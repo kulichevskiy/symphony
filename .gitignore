@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv / venv
+.venv/
+.python-version
+
+# Symphony runtime state
+.symphony/
+
+# Local Claude Code workspace settings (user-specific)
+.claude/
+
+# OS
+.DS_Store
