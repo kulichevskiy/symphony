@@ -221,6 +221,27 @@ async def test_run_agent_calls_on_event(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_drains_stderr_with_many_stdout_events(tmp_path):
+    """Regression: stderr must be captured even when stdout is long.
+
+    The implementation drains stderr concurrently to avoid a pipe-buffer
+    deadlock when the child writes a lot to stderr while we're still
+    iterating stdout. This test ensures both streams are captured together.
+    """
+    lines = [
+        b'{"type":"system","session_id":"x"}\n',
+        b'{"type":"assistant","session_id":"x"}\n',
+        b'{"type":"assistant","session_id":"x"}\n',
+        b'{"type":"assistant","session_id":"x"}\n',
+        b'{"type":"result","is_error":false,"session_id":"x"}\n',
+    ]
+    proc = _FakeProcess(lines, exit_code=0, stderr=b"warn1\nwarn2\n")
+    res = await run_agent("hi", tmp_path, spawner=_make_spawner(proc))
+    assert res.stderr == "warn1\nwarn2\n"
+    assert len(res.raw_events) == 5
+
+
+@pytest.mark.asyncio
 async def test_run_agent_no_result_event_is_failure(tmp_path):
     """Agent exited 0 but never emitted a result event — treat as failure."""
     lines = [b'{"type":"system","session_id":"x"}\n']

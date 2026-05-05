@@ -39,6 +39,29 @@ def find_result_event(events: list[dict]) -> dict | None:
     return None
 
 
+async def _read_all(stream) -> bytes:
+    if stream is None:
+        return b""
+    return await stream.read()
+
+
+async def _process_stdout(
+    stream,
+    events: list[dict],
+    on_event: Callable[[dict], None] | None,
+) -> None:
+    if stream is None:
+        return
+    async for raw in stream:
+        line = raw.decode("utf-8", errors="replace")
+        ev = parse_event_line(line)
+        if ev is None:
+            continue
+        events.append(ev)
+        if on_event is not None:
+            on_event(ev)
+
+
 def build_argv(
     prompt: str,
     *,
@@ -99,17 +122,13 @@ async def run_agent(
     )
 
     events: list[dict] = []
-    if proc.stdout is not None:
-        async for raw in proc.stdout:
-            line = raw.decode("utf-8", errors="replace")
-            ev = parse_event_line(line)
-            if ev is None:
-                continue
-            events.append(ev)
-            if on_event is not None:
-                on_event(ev)
 
-    stderr_bytes = await proc.stderr.read() if proc.stderr is not None else b""
+    # Drain stderr concurrently with stdout — otherwise a large stderr write
+    # while we're still iterating stdout fills the stderr pipe buffer and the
+    # child blocks waiting for us to read it, deadlocking the run.
+    stderr_task = asyncio.create_task(_read_all(proc.stderr))
+    await _process_stdout(proc.stdout, events, on_event)
+    stderr_bytes = await stderr_task
     exit_code = await proc.wait()
 
     session_id = extract_session_id(events)
