@@ -42,16 +42,16 @@ class RunOnceResult:
     worktree: Path | None
 
 
-def _commits_ahead(worktree: Path, base_branch: str) -> int:
-    """Number of commits on HEAD not in ``origin/<base_branch>``."""
+def _head_sha(worktree: Path) -> str:
+    """Resolve ``HEAD`` to a full SHA inside the worktree."""
     res = subprocess.run(
-        ["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"],
+        ["git", "rev-parse", "HEAD"],
         cwd=worktree,
         check=True,
         capture_output=True,
         text=True,
     )
-    return int(res.stdout.strip() or "0")
+    return res.stdout.strip()
 
 
 def _git_push(worktree: Path, branch: str) -> None:
@@ -116,6 +116,12 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         },
     )
 
+    # Snapshot HEAD before the agent runs so we can detect a true no-op even
+    # on re-dispatch into a worktree that already has prior commits ahead of
+    # origin/<base>. (`git rev-list --count origin/<base>..HEAD` is cumulative
+    # and would mistake an already-ahead branch for a successful new run.)
+    head_before = _head_sha(worktree)
+
     result = await run_agent(
         prompt,
         worktree,
@@ -138,11 +144,11 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             worktree=worktree,
         )
 
-    ahead = _commits_ahead(worktree, cfg.repo.default_branch)
-    if ahead == 0:
+    head_after = _head_sha(worktree)
+    if head_after == head_before:
         log.error(
-            "agent exited cleanly but produced no commits ahead of origin/%s; skipping push",
-            cfg.repo.default_branch,
+            "agent exited cleanly but HEAD did not advance in worktree %s; skipping push",
+            worktree,
         )
         return RunOnceResult(
             issue_number=issue_number,

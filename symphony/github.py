@@ -107,8 +107,14 @@ def view_issue(number: int, *, repo_path: Path) -> Issue:
         cwd=repo_path,
     )
     data = _parse_json(out, context=f"gh issue view {number}")
+    # `author` is nullable in the GitHub API (deleted accounts), so a plain
+    # `c.get("author", {}).get(...)` chain crashes when the key exists with
+    # value `None`. Treat missing-or-null author as an empty login.
     comments = [
-        IssueComment(author=c.get("author", {}).get("login", ""), body=c.get("body", ""))
+        IssueComment(
+            author=(c.get("author") or {}).get("login", ""),
+            body=c.get("body", ""),
+        )
         for c in data.get("comments", [])
     ]
     labels = [lbl.get("name", "") for lbl in data.get("labels", [])]

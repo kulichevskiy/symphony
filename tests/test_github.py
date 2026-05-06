@@ -78,6 +78,33 @@ def test_view_issue_parses_gh_json(monkeypatch, tmp_path):
     assert "--json" in fake.calls[0]
 
 
+def test_view_issue_handles_null_comment_author(monkeypatch, tmp_path):
+    """Regression: GitHub returns ``"author": null`` for deleted accounts.
+
+    A naive ``c.get("author", {}).get("login")`` crashes because ``.get``
+    returns the existing ``None``, not the default. The wrapper must keep
+    parsing and emit an empty-string login.
+    """
+    payload = {
+        "number": 7,
+        "title": "x",
+        "body": "",
+        "labels": [],
+        "comments": [
+            {"author": None, "body": "left in the open"},
+            {"body": "no author key at all"},
+        ],
+    }
+    monkeypatch.setattr(
+        gh_mod, "_run_gh", _stub({("issue", "view", "7"): json.dumps(payload)})
+    )
+    issue = view_issue(7, repo_path=tmp_path)
+    assert issue.comments == [
+        IssueComment(author="", body="left in the open"),
+        IssueComment(author="", body="no author key at all"),
+    ]
+
+
 def test_view_issue_handles_missing_optional_fields(monkeypatch, tmp_path):
     payload = {"number": 9, "title": "x", "body": "", "labels": [], "comments": []}
     monkeypatch.setattr(gh_mod, "_run_gh", _stub({("issue", "view", "9"): json.dumps(payload)}))

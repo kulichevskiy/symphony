@@ -79,7 +79,14 @@ def _failed_agent_result() -> AgentResult:
     )
 
 
-def _patch_happy_path(monkeypatch, tmp_path, *, agent_result=None, commits_ahead=1) -> dict[str, Any]:
+def _patch_happy_path(
+    monkeypatch,
+    tmp_path,
+    *,
+    agent_result=None,
+    head_before="aaa1111",
+    head_after="bbb2222",
+) -> dict[str, Any]:
     """Wire stubs for each external dep and capture the calls."""
     calls: dict[str, Any] = {}
     cfg = _make_config(tmp_path)
@@ -133,9 +140,15 @@ def _patch_happy_path(monkeypatch, tmp_path, *, agent_result=None, commits_ahead
     monkeypatch.setattr(ro_mod, "run_agent", _fake_run_agent)
     calls["agent"] = prompts_seen
 
-    monkeypatch.setattr(
-        ro_mod, "_commits_ahead", lambda worktree, base: (calls.setdefault("commits", (worktree, base)), commits_ahead)[1]
-    )
+    head_calls: list[str] = []
+
+    def _fake_head_sha(worktree):
+        head_calls.append(str(worktree))
+        # First call (pre-agent) returns head_before; second (post-agent) returns head_after.
+        return head_before if len(head_calls) == 1 else head_after
+
+    monkeypatch.setattr(ro_mod, "_head_sha", _fake_head_sha)
+    calls["head_sha_calls"] = head_calls
     monkeypatch.setattr(
         ro_mod, "_git_push", lambda worktree, branch: calls.setdefault("push", (worktree, branch))
     )
@@ -206,8 +219,17 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-async def test_run_once_skips_push_on_empty_diff(monkeypatch, tmp_path):
-    fixture = _patch_happy_path(monkeypatch, tmp_path, commits_ahead=0)
+async def test_run_once_skips_push_when_head_did_not_advance(monkeypatch, tmp_path):
+    """Regression: re-dispatch into a worktree already ahead of origin/<base>.
+
+    Previously the empty-diff guard used ``git rev-list --count`` which is
+    cumulative — a reused worktree with prior commits would push/open a PR
+    even when the agent did nothing this run. Comparing pre/post HEAD catches
+    the true no-op case.
+    """
+    fixture = _patch_happy_path(
+        monkeypatch, tmp_path, head_before="same000", head_after="same000"
+    )
     res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
     assert res.skipped is True
     assert res.skip_reason == "empty-diff"
