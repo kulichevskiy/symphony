@@ -1,0 +1,14 @@
+Codex requested changes on commit {{ sha }}. Address each comment:
+
+{% for c in comments -%}
+{% if c.path %}[{{ c.path }}{% if c.line %}:{{ c.line }}{% endif %}]{% else %}[general]{% endif %} {{ c.body }}
+{% endfor %}
+{% if ci_failures -%}
+
+## CI failures
+
+{% for f in ci_failures -%}
+- {{ f.name }} (see {{ f.details_url or "PR checks" }})
+{% endfor %}
+{% endif %}
+When done, ensure tests pass and commit. Do not push — Symphony will push.
