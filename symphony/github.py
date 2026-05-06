@@ -181,31 +181,47 @@ def tracked_issues(number: int, *, repo_path: Path) -> list[TrackedIssue]:
     return results
 
 
-def find_open_pr_for_branch(branch: str, *, repo_path: Path) -> PR | None:
+def find_open_pr_for_branch(
+    branch: str,
+    *,
+    repo_path: Path,
+    base_branch: str | None = None,
+    expected_owner: str | None = None,
+) -> PR | None:
     """Return the open PR whose head ref is ``branch``, if any.
 
     Used by ``run_once`` to make re-dispatch idempotent: a second run on the
     same issue should reuse the existing PR rather than failing on
     ``gh pr create``'s duplicate-PR error.
+
+    ``--head`` filters by branch name only — multiple open PRs (e.g. from
+    forks) can match the same head ref name. Callers should pass
+    ``base_branch`` and ``expected_owner`` so this picks the PR for *this*
+    repo+base, not a stranger's same-named branch.
     """
-    out = _run_gh(
-        [
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "open",
-            "--json",
-            "number,url",
-        ],
-        cwd=repo_path,
-    )
+    args = [
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "open",
+        "--json",
+        "number,url,baseRefName,headRepositoryOwner",
+    ]
+    if base_branch:
+        args += ["--base", base_branch]
+    out = _run_gh(args, cwd=repo_path)
     data = _parse_json(out, context=f"gh pr list --head {branch}")
-    if not data:
-        return None
-    first = data[0]
-    return PR(number=int(first["number"]), url=first.get("url", ""))
+    for entry in data:
+        if base_branch and entry.get("baseRefName") != base_branch:
+            continue
+        if expected_owner:
+            owner = (entry.get("headRepositoryOwner") or {}).get("login", "")
+            if owner != expected_owner:
+                continue
+        return PR(number=int(entry["number"]), url=entry.get("url", ""))
+    return None
 
 
 def open_pr(

@@ -170,8 +170,15 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
     # Re-dispatch path: an open PR for this branch may already exist from a
     # prior run. Reuse it instead of letting `gh pr create` fail with the
     # duplicate-PR error — otherwise the run aborts before the @codex review
-    # nudge can be posted on the updated commit.
-    pr = find_open_pr_for_branch(branch, repo_path=repo_path)
+    # nudge can be posted on the updated commit. Disambiguate by base branch
+    # and head-repo owner so a stranger's same-named branch from a fork
+    # cannot get our `@codex review` nudge.
+    pr = find_open_pr_for_branch(
+        branch,
+        repo_path=repo_path,
+        base_branch=cfg.repo.default_branch,
+        expected_owner=owner,
+    )
     if pr is None:
         pr = open_pr(
             repo_path=repo_path,

@@ -62,6 +62,16 @@ def _branch_exists(repo_path: Path, branch: str) -> bool:
     return res.returncode == 0
 
 
+def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
+    res = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    return res.returncode == 0
+
+
 def _worktree_exists(repo_path: Path, target: Path) -> bool:
     res = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
     target_resolved = str(target.resolve())
@@ -101,12 +111,30 @@ def ensure_worktree(
 
     branch = f"auto/{issue_number}"
     has_branch = _branch_exists(repo_path, branch)
+    has_remote_branch = _remote_branch_exists(repo_path, branch)
     has_worktree = target.is_dir() and _worktree_exists(repo_path, target)
 
     if not has_worktree:
         try:
             if has_branch:
                 _run_git(["worktree", "add", str(target), branch], cwd=repo_path)
+            elif has_remote_branch:
+                # Local branch missing but remote `auto/<n>` exists (e.g. after a
+                # reclone or local prune). Track the remote so the new local
+                # branch starts at its tip — otherwise the next push would be
+                # rejected as non-fast-forward.
+                _run_git(
+                    [
+                        "worktree",
+                        "add",
+                        "-b",
+                        branch,
+                        "--track",
+                        str(target),
+                        f"origin/{branch}",
+                    ],
+                    cwd=repo_path,
+                )
             else:
                 base_ref = f"origin/{base_branch}"
                 _run_git(

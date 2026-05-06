@@ -219,7 +219,14 @@ def test_find_open_pr_for_branch_returns_pr(monkeypatch, tmp_path):
     fake = _stub(
         {
             ("pr", "list"): json.dumps(
-                [{"number": 12, "url": "https://github.com/o/r/pull/12"}]
+                [
+                    {
+                        "number": 12,
+                        "url": "https://github.com/o/r/pull/12",
+                        "baseRefName": "main",
+                        "headRepositoryOwner": {"login": "o"},
+                    }
+                ]
             ),
         }
     )
@@ -235,6 +242,60 @@ def test_find_open_pr_for_branch_returns_none_when_no_pr(monkeypatch, tmp_path):
     fake = _stub({("pr", "list"): "[]"})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     assert find_open_pr_for_branch("auto/99", repo_path=tmp_path) is None
+
+
+def test_find_open_pr_for_branch_skips_fork_prs(monkeypatch, tmp_path):
+    """Regression: `gh pr list --head <branch>` matches by branch name only,
+    so a fork can have an open PR with the same head ref name. Must not
+    return a PR whose head-repo owner differs from `expected_owner`.
+    """
+    fake = _stub(
+        {
+            ("pr", "list"): json.dumps(
+                [
+                    {
+                        "number": 33,
+                        "url": "https://github.com/stranger/r/pull/33",
+                        "baseRefName": "main",
+                        "headRepositoryOwner": {"login": "stranger"},
+                    },
+                    {
+                        "number": 12,
+                        "url": "https://github.com/o/r/pull/12",
+                        "baseRefName": "main",
+                        "headRepositoryOwner": {"login": "o"},
+                    },
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    pr = find_open_pr_for_branch(
+        "auto/3", repo_path=tmp_path, base_branch="main", expected_owner="o"
+    )
+    assert pr == PR(number=12, url="https://github.com/o/r/pull/12")
+
+
+def test_find_open_pr_for_branch_skips_wrong_base(monkeypatch, tmp_path):
+    fake = _stub(
+        {
+            ("pr", "list"): json.dumps(
+                [
+                    {
+                        "number": 12,
+                        "url": "https://github.com/o/r/pull/12",
+                        "baseRefName": "develop",
+                        "headRepositoryOwner": {"login": "o"},
+                    }
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    pr = find_open_pr_for_branch(
+        "auto/3", repo_path=tmp_path, base_branch="main", expected_owner="o"
+    )
+    assert pr is None
 
 
 def test_arm_auto_merge_calls_gh_pr_merge(monkeypatch, tmp_path):

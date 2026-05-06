@@ -188,6 +188,49 @@ def test_ensure_worktree_sanitizes_repo_name(tmp_path):
     assert wt.name == "my_repo_with-slash-1"
 
 
+def test_ensure_worktree_tracks_remote_branch_when_local_missing(tmp_path):
+    """Regression: if `auto/<n>` is missing locally but exists on origin (e.g.
+    after a reclone), `ensure_worktree` must create the local branch tracking
+    the remote tip — not from `origin/<base>` — so the next push fast-forwards.
+    """
+    repo, bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+
+    # Simulate a prior run by pushing an `auto/42` commit to origin without
+    # leaving the local branch around (mimics a fresh clone).
+    _run(["git", "checkout", "-b", "auto/42"], cwd=repo)
+    (repo / "from-prior-run.txt").write_text("hi\n")
+    _run(["git", "add", "from-prior-run.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "prior"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "auto/42"], cwd=repo)
+    _run(["git", "checkout", "main"], cwd=repo)
+    _run(["git", "branch", "-D", "auto/42"], cwd=repo)
+
+    wt = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=42,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    # Worktree HEAD must be at the remote `auto/42` tip — not at `origin/main` —
+    # so the prior commit is preserved and the next push fast-forwards.
+    assert (wt / "from-prior-run.txt").exists()
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    remote_head = subprocess.run(
+        ["git", "rev-parse", "origin/auto/42"],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == remote_head
+
+
 def test_ensure_worktree_recovers_from_pruned_directory(tmp_path):
     """Regression: a worktree dir that was rm'd but is still registered in
     git metadata must be auto-pruned so the next `worktree add` succeeds."""

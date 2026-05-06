@@ -164,7 +164,7 @@ def _patch_happy_path(
     monkeypatch.setattr(
         ro_mod,
         "find_open_pr_for_branch",
-        lambda branch, *, repo_path: (calls.setdefault("find_pr", (branch, repo_path)), None)[1],
+        lambda branch, **kw: (calls.setdefault("find_pr", (branch, kw)), None)[1],
     )
     monkeypatch.setattr(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
@@ -213,6 +213,12 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     assert calls["open_pr"]["base"] == "main"
     assert calls["open_pr"]["title"] == "happy path"
 
+    # PR lookup was disambiguated by base branch and head-repo owner so a
+    # stranger's same-named branch from a fork can't get the @codex nudge.
+    assert calls["find_pr"][0] == "auto/3"
+    assert calls["find_pr"][1]["base_branch"] == "main"
+    assert calls["find_pr"][1]["expected_owner"] == "kulichevskiy"
+
     # @codex review nudge posted
     assert calls["comment_pr"]["pr_number"] == 99
     assert calls["comment_pr"]["body"] == "@codex review"
@@ -233,8 +239,8 @@ async def test_run_once_reuses_existing_pr_on_redispatch(monkeypatch, tmp_path):
     existing = PR(number=42, url="https://x/pr/42")
     fixture["calls"].pop("find_pr", None)
 
-    def _existing(branch, *, repo_path):
-        fixture["calls"]["find_pr"] = (branch, repo_path)
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
         return existing
 
     monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
