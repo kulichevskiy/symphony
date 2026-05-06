@@ -199,6 +199,34 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
     # never pushed yet). Stranded commits — local-only work from a prior run
     # that crashed before push — still go through the push/PR flow.
     if not agent_advanced_head and to_push == 0:
+        pr = find_open_pr_for_branch(
+            branch,
+            repo_path=repo_path,
+            base_branch=cfg.repo.default_branch,
+            expected_owner=owner,
+        )
+        if pr is not None:
+            outcome = await drive_review_loop(
+                cfg=cfg,
+                issue_number=issue_number,
+                pr_number=pr.number,
+                branch=branch,
+                worktree=worktree,
+                initial_session_id=result.session_id,
+                poll_interval_s=30.0,
+                re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
+                give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
+                round_cap=cfg.orchestrator.review_round_cap,
+            )
+            return RunOnceResult(
+                issue_number=issue_number,
+                pr=pr,
+                skipped=False,
+                skip_reason=None,
+                worktree=worktree,
+                loop_outcome=outcome,
+            )
+
         log.error(
             "agent exited cleanly, no new commits, branch in sync with origin; skipping",
         )

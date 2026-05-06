@@ -313,8 +313,9 @@ async def test_run_once_skips_when_origin_already_at_head(monkeypatch, tmp_path)
     """Regression for the previously-pushed re-dispatch case: a branch that
     was already pushed and the agent makes no further commits. ``HEAD`` is
     still ahead of ``origin/<base>`` (it has the prior feature commit), but
-    ``HEAD == origin/<branch>`` so there's nothing new to push. The run must
-    skip — otherwise we'd post a redundant @codex review for the same SHA.
+    ``HEAD == origin/<branch>`` so there's nothing new to push. When no PR is
+    open, the run must skip — otherwise we'd post a redundant @codex review for
+    the same SHA.
 
     The fixture sets ``to_push=0`` (the helper compares against
     ``origin/<branch>`` when that ref exists, so an in-sync branch is 0).
@@ -330,6 +331,40 @@ async def test_run_once_skips_when_origin_already_at_head(monkeypatch, tmp_path)
     assert res.skipped is True
     assert res.skip_reason == "empty-diff"
     assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_reviews_existing_pr_on_empty_redispatch(monkeypatch, tmp_path):
+    """A no-op redispatch can still need to observe/merge the open PR.
+
+    Review-loop outcomes like idle/stuck are retried by the orchestrator, and
+    Codex or CI may approve the existing head before the retry runs. In that
+    case run_once must evaluate the open PR instead of returning empty-diff.
+    """
+    fixture = _patch_happy_path(
+        monkeypatch,
+        tmp_path,
+        head_before="abc1234",
+        head_after="abc1234",
+        to_push=0,
+    )
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+    assert res.skipped is False
+    assert res.pr == existing
+    assert res.loop_outcome is not None
+    assert fixture["calls"]["drive_review_loop"]["pr_number"] == 42
+    assert "push" not in fixture["calls"]
+    assert "open_pr" not in fixture["calls"]
     assert "comment_pr" not in fixture["calls"]
 
 
