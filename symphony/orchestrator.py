@@ -200,6 +200,7 @@ def select_ready(
     skips: list[DispatchSkip] = []
     for issue in candidates:
         n = issue.number
+        is_retry = n in state.retry_queue
         if n in state.running:
             skips.append(DispatchSkip(n, "already-running"))
             continue
@@ -215,10 +216,10 @@ def select_ready(
         if unsatisfied:
             skips.append(DispatchSkip(n, f"blocked-by:{','.join(str(t.number) for t in unsatisfied)}"))
             continue
-        if has_open_pr(n):
+        if has_open_pr(n) and not is_retry:
             skips.append(DispatchSkip(n, "open-pr-exists"))
             continue
-        if has_local_branch(n):
+        if has_local_branch(n) and not is_retry:
             skips.append(DispatchSkip(n, "local-branch-exists"))
             continue
         ready.append(issue)
