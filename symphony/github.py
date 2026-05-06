@@ -73,17 +73,74 @@ class PR:
     url: str
 
 
-def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
+@dataclass(frozen=True)
+class Review:
+    """A pull-request review submission. ``state`` is the GitHub review state
+    (``APPROVED``, ``CHANGES_REQUESTED``, ``COMMENTED``). ``commit_sha`` is the
+    HEAD the reviewer was looking at — used to ignore stale reviews."""
+
+    id: int
+    user_login: str
+    state: str
+    body: str
+    commit_sha: str
+    submitted_at: str
+
+
+@dataclass(frozen=True)
+class ReviewComment:
+    """An inline (line-level) review comment on a PR diff."""
+
+    id: int
+    user_login: str
+    path: str
+    line: int | None
+    body: str
+    commit_sha: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Reaction:
+    """A reaction on the PR's underlying issue (Codex's ``+1`` lives here)."""
+
+    user_login: str
+    content: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CheckRun:
+    """One CI check run on the PR's HEAD commit.
+
+    ``bucket`` is gh's high-level rollup of the check status: ``"pass"``,
+    ``"fail"``, ``"pending"``, ``"skipping"``, or ``"cancel"``. ``state`` is
+    the raw GitHub state (``SUCCESS`` / ``FAILURE`` / ``IN_PROGRESS`` / …)
+    kept around for diagnostics. ``link`` points at the run details page.
+    """
+
+    name: str
+    bucket: str
+    state: str
+    link: str | None
+
+
+def _run_gh(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    allowed_exit_codes: set[int] | tuple[int, ...] = (0,),
+) -> str:
     """Run ``gh`` with the given args and return stdout.
 
-    Raises :class:`GithubError` on non-zero exit; stderr is included in the
+    Raises :class:`GithubError` on unexpected exit; stderr is included in the
     message so callers can show actionable failures without re-running.
     """
     try:
         res = subprocess.run(
             ["gh", *args],
             cwd=str(cwd) if cwd else None,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -91,6 +148,10 @@ def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
         raise GithubError(
             f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}"
         ) from e
+    if res.returncode not in allowed_exit_codes:
+        raise GithubError(
+            f"gh {' '.join(args)} failed (exit {res.returncode}): {res.stderr.strip()}"
+        )
     return res.stdout
 
 
@@ -99,6 +160,29 @@ def _parse_json(stdout: str, *, context: str) -> Any:
         return json.loads(stdout)
     except json.JSONDecodeError as e:
         raise GithubError(f"could not parse JSON from {context}: {e}") from e
+
+
+def _parse_paginated_array(stdout: str, *, context: str) -> list[Any]:
+    """Parse the output of ``gh api --paginate --slurp`` for an array endpoint.
+
+    ``--slurp`` returns a JSON array of pages (one entry per HTTP response),
+    where each page is itself an array. Without ``--slurp`` the concatenation
+    of multiple pages is not a single valid JSON document, so callers that
+    need every page MUST pass both flags. This helper flattens the
+    list-of-pages back into one list.
+    """
+    pages = _parse_json(stdout, context=context)
+    if not isinstance(pages, list):
+        raise GithubError(f"expected JSON array from {context}, got {type(pages).__name__}")
+    flat: list[Any] = []
+    for page in pages:
+        if isinstance(page, list):
+            flat.extend(page)
+        else:
+            # A single-page object response (no pagination) is wrapped in a
+            # one-element array by --slurp; pass it through unchanged.
+            flat.append(page)
+    return flat
 
 
 def view_issue(number: int, *, repo_path: Path) -> Issue:
@@ -278,3 +362,165 @@ def arm_auto_merge(
         ["pr", "merge", str(pr_number), "--auto", flag, "--delete-branch"],
         cwd=repo_path,
     )
+
+
+def merge_pr(
+    *,
+    repo_path: Path,
+    pr_number: int,
+    method: str = "squash",
+    match_head_sha: str | None = None,
+) -> None:
+    """Merge a PR immediately after Symphony's review loop approves it."""
+    flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
+    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
+    if match_head_sha:
+        args += ["--match-head-commit", match_head_sha]
+    _run_gh(
+        args,
+        cwd=repo_path,
+    )
+
+
+def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
+    out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "headRefOid"], cwd=repo_path
+    )
+    data = _parse_json(out, context=f"gh pr view {pr_number}")
+    sha = data.get("headRefOid", "")
+    if not sha:
+        raise GithubError(f"PR #{pr_number} has no headRefOid")
+    return sha
+
+
+def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
+    """All review submissions on a PR, oldest first."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_paginated_array(out, context=f"reviews for PR {pr_number}")
+    return [
+        Review(
+            id=int(r.get("id", 0)),
+            user_login=(r.get("user") or {}).get("login", ""),
+            state=r.get("state", ""),
+            body=r.get("body") or "",
+            commit_sha=r.get("commit_id", ""),
+            submitted_at=r.get("submitted_at", ""),
+        )
+        for r in data
+    ]
+
+
+def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewComment]:
+    """All inline (line-level) review comments on a PR's diff."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/pulls/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_paginated_array(out, context=f"review comments for PR {pr_number}")
+    return [
+        ReviewComment(
+            id=int(c.get("id", 0)),
+            user_login=(c.get("user") or {}).get("login", ""),
+            path=c.get("path", ""),
+            line=c.get("line"),
+            body=c.get("body") or "",
+            commit_sha=c.get("commit_id", ""),
+            created_at=c.get("created_at", ""),
+        )
+        for c in data
+    ]
+
+
+def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
+    """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/issues/{pr_number}/reactions",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_paginated_array(out, context=f"reactions for PR {pr_number}")
+    return [
+        Reaction(
+            user_login=(r.get("user") or {}).get("login", ""),
+            content=r.get("content", ""),
+            created_at=r.get("created_at", ""),
+        )
+        for r in data
+    ]
+
+
+def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
+    """Required CI check runs on the PR's HEAD commit (`gh pr checks`).
+
+    ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
+    on ``gh pr checks`` — that produces an unknown-field error. The actual
+    schema exposes ``name``, ``bucket``, ``state``, and ``link`` (among
+    others); we use those.
+
+    ``gh pr checks`` returns exit code 8 while checks are pending. That is a
+    normal polling state, so parse stdout instead of treating it as fatal.
+    """
+    out = _run_gh(
+        [
+            "pr",
+            "checks",
+            str(pr_number),
+            "--required",
+            "--json",
+            "name,bucket,state,link",
+        ],
+        cwd=repo_path,
+        allowed_exit_codes={0, 8},
+    )
+    data = _parse_json(out, context=f"checks for PR {pr_number}")
+    return [
+        CheckRun(
+            name=c.get("name", ""),
+            bucket=c.get("bucket", ""),
+            state=c.get("state", ""),
+            link=c.get("link") or None,
+        )
+        for c in data
+    ]
+
+
+def label_issue(number: int, label: str, *, repo_path: Path) -> None:
+    """Add ``label`` to the issue (or PR) with the given number. Idempotent."""
+    _run_gh(
+        ["issue", "edit", str(number), "--add-label", label], cwd=repo_path
+    )
+
+
+def get_commit_committed_at(sha: str, *, repo_path: Path) -> str:
+    """ISO timestamp for ``sha``'s committer date — used to gate Codex's
+    ``+1`` reaction (only count reactions newer than the commit they
+    presumably refer to)."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        ["api", f"repos/{owner}/{name}/commits/{sha}"], cwd=repo_path
+    )
+    data = _parse_json(out, context=f"commit {sha}")
+    try:
+        return data["commit"]["committer"]["date"]
+    except (KeyError, TypeError) as e:
+        raise GithubError(f"missing committer.date for {sha}") from e

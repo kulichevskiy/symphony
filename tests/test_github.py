@@ -12,14 +12,26 @@ import pytest
 
 from symphony import github as gh_mod
 from symphony.github import (
+    CheckRun,
     GithubError,
     Issue,
     IssueComment,
     PR,
+    Reaction,
+    Review,
+    ReviewComment,
     TrackedIssue,
     arm_auto_merge,
     comment_pr,
     find_open_pr_for_branch,
+    get_commit_committed_at,
+    get_pr_head_sha,
+    label_issue,
+    list_pr_checks,
+    list_pr_reactions,
+    list_pr_review_comments,
+    list_pr_reviews,
+    merge_pr,
     open_pr,
     tracked_issues,
     view_issue,
@@ -35,8 +47,11 @@ def _stub(responses: dict[tuple[str, ...], str]):
 
     calls: list[list[str]] = []
 
-    def _fake(args, *, cwd=None):  # type: ignore[no-untyped-def]
+    kwargs_seen: list[dict[str, object]] = []
+
+    def _fake(args, *, cwd=None, **kwargs):  # type: ignore[no-untyped-def]
         calls.append(list(args))
+        kwargs_seen.append(dict(kwargs))
         for length in range(len(args), 0, -1):
             key = tuple(args[:length])
             if key in responses:
@@ -44,6 +59,7 @@ def _stub(responses: dict[tuple[str, ...], str]):
         raise AssertionError(f"unexpected gh call: {args}")
 
     _fake.calls = calls  # type: ignore[attr-defined]
+    _fake.kwargs_seen = kwargs_seen  # type: ignore[attr-defined]
     return _fake
 
 
@@ -309,6 +325,165 @@ def test_arm_auto_merge_calls_gh_pr_merge(monkeypatch, tmp_path):
     assert "--delete-branch" in call
 
 
+def test_merge_pr_calls_direct_gh_pr_merge(monkeypatch, tmp_path):
+    fake = _stub({("pr", "merge", "12"): ""})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    merge_pr(repo_path=tmp_path, pr_number=12, match_head_sha="abc123")
+    call = fake.calls[0]
+    assert call[:3] == ["pr", "merge", "12"]
+    assert "--auto" not in call
+    assert "--squash" in call
+    assert "--delete-branch" in call
+    assert "--match-head-commit" in call
+    assert "abc123" in call
+
+
+def test_get_pr_head_sha(monkeypatch, tmp_path):
+    fake = _stub({("pr", "view", "10"): json.dumps({"headRefOid": "abc123"})})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert get_pr_head_sha(10, repo_path=tmp_path) == "abc123"
+
+
+def test_list_pr_reviews_parses_payload(monkeypatch, tmp_path):
+    payload = [
+        {
+            "id": 1,
+            "user": {"login": "alice"},
+            "state": "APPROVED",
+            "body": "lgtm",
+            "commit_id": "sha1",
+            "submitted_at": "2026-05-06T07:00:00Z",
+        },
+        {
+            "id": 2,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "state": "COMMENTED",
+            "body": None,
+            "commit_id": "sha2",
+            "submitted_at": "2026-05-06T07:30:00Z",
+        },
+    ]
+    # ``gh api --paginate --slurp`` returns a JSON array of pages; each page
+    # is itself an array. Simulate two pages to lock in the flatten path.
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("api",): json.dumps([[payload[0]], [payload[1]]]),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    reviews = list_pr_reviews(10, repo_path=tmp_path)
+    assert reviews == [
+        Review(id=1, user_login="alice", state="APPROVED", body="lgtm", commit_sha="sha1", submitted_at="2026-05-06T07:00:00Z"),
+        Review(id=2, user_login="chatgpt-codex-connector[bot]", state="COMMENTED", body="", commit_sha="sha2", submitted_at="2026-05-06T07:30:00Z"),
+    ]
+    api_call = next(c for c in fake.calls if c[0] == "api")
+    assert "--paginate" in api_call and "--slurp" in api_call
+
+
+def test_list_pr_review_comments(monkeypatch, tmp_path):
+    payload = [
+        {
+            "id": 7,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "path": "src/x.py",
+            "line": 42,
+            "body": "fix this",
+            "commit_id": "shaH",
+            "created_at": "2026-05-06T07:30:00Z",
+        }
+    ]
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("api",): json.dumps([payload]),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    cs = list_pr_review_comments(10, repo_path=tmp_path)
+    assert cs == [
+        ReviewComment(
+            id=7,
+            user_login="chatgpt-codex-connector[bot]",
+            path="src/x.py",
+            line=42,
+            body="fix this",
+            commit_sha="shaH",
+            created_at="2026-05-06T07:30:00Z",
+        )
+    ]
+    api_call = next(c for c in fake.calls if c[0] == "api")
+    assert "--paginate" in api_call and "--slurp" in api_call
+
+
+def test_list_pr_reactions(monkeypatch, tmp_path):
+    payload = [
+        {"user": {"login": "chatgpt-codex-connector[bot]"}, "content": "+1", "created_at": "2026-05-06T08:00:00Z"},
+        {"user": None, "content": "eyes", "created_at": "2026-05-06T07:00:00Z"},
+    ]
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("api",): json.dumps([payload]),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    reactions = list_pr_reactions(10, repo_path=tmp_path)
+    assert reactions == [
+        Reaction(user_login="chatgpt-codex-connector[bot]", content="+1", created_at="2026-05-06T08:00:00Z"),
+        Reaction(user_login="", content="eyes", created_at="2026-05-06T07:00:00Z"),
+    ]
+    api_call = next(c for c in fake.calls if c[0] == "api")
+    assert "--paginate" in api_call and "--slurp" in api_call
+
+
+def test_list_pr_checks(monkeypatch, tmp_path):
+    # `gh pr checks --json` exposes name/bucket/state/link (not status /
+    # conclusion / detailsUrl). Pin the schema so a copy-pasted-from-`pr
+    # view` field name doesn't sneak back in. Only required checks gate the
+    # verdict, and gh's documented pending-check exit code 8 is non-fatal.
+    payload = [
+        {"name": "build", "bucket": "pass", "state": "SUCCESS", "link": "https://ci/build"},
+        {"name": "test", "bucket": "fail", "state": "FAILURE", "link": "https://ci/test"},
+        {"name": "lint", "bucket": "pending", "state": "IN_PROGRESS", "link": None},
+    ]
+    fake = _stub({("pr", "checks", "10"): json.dumps(payload)})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    checks = list_pr_checks(10, repo_path=tmp_path)
+    assert len(checks) == 3
+    assert checks[1] == CheckRun(name="test", bucket="fail", state="FAILURE", link="https://ci/test")
+    assert checks[2].link is None
+    call = next(c for c in fake.calls if c[:2] == ["pr", "checks"])
+    call_index = fake.calls.index(call)
+    assert "--required" in call
+    assert "--json" in call
+    json_fields = call[call.index("--json") + 1].split(",")
+    assert set(json_fields) == {"name", "bucket", "state", "link"}
+    assert fake.kwargs_seen[call_index]["allowed_exit_codes"] == {0, 8}
+
+
+def test_label_issue_calls_gh(monkeypatch, tmp_path):
+    fake = _stub({("issue", "edit", "10"): ""})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    label_issue(10, "auto-stuck", repo_path=tmp_path)
+    call = fake.calls[0]
+    assert call[:3] == ["issue", "edit", "10"]
+    assert "--add-label" in call and "auto-stuck" in call
+
+
+def test_get_commit_committed_at(monkeypatch, tmp_path):
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("api",): json.dumps(
+                {"commit": {"committer": {"date": "2026-05-06T07:00:00Z"}}}
+            ),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert get_commit_committed_at("abc", repo_path=tmp_path) == "2026-05-06T07:00:00Z"
+
+
 def test_run_gh_raises_github_error_on_failure(monkeypatch, tmp_path):
     """If gh exits non-zero, the wrapper raises GithubError with stderr."""
     import subprocess as _sp
@@ -322,3 +497,21 @@ def test_run_gh_raises_github_error_on_failure(monkeypatch, tmp_path):
     with pytest.raises(GithubError) as exc:
         gh_mod._run_gh(["issue", "view", "1"], cwd=tmp_path)
     assert "bad request" in str(exc.value)
+
+
+def test_run_gh_allows_configured_nonzero_exit(monkeypatch, tmp_path):
+    """`gh pr checks` exits 8 while checks are pending; callers can allow it."""
+    import subprocess as _sp
+
+    def _pending(*args, **kwargs):
+        return _sp.CompletedProcess(args=args, returncode=8, stdout="[]", stderr="pending")
+
+    monkeypatch.setattr(gh_mod.subprocess, "run", _pending)
+    assert (
+        gh_mod._run_gh(
+            ["pr", "checks", "10"],
+            cwd=tmp_path,
+            allowed_exit_codes={0, 8},
+        )
+        == "[]"
+    )
