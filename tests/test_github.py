@@ -694,7 +694,7 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     ]
 
 
-def test_list_pr_checks_treats_forbidden_required_context_lookup_as_empty(
+def test_list_pr_checks_treats_forbidden_required_context_lookup_as_required(
     monkeypatch, tmp_path
 ):
     calls: list[list[str]] = []
@@ -739,7 +739,7 @@ def test_list_pr_checks_treats_forbidden_required_context_lookup_as_empty(
             status="in_progress",
             conclusion=None,
             details_url=None,
-            required=False,
+            required=True,
         )
     ]
     assert calls[2] == [

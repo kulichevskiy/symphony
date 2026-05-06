@@ -445,9 +445,9 @@ def _as_int_or_none(value: Any) -> int | None:
 
 def _required_status_checks(
     *, owner: str, name: str, base_branch: str, repo_path: Path
-) -> tuple[RequiredStatusCheck, ...]:
+) -> tuple[RequiredStatusCheck, ...] | None:
     if not base_branch:
-        return ()
+        return None
     encoded_branch = quote(base_branch, safe="")
     try:
         out = _run_gh(
@@ -460,7 +460,7 @@ def _required_status_checks(
     except GithubError as e:
         message = str(e)
         if "403" in message or "404" in message:
-            return ()
+            return None
         raise
     data = _parse_json(
         out,
@@ -499,6 +499,16 @@ def _matches_required_check(
         if required.app_id in (None, -1) or required.app_id == app_id:
             return True
     return False
+
+
+def _is_required_check(
+    name: str,
+    app_id: int | None,
+    required_checks: tuple[RequiredStatusCheck, ...] | None,
+) -> bool:
+    if required_checks is None:
+        return True
+    return _matches_required_check(name, app_id, required_checks)
 
 
 def is_pr_merged(pr_number: int, *, repo_path: Path) -> bool:
@@ -618,7 +628,7 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
             conclusion=c.get("conclusion") or None,
             details_url=c.get("details_url") or None,
             app_id=_as_int_or_none((c.get("app") or {}).get("id")),
-            required=_matches_required_check(
+            required=_is_required_check(
                 str(c.get("name", "")),
                 _as_int_or_none((c.get("app") or {}).get("id")),
                 required_checks,
@@ -654,7 +664,7 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
                 status=check_status,
                 conclusion=conclusion,
                 details_url=status.get("target_url") or None,
-                required=_matches_required_check(
+                required=_is_required_check(
                     str(status.get("context") or ""),
                     None,
                     required_checks,
