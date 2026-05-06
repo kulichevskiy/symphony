@@ -553,7 +553,20 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 
 def test_list_pr_checks(monkeypatch, tmp_path):
     page1 = [
-        {"name": "build", "status": "completed", "conclusion": "success", "details_url": "https://ci/build"},
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://ci/build-wrong-app",
+            "app": {"id": 999},
+        },
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://ci/build",
+            "app": {"id": 123},
+        },
     ]
     page2 = [
         {"name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://ci/test"},
@@ -599,7 +612,7 @@ def test_list_pr_checks(monkeypatch, tmp_path):
             ): json.dumps(
                 {
                     "contexts": ["test", "legacy"],
-                    "checks": [{"context": "build"}],
+                    "checks": [{"context": "build", "app_id": 123}],
                 }
             ),
             ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
@@ -612,38 +625,47 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
-    assert len(checks) == 6
+    assert len(checks) == 7
     assert checks[0] == CheckRun(
         name="build",
         status="completed",
         conclusion="success",
-        details_url="https://ci/build",
-        required=True,
+        details_url="https://ci/build-wrong-app",
+        app_id=999,
+        required=False,
     )
     assert checks[1] == CheckRun(
+        name="build",
+        status="completed",
+        conclusion="success",
+        details_url="https://ci/build",
+        app_id=123,
+        required=True,
+    )
+    assert checks[2] == CheckRun(
         name="test",
         status="completed",
         conclusion="failure",
         details_url="https://ci/test",
         required=True,
     )
-    assert checks[2].conclusion is None
-    assert checks[2].required is False
-    assert checks[3] == CheckRun(
+    assert checks[3].conclusion is None
+    assert checks[3].required is False
+    assert checks[4] == CheckRun(
         name="deploy",
         status="completed",
         conclusion="success",
         details_url="https://ci/deploy",
         required=False,
     )
-    assert checks[4] == CheckRun(
+    assert checks[5] == CheckRun(
         name="external",
         status="in_progress",
         conclusion=None,
         details_url=None,
         required=False,
     )
-    assert checks[5] == CheckRun(
+    assert checks[6] == CheckRun(
         name="legacy",
         status="completed",
         conclusion="failure",

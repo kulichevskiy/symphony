@@ -188,9 +188,7 @@ class EventLog:
         last_review_verdict = ""
         for ev in self.iter_events(issue_number=issue_number):
             payload = ev.payload
-            if ev.kind == "dispatch" or (
-                ev.kind == "agent-start" and payload.get("phase") == "round1"
-            ):
+            if ev.kind == "agent-start" and payload.get("phase") == "round1":
                 rounds_used = 0
                 last_reviewed_sha = ""
                 last_review_verdict = ""

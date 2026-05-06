@@ -123,7 +123,14 @@ class CheckRun:
     status: str
     conclusion: str | None
     details_url: str | None
+    app_id: int | None = None
     required: bool = True
+
+
+@dataclass(frozen=True)
+class RequiredStatusCheck:
+    context: str
+    app_id: int | None = None
 
 
 def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
@@ -427,11 +434,20 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     return sha
 
 
-def _required_status_contexts(
+def _as_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _required_status_checks(
     *, owner: str, name: str, base_branch: str, repo_path: Path
-) -> set[str]:
+) -> tuple[RequiredStatusCheck, ...]:
     if not base_branch:
-        return set()
+        return ()
     encoded_branch = quote(base_branch, safe="")
     try:
         out = _run_gh(
@@ -444,20 +460,42 @@ def _required_status_contexts(
     except GithubError as e:
         message = str(e)
         if "403" in message or "404" in message:
-            return set()
+            return ()
         raise
     data = _parse_json(
         out,
         context=f"required status checks for branch {base_branch}",
     )
-    contexts = {str(c) for c in data.get("contexts") or [] if c}
+    required = [
+        RequiredStatusCheck(context=str(context))
+        for context in data.get("contexts") or []
+        if context
+    ]
     for check in data.get("checks") or []:
         if not isinstance(check, dict):
             continue
         context = check.get("context")
         if context:
-            contexts.add(str(context))
-    return contexts
+            required.append(
+                RequiredStatusCheck(
+                    context=str(context),
+                    app_id=_as_int_or_none(check.get("app_id")),
+                )
+            )
+    return tuple(required)
+
+
+def _matches_required_check(
+    name: str,
+    app_id: int | None,
+    required_checks: tuple[RequiredStatusCheck, ...],
+) -> bool:
+    for required in required_checks:
+        if required.context != name:
+            continue
+        if required.app_id in (None, -1) or required.app_id == app_id:
+            return True
+    return False
 
 
 def is_pr_merged(pr_number: int, *, repo_path: Path) -> bool:
@@ -541,7 +579,7 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
     sha = pr_data.get("headRefOid", "")
     if not sha:
         raise GithubError(f"PR #{pr_number} has no headRefOid")
-    required_contexts = _required_status_contexts(
+    required_checks = _required_status_checks(
         owner=owner,
         name=name,
         base_branch=str(pr_data.get("baseRefName") or ""),
@@ -572,11 +610,16 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
 
     checks = [
         CheckRun(
-            name=c.get("name", ""),
+            name=str(c.get("name", "")),
             status=c.get("status", ""),
             conclusion=c.get("conclusion") or None,
             details_url=c.get("details_url") or None,
-            required=str(c.get("name", "")) in required_contexts,
+            app_id=_as_int_or_none((c.get("app") or {}).get("id")),
+            required=_matches_required_check(
+                str(c.get("name", "")),
+                _as_int_or_none((c.get("app") or {}).get("id")),
+                required_checks,
+            ),
         )
         for page in check_run_pages
         for c in page.get("check_runs", [])
@@ -608,7 +651,11 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
                 status=check_status,
                 conclusion=conclusion,
                 details_url=status.get("target_url") or None,
-                required=str(status.get("context") or "") in required_contexts,
+                required=_matches_required_check(
+                    str(status.get("context") or ""),
+                    None,
+                    required_checks,
+                ),
             )
         )
     return checks
