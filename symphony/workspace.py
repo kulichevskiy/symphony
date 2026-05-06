@@ -132,7 +132,20 @@ def ensure_worktree(
     has_remote_branch = _remote_branch_exists(repo_path, branch)
     has_worktree = target.is_dir() and _worktree_exists(repo_path, target)
 
-    if not has_worktree:
+    if has_worktree:
+        # The worktree could have drifted off `auto/<n>` between runs (a prior
+        # run aborted mid-checkout, or a human peeked at it). Force HEAD back
+        # to the right branch so the agent dispatches on the branch we'll
+        # later push, and not on a stale branch whose commits would be
+        # silently dropped from the PR.
+        try:
+            _run_git(["switch", branch], cwd=target)
+        except subprocess.CalledProcessError as e:
+            raise WorkspaceError(
+                f"could not switch worktree {target} to {branch}: "
+                f"{e.stderr.strip() if e.stderr else e}"
+            ) from e
+    else:
         try:
             if has_branch:
                 _run_git(["worktree", "add", str(target), branch], cwd=repo_path)

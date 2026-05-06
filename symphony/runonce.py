@@ -61,6 +61,18 @@ def _head_sha(worktree: Path) -> str:
     return res.stdout.strip()
 
 
+def _commits_ahead_of_base(worktree: Path, base_branch: str) -> int:
+    """Number of commits on the worktree's HEAD not in ``origin/<base_branch>``."""
+    res = subprocess.run(
+        ["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(res.stdout.strip() or "0")
+
+
 def _git_push(worktree: Path, branch: str) -> None:
     subprocess.run(
         ["git", "push", "-u", "origin", branch],
@@ -152,10 +164,19 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         )
 
     head_after = _head_sha(worktree)
-    if head_after == head_before:
+    agent_advanced_head = head_after != head_before
+    ahead_of_base = _commits_ahead_of_base(worktree, cfg.repo.default_branch)
+
+    # "Empty-diff" means the agent did nothing AND the branch has nothing to
+    # contribute over `origin/<base>`. If the branch is ahead of base — even
+    # without new commits this run — we still push: a previous run may have
+    # crashed after committing but before pushing, and those commits should
+    # not be left stranded. `git push` is a no-op when the remote is already
+    # up to date, so we don't worry about double-pushing.
+    if not agent_advanced_head and ahead_of_base == 0:
         log.error(
-            "agent exited cleanly but HEAD did not advance in worktree %s; skipping push",
-            worktree,
+            "agent exited cleanly, no new commits, branch at origin/%s; skipping push",
+            cfg.repo.default_branch,
         )
         return RunOnceResult(
             issue_number=issue_number,

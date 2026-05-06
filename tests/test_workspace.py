@@ -277,6 +277,56 @@ def test_ensure_worktree_tracks_remote_branch_when_local_missing(tmp_path):
     assert head == remote_head
 
 
+def test_ensure_worktree_returns_to_branch_after_drift(tmp_path):
+    """Regression: a reused worktree that drifted to a different branch
+    (e.g. a prior run aborted mid-checkout, or a human peeked) must be
+    switched back to `auto/<n>` before being returned. Otherwise the
+    agent dispatches on the wrong branch and the subsequent push of
+    `auto/<n>` silently drops the new commits from the PR.
+    """
+    repo, _bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+    wt = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=42,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    # Drift: a human runs `git switch -c side` inside the worktree.
+    _run(["git", "switch", "-c", "side"], cwd=wt)
+    head_after_drift = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after_drift == "side"
+
+    # Re-run: ensure_worktree must put HEAD back on auto/42.
+    wt2 = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=42,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    assert wt2 == wt
+    head_after_recover = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=wt2,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after_recover == "auto/42"
+
+
 def test_ensure_worktree_recovers_from_pruned_directory(tmp_path):
     """Regression: a worktree dir that was rm'd but is still registered in
     git metadata must be auto-pruned so the next `worktree add` succeeds."""
