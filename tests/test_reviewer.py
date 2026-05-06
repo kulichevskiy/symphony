@@ -37,7 +37,16 @@ def _review(*, who, state, body="", sha=HEAD, at="2026-05-06T07:30:00Z", id=1) -
     )
 
 
-def _comment(*, who=CODEX_BOT_LOGIN, sha=HEAD, body="fix this", line=42, id=1) -> ReviewComment:
+def _comment(
+    *,
+    who=CODEX_BOT_LOGIN,
+    sha=HEAD,
+    body="fix this",
+    line=42,
+    id=1,
+    at="2026-05-06T07:30:00Z",
+    review_id=0,
+) -> ReviewComment:
     return ReviewComment(
         id=id,
         user_login=who,
@@ -45,7 +54,8 @@ def _comment(*, who=CODEX_BOT_LOGIN, sha=HEAD, body="fix this", line=42, id=1) -
         line=line,
         body=body,
         commit_sha=sha,
-        created_at="2026-05-06T07:30:00Z",
+        created_at=at,
+        review_id=review_id,
     )
 
 
@@ -108,6 +118,18 @@ def test_codex_inline_comment_on_head_is_changes_requested():
     v = _eval(review_comments=[c])
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.review_comments == [c]
+
+
+def test_only_latest_codex_review_comments_block():
+    old = _comment(at="2026-05-06T07:10:00Z", review_id=1)
+    v = _eval(
+        reviews=[
+            _review(who=CODEX_BOT_LOGIN, state="COMMENTED", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who=CODEX_BOT_LOGIN, state="COMMENTED", id=2, at="2026-05-06T07:30:00Z"),
+        ],
+        review_comments=[old],
+    )
+    assert v.kind == VerdictKind.PENDING
 
 
 def test_codex_substantive_review_body_without_inline_is_changes_requested():
@@ -275,10 +297,33 @@ def test_codex_plus_one_before_head_commit_is_ignored():
 def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
     """A Codex inline comment on HEAD outranks a stale-or-fresh +1."""
     v = _eval(
-        review_comments=[_comment()],
+        review_comments=[_comment(at="2026-05-06T07:31:00Z")],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
+
+
+def test_codex_plus_one_after_inline_comment_supersedes_comment():
+    v = _eval(
+        review_comments=[_comment(at="2026-05-06T07:10:00Z")],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_codex_plus_one_after_substantive_review_supersedes_review():
+    v = _eval(
+        reviews=[
+            _review(
+                who=CODEX_BOT_LOGIN,
+                state="COMMENTED",
+                body="x" * 800,
+                at="2026-05-06T07:10:00Z",
+            )
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
 
 
 def test_human_approval_does_not_override_codex_inline_comment():

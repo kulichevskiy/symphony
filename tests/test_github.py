@@ -509,6 +509,7 @@ def test_list_pr_review_comments(monkeypatch, tmp_path):
             "body": "fix this",
             "commit_id": "shaH",
             "created_at": "2026-05-06T07:30:00Z",
+            "pull_request_review_id": 99,
         }
     ]
     fake = _stub(
@@ -525,6 +526,7 @@ def test_list_pr_review_comments(monkeypatch, tmp_path):
             body="fix this",
             commit_sha="shaH",
             created_at="2026-05-06T07:30:00Z",
+            review_id=99,
         )
     ]
     api_call = next(c for c in fake.calls if c[0] == "api")

@@ -103,6 +103,7 @@ class ReviewComment:
     body: str
     commit_sha: str
     created_at: str
+    review_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -510,6 +511,7 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
             body=c.get("body") or "",
             commit_sha=c.get("commit_id", ""),
             created_at=c.get("created_at", ""),
+            review_id=int(c.get("pull_request_review_id", 0) or 0),
         )
         for c in data
     ]

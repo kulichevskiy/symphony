@@ -116,6 +116,35 @@ def _latest_checks_by_name(checks: list[CheckRun]) -> list[CheckRun]:
     return list(latest.values())
 
 
+def _latest_codex_approval_at(
+    *,
+    head_committed_at: str,
+    reactions: list[Reaction],
+    codex_login: str,
+) -> datetime | None:
+    head_dt = _parse_iso(head_committed_at)
+    if head_dt is None:
+        return None
+
+    latest: datetime | None = None
+    for rxn in reactions:
+        if rxn.user_login != codex_login or rxn.content != "+1":
+            continue
+        rxn_dt = _parse_iso(rxn.created_at)
+        if rxn_dt is None or rxn_dt < head_dt:
+            continue
+        if latest is None or rxn_dt > latest:
+            latest = rxn_dt
+    return latest
+
+
+def _after_cutoff(ts: str, cutoff: datetime | None) -> bool:
+    if cutoff is None:
+        return True
+    dt = _parse_iso(ts)
+    return dt is None or dt > cutoff
+
+
 def evaluate_verdict(
     *,
     head_sha: str,
@@ -130,6 +159,11 @@ def evaluate_verdict(
     fresh_reviews = [r for r in reviews if r.commit_sha == head_sha]
     fresh_comments = [c for c in review_comments if c.commit_sha == head_sha]
     latest_checks = _latest_checks_by_name(checks)
+    latest_codex_approval_at = _latest_codex_approval_at(
+        head_committed_at=head_committed_at,
+        reactions=reactions,
+        codex_login=codex_login,
+    )
 
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
@@ -163,18 +197,34 @@ def evaluate_verdict(
                 last_review_body=r.body,
             )
 
-    # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
-    #    reviews always come paired with inline comments when there's
-    #    feedback, so this is the most reliable single signal.
+    # 3. Active Codex review-comments on HEAD = changes requested. GitHub keeps
+    #    old inline comments around, so only treat comments from the latest
+    #    Codex review as active, and let a later Codex approval supersede them.
     codex_fresh_comments = [c for c in fresh_comments if c.user_login == codex_login]
-    if codex_fresh_comments:
-        codex_reviews = [
-            r for r in fresh_reviews
-            if r.user_login == codex_login and r.state == "COMMENTED"
+    codex_reviews = [
+        r for r in fresh_reviews
+        if r.user_login == codex_login and r.state == "COMMENTED"
+    ]
+    latest_codex_review = codex_reviews[-1] if codex_reviews else None
+    if latest_codex_review is not None:
+        latest_review_dt = _parse_iso(latest_codex_review.submitted_at)
+        codex_fresh_comments = [
+            c for c in codex_fresh_comments
+            if (
+                c.review_id == latest_codex_review.id
+                if c.review_id
+                else latest_review_dt is None or _after_cutoff(c.created_at, latest_review_dt)
+            )
         ]
+
+    active_codex_comments = [
+        c for c in codex_fresh_comments
+        if _after_cutoff(c.created_at, latest_codex_approval_at)
+    ]
+    if active_codex_comments:
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
-            review_comments=codex_fresh_comments,
+            review_comments=active_codex_comments,
             last_review_body=codex_reviews[-1].body if codex_reviews else "",
         )
 
@@ -187,6 +237,7 @@ def evaluate_verdict(
         if r.user_login == codex_login
         and r.state == "COMMENTED"
         and len(r.body) > CODEX_BOILERPLATE_THRESHOLD
+        and _after_cutoff(r.submitted_at, latest_codex_approval_at)
     ]
     if codex_substantive:
         return Verdict(
@@ -206,14 +257,8 @@ def evaluate_verdict(
     if any(r.state == "APPROVED" for r in latest_human_reviews):
         return Verdict(kind=VerdictKind.APPROVED)
 
-    head_dt = _parse_iso(head_committed_at)
-    if head_dt is not None:
-        for rxn in reactions:
-            if rxn.user_login != codex_login or rxn.content != "+1":
-                continue
-            rxn_dt = _parse_iso(rxn.created_at)
-            if rxn_dt is not None and rxn_dt >= head_dt:
-                return Verdict(kind=VerdictKind.APPROVED)
+    if latest_codex_approval_at is not None:
+        return Verdict(kind=VerdictKind.APPROVED)
 
     return Verdict(kind=VerdictKind.PENDING)
 
