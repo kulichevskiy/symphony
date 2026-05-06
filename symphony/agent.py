@@ -24,9 +24,12 @@ def parse_event_line(line: str) -> dict | None:
     if not line:
         return None
     try:
-        return json.loads(line)
+        parsed = json.loads(line)
     except json.JSONDecodeError:
         return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 def extract_session_id(events: list[dict]) -> str | None:

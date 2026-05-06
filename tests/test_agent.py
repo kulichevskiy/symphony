@@ -32,6 +32,14 @@ def test_parse_event_line_invalid_json_returns_none():
     assert parse_event_line("{partial") is None
 
 
+def test_parse_event_line_non_object_returns_none():
+    assert parse_event_line("true") is None
+    assert parse_event_line("42") is None
+    assert parse_event_line('"hi"') is None
+    assert parse_event_line("[]") is None
+    assert parse_event_line("null") is None
+
+
 def test_extract_session_id_from_first_event():
     events = [
         {"type": "system", "session_id": "sid-123"},
