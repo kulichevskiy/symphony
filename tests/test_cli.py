@@ -27,6 +27,7 @@ def test_help_lists_run_once():
 
 def test_run_once_invokes_orchestrator(tmp_path, monkeypatch):
     from symphony.github import PR
+    from symphony.reviewer import LoopOutcome, LoopOutcomeKind
     from symphony.runonce import RunOnceResult
 
     captured: dict = {}
@@ -40,6 +41,12 @@ def test_run_once_invokes_orchestrator(tmp_path, monkeypatch):
             skipped=False,
             skip_reason=None,
             worktree=tmp_path,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=0,
+                last_session_id="sess-A",
+                head_sha="abc",
+            ),
         )
 
     monkeypatch.setattr("symphony.cli.run_once", fake_run_once)
@@ -50,6 +57,35 @@ def test_run_once_invokes_orchestrator(tmp_path, monkeypatch):
     assert "https://x/pr/99" in result.output
     assert captured["issue_number"] == 3
     assert captured["config_path"] == cfg
+
+
+def test_run_once_exits_non_zero_when_auto_stuck(tmp_path, monkeypatch):
+    from symphony.github import PR
+    from symphony.reviewer import LoopOutcome, LoopOutcomeKind
+    from symphony.runonce import RunOnceResult
+
+    async def fake_run_once(*, issue_number, config_path):
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=PR(number=99, url="https://x/pr/99"),
+            skipped=False,
+            skip_reason=None,
+            worktree=tmp_path,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.AUTO_STUCK_ROUNDS,
+                rounds_used=10,
+                last_session_id="sess-A",
+                head_sha="abc",
+            ),
+        )
+
+    monkeypatch.setattr("symphony.cli.run_once", fake_run_once)
+    cfg = tmp_path / "symphony.toml"
+    cfg.write_text("# stub\n")
+    result = runner.invoke(app, ["run-once", "3", "--config", str(cfg)])
+    # PR URL still printed; exit code surfaces non-approval terminal state.
+    assert "https://x/pr/99" in result.output
+    assert result.exit_code == 2
 
 
 def test_run_once_skipped_exits_nonzero(tmp_path, monkeypatch):
