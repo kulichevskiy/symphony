@@ -424,6 +424,7 @@ async def test_run_once_reruns_review_when_open_merge_pending_head_changes(
     fixture = _patch_happy_path(monkeypatch, tmp_path)
     existing = PR(number=42, url="https://x/pr/42")
     fixture["calls"].pop("find_pr", None)
+    order: list[str] = []
     event_log = EventLog.for_repo(fixture["cfg"].repo.path)
     event_log.emit(
         "run-terminal",
@@ -444,12 +445,41 @@ async def test_run_once_reruns_review_when_open_merge_pending_head_changes(
     monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
     monkeypatch.setattr(ro_mod, "get_pr_head_sha", lambda **kw: "new-sha")
 
+    def _fake_sync(*args):
+        order.append("sync")
+        fixture["calls"]["sync_worktree"] = args
+
+    def _fake_comment(**kw):
+        order.append("comment")
+        fixture["calls"]["comment_pr"] = kw
+
+    monkeypatch.setattr(ro_mod, "_sync_worktree_to_pr_head", _fake_sync)
+    monkeypatch.setattr(ro_mod, "comment_pr", _fake_comment)
+
+    async def _fake_loop(**kw):
+        order.append("review")
+        fixture["calls"]["drive_review_loop"] = kw
+        return ro_mod.LoopOutcome(
+            kind=ro_mod.LoopOutcomeKind.APPROVED,
+            rounds_used=0,
+            last_session_id=kw.get("initial_session_id"),
+            head_sha="new-sha",
+        )
+
+    monkeypatch.setattr(ro_mod, "drive_review_loop", _fake_loop)
+
     res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
 
     assert res.skipped is False
     assert res.pr == existing
     assert "prompt" not in fixture["calls"]["agent"]
     assert "push" not in fixture["calls"]
+    assert fixture["calls"]["sync_worktree"] == (
+        fixture["wt"],
+        "auto/3",
+        "new-sha",
+    )
+    assert order[:3] == ["sync", "comment", "review"]
     assert fixture["calls"]["comment_pr"] == {
         "repo_path": fixture["cfg"].repo.path,
         "pr_number": 42,

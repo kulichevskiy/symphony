@@ -114,6 +114,35 @@ def _git_push(worktree: Path, branch: str) -> None:
     )
 
 
+def _sync_worktree_to_pr_head(worktree: Path, branch: str, head_sha: str) -> None:
+    subprocess.run(
+        ["git", "fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    res = subprocess.run(
+        ["git", "rev-parse", f"refs/remotes/origin/{branch}"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fetched_head = res.stdout.strip()
+    if fetched_head != head_sha:
+        raise RuntimeError(
+            f"origin/{branch} is at {fetched_head}, expected PR head {head_sha}"
+        )
+    subprocess.run(
+        ["git", "reset", "--hard", head_sha],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _build_pr_body(issue: Issue) -> str:
     return f"Closes #{issue.number}\n\n{issue.title}\n\n{PR_FOOTER}\n"
 
@@ -307,6 +336,7 @@ async def run_once(
                     and current_head_sha
                     and current_head_sha != retry_head_sha
                 ):
+                    _sync_worktree_to_pr_head(worktree, branch, current_head_sha)
                     emit(
                         "pr-open",
                         {
