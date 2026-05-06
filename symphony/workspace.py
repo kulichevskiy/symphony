@@ -63,6 +63,24 @@ def _branch_exists(repo_path: Path, branch: str) -> bool:
 
 
 def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
+    """Authoritatively check whether ``origin`` has ``branch`` and refresh the
+    local remote-tracking ref so callers see it.
+
+    Skipping the fetch would mean a long-lived clone — one that hasn't
+    fetched since another runner pushed ``auto/<n>`` — would miss the
+    remote branch, fall through to creating a fresh local branch from
+    ``origin/<base>``, and then fail with a non-fast-forward push.
+    """
+    # `git fetch <ref>:refs/remotes/origin/<ref>` updates the local remote-
+    # tracking ref iff the branch exists on origin. We swallow failure (e.g.
+    # the branch doesn't exist remotely yet) and let the rev-parse below be
+    # the authoritative check.
+    subprocess.run(
+        ["git", "fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
     res = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
         cwd=repo_path,

@@ -188,6 +188,52 @@ def test_ensure_worktree_sanitizes_repo_name(tmp_path):
     assert wt.name == "my_repo_with-slash-1"
 
 
+def test_ensure_worktree_fetches_remote_branch_before_check(tmp_path):
+    """Regression: a long-lived clone where the local remote-tracking ref
+    for `auto/<n>` is stale (or absent) must still discover the remote
+    branch — `ensure_worktree` fetches it before the existence check.
+
+    Without the fetch, the next `git worktree add` would create the branch
+    from `origin/<base>` and the subsequent push would be rejected as
+    non-fast-forward.
+    """
+    repo, _bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+
+    # Set up a remote `auto/77` with one commit and then erase ALL local
+    # traces in `repo` — including the remote-tracking ref — to simulate a
+    # clone that hasn't fetched since the remote branch was created.
+    _run(["git", "checkout", "-b", "auto/77"], cwd=repo)
+    (repo / "remote-only.txt").write_text("hi\n")
+    _run(["git", "add", "remote-only.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "remote-only"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "auto/77"], cwd=repo)
+    _run(["git", "checkout", "main"], cwd=repo)
+    _run(["git", "branch", "-D", "auto/77"], cwd=repo)
+    # Drop the remote-tracking ref too — this is the case Codex flagged.
+    _run(["git", "update-ref", "-d", "refs/remotes/origin/auto/77"], cwd=repo)
+    # Sanity: the local ref is gone, so without the fetch we'd miss it.
+    rc = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/auto/77"],
+        cwd=repo,
+        capture_output=True,
+    ).returncode
+    assert rc != 0
+
+    wt = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=77,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    # The fix fetched origin/auto/77 first, so the worktree HEAD is at the
+    # remote tip — the prior commit is preserved.
+    assert (wt / "remote-only.txt").exists()
+
+
 def test_ensure_worktree_tracks_remote_branch_when_local_missing(tmp_path):
     """Regression: if `auto/<n>` is missing locally but exists on origin (e.g.
     after a reclone), `ensure_worktree` must create the local branch tracking
