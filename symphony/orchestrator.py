@@ -169,6 +169,7 @@ def select_ready(
     state: OrchestratorState,
     has_open_pr: Callable[[int], bool],
     has_local_branch: Callable[[int], bool],
+    latest_terminal_outcome: Callable[[int], str] | None = None,
     now: float,
 ) -> tuple[list[Issue], list[DispatchSkip]]:
     """Pick issues that are eligible to dispatch right now.
@@ -192,16 +193,24 @@ def select_ready(
         retry_can_reuse_existing_artifacts = (
             retry is not None and retry.reason in MERGE_RETRY_REASONS
         )
+        terminal_can_reuse_existing_artifacts = (
+            latest_terminal_outcome is not None
+            and latest_terminal_outcome(n) in MERGE_RETRY_REASONS
+        )
+        can_reuse_existing_artifacts = (
+            retry_can_reuse_existing_artifacts
+            or terminal_can_reuse_existing_artifacts
+        )
         unsatisfied = [
             t for t in graph.get(n, []) if not is_blocker_satisfied(t)
         ]
         if unsatisfied:
             skips.append(DispatchSkip(n, f"blocked-by:{','.join(str(t.number) for t in unsatisfied)}"))
             continue
-        if has_open_pr(n) and not retry_can_reuse_existing_artifacts:
+        if has_open_pr(n) and not can_reuse_existing_artifacts:
             skips.append(DispatchSkip(n, "open-pr-exists"))
             continue
-        if has_local_branch(n) and not retry_can_reuse_existing_artifacts:
+        if has_local_branch(n) and not can_reuse_existing_artifacts:
             skips.append(DispatchSkip(n, "local-branch-exists"))
             continue
         ready.append(issue)
@@ -393,6 +402,9 @@ async def run_tick(
         state=state,
         has_open_pr=has_open_pr,
         has_local_branch=has_local_branch,
+        latest_terminal_outcome=(
+            event_log.latest_terminal_outcome if event_log is not None else None
+        ),
         now=now,
     )
 

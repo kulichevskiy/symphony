@@ -181,6 +181,7 @@ def _ready(
     cycles_flat=None,
     open_prs=None,
     local_branches=None,
+    latest_terminal_outcome=None,
     now=0.0,
 ):
     state = state or OrchestratorState()
@@ -194,6 +195,7 @@ def _ready(
         state=state,
         has_open_pr=lambda n: n in open_prs,
         has_local_branch=lambda n: n in local_branches,
+        latest_terminal_outcome=latest_terminal_outcome,
         now=now,
     )
 
@@ -326,6 +328,30 @@ def test_select_ready_allows_expired_merge_retry_with_local_branch():
     ready, skips = _ready([a], {1: []}, state=state, local_branches={1}, now=15.0)
     assert [i.number for i in ready] == [1]
     assert skips == []
+
+
+def test_select_ready_allows_persisted_merge_retry_with_open_pr_after_restart():
+    a = _issue(1)
+    ready, skips = _ready(
+        [a],
+        {1: []},
+        open_prs={1},
+        latest_terminal_outcome=lambda n: LoopOutcomeKind.MERGE_PENDING.value,
+    )
+    assert [i.number for i in ready] == [1]
+    assert skips == []
+
+
+def test_select_ready_skips_persisted_non_merge_terminal_with_open_pr():
+    a = _issue(1)
+    ready, skips = _ready(
+        [a],
+        {1: []},
+        open_prs={1},
+        latest_terminal_outcome=lambda n: LoopOutcomeKind.AUTO_STUCK_IDLE.value,
+    )
+    assert ready == []
+    assert skips == [DispatchSkip(1, "open-pr-exists")]
 
 
 # ---- run_tick driver ----
@@ -545,6 +571,44 @@ async def test_run_tick_retries_merge_pending_outcome(tmp_path):
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert state.retry_queue[1].attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_run_tick_recovers_persisted_merge_retry_after_restart(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    event_log = EventLog.for_repo(tmp_path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=1,
+        payload={
+            "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+            "rounds_used": 1,
+        },
+    )
+    dispatched: list[int] = []
+
+    async def fake_run_once(*, issue_number, config_path):
+        dispatched.append(issue_number)
+        return _approved_result()
+
+    stats = await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: True,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        event_log=event_log,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert stats.dispatched == 1
+    assert dispatched == [1]
 
 
 @pytest.mark.asyncio
