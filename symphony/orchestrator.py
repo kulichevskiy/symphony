@@ -48,6 +48,33 @@ _RATE_LIMIT_INDICATORS = (
 )
 
 
+async def _sleep_or_shutdown(
+    *,
+    delay_s: float,
+    shutdown_event: asyncio.Event,
+    sleep_fn: Callable[[float], Awaitable[None]],
+) -> None:
+    sleep_task = asyncio.ensure_future(sleep_fn(delay_s))
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {sleep_task, shutdown_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if sleep_task in done:
+            sleep_task.result()
+    except Exception:
+        for task in (sleep_task, shutdown_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(sleep_task, shutdown_task, return_exceptions=True)
+        raise
+
+
 def is_rate_limited(result_or_text: Any) -> bool:
     """True if ``result``'s stderr / final_text / events mention a rate-limit.
 
@@ -422,12 +449,11 @@ async def run_forever(
 
         # Sleep with shutdown awareness — wake immediately on SIGINT-driven
         # shutdown rather than waiting out the full poll interval.
-        try:
-            await asyncio.wait_for(
-                shutdown_event.wait(), timeout=cfg.orchestrator.poll_interval_s
-            )
-        except asyncio.TimeoutError:
-            pass
+        await _sleep_or_shutdown(
+            delay_s=cfg.orchestrator.poll_interval_s,
+            shutdown_event=shutdown_event,
+            sleep_fn=sleep_fn,
+        )
 
     # Drain in-flight dispatches. The done-callback in ``run_tick`` removes
     # entries from the set as tasks finish, so we snapshot first to avoid

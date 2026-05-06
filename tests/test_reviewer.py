@@ -588,6 +588,30 @@ async def test_loop_does_not_idle_give_up_while_checks_are_pending(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_resets_idle_timer_when_head_advances_while_pending(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    snaps = [
+        _pending_snap("head1"),
+        _pending_snap("head1"),
+        _pending_snap("head2"),
+        _pending_snap("head2"),
+        _approved_snap("head2"),
+    ]
+    driver = _Driver(snaps)
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        poll_interval_s=30.0,
+        re_nudge_after_s=600.0,
+        give_up_after_s=90.0,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["label_issue"] == []
+    assert driver.calls["merge_pr"] == [(str(cfg.repo.path), 11, "head2")]
+
+
+@pytest.mark.asyncio
 async def test_loop_renudges_at_idle_threshold_then_returns_on_approval(tmp_path):
     """At 10 min PENDING, post one re-nudge; then approval lands."""
     cfg = _make_cfg(tmp_path)

@@ -370,6 +370,10 @@ async def drive_review_loop(
             reactions=snap.reactions,
             checks=snap.checks,
         )
+        if last_seen_head_sha and snap.head_sha != last_seen_head_sha:
+            last_activity = now_fn()
+            nudged_during_idle = False
+        last_seen_head_sha = snap.head_sha
 
         if verdict.kind == VerdictKind.APPROVED:
             merge_pr_fn(
@@ -448,14 +452,12 @@ async def drive_review_loop(
             rounds_used += 1
             last_activity = now_fn()
             nudged_during_idle = False
-            last_seen_head_sha = snap.head_sha
             continue
 
         # PENDING — check timers
         if verdict.pending_checks:
             last_activity = now_fn()
             nudged_during_idle = False
-            last_seen_head_sha = snap.head_sha
             continue
 
         elapsed = now_fn() - last_activity

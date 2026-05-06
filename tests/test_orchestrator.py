@@ -553,6 +553,35 @@ async def test_run_forever_exits_when_shutdown_event_set(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_forever_uses_injected_sleep_fn(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 123.0
+    shutdown = asyncio.Event()
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float):
+        sleeps.append(seconds)
+        shutdown.set()
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=lambda: [],
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+        sleep_fn=fake_sleep,
+    )
+
+    assert sleeps == [123.0]
+
+
+@pytest.mark.asyncio
 async def test_run_forever_drains_in_flight_dispatches_on_shutdown(tmp_path):
     """SIGINT during an active dispatch must let the in-flight ``run_once``
     finish, not get cancelled by the event-loop tear-down."""
