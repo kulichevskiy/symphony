@@ -118,17 +118,22 @@ def evaluate_verdict(
             ci_failures=failing_checks,
         )
 
-    # 2. Explicit human verdicts on HEAD trump everything else.
-    for r in fresh_reviews:
-        if r.user_login != codex_login:
-            if r.state == "CHANGES_REQUESTED":
-                return Verdict(
-                    kind=VerdictKind.CHANGES_REQUESTED,
-                    review_comments=fresh_comments,
-                    last_review_body=r.body,
-                )
-            if r.state == "APPROVED":
-                return Verdict(kind=VerdictKind.APPROVED)
+    # 2. Explicit human verdicts on HEAD trump everything else. Reviews come
+    #    back oldest-first; we want the *latest* verdict per reviewer so an
+    #    initial CHANGES_REQUESTED followed by an APPROVED on the same HEAD
+    #    counts as approved. Walk the list in reverse and take the first
+    #    APPROVED / CHANGES_REQUESTED state we see from any non-Codex reviewer.
+    for r in reversed(fresh_reviews):
+        if r.user_login == codex_login:
+            continue
+        if r.state == "APPROVED":
+            return Verdict(kind=VerdictKind.APPROVED)
+        if r.state == "CHANGES_REQUESTED":
+            return Verdict(
+                kind=VerdictKind.CHANGES_REQUESTED,
+                review_comments=fresh_comments,
+                last_review_body=r.body,
+            )
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
     #    reviews always come paired with inline comments when there's

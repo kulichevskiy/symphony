@@ -147,6 +147,29 @@ def _parse_json(stdout: str, *, context: str) -> Any:
         raise GithubError(f"could not parse JSON from {context}: {e}") from e
 
 
+def _parse_paginated_array(stdout: str, *, context: str) -> list[Any]:
+    """Parse the output of ``gh api --paginate --slurp`` for an array endpoint.
+
+    ``--slurp`` returns a JSON array of pages (one entry per HTTP response),
+    where each page is itself an array. Without ``--slurp`` the concatenation
+    of multiple pages is not a single valid JSON document, so callers that
+    need every page MUST pass both flags. This helper flattens the
+    list-of-pages back into one list.
+    """
+    pages = _parse_json(stdout, context=context)
+    if not isinstance(pages, list):
+        raise GithubError(f"expected JSON array from {context}, got {type(pages).__name__}")
+    flat: list[Any] = []
+    for page in pages:
+        if isinstance(page, list):
+            flat.extend(page)
+        else:
+            # A single-page object response (no pagination) is wrapped in a
+            # one-element array by --slurp; pass it through unchanged.
+            flat.append(page)
+    return flat
+
+
 def view_issue(number: int, *, repo_path: Path) -> Issue:
     out = _run_gh(
         ["issue", "view", str(number), "--json", ISSUE_FIELDS],
@@ -341,10 +364,15 @@ def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
     """All review submissions on a PR, oldest first."""
     owner, name = _name_with_owner(repo_path)
     out = _run_gh(
-        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/reviews", "--paginate"],
+        [
+            "api",
+            f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+            "--paginate",
+            "--slurp",
+        ],
         cwd=repo_path,
     )
-    data = _parse_json(out, context=f"reviews for PR {pr_number}")
+    data = _parse_paginated_array(out, context=f"reviews for PR {pr_number}")
     return [
         Review(
             id=int(r.get("id", 0)),
@@ -362,10 +390,15 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
     """All inline (line-level) review comments on a PR's diff."""
     owner, name = _name_with_owner(repo_path)
     out = _run_gh(
-        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/comments", "--paginate"],
+        [
+            "api",
+            f"repos/{owner}/{name}/pulls/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
+        ],
         cwd=repo_path,
     )
-    data = _parse_json(out, context=f"review comments for PR {pr_number}")
+    data = _parse_paginated_array(out, context=f"review comments for PR {pr_number}")
     return [
         ReviewComment(
             id=int(c.get("id", 0)),
@@ -384,10 +417,15 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
     owner, name = _name_with_owner(repo_path)
     out = _run_gh(
-        ["api", f"repos/{owner}/{name}/issues/{pr_number}/reactions", "--paginate"],
+        [
+            "api",
+            f"repos/{owner}/{name}/issues/{pr_number}/reactions",
+            "--paginate",
+            "--slurp",
+        ],
         cwd=repo_path,
     )
-    data = _parse_json(out, context=f"reactions for PR {pr_number}")
+    data = _parse_paginated_array(out, context=f"reactions for PR {pr_number}")
     return [
         Reaction(
             user_login=(r.get("user") or {}).get("login", ""),

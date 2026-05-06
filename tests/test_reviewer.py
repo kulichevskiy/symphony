@@ -175,6 +175,32 @@ def test_human_approved_review_wins():
     assert v.kind == VerdictKind.APPROVED
 
 
+def test_human_latest_approval_supersedes_earlier_changes_requested():
+    # GitHub returns reviews oldest-first. A reviewer who first asks for
+    # changes and then approves on the same HEAD must be treated as approved,
+    # not stuck on the original CHANGES_REQUESTED.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="needs work", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="APPROVED", body="lgtm now", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_human_latest_changes_requested_supersedes_earlier_approval():
+    # Symmetric to the case above: reviewer approved, then changed their
+    # mind on the same HEAD. The newer verdict wins.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="CHANGES_REQUESTED", body="actually no", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "actually no"
+
+
 def test_non_plus_one_reaction_does_not_approve():
     v = _eval(reactions=[_reaction(who=CODEX_BOT_LOGIN, content="heart", at="2026-05-06T07:30:00Z")])
     assert v.kind == VerdictKind.PENDING
