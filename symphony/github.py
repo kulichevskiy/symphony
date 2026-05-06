@@ -481,10 +481,13 @@ def _latest_statuses_by_context(statuses: list[Any]) -> list[dict[str, Any]]:
     return list(latest.values())
 
 
-def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
+def list_pr_checks(
+    pr_number: int, *, repo_path: Path, head_sha: str | None = None
+) -> list[CheckRun]:
     """CI check runs and commit statuses on the PR's HEAD commit."""
     owner, name = _name_with_owner(repo_path)
-    head_sha = get_pr_head_sha(pr_number, repo_path=repo_path)
+    if head_sha is None:
+        head_sha = get_pr_head_sha(pr_number, repo_path=repo_path)
     check_runs = _api_paginated_object_list(
         f"repos/{owner}/{name}/commits/{head_sha}/check-runs",
         repo_path=repo_path,

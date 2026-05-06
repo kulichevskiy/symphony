@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from symphony import reviewer as reviewer_mod
 from symphony.github import CheckRun, Reaction, Review, ReviewComment
 from symphony.reviewer import (
     CODEX_BOT_LOGIN,
@@ -15,6 +16,7 @@ from symphony.reviewer import (
     VerdictKind,
     drive_review_loop,
     evaluate_verdict,
+    fetch_snapshot,
     select_resume_session,
 )
 from symphony.types import AgentResult
@@ -285,6 +287,34 @@ def _pending_snap(head_sha="head1") -> ReviewSnapshot:
     return _snap(head_sha=head_sha)
 
 
+def test_fetch_snapshot_uses_sampled_head_for_checks(monkeypatch, tmp_path):
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        reviewer_mod,
+        "get_pr_head_sha",
+        lambda pr_number, *, repo_path: "sampled-head",
+    )
+    monkeypatch.setattr(
+        reviewer_mod,
+        "get_commit_committed_at",
+        lambda sha, *, repo_path: "2026-05-06T07:00:00Z",
+    )
+    monkeypatch.setattr(reviewer_mod, "list_pr_reviews", lambda pr_number, *, repo_path: [])
+    monkeypatch.setattr(
+        reviewer_mod, "list_pr_review_comments", lambda pr_number, *, repo_path: []
+    )
+    monkeypatch.setattr(reviewer_mod, "list_pr_reactions", lambda pr_number, *, repo_path: [])
+
+    def _checks(pr_number, *, repo_path, head_sha=None):
+        seen["head_sha"] = head_sha
+        return []
+
+    monkeypatch.setattr(reviewer_mod, "list_pr_checks", _checks)
+    snap = fetch_snapshot(pr_number=11, repo_path=tmp_path)
+    assert snap.head_sha == "sampled-head"
+    assert seen["head_sha"] == "sampled-head"
+
+
 def _make_cfg(tmp_path: Path):
     return SimpleNamespace(
         repo=SimpleNamespace(path=tmp_path / "repo", default_branch="main"),
@@ -506,6 +536,27 @@ async def test_loop_auto_stuck_after_idle_giveup(tmp_path):
     assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_IDLE
     assert outcome.rounds_used == 0
     assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
+
+
+@pytest.mark.asyncio
+async def test_loop_resets_idle_timer_when_pending_head_changes(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    driver = _Driver(
+        [
+            _pending_snap("head1"),
+            _pending_snap("head2"),
+            _approved_snap("head2"),
+        ]
+    )
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        poll_interval_s=30.0,
+        re_nudge_after_s=600.0,
+        give_up_after_s=60.0,
+    )
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["label_issue"] == []
 
 
 @pytest.mark.asyncio

@@ -207,7 +207,7 @@ def fetch_snapshot(*, pr_number: int, repo_path: Path) -> ReviewSnapshot:
         reviews=list_pr_reviews(pr_number, repo_path=repo_path),
         review_comments=list_pr_review_comments(pr_number, repo_path=repo_path),
         reactions=list_pr_reactions(pr_number, repo_path=repo_path),
-        checks=list_pr_checks(pr_number, repo_path=repo_path),
+        checks=list_pr_checks(pr_number, repo_path=repo_path, head_sha=head),
     )
 
 
@@ -322,6 +322,11 @@ async def drive_review_loop(
             checks=snap.checks,
         )
 
+        if snap.head_sha != last_seen_head_sha:
+            last_seen_head_sha = snap.head_sha
+            last_activity = now_fn()
+            nudged_during_idle = False
+
         if verdict.kind == VerdictKind.APPROVED:
             return LoopOutcome(
                 kind=LoopOutcomeKind.APPROVED,
@@ -394,7 +399,6 @@ async def drive_review_loop(
             rounds_used += 1
             last_activity = now_fn()
             nudged_during_idle = False
-            last_seen_head_sha = snap.head_sha
             continue
 
         # PENDING — check timers

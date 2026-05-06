@@ -446,6 +446,19 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     assert all("--paginate" in c and "--slurp" in c for c in api_calls)
 
 
+def test_list_pr_checks_uses_supplied_head_sha(monkeypatch, tmp_path):
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("api", "repos/o/r/commits/shaH/check-runs"): json.dumps([{"check_runs": []}]),
+            ("api", "repos/o/r/commits/shaH/statuses"): json.dumps([]),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert list_pr_checks(10, repo_path=tmp_path, head_sha="shaH") == []
+    assert not any(c[:3] == ["pr", "view", "10"] for c in fake.calls)
+
+
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
     fake = _stub({("issue", "edit", "10"): ""})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
