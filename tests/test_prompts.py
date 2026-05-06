@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from symphony.github import Issue, IssueComment, TrackedIssue
+from symphony.github import CheckRun, Issue, IssueComment, ReviewComment, TrackedIssue
 from symphony.prompts import make_env, render
 
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
@@ -70,18 +70,49 @@ def test_round1_includes_comments_and_deps():
     assert "- #2 spike (PR merged)" in out
 
 
-def test_review_prompt_includes_body_only_feedback():
+def _render_review(**ctx):
     env = make_env(PROMPTS_DIR)
-    out = render(
-        env,
-        "review.md.j2",
-        {
-            "sha": "abc123",
-            "comments": [],
-            "ci_failures": [],
-            "review_body": "Please fix the summary-only issue.",
-        },
+    base = {"sha": "deadbee", "comments": [], "ci_failures": [], "review_body": ""}
+    base.update(ctx)
+    return render(env, "review.md.j2", base)
+
+
+def test_review_renders_review_body_when_no_inline_comments():
+    # Regression: human review with a body but no inline comments must
+    # land its actionable text in the prompt — otherwise the agent gets
+    # a no-feedback retry and churns toward auto-stuck.
+    out = _render_review(review_body="Please refactor the parser to handle empty input.")
+    assert "Reviewer note" in out
+    assert "Please refactor the parser to handle empty input." in out
+    assert "Inline comments" not in out
+    assert "CI failures" not in out
+
+
+def test_review_renders_ci_link_field():
+    # Regression: template must use CheckRun.link, not the old
+    # `.details_url`. With Jinja's StrictUndefined the wrong attribute
+    # would crash render.
+    out = _render_review(
+        ci_failures=[CheckRun(name="test", bucket="fail", state="FAILURE", link="https://ci/run/123")],
     )
-    assert "Codex requested changes on commit abc123" in out
-    assert "## Review body" in out
-    assert "Please fix the summary-only issue." in out
+    assert "CI failures" in out
+    assert "https://ci/run/123" in out
+
+
+def test_review_renders_inline_comments_and_ci():
+    out = _render_review(
+        comments=[
+            ReviewComment(
+                id=1,
+                user_login="bot",
+                path="src/x.py",
+                line=42,
+                body="fix this",
+                commit_sha="deadbee",
+                created_at="2026-05-06T07:30:00Z",
+            )
+        ],
+        ci_failures=[CheckRun(name="lint", bucket="fail", state="FAILURE", link=None)],
+    )
+    assert "[src/x.py:42] fix this" in out
+    assert "lint (see PR checks)" in out

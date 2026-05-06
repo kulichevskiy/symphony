@@ -111,25 +111,36 @@ class Reaction:
 
 @dataclass(frozen=True)
 class CheckRun:
-    """One CI check run on the PR's HEAD commit."""
+    """One CI check run on the PR's HEAD commit.
+
+    ``bucket`` is gh's high-level rollup of the check status: ``"pass"``,
+    ``"fail"``, ``"pending"``, ``"skipping"``, or ``"cancel"``. ``state`` is
+    the raw GitHub state (``SUCCESS`` / ``FAILURE`` / ``IN_PROGRESS`` / …)
+    kept around for diagnostics. ``link`` points at the run details page.
+    """
 
     name: str
-    status: str
-    conclusion: str | None
-    details_url: str | None
+    bucket: str
+    state: str
+    link: str | None
 
 
-def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
+def _run_gh(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    allowed_exit_codes: set[int] | tuple[int, ...] = (0,),
+) -> str:
     """Run ``gh`` with the given args and return stdout.
 
-    Raises :class:`GithubError` on non-zero exit; stderr is included in the
+    Raises :class:`GithubError` on unexpected exit; stderr is included in the
     message so callers can show actionable failures without re-running.
     """
     try:
         res = subprocess.run(
             ["gh", *args],
             cwd=str(cwd) if cwd else None,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -137,6 +148,10 @@ def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
         raise GithubError(
             f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}"
         ) from e
+    if res.returncode not in allowed_exit_codes:
+        raise GithubError(
+            f"gh {' '.join(args)} failed (exit {res.returncode}): {res.stderr.strip()}"
+        )
     return res.stdout
 
 
@@ -147,52 +162,27 @@ def _parse_json(stdout: str, *, context: str) -> Any:
         raise GithubError(f"could not parse JSON from {context}: {e}") from e
 
 
-def _flatten_paginated_list(data: Any, *, context: str) -> list[Any]:
-    """Flatten ``gh api --paginate --slurp`` output for list endpoints."""
-    if not isinstance(data, list):
-        raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
-    if not data:
-        return []
-    if all(isinstance(page, list) for page in data):
-        return [item for page in data for item in page]
-    if all(isinstance(item, dict) for item in data):
-        # Tolerate old test fixtures / non-slurped single-page payloads.
-        return data
-    raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+def _parse_paginated_array(stdout: str, *, context: str) -> list[Any]:
+    """Parse the output of ``gh api --paginate --slurp`` for an array endpoint.
 
-
-def _flatten_paginated_object_list(data: Any, *, key: str, context: str) -> list[Any]:
-    """Flatten ``gh api --paginate --slurp`` output for object-list endpoints."""
-    if isinstance(data, dict):
-        pages = [data]
-    elif isinstance(data, list):
-        pages = data
-    else:
-        raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
-
-    flattened: list[Any] = []
+    ``--slurp`` returns a JSON array of pages (one entry per HTTP response),
+    where each page is itself an array. Without ``--slurp`` the concatenation
+    of multiple pages is not a single valid JSON document, so callers that
+    need every page MUST pass both flags. This helper flattens the
+    list-of-pages back into one list.
+    """
+    pages = _parse_json(stdout, context=context)
+    if not isinstance(pages, list):
+        raise GithubError(f"expected JSON array from {context}, got {type(pages).__name__}")
+    flat: list[Any] = []
     for page in pages:
-        if not isinstance(page, dict):
-            raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
-        items = page.get(key, [])
-        if not isinstance(items, list):
-            raise GithubError(f"unexpected {key!r} payload from {context}: {page!r}")
-        flattened.extend(items)
-    return flattened
-
-
-def _api_paginated_list(endpoint: str, *, repo_path: Path, context: str) -> list[Any]:
-    out = _run_gh(["api", endpoint, "--paginate", "--slurp"], cwd=repo_path)
-    data = _parse_json(out, context=context)
-    return _flatten_paginated_list(data, context=context)
-
-
-def _api_paginated_object_list(
-    endpoint: str, *, repo_path: Path, key: str, context: str
-) -> list[Any]:
-    out = _run_gh(["api", endpoint, "--paginate", "--slurp"], cwd=repo_path)
-    data = _parse_json(out, context=context)
-    return _flatten_paginated_object_list(data, key=key, context=context)
+        if isinstance(page, list):
+            flat.extend(page)
+        else:
+            # A single-page object response (no pagination) is wrapped in a
+            # one-element array by --slurp; pass it through unchanged.
+            flat.append(page)
+    return flat
 
 
 def view_issue(number: int, *, repo_path: Path) -> Issue:
@@ -374,6 +364,24 @@ def arm_auto_merge(
     )
 
 
+def merge_pr(
+    *,
+    repo_path: Path,
+    pr_number: int,
+    method: str = "squash",
+    match_head_sha: str | None = None,
+) -> None:
+    """Merge a PR immediately after Symphony's review loop approves it."""
+    flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
+    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
+    if match_head_sha:
+        args += ["--match-head-commit", match_head_sha]
+    _run_gh(
+        args,
+        cwd=repo_path,
+    )
+
+
 def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     out = _run_gh(
         ["pr", "view", str(pr_number), "--json", "headRefOid"], cwd=repo_path
@@ -388,11 +396,16 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
 def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
     """All review submissions on a PR, oldest first."""
     owner, name = _name_with_owner(repo_path)
-    data = _api_paginated_list(
-        f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
-        repo_path=repo_path,
-        context=f"reviews for PR {pr_number}",
+    out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
     )
+    data = _parse_paginated_array(out, context=f"reviews for PR {pr_number}")
     return [
         Review(
             id=int(r.get("id", 0)),
@@ -409,11 +422,16 @@ def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
 def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewComment]:
     """All inline (line-level) review comments on a PR's diff."""
     owner, name = _name_with_owner(repo_path)
-    data = _api_paginated_list(
-        f"repos/{owner}/{name}/pulls/{pr_number}/comments",
-        repo_path=repo_path,
-        context=f"review comments for PR {pr_number}",
+    out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/pulls/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
     )
+    data = _parse_paginated_array(out, context=f"review comments for PR {pr_number}")
     return [
         ReviewComment(
             id=int(c.get("id", 0)),
@@ -431,11 +449,16 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
 def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
     owner, name = _name_with_owner(repo_path)
-    data = _api_paginated_list(
-        f"repos/{owner}/{name}/issues/{pr_number}/reactions",
-        repo_path=repo_path,
-        context=f"reactions for PR {pr_number}",
+    out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/issues/{pr_number}/reactions",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
     )
+    data = _parse_paginated_array(out, context=f"reactions for PR {pr_number}")
     return [
         Reaction(
             user_login=(r.get("user") or {}).get("login", ""),
@@ -446,70 +469,39 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     ]
 
 
-def _status_to_check_run(status: dict[str, Any]) -> CheckRun:
-    state = status.get("state", "")
-    if state == "success":
-        check_status = "completed"
-        conclusion = "success"
-    elif state in {"failure", "error"}:
-        check_status = "completed"
-        conclusion = "failure"
-    elif state == "pending":
-        check_status = "in_progress"
-        conclusion = None
-    else:
-        check_status = "completed"
-        conclusion = state or None
+def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
+    """Required CI check runs on the PR's HEAD commit (`gh pr checks`).
 
-    return CheckRun(
-        name=status.get("context", ""),
-        status=check_status,
-        conclusion=conclusion,
-        details_url=status.get("target_url") or None,
+    ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
+    on ``gh pr checks`` — that produces an unknown-field error. The actual
+    schema exposes ``name``, ``bucket``, ``state``, and ``link`` (among
+    others); we use those.
+
+    ``gh pr checks`` returns exit code 8 while checks are pending. That is a
+    normal polling state, so parse stdout instead of treating it as fatal.
+    """
+    out = _run_gh(
+        [
+            "pr",
+            "checks",
+            str(pr_number),
+            "--required",
+            "--json",
+            "name,bucket,state,link",
+        ],
+        cwd=repo_path,
+        allowed_exit_codes={0, 8},
     )
-
-
-def _latest_statuses_by_context(statuses: list[Any]) -> list[dict[str, Any]]:
-    """Keep the newest status per context from GitHub's reverse-chronological list."""
-    latest: dict[str, dict[str, Any]] = {}
-    for status in statuses:
-        if not isinstance(status, dict):
-            raise GithubError(f"unexpected commit status payload: {status!r}")
-        context = status.get("context", "")
-        if context not in latest:
-            latest[context] = status
-    return list(latest.values())
-
-
-def list_pr_checks(
-    pr_number: int, *, repo_path: Path, head_sha: str | None = None
-) -> list[CheckRun]:
-    """CI check runs and commit statuses on the PR's HEAD commit."""
-    owner, name = _name_with_owner(repo_path)
-    if head_sha is None:
-        head_sha = get_pr_head_sha(pr_number, repo_path=repo_path)
-    check_runs = _api_paginated_object_list(
-        f"repos/{owner}/{name}/commits/{head_sha}/check-runs",
-        repo_path=repo_path,
-        key="check_runs",
-        context=f"check runs for PR {pr_number}",
-    )
-    statuses = _latest_statuses_by_context(
-        _api_paginated_list(
-            f"repos/{owner}/{name}/commits/{head_sha}/statuses",
-            repo_path=repo_path,
-            context=f"statuses for PR {pr_number}",
-        )
-    )
+    data = _parse_json(out, context=f"checks for PR {pr_number}")
     return [
         CheckRun(
             name=c.get("name", ""),
-            status=c.get("status", ""),
-            conclusion=c.get("conclusion") or None,
-            details_url=c.get("details_url") or c.get("html_url") or None,
+            bucket=c.get("bucket", ""),
+            state=c.get("state", ""),
+            link=c.get("link") or None,
         )
-        for c in check_runs
-    ] + [_status_to_check_run(s) for s in statuses]
+        for c in data
+    ]
 
 
 def label_issue(number: int, label: str, *, repo_path: Path) -> None:

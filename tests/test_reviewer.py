@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from symphony import reviewer as reviewer_mod
 from symphony.github import CheckRun, Reaction, Review, ReviewComment
 from symphony.reviewer import (
     CODEX_BOT_LOGIN,
@@ -16,7 +15,6 @@ from symphony.reviewer import (
     VerdictKind,
     drive_review_loop,
     evaluate_verdict,
-    fetch_snapshot,
     select_resume_session,
 )
 from symphony.types import AgentResult
@@ -53,8 +51,8 @@ def _reaction(*, who, content="+1", at) -> Reaction:
     return Reaction(user_login=who, content=content, created_at=at)
 
 
-def _check(*, name="ci", conclusion=None, status="completed") -> CheckRun:
-    return CheckRun(name=name, status=status, conclusion=conclusion, details_url=None)
+def _check(*, name="ci", bucket="pass", state="SUCCESS") -> CheckRun:
+    return CheckRun(name=name, bucket=bucket, state=state, link=None)
 
 
 def _eval(**overrides):
@@ -126,71 +124,54 @@ def test_human_changes_requested_review_wins():
     assert v.last_review_body == "needs work"
 
 
-def test_latest_human_review_state_for_reviewer_wins():
-    v = _eval(
-        reviews=[
-            _review(who="alice", state="CHANGES_REQUESTED", body="old", id=1),
-            _review(who="alice", state="APPROVED", body="fixed", id=2),
-        ]
-    )
-    assert v.kind == VerdictKind.APPROVED
-
-
-def test_latest_human_changes_requested_still_blocks():
-    v = _eval(
-        reviews=[
-            _review(who="alice", state="APPROVED", body="old", id=1),
-            _review(who="alice", state="CHANGES_REQUESTED", body="new", id=2),
-        ]
-    )
-    assert v.kind == VerdictKind.CHANGES_REQUESTED
-    assert v.last_review_body == "new"
-
-
-def test_latest_changes_requested_from_any_human_blocks_approval():
-    v = _eval(
-        reviews=[
-            _review(who="alice", state="APPROVED", body="lgtm", id=1),
-            _review(who="bob", state="CHANGES_REQUESTED", body="blocked", id=2),
-        ]
-    )
-    assert v.kind == VerdictKind.CHANGES_REQUESTED
-    assert v.last_review_body == "blocked"
-
-
 def test_failing_ci_check_is_changes_requested():
-    v = _eval(checks=[_check(name="test", conclusion="failure")])
+    v = _eval(checks=[_check(name="test", bucket="fail", state="FAILURE")])
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.ci_failures[0].name == "test"
-
-
-def test_cancelled_ci_check_is_changes_requested():
-    v = _eval(checks=[_check(name="test", conclusion="cancelled")])
-    assert v.kind == VerdictKind.CHANGES_REQUESTED
-    assert v.ci_failures[0].name == "test"
-
-
-@pytest.mark.parametrize("conclusion", ["startup_failure", "stale"])
-def test_other_failing_ci_conclusions_are_changes_requested(conclusion):
-    v = _eval(checks=[_check(name="test", conclusion=conclusion)])
-    assert v.kind == VerdictKind.CHANGES_REQUESTED
-    assert v.ci_failures[0].conclusion == conclusion
-
-
-@pytest.mark.parametrize("conclusion", ["success", "neutral", "skipped"])
-def test_non_failing_ci_conclusions_are_not_changes_requested(conclusion):
-    v = _eval(checks=[_check(name="test", conclusion=conclusion)])
-    assert v.kind == VerdictKind.PENDING
 
 
 def test_in_progress_check_is_not_failure():
-    v = _eval(checks=[_check(name="test", status="in_progress", conclusion=None)])
+    v = _eval(checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")])
     assert v.kind == VerdictKind.PENDING
+
+
+@pytest.mark.parametrize(
+    ("bucket", "state"),
+    [
+        ("pending", "IN_PROGRESS"),
+        ("cancel", "CANCELLED"),
+        ("skipping", "SKIPPED"),
+    ],
+)
+def test_non_passing_required_check_blocks_codex_approval(bucket, state):
+    v = _eval(
+        checks=[_check(name="test", bucket=bucket, state=state)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_non_passing_required_check_blocks_human_approval():
+    v = _eval(
+        checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")],
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_pending_required_check_does_not_hide_actionable_codex_comment():
+    c = _comment()
+    v = _eval(
+        checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")],
+        review_comments=[c],
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.review_comments == [c]
 
 
 def test_failing_ci_takes_priority_over_codex_approval_reaction():
     v = _eval(
-        checks=[_check(name="test", conclusion="failure")],
+        checks=[_check(name="test", bucket="fail", state="FAILURE")],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
@@ -202,6 +183,14 @@ def test_failing_ci_takes_priority_over_codex_approval_reaction():
 def test_codex_plus_one_reaction_on_head_is_approved():
     v = _eval(
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_codex_plus_one_with_passing_required_check_is_approved():
+    v = _eval(
+        checks=[_check(name="test", bucket="pass", state="SUCCESS")],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.APPROVED
 
@@ -223,8 +212,82 @@ def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
     assert v.kind == VerdictKind.CHANGES_REQUESTED
 
 
+def test_human_approval_with_fresh_codex_feedback_is_changes_requested():
+    c = _comment()
+    v = _eval(
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+        review_comments=[c],
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.review_comments == [c]
+
+
 def test_human_approved_review_wins():
     v = _eval(reviews=[_review(who="alice", state="APPROVED", body="lgtm")])
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_human_latest_approval_supersedes_earlier_changes_requested():
+    # GitHub returns reviews oldest-first. A reviewer who first asks for
+    # changes and then approves on the same HEAD must be treated as approved,
+    # not stuck on the original CHANGES_REQUESTED.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="needs work", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="APPROVED", body="lgtm now", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_human_latest_changes_requested_supersedes_earlier_approval():
+    # Symmetric to the case above: reviewer approved, then changed their
+    # mind on the same HEAD. The newer verdict wins.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="CHANGES_REQUESTED", body="actually no", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "actually no"
+
+
+def test_unresolved_changes_requested_blocks_other_reviewer_approval():
+    # Alice's CHANGES_REQUESTED is still unresolved when Bob approves. Bob's
+    # approval must NOT terminate the loop — we still owe Alice a fix.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="please fix X", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="bob", state="APPROVED", body="ship it", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "please fix X"
+
+
+def test_dismissed_review_clears_prior_changes_requested():
+    # Alice requested changes, then her review was dismissed. Bob then
+    # approved. Nothing is blocking — APPROVED.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="nope", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="DISMISSED", body="", id=2, at="2026-05-06T07:20:00Z"),
+            _review(who="bob", state="APPROVED", body="lgtm", id=3, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_commented_review_does_not_override_prior_verdict():
+    # A trailing COMMENTED review is non-binding and does not replace
+    # Alice's earlier approval.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="COMMENTED", body="one note", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
     assert v.kind == VerdictKind.APPROVED
 
 
@@ -300,32 +363,8 @@ def _pending_snap(head_sha="head1") -> ReviewSnapshot:
     return _snap(head_sha=head_sha)
 
 
-def test_fetch_snapshot_uses_sampled_head_for_checks(monkeypatch, tmp_path):
-    seen: dict[str, str | None] = {}
-    monkeypatch.setattr(
-        reviewer_mod,
-        "get_pr_head_sha",
-        lambda pr_number, *, repo_path: "sampled-head",
-    )
-    monkeypatch.setattr(
-        reviewer_mod,
-        "get_commit_committed_at",
-        lambda sha, *, repo_path: "2026-05-06T07:00:00Z",
-    )
-    monkeypatch.setattr(reviewer_mod, "list_pr_reviews", lambda pr_number, *, repo_path: [])
-    monkeypatch.setattr(
-        reviewer_mod, "list_pr_review_comments", lambda pr_number, *, repo_path: []
-    )
-    monkeypatch.setattr(reviewer_mod, "list_pr_reactions", lambda pr_number, *, repo_path: [])
-
-    def _checks(pr_number, *, repo_path, head_sha=None):
-        seen["head_sha"] = head_sha
-        return []
-
-    monkeypatch.setattr(reviewer_mod, "list_pr_checks", _checks)
-    snap = fetch_snapshot(pr_number=11, repo_path=tmp_path)
-    assert snap.head_sha == "sampled-head"
-    assert seen["head_sha"] == "sampled-head"
+def _pending_check_snap(head_sha="head1", state="QUEUED") -> ReviewSnapshot:
+    return _snap(head_sha=head_sha, checks=[_check(bucket="pending", state=state)])
 
 
 def _make_cfg(tmp_path: Path):
@@ -410,14 +449,12 @@ class _Driver:
         self.calls["label_issue"].append((number, label, str(repo_path)))
 
     def render(self, *, cfg, sha, comments, ci_failures, review_body=""):
-        self.calls["render"].append(
-            {
-                "sha": sha,
-                "n_comments": len(comments),
-                "n_ci": len(ci_failures),
-                "review_body": review_body,
-            }
-        )
+        self.calls["render"].append({
+            "sha": sha,
+            "n_comments": len(comments),
+            "n_ci": len(ci_failures),
+            "review_body": review_body,
+        })
         return f"render({sha})"
 
     async def sleep(self, _seconds):
@@ -482,29 +519,26 @@ async def test_loop_handles_changes_then_approval(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_loop_passes_body_only_review_feedback_to_prompt(tmp_path):
+async def test_loop_threads_review_body_to_renderer(tmp_path):
+    # Regression: when CHANGES_REQUESTED comes from a human review's body
+    # (no inline comments, no CI failure), the body must flow through to
+    # the prompt template — otherwise the agent gets feedback-less retries
+    # and churns toward auto-stuck.
     cfg = _make_cfg(tmp_path)
-    body = "x" * 800
-    driver = _Driver(
-        [
-            _snap(
-                reviews=[
-                    _review(
-                        who=CODEX_BOT_LOGIN,
-                        state="COMMENTED",
-                        body=body,
-                        sha="head1",
-                    )
-                ]
-            ),
-            _approved_snap("head2"),
-        ]
+    cr_review = Review(
+        id=1,
+        user_login="alice",
+        state="CHANGES_REQUESTED",
+        body="Refactor parser to handle empty input",
+        commit_sha="head1",
+        submitted_at="2026-05-06T07:30:00Z",
     )
+    body_snap = _snap(head_sha="head1", reviews=[cr_review])
+    driver = _Driver([body_snap, _approved_snap("head2")])
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.APPROVED
-    assert driver.calls["render"][0]["review_body"] == body
+    assert driver.calls["render"][0]["review_body"] == "Refactor parser to handle empty input"
     assert driver.calls["render"][0]["n_comments"] == 0
-    assert driver.calls["render"][0]["n_ci"] == 0
 
 
 @pytest.mark.asyncio
@@ -552,21 +586,18 @@ async def test_loop_auto_stuck_after_idle_giveup(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_loop_resets_idle_timer_when_pending_head_changes(tmp_path):
+async def test_loop_pending_activity_resets_idle_giveup(tmp_path):
+    """Pending-state changes mean the PR is active, not idle."""
     cfg = _make_cfg(tmp_path)
-    driver = _Driver(
-        [
-            _pending_snap("head1"),
-            _pending_snap("head2"),
-            _approved_snap("head2"),
-        ]
-    )
+    snaps = [
+        _pending_check_snap(state="QUEUED"),
+        _pending_check_snap(state="IN_PROGRESS"),
+        _pending_check_snap(state="IN_PROGRESS"),
+        _approved_snap(),
+    ]
+    driver = _Driver(snaps)
     outcome = await _spawn_loop(
-        driver,
-        cfg,
-        poll_interval_s=30.0,
-        re_nudge_after_s=600.0,
-        give_up_after_s=60.0,
+        driver, cfg, poll_interval_s=30.0, re_nudge_after_s=600.0, give_up_after_s=90.0
     )
     assert outcome.kind == LoopOutcomeKind.APPROVED
     assert driver.calls["label_issue"] == []
