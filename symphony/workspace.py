@@ -85,7 +85,7 @@ def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
     )
     if ls.returncode == 0:
         fetch = subprocess.run(
-            ["git", "fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"],
+            ["git", "fetch", "origin", f"+{branch}:refs/remotes/origin/{branch}"],
             cwd=repo_path,
             capture_output=True,
             text=True,

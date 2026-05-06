@@ -360,6 +360,56 @@ def test_remote_branch_exists_returns_false_when_origin_deleted_branch(tmp_path)
     assert not _branch_check_remote_tracking(repo, "auto/77")
 
 
+def test_remote_branch_exists_refreshes_force_pushed_branch(tmp_path):
+    """Regression: force-pushed origin branches must refresh local tracking refs."""
+    from symphony.workspace import _remote_branch_exists
+
+    repo, bare = _init_origin_repo(tmp_path)
+
+    _run(["git", "checkout", "-b", "auto/88"], cwd=repo)
+    (repo / "old.txt").write_text("old\n")
+    _run(["git", "add", "old.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "old"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "auto/88"], cwd=repo)
+    old_sha = subprocess.run(
+        ["git", "rev-parse", "origin/auto/88"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _run(["git", "checkout", "main"], cwd=repo)
+    _run(["git", "branch", "-D", "auto/88"], cwd=repo)
+
+    other = tmp_path / "force-pusher"
+    _run(["git", "clone", str(bare), str(other)], cwd=tmp_path)
+    _run(["git", "config", "user.email", "test@example.com"], cwd=other)
+    _run(["git", "config", "user.name", "Test"], cwd=other)
+    _run(["git", "checkout", "-b", "auto/88", "origin/main"], cwd=other)
+    (other / "new.txt").write_text("new\n")
+    _run(["git", "add", "new.txt"], cwd=other)
+    _run(["git", "commit", "-m", "new"], cwd=other)
+    _run(["git", "push", "--force", "origin", "auto/88"], cwd=other)
+    new_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=other,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert new_sha != old_sha
+
+    assert _remote_branch_exists(repo, "auto/88") is True
+    refreshed_sha = subprocess.run(
+        ["git", "rev-parse", "origin/auto/88"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert refreshed_sha == new_sha
+
+
 def _branch_check_remote_tracking(repo: Path, branch: str) -> bool:
     return subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
