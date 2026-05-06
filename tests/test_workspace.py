@@ -327,6 +327,107 @@ def test_ensure_worktree_returns_to_branch_after_drift(tmp_path):
     assert head_after_recover == "auto/42"
 
 
+def test_remote_branch_exists_returns_false_when_origin_deleted_branch(tmp_path):
+    """Regression: a stale local remote-tracking ref must not be trusted when
+    the remote branch has been deleted on origin (by another clone)."""
+    from symphony.workspace import _remote_branch_exists
+
+    repo, bare = _init_origin_repo(tmp_path)
+
+    # `repo` creates and pushes auto/77, then drops the local branch but
+    # keeps its remote-tracking ref. A *separate* clone deletes the branch
+    # on origin so `repo`'s ref becomes stale (and pruning only happens if
+    # `repo` does an explicit prune fetch).
+    _run(["git", "checkout", "-b", "auto/77"], cwd=repo)
+    (repo / "remote.txt").write_text("hi\n")
+    _run(["git", "add", "remote.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "remote"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "auto/77"], cwd=repo)
+    _run(["git", "checkout", "main"], cwd=repo)
+    _run(["git", "branch", "-D", "auto/77"], cwd=repo)
+
+    other = tmp_path / "other-clone"
+    _run(["git", "clone", str(bare), str(other)], cwd=tmp_path)
+    _run(["git", "push", "origin", "--delete", "auto/77"], cwd=other)
+
+    # The local remote-tracking ref in `repo` is still there — `repo` has
+    # not fetched since the deletion. The previous implementation would
+    # rev-parse that stale ref and return True, resurrecting deleted commits.
+    assert _branch_check_remote_tracking(repo, "auto/77")  # stale ref present
+
+    assert _remote_branch_exists(repo, "auto/77") is False
+    # Stale ref pruned as a side-effect.
+    assert not _branch_check_remote_tracking(repo, "auto/77")
+
+
+def _branch_check_remote_tracking(repo: Path, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        cwd=repo,
+        capture_output=True,
+    ).returncode == 0
+
+
+def test_ensure_worktree_fast_forwards_local_to_remote_tip(tmp_path):
+    """Regression: when local `auto/<n>` is behind `origin/auto/<n>` (another
+    clone advanced the remote since we last fetched), `ensure_worktree` must
+    fast-forward the local branch first. Otherwise the agent runs on stale
+    history and the next push is rejected as non-fast-forward.
+    """
+    repo, bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+
+    # Create local + remote auto/55 at SHA1.
+    _run(["git", "checkout", "-b", "auto/55"], cwd=repo)
+    (repo / "first.txt").write_text("first\n")
+    _run(["git", "add", "first.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "first"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "auto/55"], cwd=repo)
+    sha1 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    _run(["git", "checkout", "main"], cwd=repo)
+
+    # Simulate another clone advancing origin/auto/55 (SHA2). We push from a
+    # second clone of the same bare repo so origin's tip moves without the
+    # original `repo`'s local `auto/55` ref moving.
+    other = tmp_path / "other"
+    other.mkdir()
+    _run(["git", "clone", str(bare), str(other)], cwd=tmp_path)
+    _run(["git", "config", "user.email", "test@example.com"], cwd=other)
+    _run(["git", "config", "user.name", "Test"], cwd=other)
+    _run(["git", "checkout", "auto/55"], cwd=other)
+    (other / "second.txt").write_text("second\n")
+    _run(["git", "add", "second.txt"], cwd=other)
+    _run(["git", "commit", "-m", "second"], cwd=other)
+    _run(["git", "push", "origin", "auto/55"], cwd=other)
+    sha2 = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=other, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert sha2 != sha1
+
+    # Local `repo`'s `auto/55` is still at SHA1; origin is now SHA2. ensure_worktree
+    # must fast-forward `auto/55` to SHA2 before adding the worktree.
+    wt = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=55,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=wt,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == sha2
+    assert (wt / "second.txt").exists()
+
+
 def test_ensure_worktree_recovers_from_pruned_directory(tmp_path):
     """Regression: a worktree dir that was rm'd but is still registered in
     git metadata must be auto-pruned so the next `worktree add` succeeds."""
