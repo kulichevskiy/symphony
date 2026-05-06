@@ -560,11 +560,32 @@ def test_list_pr_checks(monkeypatch, tmp_path):
         {"name": "lint", "status": "in_progress", "conclusion": None, "details_url": None},
     ]
     status_page1 = [
-        {"context": "deploy", "state": "success", "target_url": "https://ci/deploy"},
-        {"context": "external", "state": "pending", "target_url": None},
+        {
+            "context": "deploy",
+            "state": "failure",
+            "target_url": "https://ci/deploy-old",
+            "created_at": "2026-05-06T07:00:00Z",
+        },
+        {
+            "context": "deploy",
+            "state": "success",
+            "target_url": "https://ci/deploy",
+            "created_at": "2026-05-06T07:05:00Z",
+        },
+        {
+            "context": "external",
+            "state": "pending",
+            "target_url": None,
+            "created_at": "2026-05-06T07:10:00Z",
+        },
     ]
     status_page2 = [
-        {"context": "legacy", "state": "error", "target_url": "https://ci/legacy"},
+        {
+            "context": "legacy",
+            "state": "error",
+            "target_url": "https://ci/legacy",
+            "created_at": "2026-05-06T07:15:00Z",
+        },
     ]
     fake = _stub(
         {

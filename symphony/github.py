@@ -532,23 +532,35 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
         for page in check_run_pages
         for c in page.get("check_runs", [])
     ]
+    latest_statuses: dict[str, Any] = {}
     for page in status_pages:
         for status in page.get("statuses", []):
-            state = str(status.get("state") or "").lower()
-            if state == "success":
-                check_status, conclusion = "completed", "success"
-            elif state in {"error", "failure"}:
-                check_status, conclusion = "completed", "failure"
-            else:
-                check_status, conclusion = "in_progress", None
-            checks.append(
-                CheckRun(
-                    name=status.get("context", ""),
-                    status=check_status,
-                    conclusion=conclusion,
-                    details_url=status.get("target_url") or None,
-                )
+            context = str(status.get("context") or "")
+            current = latest_statuses.get(context)
+            timestamp = str(status.get("created_at") or status.get("updated_at") or "")
+            current_timestamp = (
+                str(current.get("created_at") or current.get("updated_at") or "")
+                if current is not None
+                else ""
             )
+            if current is None or timestamp > current_timestamp:
+                latest_statuses[context] = status
+    for status in latest_statuses.values():
+        state = str(status.get("state") or "").lower()
+        if state == "success":
+            check_status, conclusion = "completed", "success"
+        elif state in {"error", "failure"}:
+            check_status, conclusion = "completed", "failure"
+        else:
+            check_status, conclusion = "in_progress", None
+        checks.append(
+            CheckRun(
+                name=str(status.get("context") or ""),
+                status=check_status,
+                conclusion=conclusion,
+                details_url=status.get("target_url") or None,
+            )
+        )
     return checks
 
 
