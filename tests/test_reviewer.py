@@ -366,8 +366,15 @@ class _Driver:
     def label_issue(self, number, label, *, repo_path):
         self.calls["label_issue"].append((number, label, str(repo_path)))
 
-    def render(self, *, cfg, sha, comments, ci_failures):
-        self.calls["render"].append({"sha": sha, "n_comments": len(comments), "n_ci": len(ci_failures)})
+    def render(self, *, cfg, sha, comments, ci_failures, review_body=""):
+        self.calls["render"].append(
+            {
+                "sha": sha,
+                "n_comments": len(comments),
+                "n_ci": len(ci_failures),
+                "review_body": review_body,
+            }
+        )
         return f"render({sha})"
 
     async def sleep(self, _seconds):
@@ -429,6 +436,32 @@ async def test_loop_handles_changes_then_approval(tmp_path):
     assert driver.calls["agent_resume"] == ["sess-A"]
     assert len(driver.calls["push"]) == 1
     assert any("@codex review" == body for _, _, body in driver.calls["comment_pr"])
+
+
+@pytest.mark.asyncio
+async def test_loop_passes_body_only_review_feedback_to_prompt(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    body = "x" * 800
+    driver = _Driver(
+        [
+            _snap(
+                reviews=[
+                    _review(
+                        who=CODEX_BOT_LOGIN,
+                        state="COMMENTED",
+                        body=body,
+                        sha="head1",
+                    )
+                ]
+            ),
+            _approved_snap("head2"),
+        ]
+    )
+    outcome = await _spawn_loop(driver, cfg)
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["render"][0]["review_body"] == body
+    assert driver.calls["render"][0]["n_comments"] == 0
+    assert driver.calls["render"][0]["n_ci"] == 0
 
 
 @pytest.mark.asyncio

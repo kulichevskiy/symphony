@@ -421,7 +421,10 @@ def test_list_pr_checks(monkeypatch, tmp_path):
         {"check_runs": []},
     ]
     statuses = [
-        [{"context": "legacy", "state": "error", "target_url": "https://ci/legacy"}],
+        [
+            {"context": "legacy", "state": "success", "target_url": "https://ci/legacy-new"},
+            {"context": "legacy", "state": "error", "target_url": "https://ci/legacy-old"},
+        ],
         [{"context": "deploy", "state": "pending", "target_url": None}],
     ]
     fake = _stub(
@@ -437,7 +440,7 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     assert len(checks) == 5
     assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
     assert checks[2].conclusion is None
-    assert checks[3] == CheckRun(name="legacy", status="completed", conclusion="failure", details_url="https://ci/legacy")
+    assert checks[3] == CheckRun(name="legacy", status="completed", conclusion="success", details_url="https://ci/legacy-new")
     assert checks[4] == CheckRun(name="deploy", status="in_progress", conclusion=None, details_url=None)
     api_calls = [c for c in fake.calls if c[0] == "api"]
     assert all("--paginate" in c and "--slurp" in c for c in api_calls)

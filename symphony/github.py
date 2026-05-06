@@ -469,6 +469,18 @@ def _status_to_check_run(status: dict[str, Any]) -> CheckRun:
     )
 
 
+def _latest_statuses_by_context(statuses: list[Any]) -> list[dict[str, Any]]:
+    """Keep the newest status per context from GitHub's reverse-chronological list."""
+    latest: dict[str, dict[str, Any]] = {}
+    for status in statuses:
+        if not isinstance(status, dict):
+            raise GithubError(f"unexpected commit status payload: {status!r}")
+        context = status.get("context", "")
+        if context not in latest:
+            latest[context] = status
+    return list(latest.values())
+
+
 def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
     """CI check runs and commit statuses on the PR's HEAD commit."""
     owner, name = _name_with_owner(repo_path)
@@ -479,10 +491,12 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
         key="check_runs",
         context=f"check runs for PR {pr_number}",
     )
-    statuses = _api_paginated_list(
-        f"repos/{owner}/{name}/commits/{head_sha}/statuses",
-        repo_path=repo_path,
-        context=f"statuses for PR {pr_number}",
+    statuses = _latest_statuses_by_context(
+        _api_paginated_list(
+            f"repos/{owner}/{name}/commits/{head_sha}/statuses",
+            repo_path=repo_path,
+            context=f"statuses for PR {pr_number}",
+        )
     )
     return [
         CheckRun(

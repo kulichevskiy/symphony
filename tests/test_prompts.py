@@ -68,3 +68,20 @@ def test_round1_includes_comments_and_deps():
     assert "Satisfied dependencies" in out
     assert "- #1 scaffold (PR https://x/pr/8)" in out
     assert "- #2 spike (PR merged)" in out
+
+
+def test_review_prompt_includes_body_only_feedback():
+    env = make_env(PROMPTS_DIR)
+    out = render(
+        env,
+        "review.md.j2",
+        {
+            "sha": "abc123",
+            "comments": [],
+            "ci_failures": [],
+            "review_body": "Please fix the summary-only issue.",
+        },
+    )
+    assert "Codex requested changes on commit abc123" in out
+    assert "## Review body" in out
+    assert "Please fix the summary-only issue." in out

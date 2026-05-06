@@ -1,5 +1,11 @@
 Codex requested changes on commit {{ sha }}. Address each comment:
 
+{% if review_body -%}
+## Review body
+
+{{ review_body }}
+
+{% endif -%}
 {% for c in comments -%}
 {% if c.path %}[{{ c.path }}{% if c.line %}:{{ c.line }}{% endif %}]{% else %}[general]{% endif %} {{ c.body }}
 {% endfor %}
