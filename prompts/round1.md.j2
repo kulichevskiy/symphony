@@ -1,0 +1,28 @@
+You are working on issue #{{ issue.number }}: {{ issue.title }}
+
+{{ issue.body }}
+
+{% if issue.comments -%}
+## Issue thread
+{% for c in issue.comments -%}
+> {{ c.author }}: {{ c.body }}
+{% endfor %}
+{% endif -%}
+
+Repository: {{ repo.owner }}/{{ repo.name }}
+Branch: auto/{{ issue.number }} (already checked out)
+Base: {{ repo.default_branch }}
+Working directory: {{ worktree_path }}
+
+{% if satisfied_deps -%}
+Satisfied dependencies:
+{% for d in satisfied_deps -%}
+- #{{ d.number }} {{ d.title }} (PR {{ d.pr_url or 'merged' }})
+{% endfor %}
+{% endif -%}
+
+Task: implement the change described in the issue.
+- Make focused commits.
+- Run tests/linters before declaring done.
+- Do not push or open a PR — Symphony handles git operations.
+- When done, exit cleanly.
