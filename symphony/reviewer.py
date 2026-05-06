@@ -229,7 +229,7 @@ def fetch_snapshot(*, pr_number: int, repo_path: Path) -> ReviewSnapshot:
         reviews=list_pr_reviews(pr_number, repo_path=repo_path),
         review_comments=list_pr_review_comments(pr_number, repo_path=repo_path),
         reactions=list_pr_reactions(pr_number, repo_path=repo_path),
-        checks=list_pr_checks(pr_number, repo_path=repo_path),
+        checks=list_pr_checks(pr_number, repo_path=repo_path, head_sha=head),
     )
 
 
@@ -255,6 +255,7 @@ class LoopOutcome:
     rounds_used: int
     last_session_id: str | None
     head_sha: str
+    agent_result: Any | None = None
 
 
 def select_resume_session(round_index: int, current_session_id: str | None) -> str | None:
@@ -391,6 +392,7 @@ async def drive_review_loop(
                     rounds_used=rounds_used,
                     last_session_id=session_id,
                     head_sha=snap.head_sha,
+                    agent_result=agent_result,
                 )
 
             # Capture (possibly fresh) session id for the next round.

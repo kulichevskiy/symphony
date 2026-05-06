@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from symphony import reviewer as reviewer_mod
 from symphony.github import CheckRun, Reaction, Review, ReviewComment
 from symphony.reviewer import (
     CODEX_BOT_LOGIN,
@@ -15,6 +16,7 @@ from symphony.reviewer import (
     VerdictKind,
     drive_review_loop,
     evaluate_verdict,
+    fetch_snapshot,
     select_resume_session,
 )
 from symphony.types import AgentResult
@@ -333,6 +335,36 @@ def _pending_snap(head_sha="head1") -> ReviewSnapshot:
     return _snap(head_sha=head_sha)
 
 
+def test_fetch_snapshot_uses_pinned_head_for_checks(monkeypatch, tmp_path):
+    calls: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        reviewer_mod,
+        "get_pr_head_sha",
+        lambda pr_number, repo_path: "shaH",
+    )
+    monkeypatch.setattr(
+        reviewer_mod,
+        "get_commit_committed_at",
+        lambda sha, repo_path: "2026-05-06T07:00:00Z",
+    )
+    monkeypatch.setattr(reviewer_mod, "list_pr_reviews", lambda pr_number, repo_path: [])
+    monkeypatch.setattr(
+        reviewer_mod, "list_pr_review_comments", lambda pr_number, repo_path: []
+    )
+    monkeypatch.setattr(reviewer_mod, "list_pr_reactions", lambda pr_number, repo_path: [])
+
+    def fake_checks(pr_number, *, repo_path, head_sha=None):
+        calls["head_sha"] = head_sha
+        return []
+
+    monkeypatch.setattr(reviewer_mod, "list_pr_checks", fake_checks)
+
+    snap = fetch_snapshot(pr_number=10, repo_path=tmp_path)
+
+    assert snap.head_sha == "shaH"
+    assert calls["head_sha"] == "shaH"
+
+
 def _make_cfg(tmp_path: Path):
     return SimpleNamespace(
         repo=SimpleNamespace(path=tmp_path / "repo", default_branch="main"),
@@ -540,10 +572,12 @@ async def test_loop_renudges_at_idle_threshold_then_returns_on_approval(tmp_path
 @pytest.mark.asyncio
 async def test_loop_returns_agent_failed_on_subprocess_failure(tmp_path):
     cfg = _make_cfg(tmp_path)
-    driver = _Driver([_changes_snap()], agent_results=[_failed_agent_result()])
+    failed = _failed_agent_result()
+    driver = _Driver([_changes_snap()], agent_results=[failed])
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.AGENT_FAILED
     assert outcome.rounds_used == 0
+    assert outcome.agent_result is failed
     # No push or comment after a failed agent run.
     assert driver.calls["push"] == []
     assert driver.calls["comment_pr"] == []

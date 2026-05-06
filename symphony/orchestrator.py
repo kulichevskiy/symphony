@@ -239,6 +239,13 @@ async def _dispatch_one(
     rate_limited = False
     if result.skipped and result.skip_reason == "agent-failed":
         rate_limited = is_rate_limited(getattr(result, "agent_result", None) or "")
+    elif (
+        result.loop_outcome is not None
+        and result.loop_outcome.kind.value == "agent_failed"
+    ):
+        rate_limited = is_rate_limited(
+            getattr(result.loop_outcome, "agent_result", None) or ""
+        )
 
     if rate_limited:
         state.pause(now=now_fn(), duration_s=rate_limit_pause_s)

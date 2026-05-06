@@ -550,13 +550,12 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     fake = _stub(
         {
             ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
-            ("pr", "view", "10"): json.dumps({"headRefOid": "shaH"}),
             ("api", "repos/o/r/commits/shaH/check-runs"): json.dumps(check_runs),
             ("api", "repos/o/r/commits/shaH/statuses"): json.dumps(statuses),
         }
     )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
-    checks = list_pr_checks(10, repo_path=tmp_path)
+    checks = list_pr_checks(10, repo_path=tmp_path, head_sha="shaH")
     assert len(checks) == 5
     assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
     assert checks[2].conclusion is None
