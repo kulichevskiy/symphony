@@ -422,10 +422,9 @@ async def test_run_tick_schedules_retry_on_failure(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_tick_treats_merge_failure_as_terminal(tmp_path):
+async def test_run_tick_retries_merge_failure_outcome(tmp_path):
     cfg = _make_cfg(tmp_path)
     state = OrchestratorState()
-    state.schedule_retry(1, now=0.0)
 
     async def fake_run_once(**kw):
         return RunOnceResult(
@@ -456,7 +455,7 @@ async def test_run_tick_treats_merge_failure_as_terminal(tmp_path):
     )
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert 1 not in state.retry_queue
+    assert state.retry_queue[1].attempt == 1
 
 
 @pytest.mark.asyncio

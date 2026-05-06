@@ -299,9 +299,6 @@ async def _dispatch_one(
     if outcome is not None and outcome.kind.value == "approved":
         state.clear_retry(issue.number)
         return
-    if outcome is not None and outcome.kind.value == "merge_failed":
-        state.clear_retry(issue.number)
-        return
     # Non-terminal outcomes keep the issue in the retry queue so a later tick
     # can re-dispatch (e.g. after the worktree is reset, or for
     # AUTO_STUCK_IDLE which may resolve once Codex catches up).
