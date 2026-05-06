@@ -466,22 +466,25 @@ def _required_status_checks(
         out,
         context=f"required status checks for branch {base_branch}",
     )
-    required = [
-        RequiredStatusCheck(context=str(context))
-        for context in data.get("contexts") or []
-        if context
-    ]
+    required: list[RequiredStatusCheck] = []
+    check_contexts: set[str] = set()
     for check in data.get("checks") or []:
         if not isinstance(check, dict):
             continue
         context = check.get("context")
         if context:
+            check_contexts.add(str(context))
             required.append(
                 RequiredStatusCheck(
                     context=str(context),
                     app_id=_as_int_or_none(check.get("app_id")),
                 )
             )
+    required.extend(
+        RequiredStatusCheck(context=str(context))
+        for context in data.get("contexts") or []
+        if context and str(context) not in check_contexts
+    )
     return tuple(required)
 
 

@@ -611,7 +611,7 @@ def test_list_pr_checks(monkeypatch, tmp_path):
                 "repos/o/r/branches/auto%2F5/protection/required_status_checks",
             ): json.dumps(
                 {
-                    "contexts": ["test", "legacy"],
+                    "contexts": ["build", "test", "legacy"],
                     "checks": [{"context": "build", "app_id": 123}],
                 }
             ),
