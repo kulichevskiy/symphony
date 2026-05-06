@@ -26,6 +26,7 @@ from .github import (
     list_open_issues_with_label,
     tracked_issues,
 )
+from .reviewer import LoopOutcomeKind
 from .runonce import RunOnceResult, run_once
 from .state import OrchestratorState
 
@@ -297,7 +298,10 @@ async def _dispatch_one(
 
     # Loop outcome decides retry vs terminal.
     outcome = result.loop_outcome
-    if outcome is not None and outcome.kind.value == "approved":
+    if outcome is not None and outcome.kind in {
+        LoopOutcomeKind.APPROVED,
+        LoopOutcomeKind.MERGE_UNAVAILABLE,
+    }:
         state.clear_retry(issue.number)
         return
     # Non-terminal outcomes keep the issue in the retry queue so a later tick

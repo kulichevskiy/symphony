@@ -359,6 +359,88 @@ async def test_run_once_retries_prior_merge_failure_without_round1_agent(
 
 
 @pytest.mark.asyncio
+async def test_run_once_records_merge_when_retry_pr_closed_after_merge(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_pending",
+            "rounds_used": 2,
+            "head_sha": "reviewed-sha",
+        },
+    )
+
+    def _missing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return None
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _missing)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: True)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == PR(number=42, url="https://x/pr/42")
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "approved"
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "merge"
+    assert events[-1].payload["merge_retry"] is True
+    assert events[-1].payload["pr_number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_run_once_stops_when_merge_retry_pr_is_unavailable(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_failed",
+            "rounds_used": 2,
+            "head_sha": "reviewed-sha",
+        },
+    )
+
+    def _missing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return None
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _missing)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: False)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == PR(number=42, url="https://x/pr/42")
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_unavailable"
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_unavailable"
+    assert events[-1].payload["error"] == "no open PR found for merge retry"
+
+
+@pytest.mark.asyncio
 async def test_run_once_reuses_existing_pr_on_redispatch(monkeypatch, tmp_path):
     """Regression: re-dispatch with an existing open PR must not call open_pr
     (which would fail with `gh`'s duplicate-PR error and abort before the

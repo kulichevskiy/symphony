@@ -262,10 +262,20 @@ async def run_once(
             )
         return outcome
 
-    if event_log.latest_terminal_outcome(issue_number) in {
+    latest_terminal = event_log.latest_terminal_event(issue_number)
+    if latest_terminal is not None and latest_terminal.payload.get("outcome") in {
         LoopOutcomeKind.MERGE_FAILED.value,
         LoopOutcomeKind.MERGE_PENDING.value,
     }:
+        retry_payload = latest_terminal.payload
+        retry_pr_number = retry_payload.get("pr_number")
+        retry_pr = (
+            PR(number=int(retry_pr_number), url=str(retry_payload.get("url", "")))
+            if retry_pr_number is not None
+            else None
+        )
+        retry_rounds = int(retry_payload.get("rounds_used", 0))
+        retry_head_sha = str(retry_payload.get("head_sha", ""))
         pr = find_open_pr_for_branch(
             branch,
             repo_path=repo_path,
@@ -293,6 +303,61 @@ async def run_once(
                 worktree=worktree,
                 loop_outcome=outcome,
             )
+        merged = False
+        if retry_pr is not None:
+            try:
+                merged = is_pr_merged(repo_path=repo_path, pr_number=retry_pr.number)
+            except GithubError as e:
+                log.warning(
+                    "could not verify missing PR #%d during merge retry: %s",
+                    retry_pr.number,
+                    e,
+                )
+        if merged and retry_pr is not None:
+            emit(
+                "merge",
+                {
+                    "pr_number": retry_pr.number,
+                    "url": retry_pr.url,
+                    "head_sha": retry_head_sha,
+                    "rounds_used": retry_rounds,
+                    "outcome": "approved",
+                    "merge_retry": True,
+                },
+            )
+            outcome = LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=retry_rounds,
+                last_session_id=None,
+                head_sha=retry_head_sha,
+            )
+        else:
+            error = "no open PR found for merge retry"
+            emit(
+                "run-terminal",
+                {
+                    "pr_number": retry_pr.number if retry_pr is not None else None,
+                    "url": retry_pr.url if retry_pr is not None else "",
+                    "head_sha": retry_head_sha,
+                    "rounds_used": retry_rounds,
+                    "outcome": LoopOutcomeKind.MERGE_UNAVAILABLE.value,
+                    "error": error,
+                },
+            )
+            outcome = LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_UNAVAILABLE,
+                rounds_used=retry_rounds,
+                last_session_id=None,
+                head_sha=retry_head_sha,
+            )
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=retry_pr,
+            skipped=False,
+            skip_reason=None,
+            worktree=worktree,
+            loop_outcome=outcome,
+        )
 
     env = make_env(cfg.paths.prompts_dir)
     prompt = render(

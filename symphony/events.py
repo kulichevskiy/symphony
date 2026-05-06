@@ -211,10 +211,16 @@ class EventLog:
         )
 
     def latest_terminal_outcome(self, issue_number: int) -> str:
+        ev = self.latest_terminal_event(issue_number)
+        if ev is not None:
+            return str(ev.payload.get("outcome", ev.kind))
+        return ""
+
+    def latest_terminal_event(self, issue_number: int) -> Event | None:
         for ev in reversed(self.tail_events(issue_number=issue_number, limit=100)):
             if ev.kind in TERMINAL_KINDS:
-                return str(ev.payload.get("outcome", ev.kind))
-        return ""
+                return ev
+        return None
 
     def status_snapshot(
         self,

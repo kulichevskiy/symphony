@@ -228,6 +228,7 @@ class LoopOutcomeKind(StrEnum):
     AGENT_FAILED = "agent_failed"
     MERGE_FAILED = "merge_failed"
     MERGE_PENDING = "merge_pending"
+    MERGE_UNAVAILABLE = "merge_unavailable"
 
 
 @dataclass(frozen=True)

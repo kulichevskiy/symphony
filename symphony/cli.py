@@ -131,15 +131,16 @@ def run_once_cmd(
     if result.skipped:
         log.error("runonce.skipped", issue=issue_number, reason=result.skip_reason)
         raise typer.Exit(1)
-    assert result.pr is not None  # for type-checkers; orchestrator guarantees this
+    pr_url = result.pr.url if result.pr is not None else ""
     log.info(
         "runonce.done",
         issue=issue_number,
-        pr=result.pr.url,
+        pr=pr_url,
         loop=result.loop_outcome.kind.value if result.loop_outcome else None,
         rounds=result.loop_outcome.rounds_used if result.loop_outcome else None,
     )
-    typer.echo(result.pr.url)
+    if pr_url:
+        typer.echo(pr_url)
     # Non-zero exit when the review loop didn't reach APPROVED so the CLI's
     # caller can react (auto-stuck label / agent failure both keep the PR
     # and worktree around — see SYMPHONY.md).

@@ -514,6 +514,43 @@ async def test_run_tick_retries_merge_pending_outcome(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_tick_does_not_retry_merge_unavailable_outcome(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=tmp_path,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_UNAVAILABLE,
+                rounds_used=0,
+                last_session_id=None,
+                head_sha="h",
+            ),
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert 1 not in state.retry_queue
+
+
+@pytest.mark.asyncio
 async def test_run_tick_emits_dispatch_and_retry_events(tmp_path):
     cfg = _make_cfg(tmp_path)
     state = OrchestratorState()
