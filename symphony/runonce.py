@@ -243,7 +243,12 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         round_cap=cfg.orchestrator.review_round_cap,
     )
     if outcome.kind == LoopOutcomeKind.APPROVED:
-        merge_pr(repo_path=repo_path, pr_number=pr.number, method="squash")
+        merge_pr(
+            repo_path=repo_path,
+            pr_number=pr.number,
+            method="squash",
+            match_head_sha=outcome.head_sha,
+        )
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,

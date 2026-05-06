@@ -328,12 +328,14 @@ def test_arm_auto_merge_calls_gh_pr_merge(monkeypatch, tmp_path):
 def test_merge_pr_calls_direct_gh_pr_merge(monkeypatch, tmp_path):
     fake = _stub({("pr", "merge", "12"): ""})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
-    merge_pr(repo_path=tmp_path, pr_number=12)
+    merge_pr(repo_path=tmp_path, pr_number=12, match_head_sha="abc123")
     call = fake.calls[0]
     assert call[:3] == ["pr", "merge", "12"]
     assert "--auto" not in call
     assert "--squash" in call
     assert "--delete-branch" in call
+    assert "--match-head-commit" in call
+    assert "abc123" in call
 
 
 def test_get_pr_head_sha(monkeypatch, tmp_path):

@@ -369,11 +369,15 @@ def merge_pr(
     repo_path: Path,
     pr_number: int,
     method: str = "squash",
+    match_head_sha: str | None = None,
 ) -> None:
     """Merge a PR immediately after Symphony's review loop approves it."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
+    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
+    if match_head_sha:
+        args += ["--match-head-commit", match_head_sha]
     _run_gh(
-        ["pr", "merge", str(pr_number), flag, "--delete-branch"],
+        args,
         cwd=repo_path,
     )
 

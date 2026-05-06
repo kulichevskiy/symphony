@@ -353,6 +353,10 @@ def _pending_snap(head_sha="head1") -> ReviewSnapshot:
     return _snap(head_sha=head_sha)
 
 
+def _pending_check_snap(head_sha="head1", state="QUEUED") -> ReviewSnapshot:
+    return _snap(head_sha=head_sha, checks=[_check(bucket="pending", state=state)])
+
+
 def _make_cfg(tmp_path: Path):
     return SimpleNamespace(
         repo=SimpleNamespace(path=tmp_path / "repo", default_branch="main"),
@@ -569,6 +573,24 @@ async def test_loop_auto_stuck_after_idle_giveup(tmp_path):
     assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_IDLE
     assert outcome.rounds_used == 0
     assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
+
+
+@pytest.mark.asyncio
+async def test_loop_pending_activity_resets_idle_giveup(tmp_path):
+    """Pending-state changes mean the PR is active, not idle."""
+    cfg = _make_cfg(tmp_path)
+    snaps = [
+        _pending_check_snap(state="QUEUED"),
+        _pending_check_snap(state="IN_PROGRESS"),
+        _pending_check_snap(state="IN_PROGRESS"),
+        _approved_snap(),
+    ]
+    driver = _Driver(snaps)
+    outcome = await _spawn_loop(
+        driver, cfg, poll_interval_s=30.0, re_nudge_after_s=600.0, give_up_after_s=90.0
+    )
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["label_issue"] == []
 
 
 @pytest.mark.asyncio

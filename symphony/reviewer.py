@@ -254,6 +254,27 @@ class LoopOutcome:
     head_sha: str
 
 
+def _pending_activity_key(snap: ReviewSnapshot) -> tuple[Any, ...]:
+    """Stable-enough fingerprint for pending-state activity.
+
+    Used only for idle accounting: if GitHub signals change while the verdict
+    remains PENDING, the PR is not idle and should not be auto-stuck.
+    """
+    return (
+        snap.head_sha,
+        tuple(
+            (r.id, r.user_login, r.state, r.commit_sha, r.submitted_at, r.body)
+            for r in snap.reviews
+        ),
+        tuple(
+            (c.id, c.user_login, c.path, c.line, c.commit_sha, c.created_at, c.body)
+            for c in snap.review_comments
+        ),
+        tuple((r.user_login, r.content, r.created_at) for r in snap.reactions),
+        tuple((c.name, c.bucket, c.state, c.link) for c in snap.checks),
+    )
+
+
 def select_resume_session(round_index: int, current_session_id: str | None) -> str | None:
     """Decide whether to ``--resume <id>`` for round ``round_index`` (0-indexed).
 
@@ -327,7 +348,7 @@ async def drive_review_loop(
     rounds_used = 0
     last_activity = now_fn()
     nudged_during_idle = False
-    last_seen_head_sha = ""
+    last_pending_activity_key: tuple[Any, ...] | None = None
 
     while True:
         await sleep_fn(poll_interval_s)
@@ -413,11 +434,19 @@ async def drive_review_loop(
             rounds_used += 1
             last_activity = now_fn()
             nudged_during_idle = False
-            last_seen_head_sha = snap.head_sha
+            last_pending_activity_key = None
             continue
 
         # PENDING — check timers
-        elapsed = now_fn() - last_activity
+        pending_key = _pending_activity_key(snap)
+        now = now_fn()
+        if last_pending_activity_key is None:
+            last_pending_activity_key = pending_key
+        elif pending_key != last_pending_activity_key:
+            last_pending_activity_key = pending_key
+            last_activity = now
+            nudged_during_idle = False
+        elapsed = now - last_activity
         if elapsed >= give_up_after_s:
             label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
             return LoopOutcome(

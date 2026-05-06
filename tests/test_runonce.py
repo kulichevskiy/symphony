@@ -268,6 +268,7 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
         "repo_path": fixture["cfg"].repo.path,
         "pr_number": 99,
         "method": "squash",
+        "match_head_sha": "head-sha",
     }
 
 
