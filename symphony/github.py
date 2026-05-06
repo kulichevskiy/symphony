@@ -512,10 +512,15 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
         check_runs_out, context=f"check runs for PR {pr_number}"
     )
     status_out = _run_gh(
-        ["api", f"repos/{owner}/{name}/commits/{sha}/status"],
+        [
+            "api",
+            f"repos/{owner}/{name}/commits/{sha}/status?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
         cwd=repo_path,
     )
-    status_data = _parse_json(status_out, context=f"status contexts for PR {pr_number}")
+    status_pages = _parse_json(status_out, context=f"status contexts for PR {pr_number}")
 
     checks = [
         CheckRun(
@@ -527,22 +532,23 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
         for page in check_run_pages
         for c in page.get("check_runs", [])
     ]
-    for status in status_data.get("statuses", []):
-        state = str(status.get("state") or "").lower()
-        if state == "success":
-            check_status, conclusion = "completed", "success"
-        elif state in {"error", "failure"}:
-            check_status, conclusion = "completed", "failure"
-        else:
-            check_status, conclusion = "in_progress", None
-        checks.append(
-            CheckRun(
-                name=status.get("context", ""),
-                status=check_status,
-                conclusion=conclusion,
-                details_url=status.get("target_url") or None,
+    for page in status_pages:
+        for status in page.get("statuses", []):
+            state = str(status.get("state") or "").lower()
+            if state == "success":
+                check_status, conclusion = "completed", "success"
+            elif state in {"error", "failure"}:
+                check_status, conclusion = "completed", "failure"
+            else:
+                check_status, conclusion = "in_progress", None
+            checks.append(
+                CheckRun(
+                    name=status.get("context", ""),
+                    status=check_status,
+                    conclusion=conclusion,
+                    details_url=status.get("target_url") or None,
+                )
             )
-        )
     return checks
 
 

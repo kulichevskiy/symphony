@@ -559,9 +559,11 @@ def test_list_pr_checks(monkeypatch, tmp_path):
         {"name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://ci/test"},
         {"name": "lint", "status": "in_progress", "conclusion": None, "details_url": None},
     ]
-    statuses = [
+    status_page1 = [
         {"context": "deploy", "state": "success", "target_url": "https://ci/deploy"},
         {"context": "external", "state": "pending", "target_url": None},
+    ]
+    status_page2 = [
         {"context": "legacy", "state": "error", "target_url": "https://ci/legacy"},
     ]
     fake = _stub(
@@ -571,8 +573,8 @@ def test_list_pr_checks(monkeypatch, tmp_path):
             ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
                 [{"check_runs": page1}, {"check_runs": page2}]
             ),
-            ("api", "repos/o/r/commits/abc123/status"): json.dumps(
-                {"statuses": statuses}
+            ("api", "repos/o/r/commits/abc123/status?per_page=100"): json.dumps(
+                [{"statuses": status_page1}, {"statuses": status_page2}]
             ),
         }
     )
@@ -593,7 +595,12 @@ def test_list_pr_checks(monkeypatch, tmp_path):
             "--paginate",
             "--slurp",
         ],
-        ["api", "repos/o/r/commits/abc123/status"],
+        [
+            "api",
+            "repos/o/r/commits/abc123/status?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
     ]
 
 
