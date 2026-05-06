@@ -182,6 +182,7 @@ def _patch_happy_path(
     monkeypatch.setattr(
         ro_mod, "merge_pr", lambda **kw: calls.setdefault("merge_pr", kw)
     )
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: True)
 
     # Stub the review loop so existing tests don't have to thread its inputs.
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind
@@ -304,6 +305,23 @@ async def test_run_once_records_merge_failure_as_terminal_outcome(monkeypatch, t
     assert events[-1].kind == "run-terminal"
     assert events[-1].payload["outcome"] == "merge_failed"
     assert events[-1].payload["error"] == "merge blocked"
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_emit_merge_until_pr_is_merged(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: False)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_pending"
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_pending"
+    assert "merge" not in [e.kind for e in events]
 
 
 @pytest.mark.asyncio

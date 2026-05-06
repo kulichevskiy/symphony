@@ -30,6 +30,7 @@ from .github import (
     PR,
     comment_pr,
     find_open_pr_for_branch,
+    is_pr_merged,
     merge_pr,
     name_with_owner,
     open_pr,
@@ -336,6 +337,7 @@ async def run_once(
                 pr_number=pr.number,
                 match_head_commit=outcome.head_sha,
             )
+            merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
         except GithubError as e:
             log.error("merge failed for PR #%d: %s", pr.number, e)
             emit(
@@ -356,16 +358,38 @@ async def run_once(
                 head_sha=outcome.head_sha,
             )
         else:
-            emit(
-                "merge",
-                {
-                    "pr_number": pr.number,
-                    "url": pr.url,
-                    "head_sha": outcome.head_sha,
-                    "rounds_used": outcome.rounds_used,
-                    "outcome": "approved",
-                },
-            )
+            if merged:
+                emit(
+                    "merge",
+                    {
+                        "pr_number": pr.number,
+                        "url": pr.url,
+                        "head_sha": outcome.head_sha,
+                        "rounds_used": outcome.rounds_used,
+                        "outcome": "approved",
+                    },
+                )
+            else:
+                log.warning(
+                    "merge command completed for PR #%d but PR is still open",
+                    pr.number,
+                )
+                emit(
+                    "run-terminal",
+                    {
+                        "pr_number": pr.number,
+                        "url": pr.url,
+                        "head_sha": outcome.head_sha,
+                        "rounds_used": outcome.rounds_used,
+                        "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+                    },
+                )
+                outcome = LoopOutcome(
+                    kind=LoopOutcomeKind.MERGE_PENDING,
+                    rounds_used=outcome.rounds_used,
+                    last_session_id=outcome.last_session_id,
+                    head_sha=outcome.head_sha,
+                )
     elif outcome.kind != LoopOutcomeKind.AUTO_STUCK_IDLE and outcome.kind != LoopOutcomeKind.AUTO_STUCK_ROUNDS:
         emit(
             "run-terminal",

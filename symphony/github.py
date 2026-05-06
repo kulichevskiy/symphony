@@ -425,6 +425,15 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     return sha
 
 
+def is_pr_merged(pr_number: int, *, repo_path: Path) -> bool:
+    out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "merged,state"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh pr view {pr_number}")
+    return bool(data.get("merged")) or data.get("state") == "MERGED"
+
+
 def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
     """All review submissions on a PR, oldest first."""
     owner, name = _name_with_owner(repo_path)

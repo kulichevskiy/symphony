@@ -26,6 +26,7 @@ from symphony.github import (
     find_open_pr_for_branch,
     get_commit_committed_at,
     get_pr_head_sha,
+    is_pr_merged,
     label_issue,
     list_pr_checks,
     list_pr_reactions,
@@ -461,6 +462,14 @@ def test_get_pr_head_sha(monkeypatch, tmp_path):
     fake = _stub({("pr", "view", "10"): json.dumps({"headRefOid": "abc123"})})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     assert get_pr_head_sha(10, repo_path=tmp_path) == "abc123"
+
+
+def test_is_pr_merged(monkeypatch, tmp_path):
+    fake = _stub(
+        {("pr", "view", "10"): json.dumps({"merged": True, "state": "MERGED"})}
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert is_pr_merged(10, repo_path=tmp_path) is True
 
 
 def test_list_pr_reviews_parses_payload(monkeypatch, tmp_path):
