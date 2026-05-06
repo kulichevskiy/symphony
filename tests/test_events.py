@@ -139,3 +139,25 @@ def test_status_snapshot_includes_active_and_terminal_runs(tmp_path):
     assert terminal.outcome == "auto_stuck_idle"
     assert terminal.rounds == 4
     assert terminal.total_elapsed_s == 60
+
+
+def test_status_snapshot_resets_active_state_on_new_dispatch(tmp_path):
+    log = EventLog.for_repo(tmp_path)
+    log.emit("dispatch", issue_number=8, run_id="old", ts=100)
+    log.emit(
+        "review-verdict",
+        issue_number=8,
+        run_id="old",
+        payload={"head_sha": "old-sha", "verdict": "changes_requested", "round": 7},
+        ts=120,
+    )
+    log.emit("dispatch", issue_number=8, run_id="new", ts=200)
+
+    snapshot = log.status_snapshot(now_ts=250)
+    assert len(snapshot.in_flight) == 1
+    active = snapshot.in_flight[0]
+    assert active.run_id == "new"
+    assert active.elapsed_s == 50
+    assert active.round == 0
+    assert active.last_reviewed_sha == ""
+    assert active.last_review_verdict == ""

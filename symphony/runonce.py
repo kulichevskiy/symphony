@@ -329,7 +329,11 @@ async def run_once(
         run_id=run_id,
     )
     if outcome.kind == LoopOutcomeKind.APPROVED:
-        merge_pr(repo_path=repo_path, pr_number=pr.number)
+        merge_pr(
+            repo_path=repo_path,
+            pr_number=pr.number,
+            match_head_commit=outcome.head_sha,
+        )
         emit(
             "merge",
             {

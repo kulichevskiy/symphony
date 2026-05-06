@@ -401,11 +401,15 @@ def merge_pr(
     repo_path: Path,
     pr_number: int,
     method: str = "squash",
+    match_head_commit: str | None = None,
 ) -> None:
     """Merge a PR after Symphony's review loop reaches an approved verdict."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
+    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
+    if match_head_commit:
+        args += ["--match-head-commit", match_head_commit]
     _run_gh(
-        ["pr", "merge", str(pr_number), flag, "--delete-branch"],
+        args,
         cwd=repo_path,
     )
 

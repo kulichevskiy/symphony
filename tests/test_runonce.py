@@ -264,6 +264,7 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     # would either bypass review or sit waiting forever (Codex can't satisfy
     # required-reviewer branch protection — see SYMPHONY.md M0 findings).
     assert calls["merge_pr"]["pr_number"] == 99
+    assert calls["merge_pr"]["match_head_commit"] == "head-sha"
 
 
 @pytest.mark.asyncio

@@ -224,31 +224,23 @@ class EventLog:
                 continue
             issue = ev.issue_number
             payload = ev.payload
-            if ev.kind in ("dispatch", "agent-start"):
-                active.setdefault(
-                    issue,
-                    {
-                        "run_id": ev.run_id,
-                        "started_ts": ev.ts,
-                        "round": 0,
-                        "latest_sha": "",
-                        "last_reviewed_sha": "",
-                        "last_review_verdict": "",
-                    },
-                )
+            fresh_state = {
+                "run_id": ev.run_id,
+                "started_ts": ev.ts,
+                "round": 0,
+                "latest_sha": "",
+                "last_reviewed_sha": "",
+                "last_review_verdict": "",
+            }
+            if ev.kind == "dispatch" or (
+                ev.kind == "agent-start" and payload.get("phase") == "round1"
+            ):
+                active[issue] = fresh_state
+            elif ev.kind == "agent-start":
+                active.setdefault(issue, fresh_state)
             if issue not in active and ev.kind not in ACTIVE_KINDS | TERMINAL_KINDS:
                 continue
-            state = active.setdefault(
-                issue,
-                {
-                    "run_id": ev.run_id,
-                    "started_ts": ev.ts,
-                    "round": 0,
-                    "latest_sha": "",
-                    "last_reviewed_sha": "",
-                    "last_review_verdict": "",
-                },
-            )
+            state = active.setdefault(issue, fresh_state)
             if ev.run_id:
                 state["run_id"] = ev.run_id
             if "round" in payload:
