@@ -147,6 +147,54 @@ def _parse_json(stdout: str, *, context: str) -> Any:
         raise GithubError(f"could not parse JSON from {context}: {e}") from e
 
 
+def _flatten_paginated_list(data: Any, *, context: str) -> list[Any]:
+    """Flatten ``gh api --paginate --slurp`` output for list endpoints."""
+    if not isinstance(data, list):
+        raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+    if not data:
+        return []
+    if all(isinstance(page, list) for page in data):
+        return [item for page in data for item in page]
+    if all(isinstance(item, dict) for item in data):
+        # Tolerate old test fixtures / non-slurped single-page payloads.
+        return data
+    raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+
+
+def _flatten_paginated_object_list(data: Any, *, key: str, context: str) -> list[Any]:
+    """Flatten ``gh api --paginate --slurp`` output for object-list endpoints."""
+    if isinstance(data, dict):
+        pages = [data]
+    elif isinstance(data, list):
+        pages = data
+    else:
+        raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+
+    flattened: list[Any] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+        items = page.get(key, [])
+        if not isinstance(items, list):
+            raise GithubError(f"unexpected {key!r} payload from {context}: {page!r}")
+        flattened.extend(items)
+    return flattened
+
+
+def _api_paginated_list(endpoint: str, *, repo_path: Path, context: str) -> list[Any]:
+    out = _run_gh(["api", endpoint, "--paginate", "--slurp"], cwd=repo_path)
+    data = _parse_json(out, context=context)
+    return _flatten_paginated_list(data, context=context)
+
+
+def _api_paginated_object_list(
+    endpoint: str, *, repo_path: Path, key: str, context: str
+) -> list[Any]:
+    out = _run_gh(["api", endpoint, "--paginate", "--slurp"], cwd=repo_path)
+    data = _parse_json(out, context=context)
+    return _flatten_paginated_object_list(data, key=key, context=context)
+
+
 def view_issue(number: int, *, repo_path: Path) -> Issue:
     out = _run_gh(
         ["issue", "view", str(number), "--json", ISSUE_FIELDS],
@@ -340,11 +388,11 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
 def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
     """All review submissions on a PR, oldest first."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/reviews", "--paginate"],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+        repo_path=repo_path,
+        context=f"reviews for PR {pr_number}",
     )
-    data = _parse_json(out, context=f"reviews for PR {pr_number}")
     return [
         Review(
             id=int(r.get("id", 0)),
@@ -361,11 +409,11 @@ def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
 def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewComment]:
     """All inline (line-level) review comments on a PR's diff."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/comments", "--paginate"],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/pulls/{pr_number}/comments",
+        repo_path=repo_path,
+        context=f"review comments for PR {pr_number}",
     )
-    data = _parse_json(out, context=f"review comments for PR {pr_number}")
     return [
         ReviewComment(
             id=int(c.get("id", 0)),
@@ -383,11 +431,11 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
 def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/issues/{pr_number}/reactions", "--paginate"],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/issues/{pr_number}/reactions",
+        repo_path=repo_path,
+        context=f"reactions for PR {pr_number}",
     )
-    data = _parse_json(out, context=f"reactions for PR {pr_number}")
     return [
         Reaction(
             user_login=(r.get("user") or {}).get("login", ""),
@@ -398,28 +446,53 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     ]
 
 
-def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
-    """CI check runs on the PR's HEAD commit (`gh pr checks`)."""
-    out = _run_gh(
-        [
-            "pr",
-            "checks",
-            str(pr_number),
-            "--json",
-            "name,status,conclusion,detailsUrl",
-        ],
-        cwd=repo_path,
+def _status_to_check_run(status: dict[str, Any]) -> CheckRun:
+    state = status.get("state", "")
+    if state == "success":
+        check_status = "completed"
+        conclusion = "success"
+    elif state in {"failure", "error"}:
+        check_status = "completed"
+        conclusion = "failure"
+    elif state == "pending":
+        check_status = "in_progress"
+        conclusion = None
+    else:
+        check_status = "completed"
+        conclusion = state or None
+
+    return CheckRun(
+        name=status.get("context", ""),
+        status=check_status,
+        conclusion=conclusion,
+        details_url=status.get("target_url") or None,
     )
-    data = _parse_json(out, context=f"checks for PR {pr_number}")
+
+
+def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
+    """CI check runs and commit statuses on the PR's HEAD commit."""
+    owner, name = _name_with_owner(repo_path)
+    head_sha = get_pr_head_sha(pr_number, repo_path=repo_path)
+    check_runs = _api_paginated_object_list(
+        f"repos/{owner}/{name}/commits/{head_sha}/check-runs",
+        repo_path=repo_path,
+        key="check_runs",
+        context=f"check runs for PR {pr_number}",
+    )
+    statuses = _api_paginated_list(
+        f"repos/{owner}/{name}/commits/{head_sha}/statuses",
+        repo_path=repo_path,
+        context=f"statuses for PR {pr_number}",
+    )
     return [
         CheckRun(
             name=c.get("name", ""),
             status=c.get("status", ""),
             conclusion=c.get("conclusion") or None,
-            details_url=c.get("detailsUrl") or None,
+            details_url=c.get("details_url") or c.get("html_url") or None,
         )
-        for c in data
-    ]
+        for c in check_runs
+    ] + [_status_to_check_run(s) for s in statuses]
 
 
 def label_issue(number: int, label: str, *, repo_path: Path) -> None:

@@ -124,8 +124,46 @@ def test_human_changes_requested_review_wins():
     assert v.last_review_body == "needs work"
 
 
+def test_latest_human_review_state_for_reviewer_wins():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="old", id=1),
+            _review(who="alice", state="APPROVED", body="fixed", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_latest_human_changes_requested_still_blocks():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="old", id=1),
+            _review(who="alice", state="CHANGES_REQUESTED", body="new", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "new"
+
+
+def test_latest_changes_requested_from_any_human_blocks_approval():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1),
+            _review(who="bob", state="CHANGES_REQUESTED", body="blocked", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "blocked"
+
+
 def test_failing_ci_check_is_changes_requested():
     v = _eval(checks=[_check(name="test", conclusion="failure")])
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].name == "test"
+
+
+def test_cancelled_ci_check_is_changes_requested():
+    v = _eval(checks=[_check(name="test", conclusion="cancelled")])
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.ci_failures[0].name == "test"
 

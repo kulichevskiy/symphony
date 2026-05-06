@@ -55,6 +55,7 @@ CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # that with a comfortable margin so a body of "boilerplate + tiny addendum"
 # isn't mistaken for substantive feedback.
 CODEX_BOILERPLATE_THRESHOLD = 750
+FAILED_CHECK_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required"}
 
 
 class VerdictKind(StrEnum):
@@ -109,7 +110,9 @@ def evaluate_verdict(
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
     failing_checks = [
-        c for c in checks if c.status == "completed" and c.conclusion == "failure"
+        c
+        for c in checks
+        if c.status == "completed" and c.conclusion in FAILED_CHECK_CONCLUSIONS
     ]
     if failing_checks:
         return Verdict(
@@ -118,17 +121,24 @@ def evaluate_verdict(
             ci_failures=failing_checks,
         )
 
-    # 2. Explicit human verdicts on HEAD trump everything else.
-    for r in fresh_reviews:
-        if r.user_login != codex_login:
-            if r.state == "CHANGES_REQUESTED":
-                return Verdict(
-                    kind=VerdictKind.CHANGES_REQUESTED,
-                    review_comments=fresh_comments,
-                    last_review_body=r.body,
-                )
-            if r.state == "APPROVED":
-                return Verdict(kind=VerdictKind.APPROVED)
+    # 2. Explicit human verdicts on HEAD trump everything else. GitHub returns
+    #    reviews oldest-first, so reduce to each reviewer's latest state first.
+    latest_human_reviews: list[Review] = []
+    seen_reviewers: set[str] = set()
+    for r in reversed(fresh_reviews):
+        if r.user_login == codex_login or r.user_login in seen_reviewers:
+            continue
+        seen_reviewers.add(r.user_login)
+        latest_human_reviews.append(r)
+    for r in latest_human_reviews:
+        if r.state == "CHANGES_REQUESTED":
+            return Verdict(
+                kind=VerdictKind.CHANGES_REQUESTED,
+                review_comments=fresh_comments,
+                last_review_body=r.body,
+            )
+    if any(r.state == "APPROVED" for r in latest_human_reviews):
+        return Verdict(kind=VerdictKind.APPROVED)
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
     #    reviews always come paired with inline comments when there's
