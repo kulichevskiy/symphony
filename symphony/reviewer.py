@@ -299,6 +299,7 @@ async def drive_review_loop(
     commits_to_push_fn: Callable[[Path, str, str], int] | None = None,
     comment_pr_fn: Callable[..., None] | None = None,
     label_issue_fn: Callable[..., None] | None = None,
+    merge_pr_fn: Callable[..., None] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now_fn: Callable[[], float] = None,  # type: ignore[assignment]
 ) -> LoopOutcome:
@@ -315,11 +316,25 @@ async def drive_review_loop(
     if now_fn is None:
         import time
         now_fn = time.monotonic
-    if run_agent_fn is None or render_review_prompt is None or push_fn is None or head_sha_fn is None or commits_to_push_fn is None or comment_pr_fn is None or label_issue_fn is None:
+    needs_defaults = (
+        run_agent_fn is None
+        or render_review_prompt is None
+        or push_fn is None
+        or head_sha_fn is None
+        or commits_to_push_fn is None
+        or comment_pr_fn is None
+        or label_issue_fn is None
+        or merge_pr_fn is None
+    )
+    if needs_defaults:
         # Live defaults — imported lazily to avoid a cycle with runonce.
         from . import runonce as _runonce
         from .agent import run_agent as _run_agent
-        from .github import comment_pr as _comment_pr, label_issue as _label_issue
+        from .github import (
+            comment_pr as _comment_pr,
+            label_issue as _label_issue,
+            merge_pr as _merge_pr,
+        )
 
         if run_agent_fn is None:
             run_agent_fn = _run_agent
@@ -333,6 +348,8 @@ async def drive_review_loop(
             comment_pr_fn = _comment_pr
         if label_issue_fn is None:
             label_issue_fn = _label_issue
+        if merge_pr_fn is None:
+            merge_pr_fn = _merge_pr
         if render_review_prompt is None:
             render_review_prompt = _default_render_review_prompt
 
@@ -355,6 +372,11 @@ async def drive_review_loop(
         )
 
         if verdict.kind == VerdictKind.APPROVED:
+            merge_pr_fn(
+                repo_path=cfg.repo.path,
+                pr_number=pr_number,
+                match_head_commit=snap.head_sha,
+            )
             return LoopOutcome(
                 kind=LoopOutcomeKind.APPROVED,
                 rounds_used=rounds_used,

@@ -420,7 +420,7 @@ class _Driver:
         self.calls: dict[str, list] = {
             "push": [], "comment_pr": [], "label_issue": [],
             "agent_resume": [], "render": [], "snapshot": [],
-            "head_sha": [], "to_push": [],
+            "head_sha": [], "to_push": [], "merge_pr": [],
         }
         self.now = 0.0
         self._head_sha = "head1"
@@ -454,6 +454,9 @@ class _Driver:
     def label_issue(self, number, label, *, repo_path):
         self.calls["label_issue"].append((number, label, str(repo_path)))
 
+    def merge_pr(self, *, repo_path, pr_number, match_head_commit=None):
+        self.calls["merge_pr"].append((str(repo_path), pr_number, match_head_commit))
+
     def render(self, *, cfg, sha, comments, ci_failures):
         self.calls["render"].append({"sha": sha, "n_comments": len(comments), "n_ci": len(ci_failures)})
         return f"render({sha})"
@@ -486,6 +489,7 @@ def _spawn_loop(driver, cfg, **overrides):
         commits_to_push_fn=driver.commits_to_push,
         comment_pr_fn=driver.comment_pr,
         label_issue_fn=driver.label_issue,
+        merge_pr_fn=driver.merge_pr,
         sleep_fn=driver.sleep,
         now_fn=driver.time_now,
     )
@@ -500,6 +504,7 @@ async def test_loop_returns_on_first_approved(tmp_path):
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.APPROVED
     assert outcome.rounds_used == 0
+    assert driver.calls["merge_pr"] == [(str(cfg.repo.path), 11, "head1")]
     # No agent run, no push, no extra comment posted on the immediate-approve path.
     assert driver.calls["agent_resume"] == []
     assert driver.calls["push"] == []
@@ -513,6 +518,7 @@ async def test_loop_handles_changes_then_approval(tmp_path):
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.APPROVED
     assert outcome.rounds_used == 1
+    assert driver.calls["merge_pr"] == [(str(cfg.repo.path), 11, "head2")]
     # Agent re-invoked once, with resume (round 0), pushed and re-nudged.
     assert driver.calls["agent_resume"] == ["sess-A"]
     assert len(driver.calls["push"]) == 1
@@ -546,6 +552,7 @@ async def test_loop_auto_stuck_after_round_cap(tmp_path):
     outcome = await _spawn_loop(driver, cfg, round_cap=10)
     assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_ROUNDS
     assert outcome.rounds_used == 10
+    assert driver.calls["merge_pr"] == []
     assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
 
 
@@ -606,3 +613,4 @@ async def test_loop_returns_agent_failed_on_subprocess_failure(tmp_path):
     # No push or comment after a failed agent run.
     assert driver.calls["push"] == []
     assert driver.calls["comment_pr"] == []
+    assert driver.calls["merge_pr"] == []
