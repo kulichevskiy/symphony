@@ -1,8 +1,17 @@
-Codex requested changes on commit {{ sha }}. Address each comment:
+Codex requested changes on commit {{ sha }}. Address the feedback below:
+
+{% if review_body -%}
+## Review feedback
+
+{{ review_body }}
+{% endif %}
+{% if comments -%}
+## Inline comments
 
 {% for c in comments -%}
 {% if c.path %}[{{ c.path }}{% if c.line %}:{{ c.line }}{% endif %}]{% else %}[general]{% endif %} {{ c.body }}
 {% endfor %}
+{% endif %}
 {% if ci_failures -%}
 
 ## CI failures

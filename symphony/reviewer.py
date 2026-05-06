@@ -449,6 +449,7 @@ async def drive_review_loop(
                 sha=snap.head_sha,
                 comments=verdict.review_comments,
                 ci_failures=verdict.ci_failures,
+                review_body=verdict.last_review_body,
             )
 
             resume = select_resume_session(rounds_used, session_id)
@@ -530,6 +531,7 @@ def _default_render_review_prompt(
     sha: str,
     comments: list[ReviewComment],
     ci_failures: list[CheckRun],
+    review_body: str = "",
 ) -> str:
     """Fallback renderer used when the caller didn't pass one. Renders
     `prompts/review.md.j2` against the cfg's prompts_dir."""
@@ -539,5 +541,10 @@ def _default_render_review_prompt(
     return render(
         env,
         "review.md.j2",
-        {"sha": sha, "comments": comments, "ci_failures": ci_failures},
+        {
+            "sha": sha,
+            "comments": comments,
+            "ci_failures": ci_failures,
+            "review_body": review_body,
+        },
     )

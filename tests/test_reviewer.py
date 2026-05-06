@@ -527,8 +527,15 @@ class _Driver:
     def merge_pr(self, *, repo_path, pr_number, match_head_commit=None):
         self.calls["merge_pr"].append((str(repo_path), pr_number, match_head_commit))
 
-    def render(self, *, cfg, sha, comments, ci_failures):
-        self.calls["render"].append({"sha": sha, "n_comments": len(comments), "n_ci": len(ci_failures)})
+    def render(self, *, cfg, sha, comments, ci_failures, review_body=""):
+        self.calls["render"].append(
+            {
+                "sha": sha,
+                "n_comments": len(comments),
+                "n_ci": len(ci_failures),
+                "review_body": review_body,
+            }
+        )
         return f"render({sha})"
 
     async def sleep(self, _seconds):
@@ -593,6 +600,34 @@ async def test_loop_handles_changes_then_approval(tmp_path):
     assert driver.calls["agent_resume"] == ["sess-A"]
     assert len(driver.calls["push"]) == 1
     assert any("@codex review" == body for _, _, body in driver.calls["comment_pr"])
+
+
+@pytest.mark.asyncio
+async def test_loop_passes_summary_review_body_to_retry_prompt(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    summary = "please handle the summary-only request"
+    driver = _Driver(
+        [
+            _snap(
+                head_sha="head1",
+                reviews=[
+                    _review(
+                        who="alice",
+                        state="CHANGES_REQUESTED",
+                        body=summary,
+                        sha="head1",
+                    )
+                ],
+            ),
+            _approved_snap("head2"),
+        ]
+    )
+
+    outcome = await _spawn_loop(driver, cfg)
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["render"][0]["review_body"] == summary
+    assert driver.calls["render"][0]["n_comments"] == 0
 
 
 @pytest.mark.asyncio
