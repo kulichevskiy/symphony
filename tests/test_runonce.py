@@ -163,9 +163,6 @@ def _patch_happy_path(
     monkeypatch.setattr(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
     )
-    monkeypatch.setattr(
-        ro_mod, "arm_auto_merge", lambda **kw: calls.setdefault("arm_auto_merge", kw)
-    )
 
     return {"calls": calls, "config_path": config_path, "cfg": cfg, "wt": wt, "pr": pr}
 
@@ -214,8 +211,10 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     assert calls["comment_pr"]["pr_number"] == 99
     assert calls["comment_pr"]["body"] == "@codex review"
 
-    # Auto-merge armed (squash + delete-branch are the wrapper defaults)
-    assert calls["arm_auto_merge"]["pr_number"] == 99
+    # Auto-merge intentionally NOT armed at PR-open: M3's review loop fires
+    # the merge directly once Codex approves and CI is green. Arming here
+    # would either bypass review or sit waiting forever (Codex can't satisfy
+    # required-reviewer branch protection — see SYMPHONY.md M0 findings).
 
 
 @pytest.mark.asyncio
@@ -237,7 +236,6 @@ async def test_run_once_skips_push_when_head_did_not_advance(monkeypatch, tmp_pa
     assert "push" not in fixture["calls"]
     assert "open_pr" not in fixture["calls"]
     assert "comment_pr" not in fixture["calls"]
-    assert "arm_auto_merge" not in fixture["calls"]
 
 
 @pytest.mark.asyncio
@@ -249,8 +247,7 @@ async def test_run_once_skips_push_on_agent_failure(monkeypatch, tmp_path):
     assert res.skipped is True
     assert res.skip_reason == "agent-failed"
     assert res.pr is None
-    # Crucially: no push, no PR, no comment, no merge arm.
+    # Crucially: no push, no PR, no comment.
     assert "push" not in fixture["calls"]
     assert "open_pr" not in fixture["calls"]
     assert "comment_pr" not in fixture["calls"]
-    assert "arm_auto_merge" not in fixture["calls"]

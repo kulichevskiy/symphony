@@ -171,8 +171,14 @@ def load_config(path: Path) -> Config:
         worktree_root=_resolve_relative(paths.worktree_root, base),
         prompts_dir=_resolve_relative(paths.prompts_dir, base),
     )
+    # repo.path also needs to resolve against the config file directory so a
+    # service/cron launch from a different CWD still targets the right repo.
+    resolved_repo = RepoConfig(
+        path=_resolve_relative(cfg.repo.path, base),
+        default_branch=cfg.repo.default_branch,
+    )
     return Config(
-        repo=cfg.repo,
+        repo=resolved_repo,
         github=cfg.github,
         git=cfg.git,
         orchestrator=cfg.orchestrator,

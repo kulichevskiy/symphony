@@ -1,8 +1,15 @@
-"""M2 happy path: fetch issue → worktree → agent → push → PR → arm auto-merge.
+"""M2 happy path: fetch issue → worktree → agent → push → PR open.
 
 This module is the single async entrypoint for ``symphony run-once <n>``.
 External effects (gh, git, claude) are factored into module-level helpers so
 tests can monkeypatch them without spinning up real subprocesses.
+
+Auto-merge is intentionally not armed at PR-open time. Per SYMPHONY.md (M0
+spike findings), Codex's review never satisfies required-reviewer branch
+protection — `gh pr merge --auto` would either bypass review entirely (in
+repos with no required reviewers) or sit waiting forever. M3's review loop
+fires `gh pr merge --squash --delete-branch` directly once the verdict
+resolves to Approved and CI is green.
 """
 
 from __future__ import annotations
@@ -18,7 +25,6 @@ from .config import Config, load_config
 from .github import (
     Issue,
     PR,
-    arm_auto_merge,
     comment_pr,
     name_with_owner,
     open_pr,
@@ -168,7 +174,6 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         body=_build_pr_body(issue),
     )
     comment_pr(repo_path=repo_path, pr_number=pr.number, body="@codex review")
-    arm_auto_merge(repo_path=repo_path, pr_number=pr.number)
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,

@@ -86,6 +86,24 @@ def test_load_config_resolves_prompts_dir_relative_to_config_file(tmp_path):
     assert cfg.paths.prompts_dir == (tmp_path / "prompts").resolve()
 
 
+def test_load_config_resolves_relative_repo_path_to_config_file(tmp_path):
+    """Regression: a relative `[repo].path` must resolve against the config
+    file's directory so service/cron launches from another CWD still target
+    the right repo (gh/git operations all key off this path).
+    """
+    body = SAMPLE_TOML.replace(
+        'path = "/tmp/some-project"', 'path = "./some-project"'
+    )
+    p = write_config(tmp_path, body)
+    cfg = load_config(p)
+    assert cfg.repo.path == (tmp_path / "some-project").resolve()
+
+
+def test_load_config_keeps_absolute_repo_path(tmp_path):
+    cfg = load_config(write_config(tmp_path))
+    assert cfg.repo.path == Path("/tmp/some-project")
+
+
 def test_load_config_missing_section_raises(tmp_path):
     body = SAMPLE_TOML.replace("[github]\nlabel = \"auto\"\n", "")
     p = write_config(tmp_path, body)
