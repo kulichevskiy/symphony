@@ -119,12 +119,14 @@ def evaluate_verdict(
         )
     non_passing_checks = [c for c in checks if c.bucket != "pass"]
 
-    # 2. Explicit human verdicts on HEAD trump everything else. Reviews come
+    # 2. Explicit human verdicts on HEAD are collapsed per reviewer. Reviews come
     #    back oldest-first; collapse them into one effective verdict per
     #    reviewer (latest APPROVED / CHANGES_REQUESTED wins; DISMISSED clears
     #    a prior verdict; COMMENTED is non-binding). Then aggregate across
     #    reviewers: an unresolved CHANGES_REQUESTED from anyone blocks
-    #    approval even if someone else has already approved.
+    #    approval even if someone else has already approved. Human approvals
+    #    are handled after Codex feedback below, because fresh Codex comments
+    #    still block merge.
     human_verdicts: dict[str, str] = {}
     for r in fresh_reviews:
         if r.user_login == codex_login or not r.user_login:
@@ -149,10 +151,7 @@ def evaluate_verdict(
             review_comments=fresh_comments,
             last_review_body=latest_cr.body if latest_cr else "",
         )
-    if any(v == "APPROVED" for v in human_verdicts.values()):
-        if non_passing_checks:
-            return Verdict(kind=VerdictKind.PENDING)
-        return Verdict(kind=VerdictKind.APPROVED)
+    human_approved = any(v == "APPROVED" for v in human_verdicts.values())
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
     #    reviews always come paired with inline comments when there's
@@ -190,7 +189,12 @@ def evaluate_verdict(
     if non_passing_checks:
         return Verdict(kind=VerdictKind.PENDING)
 
-    # 6. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
+    # 6. Approval via a non-Codex reviewer on HEAD. This is only considered
+    #    after fresh blocking signals have been ruled out.
+    if human_approved:
+        return Verdict(kind=VerdictKind.APPROVED)
+
+    # 7. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
     #    committer time, otherwise it's stale (referring to an earlier
     #    commit that's since been replaced).
     head_dt = _parse_iso(head_committed_at)

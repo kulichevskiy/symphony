@@ -212,6 +212,16 @@ def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
     assert v.kind == VerdictKind.CHANGES_REQUESTED
 
 
+def test_human_approval_with_fresh_codex_feedback_is_changes_requested():
+    c = _comment()
+    v = _eval(
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+        review_comments=[c],
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.review_comments == [c]
+
+
 def test_human_approved_review_wins():
     v = _eval(reviews=[_review(who="alice", state="APPROVED", body="lgtm")])
     assert v.kind == VerdictKind.APPROVED
