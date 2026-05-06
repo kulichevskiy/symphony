@@ -457,11 +457,11 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
 def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
     """All review submissions on a PR, oldest first."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/reviews", "--paginate"],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+        repo_path=repo_path,
+        context=f"reviews for PR {pr_number}",
     )
-    data = _parse_json(out, context=f"reviews for PR {pr_number}")
     return [
         Review(
             id=int(r.get("id", 0)),
@@ -478,11 +478,11 @@ def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
 def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewComment]:
     """All inline (line-level) review comments on a PR's diff."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/comments", "--paginate"],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/pulls/{pr_number}/comments",
+        repo_path=repo_path,
+        context=f"review comments for PR {pr_number}",
     )
-    data = _parse_json(out, context=f"review comments for PR {pr_number}")
     return [
         ReviewComment(
             id=int(c.get("id", 0)),
@@ -500,11 +500,11 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
 def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/issues/{pr_number}/reactions", "--paginate"],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/issues/{pr_number}/reactions",
+        repo_path=repo_path,
+        context=f"reactions for PR {pr_number}",
     )
-    data = _parse_json(out, context=f"reactions for PR {pr_number}")
     return [
         Reaction(
             user_login=(r.get("user") or {}).get("login", ""),

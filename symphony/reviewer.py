@@ -95,6 +95,18 @@ def _parse_iso(ts: str) -> datetime | None:
     return dt
 
 
+def _latest_checks_by_name(checks: list[CheckRun]) -> list[CheckRun]:
+    """Keep the newest check/status per name.
+
+    ``list_pr_checks`` receives commit statuses newest-first, so preserving the
+    first item per name drops stale failures left behind by reruns.
+    """
+    latest: dict[str, CheckRun] = {}
+    for check in checks:
+        latest.setdefault(check.name, check)
+    return list(latest.values())
+
+
 def evaluate_verdict(
     *,
     head_sha: str,
@@ -108,12 +120,13 @@ def evaluate_verdict(
     """Pure verdict evaluation. See module docstring for the rules."""
     fresh_reviews = [r for r in reviews if r.commit_sha == head_sha]
     fresh_comments = [c for c in review_comments if c.commit_sha == head_sha]
+    latest_checks = _latest_checks_by_name(checks)
 
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
     failing_checks = [
         c
-        for c in checks
+        for c in latest_checks
         if c.status == "completed" and c.conclusion in FAILED_CHECK_CONCLUSIONS
     ]
     if failing_checks:
@@ -174,7 +187,7 @@ def evaluate_verdict(
 
     # 5. Pending CI checks keep the verdict pending even if a fresh approval
     #    has already landed; a later CI failure must still feed another loop.
-    if any(c.status in PENDING_CHECK_STATUSES for c in checks):
+    if any(c.status in PENDING_CHECK_STATUSES for c in latest_checks):
         return Verdict(kind=VerdictKind.PENDING)
 
     # 6. Approval via human review or Codex ``+1`` reaction on the PR. The

@@ -467,7 +467,10 @@ def test_list_pr_reviews_parses_payload(monkeypatch, tmp_path):
         },
     ]
     fake = _stub(
-        {("repo", "view"): json.dumps({"nameWithOwner": "o/r"}), ("api",): json.dumps(payload)}
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("api",): json.dumps([payload[:1], payload[1:]]),
+        }
     )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     reviews = list_pr_reviews(10, repo_path=tmp_path)
@@ -475,6 +478,8 @@ def test_list_pr_reviews_parses_payload(monkeypatch, tmp_path):
         Review(id=1, user_login="alice", state="APPROVED", body="lgtm", commit_sha="sha1", submitted_at="2026-05-06T07:00:00Z"),
         Review(id=2, user_login="chatgpt-codex-connector[bot]", state="COMMENTED", body="", commit_sha="sha2", submitted_at="2026-05-06T07:30:00Z"),
     ]
+    api_call = next(c for c in fake.calls if c[0] == "api")
+    assert "--paginate" in api_call and "--slurp" in api_call
 
 
 def test_list_pr_review_comments(monkeypatch, tmp_path):
@@ -489,7 +494,9 @@ def test_list_pr_review_comments(monkeypatch, tmp_path):
             "created_at": "2026-05-06T07:30:00Z",
         }
     ]
-    fake = _stub({("repo", "view"): json.dumps({"nameWithOwner": "o/r"}), ("api",): json.dumps(payload)})
+    fake = _stub(
+        {("repo", "view"): json.dumps({"nameWithOwner": "o/r"}), ("api",): json.dumps([payload])}
+    )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     cs = list_pr_review_comments(10, repo_path=tmp_path)
     assert cs == [
@@ -503,6 +510,8 @@ def test_list_pr_review_comments(monkeypatch, tmp_path):
             created_at="2026-05-06T07:30:00Z",
         )
     ]
+    api_call = next(c for c in fake.calls if c[0] == "api")
+    assert "--paginate" in api_call and "--slurp" in api_call
 
 
 def test_list_pr_reactions(monkeypatch, tmp_path):
@@ -510,13 +519,17 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
         {"user": {"login": "chatgpt-codex-connector[bot]"}, "content": "+1", "created_at": "2026-05-06T08:00:00Z"},
         {"user": None, "content": "eyes", "created_at": "2026-05-06T07:00:00Z"},
     ]
-    fake = _stub({("repo", "view"): json.dumps({"nameWithOwner": "o/r"}), ("api",): json.dumps(payload)})
+    fake = _stub(
+        {("repo", "view"): json.dumps({"nameWithOwner": "o/r"}), ("api",): json.dumps([payload])}
+    )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     reactions = list_pr_reactions(10, repo_path=tmp_path)
     assert reactions == [
         Reaction(user_login="chatgpt-codex-connector[bot]", content="+1", created_at="2026-05-06T08:00:00Z"),
         Reaction(user_login="", content="eyes", created_at="2026-05-06T07:00:00Z"),
     ]
+    api_call = next(c for c in fake.calls if c[0] == "api")
+    assert "--paginate" in api_call and "--slurp" in api_call
 
 
 def test_list_pr_checks(monkeypatch, tmp_path):

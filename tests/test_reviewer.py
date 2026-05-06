@@ -197,6 +197,28 @@ def test_failing_ci_takes_priority_over_codex_approval_reaction():
     assert v.kind == VerdictKind.CHANGES_REQUESTED
 
 
+def test_latest_check_by_name_overrides_stale_failure():
+    v = _eval(
+        checks=[
+            _check(name="test", conclusion="success"),
+            _check(name="test", conclusion="failure"),
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_latest_pending_check_by_name_overrides_stale_success():
+    v = _eval(
+        checks=[
+            _check(name="test", status="in_progress", conclusion=None),
+            _check(name="test", conclusion="success"),
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
 # ---- approved ----
 
 
