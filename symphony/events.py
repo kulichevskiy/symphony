@@ -193,7 +193,10 @@ class EventLog:
                 last_reviewed_sha = ""
                 last_review_verdict = ""
             elif ev.kind == "review-fresh":
-                last_reviewed_sha = payload.get("head_sha", last_reviewed_sha)
+                head_sha = payload.get("head_sha", last_reviewed_sha)
+                if last_reviewed_sha and head_sha != last_reviewed_sha:
+                    rounds_used = int(payload.get("round", 0))
+                last_reviewed_sha = head_sha
             elif ev.kind == "review-verdict":
                 last_reviewed_sha = payload.get("head_sha", last_reviewed_sha)
                 last_review_verdict = payload.get("verdict", last_review_verdict)

@@ -324,6 +324,7 @@ async def drive_review_loop(
     last_activity = now_fn()
     nudged_during_idle = False
     last_seen_head_sha = replay.last_reviewed_sha if replay is not None else ""
+    first_poll = True
 
     def emit(kind: str, payload: dict[str, Any] | None = None) -> None:
         if event_log is None:
@@ -347,11 +348,16 @@ async def drive_review_loop(
             checks=snap.checks,
         )
         if snap.head_sha != last_seen_head_sha:
+            if first_poll and last_seen_head_sha:
+                rounds_used = 0
+                last_activity = now_fn()
+                nudged_during_idle = False
             emit(
                 "review-fresh",
                 {"head_sha": snap.head_sha, "round": rounds_used},
             )
             last_seen_head_sha = snap.head_sha
+        first_poll = False
         emit(
             "review-verdict",
             {

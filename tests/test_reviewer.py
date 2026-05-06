@@ -569,7 +569,7 @@ async def test_loop_replays_review_rounds_on_restart(tmp_path):
         payload={"head_sha": "head3", "verdict": "changes_requested", "round": 3},
         ts=4,
     )
-    driver = _Driver([_changes_snap("head4"), _approved_snap("head5")])
+    driver = _Driver([_changes_snap("head3"), _approved_snap("head2")])
 
     outcome = await _spawn_loop(driver, cfg, event_log=event_log, run_id="new-run")
 
@@ -579,3 +579,49 @@ async def test_loop_replays_review_rounds_on_restart(tmp_path):
     # and must run fresh instead of resuming the original session.
     assert driver.calls["agent_resume"] == [None]
     assert event_log.replay_review(4).rounds_used == 4
+
+
+@pytest.mark.asyncio
+async def test_loop_resets_replayed_rounds_when_current_head_changes(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    event_log = EventLog.for_repo(tmp_path)
+    event_log.emit(
+        "review-verdict",
+        issue_number=4,
+        run_id="old-run",
+        payload={"head_sha": "old-sha", "verdict": "changes_requested", "round": 10},
+        ts=1,
+    )
+    event_log.emit(
+        "agent-exit",
+        issue_number=4,
+        run_id="old-run",
+        payload={"phase": "review", "round": 10, "success": True},
+        ts=2,
+    )
+    event_log.emit(
+        "run-terminal",
+        issue_number=4,
+        run_id="old-run",
+        payload={
+            "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+            "rounds_used": 10,
+            "head_sha": "old-sha",
+        },
+        ts=3,
+    )
+    driver = _Driver([_changes_snap("new-sha"), _approved_snap("head2")])
+
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        event_log=event_log,
+        run_id="new-run",
+        round_cap=10,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert outcome.rounds_used == 1
+    assert driver.calls["agent_resume"] == ["sess-A"]
+    assert driver.calls["label_issue"] == []
+    assert event_log.replay_review(4).rounds_used == 1

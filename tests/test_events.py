@@ -120,6 +120,42 @@ def test_replay_review_does_not_reset_on_retry_dispatch(tmp_path):
     assert replay.rounds_used == 3
 
 
+def test_replay_review_resets_rounds_when_fresh_head_changes(tmp_path):
+    log = EventLog.for_repo(tmp_path)
+    log.emit(
+        "review-verdict",
+        issue_number=5,
+        run_id="old",
+        payload={"head_sha": "old-sha", "verdict": "changes_requested", "round": 10},
+        ts=1,
+    )
+    log.emit(
+        "run-terminal",
+        issue_number=5,
+        run_id="old",
+        payload={"rounds_used": 10, "outcome": "merge_pending"},
+        ts=2,
+    )
+    log.emit(
+        "review-fresh",
+        issue_number=5,
+        run_id="retry",
+        payload={"head_sha": "new-sha", "round": 0},
+        ts=3,
+    )
+    log.emit(
+        "agent-exit",
+        issue_number=5,
+        run_id="retry",
+        payload={"phase": "review", "round": 1, "success": True},
+        ts=4,
+    )
+
+    replay = log.replay_review(5)
+    assert replay.rounds_used == 1
+    assert replay.last_reviewed_sha == "new-sha"
+
+
 def test_status_snapshot_includes_active_and_terminal_runs(tmp_path):
     log = EventLog.for_repo(tmp_path)
     log.emit("dispatch", issue_number=6, run_id="r6", ts=100)
