@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-ISSUE_FIELDS = "number,title,body,comments,labels"
+ISSUE_FIELDS = "number,title,body,comments,labels,createdAt"
 
 # ``trackedIssues`` returns issues referenced as task-list items in the parent
 # issue body. ``closedByPullRequestsReferences`` gives the PR (if any) that
@@ -56,6 +56,7 @@ class Issue:
     body: str
     labels: list[str]
     comments: list[IssueComment]
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,7 +171,55 @@ def view_issue(number: int, *, repo_path: Path) -> Issue:
         body=data.get("body", ""),
         labels=labels,
         comments=comments,
+        created_at=data.get("createdAt", ""),
     )
+
+
+def list_open_issues_with_label(
+    label: str, *, repo_path: Path, limit: int = 100
+) -> list[Issue]:
+    """All open issues carrying ``label``, with the same shape as ``view_issue``.
+
+    Used by the orchestrator's poll loop to find candidates. ``createdAt``
+    drives the FIFO selection so the oldest ready issue dispatches first.
+    """
+    out = _run_gh(
+        [
+            "issue",
+            "list",
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            ISSUE_FIELDS,
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh issue list --label {label}")
+    issues: list[Issue] = []
+    for d in data:
+        comments = [
+            IssueComment(
+                author=(c.get("author") or {}).get("login", ""),
+                body=c.get("body", ""),
+            )
+            for c in d.get("comments", [])
+        ]
+        labels = [lbl.get("name", "") for lbl in d.get("labels", [])]
+        issues.append(
+            Issue(
+                number=int(d["number"]),
+                title=d.get("title", ""),
+                body=d.get("body", ""),
+                labels=labels,
+                comments=comments,
+                created_at=d.get("createdAt", ""),
+            )
+        )
+    return issues
 
 
 def name_with_owner(repo_path: Path) -> tuple[str, str]:

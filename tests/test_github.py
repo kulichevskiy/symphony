@@ -91,6 +91,49 @@ def test_view_issue_parses_gh_json(monkeypatch, tmp_path):
     assert "--json" in fake.calls[0]
 
 
+def test_view_issue_includes_created_at(monkeypatch, tmp_path):
+    payload = {
+        "number": 5,
+        "title": "x",
+        "body": "y",
+        "labels": [],
+        "comments": [],
+        "createdAt": "2026-05-01T00:00:00Z",
+    }
+    monkeypatch.setattr(gh_mod, "_run_gh", _stub({("issue", "view", "5"): json.dumps(payload)}))
+    issue = view_issue(5, repo_path=tmp_path)
+    assert issue.created_at == "2026-05-01T00:00:00Z"
+
+
+def test_list_open_issues_with_label_parses_json(monkeypatch, tmp_path):
+    from symphony.github import list_open_issues_with_label
+
+    payload = [
+        {
+            "number": 1,
+            "title": "older",
+            "body": "...",
+            "labels": [{"name": "auto"}],
+            "comments": [],
+            "createdAt": "2026-04-01T00:00:00Z",
+        },
+        {
+            "number": 2,
+            "title": "newer",
+            "body": "...",
+            "labels": [{"name": "auto"}, {"name": "p2"}],
+            "comments": [{"author": {"login": "ak"}, "body": "hi"}],
+            "createdAt": "2026-05-01T00:00:00Z",
+        },
+    ]
+    monkeypatch.setattr(gh_mod, "_run_gh", _stub({("issue", "list"): json.dumps(payload)}))
+    issues = list_open_issues_with_label("auto", repo_path=tmp_path)
+    assert [i.number for i in issues] == [1, 2]
+    assert issues[0].created_at == "2026-04-01T00:00:00Z"
+    assert issues[1].labels == ["auto", "p2"]
+    assert issues[1].comments[0].author == "ak"
+
+
 def test_view_issue_handles_null_comment_author(monkeypatch, tmp_path):
     """Regression: GitHub returns ``"author": null`` for deleted accounts.
 
