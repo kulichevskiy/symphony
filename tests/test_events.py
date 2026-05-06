@@ -63,6 +63,41 @@ def test_replay_review_restores_next_round_inputs(tmp_path):
     assert replay.last_review_verdict == "changes_requested"
 
 
+def test_replay_review_resets_when_new_run_starts(tmp_path):
+    log = EventLog.for_repo(tmp_path)
+    log.emit(
+        "agent-exit",
+        issue_number=4,
+        run_id="old",
+        payload={"phase": "review", "round": 10, "success": True},
+        ts=1,
+    )
+    log.emit(
+        "auto-stuck",
+        issue_number=4,
+        run_id="old",
+        payload={"rounds_used": 10, "outcome": "auto_stuck_rounds"},
+        ts=2,
+    )
+    log.emit(
+        "agent-start",
+        issue_number=4,
+        run_id="new",
+        payload={"phase": "round1"},
+        ts=3,
+    )
+    log.emit(
+        "agent-exit",
+        issue_number=4,
+        run_id="new",
+        payload={"phase": "review", "round": 1, "success": True},
+        ts=4,
+    )
+
+    replay = log.replay_review(4)
+    assert replay.rounds_used == 1
+
+
 def test_status_snapshot_includes_active_and_terminal_runs(tmp_path):
     log = EventLog.for_repo(tmp_path)
     log.emit("dispatch", issue_number=6, run_id="r6", ts=100)

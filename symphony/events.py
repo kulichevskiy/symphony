@@ -188,7 +188,13 @@ class EventLog:
         last_review_verdict = ""
         for ev in self.iter_events(issue_number=issue_number):
             payload = ev.payload
-            if ev.kind == "review-fresh":
+            if ev.kind == "dispatch" or (
+                ev.kind == "agent-start" and payload.get("phase") == "round1"
+            ):
+                rounds_used = 0
+                last_reviewed_sha = ""
+                last_review_verdict = ""
+            elif ev.kind == "review-fresh":
                 last_reviewed_sha = payload.get("head_sha", last_reviewed_sha)
             elif ev.kind == "review-verdict":
                 last_reviewed_sha = payload.get("head_sha", last_reviewed_sha)
