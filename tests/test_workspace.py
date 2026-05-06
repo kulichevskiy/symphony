@@ -188,6 +188,51 @@ def test_ensure_worktree_sanitizes_repo_name(tmp_path):
     assert wt.name == "my_repo_with-slash-1"
 
 
+def test_ensure_worktree_recovers_from_pruned_directory(tmp_path):
+    """Regression: a worktree dir that was rm'd but is still registered in
+    git metadata must be auto-pruned so the next `worktree add` succeeds."""
+    repo, _bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+    wt = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=42,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    assert wt.is_dir()
+
+    # Simulate someone (or a crash) removing the worktree directory without
+    # calling `git worktree remove`. The metadata under .git/worktrees/ stays.
+    import shutil
+
+    shutil.rmtree(wt)
+    assert not wt.exists()
+
+    # Re-running ensure_worktree must auto-prune and recreate at the same path.
+    wt2 = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=42,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+    assert wt2 == wt
+    assert wt2.is_dir()
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=wt2,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == "auto/42"
+
+
 def test_ensure_worktree_empty_repo_name_rejected(tmp_path):
     repo, _bare = _init_origin_repo(tmp_path)
     wt_root = tmp_path / "wts"

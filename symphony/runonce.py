@@ -26,6 +26,7 @@ from .github import (
     Issue,
     PR,
     comment_pr,
+    find_open_pr_for_branch,
     name_with_owner,
     open_pr,
     tracked_issues,
@@ -166,13 +167,19 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
 
     branch = f"auto/{issue_number}"
     _git_push(worktree, branch)
-    pr = open_pr(
-        repo_path=repo_path,
-        head=branch,
-        base=cfg.repo.default_branch,
-        title=issue.title,
-        body=_build_pr_body(issue),
-    )
+    # Re-dispatch path: an open PR for this branch may already exist from a
+    # prior run. Reuse it instead of letting `gh pr create` fail with the
+    # duplicate-PR error — otherwise the run aborts before the @codex review
+    # nudge can be posted on the updated commit.
+    pr = find_open_pr_for_branch(branch, repo_path=repo_path)
+    if pr is None:
+        pr = open_pr(
+            repo_path=repo_path,
+            head=branch,
+            base=cfg.repo.default_branch,
+            title=issue.title,
+            body=_build_pr_body(issue),
+        )
     comment_pr(repo_path=repo_path, pr_number=pr.number, body="@codex review")
     return RunOnceResult(
         issue_number=issue_number,

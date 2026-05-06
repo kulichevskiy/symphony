@@ -181,6 +181,33 @@ def tracked_issues(number: int, *, repo_path: Path) -> list[TrackedIssue]:
     return results
 
 
+def find_open_pr_for_branch(branch: str, *, repo_path: Path) -> PR | None:
+    """Return the open PR whose head ref is ``branch``, if any.
+
+    Used by ``run_once`` to make re-dispatch idempotent: a second run on the
+    same issue should reuse the existing PR rather than failing on
+    ``gh pr create``'s duplicate-PR error.
+    """
+    out = _run_gh(
+        [
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url",
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh pr list --head {branch}")
+    if not data:
+        return None
+    first = data[0]
+    return PR(number=int(first["number"]), url=first.get("url", ""))
+
+
 def open_pr(
     *,
     repo_path: Path,

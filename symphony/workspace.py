@@ -92,6 +92,13 @@ def ensure_worktree(
     target = worktree_path(worktree_root, repo_name, issue_number)
     worktree_root.mkdir(parents=True, exist_ok=True)
 
+    # Drop stale worktree metadata for paths whose directories no longer
+    # exist. Without this, a manually-removed worktree directory leaves a
+    # registration behind and the next `git worktree add` fails with
+    # "already exists at <path>". Idempotent and harmless when nothing is
+    # stale.
+    _run_git(["worktree", "prune"], cwd=repo_path)
+
     branch = f"auto/{issue_number}"
     has_branch = _branch_exists(repo_path, branch)
     has_worktree = target.is_dir() and _worktree_exists(repo_path, target)

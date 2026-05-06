@@ -160,6 +160,12 @@ def _patch_happy_path(
         return pr
 
     monkeypatch.setattr(ro_mod, "open_pr", _fake_open_pr)
+    # Default: no existing PR for the branch — open_pr will be called.
+    monkeypatch.setattr(
+        ro_mod,
+        "find_open_pr_for_branch",
+        lambda branch, *, repo_path: (calls.setdefault("find_pr", (branch, repo_path)), None)[1],
+    )
     monkeypatch.setattr(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
     )
@@ -215,6 +221,31 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     # the merge directly once Codex approves and CI is green. Arming here
     # would either bypass review or sit waiting forever (Codex can't satisfy
     # required-reviewer branch protection — see SYMPHONY.md M0 findings).
+
+
+@pytest.mark.asyncio
+async def test_run_once_reuses_existing_pr_on_redispatch(monkeypatch, tmp_path):
+    """Regression: re-dispatch with an existing open PR must not call open_pr
+    (which would fail with `gh`'s duplicate-PR error and abort before the
+    @codex review nudge gets posted on the new commit).
+    """
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+
+    def _existing(branch, *, repo_path):
+        fixture["calls"]["find_pr"] = (branch, repo_path)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+    assert res.skipped is False
+    assert res.pr == existing
+    # open_pr must NOT have been called when an existing PR is found.
+    assert "open_pr" not in fixture["calls"]
+    # but @codex review still goes out, on the existing PR
+    assert fixture["calls"]["comment_pr"]["pr_number"] == 42
 
 
 @pytest.mark.asyncio

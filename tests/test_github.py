@@ -15,9 +15,11 @@ from symphony.github import (
     GithubError,
     Issue,
     IssueComment,
+    PR,
     TrackedIssue,
     arm_auto_merge,
     comment_pr,
+    find_open_pr_for_branch,
     open_pr,
     tracked_issues,
     view_issue,
@@ -211,6 +213,28 @@ def test_comment_pr_calls_gh_pr_comment(monkeypatch, tmp_path):
     assert call[:3] == ["pr", "comment", "12"]
     assert "--body" in call
     assert "@codex review" in call
+
+
+def test_find_open_pr_for_branch_returns_pr(monkeypatch, tmp_path):
+    fake = _stub(
+        {
+            ("pr", "list"): json.dumps(
+                [{"number": 12, "url": "https://github.com/o/r/pull/12"}]
+            ),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    pr = find_open_pr_for_branch("auto/3", repo_path=tmp_path)
+    assert pr == PR(number=12, url="https://github.com/o/r/pull/12")
+    call = fake.calls[0]
+    assert "--head" in call and "auto/3" in call
+    assert "--state" in call and "open" in call
+
+
+def test_find_open_pr_for_branch_returns_none_when_no_pr(monkeypatch, tmp_path):
+    fake = _stub({("pr", "list"): "[]"})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert find_open_pr_for_branch("auto/99", repo_path=tmp_path) is None
 
 
 def test_arm_auto_merge_calls_gh_pr_merge(monkeypatch, tmp_path):
