@@ -442,7 +442,8 @@ def _required_status_contexts(
             cwd=repo_path,
         )
     except GithubError as e:
-        if "404" in str(e):
+        message = str(e)
+        if "403" in message or "404" in message:
             return set()
         raise
     data = _parse_json(

@@ -672,6 +672,60 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     ]
 
 
+def test_list_pr_checks_treats_forbidden_required_context_lookup_as_empty(
+    monkeypatch, tmp_path
+):
+    calls: list[list[str]] = []
+
+    def fake(args, *, cwd=None):  # type: ignore[no-untyped-def]
+        calls.append(list(args))
+        if args[:2] == ["repo", "view"]:
+            return json.dumps({"nameWithOwner": "o/r"})
+        if args[:3] == ["pr", "view", "10"]:
+            return json.dumps({"headRefOid": "abc123", "baseRefName": "main"})
+        if args[:2] == [
+            "api",
+            "repos/o/r/branches/main/protection/required_status_checks",
+        ]:
+            raise GithubError("gh api failed: HTTP 403")
+        if args[:2] == ["api", "repos/o/r/commits/abc123/check-runs?per_page=100"]:
+            return json.dumps(
+                [
+                    {
+                        "check_runs": [
+                            {
+                                "name": "build",
+                                "status": "in_progress",
+                                "conclusion": None,
+                                "details_url": None,
+                            }
+                        ]
+                    }
+                ]
+            )
+        if args[:2] == ["api", "repos/o/r/commits/abc123/status?per_page=100"]:
+            return json.dumps([{"statuses": []}])
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+
+    checks = list_pr_checks(10, repo_path=tmp_path)
+
+    assert checks == [
+        CheckRun(
+            name="build",
+            status="in_progress",
+            conclusion=None,
+            details_url=None,
+            required=False,
+        )
+    ]
+    assert calls[2] == [
+        "api",
+        "repos/o/r/branches/main/protection/required_status_checks",
+    ]
+
+
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
     fake = _stub({("issue", "edit", "10"): ""})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
