@@ -496,15 +496,11 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
 
 
 def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
-    """CI check runs on the PR's HEAD commit (`gh pr checks`)."""
+    """CI check runs on the PR's HEAD commit."""
+    owner, name = _name_with_owner(repo_path)
+    sha = get_pr_head_sha(pr_number, repo_path=repo_path)
     out = _run_gh(
-        [
-            "pr",
-            "checks",
-            str(pr_number),
-            "--json",
-            "name,status,conclusion,detailsUrl",
-        ],
+        ["api", f"repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100"],
         cwd=repo_path,
     )
     data = _parse_json(out, context=f"checks for PR {pr_number}")
@@ -513,9 +509,9 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
             name=c.get("name", ""),
             status=c.get("status", ""),
             conclusion=c.get("conclusion") or None,
-            details_url=c.get("detailsUrl") or None,
+            details_url=c.get("details_url") or None,
         )
-        for c in data
+        for c in data.get("check_runs", [])
     ]
 
 

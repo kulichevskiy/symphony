@@ -553,16 +553,29 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 
 def test_list_pr_checks(monkeypatch, tmp_path):
     payload = [
-        {"name": "build", "status": "completed", "conclusion": "success", "detailsUrl": "https://ci/build"},
-        {"name": "test", "status": "completed", "conclusion": "failure", "detailsUrl": "https://ci/test"},
-        {"name": "lint", "status": "in_progress", "conclusion": None, "detailsUrl": None},
+        {"name": "build", "status": "completed", "conclusion": "success", "details_url": "https://ci/build"},
+        {"name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://ci/test"},
+        {"name": "lint", "status": "in_progress", "conclusion": None, "details_url": None},
     ]
-    fake = _stub({("pr", "checks", "10"): json.dumps(payload)})
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("pr", "view", "10"): json.dumps({"headRefOid": "abc123"}),
+            ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
+                {"check_runs": payload}
+            ),
+        }
+    )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
     assert len(checks) == 3
     assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
     assert checks[2].conclusion is None
+    assert fake.calls == [
+        ["repo", "view", "--json", "nameWithOwner"],
+        ["pr", "view", "10", "--json", "headRefOid"],
+        ["api", "repos/o/r/commits/abc123/check-runs?per_page=100"],
+    ]
 
 
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
