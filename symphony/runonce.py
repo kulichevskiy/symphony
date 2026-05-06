@@ -34,6 +34,7 @@ from .github import (
 )
 from .prompts import make_env, render
 from .reviewer import LoopOutcome, LoopOutcomeKind, drive_review_loop
+from .types import AgentResult
 from .workspace import ensure_worktree
 
 log = logging.getLogger(__name__)
@@ -51,6 +52,11 @@ class RunOnceResult:
     # Populated when the review loop ran. `None` means the run skipped before
     # opening a PR; the CLI uses ``loop_outcome.kind`` to decide its exit code.
     loop_outcome: LoopOutcome | None = None
+    # Raw agent run output, populated only when the agent failed
+    # (``skip_reason == "agent-failed"``). The orchestrator scans this for
+    # 429 / usage-limit markers to decide whether to globally pause dispatch.
+    # ``None`` for any other outcome.
+    agent_result: AgentResult | None = None
 
 
 def _head_sha(worktree: Path) -> str:
@@ -180,6 +186,7 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             skipped=True,
             skip_reason="agent-failed",
             worktree=worktree,
+            agent_result=result,
         )
 
     branch = f"auto/{issue_number}"

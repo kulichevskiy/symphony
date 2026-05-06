@@ -421,6 +421,55 @@ async def test_run_tick_schedules_retry_on_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_tick_pauses_dispatch_on_agent_rate_limit(tmp_path):
+    """A 429/usage-limit failure surfaced via ``RunOnceResult.agent_result``
+    must trip ``state.pause(...)`` so the next tick is suspended."""
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    rate_limited_agent = AgentResult(
+        session_id="s",
+        exit_code=1,
+        success=False,
+        is_error=True,
+        duration_ms=1,
+        num_turns=1,
+        total_cost_usd=0.0,
+        final_text=None,
+        raw_events=[{"type": "result", "subtype": "error_usage_limit", "message": "usage limit"}],
+        stderr="",
+    )
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=True,
+            skip_reason="agent-failed",
+            worktree=tmp_path,
+            agent_result=rate_limited_agent,
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        rate_limit_pause_s=600.0,
+    )
+    # Drain the dispatch task
+    for _ in range(4):
+        await asyncio.sleep(0)
+    assert state.paused_until == 600.0
+    assert 1 in state.retry_queue
+
+
+@pytest.mark.asyncio
 async def test_run_forever_exits_when_shutdown_event_set(tmp_path):
     cfg = _make_cfg(tmp_path)
     cfg.orchestrator.poll_interval_s = 0.01  # speed the test
