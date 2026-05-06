@@ -12,13 +12,13 @@ Verdict mapping per SYMPHONY.md M0 spike findings:
 
 - **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
   the PR with ``created_at`` after the HEAD commit's committer date, AND no
-  fresh ``CHANGES_REQUESTED`` signal on HEAD. A non-Codex reviewer's
-  ``APPROVED`` review on HEAD also counts.
+  fresh ``CHANGES_REQUESTED`` signal or pending CI check on HEAD. A non-Codex
+  reviewer's ``APPROVED`` review on HEAD also counts once CI checks are done.
 - **CHANGES_REQUESTED** = (a) any failing CI check on HEAD, (b) any inline
   Codex review comment on HEAD, (c) a Codex ``COMMENTED`` review on HEAD whose
   body is substantively longer than the standard "About Codex in GitHub"
   boilerplate, or (d) a non-Codex ``CHANGES_REQUESTED`` review on HEAD.
-- **PENDING** = none of the above.
+- **PENDING** = none of the above, or approval exists while CI is still pending.
 """
 
 from __future__ import annotations
@@ -119,7 +119,11 @@ def evaluate_verdict(
             ci_failures=failing_checks,
         )
 
-    # 2. Explicit human verdicts on HEAD trump everything else.
+    pending_checks = [c for c in checks if c.status != "completed"]
+
+    # 2. Explicit human verdicts on HEAD trump Codex signals once checks are
+    #    merge-ready. Pending checks still keep approvals from merging early.
+    human_approved = False
     for r in fresh_reviews:
         if r.user_login != codex_login:
             if r.state == "CHANGES_REQUESTED":
@@ -129,7 +133,9 @@ def evaluate_verdict(
                     last_review_body=r.body,
                 )
             if r.state == "APPROVED":
-                return Verdict(kind=VerdictKind.APPROVED)
+                human_approved = True
+    if human_approved and not pending_checks:
+        return Verdict(kind=VerdictKind.APPROVED)
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
     #    reviews always come paired with inline comments when there's
@@ -162,7 +168,11 @@ def evaluate_verdict(
             last_review_body=codex_substantive[-1].body,
         )
 
-    # 5. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
+    # 5. Pending checks keep approval signals from triggering an early merge.
+    if pending_checks:
+        return Verdict(kind=VerdictKind.PENDING)
+
+    # 6. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
     #    committer time, otherwise it's stale (referring to an earlier
     #    commit that's since been replaced).
     head_dt = _parse_iso(head_committed_at)

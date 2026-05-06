@@ -136,6 +136,14 @@ def test_in_progress_check_is_not_failure():
     assert v.kind == VerdictKind.PENDING
 
 
+def test_pending_check_blocks_codex_approval_reaction():
+    v = _eval(
+        checks=[_check(name="test", status="in_progress", conclusion=None)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
 def test_failing_ci_takes_priority_over_codex_approval_reaction():
     v = _eval(
         checks=[_check(name="test", conclusion="failure")],
@@ -174,6 +182,14 @@ def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
 def test_human_approved_review_wins():
     v = _eval(reviews=[_review(who="alice", state="APPROVED", body="lgtm")])
     assert v.kind == VerdictKind.APPROVED
+
+
+def test_pending_check_blocks_human_approved_review():
+    v = _eval(
+        checks=[_check(name="test", status="queued", conclusion=None)],
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+    )
+    assert v.kind == VerdictKind.PENDING
 
 
 def test_non_plus_one_reaction_does_not_approve():
