@@ -1,14 +1,25 @@
-Codex requested changes on commit {{ sha }}. Address each comment:
+Codex requested changes on commit {{ sha }}. Address the feedback below.
+
+{% if review_body -%}
+## Reviewer note
+
+{{ review_body }}
+
+{% endif -%}
+{% if comments -%}
+## Inline comments
 
 {% for c in comments -%}
 {% if c.path %}[{{ c.path }}{% if c.line %}:{{ c.line }}{% endif %}]{% else %}[general]{% endif %} {{ c.body }}
 {% endfor %}
-{% if ci_failures -%}
 
+{% endif -%}
+{% if ci_failures -%}
 ## CI failures
 
 {% for f in ci_failures -%}
-- {{ f.name }} (see {{ f.details_url or "PR checks" }})
+- {{ f.name }} (see {{ f.link or "PR checks" }})
 {% endfor %}
-{% endif %}
+
+{% endif -%}
 When done, ensure tests pass and commit. Do not push — Symphony will push.

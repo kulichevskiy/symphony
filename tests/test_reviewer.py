@@ -392,8 +392,13 @@ class _Driver:
     def label_issue(self, number, label, *, repo_path):
         self.calls["label_issue"].append((number, label, str(repo_path)))
 
-    def render(self, *, cfg, sha, comments, ci_failures):
-        self.calls["render"].append({"sha": sha, "n_comments": len(comments), "n_ci": len(ci_failures)})
+    def render(self, *, cfg, sha, comments, ci_failures, review_body=""):
+        self.calls["render"].append({
+            "sha": sha,
+            "n_comments": len(comments),
+            "n_ci": len(ci_failures),
+            "review_body": review_body,
+        })
         return f"render({sha})"
 
     async def sleep(self, _seconds):
@@ -455,6 +460,29 @@ async def test_loop_handles_changes_then_approval(tmp_path):
     assert driver.calls["agent_resume"] == ["sess-A"]
     assert len(driver.calls["push"]) == 1
     assert any("@codex review" == body for _, _, body in driver.calls["comment_pr"])
+
+
+@pytest.mark.asyncio
+async def test_loop_threads_review_body_to_renderer(tmp_path):
+    # Regression: when CHANGES_REQUESTED comes from a human review's body
+    # (no inline comments, no CI failure), the body must flow through to
+    # the prompt template — otherwise the agent gets feedback-less retries
+    # and churns toward auto-stuck.
+    cfg = _make_cfg(tmp_path)
+    cr_review = Review(
+        id=1,
+        user_login="alice",
+        state="CHANGES_REQUESTED",
+        body="Refactor parser to handle empty input",
+        commit_sha="head1",
+        submitted_at="2026-05-06T07:30:00Z",
+    )
+    body_snap = _snap(head_sha="head1", reviews=[cr_review])
+    driver = _Driver([body_snap, _approved_snap("head2")])
+    outcome = await _spawn_loop(driver, cfg)
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["render"][0]["review_body"] == "Refactor parser to handle empty input"
+    assert driver.calls["render"][0]["n_comments"] == 0
 
 
 @pytest.mark.asyncio
