@@ -1,0 +1,119 @@
+"""Git worktree creation and reuse for per-issue agent runs.
+
+The worktree key is the *sanitized* repo name plus the issue number:
+``<worktree_root>/<sanitized-repo>-<n>``. The branch is always ``auto/<n>``
+and is created from ``origin/<default_branch>`` when missing. Repeated calls
+with the same ``(repo, issue_number)`` reuse the existing branch and worktree
+verbatim — no history is dropped.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+_VALID_CHAR = re.compile(r"[A-Za-z0-9._\-]")
+
+
+class WorkspaceError(Exception):
+    """Raised when a worktree cannot be created or violates a safety invariant."""
+
+
+def sanitize_repo_name(name: str) -> str:
+    """Map a repo name to a filesystem-safe key.
+
+    Allowed characters are ``[A-Za-z0-9._-]`` per SYMPHONY.md; anything else
+    becomes ``_``. Empty input is rejected.
+    """
+    if not name:
+        raise WorkspaceError("Repo name must not be empty")
+    return "".join(c if _VALID_CHAR.match(c) else "_" for c in name)
+
+
+def worktree_path(worktree_root: Path, repo_name: str, issue_number: int) -> Path:
+    """Compute the worktree path and assert it stays inside ``worktree_root``."""
+    sanitized = sanitize_repo_name(repo_name)
+    target = worktree_root / f"{sanitized}-{issue_number}"
+    root_resolved = worktree_root.resolve()
+    target_resolved = target.resolve()
+    try:
+        target_resolved.relative_to(root_resolved)
+    except ValueError as e:
+        raise WorkspaceError(
+            f"Worktree path {target_resolved} escapes worktree_root {root_resolved}"
+        ) from e
+    return target
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
+
+
+def _branch_exists(repo_path: Path, branch: str) -> bool:
+    res = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    return res.returncode == 0
+
+
+def _worktree_exists(repo_path: Path, target: Path) -> bool:
+    res = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
+    target_resolved = str(target.resolve())
+    for line in res.stdout.splitlines():
+        if line.startswith("worktree "):
+            wt = line[len("worktree ") :]
+            if str(Path(wt).resolve()) == target_resolved:
+                return True
+    return False
+
+
+def ensure_worktree(
+    *,
+    repo_path: Path,
+    worktree_root: Path,
+    repo_name: str,
+    issue_number: int,
+    base_branch: str,
+    author_name: str,
+    author_email: str,
+) -> Path:
+    """Create-or-reuse the per-issue worktree and pin the bot git identity.
+
+    Returns the absolute path to the worktree. Idempotent: calling twice with
+    the same arguments returns the same path and never drops commits made in
+    the worktree by previous runs.
+    """
+    target = worktree_path(worktree_root, repo_name, issue_number)
+    worktree_root.mkdir(parents=True, exist_ok=True)
+
+    branch = f"auto/{issue_number}"
+    has_branch = _branch_exists(repo_path, branch)
+    has_worktree = target.is_dir() and _worktree_exists(repo_path, target)
+
+    if not has_worktree:
+        try:
+            if has_branch:
+                _run_git(["worktree", "add", str(target), branch], cwd=repo_path)
+            else:
+                base_ref = f"origin/{base_branch}"
+                _run_git(
+                    ["worktree", "add", "-b", branch, str(target), base_ref],
+                    cwd=repo_path,
+                )
+        except subprocess.CalledProcessError as e:
+            raise WorkspaceError(
+                f"git worktree add failed: {e.stderr.strip() if e.stderr else e}"
+            ) from e
+
+    # Pin identity on every call so a config change in symphony.toml takes effect
+    # next dispatch even on a reused worktree. Local config wins over global.
+    _run_git(["config", "--local", "user.name", author_name], cwd=target)
+    _run_git(["config", "--local", "user.email", author_email], cwd=target)
+
+    return target
