@@ -267,6 +267,9 @@ class EventLog:
                     state["last_reviewed_sha"] = sha
                 if "verdict" in payload:
                     state["last_review_verdict"] = payload["verdict"]
+            if ev.kind == "retry-scheduled":
+                active.pop(issue, None)
+                continue
             if ev.kind in TERMINAL_KINDS:
                 total_elapsed = ev.ts - int(state.get("started_ts", ev.ts))
                 if ev.ts >= now - terminal_window_s:

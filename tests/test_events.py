@@ -161,3 +161,19 @@ def test_status_snapshot_resets_active_state_on_new_dispatch(tmp_path):
     assert active.round == 0
     assert active.last_reviewed_sha == ""
     assert active.last_review_verdict == ""
+
+
+def test_status_snapshot_clears_active_state_on_retry_scheduled(tmp_path):
+    log = EventLog.for_repo(tmp_path)
+    log.emit("dispatch", issue_number=9, run_id="crash", ts=100)
+    log.emit(
+        "retry-scheduled",
+        issue_number=9,
+        run_id="crash",
+        payload={"attempt": 1, "reason": "exception"},
+        ts=130,
+    )
+
+    snapshot = log.status_snapshot(now_ts=200)
+    assert snapshot.in_flight == []
+    assert snapshot.terminal_runs == []
