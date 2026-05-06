@@ -466,10 +466,17 @@ def test_get_pr_head_sha(monkeypatch, tmp_path):
 
 def test_is_pr_merged(monkeypatch, tmp_path):
     fake = _stub(
-        {("pr", "view", "10"): json.dumps({"merged": True, "state": "MERGED"})}
+        {
+            ("pr", "view", "10"): json.dumps(
+                {"state": "MERGED", "mergedAt": "2026-05-06T18:00:00Z"}
+            )
+        }
     )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     assert is_pr_merged(10, repo_path=tmp_path) is True
+    assert fake.calls == [
+        ["pr", "view", "10", "--json", "state,mergedAt"],
+    ]
 
 
 def test_list_pr_reviews_parses_payload(monkeypatch, tmp_path):
