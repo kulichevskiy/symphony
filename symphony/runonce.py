@@ -154,6 +154,7 @@ async def run_once(
     tracked = tracked_issues(issue_number, repo_path=repo_path)
     deps = _satisfied_deps(tracked)
     owner, name = name_with_owner(repo_path)
+    branch = f"auto/{issue_number}"
 
     worktree = ensure_worktree(
         repo_path=repo_path,
@@ -164,6 +165,134 @@ async def run_once(
         author_name=cfg.git.author_name,
         author_email=cfg.git.author_email,
     )
+
+    async def drive_and_merge(
+        pr: PR, *, initial_session_id: str | None
+    ) -> LoopOutcome:
+        # Drive the Codex review loop until terminal: APPROVED, AUTO_STUCK_*,
+        # or AGENT_FAILED. The first agent run's session id is threaded in so
+        # the first three review rounds can `--resume` it (cached prefix).
+        outcome = await drive_review_loop(
+            cfg=cfg,
+            issue_number=issue_number,
+            pr_number=pr.number,
+            branch=branch,
+            worktree=worktree,
+            initial_session_id=initial_session_id,
+            poll_interval_s=30.0,
+            re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
+            give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
+            round_cap=cfg.orchestrator.review_round_cap,
+            event_log=event_log,
+            run_id=run_id,
+        )
+        if outcome.kind == LoopOutcomeKind.APPROVED:
+            try:
+                merge_pr(
+                    repo_path=repo_path,
+                    pr_number=pr.number,
+                    match_head_commit=outcome.head_sha,
+                )
+                merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
+            except GithubError as e:
+                log.error("merge failed for PR #%d: %s", pr.number, e)
+                emit(
+                    "run-terminal",
+                    {
+                        "pr_number": pr.number,
+                        "url": pr.url,
+                        "head_sha": outcome.head_sha,
+                        "rounds_used": outcome.rounds_used,
+                        "outcome": LoopOutcomeKind.MERGE_FAILED.value,
+                        "error": str(e),
+                    },
+                )
+                outcome = LoopOutcome(
+                    kind=LoopOutcomeKind.MERGE_FAILED,
+                    rounds_used=outcome.rounds_used,
+                    last_session_id=outcome.last_session_id,
+                    head_sha=outcome.head_sha,
+                )
+            else:
+                if merged:
+                    emit(
+                        "merge",
+                        {
+                            "pr_number": pr.number,
+                            "url": pr.url,
+                            "head_sha": outcome.head_sha,
+                            "rounds_used": outcome.rounds_used,
+                            "outcome": "approved",
+                        },
+                    )
+                else:
+                    log.warning(
+                        "merge command completed for PR #%d but PR is still open",
+                        pr.number,
+                    )
+                    emit(
+                        "run-terminal",
+                        {
+                            "pr_number": pr.number,
+                            "url": pr.url,
+                            "head_sha": outcome.head_sha,
+                            "rounds_used": outcome.rounds_used,
+                            "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+                        },
+                    )
+                    outcome = LoopOutcome(
+                        kind=LoopOutcomeKind.MERGE_PENDING,
+                        rounds_used=outcome.rounds_used,
+                        last_session_id=outcome.last_session_id,
+                        head_sha=outcome.head_sha,
+                    )
+        elif outcome.kind not in {
+            LoopOutcomeKind.AUTO_STUCK_IDLE,
+            LoopOutcomeKind.AUTO_STUCK_ROUNDS,
+        }:
+            emit(
+                "run-terminal",
+                {
+                    "pr_number": pr.number,
+                    "url": pr.url,
+                    "head_sha": outcome.head_sha,
+                    "rounds_used": outcome.rounds_used,
+                    "outcome": outcome.kind.value,
+                },
+            )
+        return outcome
+
+    if event_log.latest_terminal_outcome(issue_number) in {
+        LoopOutcomeKind.MERGE_FAILED.value,
+        LoopOutcomeKind.MERGE_PENDING.value,
+    }:
+        pr = find_open_pr_for_branch(
+            branch,
+            repo_path=repo_path,
+            base_branch=cfg.repo.default_branch,
+            expected_owner=owner,
+        )
+        if pr is not None:
+            emit(
+                "pr-open",
+                {
+                    "number": pr.number,
+                    "url": pr.url,
+                    "head": branch,
+                    "base": cfg.repo.default_branch,
+                    "reused": True,
+                    "merge_retry": True,
+                },
+            )
+            outcome = await drive_and_merge(pr, initial_session_id=None)
+            return RunOnceResult(
+                issue_number=issue_number,
+                pr=pr,
+                skipped=False,
+                skip_reason=None,
+                worktree=worktree,
+                loop_outcome=outcome,
+            )
 
     env = make_env(cfg.paths.prompts_dir)
     prompt = render(
@@ -191,7 +320,7 @@ async def run_once(
         "agent-start",
         {
             "phase": "round1",
-            "branch": f"auto/{issue_number}",
+            "branch": branch,
             "worktree": str(worktree),
             "head_sha": head_before,
         },
@@ -239,7 +368,6 @@ async def run_once(
             agent_result=result,
         )
 
-    branch = f"auto/{issue_number}"
     head_after = _head_sha(worktree)
     agent_advanced_head = head_after != head_before
     to_push = _commits_to_push(worktree, branch, cfg.repo.default_branch)
@@ -313,94 +441,7 @@ async def run_once(
         )
     comment_pr(repo_path=repo_path, pr_number=pr.number, body="@codex review")
 
-    # Drive the Codex review loop until terminal: APPROVED, AUTO_STUCK_*, or
-    # AGENT_FAILED. The first agent run's session id is threaded in so the
-    # first three review rounds can `--resume` it (cached prefix).
-    outcome = await drive_review_loop(
-        cfg=cfg,
-        issue_number=issue_number,
-        pr_number=pr.number,
-        branch=branch,
-        worktree=worktree,
-        initial_session_id=result.session_id,
-        poll_interval_s=30.0,
-        re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
-        give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
-        round_cap=cfg.orchestrator.review_round_cap,
-        event_log=event_log,
-        run_id=run_id,
-    )
-    if outcome.kind == LoopOutcomeKind.APPROVED:
-        try:
-            merge_pr(
-                repo_path=repo_path,
-                pr_number=pr.number,
-                match_head_commit=outcome.head_sha,
-            )
-            merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
-        except GithubError as e:
-            log.error("merge failed for PR #%d: %s", pr.number, e)
-            emit(
-                "run-terminal",
-                {
-                    "pr_number": pr.number,
-                    "url": pr.url,
-                    "head_sha": outcome.head_sha,
-                    "rounds_used": outcome.rounds_used,
-                    "outcome": LoopOutcomeKind.MERGE_FAILED.value,
-                    "error": str(e),
-                },
-            )
-            outcome = LoopOutcome(
-                kind=LoopOutcomeKind.MERGE_FAILED,
-                rounds_used=outcome.rounds_used,
-                last_session_id=outcome.last_session_id,
-                head_sha=outcome.head_sha,
-            )
-        else:
-            if merged:
-                emit(
-                    "merge",
-                    {
-                        "pr_number": pr.number,
-                        "url": pr.url,
-                        "head_sha": outcome.head_sha,
-                        "rounds_used": outcome.rounds_used,
-                        "outcome": "approved",
-                    },
-                )
-            else:
-                log.warning(
-                    "merge command completed for PR #%d but PR is still open",
-                    pr.number,
-                )
-                emit(
-                    "run-terminal",
-                    {
-                        "pr_number": pr.number,
-                        "url": pr.url,
-                        "head_sha": outcome.head_sha,
-                        "rounds_used": outcome.rounds_used,
-                        "outcome": LoopOutcomeKind.MERGE_PENDING.value,
-                    },
-                )
-                outcome = LoopOutcome(
-                    kind=LoopOutcomeKind.MERGE_PENDING,
-                    rounds_used=outcome.rounds_used,
-                    last_session_id=outcome.last_session_id,
-                    head_sha=outcome.head_sha,
-                )
-    elif outcome.kind != LoopOutcomeKind.AUTO_STUCK_IDLE and outcome.kind != LoopOutcomeKind.AUTO_STUCK_ROUNDS:
-        emit(
-            "run-terminal",
-            {
-                "pr_number": pr.number,
-                "url": pr.url,
-                "head_sha": outcome.head_sha,
-                "rounds_used": outcome.rounds_used,
-                "outcome": outcome.kind.value,
-            },
-        )
+    outcome = await drive_and_merge(pr, initial_session_id=result.session_id)
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,

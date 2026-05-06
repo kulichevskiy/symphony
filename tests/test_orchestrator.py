@@ -276,6 +276,24 @@ def test_select_ready_includes_after_backoff_expires():
     assert [i.number for i in ready] == [1]
 
 
+def test_select_ready_allows_expired_retry_with_open_pr():
+    state = OrchestratorState()
+    state.schedule_retry(1, now=0.0)
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, open_prs={1}, now=15.0)
+    assert [i.number for i in ready] == [1]
+    assert skips == []
+
+
+def test_select_ready_allows_expired_retry_with_local_branch():
+    state = OrchestratorState()
+    state.schedule_retry(1, now=0.0)
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, local_branches={1}, now=15.0)
+    assert [i.number for i in ready] == [1]
+    assert skips == []
+
+
 # ---- run_tick driver ----
 
 

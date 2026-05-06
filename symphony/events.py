@@ -210,6 +210,12 @@ class EventLog:
             last_review_verdict=last_review_verdict,
         )
 
+    def latest_terminal_outcome(self, issue_number: int) -> str:
+        for ev in reversed(self.tail_events(issue_number=issue_number, limit=100)):
+            if ev.kind in TERMINAL_KINDS:
+                return str(ev.payload.get("outcome", ev.kind))
+        return ""
+
     def status_snapshot(
         self,
         *,

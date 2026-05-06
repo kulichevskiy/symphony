@@ -183,16 +183,17 @@ def select_ready(
         if state.is_in_backoff(n, now=now):
             skips.append(DispatchSkip(n, "retry-backoff"))
             continue
+        retry_ready = n in state.retry_queue
         unsatisfied = [
             t for t in graph.get(n, []) if not is_blocker_satisfied(t)
         ]
         if unsatisfied:
             skips.append(DispatchSkip(n, f"blocked-by:{','.join(str(t.number) for t in unsatisfied)}"))
             continue
-        if has_open_pr(n):
+        if has_open_pr(n) and not retry_ready:
             skips.append(DispatchSkip(n, "open-pr-exists"))
             continue
-        if has_local_branch(n):
+        if has_local_branch(n) and not retry_ready:
             skips.append(DispatchSkip(n, "local-branch-exists"))
             continue
         ready.append(issue)

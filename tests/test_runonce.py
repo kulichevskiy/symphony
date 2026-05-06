@@ -325,6 +325,40 @@ async def test_run_once_does_not_emit_merge_until_pr_is_merged(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
+async def test_run_once_retries_prior_merge_failure_without_round1_agent(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={"outcome": "merge_failed", "rounds_used": 0},
+    )
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == existing
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    assert fixture["calls"]["drive_review_loop"]["initial_session_id"] is None
+    assert fixture["calls"]["merge_pr"]["pr_number"] == 42
+    retry_event = event_log.iter_events(issue_number=3)[-2]
+    assert retry_event.kind == "pr-open"
+    assert retry_event.payload["merge_retry"] is True
+
+
+@pytest.mark.asyncio
 async def test_run_once_reuses_existing_pr_on_redispatch(monkeypatch, tmp_path):
     """Regression: re-dispatch with an existing open PR must not call open_pr
     (which would fail with `gh`'s duplicate-PR error and abort before the
