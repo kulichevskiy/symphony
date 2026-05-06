@@ -33,6 +33,7 @@ from .github import (
     view_issue,
 )
 from .prompts import make_env, render
+from .reviewer import LoopOutcome, LoopOutcomeKind, drive_review_loop
 from .workspace import ensure_worktree
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,9 @@ class RunOnceResult:
     skipped: bool
     skip_reason: str | None
     worktree: Path | None
+    # Populated when the review loop ran. `None` means the run skipped before
+    # opening a PR; the CLI uses ``loop_outcome.kind`` to decide its exit code.
+    loop_outcome: LoopOutcome | None = None
 
 
 def _head_sha(worktree: Path) -> str:
@@ -221,10 +225,27 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             body=_build_pr_body(issue),
         )
     comment_pr(repo_path=repo_path, pr_number=pr.number, body="@codex review")
+
+    # Drive the Codex review loop until terminal: APPROVED, AUTO_STUCK_*, or
+    # AGENT_FAILED. The first agent run's session id is threaded in so the
+    # first three review rounds can `--resume` it (cached prefix).
+    outcome = await drive_review_loop(
+        cfg=cfg,
+        issue_number=issue_number,
+        pr_number=pr.number,
+        branch=branch,
+        worktree=worktree,
+        initial_session_id=result.session_id,
+        poll_interval_s=30.0,
+        re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
+        give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
+        round_cap=cfg.orchestrator.review_round_cap,
+    )
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,
         skipped=False,
         skip_reason=None,
         worktree=worktree,
+        loop_outcome=outcome,
     )

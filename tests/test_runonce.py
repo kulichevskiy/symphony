@@ -179,6 +179,20 @@ def _patch_happy_path(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
     )
 
+    # Stub the review loop so existing tests don't have to thread its inputs.
+    from symphony.reviewer import LoopOutcome, LoopOutcomeKind
+
+    async def _fake_loop(**kw):
+        calls["drive_review_loop"] = kw
+        return LoopOutcome(
+            kind=LoopOutcomeKind.APPROVED,
+            rounds_used=0,
+            last_session_id=kw.get("initial_session_id"),
+            head_sha="head-sha",
+        )
+
+    monkeypatch.setattr(ro_mod, "drive_review_loop", _fake_loop)
+
     return {"calls": calls, "config_path": config_path, "cfg": cfg, "wt": wt, "pr": pr}
 
 
@@ -231,6 +245,15 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     # @codex review nudge posted
     assert calls["comment_pr"]["pr_number"] == 99
     assert calls["comment_pr"]["body"] == "@codex review"
+
+    # Review loop ran with the cfg-derived timers and the agent's session id.
+    loop_kwargs = calls["drive_review_loop"]
+    assert loop_kwargs["pr_number"] == 99
+    assert loop_kwargs["branch"] == "auto/3"
+    # Round cap, re-nudge and give-up timers are derived from cfg.
+    assert loop_kwargs["round_cap"] == fixture["cfg"].orchestrator.review_round_cap
+    assert loop_kwargs["re_nudge_after_s"] == fixture["cfg"].orchestrator.codex_renudge_after_min * 60.0
+    assert loop_kwargs["give_up_after_s"] == fixture["cfg"].orchestrator.codex_giveup_after_min * 60.0
 
     # Auto-merge intentionally NOT armed at PR-open: M3's review loop fires
     # the merge directly once Codex approves and CI is green. Arming here
