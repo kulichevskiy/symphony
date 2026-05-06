@@ -10,10 +10,11 @@ Pure verdict logic is testable without touching the network, the clock, or
 
 Verdict mapping per SYMPHONY.md M0 spike findings:
 
-- **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
-  the PR with ``created_at`` after the HEAD commit's committer date, AND no
-  fresh ``CHANGES_REQUESTED`` signal on HEAD. A non-Codex reviewer's
-  ``APPROVED`` review on HEAD also counts.
+- **APPROVED** = every required CI check is passing, plus either a fresh ``+1``
+  reaction by ``chatgpt-codex-connector[bot]`` on the PR with ``created_at``
+  after the HEAD commit's committer date, or a non-Codex reviewer's
+  ``APPROVED`` review on HEAD. No fresh ``CHANGES_REQUESTED`` signal may exist
+  on HEAD.
 - **CHANGES_REQUESTED** = (a) any failing CI check on HEAD, (b) any inline
   Codex review comment on HEAD, (c) a Codex ``COMMENTED`` review on HEAD whose
   body is substantively longer than the standard "About Codex in GitHub"
@@ -107,7 +108,8 @@ def evaluate_verdict(
     fresh_comments = [c for c in review_comments if c.commit_sha == head_sha]
 
     # 1. CI failures take priority — they're concrete, fast feedback that
-    #    Codex review can't override.
+    #    Codex review can't override. Other non-passing checks are not
+    #    actionable agent feedback, but they must block approval/merge.
     failing_checks = [c for c in checks if c.bucket == "fail"]
     if failing_checks:
         return Verdict(
@@ -115,6 +117,7 @@ def evaluate_verdict(
             review_comments=[c for c in fresh_comments if c.user_login == codex_login],
             ci_failures=failing_checks,
         )
+    non_passing_checks = [c for c in checks if c.bucket != "pass"]
 
     # 2. Explicit human verdicts on HEAD trump everything else. Reviews come
     #    back oldest-first; collapse them into one effective verdict per
@@ -147,6 +150,8 @@ def evaluate_verdict(
             last_review_body=latest_cr.body if latest_cr else "",
         )
     if any(v == "APPROVED" for v in human_verdicts.values()):
+        if non_passing_checks:
+            return Verdict(kind=VerdictKind.PENDING)
         return Verdict(kind=VerdictKind.APPROVED)
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
@@ -180,7 +185,12 @@ def evaluate_verdict(
             last_review_body=codex_substantive[-1].body,
         )
 
-    # 5. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
+    # 5. Required checks that are still pending/skipping/cancelled block
+    #    approval but do not trigger remediation.
+    if non_passing_checks:
+        return Verdict(kind=VerdictKind.PENDING)
+
+    # 6. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
     #    committer time, otherwise it's stale (referring to an earlier
     #    commit that's since been replaced).
     head_dt = _parse_iso(head_committed_at)

@@ -135,6 +135,40 @@ def test_in_progress_check_is_not_failure():
     assert v.kind == VerdictKind.PENDING
 
 
+@pytest.mark.parametrize(
+    ("bucket", "state"),
+    [
+        ("pending", "IN_PROGRESS"),
+        ("cancel", "CANCELLED"),
+        ("skipping", "SKIPPED"),
+    ],
+)
+def test_non_passing_required_check_blocks_codex_approval(bucket, state):
+    v = _eval(
+        checks=[_check(name="test", bucket=bucket, state=state)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_non_passing_required_check_blocks_human_approval():
+    v = _eval(
+        checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")],
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_pending_required_check_does_not_hide_actionable_codex_comment():
+    c = _comment()
+    v = _eval(
+        checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")],
+        review_comments=[c],
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.review_comments == [c]
+
+
 def test_failing_ci_takes_priority_over_codex_approval_reaction():
     v = _eval(
         checks=[_check(name="test", bucket="fail", state="FAILURE")],
@@ -149,6 +183,14 @@ def test_failing_ci_takes_priority_over_codex_approval_reaction():
 def test_codex_plus_one_reaction_on_head_is_approved():
     v = _eval(
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_codex_plus_one_with_passing_required_check_is_approved():
+    v = _eval(
+        checks=[_check(name="test", bucket="pass", state="SUCCESS")],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.APPROVED
 
