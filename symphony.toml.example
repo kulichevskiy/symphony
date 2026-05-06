@@ -1,0 +1,29 @@
+# Example Symphony configuration. Copy to symphony.toml and edit for your repo.
+# `$VAR` values are resolved from the environment at load time; an unset var
+# raises a clear error rather than silently falling back.
+
+[repo]
+path = "/Users/ak/Code/some-project"
+default_branch = "main"
+
+[github]
+label = "auto"
+
+[git]
+author_name = "Symphony"
+author_email = "alexey.kulichevskiy+symphony@adjust.com"
+
+[orchestrator]
+poll_interval_s = 60
+max_concurrent = 3
+review_round_cap = 10
+codex_renudge_after_min = 10
+codex_giveup_after_min = 30
+
+[agent]
+model = "claude-opus-4-7"
+max_turns = 50
+
+[paths]
+worktree_root = "/Users/ak/Code/symphony-worktrees"
+prompts_dir = "./prompts"
