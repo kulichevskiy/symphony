@@ -213,7 +213,7 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
                 branch=branch,
                 worktree=worktree,
                 initial_session_id=result.session_id,
-                poll_interval_s=30.0,
+                poll_interval_s=cfg.orchestrator.poll_interval_s,
                 re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
                 give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
                 round_cap=cfg.orchestrator.review_round_cap,

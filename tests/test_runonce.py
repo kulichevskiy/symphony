@@ -382,6 +382,10 @@ async def test_run_once_reviews_existing_pr_on_empty_redispatch(monkeypatch, tmp
     assert res.pr == existing
     assert res.loop_outcome is not None
     assert fixture["calls"]["drive_review_loop"]["pr_number"] == 42
+    assert (
+        fixture["calls"]["drive_review_loop"]["poll_interval_s"]
+        == fixture["cfg"].orchestrator.poll_interval_s
+    )
     assert "push" not in fixture["calls"]
     assert "open_pr" not in fixture["calls"]
     assert "comment_pr" not in fixture["calls"]
