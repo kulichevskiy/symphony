@@ -19,6 +19,58 @@ def test_help_lists_agent_run():
     assert "agent-run" in result.output
 
 
+def test_help_lists_run_once():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "run-once" in result.output
+
+
+def test_run_once_invokes_orchestrator(tmp_path, monkeypatch):
+    from symphony.github import PR
+    from symphony.runonce import RunOnceResult
+
+    captured: dict = {}
+
+    async def fake_run_once(*, issue_number, config_path):
+        captured["issue_number"] = issue_number
+        captured["config_path"] = config_path
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=PR(number=99, url="https://x/pr/99"),
+            skipped=False,
+            skip_reason=None,
+            worktree=tmp_path,
+        )
+
+    monkeypatch.setattr("symphony.cli.run_once", fake_run_once)
+    cfg = tmp_path / "symphony.toml"
+    cfg.write_text("# stub\n")
+    result = runner.invoke(app, ["run-once", "3", "--config", str(cfg)])
+    assert result.exit_code == 0, result.output
+    assert "https://x/pr/99" in result.output
+    assert captured["issue_number"] == 3
+    assert captured["config_path"] == cfg
+
+
+def test_run_once_skipped_exits_nonzero(tmp_path, monkeypatch):
+    from symphony.runonce import RunOnceResult
+
+    async def fake_run_once(*, issue_number, config_path):
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=True,
+            skip_reason="empty-diff",
+            worktree=tmp_path,
+        )
+
+    monkeypatch.setattr("symphony.cli.run_once", fake_run_once)
+    cfg = tmp_path / "symphony.toml"
+    cfg.write_text("# stub\n")
+    result = runner.invoke(app, ["run-once", "3", "--config", str(cfg)])
+    assert result.exit_code != 0
+
+
 def test_agent_run_invokes_runner(tmp_path, monkeypatch):
     captured: dict = {}
 

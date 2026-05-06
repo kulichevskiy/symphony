@@ -13,6 +13,7 @@ from .agent import (
     run_agent,
 )
 from .logging_setup import configure_logging
+from .runonce import run_once
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 log = structlog.get_logger()
@@ -105,3 +106,27 @@ def agent_run(
         if result.stderr:
             typer.echo(result.stderr, err=True)
         raise typer.Exit(result.exit_code if result.exit_code != 0 else 1)
+
+
+@app.command("run-once")
+def run_once_cmd(
+    issue_number: Annotated[int, typer.Argument(help="GitHub issue number to dispatch")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+            exists=False,
+        ),
+    ] = Path("symphony.toml"),
+) -> None:
+    """End-to-end one-shot for a single issue: agent run → PR open → arm auto-merge."""
+    log.info("runonce.start", issue=issue_number, config=str(config))
+    result = asyncio.run(run_once(issue_number=issue_number, config_path=config))
+    if result.skipped:
+        log.error("runonce.skipped", issue=issue_number, reason=result.skip_reason)
+        raise typer.Exit(1)
+    assert result.pr is not None  # for type-checkers; orchestrator guarantees this
+    log.info("runonce.done", issue=issue_number, pr=result.pr.url)
+    typer.echo(result.pr.url)
