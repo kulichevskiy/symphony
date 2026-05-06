@@ -22,10 +22,25 @@ MAX_BACKOFF_S = 300.0
 
 
 def compute_backoff(attempt: int) -> float:
-    """Seconds to wait before retrying after the ``attempt``-th failure (1-indexed)."""
+    """Seconds to wait before retrying after the ``attempt``-th failure (1-indexed).
+
+    The exponent is capped before the shift so a long-running failure loop
+    (which can rack up thousands of attempts at the 5-minute ceiling) can't
+    overflow ``2 ** (attempt - 1)`` into Python's float-conversion limit.
+    Once the exponent is large enough that the unclamped delay exceeds
+    ``MAX_BACKOFF_S``, the answer is constant — there's no point computing
+    the giant power.
+    """
     if attempt <= 0:
         raise ValueError(f"attempt must be >= 1, got {attempt}")
-    return min(BASE_BACKOFF_S * (2 ** (attempt - 1)), MAX_BACKOFF_S)
+    exponent = min(attempt - 1, _BACKOFF_EXPONENT_CAP)
+    return min(BASE_BACKOFF_S * (2 ** exponent), MAX_BACKOFF_S)
+
+
+# Smallest exponent at which `BASE_BACKOFF_S * 2**exponent >= MAX_BACKOFF_S`,
+# i.e. the point past which `min(..., MAX_BACKOFF_S)` would clamp anyway.
+# Computed at import time so the bound stays correct if the constants change.
+_BACKOFF_EXPONENT_CAP = max(0, int(MAX_BACKOFF_S / BASE_BACKOFF_S).bit_length())
 
 
 @dataclass

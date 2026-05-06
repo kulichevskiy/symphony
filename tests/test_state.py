@@ -39,6 +39,14 @@ def test_backoff_rejects_zero_and_negative():
         compute_backoff(-1)
 
 
+def test_backoff_does_not_overflow_at_huge_attempt_counts():
+    """A long-running failure loop can rack up thousands of attempts at the
+    5-minute ceiling; the function must not raise ``OverflowError`` from
+    ``2 ** (attempt - 1)`` and must keep returning the capped delay."""
+    assert compute_backoff(2_000) == MAX_BACKOFF_S
+    assert compute_backoff(1_000_000) == MAX_BACKOFF_S
+
+
 # ---- OrchestratorState ----
 
 

@@ -176,12 +176,18 @@ def view_issue(number: int, *, repo_path: Path) -> Issue:
 
 
 def list_open_issues_with_label(
-    label: str, *, repo_path: Path, limit: int = 100
+    label: str, *, repo_path: Path, limit: int = 1000
 ) -> list[Issue]:
     """All open issues carrying ``label``, with the same shape as ``view_issue``.
 
     Used by the orchestrator's poll loop to find candidates. ``createdAt``
     drives the FIFO selection so the oldest ready issue dispatches first.
+
+    ``gh issue list --limit`` is a fetch cap on the most-recent items: with
+    the previous default of 100, an ``auto`` backlog larger than that would
+    silently starve older issues (the FIFO sort only applied within the
+    truncated subset). The default is now high enough to cover any realistic
+    personal-autopilot backlog; bump explicitly if you really do have more.
     """
     out = _run_gh(
         [

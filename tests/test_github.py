@@ -126,12 +126,19 @@ def test_list_open_issues_with_label_parses_json(monkeypatch, tmp_path):
             "createdAt": "2026-05-01T00:00:00Z",
         },
     ]
-    monkeypatch.setattr(gh_mod, "_run_gh", _stub({("issue", "list"): json.dumps(payload)}))
+    fake = _stub({("issue", "list"): json.dumps(payload)})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
     issues = list_open_issues_with_label("auto", repo_path=tmp_path)
     assert [i.number for i in issues] == [1, 2]
     assert issues[0].created_at == "2026-04-01T00:00:00Z"
     assert issues[1].labels == ["auto", "p2"]
     assert issues[1].comments[0].author == "ak"
+    # Default limit must be high enough to cover a realistic auto backlog —
+    # `gh issue list --limit` is a fetch cap, so a too-small default
+    # silently starves older items past the cap.
+    [argv] = fake.calls
+    limit_arg = argv[argv.index("--limit") + 1]
+    assert int(limit_arg) >= 1000
 
 
 def test_view_issue_handles_null_comment_author(monkeypatch, tmp_path):
