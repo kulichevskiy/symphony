@@ -552,29 +552,48 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 
 
 def test_list_pr_checks(monkeypatch, tmp_path):
-    payload = [
+    page1 = [
         {"name": "build", "status": "completed", "conclusion": "success", "details_url": "https://ci/build"},
+    ]
+    page2 = [
         {"name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://ci/test"},
         {"name": "lint", "status": "in_progress", "conclusion": None, "details_url": None},
+    ]
+    statuses = [
+        {"context": "deploy", "state": "success", "target_url": "https://ci/deploy"},
+        {"context": "external", "state": "pending", "target_url": None},
+        {"context": "legacy", "state": "error", "target_url": "https://ci/legacy"},
     ]
     fake = _stub(
         {
             ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
             ("pr", "view", "10"): json.dumps({"headRefOid": "abc123"}),
             ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
-                {"check_runs": payload}
+                [{"check_runs": page1}, {"check_runs": page2}]
+            ),
+            ("api", "repos/o/r/commits/abc123/status"): json.dumps(
+                {"statuses": statuses}
             ),
         }
     )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
-    assert len(checks) == 3
+    assert len(checks) == 6
     assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
     assert checks[2].conclusion is None
+    assert checks[3] == CheckRun(name="deploy", status="completed", conclusion="success", details_url="https://ci/deploy")
+    assert checks[4] == CheckRun(name="external", status="in_progress", conclusion=None, details_url=None)
+    assert checks[5] == CheckRun(name="legacy", status="completed", conclusion="failure", details_url="https://ci/legacy")
     assert fake.calls == [
         ["repo", "view", "--json", "nameWithOwner"],
         ["pr", "view", "10", "--json", "headRefOid"],
-        ["api", "repos/o/r/commits/abc123/check-runs?per_page=100"],
+        [
+            "api",
+            "repos/o/r/commits/abc123/check-runs?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+        ["api", "repos/o/r/commits/abc123/status"],
     ]
 
 

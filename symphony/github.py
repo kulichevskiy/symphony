@@ -499,20 +499,51 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
     """CI check runs on the PR's HEAD commit."""
     owner, name = _name_with_owner(repo_path)
     sha = get_pr_head_sha(pr_number, repo_path=repo_path)
-    out = _run_gh(
-        ["api", f"repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100"],
+    check_runs_out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
         cwd=repo_path,
     )
-    data = _parse_json(out, context=f"checks for PR {pr_number}")
-    return [
+    check_run_pages = _parse_json(
+        check_runs_out, context=f"check runs for PR {pr_number}"
+    )
+    status_out = _run_gh(
+        ["api", f"repos/{owner}/{name}/commits/{sha}/status"],
+        cwd=repo_path,
+    )
+    status_data = _parse_json(status_out, context=f"status contexts for PR {pr_number}")
+
+    checks = [
         CheckRun(
             name=c.get("name", ""),
             status=c.get("status", ""),
             conclusion=c.get("conclusion") or None,
             details_url=c.get("details_url") or None,
         )
-        for c in data.get("check_runs", [])
+        for page in check_run_pages
+        for c in page.get("check_runs", [])
     ]
+    for status in status_data.get("statuses", []):
+        state = str(status.get("state") or "").lower()
+        if state == "success":
+            check_status, conclusion = "completed", "success"
+        elif state in {"error", "failure"}:
+            check_status, conclusion = "completed", "failure"
+        else:
+            check_status, conclusion = "in_progress", None
+        checks.append(
+            CheckRun(
+                name=status.get("context", ""),
+                status=check_status,
+                conclusion=conclusion,
+                details_url=status.get("target_url") or None,
+            )
+        )
+    return checks
 
 
 def label_issue(number: int, label: str, *, repo_path: Path) -> None:
