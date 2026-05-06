@@ -418,6 +418,63 @@ def _branch_check_remote_tracking(repo: Path, branch: str) -> bool:
     ).returncode == 0
 
 
+def test_ensure_worktree_does_not_rewrite_checked_out_branch(tmp_path):
+    """Regression: update-ref must not move a branch checked out in repo_path."""
+    repo, bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+
+    _run(["git", "checkout", "-b", "auto/55"], cwd=repo)
+    (repo / "first.txt").write_text("first\n")
+    _run(["git", "add", "first.txt"], cwd=repo)
+    _run(["git", "commit", "-m", "first"], cwd=repo)
+    _run(["git", "push", "-u", "origin", "auto/55"], cwd=repo)
+    local_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    other = tmp_path / "other"
+    _run(["git", "clone", str(bare), str(other)], cwd=tmp_path)
+    _run(["git", "config", "user.email", "test@example.com"], cwd=other)
+    _run(["git", "config", "user.name", "Test"], cwd=other)
+    _run(["git", "checkout", "auto/55"], cwd=other)
+    (other / "second.txt").write_text("second\n")
+    _run(["git", "add", "second.txt"], cwd=other)
+    _run(["git", "commit", "-m", "second"], cwd=other)
+    _run(["git", "push", "origin", "auto/55"], cwd=other)
+
+    with pytest.raises(WorkspaceError, match="git worktree add failed"):
+        ensure_worktree(
+            repo_path=repo,
+            worktree_root=wt_root,
+            repo_name="symphony",
+            issue_number=55,
+            base_branch="main",
+            author_name="Symphony",
+            author_email="sym@example.com",
+        )
+
+    head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head_after == local_sha
+    status = subprocess.run(
+        ["git", "status", "--short"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert status == ""
+
+
 def test_ensure_worktree_fast_forwards_local_to_remote_tip(tmp_path):
     """Regression: when local `auto/<n>` is behind `origin/auto/<n>` (another
     clone advanced the remote since we last fetched), `ensure_worktree` must

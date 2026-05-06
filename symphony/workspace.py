@@ -139,6 +139,11 @@ def _worktree_exists(repo_path: Path, target: Path) -> bool:
     return False
 
 
+def _branch_checked_out(repo_path: Path, branch: str) -> bool:
+    res = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
+    return f"branch refs/heads/{branch}" in res.stdout.splitlines()
+
+
 def ensure_worktree(
     *,
     repo_path: Path,
@@ -176,12 +181,14 @@ def ensure_worktree(
     # would have the agent run on out-of-date history and the subsequent
     # `git push` would be rejected as non-fast-forward. Skipped when the
     # branch is currently checked out in a worktree (you can't update a
-    # checked-out branch via `update-ref`); the worktree-reuse path below
-    # handles that case via `git switch` + the agent's later commits.
+    # checked-out branch via `update-ref` without leaving that checkout's
+    # index/worktree inconsistent); the worktree-reuse path below handles
+    # the target-worktree case via `git switch` + the agent's later commits.
     if (
         has_branch
         and has_remote_branch
         and not has_worktree
+        and not _branch_checked_out(repo_path, branch)
         and _is_ancestor(repo_path, branch, f"origin/{branch}")
     ):
         try:
