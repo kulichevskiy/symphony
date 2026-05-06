@@ -221,6 +221,24 @@ async def test_run_agent_calls_on_event(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_detaches_stdin(tmp_path):
+    """Regression: subprocess must not inherit parent stdin.
+
+    `claude -p` reads stdin; if Symphony is launched in a pipeline or under
+    a supervisor that keeps stdin open, the agent can consume unrelated
+    bytes or block on EOF.
+    """
+    import asyncio as _asyncio
+
+    proc = _FakeProcess(
+        [b'{"type":"result","is_error":false,"session_id":"x"}\n'], exit_code=0
+    )
+    spawner = _make_spawner(proc)
+    await run_agent("hi", tmp_path, spawner=spawner)
+    assert spawner.captured["kwargs"].get("stdin") == _asyncio.subprocess.DEVNULL
+
+
+@pytest.mark.asyncio
 async def test_run_agent_passes_high_stdout_limit(tmp_path):
     """Regression: subprocess stream limit must be raised above the asyncio
     default (64KiB) so a single oversized `result` line doesn't blow up the

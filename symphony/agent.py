@@ -128,6 +128,7 @@ async def run_agent(
     proc = await spawn(
         *argv,
         cwd=str(workdir),
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=STDOUT_LIMIT,
