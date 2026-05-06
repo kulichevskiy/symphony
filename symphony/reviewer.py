@@ -55,7 +55,7 @@ CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # that with a comfortable margin so a body of "boilerplate + tiny addendum"
 # isn't mistaken for substantive feedback.
 CODEX_BOILERPLATE_THRESHOLD = 750
-FAILED_CHECK_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required"}
+NON_FAILURE_CHECK_CONCLUSIONS = {"success", "neutral", "skipped"}
 
 
 class VerdictKind(StrEnum):
@@ -112,7 +112,9 @@ def evaluate_verdict(
     failing_checks = [
         c
         for c in checks
-        if c.status == "completed" and c.conclusion in FAILED_CHECK_CONCLUSIONS
+        if c.status == "completed"
+        and c.conclusion is not None
+        and c.conclusion not in NON_FAILURE_CHECK_CONCLUSIONS
     ]
     if failing_checks:
         return Verdict(

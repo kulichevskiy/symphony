@@ -170,6 +170,19 @@ def test_cancelled_ci_check_is_changes_requested():
     assert v.ci_failures[0].name == "test"
 
 
+@pytest.mark.parametrize("conclusion", ["startup_failure", "stale"])
+def test_other_failing_ci_conclusions_are_changes_requested(conclusion):
+    v = _eval(checks=[_check(name="test", conclusion=conclusion)])
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].conclusion == conclusion
+
+
+@pytest.mark.parametrize("conclusion", ["success", "neutral", "skipped"])
+def test_non_failing_ci_conclusions_are_not_changes_requested(conclusion):
+    v = _eval(checks=[_check(name="test", conclusion=conclusion)])
+    assert v.kind == VerdictKind.PENDING
+
+
 def test_in_progress_check_is_not_failure():
     v = _eval(checks=[_check(name="test", status="in_progress", conclusion=None)])
     assert v.kind == VerdictKind.PENDING
