@@ -241,6 +241,77 @@ def test_tracked_issues_parses_graphql(monkeypatch, tmp_path):
     ]
 
 
+def test_tracked_issues_paginates_graphql(monkeypatch, tmp_path):
+    repo_payload = {"nameWithOwner": "owner/name"}
+    pages = [
+        {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "trackedIssues": {
+                            "nodes": [
+                                {
+                                    "number": 1,
+                                    "title": "first page",
+                                    "state": "CLOSED",
+                                    "stateReason": "COMPLETED",
+                                    "closedByPullRequestsReferences": {"nodes": []},
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "cursor-1",
+                            },
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "trackedIssues": {
+                            "nodes": [
+                                {
+                                    "number": 101,
+                                    "title": "second page",
+                                    "state": "OPEN",
+                                    "stateReason": None,
+                                    "closedByPullRequestsReferences": {"nodes": []},
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        }
+                    }
+                }
+            }
+        },
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args, *, cwd=None):  # type: ignore[no-untyped-def]
+        calls.append(list(args))
+        if args[:2] == ["repo", "view"]:
+            return json.dumps(repo_payload)
+        if args[:2] == ["api", "graphql"]:
+            return json.dumps(pages.pop(0))
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(gh_mod, "_run_gh", fake_run_gh)
+
+    results = tracked_issues(3, repo_path=tmp_path)
+
+    assert [r.number for r in results] == [1, 101]
+    graphql_calls = [c for c in calls if c[:2] == ["api", "graphql"]]
+    assert len(graphql_calls) == 2
+    assert not any(a.startswith("after=") for a in graphql_calls[0])
+    assert "after=cursor-1" in graphql_calls[1]
+
+
 def test_open_pr_invokes_gh_create_and_returns_pr(monkeypatch, tmp_path):
     fake = _stub(
         {
