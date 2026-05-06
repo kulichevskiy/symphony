@@ -73,6 +73,52 @@ class PR:
     url: str
 
 
+@dataclass(frozen=True)
+class Review:
+    """A pull-request review submission. ``state`` is the GitHub review state
+    (``APPROVED``, ``CHANGES_REQUESTED``, ``COMMENTED``). ``commit_sha`` is the
+    HEAD the reviewer was looking at — used to ignore stale reviews."""
+
+    id: int
+    user_login: str
+    state: str
+    body: str
+    commit_sha: str
+    submitted_at: str
+
+
+@dataclass(frozen=True)
+class ReviewComment:
+    """An inline (line-level) review comment on a PR diff."""
+
+    id: int
+    user_login: str
+    path: str
+    line: int | None
+    body: str
+    commit_sha: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Reaction:
+    """A reaction on the PR's underlying issue (Codex's ``+1`` lives here)."""
+
+    user_login: str
+    content: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CheckRun:
+    """One CI check run on the PR's HEAD commit."""
+
+    name: str
+    status: str
+    conclusion: str | None
+    details_url: str | None
+
+
 def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
     """Run ``gh`` with the given args and return stdout.
 
@@ -278,3 +324,121 @@ def arm_auto_merge(
         ["pr", "merge", str(pr_number), "--auto", flag, "--delete-branch"],
         cwd=repo_path,
     )
+
+
+def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
+    out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "headRefOid"], cwd=repo_path
+    )
+    data = _parse_json(out, context=f"gh pr view {pr_number}")
+    sha = data.get("headRefOid", "")
+    if not sha:
+        raise GithubError(f"PR #{pr_number} has no headRefOid")
+    return sha
+
+
+def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
+    """All review submissions on a PR, oldest first."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/reviews", "--paginate"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"reviews for PR {pr_number}")
+    return [
+        Review(
+            id=int(r.get("id", 0)),
+            user_login=(r.get("user") or {}).get("login", ""),
+            state=r.get("state", ""),
+            body=r.get("body") or "",
+            commit_sha=r.get("commit_id", ""),
+            submitted_at=r.get("submitted_at", ""),
+        )
+        for r in data
+    ]
+
+
+def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewComment]:
+    """All inline (line-level) review comments on a PR's diff."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        ["api", f"repos/{owner}/{name}/pulls/{pr_number}/comments", "--paginate"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"review comments for PR {pr_number}")
+    return [
+        ReviewComment(
+            id=int(c.get("id", 0)),
+            user_login=(c.get("user") or {}).get("login", ""),
+            path=c.get("path", ""),
+            line=c.get("line"),
+            body=c.get("body") or "",
+            commit_sha=c.get("commit_id", ""),
+            created_at=c.get("created_at", ""),
+        )
+        for c in data
+    ]
+
+
+def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
+    """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        ["api", f"repos/{owner}/{name}/issues/{pr_number}/reactions", "--paginate"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"reactions for PR {pr_number}")
+    return [
+        Reaction(
+            user_login=(r.get("user") or {}).get("login", ""),
+            content=r.get("content", ""),
+            created_at=r.get("created_at", ""),
+        )
+        for r in data
+    ]
+
+
+def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
+    """CI check runs on the PR's HEAD commit (`gh pr checks`)."""
+    out = _run_gh(
+        [
+            "pr",
+            "checks",
+            str(pr_number),
+            "--json",
+            "name,status,conclusion,detailsUrl",
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"checks for PR {pr_number}")
+    return [
+        CheckRun(
+            name=c.get("name", ""),
+            status=c.get("status", ""),
+            conclusion=c.get("conclusion") or None,
+            details_url=c.get("detailsUrl") or None,
+        )
+        for c in data
+    ]
+
+
+def label_issue(number: int, label: str, *, repo_path: Path) -> None:
+    """Add ``label`` to the issue (or PR) with the given number. Idempotent."""
+    _run_gh(
+        ["issue", "edit", str(number), "--add-label", label], cwd=repo_path
+    )
+
+
+def get_commit_committed_at(sha: str, *, repo_path: Path) -> str:
+    """ISO timestamp for ``sha``'s committer date — used to gate Codex's
+    ``+1`` reaction (only count reactions newer than the commit they
+    presumably refer to)."""
+    owner, name = _name_with_owner(repo_path)
+    out = _run_gh(
+        ["api", f"repos/{owner}/{name}/commits/{sha}"], cwd=repo_path
+    )
+    data = _parse_json(out, context=f"commit {sha}")
+    try:
+        return data["commit"]["committer"]["date"]
+    except (KeyError, TypeError) as e:
+        raise GithubError(f"missing committer.date for {sha}") from e
