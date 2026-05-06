@@ -77,15 +77,16 @@ def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
     - any other error (network, auth) → raise :class:`WorkspaceError` loudly
       rather than fall through to a wrong "false" answer.
     """
+    remote_ref = f"refs/heads/{branch}"
     ls = subprocess.run(
-        ["git", "ls-remote", "--exit-code", "--heads", "origin", branch],
+        ["git", "ls-remote", "--exit-code", "origin", remote_ref],
         cwd=repo_path,
         capture_output=True,
         text=True,
     )
     if ls.returncode == 0:
         fetch = subprocess.run(
-            ["git", "fetch", "origin", f"+{branch}:refs/remotes/origin/{branch}"],
+            ["git", "fetch", "origin", f"+{remote_ref}:refs/remotes/origin/{branch}"],
             cwd=repo_path,
             capture_output=True,
             text=True,

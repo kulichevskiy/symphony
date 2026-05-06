@@ -410,6 +410,17 @@ def test_remote_branch_exists_refreshes_force_pushed_branch(tmp_path):
     assert refreshed_sha == new_sha
 
 
+def test_remote_branch_exists_ignores_tail_matched_branch(tmp_path):
+    """Regression: `auto/<n>` must not match `foo/auto/<n>` on origin."""
+    from symphony.workspace import _remote_branch_exists
+
+    repo, _bare = _init_origin_repo(tmp_path)
+    _run(["git", "push", "origin", "main:refs/heads/foo/auto/99"], cwd=repo)
+
+    assert _remote_branch_exists(repo, "auto/99") is False
+    assert not _branch_check_remote_tracking(repo, "auto/99")
+
+
 def _branch_check_remote_tracking(repo: Path, branch: str) -> bool:
     return subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
