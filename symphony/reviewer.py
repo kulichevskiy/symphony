@@ -20,6 +20,9 @@ Verdict mapping per SYMPHONY.md M0 spike findings:
   body is substantively longer than the standard "About Codex in GitHub"
   boilerplate, or (d) a non-Codex ``CHANGES_REQUESTED`` review on HEAD.
 - **PENDING** = none of the above, or approval exists while CI is still pending.
+  When required-check metadata is unavailable, completed CI failures still
+  request changes, but pending checks with unknown requiredness do not block
+  approval forever.
 """
 
 from __future__ import annotations
@@ -110,10 +113,11 @@ def evaluate_verdict(
 
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
-    required_checks = [c for c in checks if c.required]
+    required_checks = [c for c in checks if c.required is True]
+    required_or_unknown_checks = [c for c in checks if c.required is not False]
     failing_checks = [
         c
-        for c in required_checks
+        for c in required_or_unknown_checks
         if c.status == "completed" and c.conclusion == "failure"
     ]
     if failing_checks:

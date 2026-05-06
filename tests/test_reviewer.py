@@ -142,6 +142,12 @@ def test_in_progress_check_is_not_failure():
     assert v.kind == VerdictKind.PENDING
 
 
+def test_unknown_failing_check_is_changes_requested():
+    v = _eval(checks=[_check(name="test", conclusion="failure", required=None)])
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].name == "test"
+
+
 def test_pending_check_blocks_codex_approval_reaction():
     v = _eval(
         checks=[_check(name="test", status="in_progress", conclusion=None)],
@@ -158,6 +164,21 @@ def test_optional_pending_check_does_not_block_codex_approval_reaction():
                 status="in_progress",
                 conclusion=None,
                 required=False,
+            )
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_unknown_pending_check_does_not_block_codex_approval_reaction():
+    v = _eval(
+        checks=[
+            _check(
+                name="deploy",
+                status="in_progress",
+                conclusion=None,
+                required=None,
             )
         ],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],

@@ -124,7 +124,7 @@ class CheckRun:
     conclusion: str | None
     details_url: str | None
     app_id: int | None = None
-    required: bool = True
+    required: bool | None = True
 
 
 @dataclass(frozen=True)
@@ -505,9 +505,9 @@ def _is_required_check(
     name: str,
     app_id: int | None,
     required_checks: tuple[RequiredStatusCheck, ...] | None,
-) -> bool:
+) -> bool | None:
     if required_checks is None:
-        return True
+        return None
     return _matches_required_check(name, app_id, required_checks)
 
 
