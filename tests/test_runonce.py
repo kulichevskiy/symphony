@@ -2,7 +2,7 @@
 
 Covers the M2 happy path and the empty-diff / failed-exit guards. We patch the
 network-touching helpers (`view_issue`, `tracked_issues`, `name_with_owner`,
-`open_pr`, `comment_pr`, `merge_pr`), the worktree helper
+`open_pr`, `comment_pr`), the worktree helper
 (`ensure_worktree`), the agent runner (`run_agent`), and the local git helpers
 (`_commits_ahead`, `_git_push`) so the orchestration logic itself is what we
 exercise.
@@ -179,9 +179,6 @@ def _patch_happy_path(
     monkeypatch.setattr(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
     )
-    monkeypatch.setattr(
-        ro_mod, "merge_pr", lambda **kw: calls.setdefault("merge_pr", kw)
-    )
 
     # Stub the review loop so existing tests don't have to thread its inputs.
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind
@@ -262,14 +259,9 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     assert loop_kwargs["re_nudge_after_s"] == fixture["cfg"].orchestrator.codex_renudge_after_min * 60.0
     assert loop_kwargs["give_up_after_s"] == fixture["cfg"].orchestrator.codex_giveup_after_min * 60.0
 
-    # Auto-merge is not armed at PR-open. Once the review loop approves,
-    # Symphony fires the merge directly.
-    assert calls["merge_pr"] == {
-        "repo_path": fixture["cfg"].repo.path,
-        "pr_number": 99,
-        "method": "squash",
-        "match_head_sha": "head-sha",
-    }
+    # Auto-merge is not armed at PR-open. The review loop owns final merge
+    # handling once Codex/CI approval is observed.
+    assert "merge_pr" not in calls
 
 
 @pytest.mark.asyncio
@@ -340,8 +332,9 @@ async def test_run_once_skips_when_origin_already_at_head(monkeypatch, tmp_path)
     """Regression for the previously-pushed re-dispatch case: a branch that
     was already pushed and the agent makes no further commits. ``HEAD`` is
     still ahead of ``origin/<base>`` (it has the prior feature commit), but
-    ``HEAD == origin/<branch>`` so there's nothing new to push. The run must
-    skip — otherwise we'd post a redundant @codex review for the same SHA.
+    ``HEAD == origin/<branch>`` so there's nothing new to push. When no PR is
+    open, the run must skip — otherwise we'd post a redundant @codex review for
+    the same SHA.
 
     The fixture sets ``to_push=0`` (the helper compares against
     ``origin/<branch>`` when that ref exists, so an in-sync branch is 0).
@@ -357,6 +350,44 @@ async def test_run_once_skips_when_origin_already_at_head(monkeypatch, tmp_path)
     assert res.skipped is True
     assert res.skip_reason == "empty-diff"
     assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_reviews_existing_pr_on_empty_redispatch(monkeypatch, tmp_path):
+    """A no-op redispatch can still need to observe/merge the open PR.
+
+    Review-loop outcomes like idle/stuck are retried by the orchestrator, and
+    Codex or CI may approve the existing head before the retry runs. In that
+    case run_once must evaluate the open PR instead of returning empty-diff.
+    """
+    fixture = _patch_happy_path(
+        monkeypatch,
+        tmp_path,
+        head_before="abc1234",
+        head_after="abc1234",
+        to_push=0,
+    )
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+    assert res.skipped is False
+    assert res.pr == existing
+    assert res.loop_outcome is not None
+    assert fixture["calls"]["drive_review_loop"]["pr_number"] == 42
+    assert (
+        fixture["calls"]["drive_review_loop"]["poll_interval_s"]
+        == fixture["cfg"].orchestrator.poll_interval_s
+    )
+    assert "push" not in fixture["calls"]
+    assert "open_pr" not in fixture["calls"]
     assert "comment_pr" not in fixture["calls"]
 
 

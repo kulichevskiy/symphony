@@ -10,16 +10,16 @@ Pure verdict logic is testable without touching the network, the clock, or
 
 Verdict mapping per SYMPHONY.md M0 spike findings:
 
-- **APPROVED** = every required CI check is passing, plus either a fresh ``+1``
-  reaction by ``chatgpt-codex-connector[bot]`` on the PR with ``created_at``
-  after the HEAD commit's committer date, or a non-Codex reviewer's
-  ``APPROVED`` review on HEAD. No fresh ``CHANGES_REQUESTED`` signal may exist
-  on HEAD.
+- **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
+  the PR with ``created_at`` at or after the HEAD commit's committer date, AND no
+  fresh ``CHANGES_REQUESTED`` signal on HEAD, AND no pending or failing CI
+  checks. A non-Codex reviewer's ``APPROVED`` review on HEAD also counts once
+  checks are complete.
 - **CHANGES_REQUESTED** = (a) any failing CI check on HEAD, (b) any inline
   Codex review comment on HEAD, (c) a Codex ``COMMENTED`` review on HEAD whose
   body is substantively longer than the standard "About Codex in GitHub"
   boilerplate, or (d) a non-Codex ``CHANGES_REQUESTED`` review on HEAD.
-- **PENDING** = none of the above.
+- **PENDING** = checks are still running or none of the above has happened.
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ class Verdict:
     kind: VerdictKind
     review_comments: list[ReviewComment] = field(default_factory=list)
     ci_failures: list[CheckRun] = field(default_factory=list)
+    pending_checks: list[CheckRun] = field(default_factory=list)
     last_review_body: str = ""
 
 
@@ -93,6 +94,35 @@ def _parse_iso(ts: str) -> datetime | None:
     return dt
 
 
+def _latest_codex_approval_at(
+    *,
+    head_committed_at: str,
+    reactions: list[Reaction],
+    codex_login: str,
+) -> datetime | None:
+    head_dt = _parse_iso(head_committed_at)
+    if head_dt is None:
+        return None
+
+    latest: datetime | None = None
+    for rxn in reactions:
+        if rxn.user_login != codex_login or rxn.content != "+1":
+            continue
+        rxn_dt = _parse_iso(rxn.created_at)
+        if rxn_dt is None or rxn_dt < head_dt:
+            continue
+        if latest is None or rxn_dt > latest:
+            latest = rxn_dt
+    return latest
+
+
+def _after_cutoff(ts: str, cutoff: datetime | None) -> bool:
+    if cutoff is None:
+        return True
+    dt = _parse_iso(ts)
+    return dt is None or dt > cutoff
+
+
 def evaluate_verdict(
     *,
     head_sha: str,
@@ -106,6 +136,11 @@ def evaluate_verdict(
     """Pure verdict evaluation. See module docstring for the rules."""
     fresh_reviews = [r for r in reviews if r.commit_sha == head_sha]
     fresh_comments = [c for c in review_comments if c.commit_sha == head_sha]
+    latest_codex_approval_at = _latest_codex_approval_at(
+        head_committed_at=head_committed_at,
+        reactions=reactions,
+        codex_login=codex_login,
+    )
 
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override. Other non-passing checks are not
@@ -153,18 +188,34 @@ def evaluate_verdict(
         )
     human_approved = any(v == "APPROVED" for v in human_verdicts.values())
 
-    # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
-    #    reviews always come paired with inline comments when there's
-    #    feedback, so this is the most reliable single signal.
+    # 3. Active Codex review-comments on HEAD = changes requested. GitHub keeps
+    #    old inline comments around, so only treat comments from the latest
+    #    Codex review as active, and let a later Codex approval supersede them.
     codex_fresh_comments = [c for c in fresh_comments if c.user_login == codex_login]
-    if codex_fresh_comments:
-        codex_reviews = [
-            r for r in fresh_reviews
-            if r.user_login == codex_login and r.state == "COMMENTED"
+    codex_reviews = [
+        r for r in fresh_reviews
+        if r.user_login == codex_login and r.state == "COMMENTED"
+    ]
+    latest_codex_review = codex_reviews[-1] if codex_reviews else None
+    if latest_codex_review is not None:
+        latest_review_dt = _parse_iso(latest_codex_review.submitted_at)
+        codex_fresh_comments = [
+            c for c in codex_fresh_comments
+            if (
+                c.review_id == latest_codex_review.id
+                if c.review_id
+                else latest_review_dt is None or _after_cutoff(c.created_at, latest_review_dt)
+            )
         ]
+
+    active_codex_comments = [
+        c for c in codex_fresh_comments
+        if _after_cutoff(c.created_at, latest_codex_approval_at)
+    ]
+    if active_codex_comments:
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
-            review_comments=codex_fresh_comments,
+            review_comments=active_codex_comments,
             last_review_body=codex_reviews[-1].body if codex_reviews else "",
         )
 
@@ -177,6 +228,7 @@ def evaluate_verdict(
         if r.user_login == codex_login
         and r.state == "COMMENTED"
         and len(r.body) > CODEX_BOILERPLATE_THRESHOLD
+        and _after_cutoff(r.submitted_at, latest_codex_approval_at)
     ]
     if codex_substantive:
         return Verdict(
@@ -187,24 +239,18 @@ def evaluate_verdict(
     # 5. Required checks that are still pending/skipping/cancelled block
     #    approval but do not trigger remediation.
     if non_passing_checks:
-        return Verdict(kind=VerdictKind.PENDING)
+        return Verdict(kind=VerdictKind.PENDING, pending_checks=non_passing_checks)
 
     # 6. Approval via a non-Codex reviewer on HEAD. This is only considered
     #    after fresh blocking signals have been ruled out.
     if human_approved:
         return Verdict(kind=VerdictKind.APPROVED)
 
-    # 7. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
+    # 7. Approval via Codex ``+1`` reaction on the PR. Must be at or after HEAD's
     #    committer time, otherwise it's stale (referring to an earlier
     #    commit that's since been replaced).
-    head_dt = _parse_iso(head_committed_at)
-    if head_dt is not None:
-        for rxn in reactions:
-            if rxn.user_login != codex_login or rxn.content != "+1":
-                continue
-            rxn_dt = _parse_iso(rxn.created_at)
-            if rxn_dt is not None and rxn_dt > head_dt:
-                return Verdict(kind=VerdictKind.APPROVED)
+    if latest_codex_approval_at is not None:
+        return Verdict(kind=VerdictKind.APPROVED)
 
     return Verdict(kind=VerdictKind.PENDING)
 
@@ -230,7 +276,7 @@ def fetch_snapshot(*, pr_number: int, repo_path: Path) -> ReviewSnapshot:
         reviews=list_pr_reviews(pr_number, repo_path=repo_path),
         review_comments=list_pr_review_comments(pr_number, repo_path=repo_path),
         reactions=list_pr_reactions(pr_number, repo_path=repo_path),
-        checks=list_pr_checks(pr_number, repo_path=repo_path),
+        checks=list_pr_checks(pr_number, repo_path=repo_path, head_sha=head),
     )
 
 
@@ -256,6 +302,7 @@ class LoopOutcome:
     rounds_used: int
     last_session_id: str | None
     head_sha: str
+    agent_result: Any | None = None
 
 
 def _pending_activity_key(snap: ReviewSnapshot) -> tuple[Any, ...]:
@@ -311,6 +358,7 @@ async def drive_review_loop(
     commits_to_push_fn: Callable[[Path, str, str], int] | None = None,
     comment_pr_fn: Callable[..., None] | None = None,
     label_issue_fn: Callable[..., None] | None = None,
+    merge_pr_fn: Callable[..., None] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now_fn: Callable[[], float] = None,  # type: ignore[assignment]
 ) -> LoopOutcome:
@@ -327,11 +375,25 @@ async def drive_review_loop(
     if now_fn is None:
         import time
         now_fn = time.monotonic
-    if run_agent_fn is None or render_review_prompt is None or push_fn is None or head_sha_fn is None or commits_to_push_fn is None or comment_pr_fn is None or label_issue_fn is None:
+    needs_defaults = (
+        run_agent_fn is None
+        or render_review_prompt is None
+        or push_fn is None
+        or head_sha_fn is None
+        or commits_to_push_fn is None
+        or comment_pr_fn is None
+        or label_issue_fn is None
+        or merge_pr_fn is None
+    )
+    if needs_defaults:
         # Live defaults — imported lazily to avoid a cycle with runonce.
         from . import runonce as _runonce
         from .agent import run_agent as _run_agent
-        from .github import comment_pr as _comment_pr, label_issue as _label_issue
+        from .github import (
+            comment_pr as _comment_pr,
+            label_issue as _label_issue,
+            merge_pr as _merge_pr,
+        )
 
         if run_agent_fn is None:
             run_agent_fn = _run_agent
@@ -345,6 +407,8 @@ async def drive_review_loop(
             comment_pr_fn = _comment_pr
         if label_issue_fn is None:
             label_issue_fn = _label_issue
+        if merge_pr_fn is None:
+            merge_pr_fn = _merge_pr
         if render_review_prompt is None:
             render_review_prompt = _default_render_review_prompt
 
@@ -367,6 +431,27 @@ async def drive_review_loop(
         )
 
         if verdict.kind == VerdictKind.APPROVED:
+            try:
+                merge_pr_fn(
+                    repo_path=cfg.repo.path,
+                    pr_number=pr_number,
+                    match_head_commit=snap.head_sha,
+                )
+            except Exception:
+                log.warning(
+                    "approved PR #%d could not be merged; will retry",
+                    pr_number,
+                    exc_info=True,
+                )
+                if now_fn() - last_activity >= give_up_after_s:
+                    label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
+                    return LoopOutcome(
+                        kind=LoopOutcomeKind.AUTO_STUCK_IDLE,
+                        rounds_used=rounds_used,
+                        last_session_id=session_id,
+                        head_sha=snap.head_sha,
+                    )
+                continue
             return LoopOutcome(
                 kind=LoopOutcomeKind.APPROVED,
                 rounds_used=rounds_used,
@@ -414,6 +499,7 @@ async def drive_review_loop(
                     rounds_used=rounds_used,
                     last_session_id=session_id,
                     head_sha=snap.head_sha,
+                    agent_result=agent_result,
                 )
 
             # Capture (possibly fresh) session id for the next round.
@@ -442,6 +528,12 @@ async def drive_review_loop(
             continue
 
         # PENDING — check timers
+        if verdict.pending_checks:
+            last_activity = now_fn()
+            nudged_during_idle = False
+            last_pending_activity_key = None
+            continue
+
         pending_key = _pending_activity_key(snap)
         now = now_fn()
         if last_pending_activity_key is None:

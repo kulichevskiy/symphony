@@ -13,16 +13,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-ISSUE_FIELDS = "number,title,body,comments,labels"
+ISSUE_FIELDS = "number,title,body,comments,labels,createdAt"
 
 # ``trackedIssues`` returns issues referenced as task-list items in the parent
 # issue body. ``closedByPullRequestsReferences`` gives the PR (if any) that
 # closed each one — handy for rendering "satisfied dependencies" in the prompt.
 _TRACKED_ISSUES_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      trackedIssues(first: 50) {
+      trackedIssues(first: 100, after: $after) {
         nodes {
           number
           title
@@ -31,6 +31,10 @@ query($owner: String!, $name: String!, $number: Int!) {
           closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
             nodes { url }
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -56,6 +60,7 @@ class Issue:
     body: str
     labels: list[str]
     comments: list[IssueComment]
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,7 @@ class ReviewComment:
     body: str
     commit_sha: str
     created_at: str
+    review_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -162,27 +168,51 @@ def _parse_json(stdout: str, *, context: str) -> Any:
         raise GithubError(f"could not parse JSON from {context}: {e}") from e
 
 
-def _parse_paginated_array(stdout: str, *, context: str) -> list[Any]:
-    """Parse the output of ``gh api --paginate --slurp`` for an array endpoint.
+def _flatten_paginated_list(data: Any, *, context: str) -> list[Any]:
+    """Flatten ``gh api --paginate --slurp`` output for list endpoints."""
+    if not isinstance(data, list):
+        raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+    if not data:
+        return []
+    if all(isinstance(page, list) for page in data):
+        return [item for page in data for item in page]
+    if all(isinstance(item, dict) for item in data):
+        return data
+    raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
 
-    ``--slurp`` returns a JSON array of pages (one entry per HTTP response),
-    where each page is itself an array. Without ``--slurp`` the concatenation
-    of multiple pages is not a single valid JSON document, so callers that
-    need every page MUST pass both flags. This helper flattens the
-    list-of-pages back into one list.
-    """
-    pages = _parse_json(stdout, context=context)
-    if not isinstance(pages, list):
-        raise GithubError(f"expected JSON array from {context}, got {type(pages).__name__}")
-    flat: list[Any] = []
+
+def _flatten_paginated_object_list(data: Any, *, key: str, context: str) -> list[Any]:
+    """Flatten ``gh api --paginate --slurp`` output for object-list endpoints."""
+    if isinstance(data, dict):
+        pages = [data]
+    elif isinstance(data, list):
+        pages = data
+    else:
+        raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+
+    flattened: list[Any] = []
     for page in pages:
-        if isinstance(page, list):
-            flat.extend(page)
-        else:
-            # A single-page object response (no pagination) is wrapped in a
-            # one-element array by --slurp; pass it through unchanged.
-            flat.append(page)
-    return flat
+        if not isinstance(page, dict):
+            raise GithubError(f"unexpected paginated JSON from {context}: {data!r}")
+        items = page.get(key, [])
+        if not isinstance(items, list):
+            raise GithubError(f"unexpected {key!r} payload from {context}: {page!r}")
+        flattened.extend(items)
+    return flattened
+
+
+def _api_paginated_list(endpoint: str, *, repo_path: Path, context: str) -> list[Any]:
+    out = _run_gh(["api", endpoint, "--paginate", "--slurp"], cwd=repo_path)
+    data = _parse_json(out, context=context)
+    return _flatten_paginated_list(data, context=context)
+
+
+def _api_paginated_object_list(
+    endpoint: str, *, repo_path: Path, key: str, context: str
+) -> list[Any]:
+    out = _run_gh(["api", endpoint, "--paginate", "--slurp"], cwd=repo_path)
+    data = _parse_json(out, context=context)
+    return _flatten_paginated_object_list(data, key=key, context=context)
 
 
 def view_issue(number: int, *, repo_path: Path) -> Issue:
@@ -208,7 +238,61 @@ def view_issue(number: int, *, repo_path: Path) -> Issue:
         body=data.get("body", ""),
         labels=labels,
         comments=comments,
+        created_at=data.get("createdAt", ""),
     )
+
+
+def list_open_issues_with_label(
+    label: str, *, repo_path: Path, limit: int = 1000
+) -> list[Issue]:
+    """All open issues carrying ``label``, with the same shape as ``view_issue``.
+
+    Used by the orchestrator's poll loop to find candidates. ``createdAt``
+    drives the FIFO selection so the oldest ready issue dispatches first.
+
+    ``gh issue list --limit`` is a fetch cap on the most-recent items: with
+    the previous default of 100, an ``auto`` backlog larger than that would
+    silently starve older issues (the FIFO sort only applied within the
+    truncated subset). The default is now high enough to cover any realistic
+    personal-autopilot backlog; bump explicitly if you really do have more.
+    """
+    out = _run_gh(
+        [
+            "issue",
+            "list",
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            ISSUE_FIELDS,
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh issue list --label {label}")
+    issues: list[Issue] = []
+    for d in data:
+        comments = [
+            IssueComment(
+                author=(c.get("author") or {}).get("login", ""),
+                body=c.get("body", ""),
+            )
+            for c in d.get("comments", [])
+        ]
+        labels = [lbl.get("name", "") for lbl in d.get("labels", [])]
+        issues.append(
+            Issue(
+                number=int(d["number"]),
+                title=d.get("title", ""),
+                body=d.get("body", ""),
+                labels=labels,
+                comments=comments,
+                created_at=d.get("createdAt", ""),
+            )
+        )
+    return issues
 
 
 def name_with_owner(repo_path: Path) -> tuple[str, str]:
@@ -228,8 +312,10 @@ _name_with_owner = name_with_owner
 
 def tracked_issues(number: int, *, repo_path: Path) -> list[TrackedIssue]:
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        [
+    results: list[TrackedIssue] = []
+    after: str | None = None
+    while True:
+        args = [
             "api",
             "graphql",
             "-F",
@@ -238,31 +324,40 @@ def tracked_issues(number: int, *, repo_path: Path) -> list[TrackedIssue]:
             f"name={name}",
             "-F",
             f"number={number}",
-            "-f",
-            f"query={_TRACKED_ISSUES_QUERY}",
-        ],
-        cwd=repo_path,
-    )
-    data = _parse_json(out, context="gh api graphql trackedIssues")
-    try:
-        nodes = data["data"]["repository"]["issue"]["trackedIssues"]["nodes"]
-    except (KeyError, TypeError) as e:
-        raise GithubError(f"unexpected GraphQL response shape: {data!r}") from e
+        ]
+        if after is not None:
+            args += ["-F", f"after={after}"]
+        args += ["-f", f"query={_TRACKED_ISSUES_QUERY}"]
 
-    results: list[TrackedIssue] = []
-    for n in nodes:
-        prs = n.get("closedByPullRequestsReferences", {}).get("nodes", [])
-        pr_url = prs[0]["url"] if prs else None
-        results.append(
-            TrackedIssue(
-                number=int(n["number"]),
-                title=n.get("title", ""),
-                state=n.get("state", ""),
-                state_reason=n.get("stateReason"),
-                pr_url=pr_url,
+        out = _run_gh(args, cwd=repo_path)
+        data = _parse_json(out, context="gh api graphql trackedIssues")
+        try:
+            tracked = data["data"]["repository"]["issue"]["trackedIssues"]
+            nodes = tracked["nodes"]
+        except (KeyError, TypeError) as e:
+            raise GithubError(f"unexpected GraphQL response shape: {data!r}") from e
+
+        for n in nodes:
+            prs = n.get("closedByPullRequestsReferences", {}).get("nodes", [])
+            pr_url = prs[0]["url"] if prs else None
+            results.append(
+                TrackedIssue(
+                    number=int(n["number"]),
+                    title=n.get("title", ""),
+                    state=n.get("state", ""),
+                    state_reason=n.get("stateReason"),
+                    pr_url=pr_url,
+                )
             )
-        )
-    return results
+
+        page_info = tracked.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return results
+        after = page_info.get("endCursor")
+        if after is None:
+            raise GithubError(
+                f"trackedIssues pageInfo.hasNextPage without endCursor: {data!r}"
+            )
 
 
 def find_open_pr_for_branch(
@@ -369,13 +464,15 @@ def merge_pr(
     repo_path: Path,
     pr_number: int,
     method: str = "squash",
+    match_head_commit: str | None = None,
     match_head_sha: str | None = None,
 ) -> None:
     """Merge a PR immediately after Symphony's review loop approves it."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
     args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
-    if match_head_sha:
-        args += ["--match-head-commit", match_head_sha]
+    match_head = match_head_commit or match_head_sha
+    if match_head:
+        args += ["--match-head-commit", match_head]
     _run_gh(
         args,
         cwd=repo_path,
@@ -396,16 +493,11 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
 def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
     """All review submissions on a PR, oldest first."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        [
-            "api",
-            f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
-            "--paginate",
-            "--slurp",
-        ],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/pulls/{pr_number}/reviews",
+        repo_path=repo_path,
+        context=f"reviews for PR {pr_number}",
     )
-    data = _parse_paginated_array(out, context=f"reviews for PR {pr_number}")
     return [
         Review(
             id=int(r.get("id", 0)),
@@ -422,16 +514,11 @@ def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
 def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewComment]:
     """All inline (line-level) review comments on a PR's diff."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        [
-            "api",
-            f"repos/{owner}/{name}/pulls/{pr_number}/comments",
-            "--paginate",
-            "--slurp",
-        ],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/pulls/{pr_number}/comments",
+        repo_path=repo_path,
+        context=f"review comments for PR {pr_number}",
     )
-    data = _parse_paginated_array(out, context=f"review comments for PR {pr_number}")
     return [
         ReviewComment(
             id=int(c.get("id", 0)),
@@ -441,6 +528,7 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
             body=c.get("body") or "",
             commit_sha=c.get("commit_id", ""),
             created_at=c.get("created_at", ""),
+            review_id=int(c.get("pull_request_review_id", 0) or 0),
         )
         for c in data
     ]
@@ -449,16 +537,11 @@ def list_pr_review_comments(pr_number: int, *, repo_path: Path) -> list[ReviewCo
 def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     """Reactions on the PR's underlying issue. Codex's approval ``+1`` lives here."""
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        [
-            "api",
-            f"repos/{owner}/{name}/issues/{pr_number}/reactions",
-            "--paginate",
-            "--slurp",
-        ],
-        cwd=repo_path,
+    data = _api_paginated_list(
+        f"repos/{owner}/{name}/issues/{pr_number}/reactions",
+        repo_path=repo_path,
+        context=f"reactions for PR {pr_number}",
     )
-    data = _parse_paginated_array(out, context=f"reactions for PR {pr_number}")
     return [
         Reaction(
             user_login=(r.get("user") or {}).get("login", ""),
@@ -469,7 +552,9 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     ]
 
 
-def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
+def list_pr_checks(
+    pr_number: int, *, repo_path: Path, head_sha: str | None = None
+) -> list[CheckRun]:
     """Required CI check runs on the PR's HEAD commit (`gh pr checks`).
 
     ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
@@ -479,6 +564,9 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
 
     ``gh pr checks`` returns exit code 8 while checks are pending. That is a
     normal polling state, so parse stdout instead of treating it as fatal.
+
+    ``head_sha`` is accepted for call-site compatibility with snapshot
+    fetchers that pin other GitHub inputs to a specific head.
     """
     out = _run_gh(
         [

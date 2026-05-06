@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from symphony import reviewer as reviewer_mod
 from symphony.github import CheckRun, Reaction, Review, ReviewComment
 from symphony.reviewer import (
     CODEX_BOT_LOGIN,
@@ -15,6 +16,7 @@ from symphony.reviewer import (
     VerdictKind,
     drive_review_loop,
     evaluate_verdict,
+    fetch_snapshot,
     select_resume_session,
 )
 from symphony.types import AgentResult
@@ -35,7 +37,16 @@ def _review(*, who, state, body="", sha=HEAD, at="2026-05-06T07:30:00Z", id=1) -
     )
 
 
-def _comment(*, who=CODEX_BOT_LOGIN, sha=HEAD, body="fix this", line=42, id=1) -> ReviewComment:
+def _comment(
+    *,
+    who=CODEX_BOT_LOGIN,
+    sha=HEAD,
+    body="fix this",
+    line=42,
+    id=1,
+    at="2026-05-06T07:30:00Z",
+    review_id=0,
+) -> ReviewComment:
     return ReviewComment(
         id=id,
         user_login=who,
@@ -43,7 +54,8 @@ def _comment(*, who=CODEX_BOT_LOGIN, sha=HEAD, body="fix this", line=42, id=1) -
         line=line,
         body=body,
         commit_sha=sha,
-        created_at="2026-05-06T07:30:00Z",
+        created_at=at,
+        review_id=review_id,
     )
 
 
@@ -102,6 +114,18 @@ def test_codex_inline_comment_on_head_is_changes_requested():
     assert v.review_comments == [c]
 
 
+def test_only_latest_codex_review_comments_block():
+    old = _comment(at="2026-05-06T07:10:00Z", review_id=1)
+    v = _eval(
+        reviews=[
+            _review(who=CODEX_BOT_LOGIN, state="COMMENTED", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who=CODEX_BOT_LOGIN, state="COMMENTED", id=2, at="2026-05-06T07:30:00Z"),
+        ],
+        review_comments=[old],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
 def test_codex_substantive_review_body_without_inline_is_changes_requested():
     big_body = "x" * 800  # > 750 boilerplate threshold
     v = _eval(reviews=[_review(who=CODEX_BOT_LOGIN, state="COMMENTED", body=big_body)])
@@ -124,6 +148,38 @@ def test_human_changes_requested_review_wins():
     assert v.last_review_body == "needs work"
 
 
+def test_latest_human_review_state_for_reviewer_wins():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="old", id=1),
+            _review(who="alice", state="APPROVED", body="fixed", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_latest_human_changes_requested_still_blocks():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="old", id=1),
+            _review(who="alice", state="CHANGES_REQUESTED", body="new", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "new"
+
+
+def test_latest_changes_requested_from_any_human_blocks_approval():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1),
+            _review(who="bob", state="CHANGES_REQUESTED", body="blocked", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "blocked"
+
+
 def test_failing_ci_check_is_changes_requested():
     v = _eval(checks=[_check(name="test", bucket="fail", state="FAILURE")])
     assert v.kind == VerdictKind.CHANGES_REQUESTED
@@ -132,6 +188,23 @@ def test_failing_ci_check_is_changes_requested():
 
 def test_in_progress_check_is_not_failure():
     v = _eval(checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")])
+    assert v.kind == VerdictKind.PENDING
+    assert v.pending_checks[0].name == "test"
+
+
+def test_in_progress_check_blocks_codex_approval_reaction():
+    v = _eval(
+        checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_in_progress_check_blocks_human_approval():
+    v = _eval(
+        checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")],
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+    )
     assert v.kind == VerdictKind.PENDING
 
 
@@ -187,6 +260,13 @@ def test_codex_plus_one_reaction_on_head_is_approved():
     assert v.kind == VerdictKind.APPROVED
 
 
+def test_codex_plus_one_at_head_commit_second_is_approved():
+    v = _eval(
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at=HEAD_AT)]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
 def test_codex_plus_one_with_passing_required_check_is_approved():
     v = _eval(
         checks=[_check(name="test", bucket="pass", state="SUCCESS")],
@@ -206,10 +286,33 @@ def test_codex_plus_one_before_head_commit_is_ignored():
 def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
     """A Codex inline comment on HEAD outranks a stale-or-fresh +1."""
     v = _eval(
-        review_comments=[_comment()],
+        review_comments=[_comment(at="2026-05-06T07:31:00Z")],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
+
+
+def test_codex_plus_one_after_inline_comment_supersedes_comment():
+    v = _eval(
+        review_comments=[_comment(at="2026-05-06T07:10:00Z")],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_codex_plus_one_after_substantive_review_supersedes_review():
+    v = _eval(
+        reviews=[
+            _review(
+                who=CODEX_BOT_LOGIN,
+                state="COMMENTED",
+                body="x" * 800,
+                at="2026-05-06T07:10:00Z",
+            )
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
 
 
 def test_human_approval_with_fresh_codex_feedback_is_changes_requested():
@@ -363,6 +466,36 @@ def _pending_snap(head_sha="head1") -> ReviewSnapshot:
     return _snap(head_sha=head_sha)
 
 
+def test_fetch_snapshot_uses_pinned_head_for_checks(monkeypatch, tmp_path):
+    calls: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        reviewer_mod,
+        "get_pr_head_sha",
+        lambda pr_number, repo_path: "shaH",
+    )
+    monkeypatch.setattr(
+        reviewer_mod,
+        "get_commit_committed_at",
+        lambda sha, repo_path: "2026-05-06T07:00:00Z",
+    )
+    monkeypatch.setattr(reviewer_mod, "list_pr_reviews", lambda pr_number, repo_path: [])
+    monkeypatch.setattr(
+        reviewer_mod, "list_pr_review_comments", lambda pr_number, repo_path: []
+    )
+    monkeypatch.setattr(reviewer_mod, "list_pr_reactions", lambda pr_number, repo_path: [])
+
+    def fake_checks(pr_number, *, repo_path, head_sha=None):
+        calls["head_sha"] = head_sha
+        return []
+
+    monkeypatch.setattr(reviewer_mod, "list_pr_checks", fake_checks)
+
+    snap = fetch_snapshot(pr_number=10, repo_path=tmp_path)
+
+    assert snap.head_sha == "shaH"
+    assert calls["head_sha"] == "shaH"
+
+
 def _pending_check_snap(head_sha="head1", state="QUEUED") -> ReviewSnapshot:
     return _snap(head_sha=head_sha, checks=[_check(bucket="pending", state=state)])
 
@@ -414,7 +547,7 @@ class _Driver:
         self.calls: dict[str, list] = {
             "push": [], "comment_pr": [], "label_issue": [],
             "agent_resume": [], "render": [], "snapshot": [],
-            "head_sha": [], "to_push": [],
+            "head_sha": [], "to_push": [], "merge_pr": [],
         }
         self.now = 0.0
         self._head_sha = "head1"
@@ -448,13 +581,18 @@ class _Driver:
     def label_issue(self, number, label, *, repo_path):
         self.calls["label_issue"].append((number, label, str(repo_path)))
 
+    def merge_pr(self, *, repo_path, pr_number, match_head_commit=None):
+        self.calls["merge_pr"].append((str(repo_path), pr_number, match_head_commit))
+
     def render(self, *, cfg, sha, comments, ci_failures, review_body=""):
-        self.calls["render"].append({
-            "sha": sha,
-            "n_comments": len(comments),
-            "n_ci": len(ci_failures),
-            "review_body": review_body,
-        })
+        self.calls["render"].append(
+            {
+                "sha": sha,
+                "n_comments": len(comments),
+                "n_ci": len(ci_failures),
+                "review_body": review_body,
+            }
+        )
         return f"render({sha})"
 
     async def sleep(self, _seconds):
@@ -485,6 +623,7 @@ def _spawn_loop(driver, cfg, **overrides):
         commits_to_push_fn=driver.commits_to_push,
         comment_pr_fn=driver.comment_pr,
         label_issue_fn=driver.label_issue,
+        merge_pr_fn=driver.merge_pr,
         sleep_fn=driver.sleep,
         now_fn=driver.time_now,
     )
@@ -499,10 +638,52 @@ async def test_loop_returns_on_first_approved(tmp_path):
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.APPROVED
     assert outcome.rounds_used == 0
+    assert driver.calls["merge_pr"] == [(str(cfg.repo.path), 11, "head1")]
     # No agent run, no push, no extra comment posted on the immediate-approve path.
     assert driver.calls["agent_resume"] == []
     assert driver.calls["push"] == []
     assert driver.calls["label_issue"] == []
+
+
+@pytest.mark.asyncio
+async def test_loop_retries_after_merge_failure(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    driver = _Driver([_approved_snap(), _approved_snap()])
+    merge_attempts = []
+
+    def flaky_merge(*, repo_path, pr_number, match_head_commit=None):
+        merge_attempts.append((str(repo_path), pr_number, match_head_commit))
+        if len(merge_attempts) == 1:
+            raise RuntimeError("head changed")
+
+    outcome = await _spawn_loop(driver, cfg, merge_pr_fn=flaky_merge)
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert merge_attempts == [
+        (str(cfg.repo.path), 11, "head1"),
+        (str(cfg.repo.path), 11, "head1"),
+    ]
+    assert driver.calls["label_issue"] == []
+
+
+@pytest.mark.asyncio
+async def test_loop_auto_stuck_when_approved_merge_keeps_failing(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    driver = _Driver([_approved_snap()] * 10)
+
+    def failing_merge(*, repo_path, pr_number, match_head_commit=None):
+        raise RuntimeError("merge queue unavailable")
+
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        merge_pr_fn=failing_merge,
+        poll_interval_s=30.0,
+        give_up_after_s=60.0,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_IDLE
+    assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
 
 
 @pytest.mark.asyncio
@@ -512,6 +693,7 @@ async def test_loop_handles_changes_then_approval(tmp_path):
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.APPROVED
     assert outcome.rounds_used == 1
+    assert driver.calls["merge_pr"] == [(str(cfg.repo.path), 11, "head2")]
     # Agent re-invoked once, with resume (round 0), pushed and re-nudged.
     assert driver.calls["agent_resume"] == ["sess-A"]
     assert len(driver.calls["push"]) == 1
@@ -519,25 +701,30 @@ async def test_loop_handles_changes_then_approval(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_loop_threads_review_body_to_renderer(tmp_path):
-    # Regression: when CHANGES_REQUESTED comes from a human review's body
-    # (no inline comments, no CI failure), the body must flow through to
-    # the prompt template — otherwise the agent gets feedback-less retries
-    # and churns toward auto-stuck.
+async def test_loop_passes_summary_review_body_to_retry_prompt(tmp_path):
     cfg = _make_cfg(tmp_path)
-    cr_review = Review(
-        id=1,
-        user_login="alice",
-        state="CHANGES_REQUESTED",
-        body="Refactor parser to handle empty input",
-        commit_sha="head1",
-        submitted_at="2026-05-06T07:30:00Z",
+    summary = "please handle the summary-only request"
+    driver = _Driver(
+        [
+            _snap(
+                head_sha="head1",
+                reviews=[
+                    _review(
+                        who="alice",
+                        state="CHANGES_REQUESTED",
+                        body=summary,
+                        sha="head1",
+                    )
+                ],
+            ),
+            _approved_snap("head2"),
+        ]
     )
-    body_snap = _snap(head_sha="head1", reviews=[cr_review])
-    driver = _Driver([body_snap, _approved_snap("head2")])
+
     outcome = await _spawn_loop(driver, cfg)
+
     assert outcome.kind == LoopOutcomeKind.APPROVED
-    assert driver.calls["render"][0]["review_body"] == "Refactor parser to handle empty input"
+    assert driver.calls["render"][0]["review_body"] == summary
     assert driver.calls["render"][0]["n_comments"] == 0
 
 
@@ -568,6 +755,7 @@ async def test_loop_auto_stuck_after_round_cap(tmp_path):
     outcome = await _spawn_loop(driver, cfg, round_cap=10)
     assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_ROUNDS
     assert outcome.rounds_used == 10
+    assert driver.calls["merge_pr"] == []
     assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
 
 
@@ -583,6 +771,23 @@ async def test_loop_auto_stuck_after_idle_giveup(tmp_path):
     assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_IDLE
     assert outcome.rounds_used == 0
     assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_idle_give_up_while_checks_are_pending(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    pending = _snap(checks=[_check(name="ci", bucket="pending", state="IN_PROGRESS")])
+    snaps = [pending] * 20 + [_approved_snap()]
+    driver = _Driver(snaps)
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        poll_interval_s=30.0,
+        re_nudge_after_s=60.0,
+        give_up_after_s=90.0,
+    )
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["label_issue"] == []
 
 
 @pytest.mark.asyncio
@@ -604,6 +809,30 @@ async def test_loop_pending_activity_resets_idle_giveup(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_resets_idle_timer_when_head_advances_while_pending(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    snaps = [
+        _pending_snap("head1"),
+        _pending_snap("head1"),
+        _pending_snap("head2"),
+        _pending_snap("head2"),
+        _approved_snap("head2"),
+    ]
+    driver = _Driver(snaps)
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        poll_interval_s=30.0,
+        re_nudge_after_s=600.0,
+        give_up_after_s=90.0,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["label_issue"] == []
+    assert driver.calls["merge_pr"] == [(str(cfg.repo.path), 11, "head2")]
+
+
+@pytest.mark.asyncio
 async def test_loop_renudges_at_idle_threshold_then_returns_on_approval(tmp_path):
     """At 10 min PENDING, post one re-nudge; then approval lands."""
     cfg = _make_cfg(tmp_path)
@@ -620,10 +849,13 @@ async def test_loop_renudges_at_idle_threshold_then_returns_on_approval(tmp_path
 @pytest.mark.asyncio
 async def test_loop_returns_agent_failed_on_subprocess_failure(tmp_path):
     cfg = _make_cfg(tmp_path)
-    driver = _Driver([_changes_snap()], agent_results=[_failed_agent_result()])
+    failed = _failed_agent_result()
+    driver = _Driver([_changes_snap()], agent_results=[failed])
     outcome = await _spawn_loop(driver, cfg)
     assert outcome.kind == LoopOutcomeKind.AGENT_FAILED
     assert outcome.rounds_used == 0
+    assert outcome.agent_result is failed
     # No push or comment after a failed agent run.
     assert driver.calls["push"] == []
     assert driver.calls["comment_pr"] == []
+    assert driver.calls["merge_pr"] == []

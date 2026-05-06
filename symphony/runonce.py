@@ -27,14 +27,14 @@ from .github import (
     PR,
     comment_pr,
     find_open_pr_for_branch,
-    merge_pr,
     name_with_owner,
     open_pr,
     tracked_issues,
     view_issue,
 )
 from .prompts import make_env, render
-from .reviewer import LoopOutcome, LoopOutcomeKind, drive_review_loop
+from .reviewer import LoopOutcome, drive_review_loop
+from .types import AgentResult
 from .workspace import ensure_worktree
 
 log = logging.getLogger(__name__)
@@ -52,6 +52,11 @@ class RunOnceResult:
     # Populated when the review loop ran. `None` means the run skipped before
     # opening a PR; the CLI uses ``loop_outcome.kind`` to decide its exit code.
     loop_outcome: LoopOutcome | None = None
+    # Raw agent run output, populated only when the agent failed
+    # (``skip_reason == "agent-failed"``). The orchestrator scans this for
+    # 429 / usage-limit markers to decide whether to globally pause dispatch.
+    # ``None`` for any other outcome.
+    agent_result: AgentResult | None = None
 
 
 def _head_sha(worktree: Path) -> str:
@@ -181,6 +186,7 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             skipped=True,
             skip_reason="agent-failed",
             worktree=worktree,
+            agent_result=result,
         )
 
     branch = f"auto/{issue_number}"
@@ -193,6 +199,34 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
     # never pushed yet). Stranded commits — local-only work from a prior run
     # that crashed before push — still go through the push/PR flow.
     if not agent_advanced_head and to_push == 0:
+        pr = find_open_pr_for_branch(
+            branch,
+            repo_path=repo_path,
+            base_branch=cfg.repo.default_branch,
+            expected_owner=owner,
+        )
+        if pr is not None:
+            outcome = await drive_review_loop(
+                cfg=cfg,
+                issue_number=issue_number,
+                pr_number=pr.number,
+                branch=branch,
+                worktree=worktree,
+                initial_session_id=result.session_id,
+                poll_interval_s=cfg.orchestrator.poll_interval_s,
+                re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
+                give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
+                round_cap=cfg.orchestrator.review_round_cap,
+            )
+            return RunOnceResult(
+                issue_number=issue_number,
+                pr=pr,
+                skipped=False,
+                skip_reason=None,
+                worktree=worktree,
+                loop_outcome=outcome,
+            )
+
         log.error(
             "agent exited cleanly, no new commits, branch in sync with origin; skipping",
         )
@@ -242,13 +276,6 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
         round_cap=cfg.orchestrator.review_round_cap,
     )
-    if outcome.kind == LoopOutcomeKind.APPROVED:
-        merge_pr(
-            repo_path=repo_path,
-            pr_number=pr.number,
-            method="squash",
-            match_head_sha=outcome.head_sha,
-        )
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,
