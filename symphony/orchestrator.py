@@ -294,13 +294,16 @@ async def _dispatch_one(
             )
         return
 
-    # Loop outcome decides retry vs done.
+    # Loop outcome decides retry vs terminal.
     outcome = result.loop_outcome
     if outcome is not None and outcome.kind.value == "approved":
         state.clear_retry(issue.number)
         return
-    # Anything other than APPROVED keeps the issue in the retry queue so a
-    # later tick can re-dispatch (e.g. after the worktree is reset, or for
+    if outcome is not None and outcome.kind.value == "merge_failed":
+        state.clear_retry(issue.number)
+        return
+    # Non-terminal outcomes keep the issue in the retry queue so a later tick
+    # can re-dispatch (e.g. after the worktree is reset, or for
     # AUTO_STUCK_IDLE which may resolve once Codex catches up).
     entry = state.schedule_retry(issue.number, now=now_fn())
     if event_log is not None:

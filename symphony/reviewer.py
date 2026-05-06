@@ -216,6 +216,7 @@ class LoopOutcomeKind(StrEnum):
     AUTO_STUCK_ROUNDS = "auto_stuck_rounds"
     AUTO_STUCK_IDLE = "auto_stuck_idle"
     AGENT_FAILED = "agent_failed"
+    MERGE_FAILED = "merge_failed"
 
 
 @dataclass(frozen=True)

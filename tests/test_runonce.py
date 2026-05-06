@@ -26,7 +26,7 @@ from symphony.config import (
     RepoConfig,
 )
 from symphony.events import EventLog
-from symphony.github import Issue, IssueComment, TrackedIssue, PR
+from symphony.github import GithubError, Issue, IssueComment, TrackedIssue, PR
 from symphony.types import AgentResult
 
 
@@ -280,6 +280,30 @@ async def test_run_once_writes_event_log(monkeypatch, tmp_path):
     pr_event = [e for e in event_log.iter_events(issue_number=3) if e.kind == "pr-open"][0]
     assert pr_event.payload["number"] == 99
     assert pr_event.payload["reused"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_once_records_merge_failure_as_terminal_outcome(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    calls = fixture["calls"]
+
+    def _fail_merge(**kw):
+        calls["merge_pr"] = kw
+        raise GithubError("merge blocked")
+
+    monkeypatch.setattr(ro_mod, "merge_pr", _fail_merge)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_failed"
+    assert calls["merge_pr"]["match_head_commit"] == "head-sha"
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_failed"
+    assert events[-1].payload["error"] == "merge blocked"
 
 
 @pytest.mark.asyncio

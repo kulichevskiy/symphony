@@ -25,6 +25,7 @@ from .agent import run_agent
 from .config import Config, load_config
 from .events import EventLog
 from .github import (
+    GithubError,
     Issue,
     PR,
     comment_pr,
@@ -329,21 +330,42 @@ async def run_once(
         run_id=run_id,
     )
     if outcome.kind == LoopOutcomeKind.APPROVED:
-        merge_pr(
-            repo_path=repo_path,
-            pr_number=pr.number,
-            match_head_commit=outcome.head_sha,
-        )
-        emit(
-            "merge",
-            {
-                "pr_number": pr.number,
-                "url": pr.url,
-                "head_sha": outcome.head_sha,
-                "rounds_used": outcome.rounds_used,
-                "outcome": "approved",
-            },
-        )
+        try:
+            merge_pr(
+                repo_path=repo_path,
+                pr_number=pr.number,
+                match_head_commit=outcome.head_sha,
+            )
+        except GithubError as e:
+            log.error("merge failed for PR #%d: %s", pr.number, e)
+            emit(
+                "run-terminal",
+                {
+                    "pr_number": pr.number,
+                    "url": pr.url,
+                    "head_sha": outcome.head_sha,
+                    "rounds_used": outcome.rounds_used,
+                    "outcome": LoopOutcomeKind.MERGE_FAILED.value,
+                    "error": str(e),
+                },
+            )
+            outcome = LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_FAILED,
+                rounds_used=outcome.rounds_used,
+                last_session_id=outcome.last_session_id,
+                head_sha=outcome.head_sha,
+            )
+        else:
+            emit(
+                "merge",
+                {
+                    "pr_number": pr.number,
+                    "url": pr.url,
+                    "head_sha": outcome.head_sha,
+                    "rounds_used": outcome.rounds_used,
+                    "outcome": "approved",
+                },
+            )
     elif outcome.kind != LoopOutcomeKind.AUTO_STUCK_IDLE and outcome.kind != LoopOutcomeKind.AUTO_STUCK_ROUNDS:
         emit(
             "run-terminal",
