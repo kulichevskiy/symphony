@@ -236,18 +236,18 @@ def test_select_ready_skips_not_planned_blocker():
     assert skips[0].reason.startswith("blocked-by:99")
 
 
-def test_select_ready_skips_open_pr():
+def test_select_ready_dispatches_existing_open_pr_to_resume_review():
     a = _issue(1)
     ready, skips = _ready([a], {1: []}, open_prs={1})
-    assert ready == []
-    assert skips[0].reason == "open-pr-exists"
+    assert [i.number for i in ready] == [1]
+    assert skips == []
 
 
-def test_select_ready_skips_local_branch():
+def test_select_ready_dispatches_existing_local_branch_to_resume_work():
     a = _issue(1)
     ready, skips = _ready([a], {1: []}, local_branches={1})
-    assert ready == []
-    assert skips[0].reason == "local-branch-exists"
+    assert [i.number for i in ready] == [1]
+    assert skips == []
 
 
 def test_select_ready_skips_cycle_members():
@@ -275,7 +275,7 @@ def test_select_ready_includes_after_backoff_expires():
     assert [i.number for i in ready] == [1]
 
 
-def test_select_ready_allows_retry_with_existing_branch_and_pr():
+def test_select_ready_dispatches_retry_with_existing_branch_and_pr():
     state = OrchestratorState()
     state.schedule_retry(1, now=0.0)
     a = _issue(1)
@@ -325,6 +325,36 @@ async def test_run_tick_dispatches_up_to_concurrency_cap(tmp_path, monkeypatch):
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     assert sorted(dispatched) == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_run_tick_dispatches_existing_pr_after_restart(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    dispatched: list[int] = []
+
+    async def fake_run_once(*, issue_number, config_path):
+        dispatched.append(issue_number)
+        return _approved_result()
+
+    stats = await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: True,
+        has_local_branch=lambda n: True,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+    )
+    assert stats.candidates == 1
+    assert stats.dispatched == 1
+    assert stats.skips == []
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert dispatched == [1]
 
 
 @pytest.mark.asyncio
