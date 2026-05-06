@@ -125,17 +125,22 @@ class CheckRun:
     link: str | None
 
 
-def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
+def _run_gh(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    allowed_exit_codes: set[int] | tuple[int, ...] = (0,),
+) -> str:
     """Run ``gh`` with the given args and return stdout.
 
-    Raises :class:`GithubError` on non-zero exit; stderr is included in the
+    Raises :class:`GithubError` on unexpected exit; stderr is included in the
     message so callers can show actionable failures without re-running.
     """
     try:
         res = subprocess.run(
             ["gh", *args],
             cwd=str(cwd) if cwd else None,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -143,6 +148,10 @@ def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
         raise GithubError(
             f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}"
         ) from e
+    if res.returncode not in allowed_exit_codes:
+        raise GithubError(
+            f"gh {' '.join(args)} failed (exit {res.returncode}): {res.stderr.strip()}"
+        )
     return res.stdout
 
 
@@ -443,22 +452,27 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
 
 
 def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
-    """CI check runs on the PR's HEAD commit (`gh pr checks`).
+    """Required CI check runs on the PR's HEAD commit (`gh pr checks`).
 
     ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
     on ``gh pr checks`` — that produces an unknown-field error. The actual
     schema exposes ``name``, ``bucket``, ``state``, and ``link`` (among
     others); we use those.
+
+    ``gh pr checks`` returns exit code 8 while checks are pending. That is a
+    normal polling state, so parse stdout instead of treating it as fatal.
     """
     out = _run_gh(
         [
             "pr",
             "checks",
             str(pr_number),
+            "--required",
             "--json",
             "name,bucket,state,link",
         ],
         cwd=repo_path,
+        allowed_exit_codes={0, 8},
     )
     data = _parse_json(out, context=f"checks for PR {pr_number}")
     return [

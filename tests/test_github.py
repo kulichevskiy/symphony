@@ -46,8 +46,11 @@ def _stub(responses: dict[tuple[str, ...], str]):
 
     calls: list[list[str]] = []
 
-    def _fake(args, *, cwd=None):  # type: ignore[no-untyped-def]
+    kwargs_seen: list[dict[str, object]] = []
+
+    def _fake(args, *, cwd=None, **kwargs):  # type: ignore[no-untyped-def]
         calls.append(list(args))
+        kwargs_seen.append(dict(kwargs))
         for length in range(len(args), 0, -1):
             key = tuple(args[:length])
             if key in responses:
@@ -55,6 +58,7 @@ def _stub(responses: dict[tuple[str, ...], str]):
         raise AssertionError(f"unexpected gh call: {args}")
 
     _fake.calls = calls  # type: ignore[attr-defined]
+    _fake.kwargs_seen = kwargs_seen  # type: ignore[attr-defined]
     return _fake
 
 
@@ -422,7 +426,8 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 def test_list_pr_checks(monkeypatch, tmp_path):
     # `gh pr checks --json` exposes name/bucket/state/link (not status /
     # conclusion / detailsUrl). Pin the schema so a copy-pasted-from-`pr
-    # view` field name doesn't sneak back in.
+    # view` field name doesn't sneak back in. Only required checks gate the
+    # verdict, and gh's documented pending-check exit code 8 is non-fatal.
     payload = [
         {"name": "build", "bucket": "pass", "state": "SUCCESS", "link": "https://ci/build"},
         {"name": "test", "bucket": "fail", "state": "FAILURE", "link": "https://ci/test"},
@@ -435,9 +440,12 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     assert checks[1] == CheckRun(name="test", bucket="fail", state="FAILURE", link="https://ci/test")
     assert checks[2].link is None
     call = next(c for c in fake.calls if c[:2] == ["pr", "checks"])
+    call_index = fake.calls.index(call)
+    assert "--required" in call
     assert "--json" in call
     json_fields = call[call.index("--json") + 1].split(",")
     assert set(json_fields) == {"name", "bucket", "state", "link"}
+    assert fake.kwargs_seen[call_index]["allowed_exit_codes"] == {0, 8}
 
 
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
@@ -475,3 +483,21 @@ def test_run_gh_raises_github_error_on_failure(monkeypatch, tmp_path):
     with pytest.raises(GithubError) as exc:
         gh_mod._run_gh(["issue", "view", "1"], cwd=tmp_path)
     assert "bad request" in str(exc.value)
+
+
+def test_run_gh_allows_configured_nonzero_exit(monkeypatch, tmp_path):
+    """`gh pr checks` exits 8 while checks are pending; callers can allow it."""
+    import subprocess as _sp
+
+    def _pending(*args, **kwargs):
+        return _sp.CompletedProcess(args=args, returncode=8, stdout="[]", stderr="pending")
+
+    monkeypatch.setattr(gh_mod.subprocess, "run", _pending)
+    assert (
+        gh_mod._run_gh(
+            ["pr", "checks", "10"],
+            cwd=tmp_path,
+            allowed_exit_codes={0, 8},
+        )
+        == "[]"
+    )
