@@ -2,7 +2,7 @@
 
 Covers the M2 happy path and the empty-diff / failed-exit guards. We patch the
 network-touching helpers (`view_issue`, `tracked_issues`, `name_with_owner`,
-`open_pr`, `comment_pr`, `arm_auto_merge`), the worktree helper
+`open_pr`, `comment_pr`), the worktree helper
 (`ensure_worktree`), the agent runner (`run_agent`), and the local git helpers
 (`_commits_ahead`, `_git_push`) so the orchestration logic itself is what we
 exercise.
@@ -87,6 +87,7 @@ def _patch_happy_path(
     head_before="aaa1111",
     head_after="bbb2222",
     to_push=1,
+    loop_outcome_kind=None,
 ) -> dict[str, Any]:
     """Wire stubs for each external dep and capture the calls."""
     calls: dict[str, Any] = {}
@@ -181,11 +182,13 @@ def _patch_happy_path(
 
     # Stub the review loop so existing tests don't have to thread its inputs.
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind
+    if loop_outcome_kind is None:
+        loop_outcome_kind = LoopOutcomeKind.APPROVED
 
     async def _fake_loop(**kw):
         calls["drive_review_loop"] = kw
         return LoopOutcome(
-            kind=LoopOutcomeKind.APPROVED,
+            kind=loop_outcome_kind,
             rounds_used=0,
             last_session_id=kw.get("initial_session_id"),
             head_sha="head-sha",
@@ -251,14 +254,30 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     assert loop_kwargs["pr_number"] == 99
     assert loop_kwargs["branch"] == "auto/3"
     # Round cap, re-nudge and give-up timers are derived from cfg.
+    assert loop_kwargs["poll_interval_s"] == fixture["cfg"].orchestrator.poll_interval_s
     assert loop_kwargs["round_cap"] == fixture["cfg"].orchestrator.review_round_cap
     assert loop_kwargs["re_nudge_after_s"] == fixture["cfg"].orchestrator.codex_renudge_after_min * 60.0
     assert loop_kwargs["give_up_after_s"] == fixture["cfg"].orchestrator.codex_giveup_after_min * 60.0
 
-    # Auto-merge intentionally NOT armed at PR-open: M3's review loop fires
-    # the merge directly once Codex approves and CI is green. Arming here
-    # would either bypass review or sit waiting forever (Codex can't satisfy
-    # required-reviewer branch protection — see SYMPHONY.md M0 findings).
+    # Auto-merge is not armed at PR-open. The review loop owns final merge
+    # handling once Codex/CI approval is observed.
+    assert "merge_pr" not in calls
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_merge_when_review_loop_does_not_approve(monkeypatch, tmp_path):
+    from symphony.reviewer import LoopOutcomeKind
+
+    fixture = _patch_happy_path(
+        monkeypatch,
+        tmp_path,
+        loop_outcome_kind=LoopOutcomeKind.AUTO_STUCK_ROUNDS,
+    )
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+    assert res.skipped is False
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind == LoopOutcomeKind.AUTO_STUCK_ROUNDS
+    assert "merge_pr" not in fixture["calls"]
 
 
 @pytest.mark.asyncio

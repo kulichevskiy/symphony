@@ -64,25 +64,64 @@ def _branch_exists(repo_path: Path, branch: str) -> bool:
 
 def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
     """Authoritatively check whether ``origin`` has ``branch`` and refresh the
-    local remote-tracking ref so callers see it.
+    local remote-tracking ref so callers see the latest tip.
 
-    Skipping the fetch would mean a long-lived clone — one that hasn't
-    fetched since another runner pushed ``auto/<n>`` — would miss the
-    remote branch, fall through to creating a fresh local branch from
-    ``origin/<base>``, and then fail with a non-fast-forward push.
+    The previous implementation swallowed errors from ``git fetch`` and then
+    trusted any pre-existing local remote-tracking ref. In a long-lived
+    clone whose remote branch has since been deleted, that stale local ref
+    would make the caller resurrect old commits. We now ask origin itself
+    (``git ls-remote``) and act on its answer:
+
+    - branch present → fetch (so ``origin/<branch>`` is up-to-date) and return True
+    - branch absent  → prune any stale local ref and return False
+    - any other error (network, auth) → raise :class:`WorkspaceError` loudly
+      rather than fall through to a wrong "false" answer.
     """
-    # `git fetch <ref>:refs/remotes/origin/<ref>` updates the local remote-
-    # tracking ref iff the branch exists on origin. We swallow failure (e.g.
-    # the branch doesn't exist remotely yet) and let the rev-parse below be
-    # the authoritative check.
-    subprocess.run(
-        ["git", "fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"],
+    remote_ref = f"refs/heads/{branch}"
+    ls = subprocess.run(
+        ["git", "ls-remote", "--exit-code", "origin", remote_ref],
         cwd=repo_path,
         capture_output=True,
         text=True,
     )
+    if ls.returncode == 0:
+        fetch = subprocess.run(
+            ["git", "fetch", "origin", f"+{remote_ref}:refs/remotes/origin/{branch}"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if fetch.returncode != 0:
+            raise WorkspaceError(
+                f"git fetch origin {branch} failed: {fetch.stderr.strip() or fetch.stdout.strip()}"
+            )
+        return True
+    if ls.returncode == 2:
+        # ls-remote signals "ref not found" with exit code 2. Drop any stale
+        # remote-tracking ref so a later rev-parse can't return success on
+        # commits that no longer exist on origin.
+        subprocess.run(
+            ["git", "update-ref", "-d", f"refs/remotes/origin/{branch}"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        return False
+    raise WorkspaceError(
+        f"git ls-remote origin {branch} failed (exit {ls.returncode}): "
+        f"{ls.stderr.strip() or ls.stdout.strip()}"
+    )
+
+
+def _is_ancestor(repo_path: Path, ancestor: str, descendant: str) -> bool:
+    """Return True iff ``ancestor`` is reachable from ``descendant``.
+
+    A commit is its own ancestor, so this also handles the equal-SHAs case
+    (no fast-forward needed, but the caller's update-ref is a harmless
+    no-op anyway).
+    """
     res = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
         cwd=repo_path,
         capture_output=True,
         text=True,
@@ -99,6 +138,11 @@ def _worktree_exists(repo_path: Path, target: Path) -> bool:
             if str(Path(wt).resolve()) == target_resolved:
                 return True
     return False
+
+
+def _branch_checked_out(repo_path: Path, branch: str) -> bool:
+    res = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
+    return f"branch refs/heads/{branch}" in res.stdout.splitlines()
 
 
 def ensure_worktree(
@@ -131,6 +175,33 @@ def ensure_worktree(
     has_branch = _branch_exists(repo_path, branch)
     has_remote_branch = _remote_branch_exists(repo_path, branch)
     has_worktree = target.is_dir() and _worktree_exists(repo_path, target)
+
+    # When both local and remote `auto/<n>` exist, fast-forward the local
+    # branch to the remote tip if it's strictly behind. Without this, a
+    # stale local branch (another clone or runner pushed to origin since)
+    # would have the agent run on out-of-date history and the subsequent
+    # `git push` would be rejected as non-fast-forward. Skipped when the
+    # branch is currently checked out in a worktree (you can't update a
+    # checked-out branch via `update-ref` without leaving that checkout's
+    # index/worktree inconsistent); the worktree-reuse path below handles
+    # the target-worktree case via `git switch` + the agent's later commits.
+    if (
+        has_branch
+        and has_remote_branch
+        and not has_worktree
+        and not _branch_checked_out(repo_path, branch)
+        and _is_ancestor(repo_path, branch, f"origin/{branch}")
+    ):
+        try:
+            _run_git(
+                ["update-ref", f"refs/heads/{branch}", f"origin/{branch}"],
+                cwd=repo_path,
+            )
+        except subprocess.CalledProcessError as e:
+            raise WorkspaceError(
+                f"could not fast-forward {branch} to origin/{branch}: "
+                f"{e.stderr.strip() if e.stderr else e}"
+            ) from e
 
     if has_worktree:
         # The worktree could have drifted off `auto/<n>` between runs (a prior

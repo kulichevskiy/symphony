@@ -56,15 +56,6 @@ CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # that with a comfortable margin so a body of "boilerplate + tiny addendum"
 # isn't mistaken for substantive feedback.
 CODEX_BOILERPLATE_THRESHOLD = 750
-FAILED_CHECK_CONCLUSIONS = {
-    "failure",
-    "timed_out",
-    "cancelled",
-    "action_required",
-    "startup_failure",
-    "stale",
-}
-PENDING_CHECK_STATUSES = {"expected", "pending", "queued", "requested", "waiting", "in_progress"}
 
 
 class VerdictKind(StrEnum):
@@ -101,19 +92,6 @@ def _parse_iso(ts: str) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
-
-
-def _latest_checks_by_name(checks: list[CheckRun]) -> list[CheckRun]:
-    """Keep the newest check/status per source and name.
-
-    ``list_pr_checks`` receives commit statuses newest-first, so preserving the
-    first item per source/name drops stale failures left behind by reruns without
-    collapsing a status and check run that happen to share a name.
-    """
-    latest: dict[tuple[str, str], CheckRun] = {}
-    for check in checks:
-        latest.setdefault((check.source, check.name), check)
-    return list(latest.values())
 
 
 def _latest_codex_approval_at(
@@ -158,7 +136,6 @@ def evaluate_verdict(
     """Pure verdict evaluation. See module docstring for the rules."""
     fresh_reviews = [r for r in reviews if r.commit_sha == head_sha]
     fresh_comments = [c for c in review_comments if c.commit_sha == head_sha]
-    latest_checks = _latest_checks_by_name(checks)
     latest_codex_approval_at = _latest_codex_approval_at(
         head_committed_at=head_committed_at,
         reactions=reactions,
@@ -166,36 +143,50 @@ def evaluate_verdict(
     )
 
     # 1. CI failures take priority — they're concrete, fast feedback that
-    #    Codex review can't override.
-    failing_checks = [
-        c
-        for c in latest_checks
-        if c.status == "completed" and c.conclusion in FAILED_CHECK_CONCLUSIONS
-    ]
+    #    Codex review can't override. Other non-passing checks are not
+    #    actionable agent feedback, but they must block approval/merge.
+    failing_checks = [c for c in checks if c.bucket == "fail"]
     if failing_checks:
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
             review_comments=[c for c in fresh_comments if c.user_login == codex_login],
             ci_failures=failing_checks,
         )
+    non_passing_checks = [c for c in checks if c.bucket != "pass"]
 
-    # 2. Explicit human changes-requested reviews on HEAD trump approvals.
-    #    GitHub returns reviews oldest-first, so reduce to each reviewer's latest
-    #    state first before deciding whether a human verdict is blocking.
-    latest_human_reviews: list[Review] = []
-    seen_reviewers: set[str] = set()
-    for r in reversed(fresh_reviews):
-        if r.user_login == codex_login or r.user_login in seen_reviewers:
+    # 2. Explicit human verdicts on HEAD are collapsed per reviewer. Reviews come
+    #    back oldest-first; collapse them into one effective verdict per
+    #    reviewer (latest APPROVED / CHANGES_REQUESTED wins; DISMISSED clears
+    #    a prior verdict; COMMENTED is non-binding). Then aggregate across
+    #    reviewers: an unresolved CHANGES_REQUESTED from anyone blocks
+    #    approval even if someone else has already approved. Human approvals
+    #    are handled after Codex feedback below, because fresh Codex comments
+    #    still block merge.
+    human_verdicts: dict[str, str] = {}
+    for r in fresh_reviews:
+        if r.user_login == codex_login or not r.user_login:
             continue
-        seen_reviewers.add(r.user_login)
-        latest_human_reviews.append(r)
-    for r in latest_human_reviews:
-        if r.state == "CHANGES_REQUESTED":
-            return Verdict(
-                kind=VerdictKind.CHANGES_REQUESTED,
-                review_comments=fresh_comments,
-                last_review_body=r.body,
-            )
+        if r.state == "DISMISSED":
+            human_verdicts.pop(r.user_login, None)
+        elif r.state in ("APPROVED", "CHANGES_REQUESTED"):
+            human_verdicts[r.user_login] = r.state
+
+    if any(v == "CHANGES_REQUESTED" for v in human_verdicts.values()):
+        latest_cr = next(
+            (
+                r for r in reversed(fresh_reviews)
+                if r.user_login != codex_login
+                and r.state == "CHANGES_REQUESTED"
+                and human_verdicts.get(r.user_login) == "CHANGES_REQUESTED"
+            ),
+            None,
+        )
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            review_comments=fresh_comments,
+            last_review_body=latest_cr.body if latest_cr else "",
+        )
+    human_approved = any(v == "APPROVED" for v in human_verdicts.values())
 
     # 3. Active Codex review-comments on HEAD = changes requested. GitHub keeps
     #    old inline comments around, so only treat comments from the latest
@@ -245,18 +236,19 @@ def evaluate_verdict(
             last_review_body=codex_substantive[-1].body,
         )
 
-    # 5. Pending CI checks keep the verdict pending even if a fresh approval
-    #    has already landed; a later CI failure must still feed another loop.
-    pending_checks = [c for c in latest_checks if c.status in PENDING_CHECK_STATUSES]
-    if pending_checks:
-        return Verdict(kind=VerdictKind.PENDING, pending_checks=pending_checks)
+    # 5. Required checks that are still pending/skipping/cancelled block
+    #    approval but do not trigger remediation.
+    if non_passing_checks:
+        return Verdict(kind=VerdictKind.PENDING, pending_checks=non_passing_checks)
 
-    # 6. Approval via human review or Codex ``+1`` reaction on the PR. The
-    #    reaction must be at or after HEAD's committer time, otherwise it's
-    #    stale (referring to an earlier commit that's since been replaced).
-    if any(r.state == "APPROVED" for r in latest_human_reviews):
+    # 6. Approval via a non-Codex reviewer on HEAD. This is only considered
+    #    after fresh blocking signals have been ruled out.
+    if human_approved:
         return Verdict(kind=VerdictKind.APPROVED)
 
+    # 7. Approval via Codex ``+1`` reaction on the PR. Must be at or after HEAD's
+    #    committer time, otherwise it's stale (referring to an earlier
+    #    commit that's since been replaced).
     if latest_codex_approval_at is not None:
         return Verdict(kind=VerdictKind.APPROVED)
 
@@ -311,6 +303,27 @@ class LoopOutcome:
     last_session_id: str | None
     head_sha: str
     agent_result: Any | None = None
+
+
+def _pending_activity_key(snap: ReviewSnapshot) -> tuple[Any, ...]:
+    """Stable-enough fingerprint for pending-state activity.
+
+    Used only for idle accounting: if GitHub signals change while the verdict
+    remains PENDING, the PR is not idle and should not be auto-stuck.
+    """
+    return (
+        snap.head_sha,
+        tuple(
+            (r.id, r.user_login, r.state, r.commit_sha, r.submitted_at, r.body)
+            for r in snap.reviews
+        ),
+        tuple(
+            (c.id, c.user_login, c.path, c.line, c.commit_sha, c.created_at, c.body)
+            for c in snap.review_comments
+        ),
+        tuple((r.user_login, r.content, r.created_at) for r in snap.reactions),
+        tuple((c.name, c.bucket, c.state, c.link) for c in snap.checks),
+    )
 
 
 def select_resume_session(round_index: int, current_session_id: str | None) -> str | None:
@@ -403,7 +416,7 @@ async def drive_review_loop(
     rounds_used = 0
     last_activity = now_fn()
     nudged_during_idle = False
-    last_seen_head_sha = ""
+    last_pending_activity_key: tuple[Any, ...] | None = None
 
     while True:
         await sleep_fn(poll_interval_s)
@@ -416,10 +429,6 @@ async def drive_review_loop(
             reactions=snap.reactions,
             checks=snap.checks,
         )
-        if last_seen_head_sha and snap.head_sha != last_seen_head_sha:
-            last_activity = now_fn()
-            nudged_during_idle = False
-        last_seen_head_sha = snap.head_sha
 
         if verdict.kind == VerdictKind.APPROVED:
             try:
@@ -515,15 +524,25 @@ async def drive_review_loop(
             rounds_used += 1
             last_activity = now_fn()
             nudged_during_idle = False
+            last_pending_activity_key = None
             continue
 
         # PENDING — check timers
         if verdict.pending_checks:
             last_activity = now_fn()
             nudged_during_idle = False
+            last_pending_activity_key = None
             continue
 
-        elapsed = now_fn() - last_activity
+        pending_key = _pending_activity_key(snap)
+        now = now_fn()
+        if last_pending_activity_key is None:
+            last_pending_activity_key = pending_key
+        elif pending_key != last_pending_activity_key:
+            last_pending_activity_key = pending_key
+            last_activity = now
+            nudged_during_idle = False
+        elapsed = now - last_activity
         if elapsed >= give_up_after_s:
             label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
             return LoopOutcome(

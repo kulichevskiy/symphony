@@ -117,26 +117,36 @@ class Reaction:
 
 @dataclass(frozen=True)
 class CheckRun:
-    """One CI check run on the PR's HEAD commit."""
+    """One CI check run on the PR's HEAD commit.
+
+    ``bucket`` is gh's high-level rollup of the check status: ``"pass"``,
+    ``"fail"``, ``"pending"``, ``"skipping"``, or ``"cancel"``. ``state`` is
+    the raw GitHub state (``SUCCESS`` / ``FAILURE`` / ``IN_PROGRESS`` / …)
+    kept around for diagnostics. ``link`` points at the run details page.
+    """
 
     name: str
-    status: str
-    conclusion: str | None
-    details_url: str | None
-    source: str = "check_run"
+    bucket: str
+    state: str
+    link: str | None
 
 
-def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
+def _run_gh(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    allowed_exit_codes: set[int] | tuple[int, ...] = (0,),
+) -> str:
     """Run ``gh`` with the given args and return stdout.
 
-    Raises :class:`GithubError` on non-zero exit; stderr is included in the
+    Raises :class:`GithubError` on unexpected exit; stderr is included in the
     message so callers can show actionable failures without re-running.
     """
     try:
         res = subprocess.run(
             ["gh", *args],
             cwd=str(cwd) if cwd else None,
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
@@ -144,6 +154,10 @@ def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
         raise GithubError(
             f"gh {' '.join(args)} failed (exit {e.returncode}): {e.stderr.strip()}"
         ) from e
+    if res.returncode not in allowed_exit_codes:
+        raise GithubError(
+            f"gh {' '.join(args)} failed (exit {res.returncode}): {res.stderr.strip()}"
+        )
     return res.stdout
 
 
@@ -432,23 +446,6 @@ def comment_pr(*, repo_path: Path, pr_number: int, body: str) -> None:
     )
 
 
-def merge_pr(
-    *,
-    repo_path: Path,
-    pr_number: int,
-    method: str = "squash",
-    match_head_commit: str | None = None,
-) -> None:
-    flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
-    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
-    if match_head_commit:
-        args.extend(["--match-head-commit", match_head_commit])
-    _run_gh(
-        args,
-        cwd=repo_path,
-    )
-
-
 def arm_auto_merge(
     *,
     repo_path: Path,
@@ -458,6 +455,26 @@ def arm_auto_merge(
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
     _run_gh(
         ["pr", "merge", str(pr_number), "--auto", flag, "--delete-branch"],
+        cwd=repo_path,
+    )
+
+
+def merge_pr(
+    *,
+    repo_path: Path,
+    pr_number: int,
+    method: str = "squash",
+    match_head_commit: str | None = None,
+    match_head_sha: str | None = None,
+) -> None:
+    """Merge a PR immediately after Symphony's review loop approves it."""
+    flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
+    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
+    match_head = match_head_commit or match_head_sha
+    if match_head:
+        args += ["--match-head-commit", match_head]
+    _run_gh(
+        args,
         cwd=repo_path,
     )
 
@@ -535,58 +552,44 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
     ]
 
 
-def _status_to_check_run(status: dict[str, Any]) -> CheckRun:
-    state = status.get("state", "")
-    if state == "success":
-        check_status = "completed"
-        conclusion = "success"
-    elif state in {"failure", "error"}:
-        check_status = "completed"
-        conclusion = "failure"
-    elif state == "pending":
-        check_status = "in_progress"
-        conclusion = None
-    else:
-        check_status = "completed"
-        conclusion = state or None
-
-    return CheckRun(
-        name=status.get("context", ""),
-        status=check_status,
-        conclusion=conclusion,
-        details_url=status.get("target_url") or None,
-        source="status",
-    )
-
-
 def list_pr_checks(
     pr_number: int, *, repo_path: Path, head_sha: str | None = None
 ) -> list[CheckRun]:
-    """CI check runs and commit statuses on the PR's HEAD commit."""
-    owner, name = _name_with_owner(repo_path)
-    if head_sha is None:
-        head_sha = get_pr_head_sha(pr_number, repo_path=repo_path)
-    check_runs = _api_paginated_object_list(
-        f"repos/{owner}/{name}/commits/{head_sha}/check-runs",
-        repo_path=repo_path,
-        key="check_runs",
-        context=f"check runs for PR {pr_number}",
+    """Required CI check runs on the PR's HEAD commit (`gh pr checks`).
+
+    ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
+    on ``gh pr checks`` — that produces an unknown-field error. The actual
+    schema exposes ``name``, ``bucket``, ``state``, and ``link`` (among
+    others); we use those.
+
+    ``gh pr checks`` returns exit code 8 while checks are pending. That is a
+    normal polling state, so parse stdout instead of treating it as fatal.
+
+    ``head_sha`` is accepted for call-site compatibility with snapshot
+    fetchers that pin other GitHub inputs to a specific head.
+    """
+    out = _run_gh(
+        [
+            "pr",
+            "checks",
+            str(pr_number),
+            "--required",
+            "--json",
+            "name,bucket,state,link",
+        ],
+        cwd=repo_path,
+        allowed_exit_codes={0, 8},
     )
-    statuses = _api_paginated_list(
-        f"repos/{owner}/{name}/commits/{head_sha}/statuses",
-        repo_path=repo_path,
-        context=f"statuses for PR {pr_number}",
-    )
+    data = _parse_json(out, context=f"checks for PR {pr_number}")
     return [
         CheckRun(
             name=c.get("name", ""),
-            status=c.get("status", ""),
-            conclusion=c.get("conclusion") or None,
-            details_url=c.get("details_url") or c.get("html_url") or None,
-            source="check_run",
+            bucket=c.get("bucket", ""),
+            state=c.get("state", ""),
+            link=c.get("link") or None,
         )
-        for c in check_runs
-    ] + [_status_to_check_run(s) for s in statuses]
+        for c in data
+    ]
 
 
 def label_issue(number: int, label: str, *, repo_path: Path) -> None:
