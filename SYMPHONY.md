@@ -23,12 +23,13 @@ poll GitHub for open issues labeled `auto`
         → spawn `claude -p --output-format stream-json --max-turns 50 \
                 --model claude-opus-4-7 --permission-mode bypassPermissions \
                 --settings .symphony/claude-settings.json`
-          → on agent exit: commit, push, open PR with `Closes #N`, post `@codex review`,
-            arm `gh pr merge --auto --squash --delete-branch`
-            → poll PR reviews; on CHANGES_REQUESTED feed comments to agent via
-              `claude --resume <session-id>` (rounds 1–3) or fresh session (rounds 4–10)
-              → push, re-nudge `@codex review`, repeat
-                → on APPROVED, GitHub fires auto-merge → branch deleted, issue closed via Closes
+          → on agent exit: commit, push, open PR with `Closes #N` (Codex auto-reviews on open)
+            → poll PR reviews + reactions; on changes-requested (COMMENTED review with body)
+              feed comments to agent via `claude --resume <session-id>` (rounds 1–3) or fresh
+              session (rounds 4–10)
+              → push, post `@codex review`, repeat
+                → on approval (Codex `+1` reaction on PR + green required CI), Symphony fires
+                  `gh pr merge --squash --delete-branch` → issue closed via Closes
                   → cleanup: `git worktree remove`, log event
 ```
 
@@ -76,13 +77,24 @@ poll GitHub for open issues labeled `auto`
   `$1`). Other SPEC hooks (`before_run`, `after_run`, `before_remove`) skipped in v1.
 
 ### Review loop (Codex GH App, separate integration)
-- **Detection:** poll `gh api repos/{owner}/{repo}/pulls/{n}/reviews` every 30s while in flight.
-- **Verdict parsing:** track `last_reviewed_sha`; a review is fresh if `commit_id == HEAD`. Verdict
-  states:
-  - `APPROVED` → done (auto-merge will fire via branch protection).
-  - `CHANGES_REQUESTED` → re-invoke agent with rendered comments.
-  - `COMMENTED` with non-empty body → treat as `CHANGES_REQUESTED`.
-- **Trigger:** post `@codex review` PR comment on open and after every push (idempotent).
+- **Detection:** poll both `gh api repos/{owner}/{repo}/pulls/{n}/reviews` and `gh api
+  repos/{owner}/{repo}/issues/{n}/reactions` every 30s while in flight. Codex never posts
+  `APPROVED` / `CHANGES_REQUESTED` reviews — every Codex review is `state == "COMMENTED"`. The
+  approval signal is a `+1` reaction added to the PR (issue) by `chatgpt-codex-connector[bot]`
+  (validated in M0; see `docs/spike-findings.md`).
+- **Verdict parsing:** track `last_reviewed_sha`; a Codex review is fresh if `commit_id == HEAD`.
+  Verdict resolution against the Codex bot user `chatgpt-codex-connector[bot]`:
+  - **Approved** → fresh `+1` reaction on the PR exists with `created_at` after HEAD's
+    `committer.date`, AND no fresh `COMMENTED` review on HEAD has a non-boilerplate body. (Codex
+    review bodies always include an "About Codex in GitHub" `<details>` block; treat body length
+    < 600 chars as boilerplate-only.)
+  - **Changes requested** → fresh `COMMENTED` review on HEAD with body length ≥ 600 chars (or with
+    associated review comments — `gh api .../pulls/{n}/comments` filtered to the bot).
+  - **Pending** → no fresh review on HEAD and no fresh `+1`.
+- **Trigger:** post `@codex review` PR comment after every push (idempotent). On PR open Codex
+  auto-reviews, so Symphony skips the open-time nudge. Documented inline in every Codex review:
+  "Reviews are triggered when you Open a pull request for review, Mark a draft as ready,
+  Comment '@codex review'."
 - **Re-invocation:** rounds 1–3 resume same session; rounds 4–10 fresh session with full diff +
   accumulated comments preamble.
 - **Cap:** 10 rounds. Beyond that → label `auto-stuck`, leave PR + worktree, free slot.
@@ -90,9 +102,13 @@ poll GitHub for open issues labeled `auto`
 
 ### Output / merge
 - **Symphony writes the PR body** (with `Closes #<num>`). Agent never edits PR metadata.
-- **Auto-merge via branch protection.** Symphony arms `gh pr merge --auto --squash --delete-branch`
-  on PR open. GitHub fires merge once Codex APPROVED + required CI checks pass. **Preflight refuses
-  to start if branch protection isn't configured.**
+- **Symphony fires the merge directly.** Once verdict resolves to Approved (Codex `+1` reaction
+  on HEAD) and all required status checks are green, Symphony runs `gh pr merge <n> --squash
+  --delete-branch`. Branch protection cannot route Codex's signal — Codex never posts `APPROVED`
+  reviews — so `gh pr merge --auto` is not used. (See `docs/spike-findings.md` for why.)
+- **Branch protection** still configured to require status checks (CI must be green) but **not**
+  required approving reviewers. Preflight refuses to start if required-status-checks aren't
+  configured.
 - **No local pre-push gates** (no symphony-side `pytest`/lint). CI is source of truth; CI failure
   feeds back to agent like a review comment.
 - **Git author identity** (per worktree, not global): configurable in `symphony.toml`, defaults to a
@@ -272,18 +288,18 @@ When done, ensure tests pass and commit. Do not push — Symphony will push.
 
 ## Implementation order
 
-### M0 — Spikes (half-day, blocking)
+### M0 — Spikes (executed; see `docs/spike-findings.md`)
 
-Validate the four risky assumptions before writing milestone code:
+Four assumptions validated before writing milestone code. Outcomes:
 
-1. **Codex GH App posts formal `APPROVED`/`CHANGES_REQUESTED` reviews** (not just PR comments). Test
-   on a throwaway PR; confirm via `gh api .../reviews`.
-2. **`@codex review` PR comment triggers Codex.** If not, find the actual trigger or rely on
-   auto-only.
-3. **`claude --resume <id>`** preserves context cross-invocation. Two-line round-trip test.
-4. **Branch protection + `gh pr merge --auto`** actually fires after Codex APPROVED + green CI.
-
-If any spike fails, revisit the relevant decision before writing code.
+1. **Codex review verdict shape: design changed.** Codex never posts `APPROVED` /
+   `CHANGES_REQUESTED` — every review is `COMMENTED`. Approval is a `+1` reaction on the PR by
+   `chatgpt-codex-connector[bot]`. Verdict-parsing logic above reflects this.
+2. **`@codex review` trigger: confirmed.** Documented inline in every Codex review.
+3. **`claude --resume`: confirmed.** Round-trip test passed; context is preserved verbatim.
+4. **Auto-merge path: design changed.** Because Codex can't satisfy required-reviewers branch
+   protection, `gh pr merge --auto` is dropped; Symphony fires `gh pr merge --squash
+   --delete-branch` itself once the verdict resolves to Approved + required CI is green.
 
 ### M1 — Agent runner spike (~1 day)
 `python -m symphony.agent run --prompt ... --workdir ...` — subprocess wrapper around `claude`,
@@ -291,7 +307,8 @@ JSONL parsing, session_id capture. No GitHub, no orchestrator.
 
 ### M2 — Single-issue happy path (~2 days)
 `symphony run-once <num>`: fetch issue → worktree → agent → commit → push → open PR with
-`Closes #N` → arm auto-merge → exit. No review loop.
+`Closes #N` → exit. Merge happens later via M3's review loop, not at PR-open time. No review
+loop in M2.
 
 ### M3 — Review loop (~2 days)
 Poll Codex review verdict, feed comments back via `--resume`, cap 10 rounds, re-nudge timers,
