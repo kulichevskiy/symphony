@@ -389,6 +389,11 @@ async def test_run_once_waits_for_open_merge_pending_pr_without_remerging(
         return False
 
     monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+    monkeypatch.setattr(
+        ro_mod,
+        "get_pr_head_sha",
+        lambda **kw: "reviewed-sha",
+    )
     monkeypatch.setattr(ro_mod, "is_pr_merged", _not_merged)
 
     res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
@@ -410,6 +415,55 @@ async def test_run_once_waits_for_open_merge_pending_pr_without_remerging(
     assert events[-1].payload["outcome"] == "merge_pending"
     assert events[-1].payload["merge_retry"] is True
     assert events[-1].payload["reason"] == "open PR still pending merge"
+
+
+@pytest.mark.asyncio
+async def test_run_once_reruns_review_when_open_merge_pending_head_changes(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_pending",
+            "rounds_used": 2,
+            "head_sha": "old-sha",
+        },
+    )
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+    monkeypatch.setattr(ro_mod, "get_pr_head_sha", lambda **kw: "new-sha")
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == existing
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert fixture["calls"]["comment_pr"] == {
+        "repo_path": fixture["cfg"].repo.path,
+        "pr_number": 42,
+        "body": "@codex review",
+    }
+    assert fixture["calls"]["drive_review_loop"]["initial_session_id"] is None
+    assert fixture["calls"]["merge_pr"]["pr_number"] == 42
+    events = event_log.iter_events(issue_number=3)
+    retry_event = events[-2]
+    assert retry_event.kind == "pr-open"
+    assert retry_event.payload["merge_retry"] is True
+    assert retry_event.payload["head_changed"] is True
+    assert retry_event.payload["previous_head_sha"] == "old-sha"
+    assert retry_event.payload["head_sha"] == "new-sha"
 
 
 @pytest.mark.asyncio

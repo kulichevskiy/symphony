@@ -30,6 +30,7 @@ from .github import (
     PR,
     comment_pr,
     find_open_pr_for_branch,
+    get_pr_head_sha,
     is_pr_merged,
     merge_pr,
     name_with_owner,
@@ -287,8 +288,55 @@ async def run_once(
                 latest_terminal.payload.get("outcome")
                 == LoopOutcomeKind.MERGE_PENDING.value
             ):
+                head_check_error: str | None = None
+                try:
+                    current_head_sha = get_pr_head_sha(
+                        repo_path=repo_path,
+                        pr_number=pr.number,
+                    )
+                except GithubError as e:
+                    current_head_sha = ""
+                    head_check_error = str(e)
+                    log.warning(
+                        "could not verify pending merge PR #%d head during retry: %s",
+                        pr.number,
+                        e,
+                    )
+                if (
+                    retry_head_sha
+                    and current_head_sha
+                    and current_head_sha != retry_head_sha
+                ):
+                    emit(
+                        "pr-open",
+                        {
+                            "number": pr.number,
+                            "url": pr.url,
+                            "head": branch,
+                            "base": cfg.repo.default_branch,
+                            "reused": True,
+                            "merge_retry": True,
+                            "head_changed": True,
+                            "previous_head_sha": retry_head_sha,
+                            "head_sha": current_head_sha,
+                        },
+                    )
+                    comment_pr(
+                        repo_path=repo_path,
+                        pr_number=pr.number,
+                        body="@codex review",
+                    )
+                    outcome = await drive_and_merge(pr, initial_session_id=None)
+                    return RunOnceResult(
+                        issue_number=issue_number,
+                        pr=pr,
+                        skipped=False,
+                        skip_reason=None,
+                        worktree=worktree,
+                        loop_outcome=outcome,
+                    )
                 merged = False
-                merge_check_error: str | None = None
+                merge_check_error = head_check_error
                 try:
                     merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
                 except GithubError as e:
