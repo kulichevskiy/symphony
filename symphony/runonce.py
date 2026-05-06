@@ -19,14 +19,17 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .agent import run_agent
 from .config import Config, load_config
+from .events import EventLog
 from .github import (
     Issue,
     PR,
     comment_pr,
     find_open_pr_for_branch,
+    merge_pr,
     name_with_owner,
     open_pr,
     tracked_issues,
@@ -125,9 +128,25 @@ def _satisfied_deps(tracked: list[Any]) -> list[Any]:
     ]
 
 
-async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
+async def run_once(
+    *,
+    issue_number: int,
+    config_path: Path,
+    event_log: EventLog | None = None,
+    run_id: str | None = None,
+) -> RunOnceResult:
     cfg: Config = load_config(config_path)
     repo_path = cfg.repo.path
+    event_log = event_log or EventLog.for_repo(repo_path)
+    run_id = run_id or f"issue-{issue_number}-{uuid4().hex[:8]}"
+
+    def emit(kind: str, payload: dict[str, Any] | None = None) -> None:
+        event_log.emit(
+            kind,
+            issue_number=issue_number,
+            run_id=run_id,
+            payload=payload or {},
+        )
 
     issue = view_issue(issue_number, repo_path=repo_path)
     tracked = tracked_issues(issue_number, repo_path=repo_path)
@@ -166,11 +185,32 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
     # and would mistake an already-ahead branch for a successful new run.)
     head_before = _head_sha(worktree)
 
+    emit(
+        "agent-start",
+        {
+            "phase": "round1",
+            "branch": f"auto/{issue_number}",
+            "worktree": str(worktree),
+            "head_sha": head_before,
+        },
+    )
     result = await run_agent(
         prompt,
         worktree,
         model=cfg.agent.model,
         max_turns=cfg.agent.max_turns,
+    )
+    emit(
+        "agent-exit",
+        {
+            "phase": "round1",
+            "success": result.success,
+            "exit_code": result.exit_code,
+            "is_error": result.is_error,
+            "session_id": result.session_id,
+            "duration_ms": result.duration_ms,
+            "num_turns": result.num_turns,
+        },
     )
 
     if not result.success:
@@ -179,6 +219,14 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             issue_number,
             result.exit_code,
             result.is_error,
+        )
+        emit(
+            "run-terminal",
+            {
+                "outcome": "agent-failed",
+                "exit_code": result.exit_code,
+                "rounds_used": 0,
+            },
         )
         return RunOnceResult(
             issue_number=issue_number,
@@ -202,6 +250,14 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         log.error(
             "agent exited cleanly, no new commits, branch in sync with origin; skipping",
         )
+        emit(
+            "run-terminal",
+            {
+                "outcome": "empty-diff",
+                "head_sha": head_after,
+                "rounds_used": 0,
+            },
+        )
         return RunOnceResult(
             issue_number=issue_number,
             pr=None,
@@ -211,6 +267,7 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         )
 
     _git_push(worktree, branch)
+    emit("push", {"phase": "round1", "branch": branch, "head_sha": head_after})
     # Re-dispatch path: an open PR for this branch may already exist from a
     # prior run. Reuse it instead of letting `gh pr create` fail with the
     # duplicate-PR error — otherwise the run aborts before the @codex review
@@ -231,6 +288,27 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             title=issue.title,
             body=_build_pr_body(issue),
         )
+        emit(
+            "pr-open",
+            {
+                "number": pr.number,
+                "url": pr.url,
+                "head": branch,
+                "base": cfg.repo.default_branch,
+                "reused": False,
+            },
+        )
+    else:
+        emit(
+            "pr-open",
+            {
+                "number": pr.number,
+                "url": pr.url,
+                "head": branch,
+                "base": cfg.repo.default_branch,
+                "reused": True,
+            },
+        )
     comment_pr(repo_path=repo_path, pr_number=pr.number, body="@codex review")
 
     # Drive the Codex review loop until terminal: APPROVED, AUTO_STUCK_*, or
@@ -247,7 +325,32 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
         give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
         round_cap=cfg.orchestrator.review_round_cap,
+        event_log=event_log,
+        run_id=run_id,
     )
+    if outcome.kind == LoopOutcomeKind.APPROVED:
+        merge_pr(repo_path=repo_path, pr_number=pr.number)
+        emit(
+            "merge",
+            {
+                "pr_number": pr.number,
+                "url": pr.url,
+                "head_sha": outcome.head_sha,
+                "rounds_used": outcome.rounds_used,
+                "outcome": "approved",
+            },
+        )
+    elif outcome.kind != LoopOutcomeKind.AUTO_STUCK_IDLE and outcome.kind != LoopOutcomeKind.AUTO_STUCK_ROUNDS:
+        emit(
+            "run-terminal",
+            {
+                "pr_number": pr.number,
+                "url": pr.url,
+                "head_sha": outcome.head_sha,
+                "rounds_used": outcome.rounds_used,
+                "outcome": outcome.kind.value,
+            },
+        )
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,

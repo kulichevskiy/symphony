@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from symphony.github import CheckRun, Reaction, Review, ReviewComment
+from symphony.events import EventLog
 from symphony.reviewer import (
     CODEX_BOT_LOGIN,
     LoopOutcomeKind,
@@ -461,3 +462,54 @@ async def test_loop_returns_agent_failed_on_subprocess_failure(tmp_path):
     # No push or comment after a failed agent run.
     assert driver.calls["push"] == []
     assert driver.calls["comment_pr"] == []
+
+
+@pytest.mark.asyncio
+async def test_loop_emits_review_events(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    event_log = EventLog.for_repo(tmp_path)
+    driver = _Driver([_changes_snap("head1"), _approved_snap("head2")])
+
+    outcome = await _spawn_loop(driver, cfg, event_log=event_log, run_id="run-4")
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    kinds = [e.kind for e in event_log.iter_events(issue_number=4)]
+    assert "review-fresh" in kinds
+    assert "review-verdict" in kinds
+    assert "agent-start" in kinds
+    assert "agent-exit" in kinds
+    assert "push" in kinds
+    replay = event_log.replay_review(4)
+    assert replay.rounds_used == 1
+    assert replay.last_review_verdict == "approved"
+
+
+@pytest.mark.asyncio
+async def test_loop_replays_review_rounds_on_restart(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    event_log = EventLog.for_repo(tmp_path)
+    for round_no in (1, 2, 3):
+        event_log.emit(
+            "agent-exit",
+            issue_number=4,
+            run_id="old-run",
+            payload={"phase": "review", "round": round_no, "success": True},
+            ts=round_no,
+        )
+    event_log.emit(
+        "review-verdict",
+        issue_number=4,
+        run_id="old-run",
+        payload={"head_sha": "head3", "verdict": "changes_requested", "round": 3},
+        ts=4,
+    )
+    driver = _Driver([_changes_snap("head4"), _approved_snap("head5")])
+
+    outcome = await _spawn_loop(driver, cfg, event_log=event_log, run_id="new-run")
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert outcome.rounds_used == 4
+    # The restored round counter starts at 3, so the next remediation is round 4
+    # and must run fresh instead of resuming the original session.
+    assert driver.calls["agent_resume"] == [None]
+    assert event_log.replay_review(4).rounds_used == 4

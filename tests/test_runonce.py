@@ -25,6 +25,7 @@ from symphony.config import (
     PathsConfig,
     RepoConfig,
 )
+from symphony.events import EventLog
 from symphony.github import Issue, IssueComment, TrackedIssue, PR
 from symphony.types import AgentResult
 
@@ -178,6 +179,9 @@ def _patch_happy_path(
     monkeypatch.setattr(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
     )
+    monkeypatch.setattr(
+        ro_mod, "merge_pr", lambda **kw: calls.setdefault("merge_pr", kw)
+    )
 
     # Stub the review loop so existing tests don't have to thread its inputs.
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind
@@ -259,6 +263,22 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     # the merge directly once Codex approves and CI is green. Arming here
     # would either bypass review or sit waiting forever (Codex can't satisfy
     # required-reviewer branch protection — see SYMPHONY.md M0 findings).
+    assert calls["merge_pr"]["pr_number"] == 99
+
+
+@pytest.mark.asyncio
+async def test_run_once_writes_event_log(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+
+    await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    kinds = [e.kind for e in event_log.iter_events(issue_number=3)]
+    assert kinds[:4] == ["agent-start", "agent-exit", "push", "pr-open"]
+    assert kinds[-1] == "merge"
+    pr_event = [e for e in event_log.iter_events(issue_number=3) if e.kind == "pr-open"][0]
+    assert pr_event.payload["number"] == 99
+    assert pr_event.payload["reused"] is False
 
 
 @pytest.mark.asyncio

@@ -32,6 +32,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .events import EventLog
 from .github import (
     CheckRun,
     Reaction,
@@ -259,6 +260,8 @@ async def drive_review_loop(
     label_issue_fn: Callable[..., None] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now_fn: Callable[[], float] = None,  # type: ignore[assignment]
+    event_log: EventLog | None = None,
+    run_id: str = "",
 ) -> LoopOutcome:
     """Poll the PR until terminal state or a timeout/round cap.
 
@@ -294,11 +297,22 @@ async def drive_review_loop(
         if render_review_prompt is None:
             render_review_prompt = _default_render_review_prompt
 
+    replay = event_log.replay_review(issue_number) if event_log is not None else None
     session_id = initial_session_id
-    rounds_used = 0
+    rounds_used = replay.rounds_used if replay is not None else 0
     last_activity = now_fn()
     nudged_during_idle = False
-    last_seen_head_sha = ""
+    last_seen_head_sha = replay.last_reviewed_sha if replay is not None else ""
+
+    def emit(kind: str, payload: dict[str, Any] | None = None) -> None:
+        if event_log is None:
+            return
+        event_log.emit(
+            kind,
+            issue_number=issue_number,
+            run_id=run_id,
+            payload=payload or {},
+        )
 
     while True:
         await sleep_fn(poll_interval_s)
@@ -310,6 +324,22 @@ async def drive_review_loop(
             review_comments=snap.review_comments,
             reactions=snap.reactions,
             checks=snap.checks,
+        )
+        if snap.head_sha != last_seen_head_sha:
+            emit(
+                "review-fresh",
+                {"head_sha": snap.head_sha, "round": rounds_used},
+            )
+            last_seen_head_sha = snap.head_sha
+        emit(
+            "review-verdict",
+            {
+                "head_sha": snap.head_sha,
+                "verdict": verdict.kind.value,
+                "round": rounds_used,
+                "review_comments": len(verdict.review_comments),
+                "ci_failures": len(verdict.ci_failures),
+            },
         )
 
         if verdict.kind == VerdictKind.APPROVED:
@@ -323,6 +353,15 @@ async def drive_review_loop(
         if verdict.kind == VerdictKind.CHANGES_REQUESTED:
             if rounds_used >= round_cap:
                 label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
+                emit(
+                    "auto-stuck",
+                    {
+                        "reason": "round-cap",
+                        "rounds_used": rounds_used,
+                        "head_sha": snap.head_sha,
+                        "outcome": LoopOutcomeKind.AUTO_STUCK_ROUNDS.value,
+                    },
+                )
                 return LoopOutcome(
                     kind=LoopOutcomeKind.AUTO_STUCK_ROUNDS,
                     rounds_used=rounds_used,
@@ -340,6 +379,16 @@ async def drive_review_loop(
             resume = select_resume_session(rounds_used, session_id)
 
             head_before = head_sha_fn(worktree)
+            review_round = rounds_used + 1
+            emit(
+                "agent-start",
+                {
+                    "phase": "review",
+                    "round": review_round,
+                    "resume_session": resume,
+                    "head_sha": head_before,
+                },
+            )
             agent_result = await run_agent_fn(
                 prompt,
                 worktree,
@@ -349,6 +398,17 @@ async def drive_review_loop(
             )
 
             if not agent_result.success:
+                emit(
+                    "agent-exit",
+                    {
+                        "phase": "review",
+                        "round": review_round,
+                        "success": False,
+                        "exit_code": agent_result.exit_code,
+                        "is_error": agent_result.is_error,
+                        "session_id": agent_result.session_id,
+                    },
+                )
                 log.error(
                     "review-loop agent run failed (round %d, exit=%d)",
                     rounds_used,
@@ -366,9 +426,30 @@ async def drive_review_loop(
                 session_id = agent_result.session_id
 
             head_after = head_sha_fn(worktree)
+            emit(
+                "agent-exit",
+                {
+                    "phase": "review",
+                    "round": review_round,
+                    "success": True,
+                    "exit_code": agent_result.exit_code,
+                    "is_error": agent_result.is_error,
+                    "session_id": agent_result.session_id,
+                    "head_sha": head_after,
+                },
+            )
             to_push = commits_to_push_fn(worktree, branch, cfg.repo.default_branch)
             if head_after != head_before or to_push > 0:
                 push_fn(worktree, branch)
+                emit(
+                    "push",
+                    {
+                        "phase": "review",
+                        "round": review_round,
+                        "branch": branch,
+                        "head_sha": head_after,
+                    },
+                )
                 comment_pr_fn(
                     repo_path=cfg.repo.path,
                     pr_number=pr_number,
@@ -383,13 +464,21 @@ async def drive_review_loop(
             rounds_used += 1
             last_activity = now_fn()
             nudged_during_idle = False
-            last_seen_head_sha = snap.head_sha
             continue
 
         # PENDING — check timers
         elapsed = now_fn() - last_activity
         if elapsed >= give_up_after_s:
             label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
+            emit(
+                "auto-stuck",
+                {
+                    "reason": "idle",
+                    "rounds_used": rounds_used,
+                    "head_sha": snap.head_sha,
+                    "outcome": LoopOutcomeKind.AUTO_STUCK_IDLE.value,
+                },
+            )
             return LoopOutcome(
                 kind=LoopOutcomeKind.AUTO_STUCK_IDLE,
                 rounds_used=rounds_used,

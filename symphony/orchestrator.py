@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
+from .events import EventLog
 from .github import (
     Issue,
     TrackedIssue,
@@ -220,6 +221,7 @@ async def _dispatch_one(
     run_once_fn: Callable[..., Awaitable[RunOnceResult]],
     now_fn: Callable[[], float],
     rate_limit_pause_s: float,
+    event_log: EventLog | None = None,
 ) -> None:
     """Run a single issue through ``run_once`` and update state with the result."""
     state.running.add(issue.number)
@@ -229,7 +231,17 @@ async def _dispatch_one(
         )
     except Exception as e:  # pragma: no cover — exception path is logged + retried
         log.exception("dispatch crashed for issue #%d", issue.number)
-        state.schedule_retry(issue.number, now=now_fn())
+        entry = state.schedule_retry(issue.number, now=now_fn())
+        if event_log is not None:
+            event_log.emit(
+                "retry-scheduled",
+                issue_number=issue.number,
+                payload={
+                    "attempt": entry.attempt,
+                    "next_retry_at": int(entry.next_retry_at),
+                    "reason": "exception",
+                },
+            )
         return
     finally:
         state.running.discard(issue.number)
@@ -242,7 +254,25 @@ async def _dispatch_one(
 
     if rate_limited:
         state.pause(now=now_fn(), duration_s=rate_limit_pause_s)
-        state.schedule_retry(issue.number, now=now_fn())
+        entry = state.schedule_retry(issue.number, now=now_fn())
+        if event_log is not None:
+            event_log.emit(
+                "paused",
+                issue_number=issue.number,
+                payload={
+                    "paused_until": int(state.paused_until or 0),
+                    "reason": "rate-limit",
+                },
+            )
+            event_log.emit(
+                "retry-scheduled",
+                issue_number=issue.number,
+                payload={
+                    "attempt": entry.attempt,
+                    "next_retry_at": int(entry.next_retry_at),
+                    "reason": "rate-limit",
+                },
+            )
         log.warning(
             "rate-limit detected for issue #%d; pausing dispatch for %.0fs",
             issue.number,
@@ -251,7 +281,17 @@ async def _dispatch_one(
         return
 
     if result.skipped:
-        state.schedule_retry(issue.number, now=now_fn())
+        entry = state.schedule_retry(issue.number, now=now_fn())
+        if event_log is not None:
+            event_log.emit(
+                "retry-scheduled",
+                issue_number=issue.number,
+                payload={
+                    "attempt": entry.attempt,
+                    "next_retry_at": int(entry.next_retry_at),
+                    "reason": result.skip_reason or "skipped",
+                },
+            )
         return
 
     # Loop outcome decides retry vs done.
@@ -262,7 +302,17 @@ async def _dispatch_one(
     # Anything other than APPROVED keeps the issue in the retry queue so a
     # later tick can re-dispatch (e.g. after the worktree is reset, or for
     # AUTO_STUCK_IDLE which may resolve once Codex catches up).
-    state.schedule_retry(issue.number, now=now_fn())
+    entry = state.schedule_retry(issue.number, now=now_fn())
+    if event_log is not None:
+        event_log.emit(
+            "retry-scheduled",
+            issue_number=issue.number,
+            payload={
+                "attempt": entry.attempt,
+                "next_retry_at": int(entry.next_retry_at),
+                "reason": outcome.kind.value if outcome is not None else "not-approved",
+            },
+        )
 
 
 async def run_tick(
@@ -278,10 +328,19 @@ async def run_tick(
     now_fn: Callable[[], float],
     run_once_fn: Callable[..., Awaitable[RunOnceResult]],
     rate_limit_pause_s: float = RATE_LIMIT_PAUSE_S,
+    event_log: EventLog | None = None,
 ) -> TickStats:
     """One iteration of the poll loop. Returns a small stats record."""
-    if state.is_paused(now=now_fn()):
+    now = now_fn()
+    if state.is_paused(now=now):
         return TickStats(candidates=0, dispatched=0, skips=[])
+    if state.paused_until is not None and now >= state.paused_until:
+        if event_log is not None:
+            event_log.emit(
+                "resumed",
+                payload={"paused_until": int(state.paused_until)},
+            )
+        state.paused_until = None
 
     candidates = list_issues()
     graph = build_dep_graph(candidates, fetch_tracked=fetch_tracked)
@@ -292,6 +351,8 @@ async def run_tick(
     for n in cycles_flat:
         try:
             label_fn(n, "auto-cycle")
+            if event_log is not None:
+                event_log.emit("auto-cycle", issue_number=n, payload={})
         except Exception:  # pragma: no cover — labeling failure is non-fatal
             log.exception("could not apply auto-cycle label to #%d", n)
 
@@ -302,7 +363,7 @@ async def run_tick(
         state=state,
         has_open_pr=has_open_pr,
         has_local_branch=has_local_branch,
-        now=now_fn(),
+        now=now,
     )
 
     slots = max(0, cfg.orchestrator.max_concurrent - len(state.running))
@@ -314,6 +375,22 @@ async def run_tick(
     # this, returning from ``_main`` causes ``asyncio.run`` to cancel
     # them and abort in-flight work.
     for issue in to_dispatch:
+        if event_log is not None:
+            retry = state.retry_queue.get(issue.number)
+            if retry is not None:
+                event_log.emit(
+                    "retry-fired",
+                    issue_number=issue.number,
+                    payload={"attempt": retry.attempt},
+                )
+            event_log.emit(
+                "dispatch",
+                issue_number=issue.number,
+                payload={
+                    "title": issue.title,
+                    "created_at": issue.created_at,
+                },
+            )
         task = asyncio.create_task(
             _dispatch_one(
                 issue,
@@ -323,6 +400,7 @@ async def run_tick(
                 run_once_fn=run_once_fn,
                 now_fn=now_fn,
                 rate_limit_pause_s=rate_limit_pause_s,
+                event_log=event_log,
             ),
             name=f"dispatch-{issue.number}",
         )
@@ -348,6 +426,7 @@ async def run_forever(
     now_fn: Callable[[], float] | None = None,
     run_once_fn: Callable[..., Awaitable[RunOnceResult]] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    event_log: EventLog | None = None,
 ) -> None:
     """The main poll loop. Runs until ``shutdown_event`` is set.
 
@@ -356,6 +435,7 @@ async def run_forever(
     """
     state = state if state is not None else OrchestratorState()
     shutdown_event = shutdown_event or asyncio.Event()
+    event_log = event_log or EventLog.for_repo(cfg.repo.path)
     if now_fn is None:
         import time
         now_fn = time.monotonic
@@ -409,6 +489,7 @@ async def run_forever(
                 label_fn=label_fn,
                 now_fn=now_fn,
                 run_once_fn=run_once_fn,
+                event_log=event_log,
             )
         except Exception:  # pragma: no cover — keep the loop alive
             log.exception("poll tick raised; continuing")

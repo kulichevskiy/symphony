@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 from typing import Annotated
 
@@ -13,6 +14,7 @@ from .agent import (
     run_agent,
 )
 from .config import load_config
+from .events import EventLog
 from .logging_setup import configure_logging
 from .orchestrator import install_shutdown_handler, run_forever
 from .runonce import run_once
@@ -172,3 +174,81 @@ def run_cmd(
         log.info("orchestrator.stopped")
 
     asyncio.run(_main())
+
+
+@app.command("status")
+def status_cmd(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+        ),
+    ] = Path("symphony.toml"),
+) -> None:
+    """Show in-flight issues and recent terminal runs from the event log."""
+    cfg = load_config(config)
+    snapshot = EventLog.for_repo(cfg.repo.path).status_snapshot()
+
+    typer.echo("In-flight:")
+    if not snapshot.in_flight:
+        typer.echo("  none")
+    for item in snapshot.in_flight:
+        typer.echo(
+            "  "
+            f"#{item.issue_number} "
+            f"round={item.round} "
+            f"elapsed={item.elapsed_s}s "
+            f"latest_sha={item.latest_sha or '-'} "
+            f"last_reviewed_sha={item.last_reviewed_sha or '-'} "
+            f"last_review_verdict={item.last_review_verdict or '-'}"
+        )
+
+    typer.echo("Terminal runs (24h):")
+    if not snapshot.terminal_runs:
+        typer.echo("  none")
+    for item in snapshot.terminal_runs:
+        typer.echo(
+            "  "
+            f"#{item.issue_number} "
+            f"outcome={item.outcome} "
+            f"rounds={item.rounds} "
+            f"total_elapsed={item.total_elapsed_s}s"
+        )
+
+
+@app.command("logs")
+def logs_cmd(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+        ),
+    ] = Path("symphony.toml"),
+    issue: Annotated[
+        int | None,
+        typer.Option("--issue", help="Only show events for one issue number"),
+    ] = None,
+    follow: Annotated[
+        bool,
+        typer.Option("--follow", "-f", help="Keep waiting for new events"),
+    ] = False,
+    limit: Annotated[int, typer.Option("--limit", help="Initial events to print")] = 100,
+) -> None:
+    """Print event log rows as JSON lines."""
+    cfg = load_config(config)
+    event_log = EventLog.for_repo(cfg.repo.path)
+    last_id = 0
+    for event in event_log.tail_events(issue_number=issue, limit=limit):
+        typer.echo(event.to_json_line())
+        last_id = event.id
+
+    while follow:
+        time.sleep(1.0)
+        events = event_log.iter_events(issue_number=issue, after_id=last_id)
+        for event in events:
+            typer.echo(event.to_json_line())
+            last_id = event.id

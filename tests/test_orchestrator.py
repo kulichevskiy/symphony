@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from symphony.events import EventLog
 from symphony.github import Issue, IssueComment, TrackedIssue
 from symphony.orchestrator import (
     DispatchSkip,
@@ -421,6 +422,42 @@ async def test_run_tick_schedules_retry_on_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_tick_emits_dispatch_and_retry_events(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    event_log = EventLog.for_repo(tmp_path)
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=True,
+            skip_reason="empty-diff",
+            worktree=tmp_path,
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        event_log=event_log,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    kinds = [e.kind for e in event_log.iter_events(issue_number=1)]
+    assert kinds == ["dispatch", "retry-scheduled"]
+    assert event_log.iter_events(issue_number=1)[1].payload["reason"] == "empty-diff"
+
+
+@pytest.mark.asyncio
 async def test_run_tick_pauses_dispatch_on_agent_rate_limit(tmp_path):
     """A 429/usage-limit failure surfaced via ``RunOnceResult.agent_result``
     must trip ``state.pause(...)`` so the next tick is suspended."""
@@ -467,6 +504,70 @@ async def test_run_tick_pauses_dispatch_on_agent_rate_limit(tmp_path):
         await asyncio.sleep(0)
     assert state.paused_until == 600.0
     assert 1 in state.retry_queue
+
+
+@pytest.mark.asyncio
+async def test_run_tick_emits_paused_and_resumed_events(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    event_log = EventLog.for_repo(tmp_path)
+    rate_limited_agent = AgentResult(
+        session_id="s",
+        exit_code=1,
+        success=False,
+        is_error=True,
+        duration_ms=1,
+        num_turns=1,
+        total_cost_usd=0.0,
+        final_text="429",
+        raw_events=[],
+        stderr="",
+    )
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=True,
+            skip_reason="agent-failed",
+            worktree=tmp_path,
+            agent_result=rate_limited_agent,
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        rate_limit_pause_s=600.0,
+        event_log=event_log,
+    )
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 601.0,
+        run_once_fn=fake_run_once,
+        event_log=event_log,
+    )
+
+    kinds = [e.kind for e in event_log.iter_events()]
+    assert "paused" in kinds
+    assert "resumed" in kinds
 
 
 @pytest.mark.asyncio
