@@ -25,6 +25,13 @@ def test_help_lists_run_once():
     assert "run-once" in result.output
 
 
+def test_help_lists_run():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    # The long-running orchestrator command, distinct from `run-once`.
+    assert "\n run " in result.output or "│ run " in result.output
+
+
 def test_run_once_invokes_orchestrator(tmp_path, monkeypatch):
     from symphony.github import PR
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind

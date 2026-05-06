@@ -13,16 +13,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-ISSUE_FIELDS = "number,title,body,comments,labels"
+ISSUE_FIELDS = "number,title,body,comments,labels,createdAt"
 
 # ``trackedIssues`` returns issues referenced as task-list items in the parent
 # issue body. ``closedByPullRequestsReferences`` gives the PR (if any) that
 # closed each one — handy for rendering "satisfied dependencies" in the prompt.
 _TRACKED_ISSUES_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      trackedIssues(first: 50) {
+      trackedIssues(first: 100, after: $after) {
         nodes {
           number
           title
@@ -31,6 +31,10 @@ query($owner: String!, $name: String!, $number: Int!) {
           closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
             nodes { url }
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -56,6 +60,7 @@ class Issue:
     body: str
     labels: list[str]
     comments: list[IssueComment]
+    created_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -170,7 +175,61 @@ def view_issue(number: int, *, repo_path: Path) -> Issue:
         body=data.get("body", ""),
         labels=labels,
         comments=comments,
+        created_at=data.get("createdAt", ""),
     )
+
+
+def list_open_issues_with_label(
+    label: str, *, repo_path: Path, limit: int = 1000
+) -> list[Issue]:
+    """All open issues carrying ``label``, with the same shape as ``view_issue``.
+
+    Used by the orchestrator's poll loop to find candidates. ``createdAt``
+    drives the FIFO selection so the oldest ready issue dispatches first.
+
+    ``gh issue list --limit`` is a fetch cap on the most-recent items: with
+    the previous default of 100, an ``auto`` backlog larger than that would
+    silently starve older issues (the FIFO sort only applied within the
+    truncated subset). The default is now high enough to cover any realistic
+    personal-autopilot backlog; bump explicitly if you really do have more.
+    """
+    out = _run_gh(
+        [
+            "issue",
+            "list",
+            "--label",
+            label,
+            "--state",
+            "open",
+            "--limit",
+            str(limit),
+            "--json",
+            ISSUE_FIELDS,
+        ],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh issue list --label {label}")
+    issues: list[Issue] = []
+    for d in data:
+        comments = [
+            IssueComment(
+                author=(c.get("author") or {}).get("login", ""),
+                body=c.get("body", ""),
+            )
+            for c in d.get("comments", [])
+        ]
+        labels = [lbl.get("name", "") for lbl in d.get("labels", [])]
+        issues.append(
+            Issue(
+                number=int(d["number"]),
+                title=d.get("title", ""),
+                body=d.get("body", ""),
+                labels=labels,
+                comments=comments,
+                created_at=d.get("createdAt", ""),
+            )
+        )
+    return issues
 
 
 def name_with_owner(repo_path: Path) -> tuple[str, str]:
@@ -190,8 +249,10 @@ _name_with_owner = name_with_owner
 
 def tracked_issues(number: int, *, repo_path: Path) -> list[TrackedIssue]:
     owner, name = _name_with_owner(repo_path)
-    out = _run_gh(
-        [
+    results: list[TrackedIssue] = []
+    after: str | None = None
+    while True:
+        args = [
             "api",
             "graphql",
             "-F",
@@ -200,31 +261,40 @@ def tracked_issues(number: int, *, repo_path: Path) -> list[TrackedIssue]:
             f"name={name}",
             "-F",
             f"number={number}",
-            "-f",
-            f"query={_TRACKED_ISSUES_QUERY}",
-        ],
-        cwd=repo_path,
-    )
-    data = _parse_json(out, context="gh api graphql trackedIssues")
-    try:
-        nodes = data["data"]["repository"]["issue"]["trackedIssues"]["nodes"]
-    except (KeyError, TypeError) as e:
-        raise GithubError(f"unexpected GraphQL response shape: {data!r}") from e
+        ]
+        if after is not None:
+            args += ["-F", f"after={after}"]
+        args += ["-f", f"query={_TRACKED_ISSUES_QUERY}"]
 
-    results: list[TrackedIssue] = []
-    for n in nodes:
-        prs = n.get("closedByPullRequestsReferences", {}).get("nodes", [])
-        pr_url = prs[0]["url"] if prs else None
-        results.append(
-            TrackedIssue(
-                number=int(n["number"]),
-                title=n.get("title", ""),
-                state=n.get("state", ""),
-                state_reason=n.get("stateReason"),
-                pr_url=pr_url,
+        out = _run_gh(args, cwd=repo_path)
+        data = _parse_json(out, context="gh api graphql trackedIssues")
+        try:
+            tracked = data["data"]["repository"]["issue"]["trackedIssues"]
+            nodes = tracked["nodes"]
+        except (KeyError, TypeError) as e:
+            raise GithubError(f"unexpected GraphQL response shape: {data!r}") from e
+
+        for n in nodes:
+            prs = n.get("closedByPullRequestsReferences", {}).get("nodes", [])
+            pr_url = prs[0]["url"] if prs else None
+            results.append(
+                TrackedIssue(
+                    number=int(n["number"]),
+                    title=n.get("title", ""),
+                    state=n.get("state", ""),
+                    state_reason=n.get("stateReason"),
+                    pr_url=pr_url,
+                )
             )
-        )
-    return results
+
+        page_info = tracked.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return results
+        after = page_info.get("endCursor")
+        if after is None:
+            raise GithubError(
+                f"trackedIssues pageInfo.hasNextPage without endCursor: {data!r}"
+            )
 
 
 def find_open_pr_for_branch(

@@ -12,7 +12,9 @@ from .agent import (
     DEFAULT_PERMISSION_MODE,
     run_agent,
 )
+from .config import load_config
 from .logging_setup import configure_logging
+from .orchestrator import install_shutdown_handler, run_forever
 from .runonce import run_once
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -141,3 +143,32 @@ def run_once_cmd(
     # and worktree around — see SYMPHONY.md).
     if result.loop_outcome is not None and result.loop_outcome.kind.value != "approved":
         raise typer.Exit(2)
+
+
+@app.command("run")
+def run_cmd(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+        ),
+    ] = Path("symphony.toml"),
+) -> None:
+    """Long-running autopilot: poll for `auto`-labeled issues and dispatch."""
+    cfg = load_config(config)
+
+    async def _main() -> None:
+        loop = asyncio.get_running_loop()
+        shutdown = install_shutdown_handler(loop)
+        log.info(
+            "orchestrator.start",
+            label=cfg.github.label,
+            cap=cfg.orchestrator.max_concurrent,
+            poll_s=cfg.orchestrator.poll_interval_s,
+        )
+        await run_forever(cfg=cfg, config_path=config, shutdown_event=shutdown)
+        log.info("orchestrator.stopped")
+
+    asyncio.run(_main())

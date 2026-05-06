@@ -91,6 +91,56 @@ def test_view_issue_parses_gh_json(monkeypatch, tmp_path):
     assert "--json" in fake.calls[0]
 
 
+def test_view_issue_includes_created_at(monkeypatch, tmp_path):
+    payload = {
+        "number": 5,
+        "title": "x",
+        "body": "y",
+        "labels": [],
+        "comments": [],
+        "createdAt": "2026-05-01T00:00:00Z",
+    }
+    monkeypatch.setattr(gh_mod, "_run_gh", _stub({("issue", "view", "5"): json.dumps(payload)}))
+    issue = view_issue(5, repo_path=tmp_path)
+    assert issue.created_at == "2026-05-01T00:00:00Z"
+
+
+def test_list_open_issues_with_label_parses_json(monkeypatch, tmp_path):
+    from symphony.github import list_open_issues_with_label
+
+    payload = [
+        {
+            "number": 1,
+            "title": "older",
+            "body": "...",
+            "labels": [{"name": "auto"}],
+            "comments": [],
+            "createdAt": "2026-04-01T00:00:00Z",
+        },
+        {
+            "number": 2,
+            "title": "newer",
+            "body": "...",
+            "labels": [{"name": "auto"}, {"name": "p2"}],
+            "comments": [{"author": {"login": "ak"}, "body": "hi"}],
+            "createdAt": "2026-05-01T00:00:00Z",
+        },
+    ]
+    fake = _stub({("issue", "list"): json.dumps(payload)})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    issues = list_open_issues_with_label("auto", repo_path=tmp_path)
+    assert [i.number for i in issues] == [1, 2]
+    assert issues[0].created_at == "2026-04-01T00:00:00Z"
+    assert issues[1].labels == ["auto", "p2"]
+    assert issues[1].comments[0].author == "ak"
+    # Default limit must be high enough to cover a realistic auto backlog —
+    # `gh issue list --limit` is a fetch cap, so a too-small default
+    # silently starves older items past the cap.
+    [argv] = fake.calls
+    limit_arg = argv[argv.index("--limit") + 1]
+    assert int(limit_arg) >= 1000
+
+
 def test_view_issue_handles_null_comment_author(monkeypatch, tmp_path):
     """Regression: GitHub returns ``"author": null`` for deleted accounts.
 
@@ -189,6 +239,77 @@ def test_tracked_issues_parses_graphql(monkeypatch, tmp_path):
             number=7, title="open", state="OPEN", state_reason=None, pr_url=None,
         ),
     ]
+
+
+def test_tracked_issues_paginates_graphql(monkeypatch, tmp_path):
+    repo_payload = {"nameWithOwner": "owner/name"}
+    pages = [
+        {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "trackedIssues": {
+                            "nodes": [
+                                {
+                                    "number": 1,
+                                    "title": "first page",
+                                    "state": "CLOSED",
+                                    "stateReason": "COMPLETED",
+                                    "closedByPullRequestsReferences": {"nodes": []},
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "cursor-1",
+                            },
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "trackedIssues": {
+                            "nodes": [
+                                {
+                                    "number": 101,
+                                    "title": "second page",
+                                    "state": "OPEN",
+                                    "stateReason": None,
+                                    "closedByPullRequestsReferences": {"nodes": []},
+                                }
+                            ],
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                        }
+                    }
+                }
+            }
+        },
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args, *, cwd=None):  # type: ignore[no-untyped-def]
+        calls.append(list(args))
+        if args[:2] == ["repo", "view"]:
+            return json.dumps(repo_payload)
+        if args[:2] == ["api", "graphql"]:
+            return json.dumps(pages.pop(0))
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(gh_mod, "_run_gh", fake_run_gh)
+
+    results = tracked_issues(3, repo_path=tmp_path)
+
+    assert [r.number for r in results] == [1, 101]
+    graphql_calls = [c for c in calls if c[:2] == ["api", "graphql"]]
+    assert len(graphql_calls) == 2
+    assert not any(a.startswith("after=") for a in graphql_calls[0])
+    assert "after=cursor-1" in graphql_calls[1]
 
 
 def test_open_pr_invokes_gh_create_and_returns_pr(monkeypatch, tmp_path):
