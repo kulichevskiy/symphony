@@ -122,6 +122,7 @@ class CheckRun:
     status: str
     conclusion: str | None
     details_url: str | None
+    source: str = "check_run"
 
 
 def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
@@ -552,6 +553,7 @@ def _status_to_check_run(status: dict[str, Any]) -> CheckRun:
         status=check_status,
         conclusion=conclusion,
         details_url=status.get("target_url") or None,
+        source="status",
     )
 
 
@@ -579,6 +581,7 @@ def list_pr_checks(
             status=c.get("status", ""),
             conclusion=c.get("conclusion") or None,
             details_url=c.get("details_url") or c.get("html_url") or None,
+            source="check_run",
         )
         for c in check_runs
     ] + [_status_to_check_run(s) for s in statuses]

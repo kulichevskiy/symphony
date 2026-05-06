@@ -53,8 +53,14 @@ def _reaction(*, who, content="+1", at) -> Reaction:
     return Reaction(user_login=who, content=content, created_at=at)
 
 
-def _check(*, name="ci", conclusion=None, status="completed") -> CheckRun:
-    return CheckRun(name=name, status=status, conclusion=conclusion, details_url=None)
+def _check(*, name="ci", conclusion=None, status="completed", source="check_run") -> CheckRun:
+    return CheckRun(
+        name=name,
+        status=status,
+        conclusion=conclusion,
+        details_url=None,
+        source=source,
+    )
 
 
 def _eval(**overrides):
@@ -218,6 +224,18 @@ def test_latest_check_by_name_overrides_stale_failure():
     assert v.kind == VerdictKind.APPROVED
 
 
+def test_check_run_and_status_with_same_name_are_separate_signals():
+    v = _eval(
+        checks=[
+            _check(name="ci", conclusion="success", source="check_run"),
+            _check(name="ci", conclusion="failure", source="status"),
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].source == "status"
+
+
 def test_latest_pending_check_by_name_overrides_stale_success():
     v = _eval(
         checks=[
@@ -235,6 +253,13 @@ def test_latest_pending_check_by_name_overrides_stale_success():
 def test_codex_plus_one_reaction_on_head_is_approved():
     v = _eval(
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_codex_plus_one_at_head_commit_second_is_approved():
+    v = _eval(
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at=HEAD_AT)]
     )
     assert v.kind == VerdictKind.APPROVED
 

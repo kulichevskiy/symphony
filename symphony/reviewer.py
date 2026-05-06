@@ -11,7 +11,7 @@ Pure verdict logic is testable without touching the network, the clock, or
 Verdict mapping per SYMPHONY.md M0 spike findings:
 
 - **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
-  the PR with ``created_at`` after the HEAD commit's committer date, AND no
+  the PR with ``created_at`` at or after the HEAD commit's committer date, AND no
   fresh ``CHANGES_REQUESTED`` signal on HEAD, AND no pending or failing CI
   checks. A non-Codex reviewer's ``APPROVED`` review on HEAD also counts once
   checks are complete.
@@ -104,14 +104,15 @@ def _parse_iso(ts: str) -> datetime | None:
 
 
 def _latest_checks_by_name(checks: list[CheckRun]) -> list[CheckRun]:
-    """Keep the newest check/status per name.
+    """Keep the newest check/status per source and name.
 
     ``list_pr_checks`` receives commit statuses newest-first, so preserving the
-    first item per name drops stale failures left behind by reruns.
+    first item per source/name drops stale failures left behind by reruns without
+    collapsing a status and check run that happen to share a name.
     """
-    latest: dict[str, CheckRun] = {}
+    latest: dict[tuple[str, str], CheckRun] = {}
     for check in checks:
-        latest.setdefault(check.name, check)
+        latest.setdefault((check.source, check.name), check)
     return list(latest.values())
 
 
@@ -200,8 +201,8 @@ def evaluate_verdict(
         return Verdict(kind=VerdictKind.PENDING, pending_checks=pending_checks)
 
     # 6. Approval via human review or Codex ``+1`` reaction on the PR. The
-    #    reaction must be after HEAD's committer time, otherwise it's stale
-    #    (referring to an earlier commit that's since been replaced).
+    #    reaction must be at or after HEAD's committer time, otherwise it's
+    #    stale (referring to an earlier commit that's since been replaced).
     if any(r.state == "APPROVED" for r in latest_human_reviews):
         return Verdict(kind=VerdictKind.APPROVED)
 
@@ -211,7 +212,7 @@ def evaluate_verdict(
             if rxn.user_login != codex_login or rxn.content != "+1":
                 continue
             rxn_dt = _parse_iso(rxn.created_at)
-            if rxn_dt is not None and rxn_dt > head_dt:
+            if rxn_dt is not None and rxn_dt >= head_dt:
                 return Verdict(kind=VerdictKind.APPROVED)
 
     return Verdict(kind=VerdictKind.PENDING)

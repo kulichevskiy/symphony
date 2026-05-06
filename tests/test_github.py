@@ -576,8 +576,20 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     assert len(checks) == 5
     assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
     assert checks[2].conclusion is None
-    assert checks[3] == CheckRun(name="legacy", status="completed", conclusion="failure", details_url="https://ci/legacy")
-    assert checks[4] == CheckRun(name="deploy", status="in_progress", conclusion=None, details_url=None)
+    assert checks[3] == CheckRun(
+        name="legacy",
+        status="completed",
+        conclusion="failure",
+        details_url="https://ci/legacy",
+        source="status",
+    )
+    assert checks[4] == CheckRun(
+        name="deploy",
+        status="in_progress",
+        conclusion=None,
+        details_url=None,
+        source="status",
+    )
 
 
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
