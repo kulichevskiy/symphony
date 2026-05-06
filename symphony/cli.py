@@ -54,6 +54,14 @@ def agent_run(
     resume: Annotated[
         str | None, typer.Option(help="Resume an existing session id")
     ] = None,
+    settings: Annotated[
+        Path | None,
+        typer.Option(
+            "--settings",
+            help="Path to a Claude settings JSON file. Pass an isolated "
+            "Symphony-controlled file to keep runs deterministic across hosts.",
+        ),
+    ] = None,
 ) -> None:
     """One-shot agent invocation in the given workdir."""
     workdir.mkdir(parents=True, exist_ok=True)
@@ -74,6 +82,7 @@ def agent_run(
             model=model,
             max_turns=max_turns,
             permission_mode=permission_mode,
+            settings_path=settings,
             resume_session=resume,
             on_event=on_event,
         )

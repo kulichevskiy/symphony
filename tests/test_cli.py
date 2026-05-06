@@ -73,6 +73,69 @@ def test_agent_run_failure_propagates_exit_code(tmp_path, monkeypatch):
     assert result.exit_code == 2
 
 
+def test_agent_run_passes_settings_path(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        captured["settings_path"] = kwargs.get("settings_path")
+        return AgentResult(
+            session_id="s",
+            exit_code=0,
+            success=True,
+            is_error=False,
+            duration_ms=1,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text="ok",
+            raw_events=[],
+            stderr="",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("{}")
+    result = runner.invoke(
+        app,
+        [
+            "agent-run",
+            "--prompt",
+            "x",
+            "--workdir",
+            str(tmp_path),
+            "--settings",
+            str(settings_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["settings_path"] == settings_file
+
+
+def test_agent_run_settings_default_none(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        captured["settings_path"] = kwargs.get("settings_path")
+        return AgentResult(
+            session_id="s",
+            exit_code=0,
+            success=True,
+            is_error=False,
+            duration_ms=1,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text="ok",
+            raw_events=[],
+            stderr="",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    result = runner.invoke(
+        app, ["agent-run", "--prompt", "x", "--workdir", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    assert captured["settings_path"] is None
+
+
 def test_agent_run_success_clean_exit_zero(tmp_path, monkeypatch):
     async def fake_run_agent(prompt, workdir, **kwargs):
         return AgentResult(
