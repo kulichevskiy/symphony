@@ -694,6 +694,80 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     ]
 
 
+def test_list_pr_checks_uses_latest_check_run_attempt_per_app(monkeypatch, tmp_path):
+    check_runs = [
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "failure",
+            "details_url": "https://ci/build-old",
+            "app": {"id": 123},
+            "completed_at": "2026-05-06T07:00:00Z",
+        },
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://ci/build-new",
+            "app": {"id": 123},
+            "completed_at": "2026-05-06T07:05:00Z",
+        },
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "failure",
+            "details_url": "https://ci/build-other-app",
+            "app": {"id": 999},
+            "completed_at": "2026-05-06T07:10:00Z",
+        },
+    ]
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("pr", "view", "10"): json.dumps(
+                {"headRefOid": "abc123", "baseRefName": "main"}
+            ),
+            (
+                "api",
+                "repos/o/r/branches/main/protection/required_status_checks",
+            ): json.dumps(
+                {
+                    "contexts": [],
+                    "checks": [{"context": "build", "app_id": 123}],
+                }
+            ),
+            ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
+                [{"check_runs": check_runs}]
+            ),
+            ("api", "repos/o/r/commits/abc123/status?per_page=100"): json.dumps(
+                [{"statuses": []}]
+            ),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+
+    checks = list_pr_checks(10, repo_path=tmp_path)
+
+    assert checks == [
+        CheckRun(
+            name="build",
+            status="completed",
+            conclusion="success",
+            details_url="https://ci/build-new",
+            app_id=123,
+            required=True,
+        ),
+        CheckRun(
+            name="build",
+            status="completed",
+            conclusion="failure",
+            details_url="https://ci/build-other-app",
+            app_id=999,
+            required=False,
+        ),
+    ]
+
+
 def test_list_pr_checks_marks_forbidden_required_context_lookup_as_unknown(
     monkeypatch, tmp_path
 ):

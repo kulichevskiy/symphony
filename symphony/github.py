@@ -511,6 +511,16 @@ def _is_required_check(
     return _matches_required_check(name, app_id, required_checks)
 
 
+def _check_run_timestamp(check_run: dict[str, Any]) -> str:
+    return str(
+        check_run.get("completed_at")
+        or check_run.get("started_at")
+        or check_run.get("created_at")
+        or check_run.get("updated_at")
+        or ""
+    )
+
+
 def is_pr_merged(pr_number: int, *, repo_path: Path) -> bool:
     out = _run_gh(
         ["pr", "view", str(pr_number), "--json", "state,mergedAt"],
@@ -621,22 +631,31 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
     )
     status_pages = _parse_json(status_out, context=f"status contexts for PR {pr_number}")
 
-    checks = [
-        CheckRun(
-            name=str(c.get("name", "")),
-            status=c.get("status", ""),
-            conclusion=c.get("conclusion") or None,
-            details_url=c.get("details_url") or None,
-            app_id=_as_int_or_none((c.get("app") or {}).get("id")),
-            required=_is_required_check(
-                str(c.get("name", "")),
-                _as_int_or_none((c.get("app") or {}).get("id")),
-                required_checks,
-            ),
-        )
-        for page in check_run_pages
-        for c in page.get("check_runs", [])
-    ]
+    latest_check_runs: dict[tuple[str, int | None], tuple[str, int, CheckRun]] = {}
+    check_index = 0
+    for page in check_run_pages:
+        for c in page.get("check_runs", []):
+            check_name = str(c.get("name", ""))
+            app_id = _as_int_or_none((c.get("app") or {}).get("id"))
+            check = CheckRun(
+                name=check_name,
+                status=c.get("status", ""),
+                conclusion=c.get("conclusion") or None,
+                details_url=c.get("details_url") or None,
+                app_id=app_id,
+                required=_is_required_check(
+                    check_name,
+                    app_id,
+                    required_checks,
+                ),
+            )
+            key = (check_name, app_id)
+            timestamp = _check_run_timestamp(c)
+            current = latest_check_runs.get(key)
+            if current is None or (timestamp, check_index) > (current[0], current[1]):
+                latest_check_runs[key] = (timestamp, check_index, check)
+            check_index += 1
+    checks = [entry[2] for entry in latest_check_runs.values()]
     latest_statuses: dict[str, Any] = {}
     for page in status_pages:
         for status in page.get("statuses", []):
