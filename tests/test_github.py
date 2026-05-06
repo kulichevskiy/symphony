@@ -590,7 +590,18 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     fake = _stub(
         {
             ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
-            ("pr", "view", "10"): json.dumps({"headRefOid": "abc123"}),
+            ("pr", "view", "10"): json.dumps(
+                {"headRefOid": "abc123", "baseRefName": "auto/5"}
+            ),
+            (
+                "api",
+                "repos/o/r/branches/auto%2F5/protection/required_status_checks",
+            ): json.dumps(
+                {
+                    "contexts": ["test", "legacy"],
+                    "checks": [{"context": "build"}],
+                }
+            ),
             ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
                 [{"check_runs": page1}, {"check_runs": page2}]
             ),
@@ -602,14 +613,50 @@ def test_list_pr_checks(monkeypatch, tmp_path):
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
     assert len(checks) == 6
-    assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
+    assert checks[0] == CheckRun(
+        name="build",
+        status="completed",
+        conclusion="success",
+        details_url="https://ci/build",
+        required=True,
+    )
+    assert checks[1] == CheckRun(
+        name="test",
+        status="completed",
+        conclusion="failure",
+        details_url="https://ci/test",
+        required=True,
+    )
     assert checks[2].conclusion is None
-    assert checks[3] == CheckRun(name="deploy", status="completed", conclusion="success", details_url="https://ci/deploy")
-    assert checks[4] == CheckRun(name="external", status="in_progress", conclusion=None, details_url=None)
-    assert checks[5] == CheckRun(name="legacy", status="completed", conclusion="failure", details_url="https://ci/legacy")
+    assert checks[2].required is False
+    assert checks[3] == CheckRun(
+        name="deploy",
+        status="completed",
+        conclusion="success",
+        details_url="https://ci/deploy",
+        required=False,
+    )
+    assert checks[4] == CheckRun(
+        name="external",
+        status="in_progress",
+        conclusion=None,
+        details_url=None,
+        required=False,
+    )
+    assert checks[5] == CheckRun(
+        name="legacy",
+        status="completed",
+        conclusion="failure",
+        details_url="https://ci/legacy",
+        required=True,
+    )
     assert fake.calls == [
         ["repo", "view", "--json", "nameWithOwner"],
-        ["pr", "view", "10", "--json", "headRefOid"],
+        ["pr", "view", "10", "--json", "headRefOid,baseRefName"],
+        [
+            "api",
+            "repos/o/r/branches/auto%2F5/protection/required_status_checks",
+        ],
         [
             "api",
             "repos/o/r/commits/abc123/check-runs?per_page=100",

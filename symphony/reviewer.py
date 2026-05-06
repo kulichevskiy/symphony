@@ -12,9 +12,10 @@ Verdict mapping per SYMPHONY.md M0 spike findings:
 
 - **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
   the PR with ``created_at`` after the HEAD commit's committer date, AND no
-  fresh ``CHANGES_REQUESTED`` signal or pending CI check on HEAD. A non-Codex
-  reviewer's ``APPROVED`` review on HEAD also counts once CI checks are done.
-- **CHANGES_REQUESTED** = (a) any failing CI check on HEAD, (b) any inline
+  fresh ``CHANGES_REQUESTED`` signal or pending required CI check on HEAD. A
+  non-Codex reviewer's ``APPROVED`` review on HEAD also counts once required CI
+  checks are done.
+- **CHANGES_REQUESTED** = (a) any failing required CI check on HEAD, (b) any inline
   Codex review comment on HEAD, (c) a Codex ``COMMENTED`` review on HEAD whose
   body is substantively longer than the standard "About Codex in GitHub"
   boilerplate, or (d) a non-Codex ``CHANGES_REQUESTED`` review on HEAD.
@@ -109,8 +110,11 @@ def evaluate_verdict(
 
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
+    required_checks = [c for c in checks if c.required]
     failing_checks = [
-        c for c in checks if c.status == "completed" and c.conclusion == "failure"
+        c
+        for c in required_checks
+        if c.status == "completed" and c.conclusion == "failure"
     ]
     if failing_checks:
         return Verdict(
@@ -119,7 +123,7 @@ def evaluate_verdict(
             ci_failures=failing_checks,
         )
 
-    pending_checks = [c for c in checks if c.status != "completed"]
+    pending_checks = [c for c in required_checks if c.status != "completed"]
 
     # 2. Explicit human verdicts on HEAD trump Codex signals once checks are
     #    merge-ready. Pending checks still keep approvals from merging early.

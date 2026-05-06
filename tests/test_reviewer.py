@@ -52,8 +52,14 @@ def _reaction(*, who, content="+1", at) -> Reaction:
     return Reaction(user_login=who, content=content, created_at=at)
 
 
-def _check(*, name="ci", conclusion=None, status="completed") -> CheckRun:
-    return CheckRun(name=name, status=status, conclusion=conclusion, details_url=None)
+def _check(*, name="ci", conclusion=None, status="completed", required=True) -> CheckRun:
+    return CheckRun(
+        name=name,
+        status=status,
+        conclusion=conclusion,
+        details_url=None,
+        required=required,
+    )
 
 
 def _eval(**overrides):
@@ -144,12 +150,35 @@ def test_pending_check_blocks_codex_approval_reaction():
     assert v.kind == VerdictKind.PENDING
 
 
+def test_optional_pending_check_does_not_block_codex_approval_reaction():
+    v = _eval(
+        checks=[
+            _check(
+                name="deploy",
+                status="in_progress",
+                conclusion=None,
+                required=False,
+            )
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
 def test_failing_ci_takes_priority_over_codex_approval_reaction():
     v = _eval(
         checks=[_check(name="test", conclusion="failure")],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
+
+
+def test_optional_failing_check_does_not_block_codex_approval_reaction():
+    v = _eval(
+        checks=[_check(name="deploy", conclusion="failure", required=False)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
 
 
 # ---- approved ----

@@ -12,6 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 ISSUE_FIELDS = "number,title,body,comments,labels,createdAt"
 
@@ -122,6 +123,7 @@ class CheckRun:
     status: str
     conclusion: str | None
     details_url: str | None
+    required: bool = True
 
 
 def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
@@ -425,6 +427,38 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     return sha
 
 
+def _required_status_contexts(
+    *, owner: str, name: str, base_branch: str, repo_path: Path
+) -> set[str]:
+    if not base_branch:
+        return set()
+    encoded_branch = quote(base_branch, safe="")
+    try:
+        out = _run_gh(
+            [
+                "api",
+                f"repos/{owner}/{name}/branches/{encoded_branch}/protection/required_status_checks",
+            ],
+            cwd=repo_path,
+        )
+    except GithubError as e:
+        if "404" in str(e):
+            return set()
+        raise
+    data = _parse_json(
+        out,
+        context=f"required status checks for branch {base_branch}",
+    )
+    contexts = {str(c) for c in data.get("contexts") or [] if c}
+    for check in data.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        context = check.get("context")
+        if context:
+            contexts.add(str(context))
+    return contexts
+
+
 def is_pr_merged(pr_number: int, *, repo_path: Path) -> bool:
     out = _run_gh(
         ["pr", "view", str(pr_number), "--json", "state,mergedAt"],
@@ -498,7 +532,20 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
 def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
     """CI check runs on the PR's HEAD commit."""
     owner, name = _name_with_owner(repo_path)
-    sha = get_pr_head_sha(pr_number, repo_path=repo_path)
+    pr_out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "headRefOid,baseRefName"],
+        cwd=repo_path,
+    )
+    pr_data = _parse_json(pr_out, context=f"gh pr view {pr_number}")
+    sha = pr_data.get("headRefOid", "")
+    if not sha:
+        raise GithubError(f"PR #{pr_number} has no headRefOid")
+    required_contexts = _required_status_contexts(
+        owner=owner,
+        name=name,
+        base_branch=str(pr_data.get("baseRefName") or ""),
+        repo_path=repo_path,
+    )
     check_runs_out = _run_gh(
         [
             "api",
@@ -528,6 +575,7 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
             status=c.get("status", ""),
             conclusion=c.get("conclusion") or None,
             details_url=c.get("details_url") or None,
+            required=str(c.get("name", "")) in required_contexts,
         )
         for page in check_run_pages
         for c in page.get("check_runs", [])
@@ -559,6 +607,7 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
                 status=check_status,
                 conclusion=conclusion,
                 details_url=status.get("target_url") or None,
+                required=str(status.get("context") or "") in required_contexts,
             )
         )
     return checks
