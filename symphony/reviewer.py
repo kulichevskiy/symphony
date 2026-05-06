@@ -12,13 +12,14 @@ Verdict mapping per SYMPHONY.md M0 spike findings:
 
 - **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
   the PR with ``created_at`` after the HEAD commit's committer date, AND no
-  fresh ``CHANGES_REQUESTED`` signal on HEAD. A non-Codex reviewer's
-  ``APPROVED`` review on HEAD also counts.
+  fresh ``CHANGES_REQUESTED`` signal on HEAD, AND no pending or failing CI
+  checks. A non-Codex reviewer's ``APPROVED`` review on HEAD also counts once
+  checks are complete.
 - **CHANGES_REQUESTED** = (a) any failing CI check on HEAD, (b) any inline
   Codex review comment on HEAD, (c) a Codex ``COMMENTED`` review on HEAD whose
   body is substantively longer than the standard "About Codex in GitHub"
   boilerplate, or (d) a non-Codex ``CHANGES_REQUESTED`` review on HEAD.
-- **PENDING** = none of the above.
+- **PENDING** = checks are still running or none of the above has happened.
 """
 
 from __future__ import annotations
@@ -55,6 +56,8 @@ CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # that with a comfortable margin so a body of "boilerplate + tiny addendum"
 # isn't mistaken for substantive feedback.
 CODEX_BOILERPLATE_THRESHOLD = 750
+FAILED_CHECK_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required"}
+PENDING_CHECK_STATUSES = {"expected", "pending", "queued", "requested", "waiting", "in_progress"}
 
 
 class VerdictKind(StrEnum):
@@ -109,7 +112,9 @@ def evaluate_verdict(
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
     failing_checks = [
-        c for c in checks if c.status == "completed" and c.conclusion == "failure"
+        c
+        for c in checks
+        if c.status == "completed" and c.conclusion in FAILED_CHECK_CONCLUSIONS
     ]
     if failing_checks:
         return Verdict(
@@ -118,17 +123,23 @@ def evaluate_verdict(
             ci_failures=failing_checks,
         )
 
-    # 2. Explicit human verdicts on HEAD trump everything else.
-    for r in fresh_reviews:
-        if r.user_login != codex_login:
-            if r.state == "CHANGES_REQUESTED":
-                return Verdict(
-                    kind=VerdictKind.CHANGES_REQUESTED,
-                    review_comments=fresh_comments,
-                    last_review_body=r.body,
-                )
-            if r.state == "APPROVED":
-                return Verdict(kind=VerdictKind.APPROVED)
+    # 2. Explicit human changes-requested reviews on HEAD trump approvals.
+    #    GitHub returns reviews oldest-first, so reduce to each reviewer's latest
+    #    state first before deciding whether a human verdict is blocking.
+    latest_human_reviews: list[Review] = []
+    seen_reviewers: set[str] = set()
+    for r in reversed(fresh_reviews):
+        if r.user_login == codex_login or r.user_login in seen_reviewers:
+            continue
+        seen_reviewers.add(r.user_login)
+        latest_human_reviews.append(r)
+    for r in latest_human_reviews:
+        if r.state == "CHANGES_REQUESTED":
+            return Verdict(
+                kind=VerdictKind.CHANGES_REQUESTED,
+                review_comments=fresh_comments,
+                last_review_body=r.body,
+            )
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
     #    reviews always come paired with inline comments when there's
@@ -161,9 +172,17 @@ def evaluate_verdict(
             last_review_body=codex_substantive[-1].body,
         )
 
-    # 5. Approval via Codex ``+1`` reaction on the PR. Must be after HEAD's
-    #    committer time, otherwise it's stale (referring to an earlier
-    #    commit that's since been replaced).
+    # 5. Pending CI checks keep the verdict pending even if a fresh approval
+    #    has already landed; a later CI failure must still feed another loop.
+    if any(c.status in PENDING_CHECK_STATUSES for c in checks):
+        return Verdict(kind=VerdictKind.PENDING)
+
+    # 6. Approval via human review or Codex ``+1`` reaction on the PR. The
+    #    reaction must be after HEAD's committer time, otherwise it's stale
+    #    (referring to an earlier commit that's since been replaced).
+    if any(r.state == "APPROVED" for r in latest_human_reviews):
+        return Verdict(kind=VerdictKind.APPROVED)
+
     head_dt = _parse_iso(head_committed_at)
     if head_dt is not None:
         for rxn in reactions:

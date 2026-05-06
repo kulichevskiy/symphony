@@ -124,14 +124,68 @@ def test_human_changes_requested_review_wins():
     assert v.last_review_body == "needs work"
 
 
+def test_latest_human_review_state_for_reviewer_wins():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="old", id=1),
+            _review(who="alice", state="APPROVED", body="fixed", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_latest_human_changes_requested_still_blocks():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="old", id=1),
+            _review(who="alice", state="CHANGES_REQUESTED", body="new", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "new"
+
+
+def test_latest_changes_requested_from_any_human_blocks_approval():
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1),
+            _review(who="bob", state="CHANGES_REQUESTED", body="blocked", id=2),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "blocked"
+
+
 def test_failing_ci_check_is_changes_requested():
     v = _eval(checks=[_check(name="test", conclusion="failure")])
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.ci_failures[0].name == "test"
 
 
+def test_cancelled_ci_check_is_changes_requested():
+    v = _eval(checks=[_check(name="test", conclusion="cancelled")])
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].name == "test"
+
+
 def test_in_progress_check_is_not_failure():
     v = _eval(checks=[_check(name="test", status="in_progress", conclusion=None)])
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_in_progress_check_blocks_codex_approval_reaction():
+    v = _eval(
+        checks=[_check(name="test", status="in_progress", conclusion=None)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_in_progress_check_blocks_human_approval():
+    v = _eval(
+        checks=[_check(name="test", status="in_progress", conclusion=None)],
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+    )
     assert v.kind == VerdictKind.PENDING
 
 
@@ -168,6 +222,16 @@ def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
+
+
+def test_human_approval_does_not_override_codex_inline_comment():
+    c = _comment()
+    v = _eval(
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+        review_comments=[c],
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.review_comments == [c]
 
 
 def test_human_approved_review_wins():

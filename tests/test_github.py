@@ -520,17 +520,35 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 
 
 def test_list_pr_checks(monkeypatch, tmp_path):
-    payload = [
-        {"name": "build", "status": "completed", "conclusion": "success", "detailsUrl": "https://ci/build"},
-        {"name": "test", "status": "completed", "conclusion": "failure", "detailsUrl": "https://ci/test"},
-        {"name": "lint", "status": "in_progress", "conclusion": None, "detailsUrl": None},
+    check_runs = [
+        {
+            "check_runs": [
+                {"name": "build", "status": "completed", "conclusion": "success", "details_url": "https://ci/build"},
+                {"name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://ci/test"},
+                {"name": "lint", "status": "in_progress", "conclusion": None, "details_url": None},
+            ]
+        },
+        {"check_runs": []},
     ]
-    fake = _stub({("pr", "checks", "10"): json.dumps(payload)})
+    statuses = [
+        [{"context": "legacy", "state": "error", "target_url": "https://ci/legacy"}],
+        [{"context": "deploy", "state": "pending", "target_url": None}],
+    ]
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("pr", "view", "10"): json.dumps({"headRefOid": "shaH"}),
+            ("api", "repos/o/r/commits/shaH/check-runs"): json.dumps(check_runs),
+            ("api", "repos/o/r/commits/shaH/statuses"): json.dumps(statuses),
+        }
+    )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
-    assert len(checks) == 3
+    assert len(checks) == 5
     assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
     assert checks[2].conclusion is None
+    assert checks[3] == CheckRun(name="legacy", status="completed", conclusion="failure", details_url="https://ci/legacy")
+    assert checks[4] == CheckRun(name="deploy", status="in_progress", conclusion=None, details_url=None)
 
 
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
