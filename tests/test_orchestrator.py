@@ -408,6 +408,32 @@ async def test_run_tick_labels_cycle_members(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_tick_does_not_relabel_existing_cycle_members(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    issues = [
+        _issue(1, labels=("auto", "auto-cycle")),
+        _issue(2, labels=("auto", "auto-cycle")),
+    ]
+    labels: list[tuple[int, str]] = []
+
+    stats = await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: issues,
+        fetch_tracked=lambda n: [_tracked(2 if n == 1 else 1, state="OPEN", state_reason=None)],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: labels.append((n, lbl)),
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+    )
+    assert stats.dispatched == 0
+    assert labels == []
+
+
+@pytest.mark.asyncio
 async def test_run_tick_clears_retry_on_approval(tmp_path):
     cfg = _make_cfg(tmp_path)
     state = OrchestratorState()

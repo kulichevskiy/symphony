@@ -317,7 +317,11 @@ async def run_tick(
     cycles_flat: set[int] = set()
     for c in cycles:
         cycles_flat.update(c)
+    candidates_by_number = {issue.number: issue for issue in candidates}
     for n in cycles_flat:
+        issue = candidates_by_number.get(n)
+        if issue is not None and "auto-cycle" in issue.labels:
+            continue
         try:
             label_fn(n, "auto-cycle")
         except Exception:  # pragma: no cover — labeling failure is non-fatal
