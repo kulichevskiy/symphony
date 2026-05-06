@@ -217,10 +217,21 @@ class EventLog:
         return ""
 
     def latest_terminal_event(self, issue_number: int) -> Event | None:
-        for ev in reversed(self.tail_events(issue_number=issue_number, limit=100)):
-            if ev.kind in TERMINAL_KINDS:
-                return ev
-        return None
+        self.ensure()
+        kinds = sorted(TERMINAL_KINDS)
+        placeholders = ",".join("?" for _ in kinds)
+        with self._connect() as con:
+            row = con.execute(
+                f"""
+                SELECT id, ts, issue_number, run_id, kind, payload_json
+                FROM events
+                WHERE issue_number = ? AND kind IN ({placeholders})
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (issue_number, *kinds),
+            ).fetchone()
+        return self._row_to_event(row) if row is not None else None
 
     def status_snapshot(
         self,

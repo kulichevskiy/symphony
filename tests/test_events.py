@@ -177,3 +177,38 @@ def test_status_snapshot_clears_active_state_on_retry_scheduled(tmp_path):
     snapshot = log.status_snapshot(now_ts=200)
     assert snapshot.in_flight == []
     assert snapshot.terminal_runs == []
+
+
+def test_latest_terminal_event_searches_full_issue_history(tmp_path):
+    log = EventLog.for_repo(tmp_path)
+    terminal = log.emit(
+        "run-terminal",
+        issue_number=10,
+        run_id="old",
+        payload={"outcome": "merge_pending", "head_sha": "old-sha"},
+        ts=100,
+    )
+    for index in range(101):
+        log.emit(
+            "review-verdict",
+            issue_number=10,
+            run_id=f"noise-{index}",
+            payload={"head_sha": f"sha-{index}", "verdict": "pending"},
+            ts=101 + index,
+        )
+    log.emit(
+        "run-terminal",
+        issue_number=11,
+        run_id="other",
+        payload={"outcome": "merge_failed"},
+        ts=300,
+    )
+
+    assert "run-terminal" not in {
+        event.kind for event in log.tail_events(issue_number=10, limit=100)
+    }
+    latest = log.latest_terminal_event(10)
+    assert latest is not None
+    assert latest.id == terminal.id
+    assert latest.payload["outcome"] == "merge_pending"
+    assert log.latest_terminal_outcome(10) == "merge_pending"
