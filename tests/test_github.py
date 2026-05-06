@@ -31,6 +31,7 @@ from symphony.github import (
     list_pr_reactions,
     list_pr_review_comments,
     list_pr_reviews,
+    merge_pr,
     open_pr,
     tracked_issues,
     view_issue,
@@ -320,6 +321,17 @@ def test_arm_auto_merge_calls_gh_pr_merge(monkeypatch, tmp_path):
     call = fake.calls[0]
     assert call[:3] == ["pr", "merge", "12"]
     assert "--auto" in call
+    assert "--squash" in call
+    assert "--delete-branch" in call
+
+
+def test_merge_pr_calls_direct_gh_pr_merge(monkeypatch, tmp_path):
+    fake = _stub({("pr", "merge", "12"): ""})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    merge_pr(repo_path=tmp_path, pr_number=12)
+    call = fake.calls[0]
+    assert call[:3] == ["pr", "merge", "12"]
+    assert "--auto" not in call
     assert "--squash" in call
     assert "--delete-branch" in call
 

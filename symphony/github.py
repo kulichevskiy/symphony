@@ -364,6 +364,20 @@ def arm_auto_merge(
     )
 
 
+def merge_pr(
+    *,
+    repo_path: Path,
+    pr_number: int,
+    method: str = "squash",
+) -> None:
+    """Merge a PR immediately after Symphony's review loop approves it."""
+    flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
+    _run_gh(
+        ["pr", "merge", str(pr_number), flag, "--delete-branch"],
+        cwd=repo_path,
+    )
+
+
 def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     out = _run_gh(
         ["pr", "view", str(pr_number), "--json", "headRefOid"], cwd=repo_path
