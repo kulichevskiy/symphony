@@ -449,3 +449,59 @@ async def test_run_forever_exits_when_shutdown_event_set(tmp_path):
         run_once_fn=lambda **kw: _approved_result(),
     )
     assert ticks >= 3
+
+
+@pytest.mark.asyncio
+async def test_run_forever_drains_in_flight_dispatches_on_shutdown(tmp_path):
+    """SIGINT during an active dispatch must let the in-flight ``run_once``
+    finish, not get cancelled by the event-loop tear-down."""
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    state = OrchestratorState()
+    shutdown = asyncio.Event()
+    completed: list[int] = []
+    started = asyncio.Event()
+
+    async def slow_run_once(*, issue_number, config_path):
+        started.set()
+        # Block until shutdown fires, then "finish work" after a brief delay
+        # so the run_forever loop has already exited its sleep_fn wait when
+        # we return. If the task were cancelled by loop tear-down, this
+        # append would never execute.
+        await shutdown.wait()
+        await asyncio.sleep(0.02)
+        completed.append(issue_number)
+        return _approved_result()
+
+    async def trigger_shutdown_after_first_dispatch():
+        await started.wait()
+        shutdown.set()
+
+    list_calls = 0
+
+    def list_issues():
+        nonlocal list_calls
+        list_calls += 1
+        # Only return a candidate on the first tick so we don't spawn more
+        # tasks after shutdown is requested.
+        return [_issue(1)] if list_calls == 1 else []
+
+    await asyncio.gather(
+        run_forever(
+            cfg=cfg,
+            config_path=tmp_path / "symphony.toml",
+            state=state,
+            shutdown_event=shutdown,
+            list_issues_fn=list_issues,
+            fetch_tracked_fn=lambda n: [],
+            has_open_pr_fn=lambda n: False,
+            has_local_branch_fn=lambda n: False,
+            label_fn=lambda n, lbl: None,
+            now_fn=lambda: 0.0,
+            run_once_fn=slow_run_once,
+        ),
+        trigger_shutdown_after_first_dispatch(),
+    )
+
+    assert completed == [1], "shutdown cancelled an in-flight dispatch"
+    assert state.dispatch_tasks == set()

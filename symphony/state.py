@@ -9,6 +9,7 @@ event log lives in M5 (issue #6); recovery on restart is "look at world state
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -57,6 +58,11 @@ class OrchestratorState:
     running: set[int] = field(default_factory=set)
     retry_queue: dict[int, RetryEntry] = field(default_factory=dict)
     paused_until: float | None = None
+    # Live handles for asyncio tasks dispatched by ``run_tick``. ``run_forever``
+    # awaits this set after ``shutdown_event`` fires so SIGINT/SIGTERM drains
+    # in-flight ``run_once`` invocations rather than cancelling them when the
+    # event loop tears down.
+    dispatch_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
     def is_paused(self, *, now: float) -> bool:
         return self.paused_until is not None and now < self.paused_until

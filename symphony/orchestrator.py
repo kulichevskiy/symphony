@@ -309,9 +309,12 @@ async def run_tick(
     to_dispatch = ready[:slots]
 
     # Spawn each as a background task; the task self-removes from
-    # state.running on completion. Tasks are awaited only at shutdown.
+    # state.running on completion. Handles are tracked on ``state`` so
+    # ``run_forever`` can await them after a shutdown signal — without
+    # this, returning from ``_main`` causes ``asyncio.run`` to cancel
+    # them and abort in-flight work.
     for issue in to_dispatch:
-        asyncio.create_task(
+        task = asyncio.create_task(
             _dispatch_one(
                 issue,
                 cfg=cfg,
@@ -323,6 +326,8 @@ async def run_tick(
             ),
             name=f"dispatch-{issue.number}",
         )
+        state.dispatch_tasks.add(task)
+        task.add_done_callback(state.dispatch_tasks.discard)
 
     return TickStats(
         candidates=len(candidates), dispatched=len(to_dispatch), skips=skips
@@ -416,6 +421,16 @@ async def run_forever(
             )
         except asyncio.TimeoutError:
             pass
+
+    # Drain in-flight dispatches. The done-callback in ``run_tick`` removes
+    # entries from the set as tasks finish, so we snapshot first to avoid
+    # mutating the set while iterating. ``return_exceptions=True`` keeps a
+    # crashed dispatch from masking the others — ``_dispatch_one`` already
+    # logs and reschedules retries internally.
+    pending = list(state.dispatch_tasks)
+    if pending:
+        log.info("draining %d in-flight dispatch task(s)", len(pending))
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def install_shutdown_handler(loop: asyncio.AbstractEventLoop) -> asyncio.Event:
