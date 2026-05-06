@@ -276,18 +276,52 @@ def test_select_ready_includes_after_backoff_expires():
     assert [i.number for i in ready] == [1]
 
 
-def test_select_ready_allows_expired_retry_with_open_pr():
+def test_select_ready_skips_expired_non_merge_retry_with_open_pr():
     state = OrchestratorState()
-    state.schedule_retry(1, now=0.0)
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.AUTO_STUCK_ROUNDS.value,
+    )
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, open_prs={1}, now=15.0)
+    assert ready == []
+    assert skips == [DispatchSkip(1, "open-pr-exists")]
+
+
+def test_select_ready_allows_expired_merge_retry_with_open_pr():
+    state = OrchestratorState()
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.MERGE_PENDING.value,
+    )
     a = _issue(1)
     ready, skips = _ready([a], {1: []}, state=state, open_prs={1}, now=15.0)
     assert [i.number for i in ready] == [1]
     assert skips == []
 
 
-def test_select_ready_allows_expired_retry_with_local_branch():
+def test_select_ready_skips_expired_non_merge_retry_with_local_branch():
     state = OrchestratorState()
-    state.schedule_retry(1, now=0.0)
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.AUTO_STUCK_IDLE.value,
+    )
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, local_branches={1}, now=15.0)
+    assert ready == []
+    assert skips == [DispatchSkip(1, "local-branch-exists")]
+
+
+def test_select_ready_allows_expired_merge_retry_with_local_branch():
+    state = OrchestratorState()
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.MERGE_FAILED.value,
+    )
     a = _issue(1)
     ready, skips = _ready([a], {1: []}, state=state, local_branches={1}, now=15.0)
     assert [i.number for i in ready] == [1]

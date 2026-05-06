@@ -36,6 +36,10 @@ log = logging.getLogger(__name__)
 # than per-issue back-off because the subscription rate-limit is global —
 # re-dispatching a different issue immediately won't help.
 RATE_LIMIT_PAUSE_S = 600.0
+MERGE_RETRY_REASONS = {
+    LoopOutcomeKind.MERGE_FAILED.value,
+    LoopOutcomeKind.MERGE_PENDING.value,
+}
 
 # Substrings in agent output / events that mean "you got rate-limited". Kept
 # permissive — false positives just delay dispatch, false negatives spam the API.
@@ -184,17 +188,20 @@ def select_ready(
         if state.is_in_backoff(n, now=now):
             skips.append(DispatchSkip(n, "retry-backoff"))
             continue
-        retry_ready = n in state.retry_queue
+        retry = state.retry_queue.get(n)
+        retry_can_reuse_existing_artifacts = (
+            retry is not None and retry.reason in MERGE_RETRY_REASONS
+        )
         unsatisfied = [
             t for t in graph.get(n, []) if not is_blocker_satisfied(t)
         ]
         if unsatisfied:
             skips.append(DispatchSkip(n, f"blocked-by:{','.join(str(t.number) for t in unsatisfied)}"))
             continue
-        if has_open_pr(n) and not retry_ready:
+        if has_open_pr(n) and not retry_can_reuse_existing_artifacts:
             skips.append(DispatchSkip(n, "open-pr-exists"))
             continue
-        if has_local_branch(n) and not retry_ready:
+        if has_local_branch(n) and not retry_can_reuse_existing_artifacts:
             skips.append(DispatchSkip(n, "local-branch-exists"))
             continue
         ready.append(issue)
@@ -233,7 +240,11 @@ async def _dispatch_one(
         )
     except Exception as e:  # pragma: no cover — exception path is logged + retried
         log.exception("dispatch crashed for issue #%d", issue.number)
-        entry = state.schedule_retry(issue.number, now=now_fn())
+        entry = state.schedule_retry(
+            issue.number,
+            now=now_fn(),
+            reason="exception",
+        )
         if event_log is not None:
             event_log.emit(
                 "retry-scheduled",
@@ -256,7 +267,11 @@ async def _dispatch_one(
 
     if rate_limited:
         state.pause(now=now_fn(), duration_s=rate_limit_pause_s)
-        entry = state.schedule_retry(issue.number, now=now_fn())
+        entry = state.schedule_retry(
+            issue.number,
+            now=now_fn(),
+            reason="rate-limit",
+        )
         if event_log is not None:
             event_log.emit(
                 "paused",
@@ -283,7 +298,12 @@ async def _dispatch_one(
         return
 
     if result.skipped:
-        entry = state.schedule_retry(issue.number, now=now_fn())
+        reason = result.skip_reason or "skipped"
+        entry = state.schedule_retry(
+            issue.number,
+            now=now_fn(),
+            reason=reason,
+        )
         if event_log is not None:
             event_log.emit(
                 "retry-scheduled",
@@ -291,7 +311,7 @@ async def _dispatch_one(
                 payload={
                     "attempt": entry.attempt,
                     "next_retry_at": int(entry.next_retry_at),
-                    "reason": result.skip_reason or "skipped",
+                    "reason": reason,
                 },
             )
         return
@@ -307,7 +327,12 @@ async def _dispatch_one(
     # Non-terminal outcomes keep the issue in the retry queue so a later tick
     # can re-dispatch (e.g. after the worktree is reset, or for
     # AUTO_STUCK_IDLE which may resolve once Codex catches up).
-    entry = state.schedule_retry(issue.number, now=now_fn())
+    reason = outcome.kind.value if outcome is not None else "not-approved"
+    entry = state.schedule_retry(
+        issue.number,
+        now=now_fn(),
+        reason=reason,
+    )
     if event_log is not None:
         event_log.emit(
             "retry-scheduled",
@@ -315,7 +340,7 @@ async def _dispatch_one(
             payload={
                 "attempt": entry.attempt,
                 "next_retry_at": int(entry.next_retry_at),
-                "reason": outcome.kind.value if outcome is not None else "not-approved",
+                "reason": reason,
             },
         )
 
