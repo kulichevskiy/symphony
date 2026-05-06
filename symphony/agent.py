@@ -76,6 +76,12 @@ def build_argv(
     settings_path: Path | None = None,
     resume_session: str | None = None,
 ) -> list[str]:
+    # Note on isolation: we deliberately do NOT pass `--bare`. Per `claude --help`,
+    # `--bare` requires `ANTHROPIC_API_KEY` (or `apiKeyHelper` via `--settings`) and
+    # explicitly does not read OAuth or keychain — incompatible with Symphony's
+    # subscription-auth design (SYMPHONY.md Q18). Reproducibility comes from the
+    # caller passing a Symphony-controlled `settings_path`, which strips ambient
+    # hooks/plugins/MCP without losing OAuth.
     argv = [
         CLAUDE_BIN,
         "-p",
