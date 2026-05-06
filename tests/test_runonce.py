@@ -86,7 +86,7 @@ def _patch_happy_path(
     agent_result=None,
     head_before="aaa1111",
     head_after="bbb2222",
-    ahead_of_base=1,
+    to_push=1,
 ) -> dict[str, Any]:
     """Wire stubs for each external dep and capture the calls."""
     calls: dict[str, Any] = {}
@@ -152,10 +152,10 @@ def _patch_happy_path(
     calls["head_sha_calls"] = head_calls
     monkeypatch.setattr(
         ro_mod,
-        "_commits_ahead_of_base",
-        lambda worktree, base: (
-            calls.setdefault("ahead_of_base", (worktree, base)),
-            ahead_of_base,
+        "_commits_to_push",
+        lambda worktree, branch, base: (
+            calls.setdefault("to_push", (worktree, branch, base)),
+            to_push,
         )[1],
     )
     monkeypatch.setattr(
@@ -274,7 +274,7 @@ async def test_run_once_skips_push_when_truly_empty(monkeypatch, tmp_path):
         tmp_path,
         head_before="same000",
         head_after="same000",
-        ahead_of_base=0,
+        to_push=0,
     )
     res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
     assert res.skipped is True
@@ -286,19 +286,43 @@ async def test_run_once_skips_push_when_truly_empty(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_once_skips_when_origin_already_at_head(monkeypatch, tmp_path):
+    """Regression for the previously-pushed re-dispatch case: a branch that
+    was already pushed and the agent makes no further commits. ``HEAD`` is
+    still ahead of ``origin/<base>`` (it has the prior feature commit), but
+    ``HEAD == origin/<branch>`` so there's nothing new to push. The run must
+    skip — otherwise we'd post a redundant @codex review for the same SHA.
+
+    The fixture sets ``to_push=0`` (the helper compares against
+    ``origin/<branch>`` when that ref exists, so an in-sync branch is 0).
+    """
+    fixture = _patch_happy_path(
+        monkeypatch,
+        tmp_path,
+        head_before="abc1234",
+        head_after="abc1234",
+        to_push=0,
+    )
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+    assert res.skipped is True
+    assert res.skip_reason == "empty-diff"
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+
+
+@pytest.mark.asyncio
 async def test_run_once_pushes_stranded_commits_on_noop_agent(monkeypatch, tmp_path):
     """Regression: a prior run that crashed after commit but before push
-    leaves local commits ahead of origin/<base>. A subsequent rerun where
-    the agent legitimately exits without further changes must still push
-    the stranded commits and open/refresh the PR — otherwise the work is
-    silently abandoned.
+    leaves local commits ahead of origin. A subsequent rerun where the agent
+    legitimately exits without further changes must still push the stranded
+    commits and open/refresh the PR — otherwise the work is silently abandoned.
     """
     fixture = _patch_happy_path(
         monkeypatch,
         tmp_path,
         head_before="stranded123",
         head_after="stranded123",  # agent didn't advance HEAD
-        ahead_of_base=1,  # but branch has unpushed commits
+        to_push=1,  # but there is unpushed work
     )
     res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
     assert res.skipped is False

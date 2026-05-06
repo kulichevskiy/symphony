@@ -61,10 +61,25 @@ def _head_sha(worktree: Path) -> str:
     return res.stdout.strip()
 
 
-def _commits_ahead_of_base(worktree: Path, base_branch: str) -> int:
-    """Number of commits on the worktree's HEAD not in ``origin/<base_branch>``."""
+def _commits_to_push(worktree: Path, branch: str, base_branch: str) -> int:
+    """Number of commits on HEAD not yet on ``origin``.
+
+    Compared against ``origin/<branch>`` when that ref exists (meaning the
+    issue branch was already pushed at least once), otherwise against
+    ``origin/<base_branch>`` (the first push will create the branch). This
+    way a no-op rerun where ``HEAD == origin/<branch>`` correctly returns
+    ``0`` instead of inheriting the cumulative distance from the base —
+    avoiding a duplicate ``@codex review`` nudge for the same SHA.
+    """
+    has_remote_branch = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        cwd=worktree,
+        capture_output=True,
+        text=True,
+    ).returncode == 0
+    baseline = f"origin/{branch}" if has_remote_branch else f"origin/{base_branch}"
     res = subprocess.run(
-        ["git", "rev-list", "--count", f"origin/{base_branch}..HEAD"],
+        ["git", "rev-list", "--count", f"{baseline}..HEAD"],
         cwd=worktree,
         check=True,
         capture_output=True,
@@ -163,20 +178,18 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             worktree=worktree,
         )
 
+    branch = f"auto/{issue_number}"
     head_after = _head_sha(worktree)
     agent_advanced_head = head_after != head_before
-    ahead_of_base = _commits_ahead_of_base(worktree, cfg.repo.default_branch)
+    to_push = _commits_to_push(worktree, branch, cfg.repo.default_branch)
 
-    # "Empty-diff" means the agent did nothing AND the branch has nothing to
-    # contribute over `origin/<base>`. If the branch is ahead of base — even
-    # without new commits this run — we still push: a previous run may have
-    # crashed after committing but before pushing, and those commits should
-    # not be left stranded. `git push` is a no-op when the remote is already
-    # up to date, so we don't worry about double-pushing.
-    if not agent_advanced_head and ahead_of_base == 0:
+    # "Nothing to push" = agent did not advance HEAD AND the branch is already
+    # in sync with origin/<branch> (or with origin/<base> if the branch was
+    # never pushed yet). Stranded commits — local-only work from a prior run
+    # that crashed before push — still go through the push/PR flow.
+    if not agent_advanced_head and to_push == 0:
         log.error(
-            "agent exited cleanly, no new commits, branch at origin/%s; skipping push",
-            cfg.repo.default_branch,
+            "agent exited cleanly, no new commits, branch in sync with origin; skipping",
         )
         return RunOnceResult(
             issue_number=issue_number,
@@ -186,7 +199,6 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             worktree=worktree,
         )
 
-    branch = f"auto/{issue_number}"
     _git_push(worktree, branch)
     # Re-dispatch path: an open PR for this branch may already exist from a
     # prior run. Reuse it instead of letting `gh pr create` fail with the
