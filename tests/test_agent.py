@@ -221,6 +221,22 @@ async def test_run_agent_calls_on_event(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_passes_high_stdout_limit(tmp_path):
+    """Regression: subprocess stream limit must be raised above the asyncio
+    default (64KiB) so a single oversized `result` line doesn't blow up the
+    `async for line in stdout` loop with LimitOverrunError.
+    """
+    proc = _FakeProcess(
+        [b'{"type":"result","is_error":false,"session_id":"x"}\n'], exit_code=0
+    )
+    spawner = _make_spawner(proc)
+    await run_agent("hi", tmp_path, spawner=spawner)
+    limit = spawner.captured["kwargs"].get("limit")
+    assert limit is not None
+    assert limit >= 1024 * 1024  # at least 1 MiB
+
+
+@pytest.mark.asyncio
 async def test_run_agent_drains_stderr_with_many_stdout_events(tmp_path):
     """Regression: stderr must be captured even when stdout is long.
 

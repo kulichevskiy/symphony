@@ -11,6 +11,11 @@ DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_MAX_TURNS = 50
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
+# asyncio's default StreamReader limit is 64KiB. Claude's stream-json `result`
+# events can exceed that on long agent runs (large final text, big tool-use
+# payloads), causing `async for line in stdout` to raise LimitOverrunError.
+STDOUT_LIMIT = 4 * 1024 * 1024  # 4 MiB per line
+
 Spawner = Callable[..., Awaitable[Any]]
 
 
@@ -119,6 +124,7 @@ async def run_agent(
         cwd=str(workdir),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=STDOUT_LIMIT,
     )
 
     events: list[dict] = []
