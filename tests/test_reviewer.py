@@ -589,6 +589,47 @@ async def test_loop_returns_on_first_approved(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_loop_retries_after_merge_failure(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    driver = _Driver([_approved_snap(), _approved_snap()])
+    merge_attempts = []
+
+    def flaky_merge(*, repo_path, pr_number, match_head_commit=None):
+        merge_attempts.append((str(repo_path), pr_number, match_head_commit))
+        if len(merge_attempts) == 1:
+            raise RuntimeError("head changed")
+
+    outcome = await _spawn_loop(driver, cfg, merge_pr_fn=flaky_merge)
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert merge_attempts == [
+        (str(cfg.repo.path), 11, "head1"),
+        (str(cfg.repo.path), 11, "head1"),
+    ]
+    assert driver.calls["label_issue"] == []
+
+
+@pytest.mark.asyncio
+async def test_loop_auto_stuck_when_approved_merge_keeps_failing(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    driver = _Driver([_approved_snap()] * 10)
+
+    def failing_merge(*, repo_path, pr_number, match_head_commit=None):
+        raise RuntimeError("merge queue unavailable")
+
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        merge_pr_fn=failing_merge,
+        poll_interval_s=30.0,
+        give_up_after_s=60.0,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_IDLE
+    assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
+
+
+@pytest.mark.asyncio
 async def test_loop_handles_changes_then_approval(tmp_path):
     cfg = _make_cfg(tmp_path)
     driver = _Driver([_changes_snap("head1"), _approved_snap("head2")])

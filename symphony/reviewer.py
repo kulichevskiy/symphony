@@ -422,11 +422,27 @@ async def drive_review_loop(
         last_seen_head_sha = snap.head_sha
 
         if verdict.kind == VerdictKind.APPROVED:
-            merge_pr_fn(
-                repo_path=cfg.repo.path,
-                pr_number=pr_number,
-                match_head_commit=snap.head_sha,
-            )
+            try:
+                merge_pr_fn(
+                    repo_path=cfg.repo.path,
+                    pr_number=pr_number,
+                    match_head_commit=snap.head_sha,
+                )
+            except Exception:
+                log.warning(
+                    "approved PR #%d could not be merged; will retry",
+                    pr_number,
+                    exc_info=True,
+                )
+                if now_fn() - last_activity >= give_up_after_s:
+                    label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
+                    return LoopOutcome(
+                        kind=LoopOutcomeKind.AUTO_STUCK_IDLE,
+                        rounds_used=rounds_used,
+                        last_session_id=session_id,
+                        head_sha=snap.head_sha,
+                    )
+                continue
             return LoopOutcome(
                 kind=LoopOutcomeKind.APPROVED,
                 rounds_used=rounds_used,
