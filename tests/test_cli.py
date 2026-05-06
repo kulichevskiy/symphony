@@ -1,0 +1,158 @@
+from typer.testing import CliRunner
+
+from symphony import __version__
+from symphony.cli import app
+from symphony.types import AgentResult
+
+runner = CliRunner()
+
+
+def test_version_flag():
+    result = runner.invoke(app, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
+
+
+def test_help_lists_agent_run():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "agent-run" in result.output
+
+
+def test_agent_run_invokes_runner(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        captured["prompt"] = prompt
+        captured["workdir"] = workdir
+        captured["kwargs"] = kwargs
+        if cb := kwargs.get("on_event"):
+            cb({"type": "system", "session_id": "sess-x"})
+        return AgentResult(
+            session_id="sess-x",
+            exit_code=0,
+            success=True,
+            is_error=False,
+            duration_ms=10,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text="ok",
+            raw_events=[],
+            stderr="",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    result = runner.invoke(
+        app,
+        ["agent-run", "--prompt", "hi there", "--workdir", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["prompt"] == "hi there"
+    assert captured["workdir"] == tmp_path
+
+
+def test_agent_run_failure_propagates_exit_code(tmp_path, monkeypatch):
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        return AgentResult(
+            session_id="sess-x",
+            exit_code=2,
+            success=False,
+            is_error=True,
+            duration_ms=10,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text=None,
+            raw_events=[],
+            stderr="bad",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    result = runner.invoke(
+        app, ["agent-run", "--prompt", "x", "--workdir", str(tmp_path)]
+    )
+    assert result.exit_code == 2
+
+
+def test_agent_run_passes_settings_path(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        captured["settings_path"] = kwargs.get("settings_path")
+        return AgentResult(
+            session_id="s",
+            exit_code=0,
+            success=True,
+            is_error=False,
+            duration_ms=1,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text="ok",
+            raw_events=[],
+            stderr="",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("{}")
+    result = runner.invoke(
+        app,
+        [
+            "agent-run",
+            "--prompt",
+            "x",
+            "--workdir",
+            str(tmp_path),
+            "--settings",
+            str(settings_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["settings_path"] == settings_file
+
+
+def test_agent_run_settings_default_none(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        captured["settings_path"] = kwargs.get("settings_path")
+        return AgentResult(
+            session_id="s",
+            exit_code=0,
+            success=True,
+            is_error=False,
+            duration_ms=1,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text="ok",
+            raw_events=[],
+            stderr="",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    result = runner.invoke(
+        app, ["agent-run", "--prompt", "x", "--workdir", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    assert captured["settings_path"] is None
+
+
+def test_agent_run_success_clean_exit_zero(tmp_path, monkeypatch):
+    async def fake_run_agent(prompt, workdir, **kwargs):
+        return AgentResult(
+            session_id="s",
+            exit_code=0,
+            success=True,
+            is_error=False,
+            duration_ms=1,
+            num_turns=1,
+            total_cost_usd=0.0,
+            final_text="done",
+            raw_events=[],
+            stderr="",
+        )
+
+    monkeypatch.setattr("symphony.cli.run_agent", fake_run_agent)
+    result = runner.invoke(
+        app, ["agent-run", "--prompt", "x", "--workdir", str(tmp_path)]
+    )
+    assert result.exit_code == 0
