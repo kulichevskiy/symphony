@@ -170,9 +170,17 @@ def test_cancelled_ci_check_is_changes_requested():
     assert v.ci_failures[0].name == "test"
 
 
+@pytest.mark.parametrize("conclusion", ["startup_failure", "stale"])
+def test_other_failed_ci_conclusions_are_changes_requested(conclusion):
+    v = _eval(checks=[_check(name="test", conclusion=conclusion)])
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].name == "test"
+
+
 def test_in_progress_check_is_not_failure():
     v = _eval(checks=[_check(name="test", status="in_progress", conclusion=None)])
     assert v.kind == VerdictKind.PENDING
+    assert v.pending_checks[0].name == "test"
 
 
 def test_in_progress_check_blocks_codex_approval_reaction():
@@ -553,6 +561,23 @@ async def test_loop_auto_stuck_after_idle_giveup(tmp_path):
     assert outcome.kind == LoopOutcomeKind.AUTO_STUCK_IDLE
     assert outcome.rounds_used == 0
     assert driver.calls["label_issue"] == [(4, "auto-stuck", str(cfg.repo.path))]
+
+
+@pytest.mark.asyncio
+async def test_loop_does_not_idle_give_up_while_checks_are_pending(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    pending = _snap(checks=[_check(name="ci", status="in_progress", conclusion=None)])
+    snaps = [pending] * 20 + [_approved_snap()]
+    driver = _Driver(snaps)
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        poll_interval_s=30.0,
+        re_nudge_after_s=60.0,
+        give_up_after_s=90.0,
+    )
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert driver.calls["label_issue"] == []
 
 
 @pytest.mark.asyncio

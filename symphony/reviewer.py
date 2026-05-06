@@ -56,7 +56,14 @@ CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # that with a comfortable margin so a body of "boilerplate + tiny addendum"
 # isn't mistaken for substantive feedback.
 CODEX_BOILERPLATE_THRESHOLD = 750
-FAILED_CHECK_CONCLUSIONS = {"failure", "timed_out", "cancelled", "action_required"}
+FAILED_CHECK_CONCLUSIONS = {
+    "failure",
+    "timed_out",
+    "cancelled",
+    "action_required",
+    "startup_failure",
+    "stale",
+}
 PENDING_CHECK_STATUSES = {"expected", "pending", "queued", "requested", "waiting", "in_progress"}
 
 
@@ -78,6 +85,7 @@ class Verdict:
     kind: VerdictKind
     review_comments: list[ReviewComment] = field(default_factory=list)
     ci_failures: list[CheckRun] = field(default_factory=list)
+    pending_checks: list[CheckRun] = field(default_factory=list)
     last_review_body: str = ""
 
 
@@ -187,8 +195,9 @@ def evaluate_verdict(
 
     # 5. Pending CI checks keep the verdict pending even if a fresh approval
     #    has already landed; a later CI failure must still feed another loop.
-    if any(c.status in PENDING_CHECK_STATUSES for c in latest_checks):
-        return Verdict(kind=VerdictKind.PENDING)
+    pending_checks = [c for c in latest_checks if c.status in PENDING_CHECK_STATUSES]
+    if pending_checks:
+        return Verdict(kind=VerdictKind.PENDING, pending_checks=pending_checks)
 
     # 6. Approval via human review or Codex ``+1`` reaction on the PR. The
     #    reaction must be after HEAD's committer time, otherwise it's stale
@@ -421,6 +430,12 @@ async def drive_review_loop(
             continue
 
         # PENDING — check timers
+        if verdict.pending_checks:
+            last_activity = now_fn()
+            nudged_during_idle = False
+            last_seen_head_sha = snap.head_sha
+            continue
+
         elapsed = now_fn() - last_activity
         if elapsed >= give_up_after_s:
             label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
