@@ -111,12 +111,18 @@ class Reaction:
 
 @dataclass(frozen=True)
 class CheckRun:
-    """One CI check run on the PR's HEAD commit."""
+    """One CI check run on the PR's HEAD commit.
+
+    ``bucket`` is gh's high-level rollup of the check status: ``"pass"``,
+    ``"fail"``, ``"pending"``, ``"skipping"``, or ``"cancel"``. ``state`` is
+    the raw GitHub state (``SUCCESS`` / ``FAILURE`` / ``IN_PROGRESS`` / …)
+    kept around for diagnostics. ``link`` points at the run details page.
+    """
 
     name: str
-    status: str
-    conclusion: str | None
-    details_url: str | None
+    bucket: str
+    state: str
+    link: str | None
 
 
 def _run_gh(args: list[str], *, cwd: Path | None = None) -> str:
@@ -437,14 +443,20 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
 
 
 def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
-    """CI check runs on the PR's HEAD commit (`gh pr checks`)."""
+    """CI check runs on the PR's HEAD commit (`gh pr checks`).
+
+    ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
+    on ``gh pr checks`` — that produces an unknown-field error. The actual
+    schema exposes ``name``, ``bucket``, ``state``, and ``link`` (among
+    others); we use those.
+    """
     out = _run_gh(
         [
             "pr",
             "checks",
             str(pr_number),
             "--json",
-            "name,status,conclusion,detailsUrl",
+            "name,bucket,state,link",
         ],
         cwd=repo_path,
     )
@@ -452,9 +464,9 @@ def list_pr_checks(pr_number: int, *, repo_path: Path) -> list[CheckRun]:
     return [
         CheckRun(
             name=c.get("name", ""),
-            status=c.get("status", ""),
-            conclusion=c.get("conclusion") or None,
-            details_url=c.get("detailsUrl") or None,
+            bucket=c.get("bucket", ""),
+            state=c.get("state", ""),
+            link=c.get("link") or None,
         )
         for c in data
     ]

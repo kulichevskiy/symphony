@@ -51,8 +51,8 @@ def _reaction(*, who, content="+1", at) -> Reaction:
     return Reaction(user_login=who, content=content, created_at=at)
 
 
-def _check(*, name="ci", conclusion=None, status="completed") -> CheckRun:
-    return CheckRun(name=name, status=status, conclusion=conclusion, details_url=None)
+def _check(*, name="ci", bucket="pass", state="SUCCESS") -> CheckRun:
+    return CheckRun(name=name, bucket=bucket, state=state, link=None)
 
 
 def _eval(**overrides):
@@ -125,19 +125,19 @@ def test_human_changes_requested_review_wins():
 
 
 def test_failing_ci_check_is_changes_requested():
-    v = _eval(checks=[_check(name="test", conclusion="failure")])
+    v = _eval(checks=[_check(name="test", bucket="fail", state="FAILURE")])
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.ci_failures[0].name == "test"
 
 
 def test_in_progress_check_is_not_failure():
-    v = _eval(checks=[_check(name="test", status="in_progress", conclusion=None)])
+    v = _eval(checks=[_check(name="test", bucket="pending", state="IN_PROGRESS")])
     assert v.kind == VerdictKind.PENDING
 
 
 def test_failing_ci_takes_priority_over_codex_approval_reaction():
     v = _eval(
-        checks=[_check(name="test", conclusion="failure")],
+        checks=[_check(name="test", bucket="fail", state="FAILURE")],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
@@ -199,6 +199,44 @@ def test_human_latest_changes_requested_supersedes_earlier_approval():
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.last_review_body == "actually no"
+
+
+def test_unresolved_changes_requested_blocks_other_reviewer_approval():
+    # Alice's CHANGES_REQUESTED is still unresolved when Bob approves. Bob's
+    # approval must NOT terminate the loop — we still owe Alice a fix.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="please fix X", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="bob", state="APPROVED", body="ship it", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.last_review_body == "please fix X"
+
+
+def test_dismissed_review_clears_prior_changes_requested():
+    # Alice requested changes, then her review was dismissed. Bob then
+    # approved. Nothing is blocking — APPROVED.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="CHANGES_REQUESTED", body="nope", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="DISMISSED", body="", id=2, at="2026-05-06T07:20:00Z"),
+            _review(who="bob", state="APPROVED", body="lgtm", id=3, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_commented_review_does_not_override_prior_verdict():
+    # A trailing COMMENTED review is non-binding and does not replace
+    # Alice's earlier approval.
+    v = _eval(
+        reviews=[
+            _review(who="alice", state="APPROVED", body="lgtm", id=1, at="2026-05-06T07:10:00Z"),
+            _review(who="alice", state="COMMENTED", body="one note", id=2, at="2026-05-06T07:40:00Z"),
+        ]
+    )
+    assert v.kind == VerdictKind.APPROVED
 
 
 def test_non_plus_one_reaction_does_not_approve():

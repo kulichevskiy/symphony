@@ -108,9 +108,7 @@ def evaluate_verdict(
 
     # 1. CI failures take priority — they're concrete, fast feedback that
     #    Codex review can't override.
-    failing_checks = [
-        c for c in checks if c.status == "completed" and c.conclusion == "failure"
-    ]
+    failing_checks = [c for c in checks if c.bucket == "fail"]
     if failing_checks:
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
@@ -119,21 +117,37 @@ def evaluate_verdict(
         )
 
     # 2. Explicit human verdicts on HEAD trump everything else. Reviews come
-    #    back oldest-first; we want the *latest* verdict per reviewer so an
-    #    initial CHANGES_REQUESTED followed by an APPROVED on the same HEAD
-    #    counts as approved. Walk the list in reverse and take the first
-    #    APPROVED / CHANGES_REQUESTED state we see from any non-Codex reviewer.
-    for r in reversed(fresh_reviews):
-        if r.user_login == codex_login:
+    #    back oldest-first; collapse them into one effective verdict per
+    #    reviewer (latest APPROVED / CHANGES_REQUESTED wins; DISMISSED clears
+    #    a prior verdict; COMMENTED is non-binding). Then aggregate across
+    #    reviewers: an unresolved CHANGES_REQUESTED from anyone blocks
+    #    approval even if someone else has already approved.
+    human_verdicts: dict[str, str] = {}
+    for r in fresh_reviews:
+        if r.user_login == codex_login or not r.user_login:
             continue
-        if r.state == "APPROVED":
-            return Verdict(kind=VerdictKind.APPROVED)
-        if r.state == "CHANGES_REQUESTED":
-            return Verdict(
-                kind=VerdictKind.CHANGES_REQUESTED,
-                review_comments=fresh_comments,
-                last_review_body=r.body,
-            )
+        if r.state == "DISMISSED":
+            human_verdicts.pop(r.user_login, None)
+        elif r.state in ("APPROVED", "CHANGES_REQUESTED"):
+            human_verdicts[r.user_login] = r.state
+
+    if any(v == "CHANGES_REQUESTED" for v in human_verdicts.values()):
+        latest_cr = next(
+            (
+                r for r in reversed(fresh_reviews)
+                if r.user_login != codex_login
+                and r.state == "CHANGES_REQUESTED"
+                and human_verdicts.get(r.user_login) == "CHANGES_REQUESTED"
+            ),
+            None,
+        )
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            review_comments=fresh_comments,
+            last_review_body=latest_cr.body if latest_cr else "",
+        )
+    if any(v == "APPROVED" for v in human_verdicts.values()):
+        return Verdict(kind=VerdictKind.APPROVED)
 
     # 3. Codex review-comments on HEAD = changes requested. Boilerplate-body
     #    reviews always come paired with inline comments when there's

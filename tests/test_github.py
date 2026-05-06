@@ -420,17 +420,24 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 
 
 def test_list_pr_checks(monkeypatch, tmp_path):
+    # `gh pr checks --json` exposes name/bucket/state/link (not status /
+    # conclusion / detailsUrl). Pin the schema so a copy-pasted-from-`pr
+    # view` field name doesn't sneak back in.
     payload = [
-        {"name": "build", "status": "completed", "conclusion": "success", "detailsUrl": "https://ci/build"},
-        {"name": "test", "status": "completed", "conclusion": "failure", "detailsUrl": "https://ci/test"},
-        {"name": "lint", "status": "in_progress", "conclusion": None, "detailsUrl": None},
+        {"name": "build", "bucket": "pass", "state": "SUCCESS", "link": "https://ci/build"},
+        {"name": "test", "bucket": "fail", "state": "FAILURE", "link": "https://ci/test"},
+        {"name": "lint", "bucket": "pending", "state": "IN_PROGRESS", "link": None},
     ]
     fake = _stub({("pr", "checks", "10"): json.dumps(payload)})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
     assert len(checks) == 3
-    assert checks[1] == CheckRun(name="test", status="completed", conclusion="failure", details_url="https://ci/test")
-    assert checks[2].conclusion is None
+    assert checks[1] == CheckRun(name="test", bucket="fail", state="FAILURE", link="https://ci/test")
+    assert checks[2].link is None
+    call = next(c for c in fake.calls if c[:2] == ["pr", "checks"])
+    assert "--json" in call
+    json_fields = call[call.index("--json") + 1].split(",")
+    assert set(json_fields) == {"name", "bucket", "state", "link"}
 
 
 def test_label_issue_calls_gh(monkeypatch, tmp_path):
