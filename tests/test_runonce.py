@@ -359,6 +359,60 @@ async def test_run_once_retries_prior_merge_failure_without_round1_agent(
 
 
 @pytest.mark.asyncio
+async def test_run_once_waits_for_open_merge_pending_pr_without_remerging(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_pending",
+            "rounds_used": 2,
+            "head_sha": "reviewed-sha",
+        },
+    )
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    merge_checks = []
+
+    def _not_merged(**kw):
+        merge_checks.append(kw)
+        return False
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", _not_merged)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == existing
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_pending"
+    assert res.loop_outcome.rounds_used == 2
+    assert res.loop_outcome.head_sha == "reviewed-sha"
+    assert merge_checks == [{"repo_path": fixture["cfg"].repo.path, "pr_number": 42}]
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    assert "drive_review_loop" not in fixture["calls"]
+    assert "merge_pr" not in fixture["calls"]
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_pending"
+    assert events[-1].payload["merge_retry"] is True
+    assert events[-1].payload["reason"] == "open PR still pending merge"
+
+
+@pytest.mark.asyncio
 async def test_run_once_records_merge_when_retry_pr_closed_after_merge(
     monkeypatch, tmp_path
 ):

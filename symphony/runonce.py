@@ -283,6 +283,66 @@ async def run_once(
             expected_owner=owner,
         )
         if pr is not None:
+            if (
+                latest_terminal.payload.get("outcome")
+                == LoopOutcomeKind.MERGE_PENDING.value
+            ):
+                merged = False
+                merge_check_error: str | None = None
+                try:
+                    merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
+                except GithubError as e:
+                    merge_check_error = str(e)
+                    log.warning(
+                        "could not verify pending merge PR #%d during retry: %s",
+                        pr.number,
+                        e,
+                    )
+                if merged:
+                    emit(
+                        "merge",
+                        {
+                            "pr_number": pr.number,
+                            "url": pr.url,
+                            "head_sha": retry_head_sha,
+                            "rounds_used": retry_rounds,
+                            "outcome": "approved",
+                            "merge_retry": True,
+                        },
+                    )
+                    outcome = LoopOutcome(
+                        kind=LoopOutcomeKind.APPROVED,
+                        rounds_used=retry_rounds,
+                        last_session_id=None,
+                        head_sha=retry_head_sha,
+                    )
+                else:
+                    payload = {
+                        "pr_number": pr.number,
+                        "url": pr.url,
+                        "head_sha": retry_head_sha,
+                        "rounds_used": retry_rounds,
+                        "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+                        "merge_retry": True,
+                        "reason": "open PR still pending merge",
+                    }
+                    if merge_check_error is not None:
+                        payload["error"] = merge_check_error
+                    emit("run-terminal", payload)
+                    outcome = LoopOutcome(
+                        kind=LoopOutcomeKind.MERGE_PENDING,
+                        rounds_used=retry_rounds,
+                        last_session_id=None,
+                        head_sha=retry_head_sha,
+                    )
+                return RunOnceResult(
+                    issue_number=issue_number,
+                    pr=pr,
+                    skipped=False,
+                    skip_reason=None,
+                    worktree=worktree,
+                    loop_outcome=outcome,
+                )
             emit(
                 "pr-open",
                 {
