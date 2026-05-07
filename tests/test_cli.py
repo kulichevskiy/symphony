@@ -1,7 +1,14 @@
 import json
+import re
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 from symphony import __version__
 from symphony.cli import app
@@ -34,8 +41,16 @@ def test_help_lists_run_once():
 def test_help_lists_run():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    # The long-running orchestrator command, distinct from `run-once`.
-    assert "\n run " in result.output or "│ run " in result.output
+    # The long-running orchestrator command, distinct from `run-once` /
+    # `agent-run`. Strip ANSI so the assertion survives rich/typer table
+    # rendering on terminals of different widths (CI vs local), then
+    # match the command-cell position exactly: rich emits the command
+    # name as `│ <name>` with a single space, while wrapped help text
+    # for other commands uses multiple spaces of indentation. Matching
+    # the single-space form means a wrapped `agent run → PR` snippet
+    # in `run-once`'s description cannot satisfy this assertion.
+    clean = _strip_ansi(result.output)
+    assert re.search(r"(?m)^│ run(?:\s|$)", clean)
 
 
 def test_help_lists_status_and_logs():
