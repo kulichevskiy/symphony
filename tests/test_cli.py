@@ -81,6 +81,30 @@ def test_preflight_command_prints_failures_and_exits_nonzero(monkeypatch, tmp_pa
     assert "FAIL gh auth: not logged in" in result.output
 
 
+def test_preflight_command_allows_warnings(monkeypatch, tmp_path):
+    cfg = SimpleNamespace()
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.run_preflight",
+        lambda c: [
+            PreflightResult(
+                "Codex GitHub App",
+                False,
+                "could not verify repository installation",
+                fatal=False,
+            )
+        ],
+    )
+
+    result = runner.invoke(app, ["preflight", "--config", str(tmp_path / "x.toml")])
+
+    assert result.exit_code == 0
+    assert (
+        "WARN Codex GitHub App: could not verify repository installation"
+        in result.output
+    )
+
+
 def test_run_refuses_to_start_when_preflight_fails(monkeypatch, tmp_path):
     cfg = SimpleNamespace()
     called = False

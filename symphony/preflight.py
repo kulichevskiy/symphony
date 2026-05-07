@@ -23,6 +23,7 @@ class PreflightResult:
     name: str
     ok: bool
     message: str
+    fatal: bool = True
 
 
 CommandRunner = Callable[[list[str], Path | None], tuple[bool, str]]
@@ -132,9 +133,10 @@ def _codex_app_result(
         return PreflightResult(
             "Codex GitHub App",
             False,
-            "could not verify repository GitHub App installation. "
-            "This endpoint requires an authenticated GitHub App/JWT token: "
+            "could not verify repository Codex GitHub App installation with the "
+            "current gh token; actual review dispatch will validate it: "
             f"{e}",
+            fatal=False,
         )
     app_slug = str(data.get("app_slug") or "")
     if app_slug and app_slug not in CODEX_APP_SLUGS:
@@ -263,11 +265,18 @@ def run_preflight(
 
 
 def preflight_ok(results: list[PreflightResult]) -> bool:
-    return all(result.ok for result in results)
+    return all(result.ok or not result.fatal for result in results)
 
 
 def format_preflight_results(results: list[PreflightResult]) -> str:
+    def status(result: PreflightResult) -> str:
+        if result.ok:
+            return "OK"
+        if not result.fatal:
+            return "WARN"
+        return "FAIL"
+
     return "\n".join(
-        f"{'OK' if result.ok else 'FAIL'} {result.name}: {result.message}"
+        f"{status(result)} {result.name}: {result.message}"
         for result in results
     )
