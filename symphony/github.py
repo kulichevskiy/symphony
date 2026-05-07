@@ -470,9 +470,15 @@ def merge_pr(
     match_head_commit: str | None = None,
     match_head_sha: str | None = None,
 ) -> None:
-    """Merge a PR after Symphony's review loop reaches an approved verdict."""
+    """Merge a PR after Symphony's review loop reaches an approved verdict.
+
+    Branch teardown is left to the caller. ``--delete-branch`` would run
+    ``git branch -d auto/<n>`` locally and fail with exit 1 because the
+    branch is still checked out in the per-issue worktree, masking a
+    successful remote merge as a failure.
+    """
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
-    args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
+    args = ["pr", "merge", str(pr_number), flag]
     match_head = match_head_commit or match_head_sha
     if match_head:
         args += ["--match-head-commit", match_head]
