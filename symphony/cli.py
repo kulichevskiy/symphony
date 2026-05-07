@@ -1,4 +1,5 @@
 import asyncio
+import subprocess
 import time
 from pathlib import Path
 from typing import Annotated
@@ -14,10 +15,14 @@ from .agent import (
     run_agent,
 )
 from .config import load_config
+from .cancel import request_cancel
 from .events import EventLog
+from .garbage import find_gc_candidates, remove_gc_candidate
 from .logging_setup import configure_logging
 from .orchestrator import install_shutdown_handler, run_forever
+from .preflight import format_preflight_results, preflight_ok, run_preflight
 from .runonce import run_once
+from .scaffold import init_scaffold
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 log = structlog.get_logger()
@@ -43,6 +48,41 @@ def main(
 ) -> None:
     """Symphony — personal autopilot for GitHub Issues."""
     configure_logging()
+
+
+@app.command("init")
+def init_cmd(
+    root: Annotated[
+        Path,
+        typer.Option("--root", help="Directory where starter files should be written"),
+    ] = Path("."),
+) -> None:
+    """Write a local starter config, prompts, and runtime directory."""
+    actions = init_scaffold(root)
+    for action in actions:
+        typer.echo(f"{action.status} {action.path}")
+
+
+def _echo_preflight_or_exit(results) -> None:
+    typer.echo(format_preflight_results(results))
+    if not preflight_ok(results):
+        raise typer.Exit(1)
+
+
+@app.command("preflight")
+def preflight_cmd(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+        ),
+    ] = Path("symphony.toml"),
+) -> None:
+    """Check required local tools, GitHub setup, labels, and worktree root."""
+    cfg = load_config(config)
+    _echo_preflight_or_exit(run_preflight(cfg))
 
 
 @app.command("agent-run")
@@ -161,6 +201,7 @@ def run_cmd(
 ) -> None:
     """Long-running autopilot: poll for `auto`-labeled issues and dispatch."""
     cfg = load_config(config)
+    _echo_preflight_or_exit(run_preflight(cfg))
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -175,6 +216,72 @@ def run_cmd(
         log.info("orchestrator.stopped")
 
     asyncio.run(_main())
+
+
+@app.command("cancel")
+def cancel_cmd(
+    issue_number: Annotated[int, typer.Argument(help="GitHub issue number to cancel")],
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+        ),
+    ] = Path("symphony.toml"),
+) -> None:
+    """Request cooperative cancellation for one issue and label it."""
+    cfg = load_config(config)
+    marker = request_cancel(cfg, issue_number)
+    typer.echo(f"cancel requested for #{issue_number}; marker={marker}")
+
+
+@app.command("gc")
+def gc_cmd(
+    config: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Path to symphony.toml",
+        ),
+    ] = Path("symphony.toml"),
+    days: Annotated[
+        int,
+        typer.Option("--days", help="Minimum candidate age in days"),
+    ] = 14,
+) -> None:
+    """Remove confirmed stale worktrees for open auto-stuck issues."""
+    cfg = load_config(config)
+    candidates = find_gc_candidates(cfg, days=days)
+    if not candidates:
+        typer.echo("No gc candidates.")
+        return
+
+    typer.echo("GC candidates:")
+    for candidate in candidates:
+        typer.echo(
+            f"  #{candidate.issue_number} {candidate.path} "
+            f"branch={candidate.branch} age={candidate.age_days}d"
+        )
+
+    if not typer.confirm(
+        "Remove these worktrees and local branches?", default=False, abort=False
+    ):
+        typer.echo("Canceled.")
+        return
+
+    for candidate in candidates:
+        try:
+            remove_gc_candidate(cfg, candidate)
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or e.stdout or str(e)).strip()
+            typer.echo(
+                f"failed #{candidate.issue_number} {candidate.path}: {detail}",
+                err=True,
+            )
+            raise typer.Exit(1) from e
+        typer.echo(f"removed #{candidate.issue_number} {candidate.path}")
 
 
 @app.command("status")

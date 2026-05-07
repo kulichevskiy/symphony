@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-TERMINAL_KINDS = {"merge", "auto-stuck", "run-terminal"}
+TERMINAL_KINDS = {"merge", "auto-stuck", "auto-canceled", "run-terminal"}
 ACTIVE_KINDS = {
     "dispatch",
     "agent-start",

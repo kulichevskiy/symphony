@@ -181,6 +181,7 @@ def _ready(
     cycles_flat=None,
     open_prs=None,
     local_branches=None,
+    canceled=None,
     latest_terminal_outcome=None,
     now=0.0,
 ):
@@ -188,6 +189,7 @@ def _ready(
     cycles_flat = cycles_flat or set()
     open_prs = open_prs or set()
     local_branches = local_branches or set()
+    canceled = canceled or set()
     return select_ready(
         candidates,
         graph,
@@ -195,6 +197,7 @@ def _ready(
         state=state,
         has_open_pr=lambda n: n in open_prs,
         has_local_branch=lambda n: n in local_branches,
+        is_canceled=lambda n: n in canceled,
         latest_terminal_outcome=latest_terminal_outcome,
         now=now,
     )
@@ -259,6 +262,17 @@ def test_select_ready_skips_cycle_members():
     ready, skips = _ready([a, b], {1: [_tracked(2)], 2: [_tracked(1)]}, cycles_flat={1, 2})
     assert ready == []
     assert {s.reason for s in skips} == {"auto-cycle"}
+
+
+def test_select_ready_skips_auto_canceled_label_or_marker():
+    labeled = _issue(1, labels=("auto", "auto-canceled"))
+    marked = _issue(2)
+    ready, skips = _ready([labeled, marked], {1: [], 2: []}, canceled={2})
+    assert ready == []
+    assert skips == [
+        DispatchSkip(1, "auto-canceled"),
+        DispatchSkip(2, "auto-canceled"),
+    ]
 
 
 def test_select_ready_skips_in_backoff():

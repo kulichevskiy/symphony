@@ -6,6 +6,8 @@ from typer.testing import CliRunner
 from symphony import __version__
 from symphony.cli import app
 from symphony.events import EventLog
+from symphony.garbage import GcCandidate
+from symphony.preflight import PreflightResult
 from symphony.types import AgentResult
 
 runner = CliRunner()
@@ -41,6 +43,177 @@ def test_help_lists_status_and_logs():
     assert result.exit_code == 0
     assert "status" in result.output
     assert "logs" in result.output
+
+
+def test_help_lists_m6_commands():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    for name in ("init", "preflight", "cancel", "gc"):
+        assert name in result.output
+
+
+def test_init_writes_starter_files_idempotently(tmp_path):
+    result = runner.invoke(app, ["init", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "symphony.toml").is_file()
+    assert (tmp_path / "prompts" / "round1.md.j2").is_file()
+    assert (tmp_path / "prompts" / "review.md.j2").is_file()
+    assert (tmp_path / ".symphony").is_dir()
+    assert ".symphony/" in (tmp_path / ".gitignore").read_text()
+
+    (tmp_path / "symphony.toml").write_text("# keep me\n")
+    second = runner.invoke(app, ["init", "--root", str(tmp_path)])
+    assert second.exit_code == 0, second.output
+    assert (tmp_path / "symphony.toml").read_text() == "# keep me\n"
+
+
+def test_preflight_command_prints_failures_and_exits_nonzero(monkeypatch, tmp_path):
+    cfg = SimpleNamespace()
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.run_preflight",
+        lambda c: [PreflightResult("gh auth", False, "not logged in")],
+    )
+
+    result = runner.invoke(app, ["preflight", "--config", str(tmp_path / "x.toml")])
+
+    assert result.exit_code == 1
+    assert "FAIL gh auth: not logged in" in result.output
+
+
+def test_preflight_command_allows_warnings(monkeypatch, tmp_path):
+    cfg = SimpleNamespace()
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.run_preflight",
+        lambda c: [
+            PreflightResult(
+                "Codex GitHub App",
+                False,
+                "could not verify repository installation",
+                fatal=False,
+            )
+        ],
+    )
+
+    result = runner.invoke(app, ["preflight", "--config", str(tmp_path / "x.toml")])
+
+    assert result.exit_code == 0
+    assert (
+        "WARN Codex GitHub App: could not verify repository installation"
+        in result.output
+    )
+
+
+def test_run_refuses_to_start_when_preflight_fails(monkeypatch, tmp_path):
+    cfg = SimpleNamespace()
+    called = False
+
+    async def fake_run_forever(**kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.run_preflight",
+        lambda c: [PreflightResult("labels", False, "missing auto")],
+    )
+    monkeypatch.setattr("symphony.cli.run_forever", fake_run_forever)
+
+    result = runner.invoke(app, ["run", "--config", str(tmp_path / "x.toml")])
+
+    assert result.exit_code == 1
+    assert "FAIL labels: missing auto" in result.output
+    assert not called
+
+
+def test_run_starts_after_successful_preflight(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(
+        github=SimpleNamespace(label="auto"),
+        orchestrator=SimpleNamespace(max_concurrent=1, poll_interval_s=60),
+    )
+    called = False
+
+    async def fake_run_forever(**kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.run_preflight",
+        lambda c: [PreflightResult("labels", True, "ok")],
+    )
+    monkeypatch.setattr("symphony.cli.run_forever", fake_run_forever)
+
+    result = runner.invoke(app, ["run", "--config", str(tmp_path / "x.toml")])
+
+    assert result.exit_code == 0, result.output
+    assert "OK labels: ok" in result.output
+    assert called
+
+
+def test_cancel_command_requests_cancel(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(repo=SimpleNamespace(path=tmp_path))
+    captured = {}
+
+    def fake_request_cancel(cfg_arg, issue_number):
+        captured["cfg"] = cfg_arg
+        captured["issue_number"] = issue_number
+        return tmp_path / ".symphony" / "canceled" / "42"
+
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr("symphony.cli.request_cancel", fake_request_cancel)
+
+    result = runner.invoke(app, ["cancel", "42", "--config", "ignored.toml"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"cfg": cfg, "issue_number": 42}
+    assert "cancel requested for #42" in result.output
+
+
+def test_gc_lists_candidates_and_defaults_to_no(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(repo=SimpleNamespace(path=tmp_path))
+    removed = []
+    candidate = GcCandidate(42, tmp_path / "repo-42", "auto/42", 20)
+
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.find_gc_candidates",
+        lambda cfg_arg, days: [candidate],
+    )
+    monkeypatch.setattr(
+        "symphony.cli.remove_gc_candidate",
+        lambda cfg_arg, c: removed.append(c),
+    )
+
+    result = runner.invoke(app, ["gc", "--config", "ignored.toml"], input="\n")
+
+    assert result.exit_code == 0, result.output
+    assert "#42" in result.output
+    assert "Canceled." in result.output
+    assert removed == []
+
+
+def test_gc_removes_after_confirmation(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(repo=SimpleNamespace(path=tmp_path))
+    removed = []
+    candidate = GcCandidate(42, tmp_path / "repo-42", "auto/42", 20)
+
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.find_gc_candidates",
+        lambda cfg_arg, days: [candidate],
+    )
+    monkeypatch.setattr(
+        "symphony.cli.remove_gc_candidate",
+        lambda cfg_arg, c: removed.append(c),
+    )
+
+    result = runner.invoke(app, ["gc", "--config", "ignored.toml"], input="y\n")
+
+    assert result.exit_code == 0, result.output
+    assert removed == [candidate]
+    assert "removed #42" in result.output
 
 
 def test_status_reads_event_log(tmp_path, monkeypatch):
