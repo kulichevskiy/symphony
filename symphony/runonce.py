@@ -19,21 +19,27 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .agent import run_agent
 from .config import Config, load_config
+from .events import EventLog
 from .github import (
+    GithubError,
     Issue,
     PR,
     comment_pr,
     find_open_pr_for_branch,
+    get_pr_head_sha,
+    is_pr_merged,
+    merge_pr,
     name_with_owner,
     open_pr,
     tracked_issues,
     view_issue,
 )
 from .prompts import make_env, render
-from .reviewer import LoopOutcome, drive_review_loop
+from .reviewer import LoopOutcome, LoopOutcomeKind, drive_review_loop
 from .types import AgentResult
 from .workspace import ensure_worktree
 
@@ -108,6 +114,35 @@ def _git_push(worktree: Path, branch: str) -> None:
     )
 
 
+def _sync_worktree_to_pr_head(worktree: Path, branch: str, head_sha: str) -> None:
+    subprocess.run(
+        ["git", "fetch", "origin", f"{branch}:refs/remotes/origin/{branch}"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    res = subprocess.run(
+        ["git", "rev-parse", f"refs/remotes/origin/{branch}"],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    fetched_head = res.stdout.strip()
+    if fetched_head != head_sha:
+        raise RuntimeError(
+            f"origin/{branch} is at {fetched_head}, expected PR head {head_sha}"
+        )
+    subprocess.run(
+        ["git", "reset", "--hard", head_sha],
+        cwd=worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def _build_pr_body(issue: Issue) -> str:
     return f"Closes #{issue.number}\n\n{issue.title}\n\n{PR_FOOTER}\n"
 
@@ -125,14 +160,31 @@ def _satisfied_deps(tracked: list[Any]) -> list[Any]:
     ]
 
 
-async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
+async def run_once(
+    *,
+    issue_number: int,
+    config_path: Path,
+    event_log: EventLog | None = None,
+    run_id: str | None = None,
+) -> RunOnceResult:
     cfg: Config = load_config(config_path)
     repo_path = cfg.repo.path
+    event_log = event_log or EventLog.for_repo(repo_path)
+    run_id = run_id or f"issue-{issue_number}-{uuid4().hex[:8]}"
+
+    def emit(kind: str, payload: dict[str, Any] | None = None) -> None:
+        event_log.emit(
+            kind,
+            issue_number=issue_number,
+            run_id=run_id,
+            payload=payload or {},
+        )
 
     issue = view_issue(issue_number, repo_path=repo_path)
     tracked = tracked_issues(issue_number, repo_path=repo_path)
     deps = _satisfied_deps(tracked)
     owner, name = name_with_owner(repo_path)
+    branch = f"auto/{issue_number}"
 
     worktree = ensure_worktree(
         repo_path=repo_path,
@@ -143,6 +195,307 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         author_name=cfg.git.author_name,
         author_email=cfg.git.author_email,
     )
+
+    async def drive_and_merge(
+        pr: PR, *, initial_session_id: str | None
+    ) -> LoopOutcome:
+        # Drive the Codex review loop until terminal: APPROVED, AUTO_STUCK_*,
+        # or AGENT_FAILED. The first agent run's session id is threaded in so
+        # the first three review rounds can `--resume` it (cached prefix).
+        outcome = await drive_review_loop(
+            cfg=cfg,
+            issue_number=issue_number,
+            pr_number=pr.number,
+            branch=branch,
+            worktree=worktree,
+            initial_session_id=initial_session_id,
+            poll_interval_s=cfg.orchestrator.poll_interval_s,
+            re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
+            give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
+            round_cap=cfg.orchestrator.review_round_cap,
+            event_log=event_log,
+            run_id=run_id,
+        )
+        if outcome.kind == LoopOutcomeKind.APPROVED:
+            try:
+                merge_pr(
+                    repo_path=repo_path,
+                    pr_number=pr.number,
+                    match_head_commit=outcome.head_sha,
+                )
+                merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
+            except GithubError as e:
+                log.error("merge failed for PR #%d: %s", pr.number, e)
+                emit(
+                    "run-terminal",
+                    {
+                        "pr_number": pr.number,
+                        "url": pr.url,
+                        "head_sha": outcome.head_sha,
+                        "rounds_used": outcome.rounds_used,
+                        "outcome": LoopOutcomeKind.MERGE_FAILED.value,
+                        "error": str(e),
+                    },
+                )
+                outcome = LoopOutcome(
+                    kind=LoopOutcomeKind.MERGE_FAILED,
+                    rounds_used=outcome.rounds_used,
+                    last_session_id=outcome.last_session_id,
+                    head_sha=outcome.head_sha,
+                )
+            else:
+                if merged:
+                    emit(
+                        "merge",
+                        {
+                            "pr_number": pr.number,
+                            "url": pr.url,
+                            "head_sha": outcome.head_sha,
+                            "rounds_used": outcome.rounds_used,
+                            "outcome": "approved",
+                        },
+                    )
+                else:
+                    log.warning(
+                        "merge command completed for PR #%d but PR is still open",
+                        pr.number,
+                    )
+                    emit(
+                        "run-terminal",
+                        {
+                            "pr_number": pr.number,
+                            "url": pr.url,
+                            "head_sha": outcome.head_sha,
+                            "rounds_used": outcome.rounds_used,
+                            "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+                        },
+                    )
+                    outcome = LoopOutcome(
+                        kind=LoopOutcomeKind.MERGE_PENDING,
+                        rounds_used=outcome.rounds_used,
+                        last_session_id=outcome.last_session_id,
+                        head_sha=outcome.head_sha,
+                    )
+        elif outcome.kind not in {
+            LoopOutcomeKind.AUTO_STUCK_IDLE,
+            LoopOutcomeKind.AUTO_STUCK_ROUNDS,
+        }:
+            emit(
+                "run-terminal",
+                {
+                    "pr_number": pr.number,
+                    "url": pr.url,
+                    "head_sha": outcome.head_sha,
+                    "rounds_used": outcome.rounds_used,
+                    "outcome": outcome.kind.value,
+                },
+            )
+        return outcome
+
+    latest_terminal = event_log.latest_terminal_event(issue_number)
+    if latest_terminal is not None and latest_terminal.payload.get("outcome") in {
+        LoopOutcomeKind.MERGE_FAILED.value,
+        LoopOutcomeKind.MERGE_PENDING.value,
+    }:
+        retry_payload = latest_terminal.payload
+        retry_pr_number = retry_payload.get("pr_number")
+        retry_pr = (
+            PR(number=int(retry_pr_number), url=str(retry_payload.get("url", "")))
+            if retry_pr_number is not None
+            else None
+        )
+        retry_rounds = int(retry_payload.get("rounds_used", 0))
+        retry_head_sha = str(retry_payload.get("head_sha", ""))
+        pr = find_open_pr_for_branch(
+            branch,
+            repo_path=repo_path,
+            base_branch=cfg.repo.default_branch,
+            expected_owner=owner,
+        )
+        if pr is not None:
+            if (
+                latest_terminal.payload.get("outcome")
+                == LoopOutcomeKind.MERGE_PENDING.value
+            ):
+                head_check_error: str | None = None
+                try:
+                    current_head_sha = get_pr_head_sha(
+                        repo_path=repo_path,
+                        pr_number=pr.number,
+                    )
+                except GithubError as e:
+                    current_head_sha = ""
+                    head_check_error = str(e)
+                    log.warning(
+                        "could not verify pending merge PR #%d head during retry: %s",
+                        pr.number,
+                        e,
+                    )
+                if (
+                    retry_head_sha
+                    and current_head_sha
+                    and current_head_sha != retry_head_sha
+                ):
+                    _sync_worktree_to_pr_head(worktree, branch, current_head_sha)
+                    emit(
+                        "pr-open",
+                        {
+                            "number": pr.number,
+                            "url": pr.url,
+                            "head": branch,
+                            "base": cfg.repo.default_branch,
+                            "reused": True,
+                            "merge_retry": True,
+                            "head_changed": True,
+                            "previous_head_sha": retry_head_sha,
+                            "head_sha": current_head_sha,
+                        },
+                    )
+                    comment_pr(
+                        repo_path=repo_path,
+                        pr_number=pr.number,
+                        body="@codex review",
+                    )
+                    outcome = await drive_and_merge(pr, initial_session_id=None)
+                    return RunOnceResult(
+                        issue_number=issue_number,
+                        pr=pr,
+                        skipped=False,
+                        skip_reason=None,
+                        worktree=worktree,
+                        loop_outcome=outcome,
+                    )
+                merged = False
+                merge_check_error = head_check_error
+                try:
+                    merged = is_pr_merged(repo_path=repo_path, pr_number=pr.number)
+                except GithubError as e:
+                    merge_check_error = str(e)
+                    log.warning(
+                        "could not verify pending merge PR #%d during retry: %s",
+                        pr.number,
+                        e,
+                    )
+                if merged:
+                    emit(
+                        "merge",
+                        {
+                            "pr_number": pr.number,
+                            "url": pr.url,
+                            "head_sha": retry_head_sha,
+                            "rounds_used": retry_rounds,
+                            "outcome": "approved",
+                            "merge_retry": True,
+                        },
+                    )
+                    outcome = LoopOutcome(
+                        kind=LoopOutcomeKind.APPROVED,
+                        rounds_used=retry_rounds,
+                        last_session_id=None,
+                        head_sha=retry_head_sha,
+                    )
+                else:
+                    payload = {
+                        "pr_number": pr.number,
+                        "url": pr.url,
+                        "head_sha": retry_head_sha,
+                        "rounds_used": retry_rounds,
+                        "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+                        "merge_retry": True,
+                        "reason": "open PR still pending merge",
+                    }
+                    if merge_check_error is not None:
+                        payload["error"] = merge_check_error
+                    emit("run-terminal", payload)
+                    outcome = LoopOutcome(
+                        kind=LoopOutcomeKind.MERGE_PENDING,
+                        rounds_used=retry_rounds,
+                        last_session_id=None,
+                        head_sha=retry_head_sha,
+                    )
+                return RunOnceResult(
+                    issue_number=issue_number,
+                    pr=pr,
+                    skipped=False,
+                    skip_reason=None,
+                    worktree=worktree,
+                    loop_outcome=outcome,
+                )
+            emit(
+                "pr-open",
+                {
+                    "number": pr.number,
+                    "url": pr.url,
+                    "head": branch,
+                    "base": cfg.repo.default_branch,
+                    "reused": True,
+                    "merge_retry": True,
+                },
+            )
+            outcome = await drive_and_merge(pr, initial_session_id=None)
+            return RunOnceResult(
+                issue_number=issue_number,
+                pr=pr,
+                skipped=False,
+                skip_reason=None,
+                worktree=worktree,
+                loop_outcome=outcome,
+            )
+        merged = False
+        if retry_pr is not None:
+            try:
+                merged = is_pr_merged(repo_path=repo_path, pr_number=retry_pr.number)
+            except GithubError as e:
+                log.warning(
+                    "could not verify missing PR #%d during merge retry: %s",
+                    retry_pr.number,
+                    e,
+                )
+        if merged and retry_pr is not None:
+            emit(
+                "merge",
+                {
+                    "pr_number": retry_pr.number,
+                    "url": retry_pr.url,
+                    "head_sha": retry_head_sha,
+                    "rounds_used": retry_rounds,
+                    "outcome": "approved",
+                    "merge_retry": True,
+                },
+            )
+            outcome = LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=retry_rounds,
+                last_session_id=None,
+                head_sha=retry_head_sha,
+            )
+        else:
+            error = "no open PR found for merge retry"
+            emit(
+                "run-terminal",
+                {
+                    "pr_number": retry_pr.number if retry_pr is not None else None,
+                    "url": retry_pr.url if retry_pr is not None else "",
+                    "head_sha": retry_head_sha,
+                    "rounds_used": retry_rounds,
+                    "outcome": LoopOutcomeKind.MERGE_UNAVAILABLE.value,
+                    "error": error,
+                },
+            )
+            outcome = LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_UNAVAILABLE,
+                rounds_used=retry_rounds,
+                last_session_id=None,
+                head_sha=retry_head_sha,
+            )
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=retry_pr,
+            skipped=False,
+            skip_reason=None,
+            worktree=worktree,
+            loop_outcome=outcome,
+        )
 
     env = make_env(cfg.paths.prompts_dir)
     prompt = render(
@@ -166,11 +519,32 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
     # and would mistake an already-ahead branch for a successful new run.)
     head_before = _head_sha(worktree)
 
+    emit(
+        "agent-start",
+        {
+            "phase": "round1",
+            "branch": branch,
+            "worktree": str(worktree),
+            "head_sha": head_before,
+        },
+    )
     result = await run_agent(
         prompt,
         worktree,
         model=cfg.agent.model,
         max_turns=cfg.agent.max_turns,
+    )
+    emit(
+        "agent-exit",
+        {
+            "phase": "round1",
+            "success": result.success,
+            "exit_code": result.exit_code,
+            "is_error": result.is_error,
+            "session_id": result.session_id,
+            "duration_ms": result.duration_ms,
+            "num_turns": result.num_turns,
+        },
     )
 
     if not result.success:
@@ -179,6 +553,14 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             issue_number,
             result.exit_code,
             result.is_error,
+        )
+        emit(
+            "run-terminal",
+            {
+                "outcome": "agent-failed",
+                "exit_code": result.exit_code,
+                "rounds_used": 0,
+            },
         )
         return RunOnceResult(
             issue_number=issue_number,
@@ -189,7 +571,6 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             agent_result=result,
         )
 
-    branch = f"auto/{issue_number}"
     head_after = _head_sha(worktree)
     agent_advanced_head = head_after != head_before
     to_push = _commits_to_push(worktree, branch, cfg.repo.default_branch)
@@ -206,18 +587,7 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             expected_owner=owner,
         )
         if pr is not None:
-            outcome = await drive_review_loop(
-                cfg=cfg,
-                issue_number=issue_number,
-                pr_number=pr.number,
-                branch=branch,
-                worktree=worktree,
-                initial_session_id=result.session_id,
-                poll_interval_s=cfg.orchestrator.poll_interval_s,
-                re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
-                give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
-                round_cap=cfg.orchestrator.review_round_cap,
-            )
+            outcome = await drive_and_merge(pr, initial_session_id=result.session_id)
             return RunOnceResult(
                 issue_number=issue_number,
                 pr=pr,
@@ -230,6 +600,14 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         log.error(
             "agent exited cleanly, no new commits, branch in sync with origin; skipping",
         )
+        emit(
+            "run-terminal",
+            {
+                "outcome": "empty-diff",
+                "head_sha": head_after,
+                "rounds_used": 0,
+            },
+        )
         return RunOnceResult(
             issue_number=issue_number,
             pr=None,
@@ -239,6 +617,7 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
         )
 
     _git_push(worktree, branch)
+    emit("push", {"phase": "round1", "branch": branch, "head_sha": head_after})
     # Re-dispatch path: an open PR for this branch may already exist from a
     # prior run. Reuse it instead of letting `gh pr create` fail with the
     # duplicate-PR error — otherwise the run aborts before the @codex review
@@ -259,23 +638,30 @@ async def run_once(*, issue_number: int, config_path: Path) -> RunOnceResult:
             title=issue.title,
             body=_build_pr_body(issue),
         )
+        emit(
+            "pr-open",
+            {
+                "number": pr.number,
+                "url": pr.url,
+                "head": branch,
+                "base": cfg.repo.default_branch,
+                "reused": False,
+            },
+        )
+    else:
+        emit(
+            "pr-open",
+            {
+                "number": pr.number,
+                "url": pr.url,
+                "head": branch,
+                "base": cfg.repo.default_branch,
+                "reused": True,
+            },
+        )
     comment_pr(repo_path=repo_path, pr_number=pr.number, body="@codex review")
 
-    # Drive the Codex review loop until terminal: APPROVED, AUTO_STUCK_*, or
-    # AGENT_FAILED. The first agent run's session id is threaded in so the
-    # first three review rounds can `--resume` it (cached prefix).
-    outcome = await drive_review_loop(
-        cfg=cfg,
-        issue_number=issue_number,
-        pr_number=pr.number,
-        branch=branch,
-        worktree=worktree,
-        initial_session_id=result.session_id,
-        poll_interval_s=cfg.orchestrator.poll_interval_s,
-        re_nudge_after_s=cfg.orchestrator.codex_renudge_after_min * 60.0,
-        give_up_after_s=cfg.orchestrator.codex_giveup_after_min * 60.0,
-        round_cap=cfg.orchestrator.review_round_cap,
-    )
+    outcome = await drive_and_merge(pr, initial_session_id=result.session_id)
     return RunOnceResult(
         issue_number=issue_number,
         pr=pr,

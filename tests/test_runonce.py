@@ -25,7 +25,8 @@ from symphony.config import (
     PathsConfig,
     RepoConfig,
 )
-from symphony.github import Issue, IssueComment, TrackedIssue, PR
+from symphony.events import EventLog
+from symphony.github import GithubError, Issue, IssueComment, TrackedIssue, PR
 from symphony.types import AgentResult
 
 
@@ -179,6 +180,10 @@ def _patch_happy_path(
     monkeypatch.setattr(
         ro_mod, "comment_pr", lambda **kw: calls.setdefault("comment_pr", kw)
     )
+    monkeypatch.setattr(
+        ro_mod, "merge_pr", lambda **kw: calls.setdefault("merge_pr", kw)
+    )
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: True)
 
     # Stub the review loop so existing tests don't have to thread its inputs.
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind
@@ -259,9 +264,9 @@ async def test_run_once_happy_path_creates_pr_with_closes_marker(monkeypatch, tm
     assert loop_kwargs["re_nudge_after_s"] == fixture["cfg"].orchestrator.codex_renudge_after_min * 60.0
     assert loop_kwargs["give_up_after_s"] == fixture["cfg"].orchestrator.codex_giveup_after_min * 60.0
 
-    # Auto-merge is not armed at PR-open. The review loop owns final merge
-    # handling once Codex/CI approval is observed.
-    assert "merge_pr" not in calls
+    # Merge is attempted only after the review loop reports approval.
+    assert calls["merge_pr"]["pr_number"] == 99
+    assert calls["merge_pr"]["match_head_commit"] == "head-sha"
 
 
 @pytest.mark.asyncio
@@ -278,6 +283,316 @@ async def test_run_once_does_not_merge_when_review_loop_does_not_approve(monkeyp
     assert res.loop_outcome is not None
     assert res.loop_outcome.kind == LoopOutcomeKind.AUTO_STUCK_ROUNDS
     assert "merge_pr" not in fixture["calls"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_writes_event_log(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+
+    await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    kinds = [e.kind for e in event_log.iter_events(issue_number=3)]
+    assert kinds[:4] == ["agent-start", "agent-exit", "push", "pr-open"]
+    assert kinds[-1] == "merge"
+    pr_event = [e for e in event_log.iter_events(issue_number=3) if e.kind == "pr-open"][0]
+    assert pr_event.payload["number"] == 99
+    assert pr_event.payload["reused"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_once_records_merge_failure_as_terminal_outcome(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    calls = fixture["calls"]
+
+    def _fail_merge(**kw):
+        calls["merge_pr"] = kw
+        raise GithubError("merge blocked")
+
+    monkeypatch.setattr(ro_mod, "merge_pr", _fail_merge)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_failed"
+    assert calls["merge_pr"]["match_head_commit"] == "head-sha"
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_failed"
+    assert events[-1].payload["error"] == "merge blocked"
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_emit_merge_until_pr_is_merged(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: False)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_pending"
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_pending"
+    assert "merge" not in [e.kind for e in events]
+
+
+@pytest.mark.asyncio
+async def test_run_once_retries_prior_merge_failure_without_round1_agent(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={"outcome": "merge_failed", "rounds_used": 0},
+    )
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == existing
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    assert fixture["calls"]["drive_review_loop"]["initial_session_id"] is None
+    assert fixture["calls"]["merge_pr"]["pr_number"] == 42
+    retry_event = event_log.iter_events(issue_number=3)[-2]
+    assert retry_event.kind == "pr-open"
+    assert retry_event.payload["merge_retry"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_once_waits_for_open_merge_pending_pr_without_remerging(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_pending",
+            "rounds_used": 2,
+            "head_sha": "reviewed-sha",
+        },
+    )
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    merge_checks = []
+
+    def _not_merged(**kw):
+        merge_checks.append(kw)
+        return False
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+    monkeypatch.setattr(
+        ro_mod,
+        "get_pr_head_sha",
+        lambda **kw: "reviewed-sha",
+    )
+    monkeypatch.setattr(ro_mod, "is_pr_merged", _not_merged)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == existing
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_pending"
+    assert res.loop_outcome.rounds_used == 2
+    assert res.loop_outcome.head_sha == "reviewed-sha"
+    assert merge_checks == [{"repo_path": fixture["cfg"].repo.path, "pr_number": 42}]
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    assert "drive_review_loop" not in fixture["calls"]
+    assert "merge_pr" not in fixture["calls"]
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_pending"
+    assert events[-1].payload["merge_retry"] is True
+    assert events[-1].payload["reason"] == "open PR still pending merge"
+
+
+@pytest.mark.asyncio
+async def test_run_once_reruns_review_when_open_merge_pending_head_changes(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    existing = PR(number=42, url="https://x/pr/42")
+    fixture["calls"].pop("find_pr", None)
+    order: list[str] = []
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_pending",
+            "rounds_used": 2,
+            "head_sha": "old-sha",
+        },
+    )
+
+    def _existing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return existing
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _existing)
+    monkeypatch.setattr(ro_mod, "get_pr_head_sha", lambda **kw: "new-sha")
+
+    def _fake_sync(*args):
+        order.append("sync")
+        fixture["calls"]["sync_worktree"] = args
+
+    def _fake_comment(**kw):
+        order.append("comment")
+        fixture["calls"]["comment_pr"] = kw
+
+    monkeypatch.setattr(ro_mod, "_sync_worktree_to_pr_head", _fake_sync)
+    monkeypatch.setattr(ro_mod, "comment_pr", _fake_comment)
+
+    async def _fake_loop(**kw):
+        order.append("review")
+        fixture["calls"]["drive_review_loop"] = kw
+        return ro_mod.LoopOutcome(
+            kind=ro_mod.LoopOutcomeKind.APPROVED,
+            rounds_used=0,
+            last_session_id=kw.get("initial_session_id"),
+            head_sha="new-sha",
+        )
+
+    monkeypatch.setattr(ro_mod, "drive_review_loop", _fake_loop)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == existing
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert fixture["calls"]["sync_worktree"] == (
+        fixture["wt"],
+        "auto/3",
+        "new-sha",
+    )
+    assert order[:3] == ["sync", "comment", "review"]
+    assert fixture["calls"]["comment_pr"] == {
+        "repo_path": fixture["cfg"].repo.path,
+        "pr_number": 42,
+        "body": "@codex review",
+    }
+    assert fixture["calls"]["drive_review_loop"]["initial_session_id"] is None
+    assert fixture["calls"]["merge_pr"]["pr_number"] == 42
+    events = event_log.iter_events(issue_number=3)
+    retry_event = events[-2]
+    assert retry_event.kind == "pr-open"
+    assert retry_event.payload["merge_retry"] is True
+    assert retry_event.payload["head_changed"] is True
+    assert retry_event.payload["previous_head_sha"] == "old-sha"
+    assert retry_event.payload["head_sha"] == "new-sha"
+
+
+@pytest.mark.asyncio
+async def test_run_once_records_merge_when_retry_pr_closed_after_merge(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_pending",
+            "rounds_used": 2,
+            "head_sha": "reviewed-sha",
+        },
+    )
+
+    def _missing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return None
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _missing)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: True)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == PR(number=42, url="https://x/pr/42")
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "approved"
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "merge"
+    assert events[-1].payload["merge_retry"] is True
+    assert events[-1].payload["pr_number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_run_once_stops_when_merge_retry_pr_is_unavailable(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    fixture["calls"].pop("find_pr", None)
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=3,
+        payload={
+            "pr_number": 42,
+            "url": "https://x/pr/42",
+            "outcome": "merge_failed",
+            "rounds_used": 2,
+            "head_sha": "reviewed-sha",
+        },
+    )
+
+    def _missing(branch, **kw):
+        fixture["calls"]["find_pr"] = (branch, kw)
+        return None
+
+    monkeypatch.setattr(ro_mod, "find_open_pr_for_branch", _missing)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: False)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is False
+    assert res.pr == PR(number=42, url="https://x/pr/42")
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "merge_unavailable"
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+    events = event_log.iter_events(issue_number=3)
+    assert events[-1].kind == "run-terminal"
+    assert events[-1].payload["outcome"] == "merge_unavailable"
+    assert events[-1].payload["error"] == "no open PR found for merge retry"
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,11 @@
+import json
+from types import SimpleNamespace
+
 from typer.testing import CliRunner
 
 from symphony import __version__
 from symphony.cli import app
+from symphony.events import EventLog
 from symphony.types import AgentResult
 
 runner = CliRunner()
@@ -30,6 +34,48 @@ def test_help_lists_run():
     assert result.exit_code == 0
     # The long-running orchestrator command, distinct from `run-once`.
     assert "\n run " in result.output or "│ run " in result.output
+
+
+def test_help_lists_status_and_logs():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "status" in result.output
+    assert "logs" in result.output
+
+
+def test_status_reads_event_log(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(repo=SimpleNamespace(path=tmp_path))
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    log = EventLog.for_repo(tmp_path)
+    log.emit("dispatch", issue_number=42, run_id="r", ts=100)
+    log.emit(
+        "review-verdict",
+        issue_number=42,
+        run_id="r",
+        payload={"head_sha": "abc", "verdict": "pending", "round": 3},
+        ts=110,
+    )
+
+    result = runner.invoke(app, ["status", "--config", "ignored.toml"])
+
+    assert result.exit_code == 0, result.output
+    assert "#42" in result.output
+    assert "round=3" in result.output
+    assert "last_review_verdict=pending" in result.output
+
+
+def test_logs_outputs_json_lines_and_filters_issue(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(repo=SimpleNamespace(path=tmp_path))
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    log = EventLog.for_repo(tmp_path)
+    log.emit("dispatch", issue_number=1, run_id="a", ts=1)
+    log.emit("dispatch", issue_number=2, run_id="b", ts=2)
+
+    result = runner.invoke(app, ["logs", "--config", "ignored.toml", "--issue", "2"])
+
+    assert result.exit_code == 0, result.output
+    rows = [json.loads(line) for line in result.output.splitlines()]
+    assert [row["issue_number"] for row in rows] == [2]
 
 
 def test_run_once_invokes_orchestrator(tmp_path, monkeypatch):

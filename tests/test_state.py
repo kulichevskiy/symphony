@@ -60,9 +60,10 @@ def test_initial_state_is_empty():
 
 def test_schedule_retry_first_attempt():
     s = OrchestratorState()
-    entry = s.schedule_retry(42, now=100.0)
+    entry = s.schedule_retry(42, now=100.0, reason="merge_failed")
     assert entry.attempt == 1
     assert entry.next_retry_at == 100.0 + BASE_BACKOFF_S
+    assert entry.reason == "merge_failed"
     assert s.retry_queue[42] == entry
 
 

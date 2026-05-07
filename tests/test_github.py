@@ -26,6 +26,7 @@ from symphony.github import (
     find_open_pr_for_branch,
     get_commit_committed_at,
     get_pr_head_sha,
+    is_pr_merged,
     label_issue,
     list_pr_checks,
     list_pr_reactions,
@@ -446,12 +447,11 @@ def test_arm_auto_merge_calls_gh_pr_merge(monkeypatch, tmp_path):
     assert "--delete-branch" in call
 
 
-def test_merge_pr_calls_direct_gh_pr_merge(monkeypatch, tmp_path):
+def test_merge_pr_matches_reviewed_head(monkeypatch, tmp_path):
     fake = _stub({("pr", "merge", "12"): ""})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     merge_pr(repo_path=tmp_path, pr_number=12, match_head_commit="abc123")
-    call = fake.calls[0]
-    assert call == [
+    assert fake.calls[0] == [
         "pr",
         "merge",
         "12",
@@ -466,6 +466,21 @@ def test_get_pr_head_sha(monkeypatch, tmp_path):
     fake = _stub({("pr", "view", "10"): json.dumps({"headRefOid": "abc123"})})
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     assert get_pr_head_sha(10, repo_path=tmp_path) == "abc123"
+
+
+def test_is_pr_merged(monkeypatch, tmp_path):
+    fake = _stub(
+        {
+            ("pr", "view", "10"): json.dumps(
+                {"state": "MERGED", "mergedAt": "2026-05-06T18:00:00Z"}
+            )
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert is_pr_merged(10, repo_path=tmp_path) is True
+    assert fake.calls == [
+        ["pr", "view", "10", "--json", "state,mergedAt"],
+    ]
 
 
 def test_list_pr_reviews_parses_payload(monkeypatch, tmp_path):
@@ -564,32 +579,274 @@ def test_list_pr_reactions(monkeypatch, tmp_path):
 
 
 def test_list_pr_checks(monkeypatch, tmp_path):
-    # `gh pr checks --json` exposes name/bucket/state/link (not status /
-    # conclusion / detailsUrl). Pin the schema so a copy-pasted-from-`pr
-    # view` field name doesn't sneak back in. Only required checks gate the
-    # verdict, and gh's documented pending-check exit code 8 is non-fatal.
-    payload = [
-        {"name": "build", "bucket": "pass", "state": "SUCCESS", "link": "https://ci/build"},
-        {"name": "test", "bucket": "fail", "state": "FAILURE", "link": "https://ci/test"},
-        {"name": "lint", "bucket": "pending", "state": "IN_PROGRESS", "link": None},
+    page1 = [
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://ci/build-wrong-app",
+            "app": {"id": 999},
+        },
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://ci/build",
+            "app": {"id": 123},
+        },
+    ]
+    page2 = [
+        {"name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://ci/test"},
+        {"name": "lint", "status": "in_progress", "conclusion": None, "details_url": None},
+    ]
+    status_page1 = [
+        {
+            "context": "deploy",
+            "state": "failure",
+            "target_url": "https://ci/deploy-old",
+            "created_at": "2026-05-06T07:00:00Z",
+        },
+        {
+            "context": "deploy",
+            "state": "success",
+            "target_url": "https://ci/deploy",
+            "created_at": "2026-05-06T07:05:00Z",
+        },
+        {
+            "context": "external",
+            "state": "pending",
+            "target_url": None,
+            "created_at": "2026-05-06T07:10:00Z",
+        },
+    ]
+    status_page2 = [
+        {
+            "context": "legacy",
+            "state": "error",
+            "target_url": "https://ci/legacy",
+            "created_at": "2026-05-06T07:15:00Z",
+        },
     ]
     fake = _stub(
         {
-            ("pr", "checks", "10"): json.dumps(payload),
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("pr", "view", "10"): json.dumps(
+                {"headRefOid": "abc123", "baseRefName": "auto/5"}
+            ),
+            (
+                "api",
+                "repos/o/r/branches/auto%2F5/protection/required_status_checks",
+            ): json.dumps(
+                {
+                    "contexts": ["build", "test", "legacy"],
+                    "checks": [{"context": "build", "app_id": 123}],
+                }
+            ),
+            ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
+                [{"check_runs": page1}, {"check_runs": page2}]
+            ),
+            ("api", "repos/o/r/commits/abc123/status?per_page=100"): json.dumps(
+                [{"statuses": status_page1}, {"statuses": status_page2}]
+            ),
         }
     )
     monkeypatch.setattr(gh_mod, "_run_gh", fake)
     checks = list_pr_checks(10, repo_path=tmp_path)
-    assert len(checks) == 3
-    assert checks[1] == CheckRun(name="test", bucket="fail", state="FAILURE", link="https://ci/test")
-    assert checks[2].link is None
-    call = next(c for c in fake.calls if c[:2] == ["pr", "checks"])
-    call_index = fake.calls.index(call)
-    assert "--required" in call
-    assert "--json" in call
-    json_fields = call[call.index("--json") + 1].split(",")
-    assert set(json_fields) == {"name", "bucket", "state", "link"}
-    assert fake.kwargs_seen[call_index]["allowed_exit_codes"] == {0, 8}
+    assert len(checks) == 7
+    assert checks[0] == CheckRun(
+        name="build",
+        status="completed",
+        conclusion="success",
+        details_url="https://ci/build-wrong-app",
+        app_id=999,
+        required=False,
+    )
+    assert checks[1] == CheckRun(
+        name="build",
+        status="completed",
+        conclusion="success",
+        details_url="https://ci/build",
+        app_id=123,
+        required=True,
+    )
+    assert checks[2] == CheckRun(
+        name="test",
+        status="completed",
+        conclusion="failure",
+        details_url="https://ci/test",
+        required=True,
+    )
+    assert checks[3].conclusion is None
+    assert checks[3].required is False
+    assert checks[4] == CheckRun(
+        name="deploy",
+        status="completed",
+        conclusion="success",
+        details_url="https://ci/deploy",
+        required=False,
+    )
+    assert checks[5] == CheckRun(
+        name="external",
+        status="in_progress",
+        conclusion=None,
+        details_url=None,
+        required=False,
+    )
+    assert checks[6] == CheckRun(
+        name="legacy",
+        status="completed",
+        conclusion="failure",
+        details_url="https://ci/legacy",
+        required=True,
+    )
+    assert fake.calls == [
+        ["repo", "view", "--json", "nameWithOwner"],
+        ["pr", "view", "10", "--json", "headRefOid,baseRefName"],
+        [
+            "api",
+            "repos/o/r/branches/auto%2F5/protection/required_status_checks",
+        ],
+        [
+            "api",
+            "repos/o/r/commits/abc123/check-runs?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+        [
+            "api",
+            "repos/o/r/commits/abc123/status?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+    ]
+
+
+def test_list_pr_checks_uses_latest_check_run_attempt_per_app(monkeypatch, tmp_path):
+    check_runs = [
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "failure",
+            "details_url": "https://ci/build-old",
+            "app": {"id": 123},
+            "completed_at": "2026-05-06T07:00:00Z",
+        },
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": "https://ci/build-new",
+            "app": {"id": 123},
+            "completed_at": "2026-05-06T07:05:00Z",
+        },
+        {
+            "name": "build",
+            "status": "completed",
+            "conclusion": "failure",
+            "details_url": "https://ci/build-other-app",
+            "app": {"id": 999},
+            "completed_at": "2026-05-06T07:10:00Z",
+        },
+    ]
+    fake = _stub(
+        {
+            ("repo", "view"): json.dumps({"nameWithOwner": "o/r"}),
+            ("pr", "view", "10"): json.dumps(
+                {"headRefOid": "abc123", "baseRefName": "main"}
+            ),
+            (
+                "api",
+                "repos/o/r/branches/main/protection/required_status_checks",
+            ): json.dumps(
+                {
+                    "contexts": [],
+                    "checks": [{"context": "build", "app_id": 123}],
+                }
+            ),
+            ("api", "repos/o/r/commits/abc123/check-runs?per_page=100"): json.dumps(
+                [{"check_runs": check_runs}]
+            ),
+            ("api", "repos/o/r/commits/abc123/status?per_page=100"): json.dumps(
+                [{"statuses": []}]
+            ),
+        }
+    )
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+
+    checks = list_pr_checks(10, repo_path=tmp_path)
+
+    assert checks == [
+        CheckRun(
+            name="build",
+            status="completed",
+            conclusion="success",
+            details_url="https://ci/build-new",
+            app_id=123,
+            required=True,
+        ),
+        CheckRun(
+            name="build",
+            status="completed",
+            conclusion="failure",
+            details_url="https://ci/build-other-app",
+            app_id=999,
+            required=False,
+        ),
+    ]
+
+
+def test_list_pr_checks_marks_forbidden_required_context_lookup_as_unknown(
+    monkeypatch, tmp_path
+):
+    calls: list[list[str]] = []
+
+    def fake(args, *, cwd=None):  # type: ignore[no-untyped-def]
+        calls.append(list(args))
+        if args[:2] == ["repo", "view"]:
+            return json.dumps({"nameWithOwner": "o/r"})
+        if args[:3] == ["pr", "view", "10"]:
+            return json.dumps({"headRefOid": "abc123", "baseRefName": "main"})
+        if args[:2] == [
+            "api",
+            "repos/o/r/branches/main/protection/required_status_checks",
+        ]:
+            raise GithubError("gh api failed: HTTP 403")
+        if args[:2] == ["api", "repos/o/r/commits/abc123/check-runs?per_page=100"]:
+            return json.dumps(
+                [
+                    {
+                        "check_runs": [
+                            {
+                                "name": "build",
+                                "status": "in_progress",
+                                "conclusion": None,
+                                "details_url": None,
+                            }
+                        ]
+                    }
+                ]
+            )
+        if args[:2] == ["api", "repos/o/r/commits/abc123/status?per_page=100"]:
+            return json.dumps([{"statuses": []}])
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+
+    checks = list_pr_checks(10, repo_path=tmp_path)
+
+    assert checks == [
+        CheckRun(
+            name="build",
+            status="in_progress",
+            conclusion=None,
+            details_url=None,
+            required=None,
+        )
+    ]
+    assert calls[2] == [
+        "api",
+        "repos/o/r/branches/main/protection/required_status_checks",
+    ]
 
 
 def test_label_issue_calls_gh(monkeypatch, tmp_path):

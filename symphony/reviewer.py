@@ -12,14 +12,17 @@ Verdict mapping per SYMPHONY.md M0 spike findings:
 
 - **APPROVED** = a fresh ``+1`` reaction by ``chatgpt-codex-connector[bot]`` on
   the PR with ``created_at`` at or after the HEAD commit's committer date, AND no
-  fresh ``CHANGES_REQUESTED`` signal on HEAD, AND no pending or failing CI
-  checks. A non-Codex reviewer's ``APPROVED`` review on HEAD also counts once
-  checks are complete.
-- **CHANGES_REQUESTED** = (a) any failing CI check on HEAD, (b) any inline
+  fresh ``CHANGES_REQUESTED`` signal or pending required CI check on HEAD. A
+  non-Codex reviewer's ``APPROVED`` review on HEAD also counts once required CI
+  checks are done.
+- **CHANGES_REQUESTED** = (a) any failing required CI check on HEAD, (b) any inline
   Codex review comment on HEAD, (c) a Codex ``COMMENTED`` review on HEAD whose
   body is substantively longer than the standard "About Codex in GitHub"
   boilerplate, or (d) a non-Codex ``CHANGES_REQUESTED`` review on HEAD.
-- **PENDING** = checks are still running or none of the above has happened.
+- **PENDING** = none of the above, or approval exists while CI is still pending.
+  When required-check metadata is unavailable, completed CI failures still
+  request changes, but pending checks with unknown requiredness do not block
+  approval forever.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .events import EventLog
 from .github import (
     CheckRun,
     Reaction,
@@ -143,16 +147,21 @@ def evaluate_verdict(
     )
 
     # 1. CI failures take priority — they're concrete, fast feedback that
-    #    Codex review can't override. Other non-passing checks are not
-    #    actionable agent feedback, but they must block approval/merge.
-    failing_checks = [c for c in checks if c.bucket == "fail"]
+    #    Codex review can't override.
+    required_checks = [c for c in checks if c.required is True]
+    required_or_unknown_checks = [c for c in checks if c.required is not False]
+    failing_checks = [
+        c
+        for c in required_or_unknown_checks
+        if c.status == "completed" and c.conclusion == "failure"
+    ]
     if failing_checks:
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
             review_comments=[c for c in fresh_comments if c.user_login == codex_login],
             ci_failures=failing_checks,
         )
-    non_passing_checks = [c for c in checks if c.bucket != "pass"]
+    pending_checks = [c for c in required_checks if c.status != "completed"]
 
     # 2. Explicit human verdicts on HEAD are collapsed per reviewer. Reviews come
     #    back oldest-first; collapse them into one effective verdict per
@@ -236,10 +245,9 @@ def evaluate_verdict(
             last_review_body=codex_substantive[-1].body,
         )
 
-    # 5. Required checks that are still pending/skipping/cancelled block
-    #    approval but do not trigger remediation.
-    if non_passing_checks:
-        return Verdict(kind=VerdictKind.PENDING, pending_checks=non_passing_checks)
+    # 5. Pending checks keep approval signals from triggering an early merge.
+    if pending_checks:
+        return Verdict(kind=VerdictKind.PENDING, pending_checks=pending_checks)
 
     # 6. Approval via a non-Codex reviewer on HEAD. This is only considered
     #    after fresh blocking signals have been ruled out.
@@ -294,6 +302,9 @@ class LoopOutcomeKind(StrEnum):
     AUTO_STUCK_ROUNDS = "auto_stuck_rounds"
     AUTO_STUCK_IDLE = "auto_stuck_idle"
     AGENT_FAILED = "agent_failed"
+    MERGE_FAILED = "merge_failed"
+    MERGE_PENDING = "merge_pending"
+    MERGE_UNAVAILABLE = "merge_unavailable"
 
 
 @dataclass(frozen=True)
@@ -322,7 +333,10 @@ def _pending_activity_key(snap: ReviewSnapshot) -> tuple[Any, ...]:
             for c in snap.review_comments
         ),
         tuple((r.user_login, r.content, r.created_at) for r in snap.reactions),
-        tuple((c.name, c.bucket, c.state, c.link) for c in snap.checks),
+        tuple(
+            (c.name, c.status, c.conclusion, c.details_url, c.app_id, c.required)
+            for c in snap.checks
+        ),
     )
 
 
@@ -358,9 +372,10 @@ async def drive_review_loop(
     commits_to_push_fn: Callable[[Path, str, str], int] | None = None,
     comment_pr_fn: Callable[..., None] | None = None,
     label_issue_fn: Callable[..., None] | None = None,
-    merge_pr_fn: Callable[..., None] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now_fn: Callable[[], float] = None,  # type: ignore[assignment]
+    event_log: EventLog | None = None,
+    run_id: str = "",
 ) -> LoopOutcome:
     """Poll the PR until terminal state or a timeout/round cap.
 
@@ -383,7 +398,6 @@ async def drive_review_loop(
         or commits_to_push_fn is None
         or comment_pr_fn is None
         or label_issue_fn is None
-        or merge_pr_fn is None
     )
     if needs_defaults:
         # Live defaults — imported lazily to avoid a cycle with runonce.
@@ -392,7 +406,6 @@ async def drive_review_loop(
         from .github import (
             comment_pr as _comment_pr,
             label_issue as _label_issue,
-            merge_pr as _merge_pr,
         )
 
         if run_agent_fn is None:
@@ -407,16 +420,27 @@ async def drive_review_loop(
             comment_pr_fn = _comment_pr
         if label_issue_fn is None:
             label_issue_fn = _label_issue
-        if merge_pr_fn is None:
-            merge_pr_fn = _merge_pr
         if render_review_prompt is None:
             render_review_prompt = _default_render_review_prompt
 
+    replay = event_log.replay_review(issue_number) if event_log is not None else None
     session_id = initial_session_id
-    rounds_used = 0
+    rounds_used = replay.rounds_used if replay is not None else 0
     last_activity = now_fn()
     nudged_during_idle = False
     last_pending_activity_key: tuple[Any, ...] | None = None
+    last_seen_head_sha = replay.last_reviewed_sha if replay is not None else ""
+    first_poll = True
+
+    def emit(kind: str, payload: dict[str, Any] | None = None) -> None:
+        if event_log is None:
+            return
+        event_log.emit(
+            kind,
+            issue_number=issue_number,
+            run_id=run_id,
+            payload=payload or {},
+        )
 
     while True:
         await sleep_fn(poll_interval_s)
@@ -429,29 +453,30 @@ async def drive_review_loop(
             reactions=snap.reactions,
             checks=snap.checks,
         )
+        if snap.head_sha != last_seen_head_sha:
+            if first_poll and last_seen_head_sha:
+                rounds_used = 0
+                last_activity = now_fn()
+                nudged_during_idle = False
+                last_pending_activity_key = None
+            emit(
+                "review-fresh",
+                {"head_sha": snap.head_sha, "round": rounds_used},
+            )
+            last_seen_head_sha = snap.head_sha
+        first_poll = False
+        emit(
+            "review-verdict",
+            {
+                "head_sha": snap.head_sha,
+                "verdict": verdict.kind.value,
+                "round": rounds_used,
+                "review_comments": len(verdict.review_comments),
+                "ci_failures": len(verdict.ci_failures),
+            },
+        )
 
         if verdict.kind == VerdictKind.APPROVED:
-            try:
-                merge_pr_fn(
-                    repo_path=cfg.repo.path,
-                    pr_number=pr_number,
-                    match_head_commit=snap.head_sha,
-                )
-            except Exception:
-                log.warning(
-                    "approved PR #%d could not be merged; will retry",
-                    pr_number,
-                    exc_info=True,
-                )
-                if now_fn() - last_activity >= give_up_after_s:
-                    label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
-                    return LoopOutcome(
-                        kind=LoopOutcomeKind.AUTO_STUCK_IDLE,
-                        rounds_used=rounds_used,
-                        last_session_id=session_id,
-                        head_sha=snap.head_sha,
-                    )
-                continue
             return LoopOutcome(
                 kind=LoopOutcomeKind.APPROVED,
                 rounds_used=rounds_used,
@@ -462,6 +487,15 @@ async def drive_review_loop(
         if verdict.kind == VerdictKind.CHANGES_REQUESTED:
             if rounds_used >= round_cap:
                 label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
+                emit(
+                    "auto-stuck",
+                    {
+                        "reason": "round-cap",
+                        "rounds_used": rounds_used,
+                        "head_sha": snap.head_sha,
+                        "outcome": LoopOutcomeKind.AUTO_STUCK_ROUNDS.value,
+                    },
+                )
                 return LoopOutcome(
                     kind=LoopOutcomeKind.AUTO_STUCK_ROUNDS,
                     rounds_used=rounds_used,
@@ -480,6 +514,16 @@ async def drive_review_loop(
             resume = select_resume_session(rounds_used, session_id)
 
             head_before = head_sha_fn(worktree)
+            review_round = rounds_used + 1
+            emit(
+                "agent-start",
+                {
+                    "phase": "review",
+                    "round": review_round,
+                    "resume_session": resume,
+                    "head_sha": head_before,
+                },
+            )
             agent_result = await run_agent_fn(
                 prompt,
                 worktree,
@@ -489,6 +533,17 @@ async def drive_review_loop(
             )
 
             if not agent_result.success:
+                emit(
+                    "agent-exit",
+                    {
+                        "phase": "review",
+                        "round": review_round,
+                        "success": False,
+                        "exit_code": agent_result.exit_code,
+                        "is_error": agent_result.is_error,
+                        "session_id": agent_result.session_id,
+                    },
+                )
                 log.error(
                     "review-loop agent run failed (round %d, exit=%d)",
                     rounds_used,
@@ -507,9 +562,30 @@ async def drive_review_loop(
                 session_id = agent_result.session_id
 
             head_after = head_sha_fn(worktree)
+            emit(
+                "agent-exit",
+                {
+                    "phase": "review",
+                    "round": review_round,
+                    "success": True,
+                    "exit_code": agent_result.exit_code,
+                    "is_error": agent_result.is_error,
+                    "session_id": agent_result.session_id,
+                    "head_sha": head_after,
+                },
+            )
             to_push = commits_to_push_fn(worktree, branch, cfg.repo.default_branch)
             if head_after != head_before or to_push > 0:
                 push_fn(worktree, branch)
+                emit(
+                    "push",
+                    {
+                        "phase": "review",
+                        "round": review_round,
+                        "branch": branch,
+                        "head_sha": head_after,
+                    },
+                )
                 comment_pr_fn(
                     repo_path=cfg.repo.path,
                     pr_number=pr_number,
@@ -545,6 +621,15 @@ async def drive_review_loop(
         elapsed = now - last_activity
         if elapsed >= give_up_after_s:
             label_issue_fn(issue_number, "auto-stuck", repo_path=cfg.repo.path)
+            emit(
+                "auto-stuck",
+                {
+                    "reason": "idle",
+                    "rounds_used": rounds_used,
+                    "head_sha": snap.head_sha,
+                    "outcome": LoopOutcomeKind.AUTO_STUCK_IDLE.value,
+                },
+            )
             return LoopOutcome(
                 kind=LoopOutcomeKind.AUTO_STUCK_IDLE,
                 rounds_used=rounds_used,

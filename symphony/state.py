@@ -50,6 +50,7 @@ class RetryEntry:
     issue_number: int
     attempt: int
     next_retry_at: float  # monotonic timestamp
+    reason: str = ""
 
 
 @dataclass
@@ -91,6 +92,7 @@ class OrchestratorState:
         issue_number: int,
         *,
         now: float,
+        reason: str = "",
         backoff_fn: Callable[[int], float] = compute_backoff,
     ) -> RetryEntry:
         """Bump the attempt counter and arm the next retry timestamp."""
@@ -100,6 +102,7 @@ class OrchestratorState:
             issue_number=issue_number,
             attempt=attempt,
             next_retry_at=now + backoff_fn(attempt),
+            reason=reason,
         )
         self.retry_queue[issue_number] = entry
         return entry

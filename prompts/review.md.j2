@@ -18,7 +18,7 @@ Codex requested changes on commit {{ sha }}. Address the feedback below.
 ## CI failures
 
 {% for f in ci_failures -%}
-- {{ f.name }} (see {{ f.link or "PR checks" }})
+- {{ f.name }} (see {{ f.details_url or "PR checks" }})
 {% endfor %}
 
 {% endif -%}

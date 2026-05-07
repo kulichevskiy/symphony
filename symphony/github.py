@@ -12,6 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 ISSUE_FIELDS = "number,title,body,comments,labels,createdAt"
 
@@ -117,18 +118,20 @@ class Reaction:
 
 @dataclass(frozen=True)
 class CheckRun:
-    """One CI check run on the PR's HEAD commit.
-
-    ``bucket`` is gh's high-level rollup of the check status: ``"pass"``,
-    ``"fail"``, ``"pending"``, ``"skipping"``, or ``"cancel"``. ``state`` is
-    the raw GitHub state (``SUCCESS`` / ``FAILURE`` / ``IN_PROGRESS`` / …)
-    kept around for diagnostics. ``link`` points at the run details page.
-    """
+    """One CI check run or status context on the PR's HEAD commit."""
 
     name: str
-    bucket: str
-    state: str
-    link: str | None
+    status: str
+    conclusion: str | None
+    details_url: str | None
+    app_id: int | None = None
+    required: bool | None = True
+
+
+@dataclass(frozen=True)
+class RequiredStatusCheck:
+    context: str
+    app_id: int | None = None
 
 
 def _run_gh(
@@ -467,7 +470,7 @@ def merge_pr(
     match_head_commit: str | None = None,
     match_head_sha: str | None = None,
 ) -> None:
-    """Merge a PR immediately after Symphony's review loop approves it."""
+    """Merge a PR after Symphony's review loop reaches an approved verdict."""
     flag = {"squash": "--squash", "merge": "--merge", "rebase": "--rebase"}[method]
     args = ["pr", "merge", str(pr_number), flag, "--delete-branch"]
     match_head = match_head_commit or match_head_sha
@@ -488,6 +491,102 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     if not sha:
         raise GithubError(f"PR #{pr_number} has no headRefOid")
     return sha
+
+
+def _as_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _required_status_checks(
+    *, owner: str, name: str, base_branch: str, repo_path: Path
+) -> tuple[RequiredStatusCheck, ...] | None:
+    if not base_branch:
+        return None
+    encoded_branch = quote(base_branch, safe="")
+    try:
+        out = _run_gh(
+            [
+                "api",
+                f"repos/{owner}/{name}/branches/{encoded_branch}/protection/required_status_checks",
+            ],
+            cwd=repo_path,
+        )
+    except GithubError as e:
+        message = str(e)
+        if "403" in message or "404" in message:
+            return None
+        raise
+    data = _parse_json(
+        out,
+        context=f"required status checks for branch {base_branch}",
+    )
+    required: list[RequiredStatusCheck] = []
+    check_contexts: set[str] = set()
+    for check in data.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        context = check.get("context")
+        if context:
+            check_contexts.add(str(context))
+            required.append(
+                RequiredStatusCheck(
+                    context=str(context),
+                    app_id=_as_int_or_none(check.get("app_id")),
+                )
+            )
+    required.extend(
+        RequiredStatusCheck(context=str(context))
+        for context in data.get("contexts") or []
+        if context and str(context) not in check_contexts
+    )
+    return tuple(required)
+
+
+def _matches_required_check(
+    name: str,
+    app_id: int | None,
+    required_checks: tuple[RequiredStatusCheck, ...],
+) -> bool:
+    for required in required_checks:
+        if required.context != name:
+            continue
+        if required.app_id in (None, -1) or required.app_id == app_id:
+            return True
+    return False
+
+
+def _is_required_check(
+    name: str,
+    app_id: int | None,
+    required_checks: tuple[RequiredStatusCheck, ...] | None,
+) -> bool | None:
+    if required_checks is None:
+        return None
+    return _matches_required_check(name, app_id, required_checks)
+
+
+def _check_run_timestamp(check_run: dict[str, Any]) -> str:
+    return str(
+        check_run.get("completed_at")
+        or check_run.get("started_at")
+        or check_run.get("created_at")
+        or check_run.get("updated_at")
+        or ""
+    )
+
+
+def is_pr_merged(pr_number: int, *, repo_path: Path) -> bool:
+    out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "state,mergedAt"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh pr view {pr_number}")
+    return bool(data.get("mergedAt")) or data.get("state") == "MERGED"
 
 
 def list_pr_reviews(pr_number: int, *, repo_path: Path) -> list[Review]:
@@ -555,41 +654,105 @@ def list_pr_reactions(pr_number: int, *, repo_path: Path) -> list[Reaction]:
 def list_pr_checks(
     pr_number: int, *, repo_path: Path, head_sha: str | None = None
 ) -> list[CheckRun]:
-    """Required CI check runs on the PR's HEAD commit (`gh pr checks`).
-
-    ``status``/``conclusion``/``detailsUrl`` are NOT valid ``--json`` fields
-    on ``gh pr checks`` — that produces an unknown-field error. The actual
-    schema exposes ``name``, ``bucket``, ``state``, and ``link`` (among
-    others); we use those.
-
-    ``gh pr checks`` returns exit code 8 while checks are pending. That is a
-    normal polling state, so parse stdout instead of treating it as fatal.
-
-    ``head_sha`` is accepted for call-site compatibility with snapshot
-    fetchers that pin other GitHub inputs to a specific head.
-    """
-    out = _run_gh(
+    """CI check runs and status contexts on the PR's HEAD commit."""
+    owner, name = _name_with_owner(repo_path)
+    pr_out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "headRefOid,baseRefName"],
+        cwd=repo_path,
+    )
+    pr_data = _parse_json(pr_out, context=f"gh pr view {pr_number}")
+    sha = head_sha or pr_data.get("headRefOid", "")
+    if not sha:
+        raise GithubError(f"PR #{pr_number} has no headRefOid")
+    required_checks = _required_status_checks(
+        owner=owner,
+        name=name,
+        base_branch=str(pr_data.get("baseRefName") or ""),
+        repo_path=repo_path,
+    )
+    check_runs_out = _run_gh(
         [
-            "pr",
-            "checks",
-            str(pr_number),
-            "--required",
-            "--json",
-            "name,bucket,state,link",
+            "api",
+            f"repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100",
+            "--paginate",
+            "--slurp",
         ],
         cwd=repo_path,
-        allowed_exit_codes={0, 8},
     )
-    data = _parse_json(out, context=f"checks for PR {pr_number}")
-    return [
-        CheckRun(
-            name=c.get("name", ""),
-            bucket=c.get("bucket", ""),
-            state=c.get("state", ""),
-            link=c.get("link") or None,
+    check_run_pages = _parse_json(
+        check_runs_out, context=f"check runs for PR {pr_number}"
+    )
+    status_out = _run_gh(
+        [
+            "api",
+            f"repos/{owner}/{name}/commits/{sha}/status?per_page=100",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=repo_path,
+    )
+    status_pages = _parse_json(status_out, context=f"status contexts for PR {pr_number}")
+
+    latest_check_runs: dict[tuple[str, int | None], tuple[str, int, CheckRun]] = {}
+    check_index = 0
+    for page in check_run_pages:
+        for c in page.get("check_runs", []):
+            check_name = str(c.get("name", ""))
+            app_id = _as_int_or_none((c.get("app") or {}).get("id"))
+            check = CheckRun(
+                name=check_name,
+                status=c.get("status", ""),
+                conclusion=c.get("conclusion") or None,
+                details_url=c.get("details_url") or None,
+                app_id=app_id,
+                required=_is_required_check(
+                    check_name,
+                    app_id,
+                    required_checks,
+                ),
+            )
+            key = (check_name, app_id)
+            timestamp = _check_run_timestamp(c)
+            current = latest_check_runs.get(key)
+            if current is None or (timestamp, check_index) > (current[0], current[1]):
+                latest_check_runs[key] = (timestamp, check_index, check)
+            check_index += 1
+    checks = [entry[2] for entry in latest_check_runs.values()]
+    latest_statuses: dict[str, Any] = {}
+    for page in status_pages:
+        for status in page.get("statuses", []):
+            context = str(status.get("context") or "")
+            current = latest_statuses.get(context)
+            timestamp = str(status.get("created_at") or status.get("updated_at") or "")
+            current_timestamp = (
+                str(current.get("created_at") or current.get("updated_at") or "")
+                if current is not None
+                else ""
+            )
+            if current is None or timestamp > current_timestamp:
+                latest_statuses[context] = status
+    for status in latest_statuses.values():
+        state = str(status.get("state") or "").lower()
+        if state == "success":
+            check_status, conclusion = "completed", "success"
+        elif state in {"error", "failure"}:
+            check_status, conclusion = "completed", "failure"
+        else:
+            check_status, conclusion = "in_progress", None
+        checks.append(
+            CheckRun(
+                name=str(status.get("context") or ""),
+                status=check_status,
+                conclusion=conclusion,
+                details_url=status.get("target_url") or None,
+                required=_is_required_check(
+                    str(status.get("context") or ""),
+                    None,
+                    required_checks,
+                ),
+            )
         )
-        for c in data
-    ]
+    return checks
 
 
 def label_issue(number: int, label: str, *, repo_path: Path) -> None:

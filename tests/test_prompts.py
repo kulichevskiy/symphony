@@ -89,11 +89,17 @@ def test_review_renders_review_body_when_no_inline_comments():
 
 
 def test_review_renders_ci_link_field():
-    # Regression: template must use CheckRun.link, not the old
-    # `.details_url`. With Jinja's StrictUndefined the wrong attribute
-    # would crash render.
+    # Regression: template must use CheckRun.details_url. With Jinja's
+    # StrictUndefined the wrong attribute would crash render.
     out = _render_review(
-        ci_failures=[CheckRun(name="test", bucket="fail", state="FAILURE", link="https://ci/run/123")],
+        ci_failures=[
+            CheckRun(
+                name="test",
+                status="completed",
+                conclusion="failure",
+                details_url="https://ci/run/123",
+            )
+        ],
     )
     assert "CI failures" in out
     assert "https://ci/run/123" in out
@@ -112,7 +118,14 @@ def test_review_renders_inline_comments_and_ci():
                 created_at="2026-05-06T07:30:00Z",
             )
         ],
-        ci_failures=[CheckRun(name="lint", bucket="fail", state="FAILURE", link=None)],
+        ci_failures=[
+            CheckRun(
+                name="lint",
+                status="completed",
+                conclusion="failure",
+                details_url=None,
+            )
+        ],
     )
     assert "[src/x.py:42] fix this" in out
     assert "lint (see PR checks)" in out
