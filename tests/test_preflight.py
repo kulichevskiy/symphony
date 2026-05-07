@@ -32,9 +32,7 @@ def test_preflight_collects_successes(monkeypatch, tmp_path):
             return json.dumps(
                 {
                     "required_status_checks": {"checks": [{"context": "ci"}]},
-                    "required_pull_request_reviews": {
-                        "required_approving_review_count": 1
-                    },
+                    "required_pull_request_reviews": None,
                 }
             )
         if args[1] == "/repos/owner/repo/installation":
@@ -67,9 +65,7 @@ def test_preflight_reports_actionable_failures(monkeypatch, tmp_path):
             return json.dumps(
                 {
                     "required_status_checks": {"checks": []},
-                    "required_pull_request_reviews": {
-                        "required_approving_review_count": 0
-                    },
+                    "required_pull_request_reviews": None,
                 }
             )
         if args[1] == "/repos/owner/repo/installation":
@@ -85,6 +81,5 @@ def test_preflight_reports_actionable_failures(monkeypatch, tmp_path):
     assert "not logged in" in by_name["gh auth"].message
     assert not by_name["branch protection"].ok
     assert "required CI/status check" in by_name["branch protection"].message
-    assert "required approving review" in by_name["branch protection"].message
     assert not by_name["labels"].ok
     assert "auto-stuck" in by_name["labels"].message

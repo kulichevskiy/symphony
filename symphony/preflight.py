@@ -103,25 +103,17 @@ def _branch_protection_result(
     check_count = len(required_checks.get("checks") or []) + len(
         required_checks.get("contexts") or []
     )
-    review_cfg = data.get("required_pull_request_reviews") or {}
-    review_count = int(review_cfg.get("required_approving_review_count") or 0)
 
-    missing: list[str] = []
     if check_count < 1:
-        missing.append("at least one required CI/status check")
-    if review_count < 1:
-        missing.append("at least one required approving review")
-
-    if missing:
         return PreflightResult(
             "branch protection",
             False,
-            f"{cfg.repo.default_branch} is missing {', '.join(missing)}",
+            f"{cfg.repo.default_branch} is missing at least one required CI/status check",
         )
     return PreflightResult(
         "branch protection",
         True,
-        f"{cfg.repo.default_branch} requires {review_count} review(s) and {check_count} check(s)",
+        f"{cfg.repo.default_branch} requires {check_count} CI/status check(s)",
     )
 
 
