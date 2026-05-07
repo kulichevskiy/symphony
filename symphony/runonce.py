@@ -148,6 +148,59 @@ def _build_pr_body(issue: Issue) -> str:
     return f"Closes #{issue.number}\n\n{issue.title}\n\n{PR_FOOTER}\n"
 
 
+def _cleanup_after_merge(
+    *, repo_path: Path, worktree: Path, branch: str
+) -> None:
+    """Tear down the worktree and the local + remote ``auto/<n>`` branch.
+
+    Order matters: the worktree is removed *first* so that the subsequent
+    ``git branch -D`` is not refused with "branch is checked out at
+    <worktree>". Each step swallows non-fatal failures (worktree already
+    gone, remote branch already deleted by ``gh``) so a quirk in one step
+    cannot mask a successful merge as a failure.
+    """
+    res = subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree)],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        log.warning(
+            "git worktree remove %s failed: %s",
+            worktree,
+            (res.stderr or res.stdout).strip(),
+        )
+
+    res = subprocess.run(
+        ["git", "branch", "-D", branch],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0 and "not found" not in (res.stderr + res.stdout).lower():
+        log.warning(
+            "git branch -D %s failed: %s",
+            branch,
+            (res.stderr or res.stdout).strip(),
+        )
+
+    res = subprocess.run(
+        ["git", "push", "origin", "--delete", branch],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        combined = (res.stderr + res.stdout).lower()
+        if "remote ref does not exist" not in combined:
+            log.warning(
+                "git push origin --delete %s failed: %s",
+                branch,
+                (res.stderr or res.stdout).strip(),
+            )
+
+
 def _satisfied_deps(tracked: list[Any]) -> list[Any]:
     """Filter trackedIssues output to ones closed-as-completed.
 
@@ -273,6 +326,11 @@ async def run_once(
                 )
             else:
                 if merged:
+                    _cleanup_after_merge(
+                        repo_path=repo_path,
+                        worktree=worktree,
+                        branch=branch,
+                    )
                     emit(
                         "merge",
                         {
@@ -405,6 +463,11 @@ async def run_once(
                         e,
                     )
                 if merged:
+                    _cleanup_after_merge(
+                        repo_path=repo_path,
+                        worktree=worktree,
+                        branch=branch,
+                    )
                     emit(
                         "merge",
                         {
@@ -480,6 +543,11 @@ async def run_once(
                     e,
                 )
         if merged and retry_pr is not None:
+            _cleanup_after_merge(
+                repo_path=repo_path,
+                worktree=worktree,
+                branch=branch,
+            )
             emit(
                 "merge",
                 {
