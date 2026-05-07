@@ -490,6 +490,43 @@ def test_no_resume_when_no_session_id():
 # ---- drive_review_loop ----
 
 
+@pytest.mark.asyncio
+async def test_drive_review_loop_stops_on_cancel_request(tmp_path):
+    cfg = SimpleNamespace(
+        repo=SimpleNamespace(path=tmp_path, default_branch="main"),
+        agent=SimpleNamespace(model="m", max_turns=1),
+    )
+    labels = []
+
+    async def should_not_sleep(seconds):
+        raise AssertionError("cancel should be checked before sleeping")
+
+    outcome = await drive_review_loop(
+        cfg=cfg,
+        issue_number=42,
+        pr_number=5,
+        branch="auto/42",
+        worktree=tmp_path,
+        initial_session_id="sess-A",
+        snapshot_fn=lambda **kw: (_ for _ in ()).throw(AssertionError("no poll")),
+        run_agent_fn=lambda *a, **kw: None,
+        render_review_prompt=lambda **kw: "",
+        push_fn=lambda *a, **kw: None,
+        head_sha_fn=lambda p: HEAD,
+        commits_to_push_fn=lambda *a, **kw: 0,
+        comment_pr_fn=lambda **kw: None,
+        label_issue_fn=lambda issue_number, label, *, repo_path: labels.append(
+            (issue_number, label, repo_path)
+        ),
+        cancel_requested_fn=lambda: True,
+        sleep_fn=should_not_sleep,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.AUTO_CANCELED
+    assert outcome.last_session_id == "sess-A"
+    assert labels == [(42, "auto-canceled", tmp_path)]
+
+
 def _snap(*, head_sha="head1", reviews=(), comments=(), reactions=(), checks=()) -> ReviewSnapshot:
     return ReviewSnapshot(
         head_sha=head_sha,

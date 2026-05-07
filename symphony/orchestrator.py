@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .cancel import is_issue_canceled
 from .config import Config
 from .events import EventLog
 from .github import (
@@ -196,6 +197,7 @@ def select_ready(
     state: OrchestratorState,
     has_open_pr: Callable[[int], bool],
     has_local_branch: Callable[[int], bool],
+    is_canceled: Callable[[int], bool] | None = None,
     latest_terminal_outcome: Callable[[int], str] | None = None,
     now: float,
 ) -> tuple[list[Issue], list[DispatchSkip]]:
@@ -212,6 +214,11 @@ def select_ready(
             continue
         if n in cycles_flat:
             skips.append(DispatchSkip(n, "auto-cycle"))
+            continue
+        if "auto-canceled" in issue.labels or (
+            is_canceled is not None and is_canceled(n)
+        ):
+            skips.append(DispatchSkip(n, "auto-canceled"))
             continue
         if state.is_in_backoff(n, now=now):
             skips.append(DispatchSkip(n, "retry-backoff"))
@@ -346,6 +353,7 @@ async def _dispatch_one(
     if outcome is not None and outcome.kind in {
         LoopOutcomeKind.APPROVED,
         LoopOutcomeKind.MERGE_UNAVAILABLE,
+        LoopOutcomeKind.AUTO_CANCELED,
     }:
         state.clear_retry(issue.number)
         return
@@ -382,6 +390,7 @@ async def run_tick(
     label_fn: Callable[[int, str], None],
     now_fn: Callable[[], float],
     run_once_fn: Callable[..., Awaitable[RunOnceResult]],
+    is_canceled_fn: Callable[[int], bool] | None = None,
     rate_limit_pause_s: float = RATE_LIMIT_PAUSE_S,
     event_log: EventLog | None = None,
 ) -> TickStats:
@@ -422,6 +431,7 @@ async def run_tick(
         state=state,
         has_open_pr=has_open_pr,
         has_local_branch=has_local_branch,
+        is_canceled=is_canceled_fn,
         latest_terminal_outcome=(
             event_log.latest_terminal_outcome if event_log is not None else None
         ),
@@ -484,6 +494,7 @@ async def run_forever(
     fetch_tracked_fn: Callable[[int], list[TrackedIssue]] | None = None,
     has_open_pr_fn: Callable[[int], bool] | None = None,
     has_local_branch_fn: Callable[[int], bool] | None = None,
+    is_canceled_fn: Callable[[int], bool] | None = None,
     label_fn: Callable[[int, str], None] | None = None,
     now_fn: Callable[[], float] | None = None,
     run_once_fn: Callable[..., Awaitable[RunOnceResult]] | None = None,
@@ -535,6 +546,8 @@ async def run_forever(
         has_local_branch_fn = lambda n: _branch_exists(  # noqa: E731
             cfg.repo.path, f"auto/{n}"
         )
+    if is_canceled_fn is None:
+        is_canceled_fn = lambda n: is_issue_canceled(cfg.repo.path, n)  # noqa: E731
     if run_once_fn is None:
         run_once_fn = run_once
 
@@ -548,6 +561,7 @@ async def run_forever(
                 fetch_tracked=fetch_tracked_fn,
                 has_open_pr=has_open_pr_fn,
                 has_local_branch=has_local_branch_fn,
+                is_canceled_fn=is_canceled_fn,
                 label_fn=label_fn,
                 now_fn=now_fn,
                 run_once_fn=run_once_fn,

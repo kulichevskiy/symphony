@@ -301,6 +301,7 @@ class LoopOutcomeKind(StrEnum):
     APPROVED = "approved"
     AUTO_STUCK_ROUNDS = "auto_stuck_rounds"
     AUTO_STUCK_IDLE = "auto_stuck_idle"
+    AUTO_CANCELED = "auto_canceled"
     AGENT_FAILED = "agent_failed"
     MERGE_FAILED = "merge_failed"
     MERGE_PENDING = "merge_pending"
@@ -372,6 +373,7 @@ async def drive_review_loop(
     commits_to_push_fn: Callable[[Path, str, str], int] | None = None,
     comment_pr_fn: Callable[..., None] | None = None,
     label_issue_fn: Callable[..., None] | None = None,
+    cancel_requested_fn: Callable[[], bool] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     now_fn: Callable[[], float] = None,  # type: ignore[assignment]
     event_log: EventLog | None = None,
@@ -442,8 +444,30 @@ async def drive_review_loop(
             payload=payload or {},
         )
 
+    def canceled(head_sha: str = "") -> LoopOutcome:
+        label_issue_fn(issue_number, "auto-canceled", repo_path=cfg.repo.path)
+        emit(
+            "auto-canceled",
+            {
+                "reason": "manual",
+                "rounds_used": rounds_used,
+                "head_sha": head_sha,
+                "outcome": LoopOutcomeKind.AUTO_CANCELED.value,
+            },
+        )
+        return LoopOutcome(
+            kind=LoopOutcomeKind.AUTO_CANCELED,
+            rounds_used=rounds_used,
+            last_session_id=session_id,
+            head_sha=head_sha,
+        )
+
     while True:
+        if cancel_requested_fn is not None and cancel_requested_fn():
+            return canceled(last_seen_head_sha)
         await sleep_fn(poll_interval_s)
+        if cancel_requested_fn is not None and cancel_requested_fn():
+            return canceled(last_seen_head_sha)
         snap = snapshot_fn(pr_number=pr_number, repo_path=cfg.repo.path)
         verdict = evaluate_verdict(
             head_sha=snap.head_sha,

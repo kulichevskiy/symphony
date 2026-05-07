@@ -22,6 +22,7 @@ from typing import Any
 from uuid import uuid4
 
 from .agent import run_agent
+from .cancel import is_issue_canceled
 from .config import Config, load_config
 from .events import EventLog
 from .github import (
@@ -180,6 +181,32 @@ async def run_once(
             payload=payload or {},
         )
 
+    def cancel_requested() -> bool:
+        return is_issue_canceled(repo_path, issue_number)
+
+    if cancel_requested():
+        emit(
+            "auto-canceled",
+            {
+                "reason": "manual",
+                "rounds_used": 0,
+                "outcome": LoopOutcomeKind.AUTO_CANCELED.value,
+            },
+        )
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=True,
+            skip_reason="auto-canceled",
+            worktree=None,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.AUTO_CANCELED,
+                rounds_used=0,
+                last_session_id=None,
+                head_sha="",
+            ),
+        )
+
     issue = view_issue(issue_number, repo_path=repo_path)
     tracked = tracked_issues(issue_number, repo_path=repo_path)
     deps = _satisfied_deps(tracked)
@@ -215,6 +242,7 @@ async def run_once(
             round_cap=cfg.orchestrator.review_round_cap,
             event_log=event_log,
             run_id=run_id,
+            cancel_requested_fn=cancel_requested,
         )
         if outcome.kind == LoopOutcomeKind.APPROVED:
             try:
@@ -569,6 +597,30 @@ async def run_once(
             skip_reason="agent-failed",
             worktree=worktree,
             agent_result=result,
+        )
+
+    if cancel_requested():
+        emit(
+            "auto-canceled",
+            {
+                "reason": "manual",
+                "head_sha": _head_sha(worktree),
+                "rounds_used": 0,
+                "outcome": LoopOutcomeKind.AUTO_CANCELED.value,
+            },
+        )
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=True,
+            skip_reason="auto-canceled",
+            worktree=worktree,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.AUTO_CANCELED,
+                rounds_used=0,
+                last_session_id=result.session_id,
+                head_sha=_head_sha(worktree),
+            ),
         )
 
     head_after = _head_sha(worktree)

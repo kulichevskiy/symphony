@@ -9,11 +9,14 @@ verbatim — no history is dropped.
 
 from __future__ import annotations
 
+import logging
+import os
 import re
 import subprocess
 from pathlib import Path
 
 _VALID_CHAR = re.compile(r"[A-Za-z0-9._\-]")
+log = logging.getLogger(__name__)
 
 
 class WorkspaceError(Exception):
@@ -145,6 +148,23 @@ def _branch_checked_out(repo_path: Path, branch: str) -> bool:
     return f"branch refs/heads/{branch}" in res.stdout.splitlines()
 
 
+def _run_after_create_hook(repo_path: Path, worktree: Path) -> None:
+    hook = repo_path / ".symphony" / "hooks" / "after_create.sh"
+    if not hook.is_file() or not os.access(hook, os.X_OK):
+        return
+    res = subprocess.run(
+        [str(hook), str(worktree)],
+        cwd=repo_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode != 0:
+        message = res.stderr.strip() or res.stdout.strip() or f"exit {res.returncode}"
+        log.error("after_create hook failed for %s: %s", worktree, message)
+        raise WorkspaceError(f"after_create hook failed: {message}")
+
+
 def ensure_worktree(
     *,
     repo_path: Path,
@@ -175,6 +195,7 @@ def ensure_worktree(
     has_branch = _branch_exists(repo_path, branch)
     has_remote_branch = _remote_branch_exists(repo_path, branch)
     has_worktree = target.is_dir() and _worktree_exists(repo_path, target)
+    created_worktree = False
 
     # When both local and remote `auto/<n>` exist, fast-forward the local
     # branch to the remote tip if it's strictly behind. Without this, a
@@ -243,6 +264,7 @@ def ensure_worktree(
                     ["worktree", "add", "-b", branch, str(target), base_ref],
                     cwd=repo_path,
                 )
+            created_worktree = True
         except subprocess.CalledProcessError as e:
             raise WorkspaceError(
                 f"git worktree add failed: {e.stderr.strip() if e.stderr else e}"
@@ -252,5 +274,8 @@ def ensure_worktree(
     # next dispatch even on a reused worktree. Local config wins over global.
     _run_git(["config", "--local", "user.name", author_name], cwd=target)
     _run_git(["config", "--local", "user.email", author_email], cwd=target)
+
+    if created_worktree:
+        _run_after_create_hook(repo_path, target)
 
     return target
