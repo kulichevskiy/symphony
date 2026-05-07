@@ -456,10 +456,13 @@ def test_merge_pr_matches_reviewed_head(monkeypatch, tmp_path):
         "merge",
         "12",
         "--squash",
-        "--delete-branch",
         "--match-head-commit",
         "abc123",
     ]
+    # --delete-branch is intentionally NOT passed: it runs `git branch -d
+    # auto/<n>` against the local clone, which fails when the branch is still
+    # checked out in the per-issue worktree. Symphony does cleanup itself.
+    assert "--delete-branch" not in fake.calls[0]
 
 
 def test_get_pr_head_sha(monkeypatch, tmp_path):

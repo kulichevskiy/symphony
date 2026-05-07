@@ -184,6 +184,11 @@ def _patch_happy_path(
         ro_mod, "merge_pr", lambda **kw: calls.setdefault("merge_pr", kw)
     )
     monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: True)
+    monkeypatch.setattr(
+        ro_mod,
+        "_cleanup_after_merge",
+        lambda **kw: calls.setdefault("cleanup_after_merge", kw),
+    )
 
     # Stub the review loop so existing tests don't have to thread its inputs.
     from symphony.reviewer import LoopOutcome, LoopOutcomeKind
@@ -298,6 +303,128 @@ async def test_run_once_writes_event_log(monkeypatch, tmp_path):
     pr_event = [e for e in event_log.iter_events(issue_number=3) if e.kind == "pr-open"][0]
     assert pr_event.payload["number"] == 99
     assert pr_event.payload["reused"] is False
+
+
+@pytest.mark.asyncio
+async def test_run_once_cleans_up_worktree_and_branches_after_successful_merge(
+    monkeypatch, tmp_path
+):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    calls = fixture["calls"]
+
+    order: list[str] = []
+
+    def _record_merge(**kw):
+        order.append("merge_pr")
+        calls["merge_pr"] = kw
+
+    def _record_cleanup(**kw):
+        order.append("cleanup")
+        calls["cleanup_after_merge"] = kw
+
+    monkeypatch.setattr(ro_mod, "merge_pr", _record_merge)
+    monkeypatch.setattr(ro_mod, "_cleanup_after_merge", _record_cleanup)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.kind.value == "approved"
+    assert order == ["merge_pr", "cleanup"]
+    assert calls["cleanup_after_merge"] == {
+        "repo_path": fixture["cfg"].repo.path,
+        "worktree": fixture["wt"],
+        "branch": "auto/3",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_cleanup_when_merge_pending(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    monkeypatch.setattr(ro_mod, "is_pr_merged", lambda **kw: False)
+
+    await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert "cleanup_after_merge" not in fixture["calls"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_cleanup_when_merge_fails(monkeypatch, tmp_path):
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+
+    def _fail_merge(**kw):
+        fixture["calls"]["merge_pr"] = kw
+        raise GithubError("blocked")
+
+    monkeypatch.setattr(ro_mod, "merge_pr", _fail_merge)
+
+    await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert "cleanup_after_merge" not in fixture["calls"]
+
+
+def test_cleanup_after_merge_removes_worktree_before_branch(monkeypatch, tmp_path):
+    """The whole reason this helper exists: `git branch -D` refuses to delete
+    a branch that's still checked out in a worktree, so the worktree teardown
+    has to come first. Regressing the order would resurrect the original bug.
+    """
+    import subprocess as sp
+
+    invocations: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        invocations.append(list(cmd))
+        return _Result()
+
+    monkeypatch.setattr(sp, "run", _fake_run)
+    monkeypatch.setattr(ro_mod.subprocess, "run", _fake_run)
+
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "wts" / "symphony-3"
+    ro_mod._cleanup_after_merge(
+        repo_path=repo,
+        worktree=worktree,
+        branch="auto/3",
+    )
+
+    actions = [cmd[1] if len(cmd) > 1 else cmd[0] for cmd in invocations]
+    assert actions == ["worktree", "branch", "push"]
+    assert invocations[0] == [
+        "git",
+        "worktree",
+        "remove",
+        "--force",
+        str(worktree),
+    ]
+    assert invocations[1] == ["git", "branch", "-D", "auto/3"]
+    assert invocations[2] == ["git", "push", "origin", "--delete", "auto/3"]
+
+
+def test_cleanup_after_merge_warns_but_does_not_raise_on_failure(
+    monkeypatch, tmp_path, caplog
+):
+    class _FailResult:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    def _fake_run(cmd, **kwargs):
+        return _FailResult()
+
+    monkeypatch.setattr(ro_mod.subprocess, "run", _fake_run)
+
+    caplog.set_level("WARNING", logger=ro_mod.log.name)
+    ro_mod._cleanup_after_merge(
+        repo_path=tmp_path,
+        worktree=tmp_path / "wt",
+        branch="auto/3",
+    )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("git worktree remove" in m for m in messages)
 
 
 @pytest.mark.asyncio
