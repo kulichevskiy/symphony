@@ -62,7 +62,7 @@ def find_gc_candidates(
         issue_number = int(match.group(1))
         if issue_number not in stuck_issues:
             continue
-        age_s = max(0.0, now_ts - path.stat().st_mtime)
+        age_s = max(0.0, now_ts - _latest_activity_mtime(path))
         if age_s < min_age_s:
             continue
         candidates.append(
@@ -74,6 +74,16 @@ def find_gc_candidates(
             )
         )
     return sorted(candidates, key=lambda c: c.issue_number)
+
+
+def _latest_activity_mtime(path: Path) -> float:
+    latest = path.stat().st_mtime
+    for child in path.rglob("*"):
+        try:
+            latest = max(latest, child.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
 
 
 def remove_gc_candidate(cfg: Config, candidate: GcCandidate) -> None:

@@ -15,6 +15,7 @@ from .config import Config
 from .github import GithubError, _run_gh, name_with_owner
 
 REQUIRED_LABELS = ("auto", "auto-stuck", "auto-cycle", "auto-canceled")
+CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 
 
 @dataclass(frozen=True)
@@ -120,23 +121,33 @@ def _branch_protection_result(
 def _codex_app_result(
     *, owner: str, name: str, repo_path: Path, gh_runner: GhRunner
 ) -> PreflightResult:
+    # GitHub's `/repos/{owner}/{repo}/installation` endpoint is authenticated
+    # as a GitHub App/JWT, not as the normal user token `gh auth login`
+    # provides. Probe the Codex bot account instead so preflight remains
+    # compatible with the same token model Symphony uses for all other calls.
     try:
-        _json_from_gh(
-            ["api", f"/repos/{owner}/{name}/installation"],
+        data = _json_from_gh(
+            ["api", "users/chatgpt-codex-connector%5Bbot%5D"],
             repo_path=repo_path,
             gh_runner=gh_runner,
-            context="repository app installation",
+            context="Codex bot account",
         )
     except GithubError as e:
         return PreflightResult(
             "Codex GitHub App",
             False,
-            f"repository installation check failed: {e}",
+            f"could not reach Codex bot account: {e}",
+        )
+    if data.get("login") != CODEX_BOT_LOGIN or data.get("type") != "Bot":
+        return PreflightResult(
+            "Codex GitHub App",
+            False,
+            f"unexpected Codex bot account payload: {data!r}",
         )
     return PreflightResult(
         "Codex GitHub App",
         True,
-        "repository GitHub App installation is reachable",
+        "Codex bot account is reachable with the gh user token",
     )
 
 
