@@ -44,11 +44,13 @@ def test_help_lists_run():
     # The long-running orchestrator command, distinct from `run-once` /
     # `agent-run`. Strip ANSI so the assertion survives rich/typer table
     # rendering on terminals of different widths (CI vs local), then
-    # match only at a command-cell position — start of line, optionally
-    # behind the table's leading `│ ` — so prose mentions of `run` in
-    # other commands' help text don't satisfy the assertion.
+    # match the command-cell position exactly: rich emits the command
+    # name as `│ <name>` with a single space, while wrapped help text
+    # for other commands uses multiple spaces of indentation. Matching
+    # the single-space form means a wrapped `agent run → PR` snippet
+    # in `run-once`'s description cannot satisfy this assertion.
     clean = _strip_ansi(result.output)
-    assert re.search(r"(?m)^(?:│\s+)?run(?:\s|$)", clean)
+    assert re.search(r"(?m)^│ run(?:\s|$)", clean)
 
 
 def test_help_lists_status_and_logs():
