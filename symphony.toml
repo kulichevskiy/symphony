@@ -1,0 +1,27 @@
+# Starter Symphony configuration. Edit values before running against a real repo.
+
+[repo]
+path = "."
+default_branch = "main"
+
+[github]
+label = "auto"
+
+[git]
+author_name = "Symphony"
+author_email = "alexey.kulichevskiy+symphony@adjust.com"
+
+[orchestrator]
+poll_interval_s = 60
+max_concurrent = 3
+review_round_cap = 10
+codex_renudge_after_min = 10
+codex_giveup_after_min = 30
+
+[agent]
+model = "claude-opus-4-7"
+max_turns = 50
+
+[paths]
+worktree_root = ".symphony/worktrees"
+prompts_dir = "./prompts"
