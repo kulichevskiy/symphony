@@ -1,7 +1,14 @@
 import json
+import re
 from types import SimpleNamespace
 
 from typer.testing import CliRunner
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 from symphony import __version__
 from symphony.cli import app
@@ -34,8 +41,11 @@ def test_help_lists_run_once():
 def test_help_lists_run():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    # The long-running orchestrator command, distinct from `run-once`.
-    assert "\n run " in result.output or "│ run " in result.output
+    # The long-running orchestrator command, distinct from `run-once` /
+    # `agent-run`. Strip ANSI so the assertion survives rich/typer table
+    # rendering on terminals of different widths (CI vs local).
+    clean = _strip_ansi(result.output)
+    assert re.search(r"(?<![-\w])run(?![-\w])", clean)
 
 
 def test_help_lists_status_and_logs():
