@@ -15,7 +15,7 @@ from .config import Config
 from .github import GithubError, _run_gh, name_with_owner
 
 REQUIRED_LABELS = ("auto", "auto-stuck", "auto-cycle", "auto-canceled")
-CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+CODEX_APP_SLUGS = {"chatgpt-codex-connector", "codex"}
 
 
 @dataclass(frozen=True)
@@ -121,33 +121,32 @@ def _branch_protection_result(
 def _codex_app_result(
     *, owner: str, name: str, repo_path: Path, gh_runner: GhRunner
 ) -> PreflightResult:
-    # GitHub's `/repos/{owner}/{repo}/installation` endpoint is authenticated
-    # as a GitHub App/JWT, not as the normal user token `gh auth login`
-    # provides. Probe the Codex bot account instead so preflight remains
-    # compatible with the same token model Symphony uses for all other calls.
     try:
         data = _json_from_gh(
-            ["api", "users/chatgpt-codex-connector%5Bbot%5D"],
+            ["api", f"/repos/{owner}/{name}/installation"],
             repo_path=repo_path,
             gh_runner=gh_runner,
-            context="Codex bot account",
+            context="repository GitHub App installation",
         )
     except GithubError as e:
         return PreflightResult(
             "Codex GitHub App",
             False,
-            f"could not reach Codex bot account: {e}",
+            "could not verify repository GitHub App installation. "
+            "This endpoint requires an authenticated GitHub App/JWT token: "
+            f"{e}",
         )
-    if data.get("login") != CODEX_BOT_LOGIN or data.get("type") != "Bot":
+    app_slug = str(data.get("app_slug") or "")
+    if app_slug and app_slug not in CODEX_APP_SLUGS:
         return PreflightResult(
             "Codex GitHub App",
             False,
-            f"unexpected Codex bot account payload: {data!r}",
+            f"repository installation is for unexpected app_slug {app_slug!r}",
         )
     return PreflightResult(
         "Codex GitHub App",
         True,
-        "Codex bot account is reachable with the gh user token",
+        "repository Codex GitHub App installation is reachable",
     )
 
 

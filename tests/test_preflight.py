@@ -35,10 +35,8 @@ def test_preflight_collects_successes(monkeypatch, tmp_path):
                     "required_pull_request_reviews": None,
                 }
             )
-        if args[1] == "users/chatgpt-codex-connector%5Bbot%5D":
-            return json.dumps(
-                {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
-            )
+        if args[1] == "/repos/owner/repo/installation":
+            return json.dumps({"app_slug": "chatgpt-codex-connector"})
         if "labels" in args[1]:
             return json.dumps(
                 [[{"name": "auto"}, {"name": "auto-stuck"}], [{"name": "auto-cycle"}, {"name": "auto-canceled"}]]
@@ -70,10 +68,8 @@ def test_preflight_reports_actionable_failures(monkeypatch, tmp_path):
                     "required_pull_request_reviews": None,
                 }
             )
-        if args[1] == "users/chatgpt-codex-connector%5Bbot%5D":
-            return json.dumps(
-                {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}
-            )
+        if args[1] == "/repos/owner/repo/installation":
+            return json.dumps({"app_slug": "chatgpt-codex-connector"})
         if "labels" in args[1]:
             return json.dumps([[{"name": "auto"}]])
         raise AssertionError(args)

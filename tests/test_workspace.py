@@ -154,6 +154,7 @@ def test_ensure_worktree_runs_after_create_hook(tmp_path):
 
 def test_ensure_worktree_after_create_hook_failure_aborts(tmp_path):
     repo, _bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
     hook_dir = repo / ".symphony" / "hooks"
     hook_dir.mkdir(parents=True)
     hook = hook_dir / "after_create.sh"
@@ -163,13 +164,61 @@ def test_ensure_worktree_after_create_hook_failure_aborts(tmp_path):
     with pytest.raises(WorkspaceError, match="hook nope"):
         ensure_worktree(
             repo_path=repo,
-            worktree_root=tmp_path / "wts",
+            worktree_root=wt_root,
             repo_name="symphony",
             issue_number=42,
             base_branch="main",
             author_name="Symphony",
             author_email="sym@example.com",
         )
+    assert not (wt_root / "symphony-42").exists()
+
+
+def test_ensure_worktree_after_create_hook_failure_reruns_on_retry(tmp_path):
+    repo, _bare = _init_origin_repo(tmp_path)
+    wt_root = tmp_path / "wts"
+    hook_dir = repo / ".symphony" / "hooks"
+    hook_dir.mkdir(parents=True)
+    hook = hook_dir / "after_create.sh"
+    marker = tmp_path / "hook-attempts"
+    hook.write_text(
+        f"""#!/bin/sh
+count=0
+if [ -f "{marker}" ]; then
+  count=$(cat "{marker}")
+fi
+count=$((count + 1))
+echo "$count" > "{marker}"
+if [ "$count" -eq 1 ]; then
+  exit 7
+fi
+"""
+    )
+    hook.chmod(0o755)
+
+    with pytest.raises(WorkspaceError):
+        ensure_worktree(
+            repo_path=repo,
+            worktree_root=wt_root,
+            repo_name="symphony",
+            issue_number=42,
+            base_branch="main",
+            author_name="Symphony",
+            author_email="sym@example.com",
+        )
+
+    wt = ensure_worktree(
+        repo_path=repo,
+        worktree_root=wt_root,
+        repo_name="symphony",
+        issue_number=42,
+        base_branch="main",
+        author_name="Symphony",
+        author_email="sym@example.com",
+    )
+
+    assert wt.exists()
+    assert marker.read_text().strip() == "2"
 
 
 def test_ensure_worktree_reuses_existing_with_history(tmp_path):

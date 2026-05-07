@@ -276,6 +276,15 @@ def ensure_worktree(
     _run_git(["config", "--local", "user.email", author_email], cwd=target)
 
     if created_worktree:
-        _run_after_create_hook(repo_path, target)
+        try:
+            _run_after_create_hook(repo_path, target)
+        except WorkspaceError:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(target)],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+            )
+            raise
 
     return target
