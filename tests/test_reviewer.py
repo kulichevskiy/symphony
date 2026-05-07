@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from symphony.github import CheckRun, Reaction, Review, ReviewComment
+from symphony.events import EventLog
 from symphony.reviewer import (
     CODEX_BOT_LOGIN,
     LoopOutcomeKind,
@@ -51,8 +52,14 @@ def _reaction(*, who, content="+1", at) -> Reaction:
     return Reaction(user_login=who, content=content, created_at=at)
 
 
-def _check(*, name="ci", conclusion=None, status="completed") -> CheckRun:
-    return CheckRun(name=name, status=status, conclusion=conclusion, details_url=None)
+def _check(*, name="ci", conclusion=None, status="completed", required=True) -> CheckRun:
+    return CheckRun(
+        name=name,
+        status=status,
+        conclusion=conclusion,
+        details_url=None,
+        required=required,
+    )
 
 
 def _eval(**overrides):
@@ -135,12 +142,64 @@ def test_in_progress_check_is_not_failure():
     assert v.kind == VerdictKind.PENDING
 
 
+def test_unknown_failing_check_is_changes_requested():
+    v = _eval(checks=[_check(name="test", conclusion="failure", required=None)])
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.ci_failures[0].name == "test"
+
+
+def test_pending_check_blocks_codex_approval_reaction():
+    v = _eval(
+        checks=[_check(name="test", status="in_progress", conclusion=None)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_optional_pending_check_does_not_block_codex_approval_reaction():
+    v = _eval(
+        checks=[
+            _check(
+                name="deploy",
+                status="in_progress",
+                conclusion=None,
+                required=False,
+            )
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_unknown_pending_check_does_not_block_codex_approval_reaction():
+    v = _eval(
+        checks=[
+            _check(
+                name="deploy",
+                status="in_progress",
+                conclusion=None,
+                required=None,
+            )
+        ],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
 def test_failing_ci_takes_priority_over_codex_approval_reaction():
     v = _eval(
         checks=[_check(name="test", conclusion="failure")],
         reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
     )
     assert v.kind == VerdictKind.CHANGES_REQUESTED
+
+
+def test_optional_failing_check_does_not_block_codex_approval_reaction():
+    v = _eval(
+        checks=[_check(name="deploy", conclusion="failure", required=False)],
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+    )
+    assert v.kind == VerdictKind.APPROVED
 
 
 # ---- approved ----
@@ -173,6 +232,14 @@ def test_codex_plus_one_with_fresh_changes_requested_is_changes_requested():
 def test_human_approved_review_wins():
     v = _eval(reviews=[_review(who="alice", state="APPROVED", body="lgtm")])
     assert v.kind == VerdictKind.APPROVED
+
+
+def test_pending_check_blocks_human_approved_review():
+    v = _eval(
+        checks=[_check(name="test", status="queued", conclusion=None)],
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+    )
+    assert v.kind == VerdictKind.PENDING
 
 
 def test_non_plus_one_reaction_does_not_approve():
@@ -461,3 +528,100 @@ async def test_loop_returns_agent_failed_on_subprocess_failure(tmp_path):
     # No push or comment after a failed agent run.
     assert driver.calls["push"] == []
     assert driver.calls["comment_pr"] == []
+
+
+@pytest.mark.asyncio
+async def test_loop_emits_review_events(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    event_log = EventLog.for_repo(tmp_path)
+    driver = _Driver([_changes_snap("head1"), _approved_snap("head2")])
+
+    outcome = await _spawn_loop(driver, cfg, event_log=event_log, run_id="run-4")
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    kinds = [e.kind for e in event_log.iter_events(issue_number=4)]
+    assert "review-fresh" in kinds
+    assert "review-verdict" in kinds
+    assert "agent-start" in kinds
+    assert "agent-exit" in kinds
+    assert "push" in kinds
+    replay = event_log.replay_review(4)
+    assert replay.rounds_used == 1
+    assert replay.last_review_verdict == "approved"
+
+
+@pytest.mark.asyncio
+async def test_loop_replays_review_rounds_on_restart(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    event_log = EventLog.for_repo(tmp_path)
+    for round_no in (1, 2, 3):
+        event_log.emit(
+            "agent-exit",
+            issue_number=4,
+            run_id="old-run",
+            payload={"phase": "review", "round": round_no, "success": True},
+            ts=round_no,
+        )
+    event_log.emit(
+        "review-verdict",
+        issue_number=4,
+        run_id="old-run",
+        payload={"head_sha": "head3", "verdict": "changes_requested", "round": 3},
+        ts=4,
+    )
+    driver = _Driver([_changes_snap("head3"), _approved_snap("head2")])
+
+    outcome = await _spawn_loop(driver, cfg, event_log=event_log, run_id="new-run")
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert outcome.rounds_used == 4
+    # The restored round counter starts at 3, so the next remediation is round 4
+    # and must run fresh instead of resuming the original session.
+    assert driver.calls["agent_resume"] == [None]
+    assert event_log.replay_review(4).rounds_used == 4
+
+
+@pytest.mark.asyncio
+async def test_loop_resets_replayed_rounds_when_current_head_changes(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    event_log = EventLog.for_repo(tmp_path)
+    event_log.emit(
+        "review-verdict",
+        issue_number=4,
+        run_id="old-run",
+        payload={"head_sha": "old-sha", "verdict": "changes_requested", "round": 10},
+        ts=1,
+    )
+    event_log.emit(
+        "agent-exit",
+        issue_number=4,
+        run_id="old-run",
+        payload={"phase": "review", "round": 10, "success": True},
+        ts=2,
+    )
+    event_log.emit(
+        "run-terminal",
+        issue_number=4,
+        run_id="old-run",
+        payload={
+            "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+            "rounds_used": 10,
+            "head_sha": "old-sha",
+        },
+        ts=3,
+    )
+    driver = _Driver([_changes_snap("new-sha"), _approved_snap("head2")])
+
+    outcome = await _spawn_loop(
+        driver,
+        cfg,
+        event_log=event_log,
+        run_id="new-run",
+        round_cap=10,
+    )
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert outcome.rounds_used == 1
+    assert driver.calls["agent_resume"] == ["sess-A"]
+    assert driver.calls["label_issue"] == []
+    assert event_log.replay_review(4).rounds_used == 1

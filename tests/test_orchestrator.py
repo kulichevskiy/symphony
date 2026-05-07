@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from symphony.events import EventLog
 from symphony.github import Issue, IssueComment, TrackedIssue
 from symphony.orchestrator import (
     DispatchSkip,
@@ -180,6 +181,7 @@ def _ready(
     cycles_flat=None,
     open_prs=None,
     local_branches=None,
+    latest_terminal_outcome=None,
     now=0.0,
 ):
     state = state or OrchestratorState()
@@ -193,6 +195,7 @@ def _ready(
         state=state,
         has_open_pr=lambda n: n in open_prs,
         has_local_branch=lambda n: n in local_branches,
+        latest_terminal_outcome=latest_terminal_outcome,
         now=now,
     )
 
@@ -273,6 +276,82 @@ def test_select_ready_includes_after_backoff_expires():
     a = _issue(1)
     ready, _ = _ready([a], {1: []}, state=state, now=15.0)
     assert [i.number for i in ready] == [1]
+
+
+def test_select_ready_skips_expired_non_merge_retry_with_open_pr():
+    state = OrchestratorState()
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.AUTO_STUCK_ROUNDS.value,
+    )
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, open_prs={1}, now=15.0)
+    assert ready == []
+    assert skips == [DispatchSkip(1, "open-pr-exists")]
+
+
+def test_select_ready_allows_expired_merge_retry_with_open_pr():
+    state = OrchestratorState()
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.MERGE_PENDING.value,
+    )
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, open_prs={1}, now=15.0)
+    assert [i.number for i in ready] == [1]
+    assert skips == []
+
+
+def test_select_ready_skips_expired_non_merge_retry_with_local_branch():
+    state = OrchestratorState()
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.AUTO_STUCK_IDLE.value,
+    )
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, local_branches={1}, now=15.0)
+    assert ready == []
+    assert skips == [DispatchSkip(1, "local-branch-exists")]
+
+
+def test_select_ready_allows_expired_merge_retry_with_local_branch():
+    state = OrchestratorState()
+    state.schedule_retry(
+        1,
+        now=0.0,
+        reason=LoopOutcomeKind.MERGE_FAILED.value,
+    )
+    a = _issue(1)
+    ready, skips = _ready([a], {1: []}, state=state, local_branches={1}, now=15.0)
+    assert [i.number for i in ready] == [1]
+    assert skips == []
+
+
+def test_select_ready_allows_persisted_merge_retry_with_open_pr_after_restart():
+    a = _issue(1)
+    ready, skips = _ready(
+        [a],
+        {1: []},
+        open_prs={1},
+        latest_terminal_outcome=lambda n: LoopOutcomeKind.MERGE_PENDING.value,
+    )
+    assert [i.number for i in ready] == [1]
+    assert skips == []
+
+
+def test_select_ready_skips_persisted_non_merge_terminal_with_open_pr():
+    a = _issue(1)
+    ready, skips = _ready(
+        [a],
+        {1: []},
+        open_prs={1},
+        latest_terminal_outcome=lambda n: LoopOutcomeKind.AUTO_STUCK_IDLE.value,
+    )
+    assert ready == []
+    assert skips == [DispatchSkip(1, "open-pr-exists")]
 
 
 # ---- run_tick driver ----
@@ -421,6 +500,191 @@ async def test_run_tick_schedules_retry_on_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_tick_retries_merge_failure_outcome(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=tmp_path,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_FAILED,
+                rounds_used=0,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 100.0,
+        run_once_fn=fake_run_once,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert state.retry_queue[1].attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_run_tick_retries_merge_pending_outcome(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=tmp_path,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_PENDING,
+                rounds_used=0,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert state.retry_queue[1].attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_run_tick_recovers_persisted_merge_retry_after_restart(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    event_log = EventLog.for_repo(tmp_path)
+    event_log.emit(
+        "run-terminal",
+        issue_number=1,
+        payload={
+            "outcome": LoopOutcomeKind.MERGE_PENDING.value,
+            "rounds_used": 1,
+        },
+    )
+    dispatched: list[int] = []
+
+    async def fake_run_once(*, issue_number, config_path):
+        dispatched.append(issue_number)
+        return _approved_result()
+
+    stats = await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: True,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        event_log=event_log,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert stats.dispatched == 1
+    assert dispatched == [1]
+
+
+@pytest.mark.asyncio
+async def test_run_tick_does_not_retry_merge_unavailable_outcome(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=tmp_path,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.MERGE_UNAVAILABLE,
+                rounds_used=0,
+                last_session_id=None,
+                head_sha="h",
+            ),
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert 1 not in state.retry_queue
+
+
+@pytest.mark.asyncio
+async def test_run_tick_emits_dispatch_and_retry_events(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    event_log = EventLog.for_repo(tmp_path)
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=True,
+            skip_reason="empty-diff",
+            worktree=tmp_path,
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        event_log=event_log,
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    kinds = [e.kind for e in event_log.iter_events(issue_number=1)]
+    assert kinds == ["dispatch", "retry-scheduled"]
+    assert event_log.iter_events(issue_number=1)[1].payload["reason"] == "empty-diff"
+
+
+@pytest.mark.asyncio
 async def test_run_tick_pauses_dispatch_on_agent_rate_limit(tmp_path):
     """A 429/usage-limit failure surfaced via ``RunOnceResult.agent_result``
     must trip ``state.pause(...)`` so the next tick is suspended."""
@@ -467,6 +731,70 @@ async def test_run_tick_pauses_dispatch_on_agent_rate_limit(tmp_path):
         await asyncio.sleep(0)
     assert state.paused_until == 600.0
     assert 1 in state.retry_queue
+
+
+@pytest.mark.asyncio
+async def test_run_tick_emits_paused_and_resumed_events(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    state = OrchestratorState()
+    event_log = EventLog.for_repo(tmp_path)
+    rate_limited_agent = AgentResult(
+        session_id="s",
+        exit_code=1,
+        success=False,
+        is_error=True,
+        duration_ms=1,
+        num_turns=1,
+        total_cost_usd=0.0,
+        final_text="429",
+        raw_events=[],
+        stderr="",
+    )
+
+    async def fake_run_once(**kw):
+        return RunOnceResult(
+            issue_number=1,
+            pr=None,
+            skipped=True,
+            skip_reason="agent-failed",
+            worktree=tmp_path,
+            agent_result=rate_limited_agent,
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+        rate_limit_pause_s=600.0,
+        event_log=event_log,
+    )
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 601.0,
+        run_once_fn=fake_run_once,
+        event_log=event_log,
+    )
+
+    kinds = [e.kind for e in event_log.iter_events()]
+    assert "paused" in kinds
+    assert "resumed" in kinds
 
 
 @pytest.mark.asyncio
