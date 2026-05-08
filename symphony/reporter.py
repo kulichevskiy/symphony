@@ -30,6 +30,7 @@ _KIND_MIN_VERBOSITY: dict[str, int] = {
     "resumed": 0,
     "auto-cycle": 0,
     "auto-canceled": 0,
+    "auto-stuck": 0,
     "retry-fired": 0,
     "retry-scheduled": 1,
     "push": 1,
@@ -159,6 +160,13 @@ class TerminalReporter:
         elif kind == "auto-canceled":
             reason = payload.get("reason", "")
             self._stream.write(f"⊘ canceled #{issue_number} (reason={reason})\n")
+        elif kind == "auto-stuck":
+            reason = payload.get("reason", "")
+            rounds = payload.get("rounds_used")
+            rounds_part = f" after {rounds} rounds" if rounds is not None else ""
+            self._stream.write(
+                f"⏸ auto-stuck #{issue_number} (reason={reason}){rounds_part}\n"
+            )
         elif kind == "pr-open":
             pr_number = payload.get("number")
             reused = payload.get("reused")

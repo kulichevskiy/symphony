@@ -225,6 +225,45 @@ def test_pr_open_renders_pr_number_and_branch():
     assert "PR #57" in output
 
 
+def test_auto_stuck_round_cap_renders_reason_and_rounds():
+    stream = io.StringIO()
+    reporter = TerminalReporter(stream=stream)
+    reporter.event(
+        "auto-stuck",
+        issue_number=42,
+        payload={
+            "reason": "round-cap",
+            "rounds_used": 10,
+            "head_sha": "abc1234",
+            "outcome": "auto_stuck_rounds",
+        },
+    )
+    output = stream.getvalue()
+    assert "#42" in output
+    assert "stuck" in output.lower()
+    assert "round-cap" in output
+    assert "10" in output
+
+
+def test_auto_stuck_idle_renders_idle_reason():
+    stream = io.StringIO()
+    reporter = TerminalReporter(stream=stream)
+    reporter.event(
+        "auto-stuck",
+        issue_number=42,
+        payload={
+            "reason": "idle",
+            "rounds_used": 3,
+            "head_sha": "abc1234",
+            "outcome": "auto_stuck_idle",
+        },
+    )
+    output = stream.getvalue()
+    assert "#42" in output
+    assert "stuck" in output.lower()
+    assert "idle" in output.lower()
+
+
 def test_auto_canceled_renders_reason():
     stream = io.StringIO()
     reporter = TerminalReporter(stream=stream)
