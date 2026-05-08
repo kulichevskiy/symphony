@@ -56,7 +56,11 @@ class TerminalReporter:
         self._json_mode = json_mode
         self._now = now_fn
         self._heartbeat_interval_s = heartbeat_interval_s
-        self._last_activity_at = now_fn()
+        # Start the timer one full interval in the past so the first
+        # maybe_heartbeat call fires immediately. Otherwise the user stares
+        # at a silent terminal for 5 minutes after `symphony run` starts —
+        # the original problem we set out to fix.
+        self._last_activity_at = now_fn() - heartbeat_interval_s
 
     def event(
         self,
