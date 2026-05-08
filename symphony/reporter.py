@@ -78,6 +78,11 @@ class TerminalReporter:
         self._emit_human(kind, issue_number=issue_number, payload=payload)
 
     def maybe_heartbeat(self, snapshot: TickSnapshot) -> None:
+        # Heartbeat is gated by verbosity at the default tier — `--quiet`
+        # (verbosity < 0) suppresses periodic idle output the same way it
+        # suppresses default-tier events.
+        if self._verbosity < 0:
+            return
         now = self._now()
         if now - self._last_activity_at < self._heartbeat_interval_s:
             return

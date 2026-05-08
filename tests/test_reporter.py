@@ -100,6 +100,23 @@ def test_filtered_event_still_resets_heartbeat_timer():
     assert "idle" in stream.getvalue().lower()
 
 
+def test_heartbeat_suppressed_in_quiet_mode():
+    stream = io.StringIO()
+    clock = [1000.0]
+    reporter = TerminalReporter(
+        stream=stream,
+        verbosity=-1,
+        now_fn=lambda: clock[0],
+        heartbeat_interval_s=300.0,
+    )
+
+    snap = TickSnapshot(candidates=5, ready=0, running=2, skips=[])
+    clock[0] = 1301.0
+    reporter.maybe_heartbeat(snap)
+
+    assert stream.getvalue() == ""
+
+
 def test_heartbeat_in_json_mode_emits_heartbeat_kind():
     stream = io.StringIO()
     clock = [1000.0]
