@@ -488,12 +488,15 @@ async def run_tick(
         state.dispatch_tasks.add(task)
         task.add_done_callback(state.dispatch_tasks.discard)
 
+    # Just-dispatched issues are folded in: state.running.add() happens inside
+    # _dispatch_one, which doesn't run until the next event-loop iteration, so
+    # without this the snapshot under-reports active work on dispatch ticks.
     return TickStats(
         candidates=len(candidates),
         dispatched=len(to_dispatch),
         skips=skips,
         ready=len(ready),
-        running=len(state.running),
+        running=len(state.running) + len(to_dispatch),
     )
 
 
@@ -524,15 +527,17 @@ async def run_forever(
     state = state if state is not None else OrchestratorState()
     shutdown_event = shutdown_event or asyncio.Event()
     if event_log is None:
-        # When a reporter is attached, route every emit through it so the
-        # terminal sees the same events that go to events.db.
-        on_emit = None
-        if reporter is not None:
-            def on_emit(ev: "Event") -> None:  # type: ignore[no-redef]
-                reporter.event(
-                    ev.kind, issue_number=ev.issue_number, payload=ev.payload
-                )
-        event_log = EventLog.for_repo(cfg.repo.path, on_emit=on_emit)
+        event_log = EventLog.for_repo(cfg.repo.path)
+    if reporter is not None:
+        # Route every emit through the reporter so the terminal sees the same
+        # events that go to events.db. Works for both freshly-constructed and
+        # injected event_log instances.
+        def _forward_to_reporter(ev: "Event") -> None:
+            reporter.event(
+                ev.kind, issue_number=ev.issue_number, payload=ev.payload
+            )
+
+        event_log.subscribe(_forward_to_reporter)
     if now_fn is None:
         import time
         now_fn = time.monotonic

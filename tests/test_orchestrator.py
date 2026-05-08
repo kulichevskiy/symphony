@@ -966,6 +966,90 @@ async def test_run_forever_calls_reporter_maybe_heartbeat_each_tick(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_tick_running_count_includes_just_dispatched(tmp_path):
+    """state.running.add() happens inside _dispatch_one which only runs after
+    the next await, so a snapshot taken immediately after run_tick must include
+    the just-dispatched issues, not just the already-running ones."""
+    cfg = _make_cfg(tmp_path)
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    state = OrchestratorState()
+
+    stats = await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1), _issue(2)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_async_approved_for(1),
+    )
+
+    # Two issues dispatched in this tick; running must reflect that even
+    # though _dispatch_one hasn't yet started populating state.running.
+    assert stats.dispatched == 2
+    assert stats.running == 2
+
+    # Drain the dispatch tasks so the test exits cleanly.
+    pending = list(state.dispatch_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_run_forever_attaches_reporter_to_injected_event_log(tmp_path):
+    """Even when callers inject their own EventLog, events must reach the reporter."""
+    import io
+
+    from symphony.events import EventLog
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    shutdown = asyncio.Event()
+
+    injected_log = EventLog.for_repo(cfg.repo.path)
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=999.0,
+    )
+
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [_issue(42)]
+        shutdown.set()
+        return []
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_async_approved_for(42),
+        event_log=injected_log,
+        reporter=reporter,
+    )
+
+    output = reporter_stream.getvalue()
+    assert "#42" in output
+    assert "dispatch" in output
+
+
+@pytest.mark.asyncio
 async def test_run_forever_routes_events_to_reporter(tmp_path):
     """When a reporter is attached, EventLog.emit calls reach reporter.event."""
     import io

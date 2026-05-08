@@ -89,7 +89,18 @@ class EventLog:
         on_emit: Callable[["Event"], None] | None = None,
     ):
         self.db_path = db_path
-        self._on_emit = on_emit
+        self._subscribers: list[Callable[["Event"], None]] = []
+        if on_emit is not None:
+            self._subscribers.append(on_emit)
+
+    def subscribe(self, callback: Callable[["Event"], None]) -> None:
+        """Attach a callback invoked after each successful emit.
+
+        Survives whether the log was constructed with ``on_emit=`` or not, and
+        composes with any existing subscribers — the reporter wires up via
+        this regardless of who built the log.
+        """
+        self._subscribers.append(callback)
 
     @classmethod
     def for_repo(
@@ -147,9 +158,9 @@ class EventLog:
             kind=kind,
             payload=json.loads(payload_json),
         )
-        if self._on_emit is not None:
+        for cb in self._subscribers:
             try:
-                self._on_emit(ev)
+                cb(ev)
             except Exception:  # pragma: no cover — never let observers break the log
                 pass
         return ev
