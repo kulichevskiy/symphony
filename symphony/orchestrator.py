@@ -9,6 +9,7 @@ without the network or the clock; the driver wires them together.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import signal
@@ -242,6 +243,29 @@ def select_ready(
 # ---- Driver ----
 
 
+def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    """Whether ``fn`` accepts ``name`` as a keyword (named or via ``**kwargs``).
+
+    Used so ``_dispatch_one`` can opportunistically forward the orchestrator's
+    ``event_log`` into a custom ``run_once_fn`` without breaking older
+    callbacks whose signature is exactly ``(*, issue_number, config_path)``.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # Builtins / C functions — can't introspect, assume strict.
+        return False
+    for p in sig.parameters.values():
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if p.name == name and p.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
+
+
 @dataclass
 class TickStats:
     """Per-poll-tick summary, mostly for logging/testing."""
@@ -272,11 +296,13 @@ async def _dispatch_one(
         # (pr-open, merge, run-terminal, push, agent-start, agent-exit, ...).
         # Without this, run_once would build its own EventLog and most events
         # would never reach the terminal stream.
-        result = await run_once_fn(
-            issue_number=issue.number,
-            config_path=config_path,
-            event_log=event_log,
-        )
+        kwargs: dict[str, Any] = {
+            "issue_number": issue.number,
+            "config_path": config_path,
+        }
+        if _accepts_kwarg(run_once_fn, "event_log"):
+            kwargs["event_log"] = event_log
+        result = await run_once_fn(**kwargs)
     except Exception as e:  # pragma: no cover — exception path is logged + retried
         log.exception("dispatch crashed for issue #%d", issue.number)
         entry = state.schedule_retry(

@@ -999,6 +999,52 @@ async def test_run_tick_running_count_includes_just_dispatched(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_once_fn_without_event_log_kwarg_still_works(tmp_path):
+    """Older callbacks declared as (issue_number, config_path) without **kw or
+    event_log must keep working — _dispatch_one introspects and only forwards
+    event_log when the callable accepts it."""
+    cfg = _make_cfg(tmp_path)
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    state = OrchestratorState()
+
+    received: list[int] = []
+
+    async def fake_run_once(*, issue_number, config_path):
+        received.append(issue_number)
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=Path("/tmp"),
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=0,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(7)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+    )
+
+    pending = list(state.dispatch_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    assert received == [7]
+
+
+@pytest.mark.asyncio
 async def test_run_once_emissions_reach_reporter(tmp_path):
     """Events emitted from inside run_once must reach the reporter — the orchestrator's
     event_log (with the reporter subscribed) has to flow into run_once_fn."""
