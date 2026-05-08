@@ -205,7 +205,8 @@ def run_cmd(
             "-v",
             count=True,
             help="Increase terminal verbosity. -v adds retry-scheduled / push / "
-            "agent-start / agent-exit / startup-gc; -vv adds per-agent messages.",
+            "agent-start / agent-exit / startup-gc and prefixes each record "
+            "with an HH:MM:SS timestamp; -vv adds per-agent messages.",
         ),
     ] = 0,
     quiet: Annotated[

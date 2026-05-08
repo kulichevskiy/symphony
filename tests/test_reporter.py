@@ -391,6 +391,76 @@ def test_quiet_mode_hides_default_tier_events():
     assert stream.getvalue() == ""
 
 
+def test_no_timestamp_prefix_at_default_verbosity():
+    stream = io.StringIO()
+    reporter = TerminalReporter(stream=stream, now_fn=lambda: 1700000000.0)
+
+    reporter.event("dispatch", issue_number=42, payload={"title": "Add foo"})
+
+    # No HH:MM:SS prefix at default verbosity; line should start with the glyph.
+    assert stream.getvalue().lstrip().startswith("→")
+
+
+def test_timestamp_prefix_at_v():
+    import re
+
+    stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=stream, verbosity=1, now_fn=lambda: 1700000000.0
+    )
+
+    reporter.event(
+        "retry-scheduled",
+        issue_number=42,
+        payload={"attempt": 1, "reason": "not-approved"},
+    )
+
+    # Expect HH:MM:SS prefix.
+    assert re.match(r"^\d{2}:\d{2}:\d{2} ", stream.getvalue())
+
+
+def test_timestamp_prefix_on_heartbeat_at_v():
+    import re
+
+    stream = io.StringIO()
+    clock = [1700000000.0]
+    reporter = TerminalReporter(
+        stream=stream,
+        verbosity=1,
+        now_fn=lambda: clock[0],
+        heartbeat_interval_s=300.0,
+    )
+
+    snap = TickSnapshot(candidates=0, ready=0, running=0, skips=[])
+    reporter.maybe_heartbeat(snap)
+
+    assert re.match(r"^\d{2}:\d{2}:\d{2} ·", stream.getvalue())
+
+
+def test_json_mode_includes_ts_at_v():
+    stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=stream, json_mode=True, verbosity=1, now_fn=lambda: 1700000000.0
+    )
+
+    reporter.event("dispatch", issue_number=42, payload={"title": "Add foo"})
+
+    obj = json.loads(stream.getvalue().strip())
+    assert obj["ts"] == 1700000000.0
+
+
+def test_json_mode_omits_ts_at_default_verbosity():
+    stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=stream, json_mode=True, now_fn=lambda: 1700000000.0
+    )
+
+    reporter.event("dispatch", issue_number=42, payload={"title": "Add foo"})
+
+    obj = json.loads(stream.getvalue().strip())
+    assert "ts" not in obj
+
+
 def test_json_mode_emits_ndjson_line_per_event():
     stream = io.StringIO()
     reporter = TerminalReporter(stream=stream, json_mode=True)

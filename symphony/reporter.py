@@ -72,14 +72,15 @@ class TerminalReporter:
         payload = payload or {}
         # Any incoming event resets the heartbeat timer, even one filtered out
         # by verbosity — internal activity still proves the process is alive.
-        self._last_activity_at = self._now()
+        now = self._now()
+        self._last_activity_at = now
         min_v = _KIND_MIN_VERBOSITY.get(kind, 0)
         if self._verbosity < min_v:
             return
         if self._json_mode:
-            self._emit_json(kind, issue_number=issue_number, payload=payload)
+            self._emit_json(kind, issue_number=issue_number, payload=payload, now=now)
             return
-        self._emit_human(kind, issue_number=issue_number, payload=payload)
+        self._emit_human(kind, issue_number=issue_number, payload=payload, now=now)
 
     def maybe_heartbeat(self, snapshot: TickSnapshot) -> None:
         # Heartbeat is gated by verbosity at the default tier — `--quiet`
@@ -92,25 +93,29 @@ class TerminalReporter:
             return
         self._last_activity_at = now
         if self._json_mode:
-            self._stream.write(
-                json.dumps(
-                    {
-                        "kind": "heartbeat",
-                        "payload": {
-                            "candidates": snapshot.candidates,
-                            "ready": snapshot.ready,
-                            "running": snapshot.running,
-                        },
-                    },
-                    sort_keys=True,
-                )
-                + "\n"
-            )
+            obj: dict[str, Any] = {
+                "kind": "heartbeat",
+                "payload": {
+                    "candidates": snapshot.candidates,
+                    "ready": snapshot.ready,
+                    "running": snapshot.running,
+                },
+            }
+            if self._verbosity >= 1:
+                obj["ts"] = now
+            self._stream.write(json.dumps(obj, sort_keys=True) + "\n")
             return
         self._stream.write(
-            f"· idle: {snapshot.candidates} candidates, "
+            f"{self._ts_prefix(now)}· idle: {snapshot.candidates} candidates, "
             f"{snapshot.ready} ready, {snapshot.running} running\n"
         )
+
+    def _ts_prefix(self, now: float) -> str:
+        # Timestamps only at -v / -vv. At default verbosity the lines are sparse
+        # enough that wall-clock prefix is just noise.
+        if self._verbosity < 1:
+            return ""
+        return time.strftime("%H:%M:%S", time.localtime(now)) + " "
 
     def _emit_json(
         self,
@@ -118,10 +123,13 @@ class TerminalReporter:
         *,
         issue_number: int | None,
         payload: dict[str, Any],
+        now: float,
     ) -> None:
         obj: dict[str, Any] = {"kind": kind, "payload": payload}
         if issue_number is not None:
             obj["issue"] = issue_number
+        if self._verbosity >= 1:
+            obj["ts"] = now
         self._stream.write(json.dumps(obj, sort_keys=True) + "\n")
 
     def _emit_human(
@@ -130,10 +138,12 @@ class TerminalReporter:
         *,
         issue_number: int | None,
         payload: dict[str, Any],
+        now: float,
     ) -> None:
+        ts = self._ts_prefix(now)
         if kind == "dispatch":
             title = payload.get("title", "")
-            self._stream.write(f"→ dispatch #{issue_number} \"{title}\"\n")
+            self._stream.write(f"{ts}→ dispatch #{issue_number} \"{title}\"\n")
         elif kind == "run-terminal":
             outcome = payload.get("outcome", "unknown")
             rounds = payload.get("rounds_used")
@@ -142,47 +152,47 @@ class TerminalReporter:
                 pr_number = payload.get("pr_number")
                 pr_part = f" → PR #{pr_number}" if pr_number is not None else ""
                 self._stream.write(
-                    f"✓ #{issue_number} approved{pr_part}{rounds_part}\n"
+                    f"{ts}✓ #{issue_number} approved{pr_part}{rounds_part}\n"
                 )
             else:
                 self._stream.write(
-                    f"✗ #{issue_number} {outcome}{rounds_part}\n"
+                    f"{ts}✗ #{issue_number} {outcome}{rounds_part}\n"
                 )
         elif kind == "retry-scheduled":
             reason = payload.get("reason", "")
             attempt = payload.get("attempt", "?")
             self._stream.write(
-                f"⏳ retry scheduled #{issue_number} attempt={attempt} reason={reason}\n"
+                f"{ts}⏳ retry scheduled #{issue_number} attempt={attempt} reason={reason}\n"
             )
         elif kind == "retry-fired":
             attempt = payload.get("attempt", "?")
             self._stream.write(
-                f"↻ retry-fired #{issue_number} attempt={attempt}\n"
+                f"{ts}↻ retry-fired #{issue_number} attempt={attempt}\n"
             )
         elif kind == "paused":
             reason = payload.get("reason", "")
-            self._stream.write(f"⚠ paused (reason={reason})\n")
+            self._stream.write(f"{ts}⚠ paused (reason={reason})\n")
         elif kind == "resumed":
-            self._stream.write("▶ resumed\n")
+            self._stream.write(f"{ts}▶ resumed\n")
         elif kind == "auto-cycle":
-            self._stream.write(f"⊘ auto-cycle on #{issue_number}\n")
+            self._stream.write(f"{ts}⊘ auto-cycle on #{issue_number}\n")
         elif kind == "auto-canceled":
             reason = payload.get("reason", "")
-            self._stream.write(f"⊘ canceled #{issue_number} (reason={reason})\n")
+            self._stream.write(f"{ts}⊘ canceled #{issue_number} (reason={reason})\n")
         elif kind == "auto-stuck":
             reason = payload.get("reason", "")
             rounds = payload.get("rounds_used")
             rounds_part = f" after {rounds} rounds" if rounds is not None else ""
             self._stream.write(
-                f"⏸ auto-stuck #{issue_number} (reason={reason}){rounds_part}\n"
+                f"{ts}⏸ auto-stuck #{issue_number} (reason={reason}){rounds_part}\n"
             )
         elif kind == "pr-open":
             pr_number = payload.get("number")
             reused = payload.get("reused")
             tag = " (reused)" if reused else ""
             self._stream.write(
-                f"◆ PR #{pr_number} opened for #{issue_number}{tag}\n"
+                f"{ts}◆ PR #{pr_number} opened for #{issue_number}{tag}\n"
             )
         elif kind == "merge":
             pr_number = payload.get("pr_number")
-            self._stream.write(f"⇩ merged PR #{pr_number} for #{issue_number}\n")
+            self._stream.write(f"{ts}⇩ merged PR #{pr_number} for #{issue_number}\n")
