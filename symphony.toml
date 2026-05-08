@@ -9,7 +9,7 @@ label = "auto"
 
 [git]
 author_name = "Symphony"
-author_email = "alexey.kulichevskiy+symphony@adjust.com"
+author_email = "you@example.com"
 
 [orchestrator]
 poll_interval_s = 60

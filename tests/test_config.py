@@ -25,7 +25,7 @@ label = "auto"
 
 [git]
 author_name = "Symphony"
-author_email = "alexey.kulichevskiy+symphony@adjust.com"
+author_email = "symphony-bot@example.com"
 
 [orchestrator]
 poll_interval_s = 60
@@ -67,7 +67,7 @@ def test_load_config_field_values(tmp_path):
     assert cfg.repo.default_branch == "main"
     assert cfg.github.label == "auto"
     assert cfg.git.author_name == "Symphony"
-    assert cfg.git.author_email == "alexey.kulichevskiy+symphony@adjust.com"
+    assert cfg.git.author_email == "symphony-bot@example.com"
     assert cfg.orchestrator.poll_interval_s == 60
     assert cfg.orchestrator.max_concurrent == 3
     assert cfg.orchestrator.review_round_cap == 10
@@ -131,7 +131,7 @@ def test_load_config_unknown_nested_key_raises(tmp_path):
 def test_load_config_env_var_indirection(tmp_path, monkeypatch):
     monkeypatch.setenv("SYMPHONY_BOT_EMAIL", "bot@example.com")
     body = SAMPLE_TOML.replace(
-        'author_email = "alexey.kulichevskiy+symphony@adjust.com"',
+        'author_email = "symphony-bot@example.com"',
         'author_email = "$SYMPHONY_BOT_EMAIL"',
     )
     p = write_config(tmp_path, body)
@@ -142,7 +142,7 @@ def test_load_config_env_var_indirection(tmp_path, monkeypatch):
 def test_load_config_unset_env_var_raises(tmp_path, monkeypatch):
     monkeypatch.delenv("SYMPHONY_BOT_EMAIL_MISSING", raising=False)
     body = SAMPLE_TOML.replace(
-        'author_email = "alexey.kulichevskiy+symphony@adjust.com"',
+        'author_email = "symphony-bot@example.com"',
         'author_email = "$SYMPHONY_BOT_EMAIL_MISSING"',
     )
     p = write_config(tmp_path, body)

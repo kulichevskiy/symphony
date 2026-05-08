@@ -4,11 +4,35 @@ version = "0.1.0"
 description = "Personal autopilot driving Claude Code agents against GitHub Issues"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Alexey Kulichevskiy" },
+]
+keywords = ["claude-code", "github", "automation", "agents", "autopilot"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Version Control :: Git",
+]
 dependencies = [
     "typer>=0.12",
     "structlog>=24.1",
     "jinja2>=3.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kulichevskiy/symphony"
+Repository = "https://github.com/kulichevskiy/symphony"
+Issues = "https://github.com/kulichevskiy/symphony/issues"
 
 [project.scripts]
 symphony = "symphony.cli:app"

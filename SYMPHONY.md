@@ -137,7 +137,7 @@ poll GitHub for open issues labeled `auto`
 Sample `symphony.toml`:
 ```toml
 [repo]
-path = "/Users/ak/Code/some-project"
+path = "/path/to/your/project"
 default_branch = "main"
 
 [github]
@@ -145,7 +145,7 @@ label = "auto"
 
 [git]
 author_name = "Symphony"
-author_email = "alexey.kulichevskiy+symphony@adjust.com"
+author_email = "you@example.com"
 
 [orchestrator]
 poll_interval_s = 60
@@ -159,7 +159,7 @@ model = "claude-opus-4-7"
 max_turns = 50
 
 [paths]
-worktree_root = "/Users/ak/Code/symphony-worktrees"
+worktree_root = "/path/to/symphony-worktrees"
 prompts_dir = "./prompts"
 ```
 
