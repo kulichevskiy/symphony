@@ -1059,3 +1059,40 @@ async def test_run_forever_swallows_startup_gc_crash(tmp_path):
     )
 
     assert list_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_forever_skips_startup_gc_if_shutdown_already_set(tmp_path):
+    """Startup GC must not run if shutdown was requested before boot.
+
+    Pre-set shutdown events happen in startup/shutdown races and in tests.
+    Startup GC has destructive side effects (worktree + branch deletion);
+    once the loop is going to exit immediately we should not perform them.
+    """
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    shutdown = asyncio.Event()
+    shutdown.set()
+    gc_calls = 0
+
+    def fake_startup_gc():
+        nonlocal gc_calls
+        gc_calls += 1
+        return []
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=lambda: [],
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+        startup_gc_fn=fake_startup_gc,
+    )
+
+    assert gc_calls == 0

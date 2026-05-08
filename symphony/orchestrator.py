@@ -560,10 +560,17 @@ async def run_forever(
     # this. Failures must never block boot — :func:`run_startup_gc` already
     # logs and skips per-issue, but wrap the whole thing too in case a fresh
     # bug throws above that level.
-    try:
-        startup_gc_fn()
-    except Exception:  # pragma: no cover — never block startup on GC
-        log.exception("startup-gc raised; continuing")
+    #
+    # If shutdown was requested before we got here (startup/shutdown race, or
+    # a test pre-setting the event) skip GC entirely — its side effects are
+    # destructive (worktree/branch deletion) and the loop is about to exit
+    # anyway, so the function's "runs until shutdown_event is set" contract
+    # would be violated by doing this after the signal.
+    if not shutdown_event.is_set():
+        try:
+            startup_gc_fn()
+        except Exception:  # pragma: no cover — never block startup on GC
+            log.exception("startup-gc raised; continuing")
 
     while not shutdown_event.is_set():
         try:
