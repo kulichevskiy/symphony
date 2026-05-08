@@ -31,6 +31,7 @@ from .github import (
     PR,
     comment_pr,
     find_open_pr_for_branch,
+    get_issue_state,
     get_pr_head_sha,
     is_pr_merged,
     merge_pr,
@@ -251,6 +252,26 @@ async def run_once(
             pr=None,
             skipped=True,
             skip_reason="auto-canceled",
+            worktree=None,
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.AUTO_CANCELED,
+                rounds_used=0,
+                last_session_id=None,
+                head_sha="",
+            ),
+        )
+
+    # Closes a race where the dispatch loop's `gh issue list --state open`
+    # has not yet seen a Closes-link merge propagate and would re-run an
+    # already-completed issue. Re-check state at the last moment so we don't
+    # spin up a worktree, agent, and PR against a closed issue.
+    if get_issue_state(issue_number, repo_path=repo_path) == "CLOSED":
+        emit("run_once.skipped", {"reason": "issue-closed"})
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=True,
+            skip_reason="issue-closed",
             worktree=None,
             loop_outcome=LoopOutcome(
                 kind=LoopOutcomeKind.AUTO_CANCELED,

@@ -110,6 +110,11 @@ def _patch_happy_path(
     )
     monkeypatch.setattr(
         ro_mod,
+        "get_issue_state",
+        lambda n, *, repo_path: (calls.setdefault("issue_state", (n, repo_path)), "OPEN")[1],
+    )
+    monkeypatch.setattr(
+        ro_mod,
         "tracked_issues",
         lambda n, *, repo_path: [
             TrackedIssue(
@@ -852,6 +857,44 @@ async def test_run_once_pushes_stranded_commits_on_noop_agent(monkeypatch, tmp_p
     assert res.pr is not None
     assert "push" in fixture["calls"]
     assert "comment_pr" in fixture["calls"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_skips_when_issue_already_closed(monkeypatch, tmp_path):
+    """Closes the dispatch race where `gh issue list --state open` returns an
+    issue whose Closes-link merge has not yet propagated. run_once must
+    re-check state and bail before any worktree/agent/PR work happens.
+    """
+    fixture = _patch_happy_path(monkeypatch, tmp_path)
+    fixture["calls"].pop("issue_state", None)
+
+    def _closed(n, *, repo_path):
+        fixture["calls"]["issue_state"] = (n, repo_path)
+        return "CLOSED"
+
+    monkeypatch.setattr(ro_mod, "get_issue_state", _closed)
+
+    res = await ro_mod.run_once(issue_number=3, config_path=fixture["config_path"])
+
+    assert res.skipped is True
+    assert res.skip_reason == "issue-closed"
+    assert res.pr is None
+    assert res.worktree is None
+    assert res.loop_outcome is not None
+    assert res.loop_outcome.rounds_used == 0
+    # Nothing past the closed-issue guard ran: no worktree, no agent, no
+    # push, no PR, no comment.
+    assert "view" not in fixture["calls"]
+    assert "worktree" not in fixture["calls"]
+    assert "prompt" not in fixture["calls"]["agent"]
+    assert "push" not in fixture["calls"]
+    assert "open_pr" not in fixture["calls"]
+    assert "comment_pr" not in fixture["calls"]
+
+    event_log = EventLog.for_repo(fixture["cfg"].repo.path)
+    events = event_log.iter_events(issue_number=3)
+    assert [e.kind for e in events] == ["run_once.skipped"]
+    assert events[0].payload["reason"] == "issue-closed"
 
 
 @pytest.mark.asyncio
