@@ -9,13 +9,18 @@ without the network or the clock; the driver wires them together.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .events import Event
+    from .reporter import TerminalReporter
 
 from .cancel import is_issue_canceled
 from .config import Config
@@ -238,6 +243,29 @@ def select_ready(
 # ---- Driver ----
 
 
+def _accepts_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    """Whether ``fn`` accepts ``name`` as a keyword (named or via ``**kwargs``).
+
+    Used so ``_dispatch_one`` can opportunistically forward the orchestrator's
+    ``event_log`` into a custom ``run_once_fn`` without breaking older
+    callbacks whose signature is exactly ``(*, issue_number, config_path)``.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # Builtins / C functions — can't introspect, assume strict.
+        return False
+    for p in sig.parameters.values():
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if p.name == name and p.kind in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            return True
+    return False
+
+
 @dataclass
 class TickStats:
     """Per-poll-tick summary, mostly for logging/testing."""
@@ -245,6 +273,8 @@ class TickStats:
     candidates: int
     dispatched: int
     skips: list[DispatchSkip]
+    ready: int = 0
+    running: int = 0
 
 
 async def _dispatch_one(
@@ -261,9 +291,18 @@ async def _dispatch_one(
     """Run a single issue through ``run_once`` and update state with the result."""
     state.running.add(issue.number)
     try:
-        result = await run_once_fn(
-            issue_number=issue.number, config_path=config_path
-        )
+        # Forward the orchestrator's event_log so subscribers (e.g. the
+        # TerminalReporter) see lifecycle events emitted from inside run_once
+        # (pr-open, merge, run-terminal, push, agent-start, agent-exit, ...).
+        # Without this, run_once would build its own EventLog and most events
+        # would never reach the terminal stream.
+        kwargs: dict[str, Any] = {
+            "issue_number": issue.number,
+            "config_path": config_path,
+        }
+        if _accepts_kwarg(run_once_fn, "event_log"):
+            kwargs["event_log"] = event_log
+        result = await run_once_fn(**kwargs)
     except Exception as e:  # pragma: no cover — exception path is logged + retried
         log.exception("dispatch crashed for issue #%d", issue.number)
         entry = state.schedule_retry(
@@ -398,7 +437,9 @@ async def run_tick(
     """One iteration of the poll loop. Returns a small stats record."""
     now = now_fn()
     if state.is_paused(now=now):
-        return TickStats(candidates=0, dispatched=0, skips=[])
+        return TickStats(
+            candidates=0, dispatched=0, skips=[], ready=0, running=len(state.running)
+        )
     if state.paused_until is not None and now >= state.paused_until:
         if event_log is not None:
             event_log.emit(
@@ -480,8 +521,15 @@ async def run_tick(
         state.dispatch_tasks.add(task)
         task.add_done_callback(state.dispatch_tasks.discard)
 
+    # Just-dispatched issues are folded in: state.running.add() happens inside
+    # _dispatch_one, which doesn't run until the next event-loop iteration, so
+    # without this the snapshot under-reports active work on dispatch ticks.
     return TickStats(
-        candidates=len(candidates), dispatched=len(to_dispatch), skips=skips
+        candidates=len(candidates),
+        dispatched=len(to_dispatch),
+        skips=skips,
+        ready=len(ready),
+        running=len(state.running) + len(to_dispatch),
     )
 
 
@@ -502,6 +550,7 @@ async def run_forever(
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     event_log: EventLog | None = None,
     startup_gc_fn: Callable[..., list[Any]] | None = None,
+    reporter: "TerminalReporter | None" = None,
 ) -> None:
     """The main poll loop. Runs until ``shutdown_event`` is set.
 
@@ -510,7 +559,18 @@ async def run_forever(
     """
     state = state if state is not None else OrchestratorState()
     shutdown_event = shutdown_event or asyncio.Event()
-    event_log = event_log or EventLog.for_repo(cfg.repo.path)
+    if event_log is None:
+        event_log = EventLog.for_repo(cfg.repo.path)
+    if reporter is not None:
+        # Route every emit through the reporter so the terminal sees the same
+        # events that go to events.db. Works for both freshly-constructed and
+        # injected event_log instances.
+        def _forward_to_reporter(ev: "Event") -> None:
+            reporter.event(
+                ev.kind, issue_number=ev.issue_number, payload=ev.payload
+            )
+
+        event_log.subscribe(_forward_to_reporter)
     if now_fn is None:
         import time
         now_fn = time.monotonic
@@ -573,8 +633,9 @@ async def run_forever(
             log.exception("startup-gc raised; continuing")
 
     while not shutdown_event.is_set():
+        stats: TickStats | None = None
         try:
-            await run_tick(
+            stats = await run_tick(
                 cfg=cfg,
                 state=state,
                 config_path=config_path,
@@ -590,6 +651,18 @@ async def run_forever(
             )
         except Exception:  # pragma: no cover — keep the loop alive
             log.exception("poll tick raised; continuing")
+
+        if reporter is not None and stats is not None:
+            from .reporter import TickSnapshot
+
+            reporter.maybe_heartbeat(
+                TickSnapshot(
+                    candidates=stats.candidates,
+                    ready=stats.ready,
+                    running=stats.running,
+                    skips=[(s.issue_number, s.reason) for s in stats.skips],
+                )
+            )
 
         # Sleep with shutdown awareness — wake immediately on SIGINT-driven
         # shutdown rather than waiting out the full poll interval.

@@ -43,6 +43,25 @@ def _tracked(number: int, *, state="CLOSED", state_reason="COMPLETED") -> Tracke
     )
 
 
+def _async_approved_for(issue_number: int):
+    async def _fn(**kw):
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=Path("/tmp"),
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=0,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    return _fn
+
+
 def _approved_result() -> RunOnceResult:
     return RunOnceResult(
         issue_number=0,
@@ -900,6 +919,294 @@ async def test_run_forever_exits_when_shutdown_event_set(tmp_path):
         run_once_fn=lambda **kw: _approved_result(),
     )
     assert ticks >= 3
+
+
+@pytest.mark.asyncio
+async def test_run_forever_calls_reporter_maybe_heartbeat_each_tick(tmp_path):
+    """run_forever must build a TickSnapshot per tick and offer it to the reporter."""
+    import io
+
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    shutdown = asyncio.Event()
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks >= 1:
+            shutdown.set()
+        return []
+
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=0.0,  # heartbeat fires every check
+        now_fn=lambda: 0.0,
+    )
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+        reporter=reporter,
+    )
+
+    assert "idle" in reporter_stream.getvalue().lower()
+
+
+@pytest.mark.asyncio
+async def test_run_tick_running_count_includes_just_dispatched(tmp_path):
+    """state.running.add() happens inside _dispatch_one which only runs after
+    the next await, so a snapshot taken immediately after run_tick must include
+    the just-dispatched issues, not just the already-running ones."""
+    cfg = _make_cfg(tmp_path)
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    state = OrchestratorState()
+
+    stats = await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(1), _issue(2)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_async_approved_for(1),
+    )
+
+    # Two issues dispatched in this tick; running must reflect that even
+    # though _dispatch_one hasn't yet started populating state.running.
+    assert stats.dispatched == 2
+    assert stats.running == 2
+
+    # Drain the dispatch tasks so the test exits cleanly.
+    pending = list(state.dispatch_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_run_once_fn_without_event_log_kwarg_still_works(tmp_path):
+    """Older callbacks declared as (issue_number, config_path) without **kw or
+    event_log must keep working — _dispatch_one introspects and only forwards
+    event_log when the callable accepts it."""
+    cfg = _make_cfg(tmp_path)
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    state = OrchestratorState()
+
+    received: list[int] = []
+
+    async def fake_run_once(*, issue_number, config_path):
+        received.append(issue_number)
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=Path("/tmp"),
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=0,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    await run_tick(
+        cfg=cfg,
+        state=state,
+        config_path=tmp_path / "symphony.toml",
+        list_issues=lambda: [_issue(7)],
+        fetch_tracked=lambda n: [],
+        has_open_pr=lambda n: False,
+        has_local_branch=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=fake_run_once,
+    )
+
+    pending = list(state.dispatch_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    assert received == [7]
+
+
+@pytest.mark.asyncio
+async def test_run_once_emissions_reach_reporter(tmp_path):
+    """Events emitted from inside run_once must reach the reporter — the orchestrator's
+    event_log (with the reporter subscribed) has to flow into run_once_fn."""
+    import io
+
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    shutdown = asyncio.Event()
+
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=999.0,
+    )
+
+    async def _run_once_fn(*, issue_number, config_path, event_log=None, **kw):
+        # Simulate a run_once invocation that emits lifecycle events.
+        assert event_log is not None, "orchestrator must forward its event_log"
+        event_log.emit("merge", issue_number=issue_number, payload={"pr_number": 99})
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=Path("/tmp"),
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=1,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [_issue(42)]
+        shutdown.set()
+        return []
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_run_once_fn,
+        reporter=reporter,
+    )
+
+    output = reporter_stream.getvalue()
+    assert "PR #99" in output
+    assert "merge" in output.lower()
+
+
+@pytest.mark.asyncio
+async def test_run_forever_attaches_reporter_to_injected_event_log(tmp_path):
+    """Even when callers inject their own EventLog, events must reach the reporter."""
+    import io
+
+    from symphony.events import EventLog
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    shutdown = asyncio.Event()
+
+    injected_log = EventLog.for_repo(cfg.repo.path)
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=999.0,
+    )
+
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [_issue(42)]
+        shutdown.set()
+        return []
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_async_approved_for(42),
+        event_log=injected_log,
+        reporter=reporter,
+    )
+
+    output = reporter_stream.getvalue()
+    assert "#42" in output
+    assert "dispatch" in output
+
+
+@pytest.mark.asyncio
+async def test_run_forever_routes_events_to_reporter(tmp_path):
+    """When a reporter is attached, EventLog.emit calls reach reporter.event."""
+    import io
+
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    shutdown = asyncio.Event()
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [_issue(42)]
+        shutdown.set()
+        return []
+
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=999.0,  # suppress heartbeat for this test
+    )
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_async_approved_for(42),
+        reporter=reporter,
+    )
+
+    output = reporter_stream.getvalue()
+    assert "#42" in output
+    assert "dispatch" in output
 
 
 @pytest.mark.asyncio

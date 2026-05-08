@@ -4,7 +4,45 @@ from __future__ import annotations
 
 import sqlite3
 
-from symphony.events import EventLog
+from symphony.events import Event, EventLog
+
+
+def test_subscribe_attaches_callback_to_existing_log(tmp_path):
+    """subscribe() must reach existing EventLog instances (not just freshly constructed)."""
+    log = EventLog(tmp_path / ".symphony" / "events.db")
+    seen: list[Event] = []
+    log.subscribe(lambda ev: seen.append(ev))
+    log.emit("dispatch", issue_number=42, payload={"title": "x"}, ts=100)
+    assert [e.kind for e in seen] == ["dispatch"]
+
+
+def test_subscribe_composes_with_constructor_callback(tmp_path):
+    """A callback passed at construction must coexist with subsequent subscribe() calls."""
+    early: list[Event] = []
+    log = EventLog(
+        tmp_path / ".symphony" / "events.db",
+        on_emit=lambda ev: early.append(ev),
+    )
+    late: list[Event] = []
+    log.subscribe(lambda ev: late.append(ev))
+    log.emit("merge", issue_number=42, payload={}, ts=1)
+    assert [e.kind for e in early] == ["merge"]
+    assert [e.kind for e in late] == ["merge"]
+
+
+def test_on_emit_callback_invoked_with_emitted_event(tmp_path):
+    seen: list[Event] = []
+    log = EventLog(
+        tmp_path / ".symphony" / "events.db",
+        on_emit=lambda ev: seen.append(ev),
+    )
+    log.emit("dispatch", issue_number=42, payload={"title": "x"}, ts=100)
+    log.emit("merge", issue_number=42, payload={"pr_number": 7}, ts=200)
+
+    assert [e.kind for e in seen] == ["dispatch", "merge"]
+    assert seen[0].issue_number == 42
+    assert seen[0].payload == {"title": "x"}
+    assert seen[1].payload == {"pr_number": 7}
 
 
 def test_event_log_creates_single_events_table(tmp_path):

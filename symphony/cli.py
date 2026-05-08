@@ -198,10 +198,43 @@ def run_cmd(
             help="Path to symphony.toml",
         ),
     ] = Path("symphony.toml"),
+    verbose: Annotated[
+        int,
+        typer.Option(
+            "--verbose",
+            "-v",
+            count=True,
+            help="Increase terminal verbosity. -v adds retry-scheduled / push / "
+            "agent-start / agent-exit / startup-gc; -vv adds per-agent messages.",
+        ),
+    ] = 0,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            "-q",
+            help="Suppress event stream and idle heartbeat. Errors and warnings still print.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit events as NDJSON instead of human-friendly lines.",
+        ),
+    ] = False,
 ) -> None:
     """Long-running autopilot: poll for `auto`-labeled issues and dispatch."""
     cfg = load_config(config)
     _echo_preflight_or_exit(run_preflight(cfg))
+
+    from .reporter import TerminalReporter
+
+    verbosity = -1 if quiet else verbose
+    reporter = TerminalReporter(
+        verbosity=verbosity,
+        json_mode=json_output,
+    )
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -212,7 +245,12 @@ def run_cmd(
             cap=cfg.orchestrator.max_concurrent,
             poll_s=cfg.orchestrator.poll_interval_s,
         )
-        await run_forever(cfg=cfg, config_path=config, shutdown_event=shutdown)
+        await run_forever(
+            cfg=cfg,
+            config_path=config,
+            shutdown_event=shutdown,
+            reporter=reporter,
+        )
         log.info("orchestrator.stopped")
 
     asyncio.run(_main())

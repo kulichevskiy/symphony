@@ -11,7 +11,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 TERMINAL_KINDS = {"merge", "auto-stuck", "auto-canceled", "run-terminal"}
@@ -82,12 +82,34 @@ class StatusSnapshot:
 
 
 class EventLog:
-    def __init__(self, db_path: Path):
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        on_emit: Callable[["Event"], None] | None = None,
+    ):
         self.db_path = db_path
+        self._subscribers: list[Callable[["Event"], None]] = []
+        if on_emit is not None:
+            self._subscribers.append(on_emit)
+
+    def subscribe(self, callback: Callable[["Event"], None]) -> None:
+        """Attach a callback invoked after each successful emit.
+
+        Survives whether the log was constructed with ``on_emit=`` or not, and
+        composes with any existing subscribers — the reporter wires up via
+        this regardless of who built the log.
+        """
+        self._subscribers.append(callback)
 
     @classmethod
-    def for_repo(cls, repo_path: Path) -> "EventLog":
-        return cls(repo_path / ".symphony" / "events.db")
+    def for_repo(
+        cls,
+        repo_path: Path,
+        *,
+        on_emit: Callable[["Event"], None] | None = None,
+    ) -> "EventLog":
+        return cls(repo_path / ".symphony" / "events.db", on_emit=on_emit)
 
     def ensure(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +150,7 @@ class EventLog:
                 (event_ts, issue_number, run_id, kind, payload_json),
             )
             event_id = int(cur.lastrowid)
-        return Event(
+        ev = Event(
             id=event_id,
             ts=event_ts,
             issue_number=issue_number,
@@ -136,6 +158,12 @@ class EventLog:
             kind=kind,
             payload=json.loads(payload_json),
         )
+        for cb in self._subscribers:
+            try:
+                cb(ev)
+            except Exception:  # pragma: no cover — never let observers break the log
+                pass
+        return ev
 
     def iter_events(
         self,
