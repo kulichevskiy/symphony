@@ -113,7 +113,9 @@ gh label create auto-cycle --color B60205
 gh label create auto-canceled --color C5DEF5
 ```
 
-Branch protection on `main`: **at least one required status check** (any CI).
+Branch protection on `main`: **recommended** to require at least one status
+check (any CI). Preflight reports this as a warning, not a hard failure, since
+branch protection rules require a paid GitHub plan on private repos.
 Do **not** require approving reviewers — Codex never posts `APPROVED` reviews,
 so Symphony does the merge itself.
 

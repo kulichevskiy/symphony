@@ -98,7 +98,9 @@ def _branch_protection_result(
         return PreflightResult(
             "branch protection",
             False,
-            f"could not read protection for {cfg.repo.default_branch}: {e}",
+            f"could not read protection for {cfg.repo.default_branch} "
+            f"(branch protection requires a paid GitHub plan on private repos): {e}",
+            fatal=False,
         )
 
     required_checks = data.get("required_status_checks") or {}
@@ -111,6 +113,7 @@ def _branch_protection_result(
             "branch protection",
             False,
             f"{cfg.repo.default_branch} is missing at least one required CI/status check",
+            fatal=False,
         )
     return PreflightResult(
         "branch protection",
