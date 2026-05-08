@@ -328,8 +328,14 @@ def find_pr_for_branch(
 
     ``state`` is GitHub's PR state (``"OPEN"``, ``"CLOSED"``, ``"MERGED"``).
     Used by GC to tell ``"merged PR"`` from ``"PR closed without merge"`` from
-    ``"never opened a PR"``. Disambiguates by ``base_branch`` and
-    ``expected_owner`` like :func:`find_open_pr_for_branch`.
+    ``"never opened a PR"``.
+
+    ``expected_owner``, when given, prefers PRs whose head ref lives in that
+    owner's repo (Symphony's own pushes). If none match, falls back to the
+    most-recent PR from any owner so a contributor's fork PR with the same
+    head name still blocks GC — otherwise an open fork PR would be treated
+    as "no PR" and the worktree could be deleted out from under an active
+    review.
     """
     args = [
         "pr",
@@ -345,24 +351,32 @@ def find_pr_for_branch(
         args += ["--base", base_branch]
     out = _run_gh(args, cwd=repo_path)
     data = _parse_json(out, context=f"gh pr list --head {branch} --state all")
-    best: tuple[PR, str] | None = None
-    best_number = -1
+
+    def _entry_to_match(entry: dict[str, Any]) -> tuple[PR, str]:
+        return (
+            PR(number=int(entry["number"]), url=entry.get("url", "")),
+            str(entry.get("state") or ""),
+        )
+
+    own_best: tuple[PR, str] | None = None
+    own_best_number = -1
+    any_best: tuple[PR, str] | None = None
+    any_best_number = -1
     for entry in data:
         if base_branch and entry.get("baseRefName") != base_branch:
             continue
+        pr_number = int(entry["number"])
+        if pr_number > any_best_number:
+            any_best = _entry_to_match(entry)
+            any_best_number = pr_number
         if expected_owner:
             owner = (entry.get("headRepositoryOwner") or {}).get("login", "")
-            if owner != expected_owner:
-                continue
-        pr_number = int(entry["number"])
-        if pr_number <= best_number:
-            continue
-        best = (
-            PR(number=pr_number, url=entry.get("url", "")),
-            str(entry.get("state") or ""),
-        )
-        best_number = pr_number
-    return best
+            if owner == expected_owner and pr_number > own_best_number:
+                own_best = _entry_to_match(entry)
+                own_best_number = pr_number
+    if expected_owner and own_best is not None:
+        return own_best
+    return any_best
 
 
 def name_with_owner(repo_path: Path) -> tuple[str, str]:
