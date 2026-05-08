@@ -251,7 +251,13 @@ def gc_cmd(
         typer.Option("--days", help="Minimum candidate age in days"),
     ] = 14,
 ) -> None:
-    """Remove confirmed stale worktrees for open auto-stuck issues."""
+    """Remove stale and orphaned per-issue worktrees.
+
+    Two shapes qualify (see :mod:`symphony.garbage`):
+
+    - open ``auto-stuck`` issue, idle longer than ``--days``
+    - closed issue with no PR or with merged/closed PR (any age)
+    """
     cfg = load_config(config)
     candidates = find_gc_candidates(cfg, days=days)
     if not candidates:
@@ -262,7 +268,8 @@ def gc_cmd(
     for candidate in candidates:
         typer.echo(
             f"  #{candidate.issue_number} {candidate.path} "
-            f"branch={candidate.branch} age={candidate.age_days}d"
+            f"branch={candidate.branch} age={candidate.age_days}d "
+            f"reason={candidate.reason}"
         )
 
     if not typer.confirm(

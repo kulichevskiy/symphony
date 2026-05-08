@@ -205,8 +205,36 @@ def test_gc_lists_candidates_and_defaults_to_no(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert "#42" in result.output
+    assert "reason=auto-stuck" in result.output
     assert "Canceled." in result.output
     assert removed == []
+
+
+def test_gc_prints_closed_orphan_reason(monkeypatch, tmp_path):
+    from symphony.garbage import REASON_CLOSED_PR_MERGED
+
+    cfg = SimpleNamespace(repo=SimpleNamespace(path=tmp_path))
+    candidate = GcCandidate(
+        64,
+        tmp_path / "repo-64",
+        "auto/64",
+        0,
+        reason=REASON_CLOSED_PR_MERGED,
+    )
+
+    monkeypatch.setattr("symphony.cli.load_config", lambda p: cfg)
+    monkeypatch.setattr(
+        "symphony.cli.find_gc_candidates",
+        lambda cfg_arg, days: [candidate],
+    )
+    monkeypatch.setattr(
+        "symphony.cli.remove_gc_candidate",
+        lambda cfg_arg, c: None,
+    )
+
+    result = runner.invoke(app, ["gc", "--config", "ignored.toml"], input="\n")
+    assert result.exit_code == 0, result.output
+    assert "reason=closed-pr-merged" in result.output
 
 
 def test_gc_removes_after_confirmation(monkeypatch, tmp_path):

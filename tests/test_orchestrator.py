@@ -985,3 +985,77 @@ async def test_run_forever_drains_in_flight_dispatches_on_shutdown(tmp_path):
 
     assert completed == [1], "shutdown cancelled an in-flight dispatch"
     assert state.dispatch_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_run_forever_invokes_startup_gc_before_first_tick(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    shutdown = asyncio.Event()
+    order: list[str] = []
+    list_calls = 0
+
+    def list_issues():
+        nonlocal list_calls
+        list_calls += 1
+        order.append(f"list-{list_calls}")
+        if list_calls >= 1:
+            shutdown.set()
+        return []
+
+    def fake_startup_gc():
+        order.append("gc")
+        return []
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+        startup_gc_fn=fake_startup_gc,
+    )
+
+    assert order[0] == "gc"
+    assert "list-1" in order
+
+
+@pytest.mark.asyncio
+async def test_run_forever_swallows_startup_gc_crash(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    shutdown = asyncio.Event()
+    list_calls = 0
+
+    def list_issues():
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls >= 1:
+            shutdown.set()
+        return []
+
+    def boom():
+        raise RuntimeError("startup gc exploded")
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+        startup_gc_fn=boom,
+    )
+
+    assert list_calls >= 1
