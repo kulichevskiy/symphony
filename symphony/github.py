@@ -298,6 +298,87 @@ def list_open_issues_with_label(
     return issues
 
 
+def get_issue_state(number: int, *, repo_path: Path) -> str:
+    """Return the issue's state — ``"OPEN"`` or ``"CLOSED"``.
+
+    Used by the GC paths to decide whether an orphan worktree's underlying
+    issue is still in flight or done. Raises :class:`GithubError` on any
+    other shape so callers can log + skip rather than guess.
+    """
+    out = _run_gh(
+        ["issue", "view", str(number), "--json", "state"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh issue view {number} (state)")
+    state = str(data.get("state") or "")
+    if state not in {"OPEN", "CLOSED"}:
+        raise GithubError(f"unexpected issue state for #{number}: {state!r}")
+    return state
+
+
+def find_pr_for_branch(
+    branch: str,
+    *,
+    repo_path: Path,
+    base_branch: str | None = None,
+    expected_owner: str | None = None,
+) -> tuple[PR, str] | None:
+    """Return ``(PR, state)`` for the most-recent PR whose head ref is
+    ``branch`` in any state, or ``None`` if no PR ever existed.
+
+    ``state`` is GitHub's PR state (``"OPEN"``, ``"CLOSED"``, ``"MERGED"``).
+    Used by GC to tell ``"merged PR"`` from ``"PR closed without merge"`` from
+    ``"never opened a PR"``.
+
+    ``expected_owner``, when given, prefers PRs whose head ref lives in that
+    owner's repo (Symphony's own pushes). If none match, falls back to the
+    most-recent PR from any owner so a contributor's fork PR with the same
+    head name still blocks GC — otherwise an open fork PR would be treated
+    as "no PR" and the worktree could be deleted out from under an active
+    review.
+    """
+    args = [
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,url,state,baseRefName,headRepositoryOwner",
+    ]
+    if base_branch:
+        args += ["--base", base_branch]
+    out = _run_gh(args, cwd=repo_path)
+    data = _parse_json(out, context=f"gh pr list --head {branch} --state all")
+
+    def _entry_to_match(entry: dict[str, Any]) -> tuple[PR, str]:
+        return (
+            PR(number=int(entry["number"]), url=entry.get("url", "")),
+            str(entry.get("state") or ""),
+        )
+
+    own_best: tuple[PR, str] | None = None
+    own_best_number = -1
+    any_best: tuple[PR, str] | None = None
+    any_best_number = -1
+    for entry in data:
+        if base_branch and entry.get("baseRefName") != base_branch:
+            continue
+        pr_number = int(entry["number"])
+        if pr_number > any_best_number:
+            any_best = _entry_to_match(entry)
+            any_best_number = pr_number
+        if expected_owner:
+            owner = (entry.get("headRepositoryOwner") or {}).get("login", "")
+            if owner == expected_owner and pr_number > own_best_number:
+                own_best = _entry_to_match(entry)
+                own_best_number = pr_number
+    if expected_owner and own_best is not None:
+        return own_best
+    return any_best
+
+
 def name_with_owner(repo_path: Path) -> tuple[str, str]:
     """Resolve the GitHub ``(owner, name)`` for the repo at ``repo_path``."""
     out = _run_gh(["repo", "view", "--json", "nameWithOwner"], cwd=repo_path)

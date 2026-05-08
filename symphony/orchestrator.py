@@ -20,6 +20,7 @@ from typing import Any
 from .cancel import is_issue_canceled
 from .config import Config
 from .events import EventLog
+from .garbage import run_startup_gc
 from .github import (
     Issue,
     TrackedIssue,
@@ -500,6 +501,7 @@ async def run_forever(
     run_once_fn: Callable[..., Awaitable[RunOnceResult]] | None = None,
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     event_log: EventLog | None = None,
+    startup_gc_fn: Callable[..., list[Any]] | None = None,
 ) -> None:
     """The main poll loop. Runs until ``shutdown_event`` is set.
 
@@ -550,6 +552,25 @@ async def run_forever(
         is_canceled_fn = lambda n: is_issue_canceled(cfg.repo.path, n)  # noqa: E731
     if run_once_fn is None:
         run_once_fn = run_once
+    if startup_gc_fn is None:
+        startup_gc_fn = lambda: run_startup_gc(cfg, event_log=event_log)  # noqa: E731
+
+    # Startup GC: remove worktrees whose issue is closed (and PR is merged /
+    # closed / never opened) before the first poll tick. SYMPHONY.md promises
+    # this. Failures must never block boot — :func:`run_startup_gc` already
+    # logs and skips per-issue, but wrap the whole thing too in case a fresh
+    # bug throws above that level.
+    #
+    # If shutdown was requested before we got here (startup/shutdown race, or
+    # a test pre-setting the event) skip GC entirely — its side effects are
+    # destructive (worktree/branch deletion) and the loop is about to exit
+    # anyway, so the function's "runs until shutdown_event is set" contract
+    # would be violated by doing this after the signal.
+    if not shutdown_event.is_set():
+        try:
+            startup_gc_fn()
+        except Exception:  # pragma: no cover — never block startup on GC
+            log.exception("startup-gc raised; continuing")
 
     while not shutdown_event.is_set():
         try:

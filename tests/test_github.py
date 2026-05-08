@@ -905,3 +905,136 @@ def test_run_gh_allows_configured_nonzero_exit(monkeypatch, tmp_path):
         )
         == "[]"
     )
+
+
+def test_get_issue_state_open(monkeypatch, tmp_path):
+    from symphony.github import get_issue_state
+
+    fake = _stub({("issue", "view", "7"): json.dumps({"state": "OPEN"})})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert get_issue_state(7, repo_path=tmp_path) == "OPEN"
+
+
+def test_get_issue_state_closed(monkeypatch, tmp_path):
+    from symphony.github import get_issue_state
+
+    fake = _stub({("issue", "view", "7"): json.dumps({"state": "CLOSED"})})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert get_issue_state(7, repo_path=tmp_path) == "CLOSED"
+
+
+def test_get_issue_state_unexpected_raises(monkeypatch, tmp_path):
+    from symphony.github import get_issue_state
+
+    fake = _stub({("issue", "view", "7"): json.dumps({"state": "WAT"})})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    with pytest.raises(GithubError):
+        get_issue_state(7, repo_path=tmp_path)
+
+
+def test_find_pr_for_branch_returns_none_when_empty(monkeypatch, tmp_path):
+    from symphony.github import find_pr_for_branch
+
+    fake = _stub({("pr", "list", "--head", "auto/42"): "[]"})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    assert find_pr_for_branch("auto/42", repo_path=tmp_path) is None
+
+
+def test_find_pr_for_branch_picks_latest(monkeypatch, tmp_path):
+    from symphony.github import find_pr_for_branch
+
+    payload = [
+        {
+            "number": 11,
+            "url": "https://gh/x/11",
+            "state": "MERGED",
+            "baseRefName": "main",
+            "headRepositoryOwner": {"login": "ak"},
+        },
+        {
+            "number": 14,
+            "url": "https://gh/x/14",
+            "state": "CLOSED",
+            "baseRefName": "main",
+            "headRepositoryOwner": {"login": "ak"},
+        },
+    ]
+    fake = _stub({("pr", "list", "--head", "auto/42"): json.dumps(payload)})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    pr, state = find_pr_for_branch(
+        "auto/42",
+        repo_path=tmp_path,
+        base_branch="main",
+        expected_owner="ak",
+    )
+    assert pr.number == 14
+    assert state == "CLOSED"
+
+
+def test_find_pr_for_branch_prefers_owner_match(monkeypatch, tmp_path):
+    """Same-owner PR wins over a more-recent fork PR.
+
+    Symphony's own PR is the source of truth for the worktree's lifecycle
+    (we opened it, we close/merge it). A fork PR sharing the same head ref
+    name should not override the Symphony PR's state.
+    """
+    from symphony.github import find_pr_for_branch
+
+    payload = [
+        {
+            "number": 22,
+            "url": "https://gh/x/22",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRepositoryOwner": {"login": "stranger"},
+        },
+        {
+            "number": 21,
+            "url": "https://gh/x/21",
+            "state": "MERGED",
+            "baseRefName": "main",
+            "headRepositoryOwner": {"login": "ak"},
+        },
+    ]
+    fake = _stub({("pr", "list", "--head", "auto/42"): json.dumps(payload)})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    pr, state = find_pr_for_branch(
+        "auto/42",
+        repo_path=tmp_path,
+        base_branch="main",
+        expected_owner="ak",
+    )
+    assert pr.number == 21
+    assert state == "MERGED"
+
+
+def test_find_pr_for_branch_falls_back_to_fork_pr(monkeypatch, tmp_path):
+    """When no same-owner PR exists, return the most-recent fork PR.
+
+    Fork-based PRs (contributor without push access) share the
+    ``auto/<n>`` head name. Without this fallback, GC would treat them as
+    "no PR" and could delete a worktree that's actively under review.
+    """
+    from symphony.github import find_pr_for_branch
+
+    payload = [
+        {
+            "number": 22,
+            "url": "https://gh/x/22",
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRepositoryOwner": {"login": "stranger"},
+        },
+    ]
+    fake = _stub({("pr", "list", "--head", "auto/42"): json.dumps(payload)})
+    monkeypatch.setattr(gh_mod, "_run_gh", fake)
+    result = find_pr_for_branch(
+        "auto/42",
+        repo_path=tmp_path,
+        base_branch="main",
+        expected_owner="ak",
+    )
+    assert result is not None
+    pr, state = result
+    assert pr.number == 22
+    assert state == "OPEN"
