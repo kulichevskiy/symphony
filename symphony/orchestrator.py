@@ -267,8 +267,15 @@ async def _dispatch_one(
     """Run a single issue through ``run_once`` and update state with the result."""
     state.running.add(issue.number)
     try:
+        # Forward the orchestrator's event_log so subscribers (e.g. the
+        # TerminalReporter) see lifecycle events emitted from inside run_once
+        # (pr-open, merge, run-terminal, push, agent-start, agent-exit, ...).
+        # Without this, run_once would build its own EventLog and most events
+        # would never reach the terminal stream.
         result = await run_once_fn(
-            issue_number=issue.number, config_path=config_path
+            issue_number=issue.number,
+            config_path=config_path,
+            event_log=event_log,
         )
     except Exception as e:  # pragma: no cover — exception path is logged + retried
         log.exception("dispatch crashed for issue #%d", issue.number)

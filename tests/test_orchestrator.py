@@ -999,6 +999,73 @@ async def test_run_tick_running_count_includes_just_dispatched(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_once_emissions_reach_reporter(tmp_path):
+    """Events emitted from inside run_once must reach the reporter — the orchestrator's
+    event_log (with the reporter subscribed) has to flow into run_once_fn."""
+    import io
+
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    shutdown = asyncio.Event()
+
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=999.0,
+    )
+
+    async def _run_once_fn(*, issue_number, config_path, event_log=None, **kw):
+        # Simulate a run_once invocation that emits lifecycle events.
+        assert event_log is not None, "orchestrator must forward its event_log"
+        event_log.emit("merge", issue_number=issue_number, payload={"pr_number": 99})
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=Path("/tmp"),
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=1,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [_issue(42)]
+        shutdown.set()
+        return []
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_run_once_fn,
+        reporter=reporter,
+    )
+
+    output = reporter_stream.getvalue()
+    assert "PR #99" in output
+    assert "merge" in output.lower()
+
+
+@pytest.mark.asyncio
 async def test_run_forever_attaches_reporter_to_injected_event_log(tmp_path):
     """Even when callers inject their own EventLog, events must reach the reporter."""
     import io
