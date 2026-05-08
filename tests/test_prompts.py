@@ -72,9 +72,26 @@ def test_round1_includes_comments_and_deps():
 
 def _render_review(**ctx):
     env = make_env(PROMPTS_DIR)
-    base = {"sha": "deadbee", "comments": [], "ci_failures": [], "review_body": ""}
+    base = {
+        "sha": "deadbee",
+        "comments": [],
+        "ci_failures": [],
+        "review_body": "",
+        "merge_conflict": False,
+        "base_branch": "main",
+    }
     base.update(ctx)
     return render(env, "review.md.j2", base)
+
+
+def test_review_renders_merge_conflict_branch():
+    out = _render_review(merge_conflict=True, base_branch="main")
+    assert "conflicts with `main`" in out
+    assert "git fetch origin main" in out
+    assert "git merge origin/main" in out
+    # Pure-conflict prompt suppresses the standard reviewer-feedback sections.
+    assert "Codex requested changes" not in out
+    assert "Inline comments" not in out
 
 
 def test_review_renders_review_body_when_no_inline_comments():

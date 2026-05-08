@@ -467,6 +467,57 @@ def test_plus_one_from_random_user_does_not_approve():
     assert v.kind == VerdictKind.PENDING
 
 
+# ---- mergeable / merge conflict ----
+
+
+def test_codex_approved_but_conflicting_is_changes_requested_with_merge_conflict():
+    # PR is approved by Codex but conflicts with the base branch — would-be
+    # merge would fail. Surface as CHANGES_REQUESTED so the review loop runs
+    # the agent to resolve, with merge_conflict=True so the prompt is the
+    # conflict-resolution variant.
+    v = _eval(
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+        mergeable="CONFLICTING",
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.merge_conflict is True
+
+
+def test_human_approved_but_conflicting_is_changes_requested_with_merge_conflict():
+    v = _eval(
+        reviews=[_review(who="alice", state="APPROVED", body="lgtm")],
+        mergeable="CONFLICTING",
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.merge_conflict is True
+
+
+def test_codex_approved_with_unknown_mergeable_is_pending():
+    # GitHub computes mergeability lazily after a push. Don't race
+    # `gh pr merge` against a stale state — wait it out.
+    v = _eval(
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+        mergeable="UNKNOWN",
+    )
+    assert v.kind == VerdictKind.PENDING
+
+
+def test_codex_approved_with_mergeable_is_approved():
+    v = _eval(
+        reactions=[_reaction(who=CODEX_BOT_LOGIN, at="2026-05-06T07:30:00Z")],
+        mergeable="MERGEABLE",
+    )
+    assert v.kind == VerdictKind.APPROVED
+
+
+def test_conflicting_without_approval_is_pending():
+    # Conflict with the base branch is only actionable after Codex approves;
+    # a fresh Codex review or pending CI may still resolve mergeability later.
+    v = _eval(mergeable="CONFLICTING")
+    assert v.kind == VerdictKind.PENDING
+    assert v.merge_conflict is False
+
+
 # ---- select_resume_session ----
 
 
@@ -527,7 +578,15 @@ async def test_drive_review_loop_stops_on_cancel_request(tmp_path):
     assert labels == [(42, "auto-canceled", tmp_path)]
 
 
-def _snap(*, head_sha="head1", reviews=(), comments=(), reactions=(), checks=()) -> ReviewSnapshot:
+def _snap(
+    *,
+    head_sha="head1",
+    reviews=(),
+    comments=(),
+    reactions=(),
+    checks=(),
+    mergeable="MERGEABLE",
+) -> ReviewSnapshot:
     return ReviewSnapshot(
         head_sha=head_sha,
         head_committed_at="2026-05-06T07:00:00Z",
@@ -535,14 +594,20 @@ def _snap(*, head_sha="head1", reviews=(), comments=(), reactions=(), checks=())
         review_comments=list(comments),
         reactions=list(reactions),
         checks=list(checks),
+        mergeable=mergeable,
     )
 
 
-def _approved_snap(head_sha="head1") -> ReviewSnapshot:
+def _approved_snap(head_sha="head1", mergeable="MERGEABLE") -> ReviewSnapshot:
     return _snap(
         head_sha=head_sha,
         reactions=[Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at="2026-05-06T07:30:00Z")],
+        mergeable=mergeable,
     )
+
+
+def _conflicting_approved_snap(head_sha="head1") -> ReviewSnapshot:
+    return _approved_snap(head_sha=head_sha, mergeable="CONFLICTING")
 
 
 def _changes_snap(head_sha="head1", body="please fix") -> ReviewSnapshot:
@@ -583,6 +648,9 @@ def test_fetch_snapshot_uses_pinned_head_for_checks(monkeypatch, tmp_path):
         reviewer_mod, "list_pr_review_comments", lambda pr_number, repo_path: []
     )
     monkeypatch.setattr(reviewer_mod, "list_pr_reactions", lambda pr_number, repo_path: [])
+    monkeypatch.setattr(
+        reviewer_mod, "get_pr_mergeable", lambda pr_number, repo_path: "MERGEABLE"
+    )
 
     def fake_checks(pr_number, *, repo_path, head_sha=None):
         calls["head_sha"] = head_sha
@@ -594,6 +662,7 @@ def test_fetch_snapshot_uses_pinned_head_for_checks(monkeypatch, tmp_path):
 
     assert snap.head_sha == "shaH"
     assert calls["head_sha"] == "shaH"
+    assert snap.mergeable == "MERGEABLE"
 
 
 def _pending_check_snap(head_sha="head1", state="queued") -> ReviewSnapshot:
@@ -681,13 +750,25 @@ class _Driver:
     def label_issue(self, number, label, *, repo_path):
         self.calls["label_issue"].append((number, label, str(repo_path)))
 
-    def render(self, *, cfg, sha, comments, ci_failures, review_body=""):
+    def render(
+        self,
+        *,
+        cfg,
+        sha,
+        comments,
+        ci_failures,
+        review_body="",
+        merge_conflict=False,
+        base_branch="",
+    ):
         self.calls["render"].append(
             {
                 "sha": sha,
                 "n_comments": len(comments),
                 "n_ci": len(ci_failures),
                 "review_body": review_body,
+                "merge_conflict": merge_conflict,
+                "base_branch": base_branch,
             }
         )
         return f"render({sha})"
@@ -778,6 +859,30 @@ async def test_loop_passes_summary_review_body_to_retry_prompt(tmp_path):
 
     assert outcome.kind == LoopOutcomeKind.APPROVED
     assert driver.calls["render"][0]["review_body"] == summary
+    assert driver.calls["render"][0]["n_comments"] == 0
+
+
+@pytest.mark.asyncio
+async def test_loop_resolves_merge_conflict_then_approves(tmp_path):
+    """An approved-but-conflicting snapshot routes through the agent with
+    the merge-conflict prompt; once the agent commits the merge and the
+    follow-up snapshot is mergeable, the loop terminates as APPROVED."""
+    cfg = _make_cfg(tmp_path)
+    driver = _Driver(
+        [
+            _conflicting_approved_snap("head1"),
+            _approved_snap("head2"),
+        ]
+    )
+    outcome = await _spawn_loop(driver, cfg)
+
+    assert outcome.kind == LoopOutcomeKind.APPROVED
+    assert outcome.rounds_used == 1
+    # Exactly one render and it must have been the conflict variant, with
+    # the base branch threaded through for the agent's `git merge` step.
+    assert len(driver.calls["render"]) == 1
+    assert driver.calls["render"][0]["merge_conflict"] is True
+    assert driver.calls["render"][0]["base_branch"] == "main"
     assert driver.calls["render"][0]["n_comments"] == 0
 
 
