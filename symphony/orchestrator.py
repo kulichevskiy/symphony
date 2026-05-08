@@ -15,7 +15,11 @@ import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .events import Event
+    from .reporter import TerminalReporter
 
 from .cancel import is_issue_canceled
 from .config import Config
@@ -245,6 +249,8 @@ class TickStats:
     candidates: int
     dispatched: int
     skips: list[DispatchSkip]
+    ready: int = 0
+    running: int = 0
 
 
 async def _dispatch_one(
@@ -398,7 +404,9 @@ async def run_tick(
     """One iteration of the poll loop. Returns a small stats record."""
     now = now_fn()
     if state.is_paused(now=now):
-        return TickStats(candidates=0, dispatched=0, skips=[])
+        return TickStats(
+            candidates=0, dispatched=0, skips=[], ready=0, running=len(state.running)
+        )
     if state.paused_until is not None and now >= state.paused_until:
         if event_log is not None:
             event_log.emit(
@@ -481,7 +489,11 @@ async def run_tick(
         task.add_done_callback(state.dispatch_tasks.discard)
 
     return TickStats(
-        candidates=len(candidates), dispatched=len(to_dispatch), skips=skips
+        candidates=len(candidates),
+        dispatched=len(to_dispatch),
+        skips=skips,
+        ready=len(ready),
+        running=len(state.running),
     )
 
 
@@ -502,6 +514,7 @@ async def run_forever(
     sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
     event_log: EventLog | None = None,
     startup_gc_fn: Callable[..., list[Any]] | None = None,
+    reporter: "TerminalReporter | None" = None,
 ) -> None:
     """The main poll loop. Runs until ``shutdown_event`` is set.
 
@@ -510,7 +523,16 @@ async def run_forever(
     """
     state = state if state is not None else OrchestratorState()
     shutdown_event = shutdown_event or asyncio.Event()
-    event_log = event_log or EventLog.for_repo(cfg.repo.path)
+    if event_log is None:
+        # When a reporter is attached, route every emit through it so the
+        # terminal sees the same events that go to events.db.
+        on_emit = None
+        if reporter is not None:
+            def on_emit(ev: "Event") -> None:  # type: ignore[no-redef]
+                reporter.event(
+                    ev.kind, issue_number=ev.issue_number, payload=ev.payload
+                )
+        event_log = EventLog.for_repo(cfg.repo.path, on_emit=on_emit)
     if now_fn is None:
         import time
         now_fn = time.monotonic
@@ -573,8 +595,9 @@ async def run_forever(
             log.exception("startup-gc raised; continuing")
 
     while not shutdown_event.is_set():
+        stats: TickStats | None = None
         try:
-            await run_tick(
+            stats = await run_tick(
                 cfg=cfg,
                 state=state,
                 config_path=config_path,
@@ -590,6 +613,18 @@ async def run_forever(
             )
         except Exception:  # pragma: no cover — keep the loop alive
             log.exception("poll tick raised; continuing")
+
+        if reporter is not None and stats is not None:
+            from .reporter import TickSnapshot
+
+            reporter.maybe_heartbeat(
+                TickSnapshot(
+                    candidates=stats.candidates,
+                    ready=stats.ready,
+                    running=stats.running,
+                    skips=[(s.issue_number, s.reason) for s in stats.skips],
+                )
+            )
 
         # Sleep with shutdown awareness — wake immediately on SIGINT-driven
         # shutdown rather than waiting out the full poll interval.

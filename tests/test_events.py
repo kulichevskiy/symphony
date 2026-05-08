@@ -4,7 +4,22 @@ from __future__ import annotations
 
 import sqlite3
 
-from symphony.events import EventLog
+from symphony.events import Event, EventLog
+
+
+def test_on_emit_callback_invoked_with_emitted_event(tmp_path):
+    seen: list[Event] = []
+    log = EventLog(
+        tmp_path / ".symphony" / "events.db",
+        on_emit=lambda ev: seen.append(ev),
+    )
+    log.emit("dispatch", issue_number=42, payload={"title": "x"}, ts=100)
+    log.emit("merge", issue_number=42, payload={"pr_number": 7}, ts=200)
+
+    assert [e.kind for e in seen] == ["dispatch", "merge"]
+    assert seen[0].issue_number == 42
+    assert seen[0].payload == {"title": "x"}
+    assert seen[1].payload == {"pr_number": 7}
 
 
 def test_event_log_creates_single_events_table(tmp_path):

@@ -43,6 +43,25 @@ def _tracked(number: int, *, state="CLOSED", state_reason="COMPLETED") -> Tracke
     )
 
 
+def _async_approved_for(issue_number: int):
+    async def _fn(**kw):
+        return RunOnceResult(
+            issue_number=issue_number,
+            pr=None,
+            skipped=False,
+            skip_reason=None,
+            worktree=Path("/tmp"),
+            loop_outcome=LoopOutcome(
+                kind=LoopOutcomeKind.APPROVED,
+                rounds_used=0,
+                last_session_id="s",
+                head_sha="h",
+            ),
+        )
+
+    return _fn
+
+
 def _approved_result() -> RunOnceResult:
     return RunOnceResult(
         issue_number=0,
@@ -900,6 +919,97 @@ async def test_run_forever_exits_when_shutdown_event_set(tmp_path):
         run_once_fn=lambda **kw: _approved_result(),
     )
     assert ticks >= 3
+
+
+@pytest.mark.asyncio
+async def test_run_forever_calls_reporter_maybe_heartbeat_each_tick(tmp_path):
+    """run_forever must build a TickSnapshot per tick and offer it to the reporter."""
+    import io
+
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    shutdown = asyncio.Event()
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks >= 1:
+            shutdown.set()
+        return []
+
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=0.0,  # heartbeat fires every check
+        now_fn=lambda: 0.0,
+    )
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=lambda **kw: _approved_result(),
+        reporter=reporter,
+    )
+
+    assert "idle" in reporter_stream.getvalue().lower()
+
+
+@pytest.mark.asyncio
+async def test_run_forever_routes_events_to_reporter(tmp_path):
+    """When a reporter is attached, EventLog.emit calls reach reporter.event."""
+    import io
+
+    from symphony.reporter import TerminalReporter
+
+    cfg = _make_cfg(tmp_path)
+    cfg.orchestrator.poll_interval_s = 0.01
+    cfg.repo.path.mkdir(parents=True, exist_ok=True)
+    shutdown = asyncio.Event()
+    ticks = 0
+
+    def list_issues():
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [_issue(42)]
+        shutdown.set()
+        return []
+
+    reporter_stream = io.StringIO()
+    reporter = TerminalReporter(
+        stream=reporter_stream,
+        heartbeat_interval_s=999.0,  # suppress heartbeat for this test
+    )
+
+    await run_forever(
+        cfg=cfg,
+        config_path=tmp_path / "symphony.toml",
+        state=OrchestratorState(),
+        shutdown_event=shutdown,
+        list_issues_fn=list_issues,
+        fetch_tracked_fn=lambda n: [],
+        has_open_pr_fn=lambda n: False,
+        has_local_branch_fn=lambda n: False,
+        label_fn=lambda n, lbl: None,
+        now_fn=lambda: 0.0,
+        run_once_fn=_async_approved_for(42),
+        reporter=reporter,
+    )
+
+    output = reporter_stream.getvalue()
+    assert "#42" in output
+    assert "dispatch" in output
 
 
 @pytest.mark.asyncio
