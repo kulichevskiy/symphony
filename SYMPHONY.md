@@ -280,6 +280,7 @@ When done, ensure tests pass and commit. Do not push — Symphony will push.
 | `gh` API error | Log, skip tick, keep workers running, retry next poll |
 | Codex never reviews | Re-nudge at 10 min; give up at 30 min → `auto-stuck` |
 | Codex requests changes 10× | `auto-stuck`; leave PR + worktree |
+| PR approved but conflicts with base | Treated as `CHANGES_REQUESTED` with a merge-conflict prompt; agent merges `origin/<base>` and resolves, Symphony pushes + re-nudges Codex |
 | CI fails | Treated as `CHANGES_REQUESTED`; failing logs piped to agent as review comments |
 | Subscription rate-limited | Global `paused_until`; suspend dispatch until expiry |
 | Cycle in dependencies | Both members labeled `auto-cycle`, skipped |

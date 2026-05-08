@@ -44,6 +44,7 @@ from .github import (
     ReviewComment,
     get_commit_committed_at,
     get_pr_head_sha,
+    get_pr_mergeable,
     list_pr_checks,
     list_pr_reactions,
     list_pr_review_comments,
@@ -82,6 +83,12 @@ class Verdict:
     ci_failures: list[CheckRun] = field(default_factory=list)
     pending_checks: list[CheckRun] = field(default_factory=list)
     last_review_body: str = ""
+    # True when the verdict was forced to CHANGES_REQUESTED solely because the
+    # PR is mergeable=CONFLICTING with the base branch — i.e. Codex has
+    # otherwise approved but `gh pr merge` would fail. The review loop renders
+    # a conflict-specific prompt so the agent merges the base branch and
+    # resolves rather than chasing imaginary review feedback.
+    merge_conflict: bool = False
 
 
 def _parse_iso(ts: str) -> datetime | None:
@@ -135,6 +142,7 @@ def evaluate_verdict(
     review_comments: list[ReviewComment],
     reactions: list[Reaction],
     checks: list[CheckRun],
+    mergeable: str | None = None,
     codex_login: str = CODEX_BOT_LOGIN,
 ) -> Verdict:
     """Pure verdict evaluation. See module docstring for the rules."""
@@ -249,15 +257,27 @@ def evaluate_verdict(
     if pending_checks:
         return Verdict(kind=VerdictKind.PENDING, pending_checks=pending_checks)
 
-    # 6. Approval via a non-Codex reviewer on HEAD. This is only considered
-    #    after fresh blocking signals have been ruled out.
-    if human_approved:
-        return Verdict(kind=VerdictKind.APPROVED)
-
-    # 7. Approval via Codex ``+1`` reaction on the PR. Must be at or after HEAD's
-    #    committer time, otherwise it's stale (referring to an earlier
-    #    commit that's since been replaced).
-    if latest_codex_approval_at is not None:
+    # 6. Approval via a non-Codex reviewer on HEAD or via Codex ``+1`` reaction
+    #    on the PR. Approval is only considered after fresh blocking signals
+    #    have been ruled out. Codex's ``+1`` must be at or after HEAD's
+    #    committer time, otherwise it's stale (referring to an earlier commit
+    #    that's since been replaced).
+    approved = human_approved or latest_codex_approval_at is not None
+    if approved:
+        # 6a. Block approval if the PR conflicts with the base branch — the
+        #     subsequent ``gh pr merge`` would fail. Surface as
+        #     CHANGES_REQUESTED with merge_conflict=True so the review loop
+        #     dispatches the agent to merge the base in and resolve.
+        if mergeable == "CONFLICTING":
+            return Verdict(
+                kind=VerdictKind.CHANGES_REQUESTED,
+                merge_conflict=True,
+            )
+        # 6b. Mergeability is computed lazily by GitHub. Stay PENDING until
+        #     it resolves rather than racing with `gh pr merge` on a stale
+        #     state.
+        if mergeable == "UNKNOWN":
+            return Verdict(kind=VerdictKind.PENDING)
         return Verdict(kind=VerdictKind.APPROVED)
 
     return Verdict(kind=VerdictKind.PENDING)
@@ -273,6 +293,10 @@ class ReviewSnapshot:
     review_comments: list[ReviewComment]
     reactions: list[Reaction]
     checks: list[CheckRun]
+    # GitHub's mergeable state for the PR: ``"MERGEABLE"``, ``"CONFLICTING"``,
+    # or ``"UNKNOWN"``. ``None`` only when callers pre-date this field (kept for
+    # test-fixture compatibility — production callers always populate it).
+    mergeable: str | None = None
 
 
 def fetch_snapshot(*, pr_number: int, repo_path: Path) -> ReviewSnapshot:
@@ -285,6 +309,7 @@ def fetch_snapshot(*, pr_number: int, repo_path: Path) -> ReviewSnapshot:
         review_comments=list_pr_review_comments(pr_number, repo_path=repo_path),
         reactions=list_pr_reactions(pr_number, repo_path=repo_path),
         checks=list_pr_checks(pr_number, repo_path=repo_path, head_sha=head),
+        mergeable=get_pr_mergeable(pr_number, repo_path=repo_path),
     )
 
 
@@ -476,6 +501,7 @@ async def drive_review_loop(
             review_comments=snap.review_comments,
             reactions=snap.reactions,
             checks=snap.checks,
+            mergeable=snap.mergeable,
         )
         if snap.head_sha != last_seen_head_sha:
             if first_poll and last_seen_head_sha:
@@ -497,6 +523,7 @@ async def drive_review_loop(
                 "round": rounds_used,
                 "review_comments": len(verdict.review_comments),
                 "ci_failures": len(verdict.ci_failures),
+                "merge_conflict": verdict.merge_conflict,
             },
         )
 
@@ -533,6 +560,8 @@ async def drive_review_loop(
                 comments=verdict.review_comments,
                 ci_failures=verdict.ci_failures,
                 review_body=verdict.last_review_body,
+                merge_conflict=verdict.merge_conflict,
+                base_branch=cfg.repo.default_branch,
             )
 
             resume = select_resume_session(rounds_used, session_id)
@@ -676,6 +705,8 @@ def _default_render_review_prompt(
     comments: list[ReviewComment],
     ci_failures: list[CheckRun],
     review_body: str = "",
+    merge_conflict: bool = False,
+    base_branch: str = "",
 ) -> str:
     """Fallback renderer used when the caller didn't pass one. Renders
     `prompts/review.md.j2` against the cfg's prompts_dir."""
@@ -690,5 +721,7 @@ def _default_render_review_prompt(
             "comments": comments,
             "ci_failures": ci_failures,
             "review_body": review_body,
+            "merge_conflict": merge_conflict,
+            "base_branch": base_branch,
         },
     )

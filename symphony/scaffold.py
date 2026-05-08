@@ -64,7 +64,22 @@ Task: implement the change described in the issue.
 - When done, exit cleanly.
 """
 
-REVIEW_TEMPLATE = """Codex requested changes on commit {{ sha }}. Address the feedback below.
+REVIEW_TEMPLATE = """{% if merge_conflict -%}
+The PR is approved but cannot be merged: it conflicts with `{{ base_branch }}`.
+Resolve the conflicts on commit {{ sha }} so the branch can fast-forward cleanly.
+
+## How to resolve
+
+1. `git fetch origin {{ base_branch }}`
+2. `git merge origin/{{ base_branch }}` (do NOT rebase - preserve commit history).
+3. Resolve every conflicted file. Read both sides, keep the intent of each
+   change, and re-run any tests touched by the conflicting hunks.
+4. `git add` the resolved files and complete the merge commit.
+5. Confirm `git status` is clean and tests pass.
+
+Do not push - Symphony will push the merge commit and re-request review.
+{%- else -%}
+Codex requested changes on commit {{ sha }}. Address the feedback below.
 
 {% if review_body -%}
 ## Reviewer note
@@ -89,6 +104,7 @@ REVIEW_TEMPLATE = """Codex requested changes on commit {{ sha }}. Address the fe
 
 {% endif -%}
 When done, ensure tests pass and commit. Do not push - Symphony will push.
+{%- endif %}
 """
 
 

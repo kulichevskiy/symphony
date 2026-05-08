@@ -580,6 +580,25 @@ def get_pr_head_sha(pr_number: int, *, repo_path: Path) -> str:
     return sha
 
 
+def get_pr_mergeable(pr_number: int, *, repo_path: Path) -> str:
+    """Return GitHub's ``mergeable`` state for a PR.
+
+    Values: ``"MERGEABLE"``, ``"CONFLICTING"``, ``"UNKNOWN"``. GitHub computes
+    mergeability lazily, so a freshly-pushed PR often returns ``UNKNOWN`` for a
+    few seconds before resolving. Callers should treat ``UNKNOWN`` as
+    "re-poll", not as an approval blocker.
+    """
+    out = _run_gh(
+        ["pr", "view", str(pr_number), "--json", "mergeable"],
+        cwd=repo_path,
+    )
+    data = _parse_json(out, context=f"gh pr view {pr_number} mergeable")
+    value = str(data.get("mergeable") or "").upper()
+    if value not in ("MERGEABLE", "CONFLICTING", "UNKNOWN"):
+        return "UNKNOWN"
+    return value
+
+
 def _as_int_or_none(value: Any) -> int | None:
     if value is None:
         return None
