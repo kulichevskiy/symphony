@@ -15,6 +15,7 @@ import aiosqlite
 # Statuses that mean "this run is supposed to be alive". Kept as a tuple so
 # callers (poll dedupe, reconcile) share a single source of truth.
 LIVE_STATUSES: tuple[str, ...] = ("running",)
+DISPATCH_DEDUPE_STATUSES: tuple[str, ...] = ("running", "completed")
 
 
 @dataclass
@@ -100,6 +101,43 @@ async def create_if_no_active(
     return (cur.rowcount or 0) > 0
 
 
+async def create_if_not_dispatched(
+    conn: aiosqlite.Connection,
+    *,
+    id: str,
+    issue_id: str,
+    stage: str,
+    status: str,
+    pid: int | None,
+    started_at: str,
+    cost_usd: float = 0.0,
+) -> bool:
+    """Atomic dispatch dedupe: insert iff no running or completed run exists."""
+    placeholders = ",".join("?" * len(DISPATCH_DEDUPE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
+        SELECT ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders})
+        )
+        """,
+        (
+            id,
+            issue_id,
+            stage,
+            status,
+            pid,
+            started_at,
+            cost_usd,
+            issue_id,
+            *DISPATCH_DEDUPE_STATUSES,
+        ),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
 async def update_status(
     conn: aiosqlite.Connection,
     run_id: str,
@@ -141,10 +179,10 @@ async def has_running_or_completed(
     `failed` / `interrupted` deliberately do NOT dedupe — those are
     retry-eligible.
     """
+    placeholders = ",".join("?" * len(DISPATCH_DEDUPE_STATUSES))
     cur = await conn.execute(
-        "SELECT 1 FROM runs WHERE issue_id = ? "
-        "AND status IN ('running', 'completed') LIMIT 1",
-        (issue_id,),
+        f"SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders}) LIMIT 1",
+        (issue_id, *DISPATCH_DEDUPE_STATUSES),
     )
     row = await cur.fetchone()
     return row is not None

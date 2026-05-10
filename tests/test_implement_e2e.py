@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -231,6 +231,10 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
 
         # No PR opened on failure.
         gh.pr_create.assert_not_awaited()
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-todo"),
+        ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"

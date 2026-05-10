@@ -207,7 +207,7 @@ class Orchestrator:
             title=issue.title,
             team_key=issue.team_key,
         )
-        inserted = await db.runs.create_if_no_active(
+        inserted = await db.runs.create_if_not_dispatched(
             self._conn,
             id=run_id,
             issue_id=issue.id,
@@ -218,7 +218,7 @@ class Orchestrator:
         )
         if not inserted:
             log.info(
-                "skipping dispatch for %s: another dispatcher won the race",
+                "skipping dispatch for %s: already running or completed",
                 issue.identifier,
             )
             return None
@@ -230,19 +230,33 @@ class Orchestrator:
             await self._fail_run(run_id, f"team_states failed: {e}")
             return run_id
 
+        ready_id = states.get(binding.linear_states.ready)
         in_progress_id = states.get(binding.linear_states.in_progress)
-        if in_progress_id is None:
+        missing_state = next(
+            (
+                state
+                for state, state_id in (
+                    (binding.linear_states.ready, ready_id),
+                    (binding.linear_states.in_progress, in_progress_id),
+                )
+                if state_id is None
+            ),
+            None,
+        )
+        if missing_state is not None:
             log.warning(
                 "could not dispatch %s: missing Linear state %r for team %s",
                 issue.identifier,
-                binding.linear_states.in_progress,
+                missing_state,
                 binding.linear_team_key,
             )
             await self._fail_run(
                 run_id,
-                f"missing Linear state: {binding.linear_states.in_progress}",
+                f"missing Linear state: {missing_state}",
             )
             return run_id
+        assert ready_id is not None
+        assert in_progress_id is not None
 
         log.info(
             "dispatching %s (%s) -> %s [run_id=%s]",
@@ -291,7 +305,12 @@ class Orchestrator:
             workspace_path = await self._workspace.acquire(binding, issue)
         except Exception as e:  # noqa: BLE001 — surface as failed run
             log.exception("workspace acquire failed for %s", issue.identifier)
-            await self._fail_run(run_id, str(e))
+            await self._fail_run_and_reset_issue(
+                run_id,
+                str(e),
+                issue=issue,
+                ready_state_id=ready_id,
+            )
             return run_id
 
         try:
@@ -325,7 +344,12 @@ class Orchestrator:
                 final_kind,
                 final_returncode,
             )
-            await self._fail_run(run_id, f"runner ended with {final_kind}")
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"runner ended with {final_kind}",
+                issue=issue,
+                ready_state_id=ready_id,
+            )
             return run_id
 
         # 5. Push branch, open PR, post stage-transition comment.
@@ -334,7 +358,12 @@ class Orchestrator:
             await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
             log.warning("git push failed for %s: %s", issue.identifier, e)
-            await self._fail_run(run_id, f"push failed: {e}")
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"push failed: {e}",
+                issue=issue,
+                ready_state_id=ready_id,
+            )
             return run_id
 
         pr_url: str = ""
@@ -348,7 +377,12 @@ class Orchestrator:
             )
         except GitHubError as e:
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
-            await self._fail_run(run_id, f"pr_create failed: {e}")
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"pr_create failed: {e}",
+                issue=issue,
+                ready_state_id=ready_id,
+            )
             return run_id
 
         try:
@@ -430,6 +464,24 @@ class Orchestrator:
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+
+    async def _fail_run_and_reset_issue(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        issue: LinearIssue,
+        ready_state_id: str,
+    ) -> None:
+        await self._fail_run(run_id, reason)
+        try:
+            await self.linear.move_issue(issue.id, ready_state_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s back to ready after failed dispatch: %s",
+                issue.identifier,
+                e,
+            )
 
 
 __all__ = [

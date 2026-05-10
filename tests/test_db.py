@@ -281,6 +281,37 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_if_not_dispatched_blocks_completed_runs(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="done",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        inserted = await db.runs.create_if_not_dispatched(
+            conn,
+            id="retry",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        assert inserted is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_list_recent_keeps_active_runs_outside_limit(tmp_path: Path) -> None:
     """`runs ls` advertises "active + recent runs"; a long-running live run
     must remain visible even when newer terminated runs would otherwise

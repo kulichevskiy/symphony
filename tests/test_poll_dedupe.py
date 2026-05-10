@@ -20,7 +20,7 @@ from symphony.orchestrator.poll import Orchestrator
 
 def test_orchestrator_no_longer_uses_in_memory_dispatched_dict() -> None:
     src = inspect.getsource(Orchestrator)
-    assert "_dispatched" not in src, (
+    assert "self._dispatched" not in src, (
         "the in-memory dedupe ledger must be replaced by a SQLite query"
     )
 
@@ -79,7 +79,7 @@ def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
         workspace=workspace,
         push_fn=push_fn,
     )
-    orch._states = {"ENG": {"In Progress": "state-progress"}}  # noqa: SLF001
+    orch._states = {"ENG": {"Todo": "state-todo", "In Progress": "state-progress"}}  # noqa: SLF001
     return orch
 
 
@@ -191,7 +191,7 @@ async def test_failed_state_move_clears_dedupe_so_next_tick_retries(
         linear.move_issue = AsyncMock(side_effect=LinearError("boom"))
 
         orch = _make_orch(cfg, linear, conn)
-        orch._states = {"ENG": {"In Progress": "state-progress"}}  # noqa: SLF001
+        orch._states = {"ENG": {"Todo": "state-todo", "In Progress": "state-progress"}}  # noqa: SLF001
 
         await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
         assert await db.runs.has_running_or_completed(conn, "iss-1") is False
