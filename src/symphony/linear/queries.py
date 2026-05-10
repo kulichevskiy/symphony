@@ -68,7 +68,7 @@ query IssueComments($id: String!, $after: DateTime!) {
   issue(id: $id) {
     comments(
       first: 50,
-      filter: { createdAt: { gt: $after } },
+      filter: { createdAt: { gte: $after } },
       orderBy: createdAt
     ) {
       nodes {

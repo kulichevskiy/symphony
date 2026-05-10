@@ -208,16 +208,17 @@ class Orchestrator:
     async def _poll_slash_commands(self) -> None:
         """For each active run, fetch new comments and dispatch slash intents.
 
-        The cursor lives in `comment_cursors`; we advance it to the latest
-        comment seen on each tick so a restart of the orchestrator does not
-        re-fire previously-handled commands.
+        The cursor (`(timestamp, ids_at_timestamp)`) lives in `comment_cursors`.
+        We query with `gte` and drop any comment whose ID is in the cursor's
+        boundary set, which both (a) avoids re-firing handled commands across
+        restarts and (b) avoids losing comments tied at the boundary timestamp.
         """
         pairs = list(self._dispatch_run_ids.items())
         for issue_id, run_id in pairs:
             if run_id not in self._active_run_ids:
                 continue
             try:
-                after = await self._resolve_comment_cursor(issue_id, run_id)
+                after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
             except Exception:  # noqa: BLE001 — keep loop alive
                 log.exception("failed to resolve cursor for issue %s", issue_id)
                 continue
@@ -226,24 +227,45 @@ class Orchestrator:
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
-            if not comments:
+            fresh = [c for c in comments if c.id not in seen_ids]
+            if not fresh:
                 continue
-            latest = max(c.created_at for c in comments)
+            latest = max(c.created_at for c in fresh)
+            latest_ids = {c.id for c in fresh if c.created_at == latest}
+            # If the new boundary equals the previous boundary, accumulate the
+            # known IDs so we keep deduping any we already handled.
+            if _parse_rfc3339(latest) == after:
+                latest_ids |= seen_ids
             try:
-                await db.comment_cursors.set(self._conn, issue_id, latest)
+                await db.comment_cursors.set(
+                    self._conn, issue_id, latest, latest_ids
+                )
             except Exception:  # noqa: BLE001
                 log.exception("failed to persist comment cursor for %s", issue_id)
-            for intent in slash.parse(comments):
+            for intent in slash.parse(fresh):
                 await self._handle_slash_intent(issue_id, run_id, intent)
 
     async def _resolve_comment_cursor(
         self, issue_id: str, run_id: str
-    ) -> datetime:
+    ) -> tuple[datetime, set[str]]:
+        """Resolve the cursor, clamped to the current run's `started_at`.
+
+        Without the clamp, a stale slash comment posted between two runs on
+        the same issue would still be `> stored_cursor` when the next run
+        starts, and the first poll tick could immediately kill it even though
+        the command was not intended for it.
+        """
+        run_started = await self._run_started_at(run_id)
         stored = await db.comment_cursors.get(self._conn, issue_id)
-        if stored is not None:
-            return _parse_rfc3339(stored)
-        # Default: comments since the run started, so we don't sweep the
-        # whole historical comment trail on the first tick.
+        if stored is None:
+            return run_started, set()
+        stored_at, stored_ids = stored
+        stored_dt = _parse_rfc3339(stored_at)
+        if stored_dt < run_started:
+            return run_started, set()
+        return stored_dt, set(stored_ids)
+
+    async def _run_started_at(self, run_id: str) -> datetime:
         cur = await self._conn.execute(
             "SELECT started_at FROM runs WHERE id = ?", (run_id,)
         )

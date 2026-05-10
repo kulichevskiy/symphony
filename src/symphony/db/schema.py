@@ -26,4 +26,16 @@ async def connect(path: Path) -> aiosqlite.Connection:
 async def apply_schema(conn: aiosqlite.Connection) -> None:
     sql = _SCHEMA_PATH.read_text()
     await conn.executescript(sql)
+    await _migrate(conn)
     await conn.commit()
+
+
+async def _migrate(conn: aiosqlite.Connection) -> None:
+    """Idempotent column adds for tables that pre-existed prior schema bumps."""
+    cur = await conn.execute("PRAGMA table_info(comment_cursors)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "last_seen_ids" not in cols:
+        await conn.execute(
+            "ALTER TABLE comment_cursors "
+            "ADD COLUMN last_seen_ids TEXT NOT NULL DEFAULT '[]'"
+        )

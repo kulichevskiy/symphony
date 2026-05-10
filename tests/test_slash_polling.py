@@ -155,7 +155,96 @@ async def test_cursor_persisted_after_fetch(tmp_path: Path) -> None:
         await orch._poll_slash_commands()  # noqa: SLF001
 
         cursor = await db.comment_cursors.get(conn, "iss-1")
-        assert cursor == "2026-05-10T12:00:00+00:00"
+        assert cursor == ("2026-05-10T12:00:00+00:00", ["c2"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_boundary_tied_comment_not_double_fired(tmp_path: Path) -> None:
+    """Tick 1 sees one comment at T; tick 2 re-fetches it (gte) and must
+    drop it via the cursor's boundary-id set rather than re-firing."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        boundary = "2026-05-10T12:00:00+00:00"
+        linear.comments_since = AsyncMock(
+            return_value=[_comment("/stop", cid="c1", created_at=boundary)]
+        )
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        orch._active_run_ids.add("run-1")  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+        assert orch._runner.kill.await_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
+
+        # Tick 2 — gte returns the same comment plus a new same-timestamp
+        # comment that wasn't visible on tick 1 (e.g. pagination split).
+        # The already-handled c1 must be deduped; only c2 should fire.
+        linear.comments_since.return_value = [
+            _comment("/stop", cid="c1", created_at=boundary),
+            _comment("/stop", cid="c2", created_at=boundary),
+        ]
+        await orch._poll_slash_commands()  # noqa: SLF001
+        # One additional kill — for c2 only, not c1.
+        assert orch._runner.kill.await_count == 2  # type: ignore[attr-defined]  # noqa: SLF001
+
+        cursor = await db.comment_cursors.get(conn, "iss-1")
+        assert cursor is not None
+        last_at, last_ids = cursor
+        assert last_at == boundary
+        assert sorted(last_ids) == ["c1", "c2"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_cursor_clamped_to_run_start(tmp_path: Path) -> None:
+    """A stale `/stop` posted between runs (after run A ended, before run B
+    started) must NOT be replayed against run B."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        # Seed a stored cursor from run A that predates run B's start.
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.comment_cursors.set(
+            conn, "iss-1", "2026-05-10T08:00:00+00:00", ["old"]
+        )
+        # Run B starts at T2; the stale /stop sits between cursor and run start.
+        await db.runs.create(
+            conn,
+            id="run-b",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        orch._active_run_ids.add("run-b")  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = "run-b"  # noqa: SLF001
+
+        # Linear is queried with `after >= run_started`; assert that here, and
+        # return only stale comments before run_started to confirm they would
+        # be filtered out by the API. We assert the after timestamp is run B's
+        # start, not the stored (older) cursor.
+        linear.comments_since = AsyncMock(return_value=[])
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert linear.comments_since.await_count == 1
+        after_arg = linear.comments_since.await_args.args[1]
+        assert after_arg.isoformat() == "2026-05-10T10:00:00+00:00"
+        orch._runner.kill.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
 
