@@ -17,9 +17,11 @@ from pathlib import Path
 
 import click
 
+from . import db
 from .config import Config
 from .linear.client import Linear, LinearError
 from .orchestrator.poll import Orchestrator
+from .orchestrator.reconcile import reconcile
 
 
 def _setup_logging() -> None:
@@ -55,15 +57,20 @@ async def _run(config_path: Path, *, once: bool) -> None:
         click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
         sys.exit(2)
     async with Linear(cfg.linear_api_key) as linear:
-        orch = Orchestrator(cfg, linear)
-        if once:
-            await orch.warmup()
-            await orch._tick()  # pylint: disable=protected-access
-            return
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(orch.shutdown()))
-        await orch.run()
+        conn = await db.connect(cfg.db_path)
+        try:
+            await reconcile(conn, linear)
+            orch = Orchestrator(cfg, linear, conn)
+            if once:
+                await orch.warmup()
+                await orch._tick()  # pylint: disable=protected-access
+                return
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(orch.shutdown()))
+            await orch.run()
+        finally:
+            await conn.close()
 
 
 @main.command()
