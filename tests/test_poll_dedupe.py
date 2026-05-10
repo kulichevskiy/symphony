@@ -1,33 +1,83 @@
 """The poll loop dedupes via SQLite, not the old in-memory `_dispatched`
 dict. Re-scanning an issue that already has an active run must not
-post a second comment."""
+re-dispatch."""
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
 from symphony import db
-from symphony.config import Config, RepoBinding
+from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
+from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 
 
 def test_orchestrator_no_longer_uses_in_memory_dispatched_dict() -> None:
     src = inspect.getsource(Orchestrator)
-    assert "_dispatched" not in src, (
+    assert "self._dispatched" not in src, (
         "the in-memory dedupe ledger must be replaced by a SQLite query"
     )
 
 
+class _FakeRunner:
+    def __init__(self, events: list[RunnerEvent]) -> None:
+        self.events = events
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        return self._aiter()
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        for ev in self.events:
+            yield ev
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+class _BlockingRunner:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.killed = asyncio.Event()
+        self.run_id: str | None = None
+        self.killed_run_id: str | None = None
+        self._forever = asyncio.Event()
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        return self._aiter(spec)
+
+    async def _aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.run_id = spec.run_id
+        self.started.set()
+        yield RunnerEvent(kind="started", pid=4242)
+        await self._forever.wait()
+
+    async def kill(self, run_id: str) -> None:
+        self.killed_run_id = run_id
+        self.killed.set()
+
+
 def _binding() -> RepoBinding:
-    return RepoBinding(linear_team_key="ENG", github_repo="org/repo")
+    return RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo"),
+    )
 
 
-def _issue(uid: str = "iss-1", ident: str = "ENG-1") -> LinearIssue:
+def _issue(
+    uid: str = "iss-1",
+    ident: str = "ENG-1",
+    *,
+    state_name: str = "Todo",
+    labels: list[str] | None = None,
+) -> LinearIssue:
     return LinearIssue(
         id=uid,
         identifier=ident,
@@ -35,14 +85,220 @@ def _issue(uid: str = "iss-1", ident: str = "ENG-1") -> LinearIssue:
         description="",
         url="https://linear.app/x",
         state_id="state-todo",
-        state_name="Todo",
+        state_name=state_name,
         state_type="unstarted",
         team_key="ENG",
+        labels=labels or [],
     )
 
 
+def _make_orch(
+    cfg: Config,
+    linear: AsyncMock,
+    conn: object,
+    *,
+    runner: Runner | None = None,
+) -> Orchestrator:
+    workspace = MagicMock()
+    workspace.acquire = AsyncMock(return_value=Path("/dev/null"))
+    workspace.release = MagicMock()
+    gh = MagicMock()
+    gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
+    gh.repo_default_branch = AsyncMock(return_value="main")
+    push_fn = AsyncMock()
+    orch = Orchestrator(
+        cfg,
+        linear,
+        conn,  # type: ignore[arg-type]
+        runner=runner or _FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
+        gh=gh,
+        workspace=workspace,
+        push_fn=push_fn,
+    )
+    orch._states = {"ENG": {"Todo": "state-todo", "In Progress": "state-progress"}}  # noqa: SLF001
+    linear.lookup_issue = AsyncMock(return_value=_issue())
+    return orch
+
+
+async def _scan_and_wait(orch: Orchestrator, binding: RepoBinding) -> None:
+    tasks = await orch._scan_binding(binding)  # noqa: SLF001
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
 @pytest.mark.asyncio
-async def test_scan_skips_issues_with_active_run(tmp_path: Path) -> None:
+async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(
+            return_value=[_issue(), _issue("iss-2", "ENG-2")]
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_dispatch(
+            binding: RepoBinding, issue: LinearIssue
+        ) -> str | None:
+            started.set()
+            await release.wait()
+            return issue.id
+
+        orch._dispatch_one = AsyncMock(side_effect=_slow_dispatch)  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await asyncio.wait_for(
+            orch._scan_binding(cfg.repos[0]),  # noqa: SLF001
+            timeout=0.2,
+        )
+
+        assert len(tasks) == 2
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_kills_and_cancels_active_dispatch(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding], poll_interval_secs=300)
+        linear = AsyncMock()
+        linear.viewer_team_keys = AsyncMock(return_value=["ENG"])
+        linear.team_states = AsyncMock(
+            return_value={"Todo": "state-todo", "In Progress": "state-progress"}
+        )
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        runner = _BlockingRunner()
+        orch = _make_orch(cfg, linear, conn, runner=runner)
+
+        run_task = asyncio.create_task(orch.run())
+        await asyncio.wait_for(runner.started.wait(), timeout=1)
+        await orch.shutdown()
+        await asyncio.wait_for(run_task, timeout=1)
+
+        assert runner.killed_run_id == runner.run_id
+        assert runner.killed.is_set()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.status for run in history] == ["failed"]
+        assert history[0].ended_at is not None
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+        assert linear.move_issue.await_args_list[-1] == call("iss-1", "state-todo")
+        assert orch._dispatch_tasks == set()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_dispatch_revalidates_ready_state_before_running(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        first = _issue()
+        second = _issue("iss-2", "ENG-2")
+        stale_second = _issue("iss-2", "ENG-2", state_name="In Progress")
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[first, second])
+
+        orch = _make_orch(cfg, linear, conn)
+        linear.lookup_issue = AsyncMock(side_effect=[first, stale_second])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_dispatch(
+            binding: RepoBinding, issue: LinearIssue
+        ) -> str | None:
+            started.set()
+            await release.wait()
+            return issue.id
+
+        orch._dispatch_one = AsyncMock(side_effect=_slow_dispatch)  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await orch._scan_binding(binding)  # noqa: SLF001
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        await asyncio.gather(*tasks)
+
+        assert orch._dispatch_one.await_count == 1  # noqa: SLF001
+        orch._dispatch_one.assert_awaited_once_with(binding, first)  # noqa: SLF001
+        assert linear.lookup_issue.await_args_list == [call("iss-1"), call("iss-2")]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_issue_label_is_not_required_during_revalidation(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(update={"issue_label": ""})
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[issue])
+
+        orch = _make_orch(cfg, linear, conn)
+        linear.lookup_issue = AsyncMock(return_value=issue)
+        orch._dispatch_one = AsyncMock(return_value=issue.id)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        linear.issues_in_state.assert_awaited_once_with("ENG", "Todo", "")
+        orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_caps_scheduled_tasks_to_available_slots(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(update={"max_concurrent": 1})
+        cfg = Config(repos=[binding], global_max_concurrent=1)
+        issues = [_issue(f"iss-{n}", f"ENG-{n}") for n in range(3)]
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=issues)
+
+        orch = _make_orch(cfg, linear, conn)
+        linear.lookup_issue = AsyncMock(return_value=issues[0])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_dispatch(
+            binding: RepoBinding, issue: LinearIssue
+        ) -> str | None:
+            started.set()
+            await release.wait()
+            return issue.id
+
+        orch._dispatch_one = AsyncMock(side_effect=_slow_dispatch)  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await orch._scan_binding(binding)  # noqa: SLF001
+        assert len(tasks) == 1
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert await orch._scan_binding(binding) == []  # noqa: SLF001
+
+        release.set()
+        await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_skips_issues_with_running_run(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(repos=[_binding()])
@@ -50,25 +306,32 @@ async def test_scan_skips_issues_with_active_run(tmp_path: Path) -> None:
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
-        orch = Orchestrator(cfg, linear, conn)
+        orch = _make_orch(cfg, linear, conn)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="running",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
 
-        # First tick dispatches and records an active run.
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
-        assert linear.post_comment.await_count == 1
-
-        # Second tick must dedupe via the SQLite `runs` table, not a dict.
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
-        assert linear.post_comment.await_count == 1
+        await _scan_and_wait(orch, cfg.repos[0])
+        linear.post_comment.assert_not_awaited()
     finally:
         await conn.close()
 
 
 @pytest.mark.asyncio
 async def test_run_row_is_persisted_before_post_comment(tmp_path: Path) -> None:
-    """Dedupe correctness: the `runs` row must exist before the API call so
-    a crash or DB error after `post_comment` can't leave the issue
-    dispatched-but-unrecorded. We assert ordering by checking the DB from
-    inside the mocked `post_comment`."""
+    """Dedupe correctness: the `runs` row must exist before the first
+    Linear write so a crash after `post_comment` can't leave the issue
+    dispatched-but-unrecorded. Asserted by inspecting the DB from inside
+    the mocked `post_comment`."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(repos=[_binding()])
@@ -78,17 +341,18 @@ async def test_run_row_is_persisted_before_post_comment(tmp_path: Path) -> None:
         observed: dict[str, bool] = {}
 
         async def _post(issue_id: str, body: str) -> str:
-            observed["had_active_when_posting"] = await db.runs.has_active(
-                conn, issue_id
+            observed.setdefault(
+                "had_active_when_first_post",
+                await db.runs.has_active(conn, issue_id),
             )
             return "cmt-1"
 
         linear.post_comment = AsyncMock(side_effect=_post)
 
-        orch = Orchestrator(cfg, linear, conn)
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        orch = _make_orch(cfg, linear, conn)
+        await _scan_and_wait(orch, cfg.repos[0])
 
-        assert observed.get("had_active_when_posting") is True
+        assert observed.get("had_active_when_first_post") is True
     finally:
         await conn.close()
 
@@ -97,9 +361,9 @@ async def test_run_row_is_persisted_before_post_comment(tmp_path: Path) -> None:
 async def test_failed_announce_clears_dedupe_so_next_tick_retries(
     tmp_path: Path,
 ) -> None:
-    """If `post_comment` raises, the run row must be marked non-live so the
-    next poll can retry. Otherwise a transient Linear error would jam the
-    issue forever behind its own dedupe row."""
+    """If the ▶ `post_comment` raises, the run row must be marked
+    non-live so the next poll can retry. Otherwise a transient Linear
+    error would jam the issue forever behind its own dedupe row."""
     from symphony.linear.client import LinearError
 
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -107,21 +371,78 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
-        # First call fails, second succeeds.
+        # First scan's ▶ comment raises; second scan succeeds.
         linear.post_comment = AsyncMock(
-            side_effect=[LinearError("boom"), "cmt-1"]
+            side_effect=[LinearError("boom"), "cmt-1", "cmt-2"]
         )
 
-        orch = Orchestrator(cfg, linear, conn)
+        orch = _make_orch(cfg, linear, conn)
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
-        assert linear.post_comment.await_count == 1
+        await _scan_and_wait(orch, cfg.repos[0])
         # The failed announce row exists but is no longer live, so dedupe
         # lets the next tick retry.
         assert await db.runs.has_active(conn, "iss-1") is False
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
+        # Second tick re-announces and proceeds (>= 2 total post_comment calls).
+        assert linear.post_comment.await_count >= 2
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_state_move_clears_dedupe_so_next_tick_retries(
+    tmp_path: Path,
+) -> None:
+    """If the Linear move to In Progress fails, do not continue to a completed
+    run while the issue is still in the ready state."""
+    from symphony.linear.client import LinearError
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(side_effect=LinearError("boom"))
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {"ENG": {"Todo": "state-todo", "In Progress": "state-progress"}}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+
+        await _scan_and_wait(orch, cfg.repos[0])
         assert linear.post_comment.await_count == 2
-        assert await db.runs.has_active(conn, "iss-1") is True
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.status for run in history] == ["failed", "failed"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_in_progress_state_clears_dedupe_so_next_tick_retries(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {"ENG": {}}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+        linear.post_comment.assert_not_awaited()
+
+        await _scan_and_wait(orch, cfg.repos[0])
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.status for run in history] == ["failed", "failed"]
     finally:
         await conn.close()

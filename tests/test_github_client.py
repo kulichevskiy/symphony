@@ -82,6 +82,16 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no
 # ---- pr_create ------------------------------------------------------
 
 
+async def test_repo_default_branch_reads_repo_view(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps({"defaultBranchRef": {"name": "trunk"}})
+    log = fake_gh({"repo view org/r": [0, payload]})
+    gh = GitHub()
+    assert await gh.repo_default_branch("org/r") == "trunk"
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv == ["repo", "view", "org/r", "--json", "defaultBranchRef"]
+
+
 async def test_pr_create_appends_linear_url_when_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/42\n"]})
     gh = GitHub()
@@ -118,6 +128,16 @@ async def test_pr_create_omits_relates_when_no_linear_url(fake_gh) -> None:  # t
     assert isinstance(body, list)
     payload = body[body.index("--body") + 1]
     assert "Relates to" not in str(payload)
+
+
+async def test_pr_create_omits_base_when_not_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/1\n"]})
+    gh = GitHub()
+    await gh.pr_create(title="t", body="b", head="x", repo="org/r")
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert "--base" not in argv
+    assert "--head" in argv and argv[argv.index("--head") + 1] == "x"
 
 
 # ---- pr_checks ------------------------------------------------------

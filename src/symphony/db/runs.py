@@ -100,6 +100,43 @@ async def create_if_no_active(
     return (cur.rowcount or 0) > 0
 
 
+async def create_if_not_dispatched(
+    conn: aiosqlite.Connection,
+    *,
+    id: str,
+    issue_id: str,
+    stage: str,
+    status: str,
+    pid: int | None,
+    started_at: str,
+    cost_usd: float = 0.0,
+) -> bool:
+    """Atomic dispatch dedupe: insert iff no live run exists."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
+        SELECT ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders})
+        )
+        """,
+        (
+            id,
+            issue_id,
+            stage,
+            status,
+            pid,
+            started_at,
+            cost_usd,
+            issue_id,
+            *LIVE_STATUSES,
+        ),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
 async def update_status(
     conn: aiosqlite.Connection,
     run_id: str,
@@ -114,9 +151,28 @@ async def update_status(
     await conn.commit()
 
 
+async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int) -> None:
+    await conn.execute("UPDATE runs SET pid = ? WHERE id = ?", (pid, run_id))
+    await conn.commit()
+
+
 async def has_active(conn: aiosqlite.Connection, issue_id: str) -> bool:
-    """True if `issue_id` has any run in a live status. Replaces the
-    in-memory `_dispatched` dict as the dedupe oracle for the poll loop."""
+    """True if `issue_id` has any run in a live status."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders}) LIMIT 1",
+        (issue_id, *LIVE_STATUSES),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def has_running_or_completed(conn: aiosqlite.Connection, issue_id: str) -> bool:
+    """Dedupe oracle for the poll loop.
+
+    Historical name retained for compatibility, but dispatch dedupe is
+    intentionally live-only: completed runs must not block legitimate reruns.
+    """
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders}) LIMIT 1",

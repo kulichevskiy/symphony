@@ -48,6 +48,7 @@ class LocalRunner:
             return
 
         self._active[spec.run_id] = proc
+        yield RunnerEvent(kind="started", pid=proc.pid)
         activity = asyncio.Event()
         stalled = asyncio.Event()
         events: asyncio.Queue[RunnerEvent] = asyncio.Queue()

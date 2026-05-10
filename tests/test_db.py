@@ -263,7 +263,9 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
         assert count == 1
 
         # Once the live run terminates, a new run can be created.
-        await db.runs.update_status(conn, "run-a", "completed", ended_at="2026-05-10T00:02:00+00:00")
+        await db.runs.update_status(
+            conn, "run-a", "completed", ended_at="2026-05-10T00:02:00+00:00"
+        )
         third = await db.runs.create_if_no_active(
             conn,
             id="run-c",
@@ -274,6 +276,39 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
             started_at="2026-05-10T00:03:00+00:00",
         )
         assert third is True
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_create_if_not_dispatched_allows_completed_reruns(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="done",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        inserted = await db.runs.create_if_not_dispatched(
+            conn,
+            id="retry",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        assert inserted is True
     finally:
         await conn.close()
 

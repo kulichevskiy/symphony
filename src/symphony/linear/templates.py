@@ -15,6 +15,31 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Linear silently rejects very long comment bodies. 4 KB is the documented
+# soft cap; truncating in the caller keeps dispatch deterministic when a
+# `failed` comment's log-tail field would otherwise blow past it.
+COMMENT_BYTE_LIMIT = 4096
+
+_TRUNCATION_SUFFIX = "\n\n…[truncated]"
+
+
+def truncate_body(body: str, *, limit: int = COMMENT_BYTE_LIMIT) -> str:
+    """Cap a comment body at `limit` UTF-8 bytes, appending an ellipsis
+    marker when truncation occurs. The marker itself is included inside
+    the limit so the returned string is always within budget."""
+    encoded = body.encode("utf-8")
+    if len(encoded) <= limit:
+        return body
+    if limit <= 0:
+        return ""
+    suffix = _TRUNCATION_SUFFIX
+    suffix_encoded = suffix.encode("utf-8")
+    if len(suffix_encoded) >= limit:
+        return suffix_encoded[:limit].decode("utf-8", errors="ignore")
+    head_budget = limit - len(suffix_encoded)
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    return head + suffix
+
 
 @dataclass
 class CommentVars:

@@ -26,6 +26,8 @@ async def test_runner_streams_stdout_and_exits_clean(tmp_path: Path) -> None:
         stall_secs=10,
     )
     events = [ev async for ev in runner.run(spec)]
+    started = [e for e in events if e.kind == "started"]
+    assert started and started[0].pid is not None
     stdout = [e.line for e in events if e.kind == "stdout"]
     assert stdout == ["hello", "world"]
     exits = [e for e in events if e.kind == "exit"]

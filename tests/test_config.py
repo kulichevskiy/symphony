@@ -9,7 +9,6 @@ from pydantic import ValidationError
 
 from symphony.config import Config, LinearStates
 
-
 _BINDING_STATES = """
     linear_states:
       ready: Todo

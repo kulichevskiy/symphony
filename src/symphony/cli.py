@@ -100,6 +100,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access
+                await orch.drain_dispatch_tasks()
                 return
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -298,15 +299,14 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
             await conn.close()
         if run_id is None:
             click.echo(
-                f"{issue.identifier} already has an active run; refusing to "
+                f"{issue.identifier} already has a running run; refusing to "
                 f"start a duplicate. Inspect with `symphony runs ls`.",
                 err=True,
             )
             sys.exit(1)
         if rwi is not None and rwi.run.status == "failed":
             click.echo(
-                f"dispatch failed for {issue.identifier}: announce comment did "
-                f"not post; run {run_id} marked failed",
+                f"dispatch failed for {issue.identifier}; run {run_id} marked failed",
                 err=True,
             )
             sys.exit(1)

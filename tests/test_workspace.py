@@ -175,7 +175,6 @@ async def test_sweep_ttl_skips_in_use_workspace_even_if_mtime_is_stale(
 
     # Long-running stage: no git ops, file mtimes go stale.
     now = time.time()
-    ttl = 7 * 24 * 3600
     stale = now - 30 * 24 * 3600
     os.utime(path, (stale, stale))
     for marker in (".git/HEAD", ".git/index"):
@@ -202,7 +201,6 @@ async def test_sweep_ttl_keeps_active_workspace_with_recent_git_activity(
     # Simulate a long-running stage: dir mtime is stale, but git
     # operations (HEAD/index) have been touching the workspace.
     now = time.time()
-    ttl = 7 * 24 * 3600
     os.utime(path, (now - 30 * 24 * 3600, now - 30 * 24 * 3600))
 
     await ws.sweep_ttl(now=now)
