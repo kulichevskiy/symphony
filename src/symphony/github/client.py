@@ -209,9 +209,11 @@ class GitHub:
         pr: int | str,
         *,
         strategy: MergeStrategy = "squash",
-        auto: bool = True,
+        auto: bool = False,
         repo: str | None = None,
     ) -> None:
+        # `--auto` requires repo-level auto-merge to be enabled, so callers
+        # must opt in. Default behavior is a plain merge that works anywhere.
         argv = ["pr", "merge", str(pr), f"--{strategy}", *self._repo_args(repo)]
         if auto:
             argv.append("--auto")

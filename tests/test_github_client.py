@@ -185,6 +185,17 @@ async def test_pr_merge_squash_with_auto(fake_gh) -> None:  # type: ignore[no-un
     assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
 
 
+async def test_pr_merge_default_does_not_enable_auto(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # `--auto` requires repo-level auto-merge; default must work everywhere.
+    log = fake_gh({"pr merge": [0, ""]})
+    gh = GitHub()
+    await gh.pr_merge(99, repo="org/r")
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert "--auto" not in argv
+    assert "--squash" in argv
+
+
 # ---- non-zero exit + GH_TOKEN env -----------------------------------
 
 
