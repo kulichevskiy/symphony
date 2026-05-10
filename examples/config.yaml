@@ -11,6 +11,10 @@ db_path: ~/symphony/state.sqlite
 
 # Per-(linear-team, github-repo) bindings. The orchestrator scans each
 # team's issues and routes implementation to the paired repo.
+#
+# `linear_states` is per-binding because teams rename or replace the
+# source state ("Backlog" vs "Todo" vs "Up Next"). `ready` has no default
+# — every binding must declare which state issues are picked up from.
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -19,21 +23,24 @@ repos:
     branch_prefix: symphony
     max_concurrent: 2
     runner: local
+    linear_states:
+      ready: Todo            # source state — orchestrator picks up issues here
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
   - linear_team_key: WEB
     github_repo: org/marketing-web
     agent: claude
     issue_label: symphony
     runner: local
+    linear_states:
+      ready: Backlog
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
 
 # Stuck-loop escapes (mirrors today's Symphony defaults).
 review_iteration_cap: 6
 cost_cap_per_issue_usd: 5.0
-
-# Linear workflow state names that gate dispatch and reflect status.
-# These must exist in each linked team's workflow.
-linear_states:
-  ready: Todo            # source state — orchestrator picks up issues here
-  in_progress: In Progress
-  needs_approval: Needs Approval
-  blocked: Blocked
-  done: Done

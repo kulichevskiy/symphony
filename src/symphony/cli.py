@@ -100,14 +100,22 @@ async def _preflight(config_path: Path) -> None:
                 ok = False
                 continue
             states = await linear.team_states(binding.linear_team_key)
+            ready = binding.linear_states.ready
+            if not ready or ready not in states:
+                click.echo(
+                    f"  ✗ {binding.linear_team_key}: ready state "
+                    f"{ready!r} not in team workflow; "
+                    f"available: {sorted(states.keys())}"
+                )
+                ok = False
+                continue
             missing = [
                 name
                 for name in (
-                    cfg.linear_states.ready,
-                    cfg.linear_states.in_progress,
-                    cfg.linear_states.needs_approval,
-                    cfg.linear_states.blocked,
-                    cfg.linear_states.done,
+                    binding.linear_states.in_progress,
+                    binding.linear_states.needs_approval,
+                    binding.linear_states.blocked,
+                    binding.linear_states.done,
                 )
                 if name not in states
             ]
