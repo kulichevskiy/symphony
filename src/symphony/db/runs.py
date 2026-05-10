@@ -115,12 +115,31 @@ async def update_status(
 
 
 async def has_active(conn: aiosqlite.Connection, issue_id: str) -> bool:
-    """True if `issue_id` has any run in a live status. Replaces the
-    in-memory `_dispatched` dict as the dedupe oracle for the poll loop."""
+    """True if `issue_id` has any run in a live status."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders}) LIMIT 1",
         (issue_id, *LIVE_STATUSES),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def has_running_or_completed(
+    conn: aiosqlite.Connection, issue_id: str
+) -> bool:
+    """Dedupe oracle for the poll loop.
+
+    Returns True for issues with a `running` OR `completed` run so the
+    scan loop does not re-dispatch an issue whose Implement stage has
+    already finished but whose Linear state move hasn't propagated yet.
+    `failed` / `interrupted` deliberately do NOT dedupe — those are
+    retry-eligible.
+    """
+    cur = await conn.execute(
+        "SELECT 1 FROM runs WHERE issue_id = ? "
+        "AND status IN ('running', 'completed') LIMIT 1",
+        (issue_id,),
     )
     row = await cur.fetchone()
     return row is not None

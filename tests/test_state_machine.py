@@ -57,6 +57,8 @@ def test_on_runner_event_implement_transitions(
 
 
 def test_transition_is_frozen_dataclass() -> None:
+    from dataclasses import FrozenInstanceError
+
     t = Transition(next_run_status="completed", next_linear_state=None, halt=True)
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         t.next_run_status = "failed"  # type: ignore[misc]

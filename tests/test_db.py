@@ -263,7 +263,9 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
         assert count == 1
 
         # Once the live run terminates, a new run can be created.
-        await db.runs.update_status(conn, "run-a", "completed", ended_at="2026-05-10T00:02:00+00:00")
+        await db.runs.update_status(
+            conn, "run-a", "completed", ended_at="2026-05-10T00:02:00+00:00"
+        )
         third = await db.runs.create_if_no_active(
             conn,
             id="run-c",

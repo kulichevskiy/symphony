@@ -9,14 +9,58 @@ path the poll loop uses (run row + announce comment).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 from click.testing import CliRunner
 
 from symphony import db
+from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.cli import main
 from symphony.linear.client import LinearIssue
+
+
+class _FakeRunner:
+    def __init__(self, events: list[RunnerEvent]) -> None:
+        self.events = events
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        return self._aiter()
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        for ev in self.events:
+            yield ev
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Stub the heavy components Orchestrator constructs by default so
+    `dispatch` CLI tests do not need a live `gh`, `git push`, or agent
+    binary. The defaults run the full implement flow; mocking them keeps
+    the test focus on routing + dedupe semantics."""
+    fake_workspace = MagicMock()
+    fake_workspace.acquire = AsyncMock(return_value=Path("/tmp/fake-ws"))
+    fake_workspace.release = MagicMock()
+    fake_gh = MagicMock()
+    fake_gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
+    fake_gh.repo_clone = AsyncMock()
+    fake_runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+
+    monkeypatch.setattr(
+        "symphony.orchestrator.poll.LocalRunner", lambda: fake_runner
+    )
+    monkeypatch.setattr("symphony.orchestrator.poll.GitHub", lambda: fake_gh)
+    monkeypatch.setattr(
+        "symphony.orchestrator.poll.Workspace",
+        lambda root, clone_fn: fake_workspace,
+    )
+    monkeypatch.setattr(
+        "symphony.orchestrator.poll._default_push", AsyncMock()
+    )
 
 
 def _populate(p: Path) -> None:
@@ -195,6 +239,7 @@ def test_dispatch_creates_run_for_known_team_binding(
     )
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
+    _install_fake_runtime(monkeypatch)
 
     result = CliRunner().invoke(
         main, ["dispatch", "ENG-42", "--config", str(cfg_path)]
@@ -204,12 +249,15 @@ def test_dispatch_creates_run_for_known_team_binding(
     async def _check() -> None:
         conn = await db.connect(db_path)
         try:
-            assert await db.runs.has_active(conn, "iss-1") is True
+            # After the full Implement flow the run is `completed`, so
+            # `has_running_or_completed` is the dedupe oracle here, not
+            # `has_active` (which only matches `running`).
+            assert await db.runs.has_running_or_completed(conn, "iss-1") is True
         finally:
             await conn.close()
 
     asyncio.run(_check())
-    assert len(fake.posted) == 1, "dispatch should announce on Linear"
+    assert len(fake.posted) >= 1, "dispatch should announce on Linear"
 
 
 def test_runs_ls_rejects_non_positive_limit(tmp_path: Path) -> None:
@@ -284,6 +332,7 @@ repos:
     )
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
+    _install_fake_runtime(monkeypatch)
 
     result = CliRunner().invoke(
         main, ["dispatch", "ENG-200", "--config", str(cfg_path)]
@@ -320,6 +369,7 @@ def test_dispatch_picks_binding_by_issue_label(
     )
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
+    _install_fake_runtime(monkeypatch)
 
     result = CliRunner().invoke(
         main, ["dispatch", "ENG-100", "--config", str(cfg_path)]

@@ -240,7 +240,7 @@ def test_pr_title_and_body_format() -> None:
     contains `Relates to <linear-url>`. Verified by introspecting the
     helper that builds them so the format stays pinned even when the
     full e2e flow is mocked."""
-    from symphony.orchestrator.poll import build_pr_title, build_pr_body
+    from symphony.orchestrator.poll import build_pr_body, build_pr_title
 
     assert build_pr_title(_issue()) == "[ENG-1] Add authentication"
     body = build_pr_body(_issue())
