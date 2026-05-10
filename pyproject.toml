@@ -1,0 +1,50 @@
+[project]
+name = "symphonyd"
+version = "0.0.1"
+description = "Headless, Linear-native, multi-repo orchestrator for AI coding agents."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "aiosqlite>=0.20",
+    "structlog>=24.4",
+    "pyyaml>=6.0",
+    "click>=8.1",
+]
+
+[project.scripts]
+symphony = "symphony.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "types-pyyaml>=6.0.12.20260510",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/symphony"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src/symphony"]
