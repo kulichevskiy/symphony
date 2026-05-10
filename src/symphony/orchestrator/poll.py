@@ -2,7 +2,7 @@
 
 Walking-skeleton scope (iteration 3): scan each configured Linear team for
 issues in the "ready" state with the configured label, post a "would
-dispatch" comment, then mark the issue in-memory so we don't re-comment.
+dispatch" comment, then record a `runs` row so we don't re-comment.
 
 Real dispatch (workspace clone, agent spawn, GitHub PR creation, stage
 transitions) lands in iteration 4+. The structure of this loop is the
@@ -16,6 +16,9 @@ import logging
 import uuid
 from datetime import UTC, datetime
 
+import aiosqlite
+
+from .. import db
 from ..config import Config, RepoBinding
 from ..linear.client import Linear, LinearError, LinearIssue
 from ..linear.templates import CommentVars, run_started
@@ -24,19 +27,13 @@ log = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    """Owns the poll loop and the in-memory dispatch ledger.
+    """Owns the poll loop. Dedupe is a SQLite query over the `runs` table."""
 
-    `_dispatched` is the throwaway in-memory analog of the SQLite `runs`
-    table; iteration 4 replaces it with `db.runs`.
-    """
-
-    def __init__(self, config: Config, linear: Linear) -> None:
+    def __init__(self, config: Config, linear: Linear, conn: aiosqlite.Connection) -> None:
         self.config = config
         self.linear = linear
+        self._conn = conn
         self._shutdown = asyncio.Event()
-        # (linear_uuid -> first-dispatch RFC3339 timestamp). Used in lieu of
-        # SQLite for the walking skeleton so a re-poll doesn't re-comment.
-        self._dispatched: dict[str, str] = {}
         # Cache of (team_key -> {state_name: state_uuid}). Re-fetched on
         # startup; never mutated at runtime.
         self._states: dict[str, dict[str, str]] = {}
@@ -97,12 +94,12 @@ class Orchestrator:
             f" with label '{binding.issue_label}'" if binding.issue_label else "",
         )
         for issue in issues:
-            if issue.id in self._dispatched:
+            if await db.runs.has_active(self._conn, issue.id):
                 continue
             await self._dispatch_one(binding, issue)
 
     async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> None:
-        """Walking-skeleton: just announce and mark dispatched.
+        """Walking-skeleton: announce, then record a `runs` row.
 
         Iteration 4 will:
         - Clone the GitHub repo to `workspace_root / binding.repo_safe / issue.identifier`.
@@ -131,4 +128,19 @@ class Orchestrator:
         except LinearError as e:
             log.warning("could not announce dispatch on %s: %s", issue.identifier, e)
             return
-        self._dispatched[issue.id] = datetime.now(UTC).isoformat()
+        await db.issues.upsert(
+            self._conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.runs.create(
+            self._conn,
+            id=run_id,
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,  # iteration 4 fills this in once a real subprocess is spawned
+            started_at=datetime.now(UTC).isoformat(),
+        )
