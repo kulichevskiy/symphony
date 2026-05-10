@@ -63,6 +63,9 @@ class Workspace:
         path = self.path_for(binding, issue)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         if (path / ".git").exists():
+            # Bump mtime BEFORE git ops so a concurrent sweeper can't
+            # delete the dir between fetch and _ensure_branch.
+            path.touch(exist_ok=True)
             await self._git(path, "fetch", "origin")
         else:
             if path.exists():
@@ -72,7 +75,6 @@ class Workspace:
             path.parent.mkdir(parents=True, exist_ok=True)
             await self._clone_fn(binding.github_repo, path)
         await self._ensure_branch(path, branch)
-        # Bump mtime so an in-flight stage isn't swept mid-run.
         path.touch(exist_ok=True)
         return path
 
@@ -100,12 +102,27 @@ class Workspace:
                 if not issue_dir.is_dir():
                     continue
                 try:
-                    mtime = issue_dir.stat().st_mtime
+                    mtime = self._liveness_mtime(issue_dir)
                 except FileNotFoundError:
                     continue
                 if mtime < threshold:
                     log.info("ttl sweep: removing stale workspace %s", issue_dir)
                     await asyncio.to_thread(shutil.rmtree, issue_dir, ignore_errors=True)
+
+    @staticmethod
+    def _liveness_mtime(issue_dir: Path) -> float:
+        # Editing tracked files doesn't bump the parent dir mtime, so a
+        # long-running stage could be swept mid-run. Git operations
+        # (commit, switch, fetch) update .git/HEAD and .git/index, so
+        # use the newest of these as the heartbeat.
+        mtime = issue_dir.stat().st_mtime
+        for name in ("HEAD", "index"):
+            marker = issue_dir / ".git" / name
+            try:
+                mtime = max(mtime, marker.stat().st_mtime)
+            except FileNotFoundError:
+                continue
+        return mtime
 
     async def run_sweeper(
         self, *, interval_secs: int = DEFAULT_SWEEP_INTERVAL_SECS

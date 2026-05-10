@@ -143,6 +143,24 @@ async def test_cleanup_removes_workspace_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sweep_ttl_keeps_active_workspace_with_recent_git_activity(
+    tmp_path: Path,
+) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+    path = await ws.acquire(_binding(), _issue("ENG-42"))
+
+    # Simulate a long-running stage: dir mtime is stale, but git
+    # operations (HEAD/index) have been touching the workspace.
+    now = time.time()
+    ttl = 7 * 24 * 3600
+    os.utime(path, (now - 30 * 24 * 3600, now - 30 * 24 * 3600))
+
+    await ws.sweep_ttl(now=now)
+    assert path.exists(), "sweep must respect .git/HEAD heartbeat"
+
+
+@pytest.mark.asyncio
 async def test_sweep_ttl_removes_stale_keeps_fresh(tmp_path: Path) -> None:
     root = tmp_path / "ws"
     stale = root / "acme__widgets" / "eng-old"
