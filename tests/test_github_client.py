@@ -186,6 +186,18 @@ async def test_all_passed_treats_skipping_as_pass(fake_gh) -> None:  # type: ign
     assert result.pending is False
 
 
+async def test_all_passed_true_when_no_checks_configured(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # Repos with no required checks return an empty array. Nothing is failing
+    # or pending, so merge gating must not stall on this case.
+    fake_gh({"pr checks": [0, "[]"]})
+    gh = GitHub()
+    result = await gh.pr_checks(14, repo="org/r")
+    assert result.runs == []
+    assert result.all_passed is True
+    assert result.any_failed is False
+    assert result.pending is False
+
+
 # ---- pr_merge -------------------------------------------------------
 
 
