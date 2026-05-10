@@ -115,6 +115,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
             }
         )
         events = [
+            RunnerEvent(kind="started", pid=4242),
             RunnerEvent(kind="stdout", line=json.dumps({"type": "system"})),
             RunnerEvent(kind="stdout", line=result_line),
             RunnerEvent(kind="exit", returncode=0),
@@ -184,6 +185,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert len(history) == 1
         assert history[0].stage == "implement"
         assert history[0].status == "completed"
+        assert history[0].pid == 4242
     finally:
         await conn.close()
 

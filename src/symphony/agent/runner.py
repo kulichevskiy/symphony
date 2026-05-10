@@ -33,10 +33,11 @@ class RunnerSpec:
 
 @dataclass
 class RunnerEvent:
-    kind: Literal["stdout", "stderr", "exit", "stall_timeout", "spawn_failed"]
+    kind: Literal["started", "stdout", "stderr", "exit", "stall_timeout", "spawn_failed"]
     line: str | None = None
     returncode: int | None = None
     error: str | None = None
+    pid: int | None = None
 
 
 class Runner(Protocol):

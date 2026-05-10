@@ -139,6 +139,13 @@ class Orchestrator:
     async def shutdown(self) -> None:
         self._shutdown.set()
 
+    async def _states_for_binding(self, binding: RepoBinding) -> dict[str, str]:
+        states = self._states.get(binding.linear_team_key)
+        if states is None:
+            states = await self.linear.team_states(binding.linear_team_key)
+            self._states[binding.linear_team_key] = states
+        return states
+
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
@@ -216,6 +223,27 @@ class Orchestrator:
             )
             return None
 
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning("could not load states for %s: %s", binding.linear_team_key, e)
+            await self._fail_run(run_id, f"team_states failed: {e}")
+            return run_id
+
+        in_progress_id = states.get(binding.linear_states.in_progress)
+        if in_progress_id is None:
+            log.warning(
+                "could not dispatch %s: missing Linear state %r for team %s",
+                issue.identifier,
+                binding.linear_states.in_progress,
+                binding.linear_team_key,
+            )
+            await self._fail_run(
+                run_id,
+                f"missing Linear state: {binding.linear_states.in_progress}",
+            )
+            return run_id
+
         log.info(
             "dispatching %s (%s) -> %s [run_id=%s]",
             issue.identifier,
@@ -246,20 +274,17 @@ class Orchestrator:
             return run_id
 
         # 2. Move the Linear issue to In Progress.
-        states = self._states.get(binding.linear_team_key, {})
-        in_progress_id = states.get(binding.linear_states.in_progress)
-        if in_progress_id is not None:
-            try:
-                await self.linear.move_issue(issue.id, in_progress_id)
-            except LinearError as e:
-                log.warning(
-                    "could not move %s to %s: %s",
-                    issue.identifier,
-                    binding.linear_states.in_progress,
-                    e,
-                )
-                await self._fail_run(run_id, f"move_issue failed: {e}")
-                return run_id
+        try:
+            await self.linear.move_issue(issue.id, in_progress_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s to %s: %s",
+                issue.identifier,
+                binding.linear_states.in_progress,
+                e,
+            )
+            await self._fail_run(run_id, f"move_issue failed: {e}")
+            return run_id
 
         # 3. Acquire a per-issue workspace clone.
         try:
@@ -383,7 +408,9 @@ class Orchestrator:
         final_returncode: int | None = None
         with log_path.open("a", encoding="utf-8") as logf:
             async for ev in self._runner.run(spec):
-                if ev.kind == "stdout" and ev.line is not None:
+                if ev.kind == "started" and ev.pid is not None:
+                    await db.runs.update_pid(self._conn, run_id, ev.pid)
+                elif ev.kind == "stdout" and ev.line is not None:
                     logf.write(ev.line + "\n")
                     usage = parse_event_line(ev.line)
                     if usage is not None:

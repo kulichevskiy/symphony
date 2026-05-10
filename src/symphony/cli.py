@@ -305,8 +305,7 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
             sys.exit(1)
         if rwi is not None and rwi.run.status == "failed":
             click.echo(
-                f"dispatch failed for {issue.identifier}: announce comment did "
-                f"not post; run {run_id} marked failed",
+                f"dispatch failed for {issue.identifier}; run {run_id} marked failed",
                 err=True,
             )
             sys.exit(1)

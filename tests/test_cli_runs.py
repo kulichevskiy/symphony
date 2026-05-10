@@ -150,6 +150,7 @@ class _FakeLinear:
     def __init__(self, issue: LinearIssue | None) -> None:
         self.issue = issue
         self.posted: list[tuple[str, str]] = []
+        self.moved: list[tuple[str, str]] = []
 
     async def __aenter__(self) -> _FakeLinear:
         return self
@@ -167,6 +168,18 @@ class _FakeLinear:
     async def post_comment(self, issue_uuid: str, body: str) -> str:
         self.posted.append((issue_uuid, body))
         return "cmt-1"
+
+    async def team_states(self, team_key: str) -> dict[str, str]:
+        return {
+            "Todo": "state-todo",
+            "In Progress": "state-progress",
+            "Needs Approval": "state-needs-approval",
+            "Blocked": "state-blocked",
+            "Done": "state-done",
+        }
+
+    async def move_issue(self, issue_id_or_identifier: str, state_id: str) -> None:
+        self.moved.append((issue_id_or_identifier, state_id))
 
 
 def _yaml(team: str, db_path: Path) -> str:
@@ -258,6 +271,7 @@ def test_dispatch_creates_run_for_known_team_binding(
 
     asyncio.run(_check())
     assert len(fake.posted) >= 1, "dispatch should announce on Linear"
+    assert fake.moved == [("iss-1", "state-progress")]
 
 
 def test_runs_ls_rejects_non_positive_limit(tmp_path: Path) -> None:

@@ -114,6 +114,11 @@ async def update_status(
     await conn.commit()
 
 
+async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int) -> None:
+    await conn.execute("UPDATE runs SET pid = ? WHERE id = ?", (pid, run_id))
+    await conn.commit()
+
+
 async def has_active(conn: aiosqlite.Connection, issue_id: str) -> bool:
     """True if `issue_id` has any run in a live status."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
