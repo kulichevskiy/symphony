@@ -116,6 +116,48 @@ async def test_reconcile_treats_eperm_pid_as_alive(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_treats_unexpected_oserror_as_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`os.kill(pid, 0)` can raise OSErrors other than ProcessLookupError /
+    PermissionError — `EINVAL` for a bad PID value, plus platform-specific
+    quirks. Reconcile runs at startup, so letting those propagate would
+    prevent the orchestrator from booting. Treat as alive and continue."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-weird", identifier="ENG-4", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="weird",
+            issue_id="iss-weird",
+            stage="implement",
+            status="running",
+            pid=123,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        def fake_kill(pid: int, sig: int) -> None:
+            raise OSError(22, "Invalid argument")  # EINVAL
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock()
+        flipped = await reconcile(conn, linear)
+
+        assert flipped == 0
+        linear.post_comment.assert_not_awaited()
+        cur = await conn.execute("SELECT status FROM runs WHERE id=?", ("weird",))
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == "running"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_no_live_runs_is_a_noop(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

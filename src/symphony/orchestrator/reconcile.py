@@ -30,16 +30,18 @@ _RETRY_BODY = (
 def _process_alive(pid: int) -> bool:
     """`os.kill(pid, 0)` is the standard liveness probe: it returns 0 if the
     PID is reachable, raises `ProcessLookupError` (ESRCH) if no such process
-    exists, and `PermissionError` (EPERM) if the PID is alive but owned by
-    another user/session. Treating EPERM as dead would let reconcile mark a
-    sibling-owned run `interrupted` and invite `/retry` while a worker is
-    still running, so we only count ESRCH as dead and default everything
-    else to alive."""
+    exists, and various other `OSError`s (`EPERM` for foreign-owned PIDs,
+    `EINVAL` for bad PID values, plus platform-specific oddities) when it
+    can't decide. ESRCH is the only signal that proves death — anything
+    else means the process might still be alive. Defaulting unknown-state
+    errors to dead would either mark a sibling-owned run `interrupted` (and
+    invite `/retry` while a worker is still running) or, worse, crash
+    `reconcile()` at startup and prevent the orchestrator from booting."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
+    except OSError:
         return True
     return True
 
