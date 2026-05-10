@@ -28,11 +28,19 @@ _RETRY_BODY = (
 
 
 def _process_alive(pid: int) -> bool:
-    """`os.kill(pid, 0)` raises OSError if the PID is dead or not ours."""
+    """`os.kill(pid, 0)` is the standard liveness probe: it returns 0 if the
+    PID is reachable, raises `ProcessLookupError` (ESRCH) if no such process
+    exists, and `PermissionError` (EPERM) if the PID is alive but owned by
+    another user/session. Treating EPERM as dead would let reconcile mark a
+    sibling-owned run `interrupted` and invite `/retry` while a worker is
+    still running, so we only count ESRCH as dead and default everything
+    else to alive."""
     try:
         os.kill(pid, 0)
-    except OSError:
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     return True
 
 

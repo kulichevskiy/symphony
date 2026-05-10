@@ -74,6 +74,48 @@ async def test_reconcile_marks_dead_pids_interrupted_and_comments(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_reconcile_treats_eperm_pid_as_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PID owned by another user/session raises PermissionError from
+    `os.kill(pid, 0)`. That means the process exists — reconcile must NOT
+    flip the run to `interrupted`, otherwise we'd invite `/retry` while a
+    real worker is still running and risk duplicate execution."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-foreign", identifier="ENG-3", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="foreign",
+            issue_id="iss-foreign",
+            stage="implement",
+            status="running",
+            pid=4242,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        def fake_kill(pid: int, sig: int) -> None:
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "kill", fake_kill)
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock()
+        flipped = await reconcile(conn, linear)
+
+        assert flipped == 0
+        linear.post_comment.assert_not_awaited()
+        cur = await conn.execute("SELECT status FROM runs WHERE id=?", ("foreign",))
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == "running"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_no_live_runs_is_a_noop(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
