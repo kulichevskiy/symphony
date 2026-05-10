@@ -185,6 +185,58 @@ def test_dispatch_creates_run_for_known_team_binding(
     assert len(fake.posted) == 1, "dispatch should announce on Linear"
 
 
+def test_dispatch_errors_when_announce_comment_fails(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """If the Linear announce comment raises, the run row is flipped to
+    `failed` and the CLI must exit non-zero — otherwise an operator running
+    `dispatch` during a Linear outage sees a green success message while no
+    live run actually started."""
+    from symphony.linear.client import LinearError
+
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+
+    issue = LinearIssue(
+        id="iss-3",
+        identifier="ENG-77",
+        title="hand launch with broken linear",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+    )
+
+    class _BrokenAnnounce(_FakeLinear):
+        async def post_comment(self, issue_uuid: str, body: str) -> str:
+            raise LinearError("linear is down")
+
+    fake = _BrokenAnnounce(issue)
+    _install_fake_linear(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        main, ["dispatch", "ENG-77", "--config", str(cfg_path)]
+    )
+    assert result.exit_code != 0, result.output
+    # The error must be on stderr/output and identify the issue so the
+    # operator knows which dispatch did not actually start.
+    assert "ENG-77" in result.output
+
+    async def _check() -> None:
+        conn = await db.connect(db_path)
+        try:
+            # Row exists but is `failed`, so dedupe will not block a retry.
+            assert await db.runs.has_active(conn, "iss-3") is False
+        finally:
+            await conn.close()
+
+    asyncio.run(_check())
+
+
 def test_dispatch_errors_when_no_binding_matches_team_key(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

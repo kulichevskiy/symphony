@@ -255,9 +255,17 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
         conn = await db.connect(cfg.db_path)
         try:
             orch = Orchestrator(cfg, linear, conn)
-            await orch._dispatch_one(binding, issue)  # noqa: SLF001
+            run_id = await orch._dispatch_one(binding, issue)  # noqa: SLF001
+            rwi = await db.runs.get_with_issue(conn, run_id)
         finally:
             await conn.close()
+        if rwi is not None and rwi.run.status == "failed":
+            click.echo(
+                f"dispatch failed for {issue.identifier}: announce comment did "
+                f"not post; run {run_id} marked failed",
+                err=True,
+            )
+            sys.exit(1)
         click.echo(f"dispatched {issue.identifier} → {binding.github_repo}")
 
 

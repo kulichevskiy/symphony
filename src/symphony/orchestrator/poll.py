@@ -98,8 +98,13 @@ class Orchestrator:
                 continue
             await self._dispatch_one(binding, issue)
 
-    async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> None:
+    async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> str:
         """Walking-skeleton: record a `runs` row, then announce.
+
+        Returns the `run_id` of the row that was written. The row's final
+        status is `running` on success or `failed` if the announce raised;
+        callers that need to surface that distinction (e.g. the CLI
+        `dispatch` command) can re-read the row.
 
         Persisting first is what makes the SQLite-backed dedupe correct: if
         the host crashed (or the DB write threw) *after* a successful
@@ -154,3 +159,4 @@ class Orchestrator:
             await db.runs.update_status(
                 self._conn, run_id, "failed", ended_at=datetime.now(UTC).isoformat()
             )
+        return run_id
