@@ -15,7 +15,6 @@ import aiosqlite
 # Statuses that mean "this run is supposed to be alive". Kept as a tuple so
 # callers (poll dedupe, reconcile) share a single source of truth.
 LIVE_STATUSES: tuple[str, ...] = ("running",)
-DISPATCH_DEDUPE_STATUSES: tuple[str, ...] = ("running", "completed")
 
 
 @dataclass
@@ -112,8 +111,8 @@ async def create_if_not_dispatched(
     started_at: str,
     cost_usd: float = 0.0,
 ) -> bool:
-    """Atomic dispatch dedupe: insert iff no running or completed run exists."""
-    placeholders = ",".join("?" * len(DISPATCH_DEDUPE_STATUSES))
+    """Atomic dispatch dedupe: insert iff no live run exists."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
         INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
@@ -131,7 +130,7 @@ async def create_if_not_dispatched(
             started_at,
             cost_usd,
             issue_id,
-            *DISPATCH_DEDUPE_STATUSES,
+            *LIVE_STATUSES,
         ),
     )
     await conn.commit()
@@ -168,21 +167,16 @@ async def has_active(conn: aiosqlite.Connection, issue_id: str) -> bool:
     return row is not None
 
 
-async def has_running_or_completed(
-    conn: aiosqlite.Connection, issue_id: str
-) -> bool:
+async def has_running_or_completed(conn: aiosqlite.Connection, issue_id: str) -> bool:
     """Dedupe oracle for the poll loop.
 
-    Returns True for issues with a `running` OR `completed` run so the
-    scan loop does not re-dispatch an issue whose Implement stage has
-    already finished but whose Linear state move hasn't propagated yet.
-    `failed` / `interrupted` deliberately do NOT dedupe — those are
-    retry-eligible.
+    Historical name retained for compatibility, but dispatch dedupe is
+    intentionally live-only: completed runs must not block legitimate reruns.
     """
-    placeholders = ",".join("?" * len(DISPATCH_DEDUPE_STATUSES))
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders}) LIMIT 1",
-        (issue_id, *DISPATCH_DEDUPE_STATUSES),
+        (issue_id, *LIVE_STATUSES),
     )
     row = await cur.fetchone()
     return row is not None

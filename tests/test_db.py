@@ -281,7 +281,9 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_if_not_dispatched_blocks_completed_runs(tmp_path: Path) -> None:
+async def test_create_if_not_dispatched_allows_completed_reruns(
+    tmp_path: Path,
+) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await db.issues.upsert(
@@ -306,7 +308,7 @@ async def test_create_if_not_dispatched_blocks_completed_runs(tmp_path: Path) ->
             pid=None,
             started_at="2026-05-10T00:01:00+00:00",
         )
-        assert inserted is False
+        assert inserted is True
     finally:
         await conn.close()
 

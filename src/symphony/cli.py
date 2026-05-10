@@ -299,7 +299,7 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
             await conn.close()
         if run_id is None:
             click.echo(
-                f"{issue.identifier} already has a running or completed run; refusing to "
+                f"{issue.identifier} already has a running run; refusing to "
                 f"start a duplicate. Inspect with `symphony runs ls`.",
                 err=True,
             )

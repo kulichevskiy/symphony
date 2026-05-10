@@ -319,10 +319,9 @@ def test_dispatch_creates_run_for_known_team_binding(
     async def _check() -> None:
         conn = await db.connect(db_path)
         try:
-            # After the full Implement flow the run is `completed`, so
-            # `has_running_or_completed` is the dedupe oracle here, not
-            # `has_active` (which only matches `running`).
-            assert await db.runs.has_running_or_completed(conn, "iss-1") is True
+            history = await db.runs.history_for_issue(conn, "iss-1")
+            assert len(history) == 1
+            assert history[0].status == "completed"
         finally:
             await conn.close()
 

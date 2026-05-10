@@ -214,7 +214,7 @@ async def test_scan_caps_scheduled_tasks_to_available_slots(
 
 
 @pytest.mark.asyncio
-async def test_scan_skips_issues_with_active_run(tmp_path: Path) -> None:
+async def test_scan_skips_issues_with_running_run(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(repos=[_binding()])
@@ -223,16 +223,21 @@ async def test_scan_skips_issues_with_active_run(tmp_path: Path) -> None:
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
         orch = _make_orch(cfg, linear, conn)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="running",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
 
-        # First tick dispatches and records an active run.
         await _scan_and_wait(orch, cfg.repos[0])
-        first_call_count = linear.post_comment.await_count
-        assert first_call_count >= 1
-
-        # Second tick must dedupe via the SQLite `runs` table — not a dict —
-        # so no further comments are posted.
-        await _scan_and_wait(orch, cfg.repos[0])
-        assert linear.post_comment.await_count == first_call_count
+        linear.post_comment.assert_not_awaited()
     finally:
         await conn.close()
 
@@ -297,9 +302,8 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
         await _scan_and_wait(orch, cfg.repos[0])
         # Second tick re-announces and proceeds (>= 2 total post_comment calls).
         assert linear.post_comment.await_count >= 2
-        # The retry produced a successful run, so dedupe now blocks future
-        # scans from re-dispatching the same issue.
-        assert await db.runs.has_running_or_completed(conn, "iss-1") is True
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].status == "completed"
     finally:
         await conn.close()
 
