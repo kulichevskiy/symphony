@@ -30,3 +30,9 @@ def test_truncation_marker_is_appended() -> None:
 
 def test_default_limit_is_four_kilobytes() -> None:
     assert COMMENT_BYTE_LIMIT == 4096
+
+
+def test_tiny_limit_still_respects_byte_budget() -> None:
+    for limit in range(0, 8):
+        out = truncate_body("x" * 100, limit=limit)
+        assert len(out.encode("utf-8")) <= limit

@@ -30,8 +30,13 @@ def truncate_body(body: str, *, limit: int = COMMENT_BYTE_LIMIT) -> str:
     encoded = body.encode("utf-8")
     if len(encoded) <= limit:
         return body
+    if limit <= 0:
+        return ""
     suffix = _TRUNCATION_SUFFIX
-    head_budget = max(limit - len(suffix.encode("utf-8")), 0)
+    suffix_encoded = suffix.encode("utf-8")
+    if len(suffix_encoded) >= limit:
+        return suffix_encoded[:limit].decode("utf-8", errors="ignore")
+    head_budget = limit - len(suffix_encoded)
     head = encoded[:head_budget].decode("utf-8", errors="ignore")
     return head + suffix
 

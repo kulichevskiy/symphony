@@ -20,13 +20,39 @@ class Usage:
     output_tokens: int
 
 
-def _usage_from_mapping(usage: object, *, cost_usd: float = 0.0) -> Usage:
+def _int_or_none(value: object) -> int | None:
+    if value is None or value == "":
+        return 0
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: object) -> float | None:
+    if value is None or value == "":
+        return 0.0
+    if not isinstance(value, int | float | str):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage_from_mapping(usage: object, *, cost_usd: float = 0.0) -> Usage | None:
     if not isinstance(usage, dict):
         usage = {}
+    input_tokens = _int_or_none(usage.get("input_tokens"))
+    output_tokens = _int_or_none(usage.get("output_tokens"))
+    if input_tokens is None or output_tokens is None:
+        return None
     return Usage(
         cost_usd=cost_usd,
-        input_tokens=int(usage.get("input_tokens") or 0),
-        output_tokens=int(usage.get("output_tokens") or 0),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
 
@@ -43,7 +69,9 @@ def parse_event_line(line: str) -> Usage | None:
         return None
     kind = obj.get("type")
     if kind == "result":
-        cost = float(obj.get("total_cost_usd") or 0.0)
+        cost = _float_or_none(obj.get("total_cost_usd"))
+        if cost is None:
+            return None
         return _usage_from_mapping(obj.get("usage"), cost_usd=cost)
     if kind == "token_count":
         info = obj.get("info") or {}

@@ -39,6 +39,48 @@ def test_returns_none_on_garbage_input() -> None:
     assert parse_event_line(json.dumps([1, 2, 3])) is None
 
 
+def test_returns_none_on_malformed_numeric_usage() -> None:
+    assert (
+        parse_event_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "total_cost_usd": "oops",
+                    "usage": {"input_tokens": 1, "output_tokens": 2},
+                }
+            )
+        )
+        is None
+    )
+    assert (
+        parse_event_line(
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": "oops", "output_tokens": 2},
+                }
+            )
+        )
+        is None
+    )
+    assert (
+        parse_event_line(
+            json.dumps(
+                {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1,
+                            "output_tokens": "oops",
+                        }
+                    },
+                }
+            )
+        )
+        is None
+    )
+
+
 def test_parses_codex_token_count_event() -> None:
     """Codex streams a `token_count` event with a `total_token_usage`
     object instead of a per-result cost. We capture the token counts so
