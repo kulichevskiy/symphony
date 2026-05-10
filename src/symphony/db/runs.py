@@ -154,18 +154,33 @@ def _row_to_run_with_issue(row: aiosqlite.Row) -> RunWithIssue:
 async def list_recent(
     conn: aiosqlite.Connection, *, limit: int = 50
 ) -> list[RunWithIssue]:
-    """Inspection-side view: most-recent runs joined with their issue
-    identifier, ordered by `started_at` DESC."""
+    """Inspection-side view: every live run + the most recent terminated
+    runs up to `limit`, joined with their issue identifier, ordered by
+    `started_at` DESC.
+
+    A naive `ORDER BY started_at DESC LIMIT ?` over all rows hides a
+    long-running live run if the newest `limit` terminated runs started
+    after it — exactly the wrong thing during incident triage. So we
+    always return every `LIVE_STATUSES` row regardless of `limit`, and
+    use the limit only for the terminated tail.
+    """
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
-        """
+        f"""
         SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
                r.ended_at, r.cost_usd, i.identifier
         FROM runs r
         JOIN issues i ON i.id = r.issue_id
+        WHERE r.status IN ({placeholders})
+           OR r.id IN (
+                SELECT id FROM runs
+                WHERE status NOT IN ({placeholders})
+                ORDER BY started_at DESC
+                LIMIT ?
+           )
         ORDER BY r.started_at DESC
-        LIMIT ?
         """,
-        (limit,),
+        (*LIVE_STATUSES, *LIVE_STATUSES, limit),
     )
     rows = await cur.fetchall()
     return [_row_to_run_with_issue(r) for r in rows]

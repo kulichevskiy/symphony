@@ -18,8 +18,8 @@ from pathlib import Path
 import click
 
 from . import db
-from .config import Config
-from .linear.client import Linear, LinearError
+from .config import Config, RepoBinding
+from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
 
@@ -29,6 +29,65 @@ def _setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+
+
+def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
+    """Pick the binding the poll loop would have used for `issue`.
+
+    The poll loop scans each `(team_key, label)` pair separately, so an
+    issue is only routed to a binding if its labels match. The CLI's
+    earlier `next(... linear_team_key match ...)` selected by team key
+    alone, which silently picks the wrong repo when one Linear team is
+    fanned out to multiple repos via labels. Mirror the poll loop's
+    semantics here: prefer a binding whose `issue_label` is on the
+    issue, fall back to a label-less catchall, and refuse to guess if
+    multiple bindings could legitimately claim it.
+    """
+    team_bindings = [b for b in cfg.repos if b.linear_team_key == issue.team_key]
+    if not team_bindings:
+        configured = sorted({b.linear_team_key for b in cfg.repos})
+        click.echo(
+            f"no binding configured for team key {issue.team_key!r}; "
+            f"configured teams: {configured}",
+            err=True,
+        )
+        return None
+
+    issue_labels = set(issue.labels)
+    labeled = [
+        b for b in team_bindings
+        if b.issue_label is not None and b.issue_label in issue_labels
+    ]
+    if len(labeled) == 1:
+        return labeled[0]
+    if len(labeled) > 1:
+        click.echo(
+            f"ambiguous: {issue.identifier} matches multiple labeled bindings "
+            f"({[b.github_repo for b in labeled]}); refine the config so "
+            f"only one binding owns each label.",
+            err=True,
+        )
+        return None
+
+    catchalls = [b for b in team_bindings if b.issue_label is None]
+    if len(catchalls) == 1:
+        return catchalls[0]
+    if len(catchalls) > 1:
+        click.echo(
+            f"ambiguous: {len(catchalls)} catch-all bindings configured for "
+            f"team {issue.team_key!r}; add `issue_label` to each so the "
+            f"binding for {issue.identifier} can be picked deterministically.",
+            err=True,
+        )
+        return None
+
+    expected = sorted({b.issue_label for b in team_bindings if b.issue_label})
+    click.echo(
+        f"no binding matches {issue.identifier}: issue labels {sorted(issue_labels)} "
+        f"do not include any of {expected} and no catch-all binding is configured.",
+        err=True,
+    )
+    return None
 
 
 @click.group(invoke_without_command=True)
@@ -246,16 +305,8 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
         except LinearError as e:
             click.echo(f"linear lookup failed: {e}", err=True)
             sys.exit(1)
-        binding = next(
-            (b for b in cfg.repos if b.linear_team_key == issue.team_key), None
-        )
+        binding = _resolve_binding(cfg, issue)
         if binding is None:
-            configured = sorted({b.linear_team_key for b in cfg.repos})
-            click.echo(
-                f"no binding configured for team key {issue.team_key!r}; "
-                f"configured teams: {configured}",
-                err=True,
-            )
             sys.exit(1)
         conn = await db.connect(cfg.db_path)
         try:

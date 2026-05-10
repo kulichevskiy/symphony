@@ -276,3 +276,51 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
         assert third is True
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_list_recent_keeps_active_runs_outside_limit(tmp_path: Path) -> None:
+    """`runs ls` advertises "active + recent runs"; a long-running live run
+    must remain visible even when newer terminated runs would otherwise
+    crowd it out under `--limit`. This protects incident triage where the
+    live run is the most important row to see."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        # An older run that is still live.
+        await db.runs.create(
+            conn,
+            id="run-old-live",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=1,
+            started_at="2026-05-01T00:00:00+00:00",
+        )
+        # Three newer terminated runs; with limit=2 they would push the
+        # live run out under a naive ORDER BY/LIMIT.
+        for i, ts in enumerate(
+            ["2026-05-09T00:00:00+00:00", "2026-05-09T01:00:00+00:00", "2026-05-09T02:00:00+00:00"]
+        ):
+            await db.runs.create(
+                conn,
+                id=f"run-done-{i}",
+                issue_id="iss-1",
+                stage="implement",
+                status="completed",
+                pid=None,
+                started_at=ts,
+            )
+
+        rows = await db.runs.list_recent(conn, limit=2)
+        ids = [r.run.id for r in rows]
+        # All live runs are present regardless of limit.
+        assert "run-old-live" in ids
+        # The limit applies to terminated rows: only the 2 newest done runs.
+        assert "run-done-2" in ids
+        assert "run-done-1" in ids
+        assert "run-done-0" not in ids
+    finally:
+        await conn.close()

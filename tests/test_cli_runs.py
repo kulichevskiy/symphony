@@ -140,6 +140,33 @@ repos:
 """
 
 
+def _yaml_two_bindings(team: str, db_path: Path) -> str:
+    """One Linear team fanned out to two repos via labels — the config
+    shape that exposed the dispatch label-matching bug."""
+    return f"""
+db_path: {db_path}
+repos:
+  - linear_team_key: {team}
+    github_repo: org/api-svc
+    issue_label: api
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+  - linear_team_key: {team}
+    github_repo: org/web-app
+    issue_label: web
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+
+
 def _install_fake_linear(monkeypatch, fake: _FakeLinear) -> None:  # type: ignore[no-untyped-def]
     def _factory(_api_key: str) -> _FakeLinear:
         return fake
@@ -206,6 +233,76 @@ def test_runs_ls_rejects_directory_for_db_path(tmp_path: Path) -> None:
     assert result.exit_code != 0
     # Click's standard message for dir_okay=False mentions "directory".
     assert "directory" in result.output.lower()
+
+
+def test_dispatch_picks_binding_by_issue_label(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """When one Linear team is fanned out to multiple repos via `issue_label`,
+    the CLI must pick the repo whose label is on the issue — selecting by
+    `linear_team_key` alone routes the run to the wrong repo and posts the
+    start comment in the wrong context."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(_yaml_two_bindings(team="ENG", db_path=db_path))
+
+    issue = LinearIssue(
+        id="iss-web",
+        identifier="ENG-100",
+        title="web work",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+        labels=["web"],
+    )
+    fake = _FakeLinear(issue)
+    _install_fake_linear(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        main, ["dispatch", "ENG-100", "--config", str(cfg_path)]
+    )
+    assert result.exit_code == 0, result.output
+    # The success message names the repo, so it doubles as a routing assertion.
+    assert "org/web-app" in result.output
+    assert "org/api-svc" not in result.output
+
+
+def test_dispatch_errors_when_no_binding_label_matches(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """If every binding for the team is label-scoped and none of the issue's
+    labels match, dispatch must refuse — silently picking an arbitrary
+    binding would route the run to a repo that isn't supposed to handle it.
+    """
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(_yaml_two_bindings(team="ENG", db_path=db_path))
+
+    issue = LinearIssue(
+        id="iss-other",
+        identifier="ENG-101",
+        title="unlabeled",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+        labels=["mobile"],  # not 'api', not 'web'
+    )
+    fake = _FakeLinear(issue)
+    _install_fake_linear(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        main, ["dispatch", "ENG-101", "--config", str(cfg_path)]
+    )
+    assert result.exit_code != 0, result.output
+    assert "ENG-101" in result.output
 
 
 def test_dispatch_rejects_directory_for_config_path(tmp_path: Path) -> None:
