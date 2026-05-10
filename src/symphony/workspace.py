@@ -47,6 +47,17 @@ class Workspace:
         self._root = root
         self._clone_fn = clone_fn
         self._ttl_secs = ttl_secs
+        # Per-path lock serializes sweep_ttl against acquire/cleanup so
+        # the sweeper can't rmtree a dir between an acquire's mtime read
+        # and its first git op.
+        self._locks: dict[Path, asyncio.Lock] = {}
+
+    def _lock_for(self, path: Path) -> asyncio.Lock:
+        lock = self._locks.get(path)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[path] = lock
+        return lock
 
     @staticmethod
     def repo_safe(github_repo: str) -> str:
@@ -62,20 +73,19 @@ class Workspace:
         """Idempotent: clone if missing, fetch if present, then check out branch."""
         path = self.path_for(binding, issue)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-        if (path / ".git").exists():
-            # Bump mtime BEFORE git ops so a concurrent sweeper can't
-            # delete the dir between fetch and _ensure_branch.
+        async with self._lock_for(path):
+            if (path / ".git").exists():
+                path.touch(exist_ok=True)
+                await self._git(path, "fetch", "origin")
+            else:
+                if path.exists():
+                    # Residue from an interrupted clone — git clone refuses
+                    # non-empty destinations, so wipe before retrying.
+                    await asyncio.to_thread(shutil.rmtree, path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                await self._clone_fn(binding.github_repo, path)
+            await self._ensure_branch(path, branch)
             path.touch(exist_ok=True)
-            await self._git(path, "fetch", "origin")
-        else:
-            if path.exists():
-                # Residue from an interrupted clone — git clone refuses
-                # non-empty destinations, so wipe before retrying.
-                await asyncio.to_thread(shutil.rmtree, path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            await self._clone_fn(binding.github_repo, path)
-        await self._ensure_branch(path, branch)
-        path.touch(exist_ok=True)
         return path
 
     async def cleanup(self, issue: LinearIssue) -> None:
@@ -87,8 +97,9 @@ class Workspace:
             if not repo_dir.is_dir():
                 continue
             candidate = repo_dir / issue_id
-            if candidate.exists():
-                await asyncio.to_thread(shutil.rmtree, candidate)
+            async with self._lock_for(candidate):
+                if candidate.exists():
+                    await asyncio.to_thread(shutil.rmtree, candidate)
 
     async def sweep_ttl(self, *, now: float | None = None) -> None:
         """Remove issue dirs whose mtime is older than `ttl_secs`."""
@@ -105,7 +116,17 @@ class Workspace:
                     mtime = self._liveness_mtime(issue_dir)
                 except FileNotFoundError:
                     continue
-                if mtime < threshold:
+                if mtime >= threshold:
+                    continue
+                # Re-check under the lock so a concurrent acquire() that
+                # bumped mtime after our scan isn't wiped mid-run.
+                async with self._lock_for(issue_dir):
+                    try:
+                        mtime = self._liveness_mtime(issue_dir)
+                    except FileNotFoundError:
+                        continue
+                    if mtime >= threshold:
+                        continue
                     log.info("ttl sweep: removing stale workspace %s", issue_dir)
                     await asyncio.to_thread(shutil.rmtree, issue_dir, ignore_errors=True)
 
