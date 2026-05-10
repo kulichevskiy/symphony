@@ -35,7 +35,9 @@ from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import GitHub, GitHubError
+from ..linear import slash
 from ..linear.client import Linear, LinearError, LinearIssue
+from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import CommentVars, run_started, stage_done, truncate_body
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
@@ -79,6 +81,14 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
         binding.github_repo,
         binding.issue_label or "",
     )
+
+
+def _parse_rfc3339(s: str) -> datetime:
+    """Linear timestamps end in `Z`; Python's `fromisoformat` accepts the
+    `+00:00` form. Normalize before parsing."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -189,7 +199,78 @@ class Orchestrator:
         scheduled: list[asyncio.Task[None]] = []
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
+        try:
+            await self._poll_slash_commands()
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("slash command poll failed")
         return scheduled
+
+    async def _poll_slash_commands(self) -> None:
+        """For each active run, fetch new comments and dispatch slash intents.
+
+        The cursor lives in `comment_cursors`; we advance it to the latest
+        comment seen on each tick so a restart of the orchestrator does not
+        re-fire previously-handled commands.
+        """
+        pairs = list(self._dispatch_run_ids.items())
+        for issue_id, run_id in pairs:
+            if run_id not in self._active_run_ids:
+                continue
+            try:
+                after = await self._resolve_comment_cursor(issue_id, run_id)
+            except Exception:  # noqa: BLE001 — keep loop alive
+                log.exception("failed to resolve cursor for issue %s", issue_id)
+                continue
+            try:
+                comments = await self.linear.comments_since(issue_id, after)
+            except LinearError as e:
+                log.warning("comments_since failed for %s: %s", issue_id, e)
+                continue
+            if not comments:
+                continue
+            latest = max(c.created_at for c in comments)
+            try:
+                await db.comment_cursors.set(self._conn, issue_id, latest)
+            except Exception:  # noqa: BLE001
+                log.exception("failed to persist comment cursor for %s", issue_id)
+            for intent in slash.parse(comments):
+                await self._handle_slash_intent(issue_id, run_id, intent)
+
+    async def _resolve_comment_cursor(
+        self, issue_id: str, run_id: str
+    ) -> datetime:
+        stored = await db.comment_cursors.get(self._conn, issue_id)
+        if stored is not None:
+            return _parse_rfc3339(stored)
+        # Default: comments since the run started, so we don't sweep the
+        # whole historical comment trail on the first tick.
+        cur = await self._conn.execute(
+            "SELECT started_at FROM runs WHERE id = ?", (run_id,)
+        )
+        row = await cur.fetchone()
+        if row is not None and row[0]:
+            return _parse_rfc3339(row[0])
+        return datetime(1970, 1, 1, tzinfo=UTC)
+
+    async def _handle_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        if intent.kind is SlashKind.STOP:
+            log.info(
+                "/stop received for run %s (issue %s) — terminating runner",
+                run_id,
+                issue_id,
+            )
+            try:
+                await self._runner.kill(run_id)
+            except Exception:  # noqa: BLE001
+                log.exception("runner.kill failed for run %s", run_id)
+            return
+        log.info(
+            "slash %s received for run %s (handler not implemented in this slice)",
+            intent.kind,
+            run_id,
+        )
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
