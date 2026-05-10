@@ -132,6 +132,7 @@ class Orchestrator:
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
+        self._active_run_ids: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -180,7 +181,7 @@ class Orchestrator:
                 except TimeoutError:
                     pass
         finally:
-            await self.drain_dispatch_tasks()
+            await self.drain_dispatch_tasks(cancel=True)
 
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
@@ -188,12 +189,28 @@ class Orchestrator:
             scheduled.extend(await self._scan_binding(binding))
         return scheduled
 
-    async def drain_dispatch_tasks(self) -> None:
+    async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
+        if cancel:
+            await asyncio.gather(
+                *(
+                    self._kill_active_runner(run_id)
+                    for run_id in tuple(self._active_run_ids)
+                ),
+                return_exceptions=True,
+            )
+            for task in tuple(self._dispatch_tasks):
+                task.cancel()
         while self._dispatch_tasks:
             await asyncio.gather(
                 *tuple(self._dispatch_tasks),
                 return_exceptions=True,
             )
+
+    async def _kill_active_runner(self, run_id: str) -> None:
+        try:
+            await self._runner.kill(run_id)
+        except Exception:
+            log.exception("failed to kill runner for run_id=%s", run_id)
 
     async def _scan_binding(
         self, binding: RepoBinding
@@ -598,21 +615,25 @@ class Orchestrator:
         cumulative_cost = 0.0
         final_kind = "exit"
         final_returncode: int | None = None
-        with log_path.open("a", encoding="utf-8") as logf:
-            async for ev in self._runner.run(spec):
-                if ev.kind == "started" and ev.pid is not None:
-                    await db.runs.update_pid(self._conn, run_id, ev.pid)
-                elif ev.kind == "stdout" and ev.line is not None:
-                    logf.write(ev.line + "\n")
-                    usage = parse_event_line(ev.line)
-                    if usage is not None:
-                        cumulative_cost += usage.cost_usd
-                elif ev.kind == "stderr" and ev.line is not None:
-                    logf.write(f"[stderr] {ev.line}\n")
-                elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
-                    final_kind = ev.kind
-                    final_returncode = ev.returncode
-                    break
+        self._active_run_ids.add(run_id)
+        try:
+            with log_path.open("a", encoding="utf-8") as logf:
+                async for ev in self._runner.run(spec):
+                    if ev.kind == "started" and ev.pid is not None:
+                        await db.runs.update_pid(self._conn, run_id, ev.pid)
+                    elif ev.kind == "stdout" and ev.line is not None:
+                        logf.write(ev.line + "\n")
+                        usage = parse_event_line(ev.line)
+                        if usage is not None:
+                            cumulative_cost += usage.cost_usd
+                    elif ev.kind == "stderr" and ev.line is not None:
+                        logf.write(f"[stderr] {ev.line}\n")
+                    elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
+                        final_kind = ev.kind
+                        final_returncode = ev.returncode
+                        break
+        finally:
+            self._active_run_ids.discard(run_id)
         return cumulative_cost, final_kind, final_returncode
 
     async def _fail_run(self, run_id: str, _reason: str) -> None:

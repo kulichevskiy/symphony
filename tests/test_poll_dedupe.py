@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from symphony import db
-from symphony.agent.runner import RunnerEvent, RunnerSpec
+from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
@@ -39,6 +39,28 @@ class _FakeRunner:
 
     async def kill(self, run_id: str) -> None:
         pass
+
+
+class _BlockingRunner:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.killed = asyncio.Event()
+        self.run_id: str | None = None
+        self.killed_run_id: str | None = None
+        self._forever = asyncio.Event()
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        return self._aiter(spec)
+
+    async def _aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.run_id = spec.run_id
+        self.started.set()
+        yield RunnerEvent(kind="started", pid=4242)
+        await self._forever.wait()
+
+    async def kill(self, run_id: str) -> None:
+        self.killed_run_id = run_id
+        self.killed.set()
 
 
 def _binding() -> RepoBinding:
@@ -70,20 +92,25 @@ def _issue(
     )
 
 
-def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
+def _make_orch(
+    cfg: Config,
+    linear: AsyncMock,
+    conn: object,
+    *,
+    runner: Runner | None = None,
+) -> Orchestrator:
     workspace = MagicMock()
     workspace.acquire = AsyncMock(return_value=Path("/dev/null"))
     workspace.release = MagicMock()
     gh = MagicMock()
     gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
     gh.repo_default_branch = AsyncMock(return_value="main")
-    runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
     push_fn = AsyncMock()
     orch = Orchestrator(
         cfg,
         linear,
         conn,  # type: ignore[arg-type]
-        runner=runner,
+        runner=runner or _FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
         gh=gh,
         workspace=workspace,
         push_fn=push_fn,
@@ -131,6 +158,34 @@ async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
         await asyncio.wait_for(started.wait(), timeout=1)
         release.set()
         await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_kills_and_cancels_active_dispatch(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding], poll_interval_secs=300)
+        linear = AsyncMock()
+        linear.viewer_team_keys = AsyncMock(return_value=["ENG"])
+        linear.team_states = AsyncMock(
+            return_value={"Todo": "state-todo", "In Progress": "state-progress"}
+        )
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        runner = _BlockingRunner()
+        orch = _make_orch(cfg, linear, conn, runner=runner)
+
+        run_task = asyncio.create_task(orch.run())
+        await asyncio.wait_for(runner.started.wait(), timeout=1)
+        await orch.shutdown()
+        await asyncio.wait_for(run_task, timeout=1)
+
+        assert runner.killed_run_id == runner.run_id
+        assert runner.killed.is_set()
+        assert orch._dispatch_tasks == set()  # noqa: SLF001
     finally:
         await conn.close()
 
