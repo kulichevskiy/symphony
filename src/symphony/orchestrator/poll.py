@@ -133,6 +133,8 @@ class Orchestrator:
         self._scheduled_issue_ids: set[str] = set()
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._active_run_ids: set[str] = set()
+        self._dispatch_run_ids: dict[str, str] = {}
+        self._runs_moved_to_in_progress: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -285,12 +287,35 @@ class Orchestrator:
             key,
             asyncio.Semaphore(max(binding.max_concurrent, 1)),
         )
-        async with self._global_dispatch_sem:
-            async with binding_sem:
-                current = await self._refresh_dispatch_candidate(binding, issue)
-                if current is None:
-                    return
-                await self._dispatch_one(binding, current)
+        try:
+            async with self._global_dispatch_sem:
+                async with binding_sem:
+                    current = await self._refresh_dispatch_candidate(binding, issue)
+                    if current is None:
+                        return
+                    await self._dispatch_one(binding, current)
+        except asyncio.CancelledError:
+            await self._mark_cancelled_dispatch(issue)
+            raise
+        finally:
+            run_id = self._dispatch_run_ids.pop(issue.id, None)
+            if run_id is not None:
+                self._runs_moved_to_in_progress.discard(run_id)
+
+    async def _mark_cancelled_dispatch(self, issue: LinearIssue) -> None:
+        run_id = self._dispatch_run_ids.get(issue.id)
+        if run_id is None:
+            return
+        log.info("dispatch cancelled for %s [run_id=%s]", issue.identifier, run_id)
+        if run_id in self._runs_moved_to_in_progress:
+            await self._fail_run_and_reset_issue(
+                run_id,
+                "dispatch cancelled",
+                issue=issue,
+                rollback_state_id=issue.state_id,
+            )
+        else:
+            await self._fail_run(run_id, "dispatch cancelled")
 
     async def _refresh_dispatch_candidate(
         self, binding: RepoBinding, issue: LinearIssue
@@ -354,6 +379,7 @@ class Orchestrator:
         """
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
+        self._dispatch_run_ids[issue.id] = run_id
 
         await db.issues.upsert(
             self._conn,
@@ -454,6 +480,7 @@ class Orchestrator:
             )
             await self._fail_run(run_id, f"move_issue failed: {e}")
             return run_id
+        self._runs_moved_to_in_progress.add(run_id)
 
         # 3. Acquire a per-issue workspace clone.
         try:

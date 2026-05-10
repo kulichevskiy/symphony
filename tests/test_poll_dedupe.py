@@ -185,6 +185,11 @@ async def test_shutdown_kills_and_cancels_active_dispatch(tmp_path: Path) -> Non
 
         assert runner.killed_run_id == runner.run_id
         assert runner.killed.is_set()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.status for run in history] == ["failed"]
+        assert history[0].ended_at is not None
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+        assert linear.move_issue.await_args_list[-1] == call("iss-1", "state-todo")
         assert orch._dispatch_tasks == set()  # noqa: SLF001
     finally:
         await conn.close()
