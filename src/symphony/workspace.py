@@ -65,6 +65,10 @@ class Workspace:
         if (path / ".git").exists():
             await self._git(path, "fetch", "origin")
         else:
+            if path.exists():
+                # Residue from an interrupted clone — git clone refuses
+                # non-empty destinations, so wipe before retrying.
+                await asyncio.to_thread(shutil.rmtree, path)
             path.parent.mkdir(parents=True, exist_ok=True)
             await self._clone_fn(binding.github_repo, path)
         await self._ensure_branch(path, branch)

@@ -116,6 +116,21 @@ async def test_acquire_is_idempotent(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_acquire_recovers_from_non_git_residue(tmp_path: Path) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+
+    # Simulate residue from an interrupted clone: dir exists, no .git.
+    residue = ws.path_for(_binding(), _issue("ENG-9"))
+    residue.mkdir(parents=True)
+    (residue / "stale.txt").write_text("leftover")
+
+    path = await ws.acquire(_binding(), _issue("ENG-9"))
+    assert (path / ".git").exists()
+    assert not (path / "stale.txt").exists()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_removes_workspace_dir(tmp_path: Path) -> None:
     remote = await _make_remote(tmp_path)
     ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
