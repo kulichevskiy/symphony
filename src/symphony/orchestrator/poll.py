@@ -99,7 +99,14 @@ class Orchestrator:
             await self._dispatch_one(binding, issue)
 
     async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> None:
-        """Walking-skeleton: announce, then record a `runs` row.
+        """Walking-skeleton: record a `runs` row, then announce.
+
+        Persisting first is what makes the SQLite-backed dedupe correct: if
+        the host crashed (or the DB write threw) *after* a successful
+        `post_comment`, the next poll would see no active run and post a
+        second "starting" comment. Writing the row first closes that
+        window. If the announce itself fails, we flip the row to `failed`
+        so the next tick can retry without the dedupe suppressing it.
 
         Iteration 4 will:
         - Clone the GitHub repo to `workspace_root / binding.repo_safe / issue.identifier`.
@@ -123,11 +130,6 @@ class Orchestrator:
                 run_id=run_id,
             )
         )
-        try:
-            await self.linear.post_comment(issue.id, body)
-        except LinearError as e:
-            log.warning("could not announce dispatch on %s: %s", issue.identifier, e)
-            return
         await db.issues.upsert(
             self._conn,
             id=issue.id,
@@ -135,6 +137,7 @@ class Orchestrator:
             title=issue.title,
             team_key=issue.team_key,
         )
+        now = datetime.now(UTC).isoformat()
         await db.runs.create(
             self._conn,
             id=run_id,
@@ -142,5 +145,12 @@ class Orchestrator:
             stage="implement",
             status="running",
             pid=None,  # iteration 4 fills this in once a real subprocess is spawned
-            started_at=datetime.now(UTC).isoformat(),
+            started_at=now,
         )
+        try:
+            await self.linear.post_comment(issue.id, body)
+        except LinearError as e:
+            log.warning("could not announce dispatch on %s: %s", issue.identifier, e)
+            await db.runs.update_status(
+                self._conn, run_id, "failed", ended_at=datetime.now(UTC).isoformat()
+            )
