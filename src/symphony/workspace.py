@@ -82,7 +82,7 @@ class Workspace:
                 continue
             candidate = repo_dir / issue_id
             if candidate.exists():
-                shutil.rmtree(candidate)
+                await asyncio.to_thread(shutil.rmtree, candidate)
 
     async def sweep_ttl(self, *, now: float | None = None) -> None:
         """Remove issue dirs whose mtime is older than `ttl_secs`."""
@@ -101,7 +101,7 @@ class Workspace:
                     continue
                 if mtime < threshold:
                     log.info("ttl sweep: removing stale workspace %s", issue_dir)
-                    shutil.rmtree(issue_dir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, issue_dir, ignore_errors=True)
 
     async def run_sweeper(
         self, *, interval_secs: int = DEFAULT_SWEEP_INTERVAL_SECS
