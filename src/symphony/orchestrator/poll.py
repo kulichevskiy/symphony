@@ -299,7 +299,7 @@ class Orchestrator:
                 current.state_name,
             )
             return None
-        if binding.issue_label is not None and binding.issue_label not in current.labels:
+        if binding.issue_label and binding.issue_label not in current.labels:
             log.info(
                 "skipping %s: label %r removed before dispatch",
                 issue.identifier,

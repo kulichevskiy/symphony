@@ -176,6 +176,30 @@ async def test_queued_dispatch_revalidates_ready_state_before_running(
 
 
 @pytest.mark.asyncio
+async def test_empty_issue_label_is_not_required_during_revalidation(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(update={"issue_label": ""})
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[issue])
+
+        orch = _make_orch(cfg, linear, conn)
+        linear.lookup_issue = AsyncMock(return_value=issue)
+        orch._dispatch_one = AsyncMock(return_value=issue.id)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        linear.issues_in_state.assert_awaited_once_with("ENG", "Todo", "")
+        orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_scan_caps_scheduled_tasks_to_available_slots(
     tmp_path: Path,
 ) -> None:
