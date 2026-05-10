@@ -185,6 +185,17 @@ def test_dispatch_creates_run_for_known_team_binding(
     assert len(fake.posted) == 1, "dispatch should announce on Linear"
 
 
+def test_runs_ls_rejects_non_positive_limit(tmp_path: Path) -> None:
+    """SQLite treats a negative `LIMIT` as unbounded, so `--limit -1` would
+    print the entire `runs` table — the opposite of what `--limit` advertises.
+    Click must reject non-positive values up front."""
+    p = tmp_path / "state.sqlite"
+    _populate(p)
+    for bad in ("-1", "0"):
+        result = CliRunner().invoke(main, ["runs", "ls", "--db", str(p), "--limit", bad])
+        assert result.exit_code != 0, f"--limit {bad} must be rejected"
+
+
 def test_runs_ls_rejects_directory_for_db_path(tmp_path: Path) -> None:
     """`--db` pointing at a directory must fail at click validation, not later
     when SQLite tries to open it as a database file. This keeps the operator

@@ -150,7 +150,12 @@ def runs() -> None:
     required=True,
     help="Path to the symphonyd SQLite file.",
 )
-@click.option("--limit", type=int, default=50, help="Max rows to show.")
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=50,
+    help="Max rows to show.",
+)
 def runs_ls(db_path: Path, limit: int) -> None:
     """List active + recent runs."""
     asyncio.run(_runs_ls(db_path, limit))
