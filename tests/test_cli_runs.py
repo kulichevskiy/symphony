@@ -185,6 +185,91 @@ def test_dispatch_creates_run_for_known_team_binding(
     assert len(fake.posted) == 1, "dispatch should announce on Linear"
 
 
+def test_runs_ls_rejects_directory_for_db_path(tmp_path: Path) -> None:
+    """`--db` pointing at a directory must fail at click validation, not later
+    when SQLite tries to open it as a database file. This keeps the operator
+    error message actionable instead of `unable to open database file`."""
+    a_dir = tmp_path / "not_a_db_dir"
+    a_dir.mkdir()
+    result = CliRunner().invoke(main, ["runs", "ls", "--db", str(a_dir)])
+    assert result.exit_code != 0
+    # Click's standard message for dir_okay=False mentions "directory".
+    assert "directory" in result.output.lower()
+
+
+def test_dispatch_refuses_when_issue_already_has_active_run(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """`dispatch` must respect the same dedupe oracle as the poll loop;
+    otherwise an operator retrying it for an issue that's already mid-run
+    creates a duplicate `running` row and a duplicate "starting" comment."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+
+    issue = LinearIssue(
+        id="iss-existing",
+        identifier="ENG-50",
+        title="already running",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+    )
+
+    async def _seed_active_run() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await db.issues.upsert(
+                conn,
+                id=issue.id,
+                identifier=issue.identifier,
+                title=issue.title,
+                team_key=issue.team_key,
+            )
+            await db.runs.create(
+                conn,
+                id="run-existing",
+                issue_id=issue.id,
+                stage="implement",
+                status="running",
+                pid=999,
+                started_at="2026-05-10T00:00:00+00:00",
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_seed_active_run())
+
+    fake = _FakeLinear(issue)
+    _install_fake_linear(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        main, ["dispatch", "ENG-50", "--config", str(cfg_path)]
+    )
+    assert result.exit_code != 0, result.output
+    assert "ENG-50" in result.output
+    # No new comment posted (the existing run already announced).
+    assert fake.posted == []
+
+    # And no new run row was created.
+    async def _check() -> None:
+        conn = await db.connect(db_path)
+        try:
+            cur = await conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE issue_id = ?", (issue.id,)
+            )
+            (count,) = await cur.fetchone()  # type: ignore[misc]
+            assert count == 1
+        finally:
+            await conn.close()
+
+    asyncio.run(_check())
+
+
 def test_dispatch_errors_when_announce_comment_fails(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

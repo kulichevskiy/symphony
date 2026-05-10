@@ -146,7 +146,7 @@ def runs() -> None:
 @click.option(
     "--db",
     "db_path",
-    type=click.Path(path_type=Path, exists=True),
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
     help="Path to the symphonyd SQLite file.",
 )
@@ -179,7 +179,7 @@ async def _runs_ls(db_path: Path, limit: int) -> None:
 @click.option(
     "--db",
     "db_path",
-    type=click.Path(path_type=Path, exists=True),
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
 )
 def runs_show(run_id: str, db_path: Path) -> None:
@@ -254,6 +254,13 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
             sys.exit(1)
         conn = await db.connect(cfg.db_path)
         try:
+            if await db.runs.has_active(conn, issue.id):
+                click.echo(
+                    f"{issue.identifier} already has an active run; refusing to "
+                    f"start a duplicate. Inspect with `symphony runs ls`.",
+                    err=True,
+                )
+                sys.exit(1)
             orch = Orchestrator(cfg, linear, conn)
             run_id = await orch._dispatch_one(binding, issue)  # noqa: SLF001
             rwi = await db.runs.get_with_issue(conn, run_id)
