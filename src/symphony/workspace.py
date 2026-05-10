@@ -12,7 +12,8 @@ import asyncio
 import logging
 import shutil
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from .config import RepoBinding
@@ -49,19 +50,30 @@ class Workspace:
         self._ttl_secs = ttl_secs
         # Per-path lock serializes sweep_ttl against acquire/cleanup so
         # the sweeper can't rmtree a dir between an acquire's mtime read
-        # and its first git op.
+        # and its first git op. Refcounted so a long-lived orchestrator
+        # processing many issues doesn't leak a lock per path forever.
         self._locks: dict[Path, asyncio.Lock] = {}
+        self._lock_refs: dict[Path, int] = {}
         # Workspaces actively held by a stage. mtime-based liveness is
         # blind to long fix-runs that don't touch git; the sweeper
         # excludes anything in this set regardless of mtime.
         self._in_use: set[Path] = set()
 
-    def _lock_for(self, path: Path) -> asyncio.Lock:
+    @asynccontextmanager
+    async def _hold_lock(self, path: Path) -> AsyncIterator[None]:
         lock = self._locks.get(path)
         if lock is None:
             lock = asyncio.Lock()
             self._locks[path] = lock
-        return lock
+        self._lock_refs[path] = self._lock_refs.get(path, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._lock_refs[path] -= 1
+            if self._lock_refs[path] == 0:
+                self._lock_refs.pop(path, None)
+                self._locks.pop(path, None)
 
     @staticmethod
     def repo_safe(github_repo: str) -> str:
@@ -78,7 +90,7 @@ class Workspace:
         """Idempotent: clone if missing, fetch if present, then check out branch."""
         path = self.path_for(binding, issue)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-        async with self._lock_for(path):
+        async with self._hold_lock(path):
             if (path / ".git").exists():
                 path.touch(exist_ok=True)
                 await self._git(path, "fetch", "origin")
@@ -107,7 +119,7 @@ class Workspace:
             if not repo_dir.is_dir():
                 continue
             candidate = repo_dir / issue_id
-            async with self._lock_for(candidate):
+            async with self._hold_lock(candidate):
                 if candidate.exists():
                     await asyncio.to_thread(shutil.rmtree, candidate)
                 self._in_use.discard(candidate)
@@ -133,7 +145,7 @@ class Workspace:
                     continue
                 # Re-check under the lock so a concurrent acquire() that
                 # bumped mtime after our scan isn't wiped mid-run.
-                async with self._lock_for(issue_dir):
+                async with self._hold_lock(issue_dir):
                     if issue_dir in self._in_use:
                         continue
                     try:

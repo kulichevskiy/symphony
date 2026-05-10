@@ -149,6 +149,21 @@ async def test_cleanup_removes_workspace_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_path_locks_are_pruned_after_use(tmp_path: Path) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+
+    for i in range(5):
+        binding = _binding(repo=f"acme/widgets-{i}")
+        issue = _issue(f"ENG-{i}")
+        await ws.acquire(binding, issue)
+        await ws.cleanup(issue)
+
+    assert ws._locks == {}, "lock entries must not accumulate across issues"
+    assert ws._lock_refs == {}
+
+
+@pytest.mark.asyncio
 async def test_sweep_ttl_skips_in_use_workspace_even_if_mtime_is_stale(
     tmp_path: Path,
 ) -> None:
