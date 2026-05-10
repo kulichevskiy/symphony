@@ -201,15 +201,15 @@ async def test_pr_merge_squash_with_auto(fake_gh) -> None:  # type: ignore[no-un
     assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
 
 
-async def test_pr_merge_default_does_not_enable_auto(fake_gh) -> None:  # type: ignore[no-untyped-def]
-    # `--auto` requires repo-level auto-merge; default must work everywhere.
+async def test_pr_merge_omits_auto_unless_requested(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # `--auto` requires repo-level auto-merge; opt-in only.
     log = fake_gh({"pr merge": [0, ""]})
     gh = GitHub()
-    await gh.pr_merge(99, repo="org/r")
+    await gh.pr_merge(99, strategy="merge", repo="org/r")
     argv = _calls(log)[0]["argv"]
     assert isinstance(argv, list)
     assert "--auto" not in argv
-    assert "--squash" in argv
+    assert "--merge" in argv
 
 
 # ---- non-zero exit + GH_TOKEN env -----------------------------------
@@ -251,6 +251,28 @@ async def test_branch_list_returns_names(fake_gh) -> None:  # type: ignore[no-un
     assert isinstance(argv, list)
     assert argv[0] == "api"
     assert any("repos/org/r/branches" in str(a) for a in argv)
+    assert "--hostname" not in argv
+
+
+async def test_branch_list_handles_host_qualified_repo(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # `[HOST/]OWNER/REPO` -> --hostname HOST, path repos/OWNER/REPO/branches.
+    log = fake_gh({"api": [0, "main\n"]})
+    gh = GitHub()
+    branches = await gh.branch_list("github.example.com/org/r")
+    assert branches == ["main"]
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert "--hostname" in argv
+    assert argv[argv.index("--hostname") + 1] == "github.example.com"
+    assert any("repos/org/r/branches" in str(a) for a in argv)
+    assert not any("github.example.com/org/r" in str(a) for a in argv)
+
+
+async def test_branch_list_rejects_malformed_repo(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    fake_gh({"api": [0, ""]})
+    gh = GitHub()
+    with pytest.raises(GitHubError):
+        await gh.branch_list("just-one-segment")
 
 
 async def test_repo_clone_invokes_gh_repo_clone(fake_gh, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]

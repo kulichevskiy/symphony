@@ -210,12 +210,14 @@ class GitHub:
         self,
         pr: int | str,
         *,
-        strategy: MergeStrategy = "squash",
+        strategy: MergeStrategy,
         auto: bool = False,
         repo: str | None = None,
     ) -> None:
+        # `strategy` is required because any of merge/squash/rebase can be
+        # disabled at the repo level — there's no universally safe default.
         # `--auto` requires repo-level auto-merge to be enabled, so callers
-        # must opt in. Default behavior is a plain merge that works anywhere.
+        # opt in explicitly when they want merge-on-green.
         argv = ["pr", "merge", str(pr), f"--{strategy}", *self._repo_args(repo)]
         if auto:
             argv.append("--auto")
@@ -225,11 +227,30 @@ class GitHub:
         await self._run(["pr", "close", str(pr), *self._repo_args(repo)])
 
     async def branch_list(self, repo: str) -> list[str]:
-        """Remote branches via `gh api`. Paginated."""
+        """Remote branches via `gh api`. Paginated.
+
+        Accepts `[HOST/]OWNER/REPO` like the rest of the wrapper. The host
+        portion (if present) is forwarded via `--hostname` so GHES and other
+        non-default hosts work; only `OWNER/REPO` is interpolated into the
+        API path.
+        """
+        parts = repo.split("/")
+        if len(parts) == 3:
+            host, owner, name = parts
+            host_args = ["--hostname", host]
+            owner_repo = f"{owner}/{name}"
+        elif len(parts) == 2:
+            host_args = []
+            owner_repo = repo
+        else:
+            raise GitHubError(
+                f"branch_list: invalid repo {repo!r} (expected [HOST/]OWNER/REPO)"
+            )
         argv = [
             "api",
+            *host_args,
             "--paginate",
-            f"repos/{repo}/branches",
+            f"repos/{owner_repo}/branches",
             "--jq",
             ".[].name",
         ]
