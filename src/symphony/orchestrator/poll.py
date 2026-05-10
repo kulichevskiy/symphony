@@ -81,7 +81,7 @@ class Orchestrator:
             await self._scan_binding(binding)
 
     async def _scan_binding(self, binding: RepoBinding) -> None:
-        ready_state = binding.effective_states(self.config.linear_states).ready
+        ready_state = binding.linear_states.ready
         try:
             issues = await self.linear.issues_in_state(
                 binding.linear_team_key, ready_state, binding.issue_label
@@ -108,7 +108,7 @@ class Orchestrator:
         - Clone the GitHub repo to `workspace_root / binding.repo_safe / issue.identifier`.
         - Build a stage-1 prompt from `agent.prompts.implement(issue, binding)`.
         - Spawn the runner; stream events into the DB and Linear.
-        - Move the Linear issue to `linear_states.in_progress`.
+        - Move the Linear issue to `binding.linear_states.in_progress`.
         """
         run_id = str(uuid.uuid4())
         log.info(

@@ -32,10 +32,12 @@ class LinearStates(BaseModel):
     """Workflow state names per role.
 
     Names must match the Linear team's workflow exactly. Symphony does not
-    create or rename states.
+    create or rename states. `ready` has no default — every binding must
+    declare which state the orchestrator picks issues up from, since teams
+    rename or replace it (Backlog, Todo, Up Next, …).
     """
 
-    ready: str = "Todo"
+    ready: str = Field(min_length=1)
     in_progress: str = "In Progress"
     needs_approval: str = "Needs Approval"
     blocked: str = "Blocked"
@@ -58,10 +60,7 @@ class RepoBinding(BaseModel):
     branch_prefix: str = "symphony"
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
-    linear_states: LinearStates | None = None
-
-    def effective_states(self, default: LinearStates) -> LinearStates:
-        return self.linear_states if self.linear_states is not None else default
+    linear_states: LinearStates
 
 
 class Secrets(BaseSettings):
@@ -94,8 +93,6 @@ class Config(BaseModel):
     review_iteration_cap: int = 6
     cost_cap_per_issue_usd: float = 5.0
     stall_timeout_secs: int = 300
-
-    linear_states: LinearStates = Field(default_factory=LinearStates)
 
     # Filled in from Secrets.
     linear_api_key: str = ""
