@@ -104,6 +104,72 @@ async def list_live_with_pid(conn: aiosqlite.Connection) -> list[Run]:
     return [_row_to_run(r) for r in rows]
 
 
+@dataclass
+class RunWithIssue:
+    run: Run
+    identifier: str
+
+
+def _row_to_run_with_issue(row: aiosqlite.Row) -> RunWithIssue:
+    return RunWithIssue(run=_row_to_run(row), identifier=row["identifier"])
+
+
+async def list_recent(
+    conn: aiosqlite.Connection, *, limit: int = 50
+) -> list[RunWithIssue]:
+    """Inspection-side view: most-recent runs joined with their issue
+    identifier, ordered by `started_at` DESC."""
+    cur = await conn.execute(
+        """
+        SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
+               r.ended_at, r.cost_usd, i.identifier
+        FROM runs r
+        JOIN issues i ON i.id = r.issue_id
+        ORDER BY r.started_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run_with_issue(r) for r in rows]
+
+
+async def get_with_issue(
+    conn: aiosqlite.Connection, run_id: str
+) -> RunWithIssue | None:
+    cur = await conn.execute(
+        """
+        SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
+               r.ended_at, r.cost_usd, i.identifier
+        FROM runs r
+        JOIN issues i ON i.id = r.issue_id
+        WHERE r.id = ?
+        """,
+        (run_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_run_with_issue(row)
+
+
+async def history_for_issue(
+    conn: aiosqlite.Connection, issue_id: str
+) -> list[Run]:
+    """Stage history: all runs for an issue, oldest first."""
+    cur = await conn.execute(
+        """
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        FROM runs
+        WHERE issue_id = ?
+        ORDER BY started_at ASC
+        """,
+        (issue_id,),
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run(r) for r in rows]
+
+
 async def cost_for_issue(conn: aiosqlite.Connection, issue_id: str) -> float:
     cur = await conn.execute(
         "SELECT COALESCE(SUM(cost_usd), 0.0) FROM runs WHERE issue_id = ?",
