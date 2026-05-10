@@ -63,6 +63,43 @@ async def create(
     await conn.commit()
 
 
+async def create_if_no_active(
+    conn: aiosqlite.Connection,
+    *,
+    id: str,
+    issue_id: str,
+    stage: str,
+    status: str,
+    pid: int | None,
+    started_at: str,
+    cost_usd: float = 0.0,
+) -> bool:
+    """Atomic dedupe: insert iff no `LIVE_STATUSES` row exists for `issue_id`.
+
+    Closes the TOCTOU window between `has_active` and `create`: a separate
+    `has_active` check followed by an unconditional INSERT lets two callers
+    (poll loop and `dispatch` CLI, or two manual dispatches) both observe
+    "no active run" and both write a `running` row. Doing it in one
+    statement makes SQLite's write-side serialization carry the guarantee.
+
+    Returns True if the row was inserted, False if a live run already
+    existed and the insert was skipped.
+    """
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
+        SELECT ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders})
+        )
+        """,
+        (id, issue_id, stage, status, pid, started_at, cost_usd, issue_id, *LIVE_STATUSES),
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
+
+
 async def update_status(
     conn: aiosqlite.Connection,
     run_id: str,

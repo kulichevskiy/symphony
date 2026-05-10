@@ -98,20 +98,25 @@ class Orchestrator:
                 continue
             await self._dispatch_one(binding, issue)
 
-    async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> str:
+    async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> str | None:
         """Walking-skeleton: record a `runs` row, then announce.
 
-        Returns the `run_id` of the row that was written. The row's final
-        status is `running` on success or `failed` if the announce raised;
-        callers that need to surface that distinction (e.g. the CLI
-        `dispatch` command) can re-read the row.
+        Returns the `run_id` of the row that was written, or `None` if the
+        atomic dedupe found a pre-existing live run and skipped the insert
+        (a concurrent dispatcher won the race; do not announce again). On
+        success the row's final status is `running`; if the announce
+        raised, it's `failed` and callers that need to surface that
+        distinction (e.g. the CLI `dispatch` command) can re-read the row.
 
         Persisting first is what makes the SQLite-backed dedupe correct: if
         the host crashed (or the DB write threw) *after* a successful
         `post_comment`, the next poll would see no active run and post a
         second "starting" comment. Writing the row first closes that
-        window. If the announce itself fails, we flip the row to `failed`
-        so the next tick can retry without the dedupe suppressing it.
+        window. The insert itself uses `create_if_no_active` rather than a
+        separate `has_active` check + unconditional insert, so the dedupe
+        is atomic against a racing poll loop or a second manual dispatch.
+        If the announce itself fails, we flip the row to `failed` so the
+        next tick can retry without the dedupe suppressing it.
 
         Iteration 4 will:
         - Clone the GitHub repo to `workspace_root / binding.repo_safe / issue.identifier`.
@@ -143,7 +148,7 @@ class Orchestrator:
             team_key=issue.team_key,
         )
         now = datetime.now(UTC).isoformat()
-        await db.runs.create(
+        inserted = await db.runs.create_if_no_active(
             self._conn,
             id=run_id,
             issue_id=issue.id,
@@ -152,6 +157,12 @@ class Orchestrator:
             pid=None,  # iteration 4 fills this in once a real subprocess is spawned
             started_at=now,
         )
+        if not inserted:
+            log.info(
+                "skipping dispatch for %s: another dispatcher won the race",
+                issue.identifier,
+            )
+            return None
         try:
             await self.linear.post_comment(issue.id, body)
         except LinearError as e:

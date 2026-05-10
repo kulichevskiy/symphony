@@ -208,6 +208,16 @@ def test_runs_ls_rejects_directory_for_db_path(tmp_path: Path) -> None:
     assert "directory" in result.output.lower()
 
 
+def test_dispatch_rejects_directory_for_config_path(tmp_path: Path) -> None:
+    """Same fail-fast contract as `--db`: passing a directory must fail at
+    click validation, not deeper inside `Config.load()` with `IsADirectoryError`."""
+    a_dir = tmp_path / "not_a_config_dir"
+    a_dir.mkdir()
+    result = CliRunner().invoke(main, ["dispatch", "ENG-1", "--config", str(a_dir)])
+    assert result.exit_code != 0
+    assert "directory" in result.output.lower()
+
+
 def test_dispatch_refuses_when_issue_already_has_active_run(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
