@@ -166,21 +166,33 @@ class Orchestrator:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
         log.info("orchestrator entering poll loop (interval=%ds)", self.config.poll_interval_secs)
-        while not self._shutdown.is_set():
-            try:
-                await self._tick()
-            except Exception:  # noqa: BLE001 — must not kill the loop
-                log.exception("poll cycle failed")
-            try:
-                await asyncio.wait_for(
-                    self._shutdown.wait(), timeout=self.config.poll_interval_secs
-                )
-            except TimeoutError:
-                pass
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    await self._tick()
+                except Exception:  # noqa: BLE001 — must not kill the loop
+                    log.exception("poll cycle failed")
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=self.config.poll_interval_secs
+                    )
+                except TimeoutError:
+                    pass
+        finally:
+            await self.drain_dispatch_tasks()
 
-    async def _tick(self) -> None:
+    async def _tick(self) -> list[asyncio.Task[None]]:
+        scheduled: list[asyncio.Task[None]] = []
         for binding in self.config.repos:
-            await self._scan_binding(binding)
+            scheduled.extend(await self._scan_binding(binding))
+        return scheduled
+
+    async def drain_dispatch_tasks(self) -> None:
+        while self._dispatch_tasks:
+            await asyncio.gather(
+                *tuple(self._dispatch_tasks),
+                return_exceptions=True,
+            )
 
     async def _scan_binding(
         self, binding: RepoBinding

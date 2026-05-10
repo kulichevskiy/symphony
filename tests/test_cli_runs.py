@@ -182,9 +182,25 @@ class _FakeLinear:
         self.moved.append((issue_id_or_identifier, state_id))
 
 
+class _FakePollLinear(_FakeLinear):
+    async def viewer_team_keys(self) -> list[str]:
+        if self.issue is None:
+            return []
+        return [self.issue.team_key]
+
+    async def issues_in_state(
+        self, team_key: str, state_name: str, label: str | None
+    ) -> list[LinearIssue]:
+        if self.issue is None:
+            return []
+        return [self.issue]
+
+
 def _yaml(team: str, db_path: Path) -> str:
     return f"""
 db_path: {db_path}
+log_root: {db_path.parent / "logs"}
+workspace_root: {db_path.parent / "workspaces"}
 repos:
   - linear_team_key: {team}
     github_repo: org/api-svc
@@ -195,6 +211,46 @@ repos:
       blocked: Blocked
       done: Done
 """
+
+
+def test_once_drains_scheduled_dispatch_before_exit(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+
+    issue = LinearIssue(
+        id="iss-once",
+        identifier="ENG-9",
+        title="once dispatch",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+    )
+    fake = _FakePollLinear(issue)
+    _install_fake_linear(monkeypatch, fake)
+    _install_fake_runtime(monkeypatch)
+
+    result = CliRunner().invoke(main, ["--config", str(cfg_path), "--once"])
+    assert result.exit_code == 0, result.output
+
+    async def _check() -> None:
+        conn = await db.connect(db_path)
+        try:
+            history = await db.runs.history_for_issue(conn, "iss-once")
+        finally:
+            await conn.close()
+        assert len(history) == 1
+        assert history[0].status == "completed"
+
+    asyncio.run(_check())
+    assert len(fake.posted) == 2
+    assert fake.moved == [("iss-once", "state-progress")]
 
 
 def _yaml_two_bindings(team: str, db_path: Path) -> str:

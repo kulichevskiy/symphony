@@ -100,6 +100,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access
+                await orch.drain_dispatch_tasks()
                 return
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
