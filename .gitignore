@@ -1,0 +1,25 @@
+# Secrets — pydantic-settings reads .env natively; never commit.
+.env
+.env.*
+!.env.example
+
+# Python build / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv
+.venv/
+
+# Local SQLite + log artefacts when running on a dev machine
+*.sqlite
+*.sqlite-journal
+state.sqlite
+logs/
+workspaces/
+
+# OS
+.DS_Store
