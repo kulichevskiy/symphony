@@ -131,6 +131,7 @@ class Orchestrator:
         self._states: dict[str, dict[str, str]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
+        self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -221,21 +222,42 @@ class Orchestrator:
                 binding.max_concurrent,
             )
             return scheduled
+        binding_key = _binding_key(binding)
+        capacity = min(
+            self.config.global_max_concurrent - len(self._scheduled_issue_ids),
+            binding.max_concurrent
+            - self._scheduled_binding_counts.get(binding_key, 0),
+        )
+        if capacity <= 0:
+            log.info("scan %s: dispatch capacity is full", binding.linear_team_key)
+            return scheduled
         for issue in issues:
             if issue.id in self._scheduled_issue_ids:
                 continue
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 continue
             scheduled.append(self._schedule_dispatch(binding, issue))
+            if len(scheduled) >= capacity:
+                break
         return scheduled
 
     def _schedule_dispatch(
         self, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None]:
+        binding_key = _binding_key(binding)
         self._scheduled_issue_ids.add(issue.id)
+        self._scheduled_binding_counts[binding_key] = (
+            self._scheduled_binding_counts.get(binding_key, 0) + 1
+        )
         task = asyncio.create_task(self._dispatch_with_limits(binding, issue))
         self._dispatch_tasks.add(task)
-        task.add_done_callback(partial(self._dispatch_task_done, issue_id=issue.id))
+        task.add_done_callback(
+            partial(
+                self._dispatch_task_done,
+                issue_id=issue.id,
+                binding_key=binding_key,
+            )
+        )
         return task
 
     async def _dispatch_with_limits(
@@ -287,10 +309,15 @@ class Orchestrator:
         return current
 
     def _dispatch_task_done(
-        self, task: asyncio.Task[None], issue_id: str
+        self, task: asyncio.Task[None], issue_id: str, binding_key: BindingKey
     ) -> None:
         self._dispatch_tasks.discard(task)
         self._scheduled_issue_ids.discard(issue_id)
+        count = self._scheduled_binding_counts.get(binding_key, 0)
+        if count <= 1:
+            self._scheduled_binding_counts.pop(binding_key, None)
+        else:
+            self._scheduled_binding_counts[binding_key] = count - 1
         try:
             task.result()
         except asyncio.CancelledError:
@@ -487,19 +514,16 @@ class Orchestrator:
             return run_id
 
         pr_url: str = ""
-        try:
-            base_branch = binding.base_branch or await self._gh.repo_default_branch(
-                binding.github_repo
-            )
-        except GitHubError as e:
-            log.warning("repo_default_branch failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"repo_default_branch failed: {e}",
-                issue=issue,
-                rollback_state_id=issue.state_id,
-            )
-            return run_id
+        base_branch = binding.base_branch
+        if base_branch is None:
+            try:
+                base_branch = await self._gh.repo_default_branch(binding.github_repo)
+            except GitHubError as e:
+                log.warning(
+                    "repo_default_branch failed for %s; falling back to gh default: %s",
+                    issue.identifier,
+                    e,
+                )
         try:
             pr_url = await self._gh.pr_create(
                 title=build_pr_title(issue),

@@ -22,6 +22,7 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
+from symphony.github.client import GitHubError
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 
@@ -213,6 +214,57 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert history[0].stage == "implement"
         assert history[0].status == "completed"
         assert history[0].pid == 4242
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_implement_dispatch_falls_back_when_base_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.repo_default_branch = AsyncMock(side_effect=GitHubError("boom"))
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+
+        gh.pr_create.assert_awaited_once()
+        assert gh.pr_create.await_args.kwargs["base"] is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "completed"
     finally:
         await conn.close()
 

@@ -141,7 +141,7 @@ async def test_queued_dispatch_revalidates_ready_state_before_running(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(update={"max_concurrent": 1})
+        binding = _binding()
         cfg = Config(repos=[binding])
         first = _issue()
         second = _issue("iss-2", "ENG-2")
@@ -171,6 +171,44 @@ async def test_queued_dispatch_revalidates_ready_state_before_running(
         assert orch._dispatch_one.await_count == 1  # noqa: SLF001
         orch._dispatch_one.assert_awaited_once_with(binding, first)  # noqa: SLF001
         assert linear.lookup_issue.await_args_list == [call("iss-1"), call("iss-2")]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_caps_scheduled_tasks_to_available_slots(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(update={"max_concurrent": 1})
+        cfg = Config(repos=[binding], global_max_concurrent=1)
+        issues = [_issue(f"iss-{n}", f"ENG-{n}") for n in range(3)]
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=issues)
+
+        orch = _make_orch(cfg, linear, conn)
+        linear.lookup_issue = AsyncMock(return_value=issues[0])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_dispatch(
+            binding: RepoBinding, issue: LinearIssue
+        ) -> str | None:
+            started.set()
+            await release.wait()
+            return issue.id
+
+        orch._dispatch_one = AsyncMock(side_effect=_slow_dispatch)  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await orch._scan_binding(binding)  # noqa: SLF001
+        assert len(tasks) == 1
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert await orch._scan_binding(binding) == []  # noqa: SLF001
+
+        release.set()
+        await asyncio.gather(*tasks)
     finally:
         await conn.close()
 
