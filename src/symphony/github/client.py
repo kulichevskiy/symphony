@@ -82,7 +82,11 @@ class GitHub:
     ) -> str:
         env = {**os.environ, **self._extra_env}
         if self._token is not None:
+            # `gh` splits auth by host: GH_TOKEN for github.com / *.ghe.com,
+            # GH_ENTERPRISE_TOKEN for GHES. We don't know the target host up
+            # front, so set both — gh reads the one matching the call.
             env["GH_TOKEN"] = self._token
+            env["GH_ENTERPRISE_TOKEN"] = self._token
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._gh,

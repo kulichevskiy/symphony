@@ -45,8 +45,10 @@ def _make_fake_gh(
         "import json, os, sys\n"
         "argv = sys.argv[1:]\n"
         "tok = os.environ.get('GH_TOKEN', '')\n"
+        "etok = os.environ.get('GH_ENTERPRISE_TOKEN', '')\n"
+        "rec = {'argv': argv, 'env_GH_TOKEN': tok, 'env_GH_ENTERPRISE_TOKEN': etok}\n"
         f"with open({str(calls)!r}, 'a') as f:\n"
-        "    f.write(json.dumps({'argv': argv, 'env_GH_TOKEN': tok}) + '\\n')\n"
+        "    f.write(json.dumps(rec) + '\\n')\n"
         f"with open({str(cfg)!r}) as f:\n"
         "    responses = json.load(f)\n"
         "joined = ' '.join(argv)\n"
@@ -236,10 +238,14 @@ async def test_non_zero_exit_raises_github_error(fake_gh) -> None:  # type: igno
 
 
 async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # Both env vars are set so gh picks the right one per target host
+    # (GH_TOKEN for github.com, GH_ENTERPRISE_TOKEN for GHES).
     log = fake_gh({"pr view": [0, '{"number": 5}']})
     gh = GitHub(token="ghs_test_token")
     await gh.pr_view(5, repo="org/r")
-    assert _calls(log)[0]["env_GH_TOKEN"] == "ghs_test_token"
+    call = _calls(log)[0]
+    assert call["env_GH_TOKEN"] == "ghs_test_token"
+    assert call["env_GH_ENTERPRISE_TOKEN"] == "ghs_test_token"
 
 
 # ---- head_sha + branch_list + repo_clone + pr_comment + pr_close ----
