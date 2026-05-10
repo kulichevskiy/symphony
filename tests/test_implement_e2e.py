@@ -128,6 +128,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
 
         gh = MagicMock()
         gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
 
@@ -207,13 +208,17 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         log_text = logs[0].read_text()
         assert '"type": "result"' in log_text or '"type":"result"' in log_text
 
-        # Run row halted at in_progress: status=completed, stage=implement,
-        # and only one run row exists (no Review or Merge run was created).
+        # Two run rows: the completed Implement run, and the Review run
+        # that the orchestrator opened immediately after pinging
+        # `@codex review` on the PR.
         history = await db.runs.history_for_issue(conn, "iss-1")
-        assert len(history) == 1
+        assert len(history) == 2
         assert history[0].stage == "implement"
         assert history[0].status == "completed"
         assert history[0].pid == 4242
+        assert history[1].stage == "review"
+        assert history[1].status == "running"
+        gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
     finally:
         await conn.close()
 
@@ -245,6 +250,7 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
 
         gh = MagicMock()
         gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
         gh.repo_default_branch = AsyncMock(side_effect=GitHubError("boom"))
 
         orch = Orchestrator(
@@ -263,8 +269,10 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
         gh.pr_create.assert_awaited_once()
         assert gh.pr_create.await_args.kwargs["base"] is None
         history = await db.runs.history_for_issue(conn, "iss-1")
-        assert len(history) == 1
+        # Implement run completes, Review run opens.
+        assert [r.stage for r in history] == ["implement", "review"]
         assert history[0].status == "completed"
+        assert history[1].status == "running"
     finally:
         await conn.close()
 

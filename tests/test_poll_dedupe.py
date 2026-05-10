@@ -104,6 +104,7 @@ def _make_orch(
     workspace.release = MagicMock()
     gh = MagicMock()
     gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
+    gh.pr_comment = AsyncMock()
     gh.repo_default_branch = AsyncMock(return_value="main")
     push_fn = AsyncMock()
     orch = Orchestrator(
@@ -387,7 +388,10 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
         # Second tick re-announces and proceeds (>= 2 total post_comment calls).
         assert linear.post_comment.await_count >= 2
         history = await db.runs.history_for_issue(conn, "iss-1")
-        assert history[-1].status == "completed"
+        # Latest run is the Review row opened after Implement succeeded;
+        # the Implement row before it should be marked completed.
+        implement_runs = [r for r in history if r.stage == "implement"]
+        assert any(r.status == "completed" for r in implement_runs)
     finally:
         await conn.close()
 

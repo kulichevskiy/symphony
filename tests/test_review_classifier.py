@@ -39,7 +39,6 @@ from symphony.pipeline.review_classifier import (
     should_dispatch_fix_run,
 )
 
-
 HEAD_SHA = "deadbeef"
 HEAD_COMMITTED_AT = "2025-01-01T12:00:00Z"
 LATER = "2025-01-01T13:00:00Z"
