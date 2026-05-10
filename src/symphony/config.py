@@ -58,6 +58,10 @@ class RepoBinding(BaseModel):
     branch_prefix: str = "symphony"
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
+    linear_states: LinearStates | None = None
+
+    def effective_states(self, default: LinearStates) -> LinearStates:
+        return self.linear_states if self.linear_states is not None else default
 
 
 class Secrets(BaseSettings):

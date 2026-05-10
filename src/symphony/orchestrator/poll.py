@@ -81,7 +81,7 @@ class Orchestrator:
             await self._scan_binding(binding)
 
     async def _scan_binding(self, binding: RepoBinding) -> None:
-        ready_state = self.config.linear_states.ready
+        ready_state = binding.effective_states(self.config.linear_states).ready
         try:
             issues = await self.linear.issues_in_state(
                 binding.linear_team_key, ready_state, binding.issue_label
