@@ -1,0 +1,237 @@
+"""Tests for `symphony.github.client.GitHub` — the gh CLI wrapper.
+
+We exercise the wrapper against a fake `gh` shim placed earlier on `PATH`.
+The shim is a tiny Python script that records its argv and emits canned
+output based on argv patterns. This is faster + more predictable than
+mocking `asyncio.subprocess` and catches real argv-construction bugs.
+
+Covers:
+- argv shape for each method (no shell injection — list-form invocation)
+- `pr_create` body always carries `Relates to <linear-url>` when supplied
+- `pr_checks` parses JSON output into a typed `PRChecks` object
+- `pr_merge(strategy="squash")` enables auto-merge with the right flag
+- non-zero exit raises `GitHubError`
+- JSON parse failure raises `GitHubError`
+- `GH_TOKEN` override is forwarded into the subprocess env
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from symphony.github.client import GitHub, GitHubError, PRChecks
+
+
+def _make_fake_gh(
+    tmp_path: Path, responses: dict[str, list[object]]
+) -> tuple[Path, Path]:
+    """Write a fake `gh` to a temp dir and return (bin_dir, calls_log).
+
+    `responses` maps a substring of the joined argv to `[exit_code, stdout]`.
+    The first matching pattern wins; default is exit 0 with empty stdout.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    cfg = bin_dir / "responses.json"
+    cfg.write_text(json.dumps(responses))
+    calls = bin_dir / "calls.log"
+    shim = bin_dir / "gh"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "argv = sys.argv[1:]\n"
+        f"with open({str(calls)!r}, 'a') as f:\n"
+        "    f.write(json.dumps({'argv': argv, 'env_GH_TOKEN': os.environ.get('GH_TOKEN', '')}) + '\\n')\n"
+        f"with open({str(cfg)!r}) as f:\n"
+        "    responses = json.load(f)\n"
+        "joined = ' '.join(argv)\n"
+        "for pattern, spec in responses.items():\n"
+        "    if pattern in joined:\n"
+        "        code, out = spec[0], spec[1]\n"
+        "        sys.stdout.write(out)\n"
+        "        sys.exit(code)\n"
+        "sys.exit(0)\n"
+    )
+    shim.chmod(0o755)
+    return bin_dir, calls
+
+
+def _calls(log: Path) -> list[dict[str, object]]:
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+
+
+@pytest.fixture
+def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    def _build(responses: dict[str, list[object]]) -> Path:
+        bin_dir, log = _make_fake_gh(tmp_path, responses)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        return log
+
+    return _build
+
+
+# ---- pr_create ------------------------------------------------------
+
+
+async def test_pr_create_appends_linear_url_when_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/42\n"]})
+    gh = GitHub()
+    url = await gh.pr_create(
+        title="t",
+        body="my body",
+        base="main",
+        head="feat/x",
+        repo="org/r",
+        linear_url="https://linear.app/team/issue/ENG-1",
+    )
+    assert url == "https://github.com/org/r/pull/42"
+    calls = _calls(log)
+    assert len(calls) == 1
+    argv = calls[0]["argv"]
+    assert isinstance(argv, list)
+    # argv must be list-form (no shell). title/body passed via flags.
+    assert argv[0] == "pr"
+    assert argv[1] == "create"
+    assert "--title" in argv and argv[argv.index("--title") + 1] == "t"
+    assert "--base" in argv and argv[argv.index("--base") + 1] == "main"
+    assert "--head" in argv and argv[argv.index("--head") + 1] == "feat/x"
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
+    body = argv[argv.index("--body") + 1]
+    assert "my body" in body
+    assert "Relates to https://linear.app/team/issue/ENG-1" in body
+
+
+async def test_pr_create_omits_relates_when_no_linear_url(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/1\n"]})
+    gh = GitHub()
+    await gh.pr_create(title="t", body="b", base="main", head="x", repo="org/r")
+    body = _calls(log)[0]["argv"]
+    assert isinstance(body, list)
+    payload = body[body.index("--body") + 1]
+    assert "Relates to" not in str(payload)
+
+
+# ---- pr_checks ------------------------------------------------------
+
+
+async def test_pr_checks_parses_json_into_typed_object(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps(
+        [
+            {"name": "build", "state": "SUCCESS", "bucket": "pass", "link": "u1"},
+            {"name": "test", "state": "FAILURE", "bucket": "fail", "link": "u2"},
+            {"name": "lint", "state": "PENDING", "bucket": "pending", "link": None},
+        ]
+    )
+    log = fake_gh({"pr checks": [0, payload]})
+    gh = GitHub()
+    result = await gh.pr_checks(42, repo="org/r")
+    assert isinstance(result, PRChecks)
+    assert [r.name for r in result.runs] == ["build", "test", "lint"]
+    assert result.any_failed is True
+    assert result.all_passed is False
+    assert result.pending is True
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["pr", "checks", "42"]
+    assert "--json" in argv
+
+
+async def test_pr_checks_raises_on_json_parse_failure(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    fake_gh({"pr checks": [0, "not json at all"]})
+    gh = GitHub()
+    with pytest.raises(GitHubError):
+        await gh.pr_checks(7, repo="org/r")
+
+
+# ---- pr_merge -------------------------------------------------------
+
+
+async def test_pr_merge_squash_with_auto(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr merge": [0, ""]})
+    gh = GitHub()
+    await gh.pr_merge(99, strategy="squash", auto=True, repo="org/r")
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["pr", "merge", "99"]
+    assert "--squash" in argv
+    assert "--auto" in argv
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
+
+
+# ---- non-zero exit + GH_TOKEN env -----------------------------------
+
+
+async def test_non_zero_exit_raises_github_error(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    fake_gh({"pr view": [1, "boom\n"]})
+    gh = GitHub()
+    with pytest.raises(GitHubError):
+        await gh.pr_view(5, repo="org/r")
+
+
+async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr view": [0, '{"number": 5}']})
+    gh = GitHub(token="ghs_test_token")
+    await gh.pr_view(5, repo="org/r")
+    assert _calls(log)[0]["env_GH_TOKEN"] == "ghs_test_token"
+
+
+# ---- head_sha + branch_list + repo_clone + pr_comment + pr_close ----
+
+
+async def test_head_sha_returns_pr_head_oid(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr view": [0, "deadbeefcafe\n"]})
+    gh = GitHub()
+    sha = await gh.head_sha(42, repo="org/r")
+    assert sha == "deadbeefcafe"
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert "headRefOid" in " ".join(str(a) for a in argv)
+
+
+async def test_branch_list_returns_names(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"api": [0, "main\nfeat/x\nfeat/y\n"]})
+    gh = GitHub()
+    branches = await gh.branch_list("org/r")
+    assert branches == ["main", "feat/x", "feat/y"]
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[0] == "api"
+    assert any("repos/org/r/branches" in str(a) for a in argv)
+
+
+async def test_repo_clone_invokes_gh_repo_clone(fake_gh, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"repo clone": [0, ""]})
+    gh = GitHub()
+    dest = tmp_path / "ws"
+    await gh.repo_clone("org/r", dest)
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:2] == ["repo", "clone"]
+    assert "org/r" in argv
+    assert str(dest) in argv
+
+
+async def test_pr_comment_passes_body(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr comment": [0, ""]})
+    gh = GitHub()
+    await gh.pr_comment(7, "hello world", repo="org/r")
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["pr", "comment", "7"]
+    assert "--body" in argv
+    assert argv[argv.index("--body") + 1] == "hello world"
+
+
+async def test_pr_close_invokes_pr_close(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr close": [0, ""]})
+    gh = GitHub()
+    await gh.pr_close(8, repo="org/r")
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["pr", "close", "8"]
