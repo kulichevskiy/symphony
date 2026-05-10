@@ -40,3 +40,13 @@ CREATE TABLE IF NOT EXISTS comment_cursors (
     issue_id     TEXT PRIMARY KEY REFERENCES issues(id),
     last_seen_at TEXT NOT NULL
 );
+
+-- Per-issue cost-warning idempotency. The cost warning template fires
+-- exactly once per issue — when the cumulative cost first crosses the
+-- configured threshold. Persisting the post timestamp lets a restarted
+-- orchestrator skip the warning even if cumulative cost is already past
+-- threshold from prior runs.
+CREATE TABLE IF NOT EXISTS issue_cost_marks (
+    issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
+    warning_posted_at   TEXT
+);

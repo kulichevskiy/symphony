@@ -36,7 +36,19 @@ from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import GitHub, GitHubError
 from ..linear.client import Linear, LinearError, LinearIssue
-from ..linear.templates import CommentVars, run_started, stage_done, truncate_body
+from ..linear.templates import (
+    CommentVars,
+    cost_warning,
+    run_started,
+    stage_done,
+    stuck_loop_escape,
+    truncate_body,
+)
+from ..pipeline.cost_guard import (
+    effective_cap,
+    effective_warning_pct,
+    evaluate_cost,
+)
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
 
@@ -495,12 +507,17 @@ class Orchestrator:
             )
             return run_id
 
+        prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+
         try:
-            cumulative_cost, final_kind, final_returncode = await self._run_agent(
-                binding=binding,
-                issue=issue,
-                run_id=run_id,
-                workspace_path=workspace_path,
+            cumulative_cost, final_kind, final_returncode, cap_breached = (
+                await self._run_agent(
+                    binding=binding,
+                    issue=issue,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                    prior_total=prior_total,
+                )
             )
         except Exception as e:  # noqa: BLE001 — surface as failed run
             log.exception("agent execution failed for %s", issue.identifier)
@@ -521,6 +538,17 @@ class Orchestrator:
                 (cumulative_cost, run_id),
             )
             await self._conn.commit()
+
+        # Cost cap breach: park the issue at `needs_approval` with the
+        # stuck-loop-escape template, do not open a PR.
+        if cap_breached:
+            await self._handle_cap_breach(
+                binding=binding,
+                issue=issue,
+                run_id=run_id,
+                cumulative_total=prior_total + cumulative_cost,
+            )
+            return run_id
 
         transition = on_runner_event(
             stage="implement",
@@ -618,9 +646,17 @@ class Orchestrator:
         issue: LinearIssue,
         run_id: str,
         workspace_path: Path,
-    ) -> tuple[float, str, int | None]:
+        prior_total: float,
+    ) -> tuple[float, str, int | None, bool]:
         """Spawn the runner and consume events. Returns
-        (cumulative_cost, final_event_kind, final_returncode).
+        (cumulative_cost, final_event_kind, final_returncode, cap_breached).
+
+        After every cost-emitting event the cumulative *issue* total
+        (prior runs + this run so far) is checked against the cap and
+        warning threshold. The once-per-issue cost-warning comment is
+        posted the first time the threshold is crossed; on cap breach the
+        runner is killed and the loop exits with `cap_breached=True` so
+        the caller can park the issue at `needs_approval`.
         """
         prompt = implement_prompt(
             issue_title=issue.title,
@@ -639,9 +675,22 @@ class Orchestrator:
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
+        cap_usd = effective_cap(
+            global_cap_usd=self.config.cost_cap_per_issue_usd,
+            binding_override=binding.cost_cap_usd,
+        )
+        warning_pct = effective_warning_pct(
+            global_pct=self.config.cost_warning_pct,
+            binding_override=binding.cost_warning_pct,
+        )
+        warning_already_fired = (
+            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+        )
+
         cumulative_cost = 0.0
         final_kind = "exit"
         final_returncode: int | None = None
+        cap_breached = False
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -652,7 +701,29 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
+                            previous_total = prior_total + cumulative_cost
                             cumulative_cost += usage.cost_usd
+                            new_total = prior_total + cumulative_cost
+                            decision = evaluate_cost(
+                                previous_total=previous_total,
+                                new_total=new_total,
+                                cap_usd=cap_usd,
+                                warning_pct=warning_pct,
+                                warning_already_fired=warning_already_fired,
+                            )
+                            if decision.fire_warning:
+                                await self._post_cost_warning(
+                                    binding=binding,
+                                    issue=issue,
+                                    run_id=run_id,
+                                    cumulative_total=new_total,
+                                    cap_usd=cap_usd,
+                                )
+                                warning_already_fired = True
+                            if decision.cap_breached:
+                                cap_breached = True
+                                await self._kill_active_runner(run_id)
+                                break
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
@@ -661,7 +732,88 @@ class Orchestrator:
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        return cumulative_cost, final_kind, final_returncode
+        return cumulative_cost, final_kind, final_returncode, cap_breached
+
+    async def _post_cost_warning(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        cumulative_total: float,
+        cap_usd: float,
+    ) -> None:
+        pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
+        body = cost_warning(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                cost=f"${cumulative_total:.4f}",
+                pct=pct,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("cost_warning comment failed on %s: %s", issue.identifier, e)
+            return
+        await db.cost_marks.mark_warning_posted(
+            self._conn, issue.id, datetime.now(UTC).isoformat()
+        )
+
+    async def _handle_cap_breach(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        cumulative_total: float,
+    ) -> None:
+        """Park the issue at `needs_approval` and post stuck-loop-escape."""
+        history = await db.runs.history_for_issue(self._conn, issue.id)
+        review_iter = sum(1 for r in history if r.stage == "review")
+        states = await self._states_for_binding(binding)
+        needs_approval_id = states.get(binding.linear_states.needs_approval)
+        if needs_approval_id is not None:
+            try:
+                await self.linear.move_issue(issue.id, needs_approval_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to needs_approval after cap breach: %s",
+                    issue.identifier,
+                    e,
+                )
+        else:
+            log.warning(
+                "no needs_approval state for team %s; cannot park %s",
+                binding.linear_team_key,
+                issue.identifier,
+            )
+        body = stuck_loop_escape(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                cost=f"${cumulative_total:.4f}",
+                review_iter=review_iter,
+                trigger="cost_cap",
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "stuck_loop_escape comment failed on %s: %s", issue.identifier, e
+            )
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            "failed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
 
     async def _fail_run(self, run_id: str, _reason: str) -> None:
         await db.runs.update_status(

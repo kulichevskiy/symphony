@@ -61,6 +61,10 @@ class RepoBinding(BaseModel):
     base_branch: str | None = None
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
+    # Per-binding cost knobs. `None` falls back to the global default; an
+    # explicit `0` disables the cap (useful when one team is exempt).
+    cost_cap_usd: float | None = None
+    cost_warning_pct: int | None = None
     linear_states: LinearStates
 
 
@@ -92,7 +96,8 @@ class Config(BaseModel):
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 6
-    cost_cap_per_issue_usd: float = 5.0
+    cost_cap_per_issue_usd: float = 15.0
+    cost_warning_pct: int = 75
     stall_timeout_secs: int = 300
 
     # Filled in from Secrets.
