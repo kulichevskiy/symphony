@@ -43,7 +43,9 @@ class PRChecks:
 
     @property
     def all_passed(self) -> bool:
-        return bool(self.runs) and all(r.bucket == "pass" for r in self.runs)
+        # `skipping` is non-blocking (path-conditional workflows), so it counts
+        # as passing alongside `pass`.
+        return bool(self.runs) and all(r.bucket in ("pass", "skipping") for r in self.runs)
 
     @property
     def any_failed(self) -> bool:

@@ -170,6 +170,22 @@ async def test_pr_checks_raises_on_other_non_zero_exit(fake_gh) -> None:  # type
         await gh.pr_checks(12, repo="org/r")
 
 
+async def test_all_passed_treats_skipping_as_pass(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # Path-conditional workflows produce `skipping` runs; PR is still mergeable.
+    payload = json.dumps(
+        [
+            {"name": "build", "state": "SUCCESS", "bucket": "pass", "link": None},
+            {"name": "lint", "state": "SKIPPED", "bucket": "skipping", "link": None},
+        ]
+    )
+    fake_gh({"pr checks": [0, payload]})
+    gh = GitHub()
+    result = await gh.pr_checks(13, repo="org/r")
+    assert result.all_passed is True
+    assert result.any_failed is False
+    assert result.pending is False
+
+
 # ---- pr_merge -------------------------------------------------------
 
 
