@@ -111,6 +111,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
 
         linear = AsyncMock()
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.post_comment = AsyncMock(return_value="cmt-1")
         linear.move_issue = AsyncMock()
 
@@ -223,6 +224,7 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
 
         linear = AsyncMock()
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.post_comment = AsyncMock(return_value="cmt-1")
         linear.move_issue = AsyncMock()
 
@@ -277,6 +279,7 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
 
         linear = AsyncMock()
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.post_comment = AsyncMock(return_value="cmt-1")
         linear.move_issue = AsyncMock()
 

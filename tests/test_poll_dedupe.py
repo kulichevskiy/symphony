@@ -8,7 +8,7 @@ import asyncio
 import inspect
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -49,7 +49,13 @@ def _binding() -> RepoBinding:
     )
 
 
-def _issue(uid: str = "iss-1", ident: str = "ENG-1") -> LinearIssue:
+def _issue(
+    uid: str = "iss-1",
+    ident: str = "ENG-1",
+    *,
+    state_name: str = "Todo",
+    labels: list[str] | None = None,
+) -> LinearIssue:
     return LinearIssue(
         id=uid,
         identifier=ident,
@@ -57,9 +63,10 @@ def _issue(uid: str = "iss-1", ident: str = "ENG-1") -> LinearIssue:
         description="",
         url="https://linear.app/x",
         state_id="state-todo",
-        state_name="Todo",
+        state_name=state_name,
         state_type="unstarted",
         team_key="ENG",
+        labels=labels or [],
     )
 
 
@@ -81,6 +88,7 @@ def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
         push_fn=push_fn,
     )
     orch._states = {"ENG": {"Todo": "state-todo", "In Progress": "state-progress"}}  # noqa: SLF001
+    linear.lookup_issue = AsyncMock(return_value=_issue())
     return orch
 
 
@@ -122,6 +130,46 @@ async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
         await asyncio.wait_for(started.wait(), timeout=1)
         release.set()
         await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_dispatch_revalidates_ready_state_before_running(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(update={"max_concurrent": 1})
+        cfg = Config(repos=[binding])
+        first = _issue()
+        second = _issue("iss-2", "ENG-2")
+        stale_second = _issue("iss-2", "ENG-2", state_name="In Progress")
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[first, second])
+
+        orch = _make_orch(cfg, linear, conn)
+        linear.lookup_issue = AsyncMock(side_effect=[first, stale_second])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_dispatch(
+            binding: RepoBinding, issue: LinearIssue
+        ) -> str | None:
+            started.set()
+            await release.wait()
+            return issue.id
+
+        orch._dispatch_one = AsyncMock(side_effect=_slow_dispatch)  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await orch._scan_binding(binding)  # noqa: SLF001
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        await asyncio.gather(*tasks)
+
+        assert orch._dispatch_one.await_count == 1  # noqa: SLF001
+        orch._dispatch_one.assert_awaited_once_with(binding, first)  # noqa: SLF001
+        assert linear.lookup_issue.await_args_list == [call("iss-1"), call("iss-2")]
     finally:
         await conn.close()
 

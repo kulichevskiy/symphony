@@ -248,7 +248,43 @@ class Orchestrator:
         )
         async with self._global_dispatch_sem:
             async with binding_sem:
-                await self._dispatch_one(binding, issue)
+                current = await self._refresh_dispatch_candidate(binding, issue)
+                if current is None:
+                    return
+                await self._dispatch_one(binding, current)
+
+    async def _refresh_dispatch_candidate(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> LinearIssue | None:
+        try:
+            current = await self.linear.lookup_issue(issue.id)
+        except LinearError as e:
+            log.warning("could not revalidate %s before dispatch: %s", issue.identifier, e)
+            return None
+        if current.team_key != binding.linear_team_key:
+            log.info(
+                "skipping %s: team changed from %s to %s before dispatch",
+                issue.identifier,
+                binding.linear_team_key,
+                current.team_key,
+            )
+            return None
+        if current.state_name != binding.linear_states.ready:
+            log.info(
+                "skipping %s: state changed from %s to %s before dispatch",
+                issue.identifier,
+                binding.linear_states.ready,
+                current.state_name,
+            )
+            return None
+        if binding.issue_label is not None and binding.issue_label not in current.labels:
+            log.info(
+                "skipping %s: label %r removed before dispatch",
+                issue.identifier,
+                binding.issue_label,
+            )
+            return None
+        return current
 
     def _dispatch_task_done(
         self, task: asyncio.Task[None], issue_id: str
