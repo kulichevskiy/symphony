@@ -4,6 +4,7 @@ re-dispatch."""
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -83,6 +84,48 @@ def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
     return orch
 
 
+async def _scan_and_wait(orch: Orchestrator, binding: RepoBinding) -> None:
+    tasks = await orch._scan_binding(binding)  # noqa: SLF001
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(
+            return_value=[_issue(), _issue("iss-2", "ENG-2")]
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _slow_dispatch(
+            binding: RepoBinding, issue: LinearIssue
+        ) -> str | None:
+            started.set()
+            await release.wait()
+            return issue.id
+
+        orch._dispatch_one = AsyncMock(side_effect=_slow_dispatch)  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await asyncio.wait_for(
+            orch._scan_binding(cfg.repos[0]),  # noqa: SLF001
+            timeout=0.2,
+        )
+
+        assert len(tasks) == 2
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_scan_skips_issues_with_active_run(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -95,13 +138,13 @@ async def test_scan_skips_issues_with_active_run(tmp_path: Path) -> None:
         orch = _make_orch(cfg, linear, conn)
 
         # First tick dispatches and records an active run.
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         first_call_count = linear.post_comment.await_count
         assert first_call_count >= 1
 
         # Second tick must dedupe via the SQLite `runs` table — not a dict —
         # so no further comments are posted.
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         assert linear.post_comment.await_count == first_call_count
     finally:
         await conn.close()
@@ -131,7 +174,7 @@ async def test_run_row_is_persisted_before_post_comment(tmp_path: Path) -> None:
         linear.post_comment = AsyncMock(side_effect=_post)
 
         orch = _make_orch(cfg, linear, conn)
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
 
         assert observed.get("had_active_when_first_post") is True
     finally:
@@ -159,12 +202,12 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
 
         orch = _make_orch(cfg, linear, conn)
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         # The failed announce row exists but is no longer live, so dedupe
         # lets the next tick retry.
         assert await db.runs.has_active(conn, "iss-1") is False
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         # Second tick re-announces and proceeds (>= 2 total post_comment calls).
         assert linear.post_comment.await_count >= 2
         # The retry produced a successful run, so dedupe now blocks future
@@ -193,10 +236,10 @@ async def test_failed_state_move_clears_dedupe_so_next_tick_retries(
         orch = _make_orch(cfg, linear, conn)
         orch._states = {"ENG": {"Todo": "state-todo", "In Progress": "state-progress"}}  # noqa: SLF001
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         assert await db.runs.has_running_or_completed(conn, "iss-1") is False
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         assert linear.post_comment.await_count == 2
 
         history = await db.runs.history_for_issue(conn, "iss-1")
@@ -219,11 +262,11 @@ async def test_missing_in_progress_state_clears_dedupe_so_next_tick_retries(
         orch = _make_orch(cfg, linear, conn)
         orch._states = {"ENG": {}}  # noqa: SLF001
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         assert await db.runs.has_running_or_completed(conn, "iss-1") is False
         linear.post_comment.assert_not_awaited()
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert [run.status for run in history] == ["failed", "failed"]
     finally:

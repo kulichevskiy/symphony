@@ -11,6 +11,7 @@ Review and Merge are out of scope for this slice.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -37,6 +38,19 @@ class _FakeRunner:
     async def _aiter(self) -> AsyncIterator[RunnerEvent]:
         for ev in self.events:
             yield ev
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+class _ExplodingRunner:
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        return self._aiter()
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        if False:
+            yield RunnerEvent(kind="exit", returncode=0)
+        raise RuntimeError("agent stream exploded")
 
     async def kill(self, run_id: str) -> None:
         pass
@@ -75,6 +89,12 @@ def _states() -> dict[str, str]:
         "Blocked": "state-bl",
         "Done": "state-done",
     }
+
+
+async def _scan_and_wait(orch: Orchestrator, binding: RepoBinding) -> None:
+    tasks = await orch._scan_binding(binding)  # noqa: SLF001
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio
@@ -133,7 +153,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
 
         # ▶ starting comment + stage-transition comment.
         assert linear.post_comment.await_count == 2
@@ -227,10 +247,63 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
-        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        await _scan_and_wait(orch, cfg.repos[0])
 
         # No PR opened on failure.
         gh.pr_create.assert_not_awaited()
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-todo"),
+        ]
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "failed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_implement_dispatch_marks_failed_on_runner_exception(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_ExplodingRunner(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+
+        gh.pr_create.assert_not_awaited()
+        workspace.release.assert_called_once()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
             call("iss-1", "state-todo"),

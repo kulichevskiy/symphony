@@ -23,6 +23,7 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 
 import aiosqlite
@@ -42,6 +43,7 @@ from ..workspace import Workspace
 log = logging.getLogger(__name__)
 
 PushFn = Callable[[Path, str], Awaitable[None]]
+BindingKey = tuple[str, str, str]
 
 
 def build_pr_title(issue: LinearIssue) -> str:
@@ -69,6 +71,14 @@ def build_runner_command(agent: str, prompt: str) -> list[str]:
     if agent == "codex":
         return ["codex", "exec", "--json", prompt]
     raise ValueError(f"unknown agent {agent!r}")
+
+
+def _binding_key(binding: RepoBinding) -> BindingKey:
+    return (
+        binding.linear_team_key,
+        binding.github_repo,
+        binding.issue_label or "",
+    )
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -119,6 +129,12 @@ class Orchestrator:
         # Cache of (team_key -> {state_name: state_uuid}). Re-fetched on
         # startup; never mutated at runtime.
         self._states: dict[str, dict[str, str]] = {}
+        self._dispatch_tasks: set[asyncio.Task[None]] = set()
+        self._scheduled_issue_ids: set[str] = set()
+        self._global_dispatch_sem = asyncio.Semaphore(
+            max(config.global_max_concurrent, 1)
+        )
+        self._binding_dispatch_sems: dict[BindingKey, asyncio.Semaphore] = {}
 
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
@@ -166,7 +182,10 @@ class Orchestrator:
         for binding in self.config.repos:
             await self._scan_binding(binding)
 
-    async def _scan_binding(self, binding: RepoBinding) -> None:
+    async def _scan_binding(
+        self, binding: RepoBinding
+    ) -> list[asyncio.Task[None]]:
+        scheduled: list[asyncio.Task[None]] = []
         ready_state = binding.linear_states.ready
         try:
             issues = await self.linear.issues_in_state(
@@ -174,7 +193,7 @@ class Orchestrator:
             )
         except LinearError as e:
             log.warning("scan failed for %s: %s", binding.linear_team_key, e)
-            return
+            return scheduled
         log.info(
             "scan %s: %d issue(s) in %s%s",
             binding.linear_team_key,
@@ -182,10 +201,54 @@ class Orchestrator:
             ready_state,
             f" with label '{binding.issue_label}'" if binding.issue_label else "",
         )
+        if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
+            log.info(
+                "scan %s: dispatch capacity is zero (global=%d, binding=%d)",
+                binding.linear_team_key,
+                self.config.global_max_concurrent,
+                binding.max_concurrent,
+            )
+            return scheduled
         for issue in issues:
+            if issue.id in self._scheduled_issue_ids:
+                continue
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 continue
-            await self._dispatch_one(binding, issue)
+            scheduled.append(self._schedule_dispatch(binding, issue))
+        return scheduled
+
+    def _schedule_dispatch(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> asyncio.Task[None]:
+        self._scheduled_issue_ids.add(issue.id)
+        task = asyncio.create_task(self._dispatch_with_limits(binding, issue))
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(partial(self._dispatch_task_done, issue_id=issue.id))
+        return task
+
+    async def _dispatch_with_limits(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> None:
+        key = _binding_key(binding)
+        binding_sem = self._binding_dispatch_sems.setdefault(
+            key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        async with self._global_dispatch_sem:
+            async with binding_sem:
+                await self._dispatch_one(binding, issue)
+
+    def _dispatch_task_done(
+        self, task: asyncio.Task[None], issue_id: str
+    ) -> None:
+        self._dispatch_tasks.discard(task)
+        self._scheduled_issue_ids.discard(issue_id)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("dispatch task crashed for issue_id=%s", issue_id)
 
     async def _dispatch_one(
         self, binding: RepoBinding, issue: LinearIssue
@@ -320,6 +383,15 @@ class Orchestrator:
                 run_id=run_id,
                 workspace_path=workspace_path,
             )
+        except Exception as e:  # noqa: BLE001 — surface as failed run
+            log.exception("agent execution failed for %s", issue.identifier)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"agent execution failed: {e}",
+                issue=issue,
+                ready_state_id=ready_id,
+            )
+            return run_id
         finally:
             self._workspace.release(binding, issue)
 
