@@ -162,10 +162,12 @@ class Workspace:
         # Prefer an existing local branch (preserves agent commits made
         # during a prior fix-run). Otherwise, track origin if it has the
         # branch. Otherwise, create from current HEAD.
-        if await self._git_ok(path, "rev-parse", "--verify", branch):
+        # Use fully-qualified ref paths so a tag with the same name
+        # doesn't trick `git switch` into "a branch is expected".
+        if await self._git_ok(path, "rev-parse", "--verify", f"refs/heads/{branch}"):
             await self._git(path, "switch", branch)
             return
-        if await self._git_ok(path, "rev-parse", "--verify", f"origin/{branch}"):
+        if await self._git_ok(path, "rev-parse", "--verify", f"refs/remotes/origin/{branch}"):
             await self._git(path, "switch", "-c", branch, "--track", f"origin/{branch}")
             return
         await self._git(path, "switch", "-c", branch)
