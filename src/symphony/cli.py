@@ -18,8 +18,8 @@ from pathlib import Path
 import click
 
 from . import db
-from .config import Config
-from .linear.client import Linear, LinearError
+from .config import Config, RepoBinding
+from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
 
@@ -29,6 +29,42 @@ def _setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+
+
+def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
+    """Pick the binding the poll loop would have used for `issue`.
+
+    The poll loop iterates `cfg.repos` in order and the first binding whose
+    `(team_key, label)` filter matches an issue claims it (subsequent
+    bindings see it as already-active and skip). Mirror that: walk
+    `cfg.repos` in order and return the first binding for the issue's team
+    that either has no `issue_label` (catch-all) or whose label is on the
+    issue. Selecting by team key alone, as the earlier `next(...)` did,
+    silently routed manual dispatches to the wrong repo when one team was
+    fanned out to multiple repos via labels.
+    """
+    team_bindings = [b for b in cfg.repos if b.linear_team_key == issue.team_key]
+    if not team_bindings:
+        configured = sorted({b.linear_team_key for b in cfg.repos})
+        click.echo(
+            f"no binding configured for team key {issue.team_key!r}; "
+            f"configured teams: {configured}",
+            err=True,
+        )
+        return None
+
+    issue_labels = set(issue.labels)
+    for binding in team_bindings:
+        if binding.issue_label is None or binding.issue_label in issue_labels:
+            return binding
+
+    expected = sorted({b.issue_label for b in team_bindings if b.issue_label})
+    click.echo(
+        f"no binding matches {issue.identifier}: issue labels {sorted(issue_labels)} "
+        f"do not include any of {expected} and no catch-all binding is configured.",
+        err=True,
+    )
+    return None
 
 
 @click.group(invoke_without_command=True)
@@ -135,6 +171,146 @@ async def _preflight(config_path: Path) -> None:
             else:
                 click.echo(f"  ✓ {binding.linear_team_key} → {binding.github_repo}: states ok")
         sys.exit(0 if ok else 1)
+
+
+@main.group()
+def runs() -> None:
+    """Inspect runs in the SQLite store. No orchestrator process required."""
+
+
+@runs.command("ls")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Path to the symphonyd SQLite file.",
+)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=1),
+    default=50,
+    help="Max rows to show.",
+)
+def runs_ls(db_path: Path, limit: int) -> None:
+    """List active + recent runs."""
+    asyncio.run(_runs_ls(db_path, limit))
+
+
+async def _runs_ls(db_path: Path, limit: int) -> None:
+    conn = await db.connect(db_path)
+    try:
+        rows = await db.runs.list_recent(conn, limit=limit)
+    finally:
+        await conn.close()
+    if not rows:
+        click.echo("(no runs)")
+        return
+    click.echo("id\tissue\tstage\tstatus\tcost\tstarted_at")
+    for r in rows:
+        run = r.run
+        click.echo(
+            f"{run.id}\t{r.identifier}\t{run.stage}\t{run.status}\t"
+            f"${run.cost_usd:.2f}\t{run.started_at}"
+        )
+
+
+@runs.command("show")
+@click.argument("run_id")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+)
+def runs_show(run_id: str, db_path: Path) -> None:
+    """Show full detail for a single run."""
+    asyncio.run(_runs_show(run_id, db_path))
+
+
+async def _runs_show(run_id: str, db_path: Path) -> None:
+    conn = await db.connect(db_path)
+    try:
+        rwi = await db.runs.get_with_issue(conn, run_id)
+        if rwi is None:
+            click.echo(f"run not found: {run_id}", err=True)
+            sys.exit(1)
+        cursor = await db.comment_cursors.get(conn, rwi.run.issue_id)
+        history = await db.runs.history_for_issue(conn, rwi.run.issue_id)
+    finally:
+        await conn.close()
+    run = rwi.run
+    click.echo(f"id:             {run.id}")
+    click.echo(f"issue:          {rwi.identifier} ({run.issue_id})")
+    click.echo(f"stage:          {run.stage}")
+    click.echo(f"status:         {run.status}")
+    click.echo(f"pid:            {run.pid if run.pid is not None else '-'}")
+    click.echo(f"started_at:     {run.started_at}")
+    click.echo(f"ended_at:       {run.ended_at or '-'}")
+    click.echo(f"cost_usd:       {run.cost_usd}")
+    click.echo(f"comment cursor: {cursor or '-'}")
+    click.echo("stage history:")
+    for h in history:
+        marker = "*" if h.id == run.id else " "
+        click.echo(
+            f"  {marker} {h.started_at}  {h.stage:<10}  {h.status:<11}  {h.id}"
+        )
+
+
+@main.command()
+@click.argument("linear_id")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+)
+def dispatch(linear_id: str, config_path: Path) -> None:
+    """Hand-launch a run for a Linear issue, regardless of its state."""
+    _setup_logging()
+    asyncio.run(_dispatch(linear_id, config_path))
+
+
+async def _dispatch(linear_id: str, config_path: Path) -> None:
+    cfg = Config.load(config_path)
+    if not cfg.linear_api_key:
+        click.echo("LINEAR_API_KEY is empty", err=True)
+        sys.exit(2)
+    async with Linear(cfg.linear_api_key) as linear:
+        try:
+            issue = await linear.lookup_issue(linear_id)
+        except LinearError as e:
+            click.echo(f"linear lookup failed: {e}", err=True)
+            sys.exit(1)
+        binding = _resolve_binding(cfg, issue)
+        if binding is None:
+            sys.exit(1)
+        conn = await db.connect(cfg.db_path)
+        try:
+            orch = Orchestrator(cfg, linear, conn)
+            run_id = await orch._dispatch_one(binding, issue)  # noqa: SLF001
+            rwi = (
+                await db.runs.get_with_issue(conn, run_id)
+                if run_id is not None
+                else None
+            )
+        finally:
+            await conn.close()
+        if run_id is None:
+            click.echo(
+                f"{issue.identifier} already has an active run; refusing to "
+                f"start a duplicate. Inspect with `symphony runs ls`.",
+                err=True,
+            )
+            sys.exit(1)
+        if rwi is not None and rwi.run.status == "failed":
+            click.echo(
+                f"dispatch failed for {issue.identifier}: announce comment did "
+                f"not post; run {run_id} marked failed",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(f"dispatched {issue.identifier} → {binding.github_repo}")
 
 
 if __name__ == "__main__":
