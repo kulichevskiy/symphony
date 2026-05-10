@@ -150,6 +150,26 @@ async def test_pr_checks_raises_on_json_parse_failure(fake_gh) -> None:  # type:
         await gh.pr_checks(7, repo="org/r")
 
 
+async def test_pr_checks_accepts_exit_code_8_pending(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # `gh pr checks` exits 8 when checks are still pending but still emits JSON.
+    payload = json.dumps(
+        [{"name": "build", "state": "PENDING", "bucket": "pending", "link": None}]
+    )
+    fake_gh({"pr checks": [8, payload]})
+    gh = GitHub()
+    result = await gh.pr_checks(11, repo="org/r")
+    assert result.pending is True
+    assert result.all_passed is False
+    assert result.any_failed is False
+
+
+async def test_pr_checks_raises_on_other_non_zero_exit(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    fake_gh({"pr checks": [1, "boom"]})
+    gh = GitHub()
+    with pytest.raises(GitHubError):
+        await gh.pr_checks(12, repo="org/r")
+
+
 # ---- pr_merge -------------------------------------------------------
 
 

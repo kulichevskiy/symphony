@@ -75,7 +75,7 @@ class GitHub:
         argv: list[str],
         *,
         cwd: Path | None = None,
-        check: bool = True,
+        allow_exit_codes: tuple[int, ...] = (0,),
     ) -> str:
         env = {**os.environ, **self._extra_env}
         if self._token is not None:
@@ -95,14 +95,20 @@ class GitHub:
         stdout_b, stderr_b = await proc.communicate()
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
-        if check and proc.returncode != 0:
+        if proc.returncode not in allow_exit_codes:
             raise GitHubError(
                 f"gh {' '.join(argv)} exited {proc.returncode}: {stderr.strip() or stdout.strip()}"
             )
         return stdout
 
-    async def _run_json(self, argv: list[str], *, cwd: Path | None = None) -> Any:
-        out = await self._run(argv, cwd=cwd)
+    async def _run_json(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path | None = None,
+        allow_exit_codes: tuple[int, ...] = (0,),
+    ) -> Any:
+        out = await self._run(argv, cwd=cwd, allow_exit_codes=allow_exit_codes)
         try:
             return json.loads(out)
         except json.JSONDecodeError as e:
@@ -180,7 +186,8 @@ class GitHub:
             "--json",
             "name,state,bucket,link",
         ]
-        data = await self._run_json(argv)
+        # gh exits 8 when checks are still pending but still emits valid JSON.
+        data = await self._run_json(argv, allow_exit_codes=(0, 8))
         if not isinstance(data, list):
             raise GitHubError(f"pr checks: expected array, got {type(data).__name__}")
         runs: list[CheckRun] = []
