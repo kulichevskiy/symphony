@@ -34,14 +34,14 @@ def _setup_logging() -> None:
 def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
     """Pick the binding the poll loop would have used for `issue`.
 
-    The poll loop scans each `(team_key, label)` pair separately, so an
-    issue is only routed to a binding if its labels match. The CLI's
-    earlier `next(... linear_team_key match ...)` selected by team key
-    alone, which silently picks the wrong repo when one Linear team is
-    fanned out to multiple repos via labels. Mirror the poll loop's
-    semantics here: prefer a binding whose `issue_label` is on the
-    issue, fall back to a label-less catchall, and refuse to guess if
-    multiple bindings could legitimately claim it.
+    The poll loop iterates `cfg.repos` in order and the first binding whose
+    `(team_key, label)` filter matches an issue claims it (subsequent
+    bindings see it as already-active and skip). Mirror that: walk
+    `cfg.repos` in order and return the first binding for the issue's team
+    that either has no `issue_label` (catch-all) or whose label is on the
+    issue. Selecting by team key alone, as the earlier `next(...)` did,
+    silently routed manual dispatches to the wrong repo when one team was
+    fanned out to multiple repos via labels.
     """
     team_bindings = [b for b in cfg.repos if b.linear_team_key == issue.team_key]
     if not team_bindings:
@@ -54,32 +54,9 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
         return None
 
     issue_labels = set(issue.labels)
-    labeled = [
-        b for b in team_bindings
-        if b.issue_label is not None and b.issue_label in issue_labels
-    ]
-    if len(labeled) == 1:
-        return labeled[0]
-    if len(labeled) > 1:
-        click.echo(
-            f"ambiguous: {issue.identifier} matches multiple labeled bindings "
-            f"({[b.github_repo for b in labeled]}); refine the config so "
-            f"only one binding owns each label.",
-            err=True,
-        )
-        return None
-
-    catchalls = [b for b in team_bindings if b.issue_label is None]
-    if len(catchalls) == 1:
-        return catchalls[0]
-    if len(catchalls) > 1:
-        click.echo(
-            f"ambiguous: {len(catchalls)} catch-all bindings configured for "
-            f"team {issue.team_key!r}; add `issue_label` to each so the "
-            f"binding for {issue.identifier} can be picked deterministically.",
-            err=True,
-        )
-        return None
+    for binding in team_bindings:
+        if binding.issue_label is None or binding.issue_label in issue_labels:
+            return binding
 
     expected = sorted({b.issue_label for b in team_bindings if b.issue_label})
     click.echo(

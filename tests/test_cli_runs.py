@@ -235,6 +235,65 @@ def test_runs_ls_rejects_directory_for_db_path(tmp_path: Path) -> None:
     assert "directory" in result.output.lower()
 
 
+def test_dispatch_first_matching_binding_in_cfg_order_wins(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Mirror the poll loop's first-come-first-serve precedence: when a
+    catch-all binding is listed before a labeled one, the poll loop's
+    catch-all scan would claim the issue first. The CLI must pick the same
+    binding so that `dispatch` can't route differently than the automated
+    path for the same issue."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    cfg_path = tmp_path / "cfg.yaml"
+    # Catch-all FIRST, labeled second — under cfg order, the catch-all wins
+    # even though the issue carries the labeled binding's label.
+    cfg_path.write_text(f"""
+db_path: {db_path}
+repos:
+  - linear_team_key: ENG
+    github_repo: org/catchall
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+  - linear_team_key: ENG
+    github_repo: org/web-app
+    issue_label: web
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+""")
+
+    issue = LinearIssue(
+        id="iss-web",
+        identifier="ENG-200",
+        title="web with catchall first",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+        labels=["web"],
+    )
+    fake = _FakeLinear(issue)
+    _install_fake_linear(monkeypatch, fake)
+
+    result = CliRunner().invoke(
+        main, ["dispatch", "ENG-200", "--config", str(cfg_path)]
+    )
+    assert result.exit_code == 0, result.output
+    # cfg order wins: catch-all (listed first) claims it, not the labeled binding.
+    assert "org/catchall" in result.output
+    assert "org/web-app" not in result.output
+
+
 def test_dispatch_picks_binding_by_issue_label(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
