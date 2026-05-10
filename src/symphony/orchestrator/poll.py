@@ -258,6 +258,8 @@ class Orchestrator:
                     binding.linear_states.in_progress,
                     e,
                 )
+                await self._fail_run(run_id, f"move_issue failed: {e}")
+                return run_id
 
         # 3. Acquire a per-issue workspace clone.
         try:

@@ -170,3 +170,34 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
         assert await db.runs.has_running_or_completed(conn, "iss-1") is True
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_state_move_clears_dedupe_so_next_tick_retries(
+    tmp_path: Path,
+) -> None:
+    """If the Linear move to In Progress fails, do not continue to a completed
+    run while the issue is still in the ready state."""
+    from symphony.linear.client import LinearError
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(side_effect=LinearError("boom"))
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {"ENG": {"In Progress": "state-progress"}}  # noqa: SLF001
+
+        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+
+        await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert linear.post_comment.await_count == 2
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.status for run in history] == ["failed", "failed"]
+    finally:
+        await conn.close()
