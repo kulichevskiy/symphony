@@ -149,6 +149,34 @@ async def test_cleanup_removes_workspace_dir(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_sweep_ttl_skips_in_use_workspace_even_if_mtime_is_stale(
+    tmp_path: Path,
+) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+    binding = _binding()
+    issue = _issue("ENG-99")
+    path = await ws.acquire(binding, issue)
+
+    # Long-running stage: no git ops, file mtimes go stale.
+    now = time.time()
+    ttl = 7 * 24 * 3600
+    stale = now - 30 * 24 * 3600
+    os.utime(path, (stale, stale))
+    for marker in (".git/HEAD", ".git/index"):
+        if (path / marker).exists():
+            os.utime(path / marker, (stale, stale))
+
+    await ws.sweep_ttl(now=now)
+    assert path.exists(), "sweep must skip in-use workspaces"
+
+    # After release, sweep can collect it.
+    ws.release(binding, issue)
+    await ws.sweep_ttl(now=now)
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
 async def test_sweep_ttl_keeps_active_workspace_with_recent_git_activity(
     tmp_path: Path,
 ) -> None:

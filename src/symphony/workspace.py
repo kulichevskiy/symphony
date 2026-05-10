@@ -51,6 +51,10 @@ class Workspace:
         # the sweeper can't rmtree a dir between an acquire's mtime read
         # and its first git op.
         self._locks: dict[Path, asyncio.Lock] = {}
+        # Workspaces actively held by a stage. mtime-based liveness is
+        # blind to long fix-runs that don't touch git; the sweeper
+        # excludes anything in this set regardless of mtime.
+        self._in_use: set[Path] = set()
 
     def _lock_for(self, path: Path) -> asyncio.Lock:
         lock = self._locks.get(path)
@@ -87,7 +91,12 @@ class Workspace:
                 await self._clone_fn(binding.github_repo, path)
             await self._ensure_branch(path, branch)
             path.touch(exist_ok=True)
+            self._in_use.add(path)
         return path
+
+    def release(self, binding: RepoBinding, issue: LinearIssue) -> None:
+        """Mark a workspace no longer in active use (eligible for sweep)."""
+        self._in_use.discard(self.path_for(binding, issue))
 
     async def cleanup(self, issue: LinearIssue) -> None:
         """Remove the workspace dir for `issue` from every repo namespace."""
@@ -101,6 +110,7 @@ class Workspace:
             async with self._lock_for(candidate):
                 if candidate.exists():
                     await asyncio.to_thread(shutil.rmtree, candidate)
+                self._in_use.discard(candidate)
 
     async def sweep_ttl(self, *, now: float | None = None) -> None:
         """Remove issue dirs whose mtime is older than `ttl_secs`."""
@@ -113,6 +123,8 @@ class Workspace:
             for issue_dir in repo_dir.iterdir():
                 if not issue_dir.is_dir():
                     continue
+                if issue_dir in self._in_use:
+                    continue
                 try:
                     mtime = self._liveness_mtime(issue_dir)
                 except FileNotFoundError:
@@ -122,6 +134,8 @@ class Workspace:
                 # Re-check under the lock so a concurrent acquire() that
                 # bumped mtime after our scan isn't wiped mid-run.
                 async with self._lock_for(issue_dir):
+                    if issue_dir in self._in_use:
+                        continue
                     try:
                         mtime = self._liveness_mtime(issue_dir)
                     except FileNotFoundError:
