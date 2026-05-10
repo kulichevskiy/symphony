@@ -58,6 +58,7 @@ class RepoBinding(BaseModel):
     agent: Literal["claude", "codex"] = "claude"
     issue_label: str | None = None
     branch_prefix: str = "symphony"
+    base_branch: str | None = None
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
     linear_states: LinearStates

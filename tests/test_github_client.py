@@ -82,6 +82,16 @@ def fake_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no
 # ---- pr_create ------------------------------------------------------
 
 
+async def test_repo_default_branch_reads_repo_view(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps({"defaultBranchRef": {"name": "trunk"}})
+    log = fake_gh({"repo view org/r": [0, payload]})
+    gh = GitHub()
+    assert await gh.repo_default_branch("org/r") == "trunk"
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv == ["repo", "view", "org/r", "--json", "defaultBranchRef"]
+
+
 async def test_pr_create_appends_linear_url_when_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/42\n"]})
     gh = GitHub()

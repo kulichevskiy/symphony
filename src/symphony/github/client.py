@@ -132,6 +132,19 @@ class GitHub:
     async def repo_clone(self, repo: str, dest: Path) -> None:
         await self._run(["repo", "clone", repo, str(dest)])
 
+    async def repo_default_branch(self, repo: str) -> str:
+        result = await self._run_json(
+            ["repo", "view", repo, "--json", "defaultBranchRef"]
+        )
+        if not isinstance(result, dict):
+            raise GitHubError(
+                f"repo view: expected object, got {type(result).__name__}"
+            )
+        default_ref = result.get("defaultBranchRef")
+        if not isinstance(default_ref, dict) or not default_ref.get("name"):
+            raise GitHubError(f"repo view: missing default branch for {repo}")
+        return str(default_ref["name"])
+
     async def pr_create(
         self,
         *,

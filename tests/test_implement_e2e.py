@@ -128,6 +128,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         gh = MagicMock()
         gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         push_fn = AsyncMock()
 
@@ -189,9 +190,10 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         kwargs = gh.pr_create.await_args.kwargs
         assert kwargs["title"] == "[ENG-1] Add authentication"
         assert kwargs["repo"] == "org/repo"
+        assert kwargs["base"] == "trunk"
         assert kwargs["head"] == "symphony/eng-1"
-        assert "base" not in kwargs
         assert kwargs["linear_url"] == "https://linear.app/team/issue/ENG-1"
+        gh.repo_default_branch.assert_awaited_once_with("org/repo")
 
         # Per-issue cost accumulated from streaming JSON.
         cost = await db.runs.cost_for_issue(conn, "iss-1")
@@ -240,6 +242,7 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
 
         gh = MagicMock()
         gh.pr_create = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         events = [
             RunnerEvent(kind="stderr", line="boom"),
@@ -295,6 +298,7 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
 
         gh = MagicMock()
         gh.pr_create = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         orch = Orchestrator(
             cfg,
@@ -348,6 +352,7 @@ async def test_manual_dispatch_failure_rolls_back_to_original_state(
 
         gh = MagicMock()
         gh.pr_create = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         runner = _FakeRunner(
             [

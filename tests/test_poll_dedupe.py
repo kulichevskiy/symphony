@@ -76,6 +76,7 @@ def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
     workspace.release = MagicMock()
     gh = MagicMock()
     gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
+    gh.repo_default_branch = AsyncMock(return_value="main")
     runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
     push_fn = AsyncMock()
     orch = Orchestrator(

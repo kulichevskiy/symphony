@@ -488,9 +488,23 @@ class Orchestrator:
 
         pr_url: str = ""
         try:
+            base_branch = binding.base_branch or await self._gh.repo_default_branch(
+                binding.github_repo
+            )
+        except GitHubError as e:
+            log.warning("repo_default_branch failed for %s: %s", issue.identifier, e)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"repo_default_branch failed: {e}",
+                issue=issue,
+                rollback_state_id=issue.state_id,
+            )
+            return run_id
+        try:
             pr_url = await self._gh.pr_create(
                 title=build_pr_title(issue),
                 body="",
+                base=base_branch,
                 head=branch,
                 repo=binding.github_repo,
                 linear_url=issue.url,
