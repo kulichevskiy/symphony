@@ -61,10 +61,11 @@ class Workspace:
 
     @staticmethod
     def repo_safe(github_repo: str) -> str:
-        # `org/repo` would otherwise nest into a subdirectory and conflict
-        # with case-folded filesystems if the repo name is reused under
-        # multiple orgs. Double underscore keeps the mapping reversible.
-        return github_repo.replace("/", "__")
+        # GitHub repo names allow `_` and use `/` as the owner/name
+        # separator. A naive `/` → `__` swap collides (e.g. `a/b__c`
+        # and `a__b/c` both map to `a__b__c`). Escape `_` first so
+        # the encoding stays injective.
+        return github_repo.replace("_", "_u").replace("/", "_s")
 
     def path_for(self, binding: RepoBinding, issue: LinearIssue) -> Path:
         return self._root / self.repo_safe(binding.github_repo) / issue.identifier.lower()

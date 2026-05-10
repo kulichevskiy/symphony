@@ -73,10 +73,16 @@ def _make_clone_fn(remote: Path):
 
 
 def test_repo_safe_collapses_slash() -> None:
-    assert Workspace.repo_safe("acme/widgets") == "acme__widgets"
-    assert Workspace.repo_safe("acme/repo-name") == "acme__repo-name"
+    assert Workspace.repo_safe("acme/widgets") == "acme_swidgets"
+    assert Workspace.repo_safe("acme/repo-name") == "acme_srepo-name"
     # Deterministic: same input -> same output.
     assert Workspace.repo_safe("a/b") == Workspace.repo_safe("a/b")
+
+
+def test_repo_safe_is_injective_for_underscore_collisions() -> None:
+    # The naive `/`→`__` swap collapsed these two distinct repos to
+    # the same dir; the escape must keep them separate.
+    assert Workspace.repo_safe("acme/foo__bar") != Workspace.repo_safe("acme__foo/bar")
 
 
 @pytest.mark.asyncio
@@ -86,7 +92,7 @@ async def test_acquire_clones_and_checks_out_branch(tmp_path: Path) -> None:
 
     path = await ws.acquire(_binding(), _issue("ENG-123"))
 
-    assert path == tmp_path / "ws" / "acme__widgets" / "eng-123"
+    assert path == tmp_path / "ws" / "acme_swidgets" / "eng-123"
     assert (path / ".git").exists()
     assert (path / "README.md").exists()
 
@@ -163,8 +169,8 @@ async def test_sweep_ttl_keeps_active_workspace_with_recent_git_activity(
 @pytest.mark.asyncio
 async def test_sweep_ttl_removes_stale_keeps_fresh(tmp_path: Path) -> None:
     root = tmp_path / "ws"
-    stale = root / "acme__widgets" / "eng-old"
-    fresh = root / "acme__widgets" / "eng-new"
+    stale = root / "acme_swidgets" / "eng-old"
+    fresh = root / "acme_swidgets" / "eng-new"
     stale.mkdir(parents=True)
     fresh.mkdir(parents=True)
 
