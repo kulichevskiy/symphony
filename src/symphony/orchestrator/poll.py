@@ -699,6 +699,12 @@ class Orchestrator:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
                         logf.write(ev.line + "\n")
+                        if cap_breached:
+                            # Already killed the runner; keep draining so its
+                            # pump/watch tasks can finish via the terminal
+                            # event path instead of being orphaned by an
+                            # early aclose() of the async generator.
+                            continue
                         usage = parse_event_line(ev.line)
                         if usage is not None:
                             previous_total = prior_total + cumulative_cost
@@ -723,7 +729,6 @@ class Orchestrator:
                             if decision.cap_breached:
                                 cap_breached = True
                                 await self._kill_active_runner(run_id)
-                                break
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):

@@ -158,9 +158,11 @@ async def test_cap_breach_parks_issue_at_needs_approval(tmp_path: Path) -> None:
         gh.pr_create.assert_not_awaited()
         assert runner.kill_calls == [orch._dispatch_run_ids.get("iss-1") or ""] or runner.kill_calls  # noqa: SLF001
 
-        # Cap-breach event short-circuited the loop: the trailing `exit`
-        # event was never consumed.
-        assert runner.events_consumed < len(runner.cost_increments) + 2
+        # Cap-breach kept consuming events until the runner's terminal
+        # `exit` — otherwise an early aclose() would orphan the runner's
+        # pump/watch tasks. The +1 (vs len(increments)) accounts for the
+        # post-stdout iteration that runs through to yield `exit`.
+        assert runner.events_consumed == len(runner.cost_increments) + 1
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
