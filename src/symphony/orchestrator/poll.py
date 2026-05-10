@@ -315,7 +315,6 @@ class Orchestrator:
             pr_url = await self._gh.pr_create(
                 title=build_pr_title(issue),
                 body="",
-                base="main",
                 head=branch,
                 repo=binding.github_repo,
                 linear_url=issue.url,

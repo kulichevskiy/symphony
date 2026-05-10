@@ -164,6 +164,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert kwargs["title"] == "[ENG-1] Add authentication"
         assert kwargs["repo"] == "org/repo"
         assert kwargs["head"] == "symphony/eng-1"
+        assert "base" not in kwargs
         assert kwargs["linear_url"] == "https://linear.app/team/issue/ENG-1"
 
         # Per-issue cost accumulated from streaming JSON.

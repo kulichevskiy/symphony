@@ -137,7 +137,7 @@ class GitHub:
         *,
         title: str,
         body: str,
-        base: str,
+        base: str | None = None,
         head: str,
         repo: str | None = None,
         linear_url: str | None = None,
@@ -155,12 +155,16 @@ class GitHub:
             title,
             "--body",
             full_body,
-            "--base",
-            base,
-            "--head",
-            head,
-            *self._repo_args(repo),
         ]
+        if base:
+            argv.extend(["--base", base])
+        argv.extend(
+            [
+                "--head",
+                head,
+                *self._repo_args(repo),
+            ]
+        )
         if draft:
             argv.append("--draft")
         out = await self._run(argv)

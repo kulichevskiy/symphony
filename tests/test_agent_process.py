@@ -62,6 +62,24 @@ def test_parses_codex_token_count_event() -> None:
     assert usage.output_tokens == 300
 
 
+def test_parses_codex_turn_completed_usage() -> None:
+    """Codex `exec --json` reports final usage on `turn.completed`."""
+    line = json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 2100,
+                "cached_input_tokens": 400,
+                "output_tokens": 550,
+                "total_tokens": 2650,
+            },
+        }
+    )
+    assert parse_event_line(line) == Usage(
+        cost_usd=0.0, input_tokens=2100, output_tokens=550
+    )
+
+
 def test_usage_cost_accumulates_on_caller() -> None:
     """Multiple result events in a single run are summed by the caller.
     The parser is stateless: each call returns the usage for that line.
