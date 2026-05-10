@@ -420,7 +420,7 @@ class Orchestrator:
                 run_id,
                 str(e),
                 issue=issue,
-                ready_state_id=ready_id,
+                rollback_state_id=issue.state_id,
             )
             return run_id
 
@@ -437,7 +437,7 @@ class Orchestrator:
                 run_id,
                 f"agent execution failed: {e}",
                 issue=issue,
-                ready_state_id=ready_id,
+                rollback_state_id=issue.state_id,
             )
             return run_id
         finally:
@@ -468,7 +468,7 @@ class Orchestrator:
                 run_id,
                 f"runner ended with {final_kind}",
                 issue=issue,
-                ready_state_id=ready_id,
+                rollback_state_id=issue.state_id,
             )
             return run_id
 
@@ -482,7 +482,7 @@ class Orchestrator:
                 run_id,
                 f"push failed: {e}",
                 issue=issue,
-                ready_state_id=ready_id,
+                rollback_state_id=issue.state_id,
             )
             return run_id
 
@@ -501,7 +501,7 @@ class Orchestrator:
                 run_id,
                 f"pr_create failed: {e}",
                 issue=issue,
-                ready_state_id=ready_id,
+                rollback_state_id=issue.state_id,
             )
             return run_id
 
@@ -591,14 +591,14 @@ class Orchestrator:
         reason: str,
         *,
         issue: LinearIssue,
-        ready_state_id: str,
+        rollback_state_id: str,
     ) -> None:
         await self._fail_run(run_id, reason)
         try:
-            await self.linear.move_issue(issue.id, ready_state_id)
+            await self.linear.move_issue(issue.id, rollback_state_id)
         except LinearError as e:
             log.warning(
-                "could not move %s back to ready after failed dispatch: %s",
+                "could not roll %s back after failed dispatch: %s",
                 issue.identifier,
                 e,
             )

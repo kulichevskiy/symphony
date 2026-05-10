@@ -66,15 +66,19 @@ def _binding() -> RepoBinding:
     )
 
 
-def _issue() -> LinearIssue:
+def _issue(
+    *,
+    state_id: str = "state-todo",
+    state_name: str = "Todo",
+) -> LinearIssue:
     return LinearIssue(
         id="iss-1",
         identifier="ENG-1",
         title="Add authentication",
         description="Need OAuth login for the dashboard.",
         url="https://linear.app/team/issue/ENG-1",
-        state_id="state-todo",
-        state_name="Todo",
+        state_id=state_id,
+        state_name=state_name,
         state_type="unstarted",
         team_key="ENG",
         labels=["feature", "backend"],
@@ -310,6 +314,63 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
             call("iss-1", "state-todo"),
+        ]
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "failed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_dispatch_failure_rolls_back_to_original_state(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        issue = _issue(state_id="state-blocked", state_name="Blocked")
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock()
+
+        runner = _FakeRunner(
+            [
+                RunnerEvent(kind="stderr", line="boom"),
+                RunnerEvent(kind="exit", returncode=2),
+            ]
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(cfg.repos[0], issue)  # noqa: SLF001
+
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-blocked"),
         ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
