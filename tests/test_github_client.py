@@ -141,6 +141,7 @@ async def test_pr_checks_parses_json_into_typed_object(fake_gh) -> None:  # type
     assert isinstance(argv, list)
     assert argv[:3] == ["pr", "checks", "42"]
     assert "--json" in argv
+    assert "--required" in argv
 
 
 async def test_pr_checks_raises_on_json_parse_failure(fake_gh) -> None:  # type: ignore[no-untyped-def]

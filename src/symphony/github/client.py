@@ -181,10 +181,13 @@ class GitHub:
         await self._run(argv)
 
     async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks:
+        # `--required` mirrors GitHub's mergeability rule: optional checks
+        # should not block merge gating even if they fail.
         argv = [
             "pr",
             "checks",
             str(pr),
+            "--required",
             *self._repo_args(repo),
             "--json",
             "name,state,bucket,link",
