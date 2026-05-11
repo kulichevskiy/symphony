@@ -66,3 +66,18 @@ CREATE TABLE IF NOT EXISTS issue_cost_marks (
     issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
     warning_posted_at   TEXT
 );
+
+-- Runs waiting for an explicit operator slash command after the runner has
+-- stopped. Cost-cap breaches use this so `/approve` and `/reject` remain
+-- actionable after an orchestrator restart.
+CREATE TABLE IF NOT EXISTS operator_waits (
+    issue_id        TEXT PRIMARY KEY REFERENCES issues(id),
+    run_id          TEXT NOT NULL REFERENCES runs(id),
+    kind            TEXT NOT NULL,
+    linear_team_key TEXT NOT NULL,
+    github_repo     TEXT NOT NULL,
+    issue_label     TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_waits_run ON operator_waits(run_id);

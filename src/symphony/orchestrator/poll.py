@@ -256,6 +256,7 @@ class Orchestrator:
 
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
+        await self._restore_operator_waits()
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
         try:
@@ -272,6 +273,7 @@ class Orchestrator:
         boundary set, which both (a) avoids re-firing handled commands across
         restarts and (b) avoids losing comments tied at the boundary timestamp.
         """
+        await self._restore_operator_waits()
         pairs = list(self._dispatch_run_ids.items())
         for issue_id, run_id in pairs:
             if (
@@ -398,7 +400,7 @@ class Orchestrator:
                 log.warning(
                     "cost-cap resume comment failed for issue %s: %s", issue_id, e
                 )
-            self._clear_operator_wait(issue_id, run_id)
+            await self._clear_operator_wait(issue_id, run_id)
             return
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
@@ -406,7 +408,7 @@ class Orchestrator:
             blocked_id = states.get(binding.linear_states.blocked)
             if blocked_id is not None:
                 await self.linear.move_issue(issue_id, blocked_id)
-            self._clear_operator_wait(issue_id, run_id)
+            await self._clear_operator_wait(issue_id, run_id)
             return
 
         log.info(
@@ -415,18 +417,65 @@ class Orchestrator:
             run_id,
         )
 
-    def _track_operator_wait(
+    async def _restore_operator_waits(self) -> None:
+        waits = await db.operator_waits.list_all(self._conn)
+        for wait in waits:
+            if wait.kind != db.operator_waits.KIND_COST_CAP:
+                log.warning(
+                    "ignoring unsupported operator wait kind %r for issue %s",
+                    wait.kind,
+                    wait.issue_id,
+                )
+                continue
+            binding = self._binding_for_operator_wait(wait)
+            if binding is None:
+                log.warning(
+                    "cannot restore operator wait for issue %s: no binding for %s/%s label=%r",
+                    wait.issue_id,
+                    wait.linear_team_key,
+                    wait.github_repo,
+                    wait.issue_label,
+                )
+                continue
+            self._dispatch_run_ids[wait.issue_id] = wait.run_id
+            self._operator_wait_run_ids.add(wait.run_id)
+            self._cost_cap_run_bindings[wait.run_id] = binding
+
+    def _binding_for_operator_wait(
+        self, wait: db.operator_waits.OperatorWait
+    ) -> RepoBinding | None:
+        for binding in self.config.repos:
+            if (
+                binding.linear_team_key == wait.linear_team_key
+                and binding.github_repo == wait.github_repo
+                and (binding.issue_label or "") == wait.issue_label
+            ):
+                return binding
+        return None
+
+    async def _track_operator_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding
     ) -> None:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._cost_cap_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_COST_CAP,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+        )
 
-    def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
+    async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
         if self._dispatch_run_ids.get(issue_id) == run_id:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
         self._cost_cap_run_bindings.pop(run_id, None)
+        await db.operator_waits.delete(self._conn, issue_id, run_id)
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
@@ -1168,7 +1217,7 @@ class Orchestrator:
                 log.warning(
                     "cost_cap_reached comment failed on %s: %s", issue.identifier, e
                 )
-            self._track_operator_wait(issue.id, run_id, binding)
+            await self._track_operator_wait(issue.id, run_id, binding)
         finally:
             await db.runs.update_status(
                 self._conn,

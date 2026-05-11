@@ -226,6 +226,10 @@ async def test_cap_breach_keeps_run_waiting_for_operator_slash(
         assert run_id is not None
         assert run_id in orch._operator_wait_run_ids  # noqa: SLF001
         assert run_id not in orch._active_run_ids  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == run_id
+        assert wait.kind == db.operator_waits.KIND_COST_CAP
     finally:
         await conn.close()
 
