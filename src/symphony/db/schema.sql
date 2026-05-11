@@ -63,3 +63,14 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id          TEXT PRIMARY KEY,
     received_at TEXT NOT NULL
 );
+
+-- Review-stage state per issue.
+--   iteration              fix-runs dispatched so far (capped at 12).
+--   last_trigger_signature stable signature of the most recent
+--                          review_classifier verdict; used to dedup
+--                          consecutive fix-runs against the same trigger.
+CREATE TABLE IF NOT EXISTS review_state (
+    issue_id               TEXT PRIMARY KEY REFERENCES issues(id),
+    iteration              INTEGER NOT NULL DEFAULT 0,
+    last_trigger_signature TEXT NOT NULL DEFAULT ''
+);
