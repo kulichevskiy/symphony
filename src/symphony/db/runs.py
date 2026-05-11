@@ -278,6 +278,25 @@ async def history_for_issue(
     return [_row_to_run(r) for r in rows]
 
 
+async def latest_for_issue_stage(
+    conn: aiosqlite.Connection, *, issue_id: str, stage: str
+) -> Run | None:
+    cur = await conn.execute(
+        """
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        FROM runs
+        WHERE issue_id = ? AND stage = ?
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (issue_id, stage),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_run(row)
+
+
 async def cost_for_issue(conn: aiosqlite.Connection, issue_id: str) -> float:
     cur = await conn.execute(
         "SELECT COALESCE(SUM(cost_usd), 0.0) FROM runs WHERE issue_id = ?",

@@ -108,6 +108,7 @@ async def _seed_review_candidate(conn) -> None:  # type: ignore[no-untyped-def]
 
 def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
     calls = tmp_path / "gh-calls.jsonl"
+    merged_flag = tmp_path / "merged.flag"
     shim = tmp_path / "gh"
     pr_view = {
         "number": 42,
@@ -118,6 +119,7 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         "headRefOid": "abc123",
         "mergeable": "MERGEABLE",
         "isDraft": False,
+        "merged": False,
     }
     checks = [
         {
@@ -140,7 +142,9 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
     shim.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
+        "from pathlib import Path\n"
         f"calls = {str(calls)!r}\n"
+        f"merged_flag = Path({str(merged_flag)!r})\n"
         f"pr_view = json.loads({json.dumps(json.dumps(pr_view))})\n"
         f"checks = json.loads({json.dumps(json.dumps(checks))})\n"
         f"reviews = json.loads({json.dumps(json.dumps(reviews))})\n"
@@ -150,6 +154,9 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         "    f.write(json.dumps({'argv': argv}) + '\\n')\n"
         "joined = ' '.join(argv)\n"
         "if argv[:2] == ['pr', 'view']:\n"
+        "    if merged_flag.exists():\n"
+        "        pr_view['state'] = 'MERGED'\n"
+        "        pr_view['merged'] = True\n"
         "    sys.stdout.write(json.dumps(pr_view)); sys.exit(0)\n"
         "if argv[:2] == ['pr', 'checks']:\n"
         "    sys.stdout.write(json.dumps(checks)); sys.exit(0)\n"
@@ -162,6 +169,7 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         "if 'repos/org/repo/commits/abc123' in joined:\n"
         "    sys.stdout.write(json.dumps(commit)); sys.exit(0)\n"
         "if argv[:3] == ['pr', 'merge', '42']:\n"
+        "    merged_flag.write_text('1')\n"
         "    sys.exit(0)\n"
         "sys.stderr.write('unexpected gh call: ' + joined)\n"
         "sys.exit(1)\n"
@@ -240,6 +248,92 @@ async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> N
         assert "--squash" in merge_call["argv"]
         assert "--auto" in merge_call["argv"]
         assert "--repo" in merge_call["argv"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_submission_waits_until_pr_reports_merged(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            side_effect=[
+                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": False},
+                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": False},
+                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": True},
+            ]
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._poll_merge_candidates()  # noqa: SLF001
+
+        gh.pr_merge.assert_awaited_once()
+        push_fn.assert_awaited_once()
+        linear.move_issue.assert_not_awaited()
+        workspace.cleanup.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "completed"
+        assert (await db.issue_prs.list_merge_candidates(conn))[0].pr_number == 42
+
+        await orch._poll_merge_candidates()  # noqa: SLF001
+
+        gh.pr_merge.assert_awaited_once()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        workspace.cleanup.assert_awaited_once_with(_issue())
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].status == "done"
+        assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
         await conn.close()
 

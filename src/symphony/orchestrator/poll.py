@@ -237,6 +237,10 @@ def _reactions_from_github(entries: list[dict[str, object]]) -> tuple[Reaction, 
     return tuple(reactions)
 
 
+def _pr_view_is_merged(view: dict[str, object]) -> bool:
+    return bool(view.get("merged")) or str(view.get("state") or "").upper() == "MERGED"
+
+
 async def _default_push(workspace_path: Path, branch: str) -> None:
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -658,6 +662,20 @@ class Orchestrator:
                     e,
                 )
                 continue
+            latest_merge = await db.runs.latest_for_issue_stage(
+                self._conn,
+                issue_id=candidate.issue_id,
+                stage="merge",
+            )
+            if latest_merge is not None and latest_merge.status == "completed":
+                await self._poll_submitted_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                    run_id=latest_merge.id,
+                )
+                continue
             try:
                 verdict = await self._review_verdict_for_pr(
                     binding=binding,
@@ -722,6 +740,62 @@ class Orchestrator:
             ci=ci,
             snapshot=snapshot,
         )
+
+    async def _poll_submitted_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+    ) -> None:
+        try:
+            if await self._mark_merge_done_if_merged(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+            ):
+                return
+        except Exception as e:  # noqa: BLE001 — retry finalization next tick
+            log.warning(
+                "could not verify submitted merge for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return
+
+        try:
+            verdict = await self._review_verdict_for_pr(
+                binding=binding,
+                pr_number=pr_number,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not reclassify submitted merge for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return
+        if verdict.kind is VerdictKind.CHANGES_REQUESTED:
+            reason = "merge readiness regressed"
+            if verdict.failing_checks:
+                reason = "required CI failed: " + ", ".join(verdict.failing_checks)
+            elif verdict.merge_conflict:
+                reason = "merge conflict against base"
+            elif verdict.rule:
+                reason = f"review readiness regressed: {verdict.rule}"
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=reason,
+            )
 
     async def _dispatch_one(
         self, binding: RepoBinding, issue: LinearIssue
@@ -1077,26 +1151,53 @@ class Orchestrator:
                 return run_id
 
             try:
-                await self._mark_merge_done(
+                merged = await self._mark_merge_done_if_merged(
                     binding=binding,
                     issue=issue,
+                    pr_number=pr_number,
                     pr_url=pr_url,
                     run_id=run_id,
                 )
             except Exception as e:  # noqa: BLE001
-                log.exception("merge finalization failed for %s", issue.identifier)
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=f"post-merge finalization failed: {e}",
+                log.warning(
+                    "could not verify merge completion for %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                merged = False
+            if not merged:
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "completed",
+                    ended_at=datetime.now(UTC).isoformat(),
                 )
             return run_id
         finally:
             if workspace_path is not None:
                 self._workspace.release(binding, issue)
             self._dispatch_run_ids.pop(issue.id, None)
+
+    async def _mark_merge_done_if_merged(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+    ) -> bool:
+        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        if not _pr_view_is_merged(view):
+            return False
+        await self._mark_merge_done(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            run_id=run_id,
+        )
+        return True
 
     async def _mark_merge_done(
         self,

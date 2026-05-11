@@ -202,7 +202,7 @@ class GitHub:
             str(pr),
             *self._repo_args(repo),
             "--json",
-            "number,title,state,url,headRefName,headRefOid,mergeable,isDraft",
+            "number,title,state,url,headRefName,headRefOid,mergeable,isDraft,merged",
         ]
         result = await self._run_json(argv)
         if not isinstance(result, dict):
@@ -247,39 +247,33 @@ class GitHub:
         self, pr: int | str, *, repo: str
     ) -> list[dict[str, Any]]:
         host_args, owner_repo = self._api_repo(repo)
-        result = await self._run_json(
+        result = await self._run_paginated_list(
             [
                 "api",
                 *host_args,
                 f"repos/{owner_repo}/pulls/{pr}/comments",
             ]
         )
-        if not isinstance(result, list):
-            raise GitHubError(
-                f"pull review comments: expected array, got {type(result).__name__}"
-            )
-        return [entry for entry in result if isinstance(entry, dict)]
+        return result
 
     async def pr_reviews(
         self, pr: int | str, *, repo: str
     ) -> list[dict[str, Any]]:
         host_args, owner_repo = self._api_repo(repo)
-        result = await self._run_json(
+        result = await self._run_paginated_list(
             [
                 "api",
                 *host_args,
                 f"repos/{owner_repo}/pulls/{pr}/reviews",
             ]
         )
-        if not isinstance(result, list):
-            raise GitHubError(f"pull reviews: expected array, got {type(result).__name__}")
-        return [entry for entry in result if isinstance(entry, dict)]
+        return result
 
     async def pr_reactions(
         self, pr: int | str, *, repo: str
     ) -> list[dict[str, Any]]:
         host_args, owner_repo = self._api_repo(repo)
-        result = await self._run_json(
+        result = await self._run_paginated_list(
             [
                 "api",
                 *host_args,
@@ -288,11 +282,28 @@ class GitHub:
                 f"repos/{owner_repo}/issues/{pr}/reactions",
             ]
         )
+        return result
+
+    async def _run_paginated_list(self, argv: list[str]) -> list[dict[str, Any]]:
+        result = await self._run_json(
+            [
+                argv[0],
+                "--paginate",
+                "--slurp",
+                *argv[1:],
+            ]
+        )
         if not isinstance(result, list):
             raise GitHubError(
-                f"issue reactions: expected array, got {type(result).__name__}"
+                f"paginated api: expected array, got {type(result).__name__}"
             )
-        return [entry for entry in result if isinstance(entry, dict)]
+        flattened: list[dict[str, Any]] = []
+        for page in result:
+            if isinstance(page, list):
+                flattened.extend(entry for entry in page if isinstance(entry, dict))
+            elif isinstance(page, dict):
+                flattened.append(page)
+        return flattened
 
     async def commit_committed_at(self, repo: str, sha: str) -> str:
         host_args, owner_repo = self._api_repo(repo)
