@@ -47,6 +47,7 @@ from symphony.pipeline.review_classifier import (
 HEAD_SHA = "deadbeef"
 HEAD_COMMITTED_AT = "2025-01-01T12:00:00Z"
 LATER = "2025-01-01T13:00:00Z"
+LATER_STILL = "2025-01-01T14:00:00Z"
 EARLIER = "2024-12-31T12:00:00Z"
 
 
@@ -302,6 +303,49 @@ def test_rule_5_human_changes_requested_on_head() -> None:
     assert v.trigger_signature.startswith("human_cr:")
 
 
+def test_rule_5_latest_human_changes_requested_wins_over_prior_approval() -> None:
+    reviews = (
+        Review(
+            user_login="alice",
+            state="APPROVED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+        ),
+        Review(
+            user_login="alice",
+            state="CHANGES_REQUESTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER_STILL,
+            body="Still blocked.",
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.rule == "human_changes_requested"
+    assert v.last_review_body == "Still blocked."
+
+
+def test_rule_5_dismissed_latest_human_review_clears_prior_request() -> None:
+    reviews = (
+        Review(
+            user_login="alice",
+            state="CHANGES_REQUESTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="Please address the comments.",
+        ),
+        Review(
+            user_login="alice",
+            state="DISMISSED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER_STILL,
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.PENDING
+    assert v.rule == "no_signal"
+
+
 # --- Rule 6: approval ------------------------------------------------------
 
 
@@ -333,6 +377,27 @@ def test_rule_6_human_approval_counts() -> None:
     )
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
     assert v.kind == VerdictKind.APPROVED
+
+
+def test_rule_6_latest_human_approval_supersedes_prior_changes_requested() -> None:
+    reviews = (
+        Review(
+            user_login="alice",
+            state="CHANGES_REQUESTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="Please address the comments.",
+        ),
+        Review(
+            user_login="alice",
+            state="APPROVED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER_STILL,
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "approved"
 
 
 # --- Rule 7: approved + CONFLICTING ---------------------------------------

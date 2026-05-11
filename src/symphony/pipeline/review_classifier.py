@@ -154,6 +154,20 @@ def _stable_digest(parts: Iterable[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def _latest_reviews_by_author(reviews: Iterable[Review]) -> list[Review]:
+    latest: dict[str, Review] = {}
+    latest_seen_at: dict[str, datetime] = {}
+    for review in reviews:
+        submitted_at = _parse_iso(review.submitted_at) or datetime.min.replace(
+            tzinfo=UTC
+        )
+        previous_at = latest_seen_at.get(review.user_login)
+        if previous_at is None or submitted_at >= previous_at:
+            latest[review.user_login] = review
+            latest_seen_at[review.user_login] = submitted_at
+    return list(latest.values())
+
+
 def review_classifier(
     *,
     comments: list[ReviewComment],
@@ -190,6 +204,11 @@ def review_classifier(
 
     fresh_reviews = [
         r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha
+    ]
+    latest_human_reviews = [
+        r
+        for r in _latest_reviews_by_author(fresh_reviews)
+        if not is_codex_author(r.user_login)
     ]
 
     # Rule 3 — Codex inline review comments on HEAD.
@@ -231,9 +250,8 @@ def review_classifier(
     # Rule 5 — human `CHANGES_REQUESTED` on HEAD.
     human_cr = [
         r
-        for r in fresh_reviews
-        if not is_codex_author(r.user_login)
-        and r.state == "CHANGES_REQUESTED"
+        for r in latest_human_reviews
+        if r.state == "CHANGES_REQUESTED"
     ]
     if human_cr:
         logins = sorted({r.user_login for r in human_cr})
@@ -256,8 +274,7 @@ def review_classifier(
         if codex_approval_at is None or rxn_dt > codex_approval_at:
             codex_approval_at = rxn_dt
     human_approved = any(
-        r.state == "APPROVED" and not is_codex_author(r.user_login)
-        for r in fresh_reviews
+        r.state == "APPROVED" for r in latest_human_reviews
     )
     approved = codex_approval_at is not None or human_approved
 
