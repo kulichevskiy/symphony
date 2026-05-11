@@ -208,17 +208,17 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         log_text = logs[0].read_text()
         assert '"type": "result"' in log_text or '"type":"result"' in log_text
 
-        # Two run rows: the completed Implement run, and the completed
-        # Review handoff row recorded immediately after pinging
-        # `@codex review` on the PR.
+        # Two run rows: the completed Implement run, and the live Review
+        # monitor row recorded immediately after pinging `@codex review`
+        # on the PR.
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 2
         assert history[0].stage == "implement"
         assert history[0].status == "completed"
         assert history[0].pid == 4242
         assert history[1].stage == "review"
-        assert history[1].status == "completed"
-        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+        assert history[1].status == "running"
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is True
         gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
     finally:
         await conn.close()
@@ -270,10 +270,10 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
         gh.pr_create.assert_awaited_once()
         assert gh.pr_create.await_args.kwargs["base"] is None
         history = await db.runs.history_for_issue(conn, "iss-1")
-        # Implement run completes, Review handoff is recorded.
+        # Implement run completes, Review monitor is recorded.
         assert [r.stage for r in history] == ["implement", "review"]
         assert history[0].status == "completed"
-        assert history[1].status == "completed"
+        assert history[1].status == "running"
     finally:
         await conn.close()
 

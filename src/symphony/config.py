@@ -113,7 +113,7 @@ class Config(BaseModel):
 
     repos: list[RepoBinding] = Field(default_factory=list)
 
-    review_iteration_cap: int = 6
+    review_iteration_cap: int = 12
     cost_cap_per_issue_usd: float = 15.0
     cost_warning_pct: int = 75
     stall_timeout_secs: int = 300

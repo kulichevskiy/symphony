@@ -40,6 +40,28 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
             "ADD COLUMN last_seen_ids TEXT NOT NULL DEFAULT '[]'"
         )
 
+    cur = await conn.execute("PRAGMA table_info(review_state)")
+    review_cols = {row[1] for row in await cur.fetchall()}
+    if "ci_fetch_failures" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state "
+            "ADD COLUMN ci_fetch_failures INTEGER NOT NULL DEFAULT 0"
+        )
+    if "pr_number" not in review_cols:
+        await conn.execute("ALTER TABLE review_state ADD COLUMN pr_number INTEGER")
+    if "pr_url" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''"
+        )
+    if "github_repo" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''"
+        )
+    if "issue_label" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state ADD COLUMN issue_label TEXT NOT NULL DEFAULT ''"
+        )
+
     cur = await conn.execute("PRAGMA table_info(webhook_deliveries)")
     cols = {row[1] for row in await cur.fetchall()}
     if "status" not in cols:

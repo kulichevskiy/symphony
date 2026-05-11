@@ -18,11 +18,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 MergeStrategy = Literal["squash", "merge", "rebase"]
+
+_ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)")
+DEFAULT_LOG_TAIL_BYTES = 12_000
 
 
 class GitHubError(RuntimeError):
@@ -231,6 +235,35 @@ class GitHub:
             )
         return PRChecks(runs=runs)
 
+    async def check_log_tail(
+        self,
+        check: CheckRun,
+        *,
+        repo: str | None = None,
+        max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    ) -> str:
+        """Return a truncated failed-step log excerpt for a PR check run.
+
+        `gh pr checks --json link` points at an Actions run/job page. Browser
+        job URLs do not carry the job database id required by `gh run view --job`,
+        so use the parent run id and ask gh for all failed-step logs in that run.
+        Checks without an Actions URL simply have no retrievable excerpt.
+        """
+        if not check.link:
+            return ""
+        run_match = _ACTIONS_RUN_RE.search(check.link)
+        if run_match is None:
+            return ""
+        argv = [
+            "run",
+            "view",
+            run_match.group(1),
+            *self._repo_args(repo),
+            "--log-failed",
+        ]
+        out = await self._run(argv)
+        return _tail_utf8(out, max_bytes=max_bytes)
+
     async def pr_merge(
         self,
         pr: int | str,
@@ -296,3 +329,16 @@ class GitHub:
         ]
         out = await self._run(argv)
         return out.strip()
+
+
+def _tail_utf8(text: str, *, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    if max_bytes <= 0:
+        return ""
+    suffix = b"\n...[truncated]\n"
+    if len(suffix) >= max_bytes:
+        return suffix[:max_bytes].decode("utf-8", errors="ignore")
+    tail = encoded[-(max_bytes - len(suffix)) :].decode("utf-8", errors="ignore")
+    return suffix.decode("utf-8") + tail
