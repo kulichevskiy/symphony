@@ -174,6 +174,19 @@ def test_rule_2_pending_required_ci_wins_over_codex_feedback() -> None:
     assert "unit" in v.pending_checks
 
 
+def test_rule_2_pending_unknown_required_ci_marks_pending() -> None:
+    ci = [
+        CheckRun(name="unit", status="in_progress", conclusion=None, required=None),
+    ]
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
+    )
+    v = review_classifier(comments=[], ci=ci, snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.PENDING
+    assert v.rule == "pending_ci"
+    assert "unit" in v.pending_checks
+
+
 # --- Rule 3: Codex inline comments on HEAD --------------------------------
 
 
@@ -206,6 +219,33 @@ def test_rule_3_codex_comment_on_stale_sha_ignored() -> None:
     ]
     v = review_classifier(comments=comments, ci=[], snapshot=_snap())
     assert v.kind != VerdictKind.CHANGES_REQUESTED
+
+
+def test_rule_3_codex_inline_signature_uses_full_comment_body() -> None:
+    prefix = "Shared feedback prefix. " * 8
+    comments_a = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body=prefix + "Fix path A.",
+            commit_sha=HEAD_SHA,
+            created_at=LATER,
+            path="src/foo.py",
+            line=42,
+        ),
+    ]
+    comments_b = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body=prefix + "Fix path B.",
+            commit_sha=HEAD_SHA,
+            created_at=LATER,
+            path="src/foo.py",
+            line=42,
+        ),
+    ]
+    a = review_classifier(comments=comments_a, ci=[], snapshot=_snap())
+    b = review_classifier(comments=comments_b, ci=[], snapshot=_snap())
+    assert a.trigger_signature != b.trigger_signature
 
 
 # --- Rule 4: Codex substantive review body --------------------------------

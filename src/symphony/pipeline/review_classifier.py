@@ -142,7 +142,7 @@ def _parse_iso(ts: str) -> datetime | None:
 
 
 def _comment_key(c: ReviewComment) -> str:
-    return f"{c.commit_sha}|{c.path}|{c.line}|{c.body[:120]}"
+    return f"{c.commit_sha}|{c.path}|{c.line}|{c.body}"
 
 
 def _stable_digest(parts: Iterable[str]) -> str:
@@ -179,7 +179,7 @@ def review_classifier(
             failing_checks=tuple(names),
         )
 
-    pending = [c for c in ci if c.required is True and c.status != "completed"]
+    pending = [c for c in ci if c.required is not False and c.status != "completed"]
     # Rule 2 — pending required CI check (no failures).
     if pending:
         return Verdict(
