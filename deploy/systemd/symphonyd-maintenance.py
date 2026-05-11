@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -61,7 +60,8 @@ def _backup_timestamp(now: datetime) -> str:
 
 
 def _sqlite_dot_quote(path: Path) -> str:
-    return shlex.quote(str(path))
+    escaped = str(path).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def backup_sqlite(db_path: Path, *, now: datetime, sqlite3_bin: str) -> Path:

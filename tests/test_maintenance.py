@@ -37,7 +37,9 @@ def test_maintenance_backs_up_sqlite_rotates_backups_and_prunes_logs(
 
     module = _load_maintenance_module()
     now = datetime(2026, 5, 11, 12, 30, tzinfo=UTC)
-    db_path = tmp_path / "state.sqlite"
+    db_dir = tmp_path / "state's dir"
+    db_dir.mkdir()
+    db_path = db_dir / "state.sqlite"
     log_root = tmp_path / "logs"
     log_root.mkdir()
 
