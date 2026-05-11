@@ -1,5 +1,5 @@
 # Copy to /home/symphony/.cloudflared/config.yml and replace the placeholders.
-tunnel: symphonyd
+tunnel: <TUNNEL_ID>
 credentials-file: /home/symphony/.cloudflared/<TUNNEL_ID>.json
 
 ingress:

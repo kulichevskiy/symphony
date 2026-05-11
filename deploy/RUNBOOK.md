@@ -152,7 +152,7 @@ cloudflared tunnel create symphonyd
 cloudflared tunnel list
 ```
 
-Copy the tunnel UUID from `cloudflared tunnel list`, then install the sample config:
+Copy the tunnel UUID from `cloudflared tunnel list`, then install the sample config. The UUID must replace both the top-level `tunnel` value and the credentials filename placeholder:
 
 ```bash
 install -d -m 0700 "$HOME/.cloudflared"
