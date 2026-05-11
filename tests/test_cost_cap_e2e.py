@@ -311,6 +311,45 @@ async def test_cap_breach_marks_run_failed_when_state_lookup_fails(
 
 
 @pytest.mark.asyncio
+async def test_cap_breach_resets_issue_when_needs_approval_move_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=15.0,
+            cost_warning_pct=75,
+        )
+
+        ws = tmp_path / "ws" / "org_srepo" / "eng-1"
+        ws.mkdir(parents=True)
+        runner = _CostStreamRunner([16.0])
+        orch, linear, gh, _ws = _orch(cfg, conn, runner, ws)
+        linear.move_issue.side_effect = [
+            None,
+            LinearError("needs approval temporarily unavailable"),
+            None,
+        ]
+
+        await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+
+        moves = [c.args for c in linear.move_issue.await_args_list]
+        assert moves[0] == ("iss-1", "state-progress")
+        assert ("iss-1", "state-na") in moves
+        assert moves[-1] == ("iss-1", "state-todo")
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "failed"
+        gh.pr_create.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_warning_does_not_repost_after_persistent_mark(tmp_path: Path) -> None:
     """If the warning was already posted on a prior run, a follow-up run
     that pushes cost further past the threshold (but still below cap)

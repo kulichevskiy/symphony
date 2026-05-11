@@ -810,6 +810,7 @@ class Orchestrator:
                 needs_approval_id = None
             else:
                 needs_approval_id = states.get(binding.linear_states.needs_approval)
+            parked = False
             if needs_approval_id is not None:
                 try:
                     await self.linear.move_issue(issue.id, needs_approval_id)
@@ -819,12 +820,23 @@ class Orchestrator:
                         issue.identifier,
                         e,
                     )
+                else:
+                    parked = True
             else:
                 log.warning(
                     "no needs_approval state for team %s; cannot park %s",
                     binding.linear_team_key,
                     issue.identifier,
                 )
+            if not parked:
+                try:
+                    await self.linear.move_issue(issue.id, issue.state_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not reset %s after cap-breach parking failed: %s",
+                        issue.identifier,
+                        e,
+                    )
             body = stuck_loop_escape(
                 CommentVars(
                     stage="implement",
