@@ -287,8 +287,9 @@ def review_classifier(
                 rule="merge_conflict",
                 merge_conflict=True,
             )
-        # Rule 8 — mergeable still computing; do not race `gh pr merge`.
-        if snapshot.mergeable == "UNKNOWN":
+        # Rule 8 — mergeable still computing or unavailable; do not race
+        # `gh pr merge`.
+        if snapshot.mergeable != "MERGEABLE":
             return Verdict(
                 kind=VerdictKind.PENDING,
                 rule="approved_unknown_mergeable",

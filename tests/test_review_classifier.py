@@ -471,6 +471,16 @@ def test_rule_8_approved_but_unknown_mergeable_stays_pending() -> None:
     assert v.kind == VerdictKind.PENDING
 
 
+def test_rule_8_approved_but_unset_mergeable_stays_pending() -> None:
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
+    )
+    snap = _snap(reactions=reactions, mergeable=None)
+    v = review_classifier(comments=[], ci=[], snapshot=snap)
+    assert v.kind == VerdictKind.PENDING
+    assert v.rule == "approved_unknown_mergeable"
+
+
 # --- Substring rejection inside the classifier -----------------------------
 
 
