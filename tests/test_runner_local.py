@@ -84,6 +84,20 @@ async def test_runner_exits_when_child_holds_pipe_open(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_waits_when_process_closes_stdio_before_exit(tmp_path: Path) -> None:
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-closed-stdio",
+        workspace_path=tmp_path,
+        command=["sh", "-c", "exec >/dev/null 2>/dev/null; sleep 30"],
+        stall_secs=1,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=10)
+    assert events[-1].kind == "stall_timeout"
+    assert not any(e.kind == "exit" and e.returncode is None for e in events)
+
+
+@pytest.mark.asyncio
 async def test_runner_kills_on_stall(tmp_path: Path) -> None:
     runner = LocalRunner()
     spec = RunnerSpec(

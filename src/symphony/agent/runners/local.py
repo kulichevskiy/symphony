@@ -132,8 +132,6 @@ class LocalRunner:
                             break
                         continue
                     drain_deadline = None
-                    if stdout_task.done() and stderr_task.done():
-                        break
                     yield RunnerEvent(kind="tick")
                     continue
                 yield ev
