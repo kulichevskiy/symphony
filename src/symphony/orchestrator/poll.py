@@ -2457,7 +2457,14 @@ class Orchestrator:
                     pr_number,
                     e,
                 )
-                merged = False
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"merge finalization failed: {e}",
+                )
+                return run_id
             if not merged:
                 await db.runs.update_status(
                     self._conn,
