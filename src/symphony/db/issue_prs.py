@@ -14,6 +14,7 @@ class IssuePR:
     title: str
     team_key: str
     github_repo: str
+    binding_key: str
     pr_number: int
     pr_url: str
     created_at: str
@@ -27,6 +28,7 @@ def _row_to_issue_pr(row: aiosqlite.Row) -> IssuePR:
         title=row["title"],
         team_key=row["team_key"],
         github_repo=row["github_repo"],
+        binding_key=row["binding_key"],
         pr_number=row["pr_number"],
         pr_url=row["pr_url"],
         created_at=row["created_at"],
@@ -42,18 +44,22 @@ async def upsert(
     pr_number: int,
     pr_url: str,
     created_at: str,
+    binding_key: str = "",
 ) -> None:
     await conn.execute(
         """
-        INSERT INTO issue_prs (issue_id, github_repo, pr_number, pr_url, created_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id, github_repo) DO UPDATE SET
+            binding_key = excluded.binding_key,
             pr_number  = excluded.pr_number,
             pr_url     = excluded.pr_url,
             created_at = excluded.created_at,
             merged_at  = NULL
         """,
-        (issue_id, github_repo, pr_number, pr_url, created_at),
+        (issue_id, github_repo, binding_key, pr_number, pr_url, created_at),
     )
     await conn.commit()
 
@@ -86,7 +92,7 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     cur = await conn.execute(
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
-               p.pr_number, p.pr_url, p.created_at, p.merged_at
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL

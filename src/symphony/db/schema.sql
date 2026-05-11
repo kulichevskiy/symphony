@@ -44,6 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 CREATE TABLE IF NOT EXISTS issue_prs (
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     github_repo TEXT NOT NULL,
+    binding_key TEXT NOT NULL DEFAULT '',
     pr_number   INTEGER NOT NULL,
     pr_url      TEXT NOT NULL,
     created_at  TEXT NOT NULL,

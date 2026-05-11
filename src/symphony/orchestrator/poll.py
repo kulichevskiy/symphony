@@ -19,6 +19,7 @@ in the "ready" state with the configured label, then for each one:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import uuid
@@ -171,6 +172,10 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
         binding.github_repo,
         binding.issue_label or "",
     )
+
+
+def _binding_storage_key(binding: RepoBinding) -> str:
+    return json.dumps(_binding_key(binding), separators=(",", ":"))
 
 
 def _parse_rfc3339(s: str) -> datetime:
@@ -918,6 +923,12 @@ class Orchestrator:
             log.exception("dispatch task crashed for issue_id=%s", issue_id)
 
     def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None:
+        if candidate.binding_key:
+            for binding in self.config.repos:
+                if _binding_storage_key(binding) == candidate.binding_key:
+                    return binding
+            return None
+
         for binding in self.config.repos:
             if (
                 binding.linear_team_key == candidate.team_key
@@ -1720,6 +1731,7 @@ class Orchestrator:
                 self._conn,
                 issue_id=issue.id,
                 github_repo=binding.github_repo,
+                binding_key=_binding_storage_key(binding),
                 pr_number=pr_number,
                 pr_url=pr_url,
                 created_at=datetime.now(UTC).isoformat(),

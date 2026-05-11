@@ -15,7 +15,7 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearError, LinearIssue
-from symphony.orchestrator.poll import Orchestrator
+from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
 
 
 class _FakeRunner:
@@ -61,12 +61,18 @@ async def _poll_and_wait(orch: Orchestrator) -> None:
         await asyncio.gather(*tasks)
 
 
-def _binding(*, agent: str = "codex") -> RepoBinding:
+def _binding(
+    *,
+    agent: str = "codex",
+    issue_label: str | None = None,
+    branch_prefix: str = "symphony",
+) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
         agent=agent,  # type: ignore[arg-type]
-        branch_prefix="symphony",
+        issue_label=issue_label,
+        branch_prefix=branch_prefix,
         linear_states=LinearStates(ready="Todo"),
     )
 
@@ -96,7 +102,9 @@ def _states() -> dict[str, str]:
     }
 
 
-async def _seed_review_candidate(conn) -> None:  # type: ignore[no-untyped-def]
+async def _seed_review_candidate(
+    conn, *, binding_key: str = ""
+) -> None:  # type: ignore[no-untyped-def]
     await db.issues.upsert(
         conn,
         id="iss-1",
@@ -127,6 +135,7 @@ async def _seed_review_candidate(conn) -> None:  # type: ignore[no-untyped-def]
         conn,
         issue_id="iss-1",
         github_repo="org/repo",
+        binding_key=binding_key,
         pr_number=42,
         pr_url="https://github.com/org/repo/pull/42",
         created_at="2026-05-10T00:01:00+00:00",
@@ -207,6 +216,46 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
 
 def _read_calls(calls: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in calls.read_text().splitlines()]
+
+
+@pytest.mark.asyncio
+async def test_merge_candidate_uses_recorded_binding_key(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        target = _binding(
+            agent="codex",
+            issue_label="backend",
+            branch_prefix="backend",
+        )
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(target))
+        cfg = Config(
+            repos=[
+                _binding(
+                    agent="claude",
+                    issue_label="frontend",
+                    branch_prefix="frontend",
+                ),
+                target,
+            ],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        candidate = (await db.issue_prs.list_merge_candidates(conn))[0]
+
+        assert orch._binding_for_pr(candidate) == target  # noqa: SLF001
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio

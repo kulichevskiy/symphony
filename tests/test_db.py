@@ -219,6 +219,7 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
             conn,
             issue_id="iss-1",
             github_repo="org/repo",
+            binding_key='["ENG","org/repo","backend"]',
             pr_number=42,
             pr_url="https://github.com/org/repo/pull/42",
             created_at="2026-05-10T00:00:00+00:00",
@@ -238,6 +239,7 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
         assert len(candidates) == 1
         assert candidates[0].pr_number == 42
         assert candidates[0].github_repo == "org/repo"
+        assert candidates[0].binding_key == '["ENG","org/repo","backend"]'
 
         await db.issue_prs.mark_merged(
             conn,
