@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from .client import LinearComment
 
 _PATTERN = re.compile(r"^\s*/(approve|reject|retry|stop|skip-review)\b", re.IGNORECASE)
+_THUMBS_UP = {"👍", ":+1:", ":+1"}
+_THUMBS_UP_EMOJI = "👍"
+_VARIATION_SELECTORS = {"\ufe0e", "\ufe0f"}
 
 
 class SlashKind(StrEnum):
@@ -40,6 +43,17 @@ class SlashIntent:
     created_at: str
 
 
+def _is_thumbs_up(body: str) -> bool:
+    if body in _THUMBS_UP:
+        return True
+    normalized = "".join(
+        ch
+        for ch in body
+        if ch not in _VARIATION_SELECTORS and not 0x1F3FB <= ord(ch) <= 0x1F3FF
+    )
+    return normalized == _THUMBS_UP_EMOJI
+
+
 def parse(comments: list[LinearComment]) -> list[SlashIntent]:
     """Pure function: filter and classify. No I/O."""
     out: list[SlashIntent] = []
@@ -49,7 +63,17 @@ def parse(comments: list[LinearComment]) -> list[SlashIntent]:
         if c.external_thread_type is not None:
             # Mirrored from elsewhere; the originating side's poll handles it.
             continue
-        m = _PATTERN.match(c.body or "")
+        body = (c.body or "").strip()
+        if _is_thumbs_up(body):
+            out.append(
+                SlashIntent(
+                    kind=SlashKind.APPROVE,
+                    comment_id=c.id,
+                    created_at=c.created_at,
+                )
+            )
+            continue
+        m = _PATTERN.match(body)
         if not m:
             continue
         kind = SlashKind(m.group(1).lower())
