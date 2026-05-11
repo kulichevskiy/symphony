@@ -65,8 +65,19 @@ def test_ignores_unknown_slash() -> None:
 
 
 def test_treats_thumbs_up_as_approve() -> None:
-    intents = parse([_c("👍", cid="c-1"), _c(":+1:", cid="c-2"), _c(":+1", cid="c-3")])
+    comments = [
+        _c("👍", cid="c-1"),
+        _c(":+1:", cid="c-2"),
+        _c(":+1", cid="c-3"),
+        _c("👍🏽", cid="c-4"),
+        _c("👍️", cid="c-5"),
+    ]
+
+    intents = parse(comments)
+
     assert [i.kind for i in intents] == [
+        SlashKind.APPROVE,
+        SlashKind.APPROVE,
         SlashKind.APPROVE,
         SlashKind.APPROVE,
         SlashKind.APPROVE,
