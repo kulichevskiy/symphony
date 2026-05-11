@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -58,15 +59,34 @@ class _CostStreamRunner:
         self.kill_calls.append(run_id)
 
 
+class _EventRunner:
+    def __init__(self, events: list[RunnerEvent]) -> None:
+        self.events = events
+        self.kill_calls: list[str] = []
+        self.captured_spec: RunnerSpec | None = None
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.captured_spec = spec
+        return self._aiter()
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        for ev in self.events:
+            yield ev
+
+    async def kill(self, run_id: str) -> None:
+        self.kill_calls.append(run_id)
+
+
 def _binding(
     *,
+    agent: Literal["claude", "codex"] = "claude",
     cost_cap_usd: float | None = None,
     cost_warning_pct: int | None = None,
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
-        agent="claude",
+        agent=agent,
         branch_prefix="symphony",
         cost_cap_usd=cost_cap_usd,
         cost_warning_pct=cost_warning_pct,
@@ -174,6 +194,32 @@ async def test_cap_breach_parks_issue_at_needs_approval(tmp_path: Path) -> None:
 
         # Warning idempotency mark persisted.
         assert await db.cost_marks.warning_posted_at(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cap_breach_keeps_counting_late_cost_events(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=15.0,
+            cost_warning_pct=75,
+        )
+        ws = tmp_path / "ws" / "org_srepo" / "eng-1"
+        ws.mkdir(parents=True)
+        runner = _CostStreamRunner([16.0, 2.0])
+        orch, _linear, _gh, _ws = _orch(cfg, conn, runner, ws)
+
+        await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].cost_usd == pytest.approx(18.0)
     finally:
         await conn.close()
 
@@ -344,6 +390,56 @@ async def test_cap_breach_resets_issue_when_needs_approval_move_fails(
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        gh.pr_create.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_token_usage_estimates_cost_for_cap(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding(agent="codex")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=0.02,
+            cost_warning_pct=75,
+        )
+
+        ws = tmp_path / "ws" / "org_srepo" / "eng-1"
+        ws.mkdir(parents=True)
+        runner = _EventRunner(
+            [
+                RunnerEvent(kind="started", pid=1234),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "usage": {
+                                "input_tokens": 1_000,
+                                "cached_input_tokens": 200,
+                                "output_tokens": 2_000,
+                            },
+                        }
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+        orch, linear, gh, _ws = _orch(cfg, conn, runner, ws)
+
+        await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "failed"
+        assert history[0].cost_usd == pytest.approx(0.021025)
+        assert runner.kill_calls
+        moves = [c.args for c in linear.move_issue.await_args_list]
+        assert ("iss-1", "state-na") in moves
         gh.pr_create.assert_not_awaited()
     finally:
         await conn.close()

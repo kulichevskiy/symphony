@@ -47,6 +47,7 @@ from ..linear.templates import (
 from ..pipeline.cost_guard import (
     effective_cap,
     effective_warning_pct,
+    estimate_codex_cost_usd,
     evaluate_cost,
 )
 from ..pipeline.state_machine import on_runner_event
@@ -709,6 +710,9 @@ class Orchestrator:
         final_kind = "exit"
         final_returncode: int | None = None
         cap_breached = False
+        last_estimated_input_tokens = 0
+        last_estimated_cached_input_tokens = 0
+        last_estimated_output_tokens = 0
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -717,17 +721,42 @@ class Orchestrator:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
                         logf.write(ev.line + "\n")
-                        if cap_breached:
-                            # Already killed the runner; keep draining so its
-                            # pump/watch tasks can finish via the terminal
-                            # event path instead of being orphaned by an
-                            # early aclose() of the async generator.
-                            continue
                         usage = parse_event_line(ev.line)
                         if usage is not None:
+                            cost_delta = usage.cost_usd
+                            if binding.agent == "codex" and cost_delta <= 0:
+                                input_delta = max(
+                                    usage.input_tokens - last_estimated_input_tokens, 0
+                                )
+                                cached_input_delta = max(
+                                    usage.cached_input_tokens
+                                    - last_estimated_cached_input_tokens,
+                                    0,
+                                )
+                                output_delta = max(
+                                    usage.output_tokens - last_estimated_output_tokens,
+                                    0,
+                                )
+                                last_estimated_input_tokens = max(
+                                    last_estimated_input_tokens, usage.input_tokens
+                                )
+                                last_estimated_cached_input_tokens = max(
+                                    last_estimated_cached_input_tokens,
+                                    usage.cached_input_tokens,
+                                )
+                                last_estimated_output_tokens = max(
+                                    last_estimated_output_tokens, usage.output_tokens
+                                )
+                                cost_delta = estimate_codex_cost_usd(
+                                    input_tokens=input_delta,
+                                    cached_input_tokens=cached_input_delta,
+                                    output_tokens=output_delta,
+                                )
                             previous_total = prior_total + cumulative_cost
-                            cumulative_cost += usage.cost_usd
+                            cumulative_cost += cost_delta
                             new_total = prior_total + cumulative_cost
+                            if cap_breached:
+                                continue
                             decision = evaluate_cost(
                                 previous_total=previous_total,
                                 new_total=new_total,

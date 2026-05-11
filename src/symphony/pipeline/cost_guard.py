@@ -18,6 +18,27 @@ class CostDecision:
     cap_breached: bool
 
 
+CODEX_INPUT_USD_PER_MILLION_TOKENS = 1.25
+CODEX_CACHED_INPUT_USD_PER_MILLION_TOKENS = 0.125
+CODEX_OUTPUT_USD_PER_MILLION_TOKENS = 10.0
+
+
+def estimate_codex_cost_usd(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+) -> float:
+    """Estimate Codex USD cost from token usage when CLI output has no price."""
+    cached = max(cached_input_tokens, 0)
+    billable_input = max(input_tokens - cached, 0)
+    return (
+        (billable_input * CODEX_INPUT_USD_PER_MILLION_TOKENS)
+        + (cached * CODEX_CACHED_INPUT_USD_PER_MILLION_TOKENS)
+        + (max(output_tokens, 0) * CODEX_OUTPUT_USD_PER_MILLION_TOKENS)
+    ) / 1_000_000
+
+
 def evaluate_cost(
     *,
     previous_total: float,
@@ -60,5 +81,6 @@ __all__ = [
     "CostDecision",
     "effective_cap",
     "effective_warning_pct",
+    "estimate_codex_cost_usd",
     "evaluate_cost",
 ]

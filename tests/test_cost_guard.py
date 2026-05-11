@@ -15,6 +15,7 @@ from symphony.pipeline.cost_guard import (
     CostDecision,
     effective_cap,
     effective_warning_pct,
+    estimate_codex_cost_usd,
     evaluate_cost,
 )
 
@@ -160,3 +161,12 @@ def test_effective_cap_uses_binding_override_when_set() -> None:
 def test_effective_warning_pct_uses_binding_override_when_set() -> None:
     assert effective_warning_pct(global_pct=75, binding_override=None) == 75
     assert effective_warning_pct(global_pct=75, binding_override=50) == 50
+
+
+def test_estimates_codex_cost_from_tokens() -> None:
+    cost = estimate_codex_cost_usd(
+        input_tokens=1_000_000,
+        cached_input_tokens=200_000,
+        output_tokens=100_000,
+    )
+    assert round(cost, 6) == 2.025
