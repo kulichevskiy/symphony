@@ -795,48 +795,60 @@ class Orchestrator:
         cumulative_total: float,
     ) -> None:
         """Park the issue at `needs_approval` and post stuck-loop-escape."""
-        history = await db.runs.history_for_issue(self._conn, issue.id)
-        review_iter = sum(1 for r in history if r.stage == "review")
-        states = await self._states_for_binding(binding)
-        needs_approval_id = states.get(binding.linear_states.needs_approval)
-        if needs_approval_id is not None:
+        try:
+            history = await db.runs.history_for_issue(self._conn, issue.id)
+            review_iter = sum(1 for r in history if r.stage == "review")
             try:
-                await self.linear.move_issue(issue.id, needs_approval_id)
+                states = await self._states_for_binding(binding)
             except LinearError as e:
                 log.warning(
-                    "could not move %s to needs_approval after cap breach: %s",
+                    "could not load states for %s after cap breach on %s: %s",
+                    binding.linear_team_key,
                     issue.identifier,
                     e,
                 )
-        else:
-            log.warning(
-                "no needs_approval state for team %s; cannot park %s",
-                binding.linear_team_key,
-                issue.identifier,
+                needs_approval_id = None
+            else:
+                needs_approval_id = states.get(binding.linear_states.needs_approval)
+            if needs_approval_id is not None:
+                try:
+                    await self.linear.move_issue(issue.id, needs_approval_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to needs_approval after cap breach: %s",
+                        issue.identifier,
+                        e,
+                    )
+            else:
+                log.warning(
+                    "no needs_approval state for team %s; cannot park %s",
+                    binding.linear_team_key,
+                    issue.identifier,
+                )
+            body = stuck_loop_escape(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    cost=f"${cumulative_total:.4f}",
+                    review_iter=review_iter,
+                    trigger="cost_cap",
+                )
             )
-        body = stuck_loop_escape(
-            CommentVars(
-                stage="implement",
-                repo=binding.github_repo,
-                issue=0,
-                run_id=run_id,
-                cost=f"${cumulative_total:.4f}",
-                review_iter=review_iter,
-                trigger="cost_cap",
+            try:
+                await self.linear.post_comment(issue.id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "stuck_loop_escape comment failed on %s: %s", issue.identifier, e
+                )
+        finally:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "failed",
+                ended_at=datetime.now(UTC).isoformat(),
             )
-        )
-        try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning(
-                "stuck_loop_escape comment failed on %s: %s", issue.identifier, e
-            )
-        await db.runs.update_status(
-            self._conn,
-            run_id,
-            "failed",
-            ended_at=datetime.now(UTC).isoformat(),
-        )
 
     async def _fail_run(self, run_id: str, _reason: str) -> None:
         await db.runs.update_status(
