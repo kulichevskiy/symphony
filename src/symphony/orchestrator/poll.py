@@ -137,6 +137,10 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
     )
 
 
+def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
+    return issue.state_name == binding.linear_states.in_progress
+
+
 def _parse_rfc3339(s: str) -> datetime:
     """Linear timestamps end in `Z`; Python's `fromisoformat` accepts the
     `+00:00` form. Normalize before parsing."""
@@ -471,6 +475,24 @@ class Orchestrator:
                     run.id,
                     issue.identifier,
                 )
+                await self._fail_orphaned_review_run(
+                    run=run,
+                    issue=issue,
+                    state=state,
+                    error=(
+                        "review monitor no longer matches any configured "
+                        "repository binding"
+                    ),
+                )
+                continue
+            if not _review_issue_is_active(issue, binding):
+                log.info(
+                    "closing review run %s for %s because issue is in %s",
+                    run.id,
+                    issue.identifier,
+                    issue.state_name,
+                )
+                await self._close_review_run(run)
                 continue
             scheduled.append(self._schedule_review_poll(run, binding, issue))
         return scheduled
@@ -532,6 +554,14 @@ class Orchestrator:
             pass
         except Exception:
             log.exception("review poll task crashed for run_id=%s", run_id)
+
+    async def _close_review_run(self, run: db.runs.Run) -> None:
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            "completed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
 
     async def _poll_review_run(
         self,
@@ -840,6 +870,47 @@ class Orchestrator:
             await self.linear.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("review failed comment failed on %s: %s", issue.identifier, e)
+
+    async def _fail_orphaned_review_run(
+        self,
+        *,
+        run: db.runs.Run,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+        error: str,
+    ) -> None:
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            "failed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+        repo = state.github_repo or "(unknown repo)"
+        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        body = failed(
+            CommentVars(
+                stage="review",
+                repo=repo,
+                issue=0,
+                pr_url=_pr_url_for_state(
+                    repo=repo,
+                    pr_number=state.pr_number,
+                    pr_url=state.pr_url,
+                ),
+                run_id=run.id,
+                cost=f"${cost:.4f}",
+                error=error,
+                last_log="",
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "orphaned review failed comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
 
     async def _park_review_for_approval(
         self,

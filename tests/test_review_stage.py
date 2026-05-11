@@ -114,6 +114,21 @@ def _issue_in_progress(*, labels: list[str] | None = None) -> LinearIssue:
     )
 
 
+def _issue_done() -> LinearIssue:
+    return LinearIssue(
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        description="Need OAuth.",
+        url="https://linear.app/team/issue/ENG-1",
+        state_id="state-done",
+        state_name="Done",
+        state_type="completed",
+        team_key="ENG",
+        labels=["feature"],
+    )
+
+
 def _comment(body: str, *, cid: str = "c1") -> LinearComment:
     return LinearComment(
         id=cid,
@@ -750,6 +765,7 @@ async def test_active_review_does_not_rebind_stored_pr_to_different_repo(
 
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
 
         gh = MagicMock()
         gh.pr_checks = AsyncMock()
@@ -768,6 +784,52 @@ async def test_active_review_does_not_rebind_stored_pr_to_different_repo(
 
         assert tasks == []
         gh.pr_checks.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "failed"
+        posted = linear.post_comment.await_args.args[1]
+        assert "no longer matches any configured repository binding" in posted
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_active_review_closes_when_issue_leaves_in_progress(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_done())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        tasks = await _poll_review_and_wait(orch)
+
+        assert tasks == []
+        gh.pr_checks.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "completed"
     finally:
         await conn.close()
 
