@@ -530,6 +530,78 @@ async def test_merge_candidate_skips_when_binding_label_no_longer_matches(
 
 
 @pytest.mark.asyncio
+async def test_queued_merge_revalidates_issue_before_execution(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        paused = _issue()
+        paused.state_name = "Blocked"
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(side_effect=[_issue(), paused])
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_merge = AsyncMock()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        await _poll_and_wait(orch)
+
+        assert [call.args[0] for call in linear.lookup_issue.await_args_list] == [
+            "iss-1",
+            "iss-1",
+        ]
+        workspace.acquire.assert_not_awaited()
+        gh.pr_merge.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == ["implement", "review"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

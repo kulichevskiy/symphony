@@ -1855,9 +1855,12 @@ class Orchestrator:
         try:
             async with self._global_dispatch_sem:
                 async with binding_sem:
+                    current = await self._refresh_merge_candidate(binding, issue)
+                    if current is None:
+                        return
                     await self._merge_approved_pr(
                         binding=binding,
-                        issue=issue,
+                        issue=current,
                         pr_number=pr_number,
                         pr_url=pr_url,
                     )
@@ -1866,6 +1869,30 @@ class Orchestrator:
             if run_id is not None:
                 await self._fail_run(run_id, "merge cancelled")
             raise
+
+    async def _refresh_merge_candidate(
+        self,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> LinearIssue | None:
+        try:
+            current = await self.linear.lookup_issue(issue.id)
+        except LinearError as e:
+            log.warning(
+                "could not revalidate %s before merge execution: %s",
+                issue.identifier,
+                e,
+            )
+            return None
+        if not _merge_issue_matches_binding(current, binding):
+            log.info(
+                "skipping merge for %s: issue is no longer active for binding %s/%s",
+                current.identifier,
+                binding.github_repo,
+                binding.issue_label or "",
+            )
+            return None
+        return current
 
     async def _review_verdict_for_pr(
         self,
