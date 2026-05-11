@@ -24,7 +24,14 @@ async def test_connect_creates_tables_and_persists(tmp_path: Path) -> None:
     finally:
         await conn.close()
 
-    for table in ("repos", "issues", "runs", "issue_prs", "comment_cursors"):
+    for table in (
+        "repos",
+        "issues",
+        "runs",
+        "issue_prs",
+        "comment_cursors",
+        "operator_waits",
+    ):
         assert table in names, f"expected {table} in {names}"
 
     assert p.exists()
@@ -261,6 +268,46 @@ async def test_comment_cursor_advance(tmp_path: Path) -> None:
         )
         got = await db.comment_cursors.get(conn, "iss-1")
         assert got == ("2026-05-10T01:00:00+00:00", ["c2", "c3"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-1",
+            kind=db.operator_waits.KIND_COST_CAP,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="ready",
+            created_at="2026-05-10T01:00:00+00:00",
+        )
+
+        got = await db.operator_waits.get(conn, "iss-1")
+        assert got is not None
+        assert got.run_id == "run-1"
+        assert got.kind == db.operator_waits.KIND_COST_CAP
+        assert got.issue_label == "ready"
+        assert await db.operator_waits.list_all(conn) == [got]
+
+        await db.operator_waits.delete(conn, "iss-1", "run-1")
+        assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()
 

@@ -133,6 +133,117 @@ async def test_stop_intent_kills_active_runner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_approve_resumes_cost_cap_waiting_run(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("/approve")])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-05-10T01:00:00+00:00",
+        )
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+        orch._operator_wait_run_ids.add("run-1")  # noqa: SLF001
+        orch._cost_cap_run_bindings["run-1"] = cfg.repos[0]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.comments_since.assert_awaited_once()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Resumed" in body for body in bodies)
+        assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+        assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reject_stops_cost_cap_waiting_run(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("/reject")])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-05-10T01:00:00+00:00",
+        )
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+        orch._operator_wait_run_ids.add("run-1")  # noqa: SLF001
+        orch._cost_cap_run_bindings["run-1"] = cfg.repos[0]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.comments_since.assert_awaited_once()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-blocked")
+        assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+        assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_resumes_cost_cap_wait_after_restart(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("/approve")])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-05-10T01:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-1",
+            kind=db.operator_waits.KIND_COST_CAP,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T01:00:00+00:00",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.comments_since.assert_awaited_once()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Resumed" in body for body in bodies)
+        assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+        assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_cursor_persisted_after_fetch(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

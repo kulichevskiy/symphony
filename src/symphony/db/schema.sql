@@ -64,6 +64,28 @@ CREATE TABLE IF NOT EXISTS comment_cursors (
     last_seen_ids TEXT NOT NULL DEFAULT '[]'
 );
 
+-- Comment IDs handled by either webhook or poll delivery. This lets webhook
+-- delivery order differ from comment creation order without dropping an older
+-- slash command merely because the cursor has already moved past it.
+CREATE TABLE IF NOT EXISTS comment_events (
+    comment_id TEXT PRIMARY KEY,
+    issue_id   TEXT NOT NULL REFERENCES issues(id),
+    seen_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_comment_events_issue ON comment_events(issue_id);
+
+-- Linear webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
+-- pruned opportunistically before each insert based on the configured TTL.
+-- `status` remains pending until the handler succeeds, so retries are not
+-- acknowledged as duplicates before their side effects are durable.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id          TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'handled'))
+);
+
 -- Review-stage state per issue.
 --   iteration              fix-runs dispatched so far (capped at 12).
 --   last_trigger_signature stable signature of the most recent
@@ -74,3 +96,28 @@ CREATE TABLE IF NOT EXISTS review_state (
     iteration              INTEGER NOT NULL DEFAULT 0,
     last_trigger_signature TEXT NOT NULL DEFAULT ''
 );
+
+-- Per-issue cost-warning idempotency. The cost warning template fires
+-- exactly once per issue — when the cumulative cost first crosses the
+-- configured threshold. Persisting the post timestamp lets a restarted
+-- orchestrator skip the warning even if cumulative cost is already past
+-- threshold from prior runs.
+CREATE TABLE IF NOT EXISTS issue_cost_marks (
+    issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
+    warning_posted_at   TEXT
+);
+
+-- Runs waiting for an explicit operator slash command after the runner has
+-- stopped. Cost-cap breaches use this so `/approve` and `/reject` remain
+-- actionable after an orchestrator restart.
+CREATE TABLE IF NOT EXISTS operator_waits (
+    issue_id        TEXT PRIMARY KEY REFERENCES issues(id),
+    run_id          TEXT NOT NULL REFERENCES runs(id),
+    kind            TEXT NOT NULL,
+    linear_team_key TEXT NOT NULL,
+    github_repo     TEXT NOT NULL,
+    issue_label     TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_waits_run ON operator_waits(run_id);

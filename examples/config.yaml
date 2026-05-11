@@ -1,5 +1,6 @@
 # Example symphonyd config. Copy this and edit the two LINEAR_TEAM_KEY /
 # GITHUB_REPO entries plus the LINEAR_API_KEY env var.
+# Set LINEAR_WEBHOOK_SECRET to also start the loopback-only webhook receiver.
 #
 # All paths are expanded with ~ and env vars.
 
@@ -8,6 +9,10 @@ global_max_concurrent: 4
 workspace_root: ~/symphony/workspaces
 log_root: ~/symphony/logs
 db_path: ~/symphony/state.sqlite
+webhook_host: 127.0.0.1
+webhook_port: 8787
+webhook_dedupe_ttl_secs: 600
+webhook_timestamp_tolerance_secs: 60
 
 # Per-(linear-team, github-repo) bindings. The orchestrator scans each
 # team's issues and routes implementation to the paired repo.
