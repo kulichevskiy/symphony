@@ -283,6 +283,10 @@ def _pr_view_is_merged(view: dict[str, object]) -> bool:
     )
 
 
+def _pr_view_is_closed(view: dict[str, object]) -> bool:
+    return str(view.get("state") or "").upper() == "CLOSED"
+
+
 async def _default_push(workspace_path: Path, branch: str) -> None:
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -978,9 +982,33 @@ class Orchestrator:
                 )
                 continue
             try:
+                view = await self._gh.pr_view(
+                    candidate.pr_number,
+                    repo=binding.github_repo,
+                )
+                if await self._finalize_pr_if_closed(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                    run_id=str(uuid.uuid4()),
+                    create_run=True,
+                    view=view,
+                ):
+                    continue
+            except Exception as e:  # noqa: BLE001 — retry finalization next tick
+                log.warning(
+                    "could not check finalized PR state for %s#%d: %s",
+                    binding.github_repo,
+                    candidate.pr_number,
+                    e,
+                )
+                continue
+            try:
                 verdict = await self._review_verdict_for_pr(
                     binding=binding,
                     pr_number=candidate.pr_number,
+                    view=view,
                 )
             except GitHubError as e:
                 log.warning(
@@ -1084,8 +1112,10 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         pr_number: int,
+        view: dict[str, object] | None = None,
     ) -> Verdict:
-        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        if view is None:
+            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
             raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
@@ -1123,12 +1153,15 @@ class Orchestrator:
         run_id: str,
     ) -> None:
         try:
-            if await self._mark_merge_done_if_merged(
+            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+            if await self._finalize_pr_if_closed(
                 binding=binding,
                 issue=issue,
                 pr_number=pr_number,
                 pr_url=pr_url,
                 run_id=run_id,
+                create_run=False,
+                view=view,
             ):
                 return
         except Exception as e:  # noqa: BLE001 — retry finalization next tick
@@ -1144,6 +1177,7 @@ class Orchestrator:
             verdict = await self._review_verdict_for_pr(
                 binding=binding,
                 pr_number=pr_number,
+                view=view,
             )
         except GitHubError as e:
             log.warning(
@@ -1168,6 +1202,49 @@ class Orchestrator:
                 run_id=run_id,
                 reason=reason,
             )
+
+    async def _finalize_pr_if_closed(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+        create_run: bool,
+        view: dict[str, object],
+    ) -> bool:
+        if _pr_view_is_merged(view):
+            if create_run:
+                inserted = await db.runs.create_if_no_active(
+                    self._conn,
+                    id=run_id,
+                    issue_id=issue.id,
+                    stage="merge",
+                    status="running",
+                    pid=None,
+                    started_at=datetime.now(UTC).isoformat(),
+                )
+                if not inserted:
+                    return True
+            await self._mark_merge_done(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+            )
+            return True
+        if _pr_view_is_closed(view):
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason="pull request closed before merge",
+                create_run=create_run,
+            )
+            return True
+        return False
 
     async def _dispatch_one(
         self, binding: RepoBinding, issue: LinearIssue
