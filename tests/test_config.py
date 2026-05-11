@@ -75,6 +75,37 @@ repos:
     assert cfg.repos[0].codex_model == "gpt-5.1-codex-max"
 
 
+def test_activity_comment_config_defaults_and_overrides(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+activity_comments_enabled: true
+activity_comment_interval_secs: 300
+activity_comment_min_interval_secs: 120
+activity_comment_event_threshold: 20
+activity_comment_long_running_secs: 300
+activity_comment_long_running_repeat_secs: 600
+activity_comment_include_failed_output_lines: 2
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    activity_comments_enabled: false
+    activity_comment_interval_secs: 60
+    activity_comment_event_threshold: 5
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.activity_comment_interval_secs == 300
+    assert cfg.activity_comment_long_running_repeat_secs == 600
+    assert cfg.repos[0].activity_comments_enabled is False
+    assert cfg.repos[0].activity_comment_interval_secs == 60
+    assert cfg.repos[0].activity_comment_event_threshold == 5
+
+
 def test_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""

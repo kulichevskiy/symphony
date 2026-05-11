@@ -30,6 +30,8 @@ async def test_connect_creates_tables_and_persists(tmp_path: Path) -> None:
         "runs",
         "issue_prs",
         "comment_cursors",
+        "activity_comment_marks",
+        "activity_command_marks",
         "operator_waits",
     ):
         assert table in names, f"expected {table} in {names}"

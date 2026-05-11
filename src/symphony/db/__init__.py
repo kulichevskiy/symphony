@@ -14,6 +14,7 @@ Each table has its own DAO module exposing typed read/write functions:
 from __future__ import annotations
 
 from . import (
+    activity_comments,
     comment_cursors,
     comment_events,
     cost_marks,
@@ -27,6 +28,7 @@ from . import (
 from .schema import apply_schema, connect
 
 __all__ = [
+    "activity_comments",
     "apply_schema",
     "comment_cursors",
     "comment_events",
