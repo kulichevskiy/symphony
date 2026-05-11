@@ -209,7 +209,7 @@ systemctl restart symphonyd.service
 systemctl restart cloudflared.service
 journalctl -u symphonyd.service -n 200 --no-pager
 journalctl -u cloudflared.service -n 200 --no-pager
-sudo -iu symphony -- /opt/symphonyd/.venv/bin/symphony --config /opt/symphonyd/config.yaml --once
+sudo -iu symphony -- sh -lc 'cd /opt/symphonyd && .venv/bin/symphony --config /opt/symphonyd/config.yaml --once'
 ```
 
 To update from the operator workstation:
