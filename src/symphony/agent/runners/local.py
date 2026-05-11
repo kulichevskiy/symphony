@@ -20,6 +20,8 @@ from contextlib import suppress
 
 from ..runner import RunnerEvent, RunnerSpec
 
+_STREAM_DRAIN_SECS = 2.0
+
 
 class LocalRunner:
     """Runs agent CLIs as subprocesses on this host.
@@ -31,6 +33,7 @@ class LocalRunner:
 
     def __init__(self) -> None:
         self._active: dict[str, asyncio.subprocess.Process] = {}
+        self._pending_kills: set[str] = set()
 
     async def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         env = {**os.environ, **spec.env}
@@ -39,6 +42,7 @@ class LocalRunner:
                 *spec.command,
                 cwd=spec.workspace_path,
                 env=env,
+                start_new_session=True,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -48,6 +52,10 @@ class LocalRunner:
             return
 
         self._active[spec.run_id] = proc
+        if spec.run_id in self._pending_kills:
+            self._pending_kills.discard(spec.run_id)
+            with suppress(ProcessLookupError):
+                _terminate_process_group(proc.pid)
         yield RunnerEvent(kind="started", pid=proc.pid)
         activity = asyncio.Event()
         stalled = asyncio.Event()
@@ -78,12 +86,14 @@ class LocalRunner:
                     if not _pid_alive(proc.pid):
                         return
                     stalled.set()
-                    proc.terminate()
+                    _terminate_process_group(proc.pid)
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
                     except TimeoutError:
                         with suppress(ProcessLookupError):
-                            proc.kill()
+                            _kill_process_group(proc.pid)
+                        with suppress(Exception):
+                            await proc.wait()
                     return
                 else:
                     activity.clear()
@@ -92,6 +102,8 @@ class LocalRunner:
         stderr_task = asyncio.create_task(pump(proc.stderr, "stderr"))
         watch_task = asyncio.create_task(watchdog())
         wait_task = asyncio.create_task(proc.wait())
+        drain_deadline: float | None = None
+        cleaned_process_group = False
 
         try:
             while True:
@@ -99,13 +111,42 @@ class LocalRunner:
                 try:
                     ev = await asyncio.wait_for(events.get(), timeout=0.25)
                 except TimeoutError:
-                    if wait_task.done() and stdout_task.done() and stderr_task.done():
-                        break
+                    process_done = (
+                        wait_task.done()
+                        or proc.returncode is not None
+                        or not _pid_alive(proc.pid)
+                    )
+                    if process_done:
+                        # Flush tail output without letting inherited pipe handles
+                        # keep the runner open after the parent process is gone.
+                        if not cleaned_process_group:
+                            with suppress(ProcessLookupError):
+                                _terminate_process_group(proc.pid)
+                            cleaned_process_group = True
+                        if stdout_task.done() and stderr_task.done():
+                            break
+                        loop = asyncio.get_running_loop()
+                        if drain_deadline is None:
+                            drain_deadline = loop.time() + _STREAM_DRAIN_SECS
+                        if loop.time() >= drain_deadline:
+                            break
+                        continue
+                    drain_deadline = None
                     yield RunnerEvent(kind="tick")
                     continue
                 yield ev
 
+            for task in (stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            if not wait_task.done():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(wait_task, timeout=0.25)
+            if not wait_task.done():
+                wait_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wait_task
             watch_task.cancel()
             with suppress(asyncio.CancelledError):
                 await watch_task
@@ -119,15 +160,20 @@ class LocalRunner:
 
     async def kill(self, run_id: str) -> None:
         proc = self._active.get(run_id)
-        if proc is None or proc.returncode is not None:
+        if proc is None:
+            self._pending_kills.add(run_id)
+            return
+        if proc.returncode is not None:
             return
         with suppress(ProcessLookupError):
-            proc.terminate()
+            _terminate_process_group(proc.pid)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5.0)
         except TimeoutError:
             with suppress(ProcessLookupError):
-                proc.kill()
+                _kill_process_group(proc.pid)
+            with suppress(Exception):
+                await proc.wait()
 
 
 def _pid_alive(pid: int | None) -> bool:
@@ -141,3 +187,15 @@ def _pid_alive(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _terminate_process_group(pid: int | None) -> None:
+    if pid is None:
+        return
+    os.killpg(pid, 15)
+
+
+def _kill_process_group(pid: int | None) -> None:
+    if pid is None:
+        return
+    os.killpg(pid, 9)
