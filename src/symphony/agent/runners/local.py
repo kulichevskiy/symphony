@@ -20,6 +20,8 @@ from contextlib import suppress
 
 from ..runner import RunnerEvent, RunnerSpec
 
+_STREAM_DRAIN_SECS = 2.0
+
 
 class LocalRunner:
     """Runs agent CLIs as subprocesses on this host.
@@ -100,6 +102,8 @@ class LocalRunner:
         stderr_task = asyncio.create_task(pump(proc.stderr, "stderr"))
         watch_task = asyncio.create_task(watchdog())
         wait_task = asyncio.create_task(proc.wait())
+        drain_deadline: float | None = None
+        cleaned_process_group = False
 
         try:
             while True:
@@ -107,13 +111,44 @@ class LocalRunner:
                 try:
                     ev = await asyncio.wait_for(events.get(), timeout=0.25)
                 except TimeoutError:
-                    if wait_task.done():
+                    process_done = (
+                        wait_task.done()
+                        or proc.returncode is not None
+                        or not _pid_alive(proc.pid)
+                    )
+                    if process_done:
+                        # Flush tail output without letting inherited pipe handles
+                        # keep the runner open after the parent process is gone.
+                        if not cleaned_process_group:
+                            with suppress(ProcessLookupError):
+                                _terminate_process_group(proc.pid)
+                            cleaned_process_group = True
+                        if stdout_task.done() and stderr_task.done():
+                            break
+                        loop = asyncio.get_running_loop()
+                        if drain_deadline is None:
+                            drain_deadline = loop.time() + _STREAM_DRAIN_SECS
+                        if loop.time() >= drain_deadline:
+                            break
+                        continue
+                    drain_deadline = None
+                    if stdout_task.done() and stderr_task.done():
                         break
                     yield RunnerEvent(kind="tick")
                     continue
                 yield ev
 
+            for task in (stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            if not wait_task.done():
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(wait_task, timeout=0.25)
+            if not wait_task.done():
+                wait_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wait_task
             watch_task.cancel()
             with suppress(asyncio.CancelledError):
                 await watch_task
