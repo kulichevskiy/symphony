@@ -52,14 +52,14 @@ def _headers(body: bytes, *, delivery: str = "evt-1") -> dict[str, str]:
     }
 
 
-def _payload() -> dict[str, Any]:
+def _payload(body: str = "/stop") -> dict[str, Any]:
     return {
         "type": "Comment",
         "action": "create",
         "webhookTimestamp": int(NOW.timestamp() * 1000),
         "data": {
             "id": "c1",
-            "body": "/stop",
+            "body": body,
             "createdAt": "2026-05-11T12:00:00+00:00",
             "issueId": "iss-1",
         },
@@ -316,6 +316,46 @@ async def test_webhook_comment_uses_slash_path_and_poll_does_not_refire(
         assert orch._runner.kill.await_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
         cursor = await db.comment_cursors.get(conn, "iss-1")
         assert cursor == ("2026-05-11T12:00:00+00:00", ["c1"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_comment_resumes_operator_waiting_run(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-05-10T01:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-1",
+            kind=db.operator_waits.KIND_COST_CAP,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T01:00:00+00:00",
+        )
+
+        result = await orch.handle_linear_webhook(_payload("/approve"))
+
+        assert result.handled is True
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Resumed" in body for body in bodies)
+        assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+        assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()
 

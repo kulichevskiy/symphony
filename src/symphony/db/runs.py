@@ -151,8 +151,18 @@ async def update_status(
     await conn.commit()
 
 
-async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int) -> None:
+async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -> None:
     await conn.execute("UPDATE runs SET pid = ? WHERE id = ?", (pid, run_id))
+    await conn.commit()
+
+
+async def add_cost(
+    conn: aiosqlite.Connection, run_id: str, cost_usd: float
+) -> None:
+    await conn.execute(
+        "UPDATE runs SET cost_usd = cost_usd + ? WHERE id = ?",
+        (cost_usd, run_id),
+    )
     await conn.commit()
 
 
@@ -192,6 +202,24 @@ async def list_live_with_pid(conn: aiosqlite.Connection) -> list[Run]:
         WHERE status IN ({placeholders}) AND pid IS NOT NULL
         """,
         LIVE_STATUSES,
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run(r) for r in rows]
+
+
+async def list_live_by_stage(
+    conn: aiosqlite.Connection, *, stage: str
+) -> list[Run]:
+    """Live runs for one stage, oldest first."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        FROM runs
+        WHERE stage = ? AND status IN ({placeholders})
+        ORDER BY started_at ASC
+        """,
+        (stage, *LIVE_STATUSES),
     )
     rows = await cur.fetchall()
     return [_row_to_run(r) for r in rows]

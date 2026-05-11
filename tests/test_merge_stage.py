@@ -844,6 +844,71 @@ async def test_externally_merged_candidate_finishes_before_review_classification
         gh.pr_reactions.assert_not_awaited()
         gh.commit_committed_at.assert_not_awaited()
         gh.pr_merge.assert_not_awaited()
+        linear.lookup_issue.assert_awaited_once_with("iss-1")
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        workspace.cleanup.assert_awaited_once_with(_issue())
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "done"
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_externally_merged_candidate_records_done_when_final_comment_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        workspace = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(side_effect=LinearError("comments down"))
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "state": "MERGED",
+                "mergedAt": "2026-05-10T00:04:00Z",
+            }
+        )
+        gh.pr_checks = AsyncMock()
+        gh.pr_review_comments = AsyncMock()
+        gh.pr_reviews = AsyncMock()
+        gh.pr_reactions = AsyncMock()
+        gh.commit_committed_at = AsyncMock()
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        gh.pr_checks.assert_not_awaited()
+        gh.pr_review_comments.assert_not_awaited()
+        gh.pr_reviews.assert_not_awaited()
+        gh.pr_reactions.assert_not_awaited()
+        gh.commit_committed_at.assert_not_awaited()
+        gh.pr_merge.assert_not_awaited()
         linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
         workspace.cleanup.assert_awaited_once_with(_issue())
         history = await db.runs.history_for_issue(conn, "iss-1")

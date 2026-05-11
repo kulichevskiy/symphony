@@ -92,10 +92,18 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 --   last_trigger_signature stable signature of the most recent
 --                          review_classifier verdict; used to dedup
 --                          consecutive fix-runs against the same trigger.
+--   ci_fetch_failures      consecutive `gh pr checks` fetch failures.
+--   pr_number/pr_url       active PR under Review.
+--   github_repo/issue_label binding selected when Review started.
 CREATE TABLE IF NOT EXISTS review_state (
     issue_id               TEXT PRIMARY KEY REFERENCES issues(id),
     iteration              INTEGER NOT NULL DEFAULT 0,
-    last_trigger_signature TEXT NOT NULL DEFAULT ''
+    last_trigger_signature TEXT NOT NULL DEFAULT '',
+    ci_fetch_failures      INTEGER NOT NULL DEFAULT 0,
+    pr_number              INTEGER,
+    pr_url                 TEXT NOT NULL DEFAULT '',
+    github_repo            TEXT NOT NULL DEFAULT '',
+    issue_label            TEXT NOT NULL DEFAULT ''
 );
 
 -- Per-issue cost-warning idempotency. The cost warning template fires

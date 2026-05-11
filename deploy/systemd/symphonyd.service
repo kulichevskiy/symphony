@@ -1,0 +1,29 @@
+[Unit]
+Description=symphonyd Linear orchestrator
+Documentation=https://github.com/kulichevskiy/symphonyd
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=symphony
+Group=symphony
+WorkingDirectory=/opt/symphonyd
+EnvironmentFile=/opt/symphonyd/.env
+Environment=HOME=/home/symphony
+Environment=XDG_CONFIG_HOME=/home/symphony/.config
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/symphonyd/.venv/bin:/home/symphony/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/test -f /opt/symphonyd/.env
+ExecStartPre=/usr/bin/test -f /opt/symphonyd/config.yaml
+ExecStartPre=/usr/bin/test -x /opt/symphonyd/.venv/bin/symphony
+ExecStart=/opt/symphonyd/.venv/bin/symphony --config /opt/symphonyd/config.yaml
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
