@@ -101,6 +101,7 @@ class LocalRunner:
                 except TimeoutError:
                     if wait_task.done() and stdout_task.done() and stderr_task.done():
                         break
+                    yield RunnerEvent(kind="tick")
                     continue
                 yield ev
 

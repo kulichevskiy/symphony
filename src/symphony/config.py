@@ -70,6 +70,13 @@ class RepoBinding(BaseModel):
     # explicit `0` disables the cap (useful when one team is exempt).
     cost_cap_usd: float | None = None
     cost_warning_pct: int | None = None
+    activity_comments_enabled: bool | None = None
+    activity_comment_interval_secs: int | None = Field(default=None, ge=1)
+    activity_comment_min_interval_secs: int | None = Field(default=None, ge=1)
+    activity_comment_event_threshold: int | None = Field(default=None, ge=1)
+    activity_comment_long_running_secs: int | None = Field(default=None, ge=1)
+    activity_comment_long_running_repeat_secs: int | None = Field(default=None, ge=1)
+    activity_comment_include_failed_output_lines: int | None = Field(default=None, ge=0)
     linear_states: LinearStates
 
     @field_validator("codex_model")
@@ -119,6 +126,13 @@ class Config(BaseModel):
     cost_cap_per_issue_usd: float = 15.0
     cost_warning_pct: int = 75
     stall_timeout_secs: int = 300
+    activity_comments_enabled: bool = True
+    activity_comment_interval_secs: int = Field(default=300, ge=1)
+    activity_comment_min_interval_secs: int = Field(default=120, ge=1)
+    activity_comment_event_threshold: int = Field(default=20, ge=1)
+    activity_comment_long_running_secs: int = Field(default=300, ge=1)
+    activity_comment_long_running_repeat_secs: int = Field(default=600, ge=1)
+    activity_comment_include_failed_output_lines: int = Field(default=2, ge=0)
 
     # Filled in from Secrets.
     linear_api_key: str = ""

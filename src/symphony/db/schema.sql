@@ -116,6 +116,24 @@ CREATE TABLE IF NOT EXISTS issue_cost_marks (
     warning_posted_at   TEXT
 );
 
+-- Rate-limit/dedupe state for Codex activity comments. The full activity
+-- stream is not stored here; raw JSONL remains in per-run log files.
+CREATE TABLE IF NOT EXISTS activity_comment_marks (
+    run_id                 TEXT PRIMARY KEY REFERENCES runs(id),
+    first_unpublished_at   TEXT,
+    last_event_at          TEXT,
+    event_count_since_post INTEGER NOT NULL DEFAULT 0,
+    last_posted_at         TEXT,
+    last_fingerprint       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS activity_command_marks (
+    run_id             TEXT NOT NULL REFERENCES runs(id),
+    item_id            TEXT NOT NULL,
+    last_heartbeat_at  TEXT NOT NULL,
+    PRIMARY KEY (run_id, item_id)
+);
+
 -- Runs waiting for an explicit operator slash command after the runner has
 -- stopped. Cost-cap breaches use this so `/approve` and `/reject` remain
 -- actionable after an orchestrator restart.

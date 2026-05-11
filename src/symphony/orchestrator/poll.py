@@ -34,6 +34,13 @@ from typing import Any
 import aiosqlite
 
 from .. import db
+from ..agent.activity import (
+    ActivityPublishReason,
+    ActivitySession,
+    ActivitySettings,
+    digest_fingerprint,
+    format_activity_digest,
+)
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.process import Usage, parse_event_line
 from ..agent.prompt import implement_prompt, merge_prompt, review_fix_prompt
@@ -120,6 +127,55 @@ class _UsageCostEstimator:
             output_tokens=output_delta,
             model=self.codex_model,
         )
+
+
+def _activity_settings_for(config: Config, binding: RepoBinding) -> ActivitySettings:
+    return ActivitySettings(
+        enabled=(
+            config.activity_comments_enabled
+            if binding.activity_comments_enabled is None
+            else binding.activity_comments_enabled
+        ),
+        interval_secs=(
+            config.activity_comment_interval_secs
+            if binding.activity_comment_interval_secs is None
+            else binding.activity_comment_interval_secs
+        ),
+        min_interval_secs=(
+            config.activity_comment_min_interval_secs
+            if binding.activity_comment_min_interval_secs is None
+            else binding.activity_comment_min_interval_secs
+        ),
+        event_threshold=(
+            config.activity_comment_event_threshold
+            if binding.activity_comment_event_threshold is None
+            else binding.activity_comment_event_threshold
+        ),
+        long_running_secs=(
+            config.activity_comment_long_running_secs
+            if binding.activity_comment_long_running_secs is None
+            else binding.activity_comment_long_running_secs
+        ),
+        long_running_repeat_secs=(
+            config.activity_comment_long_running_repeat_secs
+            if binding.activity_comment_long_running_repeat_secs is None
+            else binding.activity_comment_long_running_repeat_secs
+        ),
+        include_failed_output_lines=(
+            config.activity_comment_include_failed_output_lines
+            if binding.activity_comment_include_failed_output_lines is None
+            else binding.activity_comment_include_failed_output_lines
+        ),
+    )
+
+
+def _parse_optional_datetime(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return _parse_rfc3339(raw)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -464,6 +520,7 @@ class Orchestrator:
         gh: GitHub | None = None,
         workspace: Workspace | None = None,
         push_fn: PushFn | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self.linear = linear
@@ -477,6 +534,7 @@ class Orchestrator:
             else Workspace(root=config.workspace_root, clone_fn=self._gh.repo_clone)
         )
         self._push_fn: PushFn = push_fn if push_fn is not None else _default_push
+        self._clock = clock
         # Cache of (team_key -> {state_name: state_uuid}). Re-fetched on
         # startup; never mutated at runtime.
         self._states: dict[str, dict[str, str]] = {}
@@ -496,6 +554,11 @@ class Orchestrator:
             max(config.global_max_concurrent, 1)
         )
         self._binding_dispatch_sems: dict[BindingKey, asyncio.Semaphore] = {}
+
+    def _now(self) -> datetime:
+        if self._clock is not None:
+            return self._clock()
+        return datetime.now(UTC)
 
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
@@ -1250,11 +1313,14 @@ class Orchestrator:
         self._dispatch_run_ids[issue.id] = fix_run_id
 
         try:
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
             cost, final_kind, final_returncode = await self._run_fix_agent(
                 binding=binding,
+                issue=issue,
                 run_id=fix_run_id,
                 workspace_path=workspace_path,
                 prompt=prompt,
+                prior_total=prior_total,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("review fix-run execution failed for %s", issue.identifier)
@@ -2698,6 +2764,168 @@ class Orchestrator:
         )
         return review_run_id
 
+    def _activity_session(
+        self,
+        *,
+        binding: RepoBinding,
+        run_id: str,
+        stage: str,
+        workspace_path: Path,
+    ) -> ActivitySession | None:
+        if binding.agent != "codex" or stage not in {"implement", "review_fix"}:
+            return None
+        settings = _activity_settings_for(self.config, binding)
+        if not settings.enabled:
+            return None
+        return ActivitySession(
+            settings=settings,
+            run_id=run_id,
+            stage=stage,
+            workspace_path=workspace_path,
+        )
+
+    async def _record_activity_stdout(
+        self,
+        *,
+        session: ActivitySession | None,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        line: str,
+        cumulative_total: float,
+    ) -> None:
+        if session is None:
+            return
+        now = self._now()
+        if not session.record_line(line, now):
+            return
+        await db.activity_comments.record_event(
+            self._conn,
+            run_id=session.run_id,
+            occurred_at=now.isoformat(),
+        )
+        mark = await db.activity_comments.get(self._conn, session.run_id)
+        last_posted_at = (
+            _parse_optional_datetime(mark.last_posted_at)
+            if mark is not None
+            else None
+        )
+        reason = session.due_reason(now, last_posted_at=last_posted_at)
+        if reason is not None:
+            await self._publish_activity_digest(
+                session=session,
+                binding=binding,
+                issue=issue,
+                reason=reason,
+                now=now,
+                cumulative_total=cumulative_total,
+            )
+
+    async def _record_activity_tick(
+        self,
+        *,
+        session: ActivitySession | None,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        cumulative_total: float,
+    ) -> None:
+        if session is None:
+            return
+        now = self._now()
+        raw_marks = await db.activity_comments.heartbeat_marks(
+            self._conn,
+            run_id=session.run_id,
+        )
+        marks = {
+            item_id: parsed
+            for item_id, raw in raw_marks.items()
+            if (parsed := _parse_optional_datetime(raw)) is not None
+        }
+        due_item_ids = session.heartbeat_due_item_ids(
+            now,
+            last_heartbeat_at_by_item=marks,
+        )
+        if not due_item_ids:
+            return
+        await self._publish_activity_digest(
+            session=session,
+            binding=binding,
+            issue=issue,
+            reason="heartbeat",
+            now=now,
+            cumulative_total=cumulative_total,
+            heartbeat_item_ids=due_item_ids,
+        )
+
+    async def _flush_activity(
+        self,
+        *,
+        session: ActivitySession | None,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        cumulative_total: float,
+    ) -> None:
+        if session is None or not session.has_unpublished_events():
+            return
+        await self._publish_activity_digest(
+            session=session,
+            binding=binding,
+            issue=issue,
+            reason="final",
+            now=self._now(),
+            cumulative_total=cumulative_total,
+        )
+
+    async def _publish_activity_digest(
+        self,
+        *,
+        session: ActivitySession,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        reason: ActivityPublishReason,
+        now: datetime,
+        cumulative_total: float,
+        heartbeat_item_ids: tuple[str, ...] = (),
+    ) -> bool:
+        digest = session.build_digest(
+            reason=reason,
+            now=now,
+            cumulative_cost_usd=cumulative_total,
+        )
+        body = truncate_body(format_activity_digest(digest))
+        fingerprint = digest_fingerprint(body)
+        mark = await db.activity_comments.get(self._conn, session.run_id)
+        if (
+            mark is not None
+            and mark.last_fingerprint == fingerprint
+            and not session.has_unpublished_events()
+        ):
+            return False
+        try:
+            await self.linear.post_comment(issue.id, body)
+        except LinearError as e:
+            log.warning(
+                "activity comment failed on %s run %s: %s",
+                issue.identifier,
+                session.run_id,
+                e,
+            )
+            return False
+        await db.activity_comments.mark_published(
+            self._conn,
+            run_id=session.run_id,
+            posted_at=now.isoformat(),
+            fingerprint=fingerprint,
+        )
+        for item_id in heartbeat_item_ids:
+            await db.activity_comments.mark_heartbeat(
+                self._conn,
+                run_id=session.run_id,
+                item_id=item_id,
+                posted_at=now.isoformat(),
+            )
+        session.mark_published()
+        return True
+
     async def _run_agent(
         self,
         *,
@@ -2845,6 +3073,12 @@ class Orchestrator:
             agent=binding.agent,
             codex_model=binding.codex_model,
         )
+        activity = self._activity_session(
+            binding=binding,
+            run_id=run_id,
+            stage=stage,
+            workspace_path=workspace_path,
+        )
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -2880,9 +3114,29 @@ class Orchestrator:
                             if decision.cap_breached:
                                 cap_breached = True
                                 await self._kill_active_runner(run_id)
+                        await self._record_activity_stdout(
+                            session=activity,
+                            binding=binding,
+                            issue=issue,
+                            line=ev.line,
+                            cumulative_total=prior_total + cumulative_cost,
+                        )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
+                    elif ev.kind == "tick":
+                        await self._record_activity_tick(
+                            session=activity,
+                            binding=binding,
+                            issue=issue,
+                            cumulative_total=prior_total + cumulative_cost,
+                        )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
+                        await self._flush_activity(
+                            session=activity,
+                            binding=binding,
+                            issue=issue,
+                            cumulative_total=prior_total + cumulative_cost,
+                        )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
                         break
@@ -2894,9 +3148,11 @@ class Orchestrator:
         self,
         *,
         binding: RepoBinding,
+        issue: LinearIssue,
         run_id: str,
         workspace_path: Path,
         prompt: str,
+        prior_total: float,
     ) -> tuple[float, str, int | None]:
         command = build_fix_runner_command(
             binding.agent,
@@ -2910,6 +3166,10 @@ class Orchestrator:
             stage="review",
             agent=binding.agent,
             codex_model=binding.codex_model,
+            binding=binding,
+            issue=issue,
+            activity_stage="review_fix",
+            prior_total=prior_total,
         )
 
     async def _run_runner(
@@ -2920,7 +3180,11 @@ class Orchestrator:
         command: list[str],
         stage: str,
         agent: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
         codex_model: str = DEFAULT_CODEX_MODEL,
+        activity_stage: str | None = None,
+        prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
     ) -> tuple[float, str, int | None]:
         spec = RunnerSpec(
@@ -2938,6 +3202,16 @@ class Orchestrator:
         final_kind = "exit"
         final_returncode: int | None = None
         cost_estimator = _UsageCostEstimator(agent=agent, codex_model=codex_model)
+        activity = (
+            self._activity_session(
+                binding=binding,
+                run_id=run_id,
+                stage=activity_stage,
+                workspace_path=workspace_path,
+            )
+            if activity_stage is not None
+            else None
+        )
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -2949,9 +3223,29 @@ class Orchestrator:
                         usage = parse_event_line(ev.line)
                         if usage is not None:
                             cumulative_cost += cost_estimator.delta(usage)
+                        await self._record_activity_stdout(
+                            session=activity,
+                            binding=binding,
+                            issue=issue,
+                            line=ev.line,
+                            cumulative_total=prior_total + cumulative_cost,
+                        )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
+                    elif ev.kind == "tick":
+                        await self._record_activity_tick(
+                            session=activity,
+                            binding=binding,
+                            issue=issue,
+                            cumulative_total=prior_total + cumulative_cost,
+                        )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
+                        await self._flush_activity(
+                            session=activity,
+                            binding=binding,
+                            issue=issue,
+                            cumulative_total=prior_total + cumulative_cost,
+                        )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
                         break
