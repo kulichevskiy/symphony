@@ -1125,6 +1125,16 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
     assert "fix this" in argv
 
 
+def test_build_fix_runner_command_passes_configured_codex_model() -> None:
+    argv = build_fix_runner_command(
+        "codex",
+        "fix this",
+        codex_model="gpt-5.1-codex-max",
+    )
+    assert argv[:5] == ["codex", "exec", "--json", "--model", "gpt-5.1-codex-max"]
+    assert argv[-1] == "fix this"
+
+
 # --- PR URL parser ---------------------------------------------------------
 
 

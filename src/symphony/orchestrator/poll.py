@@ -160,7 +160,12 @@ def build_runner_command(
     raise ValueError(f"unknown agent {agent!r}")
 
 
-def build_fix_runner_command(agent: str, prompt: str) -> list[str]:
+def build_fix_runner_command(
+    agent: str,
+    prompt: str,
+    *,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+) -> list[str]:
     """argv for a Review-stage fix-run.
 
     Fix-runs go through the binding's CLI (claude or codex), NOT through
@@ -168,7 +173,7 @@ def build_fix_runner_command(agent: str, prompt: str) -> list[str]:
     comments; the binding's `agent` field is what drives code changes
     in response to its feedback.
     """
-    return build_runner_command(agent, prompt)
+    return build_runner_command(agent, prompt, codex_model=codex_model)
 
 
 _PR_URL_RE = re.compile(r"/pull/(\d+)")
@@ -1945,7 +1950,11 @@ class Orchestrator:
         workspace_path: Path,
         prompt: str,
     ) -> tuple[float, str, int | None]:
-        command = build_fix_runner_command(binding.agent, prompt)
+        command = build_fix_runner_command(
+            binding.agent,
+            prompt,
+            codex_model=binding.codex_model,
+        )
         return await self._run_runner(
             run_id=run_id,
             workspace_path=workspace_path,
