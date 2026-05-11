@@ -292,6 +292,7 @@ class Orchestrator:
                 await self._runner.kill(run_id)
             except Exception:  # noqa: BLE001
                 log.exception("runner.kill failed for run %s", run_id)
+                raise
             return
         log.info(
             "slash %s received for run %s (handler not implemented in this slice)",
