@@ -23,7 +23,7 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.github.client import CheckRun, GitHub, PRChecks
+from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import (
     Orchestrator,
@@ -395,6 +395,67 @@ async def test_red_ci_dedup_skips_identical_back_to_back_fix_run(
         gh.check_log_tail.assert_not_awaited()
         state = await db.review_state.get(conn, "iss-1")
         assert state.iteration == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_head_lookup_failure_does_not_dedup_to_unknown_head(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, signature="ci:unknown-head:lint")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [
+                    CheckRun(
+                        name="lint",
+                        state="FAILURE",
+                        bucket="fail",
+                        link="https://github.com/org/repo/actions/runs/1/jobs/2",
+                    )
+                ]
+            )
+        )
+        gh.head_sha = AsyncMock(side_effect=GitHubError("head lookup failed"))
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is not None
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 1
+        assert state.last_trigger_signature.startswith("ci:unknown-head-")
+        assert state.last_trigger_signature != "ci:unknown-head:lint"
     finally:
         await conn.close()
 

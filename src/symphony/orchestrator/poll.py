@@ -19,6 +19,7 @@ in the "ready" state with the configured label, then for each one:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -186,6 +187,28 @@ def _review_check_from_gh(run: GitHubCheckRun) -> ReviewCheckRun:
         conclusion=conclusion,
         required=True,
     )
+
+
+def _unknown_head_ci_scope(checks: PRChecks) -> str:
+    failed = [
+        run
+        for run in checks.runs
+        if run.bucket.lower() in {"fail", "cancel"}
+    ]
+    scoped_runs = failed or checks.runs
+    parts = sorted(
+        "\0".join(
+            [
+                run.name,
+                run.bucket.lower(),
+                run.state.lower(),
+                run.link or "",
+            ]
+        )
+        for run in scoped_runs
+    )
+    digest = hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+    return f"unknown-head-{digest}"
 
 
 def _pr_url_for_state(
@@ -553,7 +576,9 @@ class Orchestrator:
                 state.pr_number,
                 e,
             )
-            head_sha = "unknown-head"
+            # Without a head SHA, scope CI dedup to the current check links so
+            # new failed runs do not collapse into one permanent placeholder.
+            head_sha = _unknown_head_ci_scope(checks)
 
         verdict = review_classifier(
             comments=[],
