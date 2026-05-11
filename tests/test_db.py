@@ -107,6 +107,21 @@ async def test_runs_create_and_has_active(tmp_path: Path) -> None:
             conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00"
         )
         assert await db.runs.has_active(conn, "iss-1") is False
+
+        await db.runs.create(
+            conn,
+            id="review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.runs.has_active(conn, "iss-1") is True
+        assert (
+            await db.runs.has_active(conn, "iss-1", ignored_stage="review")
+            is False
+        )
     finally:
         await conn.close()
 
@@ -231,7 +246,7 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
             id="review",
             issue_id="iss-1",
             stage="review",
-            status="completed",
+            status="running",
             pid=None,
             started_at="2026-05-10T00:01:00+00:00",
         )
@@ -443,6 +458,30 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
             started_at="2026-05-10T00:03:00+00:00",
         )
         assert third is True
+
+        merge = await db.runs.create_if_no_active(
+            conn,
+            id="run-d",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:04:00+00:00",
+            ignored_stage="review",
+        )
+        assert merge is True
+
+        blocked = await db.runs.create_if_no_active(
+            conn,
+            id="run-e",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:05:00+00:00",
+            ignored_stage="review",
+        )
+        assert blocked is False
     finally:
         await conn.close()
 

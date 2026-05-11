@@ -73,6 +73,7 @@ async def create_if_no_active(
     pid: int | None,
     started_at: str,
     cost_usd: float = 0.0,
+    ignored_stage: str | None = None,
 ) -> bool:
     """Atomic dedupe: insert iff no `LIVE_STATUSES` row exists for `issue_id`.
 
@@ -86,15 +87,32 @@ async def create_if_no_active(
     existed and the insert was skipped.
     """
     placeholders = ",".join("?" * len(LIVE_STATUSES))
+    stage_filter = "" if ignored_stage is None else " AND stage != ?"
+    dedupe_params: tuple[str, ...] = (
+        (*LIVE_STATUSES,)
+        if ignored_stage is None
+        else (*LIVE_STATUSES, ignored_stage)
+    )
     cur = await conn.execute(
         f"""
         INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
         SELECT ?, ?, ?, ?, ?, ?, ?
         WHERE NOT EXISTS (
-            SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders})
+            SELECT 1 FROM runs
+            WHERE issue_id = ? AND status IN ({placeholders}){stage_filter}
         )
         """,
-        (id, issue_id, stage, status, pid, started_at, cost_usd, issue_id, *LIVE_STATUSES),
+        (
+            id,
+            issue_id,
+            stage,
+            status,
+            pid,
+            started_at,
+            cost_usd,
+            issue_id,
+            *dedupe_params,
+        ),
     )
     await conn.commit()
     return (cur.rowcount or 0) > 0
@@ -166,12 +184,27 @@ async def add_cost(
     await conn.commit()
 
 
-async def has_active(conn: aiosqlite.Connection, issue_id: str) -> bool:
+async def has_active(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    ignored_stage: str | None = None,
+) -> bool:
     """True if `issue_id` has any run in a live status."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
+    stage_filter = "" if ignored_stage is None else " AND stage != ?"
+    params: tuple[str, ...] = (
+        (issue_id, *LIVE_STATUSES)
+        if ignored_stage is None
+        else (issue_id, *LIVE_STATUSES, ignored_stage)
+    )
     cur = await conn.execute(
-        f"SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders}) LIMIT 1",
-        (issue_id, *LIVE_STATUSES),
+        f"""
+        SELECT 1 FROM runs
+        WHERE issue_id = ? AND status IN ({placeholders}){stage_filter}
+        LIMIT 1
+        """,
+        params,
     )
     row = await cur.fetchone()
     return row is not None

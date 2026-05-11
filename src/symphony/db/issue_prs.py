@@ -100,7 +100,7 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
                 AND r.stage = 'review'
-                AND r.status = 'completed'
+                AND r.status IN ('running', 'completed')
                 AND r.started_at >= p.created_at
           )
           AND NOT EXISTS (

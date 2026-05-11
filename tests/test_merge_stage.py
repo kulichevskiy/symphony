@@ -534,6 +534,7 @@ async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_review_candidate(conn)
+        await db.runs.update_status(conn, "review", "running")
         runner = _BlockingRunner()
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")

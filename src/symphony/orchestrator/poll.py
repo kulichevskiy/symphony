@@ -1663,7 +1663,11 @@ class Orchestrator:
                 continue
             if candidate.issue_id in self._scheduled_issue_ids:
                 continue
-            if await db.runs.has_active(self._conn, candidate.issue_id):
+            if await db.runs.has_active(
+                self._conn,
+                candidate.issue_id,
+                ignored_stage="review",
+            ):
                 continue
             try:
                 issue = await self.linear.lookup_issue(candidate.issue_id)
@@ -1939,6 +1943,7 @@ class Orchestrator:
                     status="running",
                     pid=None,
                     started_at=datetime.now(UTC).isoformat(),
+                    ignored_stage="review",
                 )
                 if not inserted:
                     return True
@@ -2266,6 +2271,7 @@ class Orchestrator:
             status="running",
             pid=None,
             started_at=now,
+            ignored_stage="review",
         )
         if not inserted:
             return None
@@ -2486,6 +2492,7 @@ class Orchestrator:
                 status="running",
                 pid=None,
                 started_at=datetime.now(UTC).isoformat(),
+                ignored_stage="review",
             )
             if not inserted:
                 return
