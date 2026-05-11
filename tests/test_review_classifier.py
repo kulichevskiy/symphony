@@ -99,6 +99,30 @@ def test_rule_1_failing_required_ci_marks_changes_requested() -> None:
     assert v.trigger_signature.startswith("ci:")
 
 
+@pytest.mark.parametrize(
+    "conclusion",
+    ["action_required", "cancelled", "failure", "stale", "startup_failure", "timed_out"],
+)
+def test_rule_1_blocking_required_ci_conclusions_win_over_approval(
+    conclusion: str,
+) -> None:
+    ci = [
+        CheckRun(
+            name=f"required-{conclusion}",
+            status="completed",
+            conclusion=conclusion,
+            required=True,
+        ),
+    ]
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
+    )
+    v = review_classifier(comments=[], ci=ci, snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.rule == "failing_ci"
+    assert f"required-{conclusion}" in v.failing_checks
+
+
 def test_rule_1_failing_ci_with_unknown_required_still_blocks() -> None:
     # When `required` is None (unknown), still treat a completed failure
     # as blocking — better to over-report than to silently pass with

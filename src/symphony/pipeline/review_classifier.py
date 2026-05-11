@@ -45,6 +45,18 @@ CODEX_BOILERPLATE_THRESHOLD = 750
 # Needs Approval once this many fix-runs have been dispatched.
 DEFAULT_REVIEW_ITERATION_CAP = 12
 
+# GitHub check conclusions that indicate the required check did not pass.
+BLOCKING_CHECK_CONCLUSIONS = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "stale",
+        "startup_failure",
+        "timed_out",
+    }
+)
+
 
 class VerdictKind(StrEnum):
     APPROVED = "approved"
@@ -150,13 +162,13 @@ def review_classifier(
 ) -> Verdict:
     """Classify the current review state. See module docstring for rules."""
 
-    # Rule 1 — failing required (or unknown-required) CI check.
+    # Rule 1 — failed required (or unknown-required) CI check.
     failing = [
         c
         for c in ci
         if c.required is not False
         and c.status == "completed"
-        and c.conclusion == "failure"
+        and c.conclusion in BLOCKING_CHECK_CONCLUSIONS
     ]
     if failing:
         names = sorted(c.name for c in failing)
