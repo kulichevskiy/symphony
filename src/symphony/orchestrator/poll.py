@@ -271,7 +271,11 @@ def _reactions_from_github(entries: list[dict[str, object]]) -> tuple[Reaction, 
 
 
 def _pr_view_is_merged(view: dict[str, object]) -> bool:
-    return bool(view.get("merged")) or str(view.get("state") or "").upper() == "MERGED"
+    return (
+        bool(view.get("mergedAt"))
+        or bool(view.get("merged"))
+        or str(view.get("state") or "").upper() == "MERGED"
+    )
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:

@@ -202,7 +202,7 @@ class GitHub:
             str(pr),
             *self._repo_args(repo),
             "--json",
-            "number,title,state,url,headRefName,headRefOid,mergeable,isDraft,merged",
+            "number,title,state,url,headRefName,headRefOid,mergeable,isDraft,mergedAt",
         ]
         result = await self._run_json(argv)
         if not isinstance(result, dict):

@@ -266,6 +266,11 @@ async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  
     call = _calls(log)[0]
     assert call["env_GH_TOKEN"] == "ghs_test_token"
     assert call["env_GH_ENTERPRISE_TOKEN"] == "ghs_test_token"
+    argv = call["argv"]
+    assert isinstance(argv, list)
+    fields = str(argv[argv.index("--json") + 1])
+    assert "mergedAt" in fields
+    assert "merged," not in fields
 
 
 # ---- head_sha + branch_list + repo_clone + pr_comment + pr_close ----

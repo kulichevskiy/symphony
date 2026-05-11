@@ -146,7 +146,7 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         "headRefOid": "abc123",
         "mergeable": "MERGEABLE",
         "isDraft": False,
-        "merged": False,
+        "mergedAt": None,
     }
     checks = [
         {
@@ -183,7 +183,7 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         "if argv[:2] == ['pr', 'view']:\n"
         "    if merged_flag.exists():\n"
         "        pr_view['state'] = 'MERGED'\n"
-        "        pr_view['merged'] = True\n"
+        "        pr_view['mergedAt'] = '2026-05-10T00:04:00Z'\n"
         "    sys.stdout.write(json.dumps(pr_view)); sys.exit(0)\n"
         "if argv[:2] == ['pr', 'checks']:\n"
         "    sys.stdout.write(json.dumps(checks)); sys.exit(0)\n"
@@ -296,8 +296,12 @@ async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
         gh = MagicMock()
         gh.pr_view = AsyncMock(
             side_effect=[
-                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": False},
-                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": True},
+                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergedAt": None},
+                {
+                    "headRefOid": "abc123",
+                    "mergeable": "MERGEABLE",
+                    "mergedAt": "2026-05-10T00:04:00Z",
+                },
             ]
         )
         gh.pr_checks = AsyncMock(
@@ -387,9 +391,13 @@ async def test_auto_merge_submission_waits_until_pr_reports_merged(
         gh = MagicMock()
         gh.pr_view = AsyncMock(
             side_effect=[
-                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": False},
-                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": False},
-                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "merged": True},
+                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergedAt": None},
+                {"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergedAt": None},
+                {
+                    "headRefOid": "abc123",
+                    "mergeable": "MERGEABLE",
+                    "mergedAt": "2026-05-10T00:04:00Z",
+                },
             ]
         )
         gh.pr_checks = AsyncMock(
@@ -551,7 +559,7 @@ async def test_merge_conflict_closes_run_when_state_lookup_fails(
             return_value={
                 "headRefOid": "abc123",
                 "mergeable": "CONFLICTING",
-                "merged": False,
+                "mergedAt": None,
             }
         )
         gh.pr_checks = AsyncMock(
