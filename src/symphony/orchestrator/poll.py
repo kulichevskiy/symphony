@@ -503,10 +503,25 @@ class Orchestrator:
         self, run: db.runs.Run, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None]:
         self._review_poll_run_ids.add(run.id)
-        task = asyncio.create_task(self._poll_review_run(run, binding, issue))
+        task = asyncio.create_task(self._poll_review_run_with_limits(run, binding, issue))
         self._review_poll_tasks.add(task)
         task.add_done_callback(partial(self._review_poll_done, run_id=run.id))
         return task
+
+    async def _poll_review_run_with_limits(
+        self,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> None:
+        key = _binding_key(binding)
+        binding_sem = self._binding_dispatch_sems.setdefault(
+            key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        async with self._global_dispatch_sem:
+            async with binding_sem:
+                await self._poll_review_run(run, binding, issue)
 
     def _review_poll_done(self, task: asyncio.Task[None], run_id: str) -> None:
         self._review_poll_tasks.discard(task)
@@ -605,10 +620,7 @@ class Orchestrator:
             return
 
         iteration = await db.review_state.bump_iteration(self._conn, issue.id)
-        await db.review_state.set_signature(
-            self._conn, issue.id, verdict.trigger_signature
-        )
-        await self._dispatch_ci_fix_run(
+        dispatched = await self._dispatch_ci_fix_run(
             run=run,
             binding=binding,
             issue=issue,
@@ -616,6 +628,10 @@ class Orchestrator:
             verdict=verdict,
             iteration=iteration,
         )
+        if dispatched:
+            await db.review_state.set_signature(
+                self._conn, issue.id, verdict.trigger_signature
+            )
 
     async def _dispatch_ci_fix_run(
         self,
@@ -626,7 +642,7 @@ class Orchestrator:
         checks: PRChecks,
         verdict: Verdict,
         iteration: int,
-    ) -> None:
+    ) -> bool:
         log_tail = await self._failing_check_log_tail(
             checks=checks,
             verdict=verdict,
@@ -658,7 +674,7 @@ class Orchestrator:
                 error=f"workspace acquire failed: {e}",
                 last_log=str(e),
             )
-            return
+            return False
 
         fix_run_id = str(uuid.uuid4())
         await db.runs.create(
@@ -694,7 +710,7 @@ class Orchestrator:
                 error=f"review fix-run execution failed: {e}",
                 last_log=str(e),
             )
-            return
+            return False
         finally:
             if self._dispatch_run_ids.get(issue.id) == fix_run_id:
                 self._dispatch_run_ids.pop(issue.id, None)
@@ -722,7 +738,7 @@ class Orchestrator:
                 error=f"review fix-run ended with {final_kind}",
                 last_log="",
             )
-            return
+            return False
 
         await db.runs.update_status(
             self._conn,
@@ -745,7 +761,7 @@ class Orchestrator:
                 error=f"push failed: {e}",
                 last_log=str(e),
             )
-            return
+            return False
 
         state = await db.review_state.get(self._conn, issue.id)
         if state.pr_number is not None:
@@ -762,6 +778,7 @@ class Orchestrator:
                     state.pr_number,
                     e,
                 )
+        return True
 
     async def _failing_check_log_tail(
         self,

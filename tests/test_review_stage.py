@@ -373,6 +373,72 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
 
 
 @pytest.mark.asyncio
+async def test_red_ci_defers_signature_until_fix_run_succeeds(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="lint", state="FAILURE", bucket="fail", link=None)]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_comment = AsyncMock()
+
+        runner = _BlockingRunner()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            tasks = await orch._poll_review_runs()  # noqa: SLF001
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+
+            state = await db.review_state.get(conn, "iss-1")
+            assert state.iteration == 1
+            assert state.last_trigger_signature == ""
+
+            runner.release.set()
+            await asyncio.gather(*tasks)
+
+            state = await db.review_state.get(conn, "iss-1")
+            assert state.last_trigger_signature == "ci:head-sha:lint"
+        finally:
+            runner.release.set()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_red_ci_dedup_skips_identical_back_to_back_fix_run(
     tmp_path: Path,
 ) -> None:
@@ -707,6 +773,51 @@ async def test_review_fix_run_does_not_block_poll_tick(tmp_path: Path) -> None:
             runner.release.set()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_poll_respects_global_dispatch_limit(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            global_max_concurrent=1,
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+
+        await orch._global_dispatch_sem.acquire()  # noqa: SLF001
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            tasks = await orch._poll_review_runs()  # noqa: SLF001
+            await asyncio.sleep(0)
+
+            assert len(tasks) == 1
+            assert not tasks[0].done()
+            gh.pr_checks.assert_not_awaited()
+        finally:
+            orch._global_dispatch_sem.release()  # noqa: SLF001
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        gh.pr_checks.assert_awaited_once_with(42, repo="org/repo")
     finally:
         await conn.close()
 
