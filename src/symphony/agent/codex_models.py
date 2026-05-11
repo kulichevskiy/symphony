@@ -15,6 +15,11 @@ class CodexModelPricing:
 DEFAULT_CODEX_MODEL = "gpt-5.1-codex"
 
 CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, CodexModelPricing] = {
+    "gpt-5.5": CodexModelPricing(
+        input_usd_per_million_tokens=5.0,
+        cached_input_usd_per_million_tokens=0.5,
+        output_usd_per_million_tokens=30.0,
+    ),
     "gpt-5.1-codex": CodexModelPricing(
         input_usd_per_million_tokens=1.25,
         cached_input_usd_per_million_tokens=0.125,

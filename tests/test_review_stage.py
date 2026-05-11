@@ -382,10 +382,12 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
 
         assert runner.captured_spec is not None
         assert runner.captured_spec.stage == "review"
-        assert runner.captured_spec.command[:5] == [
+        assert runner.captured_spec.command[:7] == [
             "codex",
             "exec",
             "--json",
+            "--sandbox",
+            "workspace-write",
             "--model",
             "gpt-5.1-codex-max",
         ]
@@ -1135,10 +1137,12 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
         "fix this",
         codex_model="gpt-5.1-codex-max",
     )
-    assert argv[:5] == [
+    assert argv[:7] == [
         "codex",
         "exec",
         "--json",
+        "--sandbox",
+        "workspace-write",
         "--model",
         "gpt-5.1-codex-max",
     ]
@@ -1151,7 +1155,15 @@ def test_build_fix_runner_command_passes_configured_codex_model() -> None:
         "fix this",
         codex_model="gpt-5.1-codex-max",
     )
-    assert argv[:5] == ["codex", "exec", "--json", "--model", "gpt-5.1-codex-max"]
+    assert argv[:7] == [
+        "codex",
+        "exec",
+        "--json",
+        "--sandbox",
+        "workspace-write",
+        "--model",
+        "gpt-5.1-codex-max",
+    ]
     assert argv[-1] == "fix this"
 
 

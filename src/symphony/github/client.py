@@ -84,6 +84,19 @@ class GitHub:
         cwd: Path | None = None,
         allow_exit_codes: tuple[int, ...] = (0,),
     ) -> str:
+        stdout, stderr, returncode = await self._run_capture(argv, cwd=cwd)
+        if returncode not in allow_exit_codes:
+            raise GitHubError(
+                f"gh {' '.join(argv)} exited {returncode}: {stderr.strip() or stdout.strip()}"
+            )
+        return stdout
+
+    async def _run_capture(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path | None = None,
+    ) -> tuple[str, str, int]:
         env = {**os.environ, **self._extra_env}
         if self._token is not None:
             # `gh` splits auth by host: GH_TOKEN for github.com / *.ghe.com,
@@ -106,11 +119,7 @@ class GitHub:
         stdout_b, stderr_b = await proc.communicate()
         stdout = stdout_b.decode(errors="replace")
         stderr = stderr_b.decode(errors="replace")
-        if proc.returncode not in allow_exit_codes:
-            raise GitHubError(
-                f"gh {' '.join(argv)} exited {proc.returncode}: {stderr.strip() or stdout.strip()}"
-            )
-        return stdout
+        return stdout, stderr, proc.returncode if proc.returncode is not None else -1
 
     async def _run_json(
         self,
@@ -229,8 +238,23 @@ class GitHub:
             "--json",
             "name,state,bucket,link",
         ]
-        # gh exits 8 when checks are still pending but still emits valid JSON.
-        data = await self._run_json(argv, allow_exit_codes=(0, 8))
+        stdout, stderr, returncode = await self._run_capture(argv)
+        # `gh pr checks --required` exits 1 when the branch has no reported
+        # checks at all. That is equivalent to an empty required-check list,
+        # not a transient GitHub failure.
+        output = f"{stderr}\n{stdout}".casefold()
+        if returncode == 1 and "no checks reported" in output:
+            return PRChecks()
+        if returncode not in (0, 8):
+            raise GitHubError(
+                f"gh {' '.join(argv)} exited {returncode}: {stderr.strip() or stdout.strip()}"
+            )
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError as e:
+            raise GitHubError(
+                f"could not parse gh output as JSON: {e}; output={stdout[:200]!r}"
+            ) from e
         if not isinstance(data, list):
             raise GitHubError(f"pr checks: expected array, got {type(data).__name__}")
         runs: list[CheckRun] = []

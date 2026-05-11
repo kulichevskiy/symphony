@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from symphony.linear import queries
 from symphony.linear.client import Linear
 
 
@@ -57,3 +58,8 @@ async def test_comments_since_paginates_all_matching_comments() -> None:
 
     assert [c.id for c in comments] == ["c1", "c2"]
     assert [call["cursor"] for call in calls] == [None, "cursor-1"]
+
+
+def test_comments_since_uses_linear_filter_timestamp_type() -> None:
+    assert "$after: DateTimeOrDuration!" in queries.ISSUE_COMMENTS_SINCE
+    assert "$after: DateTime!" not in queries.ISSUE_COMMENTS_SINCE

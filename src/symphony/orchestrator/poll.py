@@ -161,7 +161,16 @@ def build_runner_command(
         command.append(prompt)
         return command
     if agent == "codex":
-        return ["codex", "exec", "--json", "--model", codex_model, prompt]
+        return [
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "--model",
+            codex_model,
+            prompt,
+        ]
     raise ValueError(f"unknown agent {agent!r}")
 
 

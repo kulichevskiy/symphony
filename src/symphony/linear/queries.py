@@ -5,8 +5,9 @@ Verified against Linear's introspectable schema (see iteration 7 of
 
 - `$id: String!` accepts both UUIDs and identifiers ("ENG-123") for `issue`
   and `issueUpdate`. `commentCreate.input.issueId` requires the UUID form.
-- `$after: DateTime!` is non-null. Passing nullable `DateTime` is rejected
-  by the server.
+- `$after: DateTimeOrDuration!` is non-null. Linear's current comment
+  filter schema rejects `DateTime!` even when the value is an absolute
+  RFC3339 timestamp.
 """
 
 LOOKUP_ISSUE = """
@@ -64,7 +65,7 @@ query IssuesInState($team: String!, $stateName: String!) {
 """
 
 ISSUE_COMMENTS_SINCE = """
-query IssueComments($id: String!, $after: DateTime!, $cursor: String) {
+query IssueComments($id: String!, $after: DateTimeOrDuration!, $cursor: String) {
   issue(id: $id) {
     comments(
       first: 50,

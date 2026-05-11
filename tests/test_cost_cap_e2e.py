@@ -510,10 +510,12 @@ async def test_codex_token_usage_estimates_cost_for_cap(tmp_path: Path) -> None:
         await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
 
         assert runner.captured_spec is not None
-        assert runner.captured_spec.command[:5] == [
+        assert runner.captured_spec.command[:7] == [
             "codex",
             "exec",
             "--json",
+            "--sandbox",
+            "workspace-write",
             "--model",
             "gpt-5.1-codex",
         ]

@@ -221,6 +221,16 @@ async def test_all_passed_true_when_no_checks_configured(fake_gh) -> None:  # ty
     assert result.pending is False
 
 
+async def test_pr_checks_treats_no_checks_reported_as_empty(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    fake_gh({"pr checks": [1, "no checks reported on the 'feature' branch"]})
+    gh = GitHub()
+    result = await gh.pr_checks(15, repo="org/r")
+    assert result.runs == []
+    assert result.all_passed is True
+    assert result.any_failed is False
+    assert result.pending is False
+
+
 async def test_check_log_tail_fetches_run_log_from_check_link(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"run view": [0, "line 1\nline 2\n"]})
     gh = GitHub()
