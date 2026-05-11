@@ -1731,6 +1731,7 @@ class Orchestrator:
                 self._conn,
                 issue_id=candidate.issue_id,
                 stage="merge",
+                started_at_gte=candidate.created_at,
             )
             if latest_merge is not None and latest_merge.status == "completed":
                 await self._poll_submitted_merge(

@@ -342,6 +342,56 @@ async def test_issue_prs_scopes_candidates_to_current_pr_cycle(
 
 
 @pytest.mark.asyncio
+async def test_latest_for_issue_stage_can_scope_to_current_cycle(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="old-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        assert (
+            await db.runs.latest_for_issue_stage(
+                conn,
+                issue_id="iss-1",
+                stage="merge",
+                started_at_gte="2026-05-10T01:00:00+00:00",
+            )
+            is None
+        )
+
+        await db.runs.create(
+            conn,
+            id="new-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T01:01:00+00:00",
+        )
+        latest = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="merge",
+            started_at_gte="2026-05-10T01:00:00+00:00",
+        )
+        assert latest is not None
+        assert latest.id == "new-merge"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_comment_cursor_advance(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

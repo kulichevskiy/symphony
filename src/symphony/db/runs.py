@@ -340,17 +340,27 @@ async def history_for_issue(
 
 
 async def latest_for_issue_stage(
-    conn: aiosqlite.Connection, *, issue_id: str, stage: str
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    stage: str,
+    started_at_gte: str | None = None,
 ) -> Run | None:
+    started_filter = "" if started_at_gte is None else " AND started_at >= ?"
+    params = (
+        (issue_id, stage)
+        if started_at_gte is None
+        else (issue_id, stage, started_at_gte)
+    )
     cur = await conn.execute(
-        """
+        f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
         FROM runs
-        WHERE issue_id = ? AND stage = ?
+        WHERE issue_id = ? AND stage = ?{started_filter}
         ORDER BY started_at DESC
         LIMIT 1
         """,
-        (issue_id, stage),
+        params,
     )
     row = await cur.fetchone()
     if row is None:

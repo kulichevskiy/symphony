@@ -607,6 +607,15 @@ async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
     try:
         await _seed_review_candidate(conn)
         await db.runs.update_status(conn, "review", "running")
+        await db.runs.create(
+            conn,
+            id="old-submitted-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T00:00:00+00:00",
+        )
         runner = _BlockingRunner()
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
