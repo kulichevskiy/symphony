@@ -422,18 +422,73 @@ async def test_red_ci_defers_signature_until_fix_run_succeeds(
             await asyncio.wait_for(runner.started.wait(), timeout=1)
 
             state = await db.review_state.get(conn, "iss-1")
-            assert state.iteration == 1
+            assert state.iteration == 0
             assert state.last_trigger_signature == ""
 
             runner.release.set()
             await asyncio.gather(*tasks)
 
             state = await db.review_state.get(conn, "iss-1")
+            assert state.iteration == 1
             assert state.last_trigger_signature == "ci:head-sha:lint"
         finally:
             runner.release.set()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_workspace_failure_does_not_consume_iteration(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(side_effect=RuntimeError("workspace busy"))
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="lint", state="FAILURE", bucket="fail", link=None)]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        await _poll_review_and_wait(orch)
+
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 0
+        assert state.last_trigger_signature == ""
+        assert runner.captured_spec is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        assert monitor.status == "failed"
     finally:
         await conn.close()
 

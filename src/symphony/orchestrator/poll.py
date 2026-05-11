@@ -619,7 +619,7 @@ class Orchestrator:
             )
             return
 
-        iteration = await db.review_state.bump_iteration(self._conn, issue.id)
+        iteration = state.iteration + 1
         dispatched = await self._dispatch_ci_fix_run(
             run=run,
             binding=binding,
@@ -629,6 +629,7 @@ class Orchestrator:
             iteration=iteration,
         )
         if dispatched:
+            await db.review_state.bump_iteration(self._conn, issue.id)
             await db.review_state.set_signature(
                 self._conn, issue.id, verdict.trigger_signature
             )
