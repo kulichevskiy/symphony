@@ -35,7 +35,7 @@ import aiosqlite
 
 from .. import db
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
-from ..agent.process import parse_event_line
+from ..agent.process import Usage, parse_event_line
 from ..agent.prompt import implement_prompt, merge_prompt, review_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.local import LocalRunner
@@ -87,6 +87,41 @@ BindingKey = tuple[str, str, str]
 CI_FETCH_FAILURE_LIMIT = 5
 
 
+@dataclass
+class _UsageCostEstimator:
+    agent: str
+    codex_model: str
+    last_estimated_input_tokens: int = 0
+    last_estimated_cached_input_tokens: int = 0
+    last_estimated_output_tokens: int = 0
+
+    def delta(self, usage: Usage) -> float:
+        if self.agent != "codex" or usage.cost_usd > 0:
+            return usage.cost_usd
+        input_delta = max(usage.input_tokens - self.last_estimated_input_tokens, 0)
+        cached_input_delta = max(
+            usage.cached_input_tokens - self.last_estimated_cached_input_tokens,
+            0,
+        )
+        output_delta = max(usage.output_tokens - self.last_estimated_output_tokens, 0)
+        self.last_estimated_input_tokens = max(
+            self.last_estimated_input_tokens, usage.input_tokens
+        )
+        self.last_estimated_cached_input_tokens = max(
+            self.last_estimated_cached_input_tokens,
+            usage.cached_input_tokens,
+        )
+        self.last_estimated_output_tokens = max(
+            self.last_estimated_output_tokens, usage.output_tokens
+        )
+        return estimate_codex_cost_usd(
+            input_tokens=input_delta,
+            cached_input_tokens=cached_input_delta,
+            output_tokens=output_delta,
+            model=self.codex_model,
+        )
+
+
 @dataclass(frozen=True)
 class WebhookDispatchResult:
     kind: str
@@ -130,7 +165,12 @@ def build_runner_command(
     raise ValueError(f"unknown agent {agent!r}")
 
 
-def build_fix_runner_command(agent: str, prompt: str) -> list[str]:
+def build_fix_runner_command(
+    agent: str,
+    prompt: str,
+    *,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+) -> list[str]:
     """argv for a Review-stage fix-run.
 
     Fix-runs go through the binding's CLI (claude or codex), NOT through
@@ -138,7 +178,7 @@ def build_fix_runner_command(agent: str, prompt: str) -> list[str]:
     comments; the binding's `agent` field is what drives code changes
     in response to its feedback.
     """
-    return build_runner_command(agent, prompt)
+    return build_runner_command(agent, prompt, codex_model=codex_model)
 
 
 def build_merge_runner_command(
@@ -2756,9 +2796,10 @@ class Orchestrator:
         final_kind = "exit"
         final_returncode: int | None = None
         cap_breached = False
-        last_estimated_input_tokens = 0
-        last_estimated_cached_input_tokens = 0
-        last_estimated_output_tokens = 0
+        cost_estimator = _UsageCostEstimator(
+            agent=binding.agent,
+            codex_model=binding.codex_model,
+        )
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -2769,36 +2810,7 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
-                            cost_delta = usage.cost_usd
-                            if binding.agent == "codex" and cost_delta <= 0:
-                                input_delta = max(
-                                    usage.input_tokens - last_estimated_input_tokens, 0
-                                )
-                                cached_input_delta = max(
-                                    usage.cached_input_tokens
-                                    - last_estimated_cached_input_tokens,
-                                    0,
-                                )
-                                output_delta = max(
-                                    usage.output_tokens - last_estimated_output_tokens,
-                                    0,
-                                )
-                                last_estimated_input_tokens = max(
-                                    last_estimated_input_tokens, usage.input_tokens
-                                )
-                                last_estimated_cached_input_tokens = max(
-                                    last_estimated_cached_input_tokens,
-                                    usage.cached_input_tokens,
-                                )
-                                last_estimated_output_tokens = max(
-                                    last_estimated_output_tokens, usage.output_tokens
-                                )
-                                cost_delta = estimate_codex_cost_usd(
-                                    input_tokens=input_delta,
-                                    cached_input_tokens=cached_input_delta,
-                                    output_tokens=output_delta,
-                                    model=binding.codex_model,
-                                )
+                            cost_delta = cost_estimator.delta(usage)
                             previous_total = prior_total + cumulative_cost
                             cumulative_cost += cost_delta
                             new_total = prior_total + cumulative_cost
@@ -2841,12 +2853,18 @@ class Orchestrator:
         workspace_path: Path,
         prompt: str,
     ) -> tuple[float, str, int | None]:
-        command = build_fix_runner_command(binding.agent, prompt)
+        command = build_fix_runner_command(
+            binding.agent,
+            prompt,
+            codex_model=binding.codex_model,
+        )
         return await self._run_runner(
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
             stage="review",
+            agent=binding.agent,
+            codex_model=binding.codex_model,
         )
 
     async def _run_runner(
@@ -2856,6 +2874,8 @@ class Orchestrator:
         workspace_path: Path,
         command: list[str],
         stage: str,
+        agent: str,
+        codex_model: str = DEFAULT_CODEX_MODEL,
         clear_pid_on_finish: bool = False,
     ) -> tuple[float, str, int | None]:
         spec = RunnerSpec(
@@ -2872,6 +2892,7 @@ class Orchestrator:
         cumulative_cost = 0.0
         final_kind = "exit"
         final_returncode: int | None = None
+        cost_estimator = _UsageCostEstimator(agent=agent, codex_model=codex_model)
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -2882,7 +2903,7 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
-                            cumulative_cost += usage.cost_usd
+                            cumulative_cost += cost_estimator.delta(usage)
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
