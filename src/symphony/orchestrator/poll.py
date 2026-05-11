@@ -30,6 +30,7 @@ from pathlib import Path
 import aiosqlite
 
 from .. import db
+from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.process import parse_event_line
 from ..agent.prompt import implement_prompt
 from ..agent.runner import Runner, RunnerSpec
@@ -39,7 +40,21 @@ from ..github.client import GitHub, GitHubError
 from ..linear import slash
 from ..linear.client import Linear, LinearError, LinearIssue
 from ..linear.slash import SlashIntent, SlashKind
-from ..linear.templates import CommentVars, run_started, stage_done, truncate_body
+from ..linear.templates import (
+    CommentVars,
+    cost_cap_reached,
+    cost_warning,
+    resumed,
+    run_started,
+    stage_done,
+    truncate_body,
+)
+from ..pipeline.cost_guard import (
+    effective_cap,
+    effective_warning_pct,
+    estimate_codex_cost_usd,
+    evaluate_cost,
+)
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
 
@@ -60,19 +75,28 @@ def build_pr_body(issue: LinearIssue) -> str:
     return f"Relates to {issue.url}"
 
 
-def build_runner_command(agent: str, prompt: str) -> list[str]:
+def build_runner_command(
+    agent: str,
+    prompt: str,
+    *,
+    max_budget_usd: float | None = None,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+) -> list[str]:
     """Per-runner argv for the Implement stage prompt."""
     if agent == "claude":
-        return [
+        command = [
             "claude",
             "--print",
             "--output-format",
             "stream-json",
             "--verbose",
-            prompt,
         ]
+        if max_budget_usd is not None:
+            command.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
+        command.append(prompt)
+        return command
     if agent == "codex":
-        return ["codex", "exec", "--json", prompt]
+        return ["codex", "exec", "--json", "--model", codex_model, prompt]
     raise ValueError(f"unknown agent {agent!r}")
 
 
@@ -177,6 +201,8 @@ class Orchestrator:
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
+        self._operator_wait_run_ids: set[str] = set()
+        self._cost_cap_run_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
@@ -230,6 +256,7 @@ class Orchestrator:
 
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
+        await self._restore_operator_waits()
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
         try:
@@ -246,9 +273,13 @@ class Orchestrator:
         boundary set, which both (a) avoids re-firing handled commands across
         restarts and (b) avoids losing comments tied at the boundary timestamp.
         """
+        await self._restore_operator_waits()
         pairs = list(self._dispatch_run_ids.items())
         for issue_id, run_id in pairs:
-            if run_id not in self._active_run_ids:
+            if (
+                run_id not in self._active_run_ids
+                and run_id not in self._operator_wait_run_ids
+            ):
                 continue
             try:
                 after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
@@ -315,6 +346,9 @@ class Orchestrator:
     async def _handle_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
+        if run_id in self._cost_cap_run_bindings:
+            await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
+            return
         if intent.kind is SlashKind.STOP:
             log.info(
                 "/stop received for run %s (issue %s) — terminating runner",
@@ -332,6 +366,116 @@ class Orchestrator:
             intent.kind,
             run_id,
         )
+
+    async def _handle_cost_cap_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._cost_cap_run_bindings.get(run_id)
+        if binding is None:
+            return
+
+        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
+            states = await self._states_for_binding(binding)
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                log.warning(
+                    "could not resume cost-capped run %s: missing ready state %r",
+                    run_id,
+                    binding.linear_states.ready,
+                )
+                return
+            await self.linear.move_issue(issue_id, ready_id)
+            body = resumed(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    next_stage=binding.linear_states.ready,
+                )
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "cost-cap resume comment failed for issue %s: %s", issue_id, e
+                )
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            states = await self._states_for_binding(binding)
+            blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is not None:
+                await self.linear.move_issue(issue_id, blocked_id)
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        log.info(
+            "slash %s received for cost-capped run %s (ignored)",
+            intent.kind,
+            run_id,
+        )
+
+    async def _restore_operator_waits(self) -> None:
+        waits = await db.operator_waits.list_all(self._conn)
+        for wait in waits:
+            if wait.kind != db.operator_waits.KIND_COST_CAP:
+                log.warning(
+                    "ignoring unsupported operator wait kind %r for issue %s",
+                    wait.kind,
+                    wait.issue_id,
+                )
+                continue
+            binding = self._binding_for_operator_wait(wait)
+            if binding is None:
+                log.warning(
+                    "cannot restore operator wait for issue %s: no binding for %s/%s label=%r",
+                    wait.issue_id,
+                    wait.linear_team_key,
+                    wait.github_repo,
+                    wait.issue_label,
+                )
+                continue
+            self._dispatch_run_ids[wait.issue_id] = wait.run_id
+            self._operator_wait_run_ids.add(wait.run_id)
+            self._cost_cap_run_bindings[wait.run_id] = binding
+
+    def _binding_for_operator_wait(
+        self, wait: db.operator_waits.OperatorWait
+    ) -> RepoBinding | None:
+        for binding in self.config.repos:
+            if (
+                binding.linear_team_key == wait.linear_team_key
+                and binding.github_repo == wait.github_repo
+                and (binding.issue_label or "") == wait.issue_label
+            ):
+                return binding
+        return None
+
+    async def _track_operator_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._cost_cap_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_COST_CAP,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
+        if self._dispatch_run_ids.get(issue_id) == run_id:
+            self._dispatch_run_ids.pop(issue_id, None)
+        self._operator_wait_run_ids.discard(run_id)
+        self._cost_cap_run_bindings.pop(run_id, None)
+        await db.operator_waits.delete(self._conn, issue_id, run_id)
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
@@ -395,6 +539,8 @@ class Orchestrator:
         for issue in issues:
             if issue.id in self._scheduled_issue_ids:
                 continue
+            if issue.id in self._dispatch_run_ids:
+                continue
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 continue
             scheduled.append(self._schedule_dispatch(binding, issue))
@@ -440,8 +586,10 @@ class Orchestrator:
             await self._mark_cancelled_dispatch(issue)
             raise
         finally:
-            run_id = self._dispatch_run_ids.pop(issue.id, None)
+            run_id = self._dispatch_run_ids.get(issue.id)
             if run_id is not None:
+                if run_id not in self._operator_wait_run_ids:
+                    self._dispatch_run_ids.pop(issue.id, None)
                 self._runs_moved_to_in_progress.discard(run_id)
 
     async def _mark_cancelled_dispatch(self, issue: LinearIssue) -> None:
@@ -637,12 +785,17 @@ class Orchestrator:
             )
             return run_id
 
+        prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+
         try:
-            cumulative_cost, final_kind, final_returncode = await self._run_agent(
-                binding=binding,
-                issue=issue,
-                run_id=run_id,
-                workspace_path=workspace_path,
+            cumulative_cost, final_kind, final_returncode, cap_breached = (
+                await self._run_agent(
+                    binding=binding,
+                    issue=issue,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                    prior_total=prior_total,
+                )
             )
         except Exception as e:  # noqa: BLE001 — surface as failed run
             log.exception("agent execution failed for %s", issue.identifier)
@@ -663,6 +816,16 @@ class Orchestrator:
                 (cumulative_cost, run_id),
             )
             await self._conn.commit()
+
+        # Cost cap breach: park the issue for operator action; do not open a PR.
+        if cap_breached:
+            await self._handle_cap_breach(
+                binding=binding,
+                issue=issue,
+                run_id=run_id,
+                cumulative_total=prior_total + cumulative_cost,
+            )
+            return run_id
 
         transition = on_runner_event(
             stage="implement",
@@ -818,16 +981,47 @@ class Orchestrator:
         issue: LinearIssue,
         run_id: str,
         workspace_path: Path,
-    ) -> tuple[float, str, int | None]:
+        prior_total: float,
+    ) -> tuple[float, str, int | None, bool]:
         """Spawn the runner and consume events. Returns
-        (cumulative_cost, final_event_kind, final_returncode).
+        (cumulative_cost, final_event_kind, final_returncode, cap_breached).
+
+        After every cost-emitting event the cumulative *issue* total
+        (prior runs + this run so far) is checked against the cap and
+        warning threshold. The once-per-issue cost-warning comment is
+        posted the first time the threshold is crossed; on cap breach the
+        runner is killed and the loop exits with `cap_breached=True` so
+        the caller can park the issue at `needs_approval`.
         """
+        cap_usd = effective_cap(
+            global_cap_usd=self.config.cost_cap_per_issue_usd,
+            binding_override=binding.cost_cap_usd,
+        )
+        warning_pct = effective_warning_pct(
+            global_pct=self.config.cost_warning_pct,
+            binding_override=binding.cost_warning_pct,
+        )
+        warning_already_fired = (
+            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+        )
+
+        max_budget_usd: float | None = None
+        if cap_usd > 0:
+            max_budget_usd = cap_usd - prior_total
+            if max_budget_usd <= 0:
+                return 0.0, "cost_cap", None, True
+
         prompt = implement_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
             labels=list(issue.labels),
         )
-        command = build_runner_command(binding.agent, prompt)
+        command = build_runner_command(
+            binding.agent,
+            prompt,
+            max_budget_usd=max_budget_usd,
+            codex_model=binding.codex_model,
+        )
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
@@ -842,6 +1036,10 @@ class Orchestrator:
         cumulative_cost = 0.0
         final_kind = "exit"
         final_returncode: int | None = None
+        cap_breached = False
+        last_estimated_input_tokens = 0
+        last_estimated_cached_input_tokens = 0
+        last_estimated_output_tokens = 0
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
@@ -852,7 +1050,59 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
-                            cumulative_cost += usage.cost_usd
+                            cost_delta = usage.cost_usd
+                            if binding.agent == "codex" and cost_delta <= 0:
+                                input_delta = max(
+                                    usage.input_tokens - last_estimated_input_tokens, 0
+                                )
+                                cached_input_delta = max(
+                                    usage.cached_input_tokens
+                                    - last_estimated_cached_input_tokens,
+                                    0,
+                                )
+                                output_delta = max(
+                                    usage.output_tokens - last_estimated_output_tokens,
+                                    0,
+                                )
+                                last_estimated_input_tokens = max(
+                                    last_estimated_input_tokens, usage.input_tokens
+                                )
+                                last_estimated_cached_input_tokens = max(
+                                    last_estimated_cached_input_tokens,
+                                    usage.cached_input_tokens,
+                                )
+                                last_estimated_output_tokens = max(
+                                    last_estimated_output_tokens, usage.output_tokens
+                                )
+                                cost_delta = estimate_codex_cost_usd(
+                                    input_tokens=input_delta,
+                                    cached_input_tokens=cached_input_delta,
+                                    output_tokens=output_delta,
+                                    model=binding.codex_model,
+                                )
+                            previous_total = prior_total + cumulative_cost
+                            cumulative_cost += cost_delta
+                            new_total = prior_total + cumulative_cost
+                            if cap_breached:
+                                continue
+                            decision = evaluate_cost(
+                                previous_total=previous_total,
+                                new_total=new_total,
+                                cap_usd=cap_usd,
+                                warning_pct=warning_pct,
+                                warning_already_fired=warning_already_fired,
+                            )
+                            if decision.fire_warning:
+                                warning_already_fired = await self._post_cost_warning(
+                                    binding=binding,
+                                    issue=issue,
+                                    run_id=run_id,
+                                    cumulative_total=new_total,
+                                    cap_usd=cap_usd,
+                                )
+                            if decision.cap_breached:
+                                cap_breached = True
+                                await self._kill_active_runner(run_id)
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
@@ -861,7 +1111,120 @@ class Orchestrator:
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        return cumulative_cost, final_kind, final_returncode
+        return cumulative_cost, final_kind, final_returncode, cap_breached
+
+    async def _post_cost_warning(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        cumulative_total: float,
+        cap_usd: float,
+    ) -> bool:
+        pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
+        body = cost_warning(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                cost=f"${cumulative_total:.4f}",
+                pct=pct,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("cost_warning comment failed on %s: %s", issue.identifier, e)
+            return False
+        await db.cost_marks.mark_warning_posted(
+            self._conn, issue.id, datetime.now(UTC).isoformat()
+        )
+        return True
+
+    async def _handle_cap_breach(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        cumulative_total: float,
+    ) -> None:
+        """Park a cost-capped issue and post a cost-cap escalation."""
+        try:
+            try:
+                states = await self._states_for_binding(binding)
+            except LinearError as e:
+                log.warning(
+                    "could not load states for %s after cap breach on %s: %s",
+                    binding.linear_team_key,
+                    issue.identifier,
+                    e,
+                )
+                states = {}
+            needs_approval_id = states.get(binding.linear_states.needs_approval)
+            blocked_id = states.get(binding.linear_states.blocked)
+            parked = False
+            if needs_approval_id is not None:
+                try:
+                    await self.linear.move_issue(issue.id, needs_approval_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to needs_approval after cap breach: %s",
+                        issue.identifier,
+                        e,
+                    )
+                else:
+                    parked = True
+            else:
+                log.warning(
+                    "no needs_approval state for team %s; cannot park %s",
+                    binding.linear_team_key,
+                    issue.identifier,
+                )
+            if not parked and blocked_id is not None:
+                try:
+                    await self.linear.move_issue(issue.id, blocked_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to blocked after cap breach: %s",
+                        issue.identifier,
+                        e,
+                    )
+                else:
+                    parked = True
+            if not parked and blocked_id is None:
+                log.warning(
+                    "no blocked state for team %s; leaving %s out of the ready queue "
+                    "after cap breach",
+                    binding.linear_team_key,
+                    issue.identifier,
+                )
+            body = cost_cap_reached(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    cost=f"${cumulative_total:.4f}",
+                    trigger="cost_cap",
+                )
+            )
+            try:
+                await self.linear.post_comment(issue.id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "cost_cap_reached comment failed on %s: %s", issue.identifier, e
+                )
+            await self._track_operator_wait(issue.id, run_id, binding)
+        finally:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "failed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
 
     async def _fail_run(self, run_id: str, _reason: str) -> None:
         await db.runs.update_status(
