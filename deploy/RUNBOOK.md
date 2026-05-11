@@ -10,7 +10,7 @@ Run as `root` on a fresh Ubuntu 24.04 host:
 
 ```bash
 apt-get update
-apt-get install -y ca-certificates curl git gnupg jq nodejs npm openssh-client python3 rsync sudo wget
+apt-get install -y ca-certificates curl git gnupg jq nodejs npm openssh-client python3 rsync sqlite3 sudo wget
 adduser --disabled-password --gecos "" symphony
 usermod -aG sudo symphony
 install -d -o symphony -g symphony -m 0755 /opt/symphonyd
@@ -133,13 +133,26 @@ Run as `root`:
 
 ```bash
 cp /opt/symphonyd/deploy/systemd/symphonyd.service /etc/systemd/system/symphonyd.service
+cp /opt/symphonyd/deploy/systemd/symphonyd-maintenance.service /etc/systemd/system/symphonyd-maintenance.service
+cp /opt/symphonyd/deploy/systemd/symphonyd-maintenance.timer /etc/systemd/system/symphonyd-maintenance.timer
 systemctl daemon-reload
 systemctl enable --now symphonyd.service
+systemctl enable --now symphonyd-maintenance.timer
 systemctl status symphonyd.service --no-pager
+systemctl list-timers symphonyd-maintenance.timer --no-pager
 journalctl -u symphonyd.service -f
 ```
 
 The unit must show a webhook listener on `127.0.0.1:8787` when `LINEAR_WEBHOOK_SECRET` is set. It must never listen on `0.0.0.0`.
+
+The maintenance timer runs daily. It reads `db_path` and `log_root` from `/opt/symphonyd/config.yaml`, creates online-safe SQLite backups next to the DB using `sqlite3 .backup`, keeps the 7 newest backups by default, and prunes `*.log` files older than 14 days by default. Override the defaults by editing `SYMPHONYD_BACKUP_KEEP` and `SYMPHONYD_LOG_RETENTION_DAYS` in `/etc/systemd/system/symphonyd-maintenance.service`, then run `systemctl daemon-reload`.
+
+To run maintenance immediately:
+
+```bash
+systemctl start symphonyd-maintenance.service
+journalctl -u symphonyd-maintenance.service -n 50 --no-pager
+```
 
 ## 5. Set up Cloudflare Tunnel
 
@@ -207,8 +220,10 @@ Common commands:
 ```bash
 systemctl restart symphonyd.service
 systemctl restart cloudflared.service
+systemctl start symphonyd-maintenance.service
 journalctl -u symphonyd.service -n 200 --no-pager
 journalctl -u cloudflared.service -n 200 --no-pager
+journalctl -u symphonyd-maintenance.service -n 50 --no-pager
 sudo -iu symphony -- sh -lc 'cd /opt/symphonyd && .venv/bin/symphony --config /opt/symphonyd/config.yaml --once'
 ```
 
