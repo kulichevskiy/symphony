@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from symphony.github.client import GitHub, GitHubError, PRChecks
+from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 
 
 def _make_fake_gh(
@@ -219,6 +219,27 @@ async def test_all_passed_true_when_no_checks_configured(fake_gh) -> None:  # ty
     assert result.all_passed is True
     assert result.any_failed is False
     assert result.pending is False
+
+
+async def test_check_log_tail_fetches_job_log_from_check_link(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"run view": [0, "line 1\nline 2\n"]})
+    gh = GitHub()
+    tail = await gh.check_log_tail(
+        CheckRun(
+            name="unit",
+            state="FAILURE",
+            bucket="fail",
+            link="https://github.com/org/r/actions/runs/123/jobs/456",
+        ),
+        repo="org/r",
+    )
+    assert tail == "line 1\nline 2\n"
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:2] == ["run", "view"]
+    assert "--job" in argv and argv[argv.index("--job") + 1] == "456"
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
+    assert "--log-failed" in argv
 
 
 # ---- pr_merge -------------------------------------------------------

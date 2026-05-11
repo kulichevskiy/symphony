@@ -31,15 +31,34 @@ import aiosqlite
 
 from .. import db
 from ..agent.process import parse_event_line
-from ..agent.prompt import implement_prompt
+from ..agent.prompt import implement_prompt, review_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
-from ..github.client import GitHub, GitHubError
+from ..github.client import CheckRun as GitHubCheckRun
+from ..github.client import GitHub, GitHubError, PRChecks
 from ..linear import slash
 from ..linear.client import Linear, LinearError, LinearIssue
 from ..linear.slash import SlashIntent, SlashKind
-from ..linear.templates import CommentVars, run_started, stage_done, truncate_body
+from ..linear.templates import (
+    CommentVars,
+    failed,
+    run_started,
+    stage_done,
+    stuck_loop_escape,
+    truncate_body,
+)
+from ..pipeline.review_classifier import (
+    CheckRun as ReviewCheckRun,
+)
+from ..pipeline.review_classifier import (
+    ReviewSnapshot,
+    Verdict,
+    VerdictKind,
+    has_hit_iteration_cap,
+    review_classifier,
+    should_dispatch_fix_run,
+)
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
 
@@ -47,6 +66,7 @@ log = logging.getLogger(__name__)
 
 PushFn = Callable[[Path, str], Awaitable[None]]
 BindingKey = tuple[str, str, str]
+CI_FETCH_FAILURE_LIMIT = 5
 
 
 def build_pr_title(issue: LinearIssue) -> str:
@@ -143,6 +163,41 @@ async def _default_push(workspace_path: Path, branch: str) -> None:
         )
 
 
+def _review_check_from_gh(run: GitHubCheckRun) -> ReviewCheckRun:
+    bucket = run.bucket.lower()
+    state = run.state.lower()
+    status = (
+        "completed"
+        if bucket in {"pass", "fail", "cancel", "skipping"}
+        else "in_progress"
+    )
+    conclusion_by_bucket = {
+        "pass": "success",
+        "fail": "failure",
+        "cancel": "cancelled",
+        "skipping": "skipped",
+    }
+    conclusion = conclusion_by_bucket.get(bucket)
+    if conclusion is None and status == "completed":
+        conclusion = state or None
+    return ReviewCheckRun(
+        name=run.name,
+        status=status,
+        conclusion=conclusion,
+        required=True,
+    )
+
+
+def _pr_url_for_state(
+    *, repo: str, pr_number: int | None, pr_url: str
+) -> str:
+    if pr_url:
+        return pr_url
+    if pr_number is not None:
+        return f"https://github.com/{repo}/pull/{pr_number}"
+    return "(no PR)"
+
+
 class Orchestrator:
     """Owns the poll loop. Dedupe is a SQLite query over the `runs` table."""
 
@@ -230,6 +285,10 @@ class Orchestrator:
 
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
+        try:
+            await self._poll_review_runs()
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("review poll failed")
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
         try:
@@ -355,6 +414,355 @@ class Orchestrator:
             await self._runner.kill(run_id)
         except Exception:
             log.exception("failed to kill runner for run_id=%s", run_id)
+
+    async def _poll_review_runs(self) -> None:
+        """Poll CI for each active Review monitor row.
+
+        Review uses a live `runs` row as the durable stage monitor. Local
+        fix-runs reuse that row's run id while the runner is active; the row
+        remains `running` after a successful fix so the next tick can keep
+        polling the same PR.
+        """
+        for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
+            if run.id in self._active_run_ids:
+                continue
+            try:
+                issue = await self.linear.lookup_issue(run.issue_id)
+            except LinearError as e:
+                log.warning("could not resolve issue for review run %s: %s", run.id, e)
+                continue
+            binding = self._binding_for_issue(issue)
+            if binding is None:
+                log.warning(
+                    "no repo binding found for active review run %s (%s)",
+                    run.id,
+                    issue.identifier,
+                )
+                continue
+            await self._poll_review_run(run, binding, issue)
+
+    def _binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
+        for binding in self.config.repos:
+            if binding.linear_team_key != issue.team_key:
+                continue
+            if binding.issue_label and binding.issue_label not in issue.labels:
+                continue
+            return binding
+        return None
+
+    async def _poll_review_run(
+        self,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> None:
+        state = await db.review_state.get(self._conn, issue.id)
+        if state.pr_number is None:
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error="review run has no PR number",
+                last_log="",
+            )
+            return
+
+        try:
+            checks = await self._gh.pr_checks(state.pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            failures = await db.review_state.bump_ci_fetch_failures(
+                self._conn, issue.id
+            )
+            log.warning(
+                "gh pr checks failed for %s#%d (%d/%d): %s",
+                binding.github_repo,
+                state.pr_number,
+                failures,
+                CI_FETCH_FAILURE_LIMIT,
+                e,
+            )
+            if failures >= CI_FETCH_FAILURE_LIMIT:
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=(
+                        "gh pr checks failed "
+                        f"{failures} consecutive times: {e}"
+                    ),
+                    last_log=str(e),
+                )
+            return
+
+        await db.review_state.reset_ci_fetch_failures(self._conn, issue.id)
+
+        try:
+            head_sha = await self._gh.head_sha(
+                state.pr_number, repo=binding.github_repo
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR head for %s#%d: %s",
+                binding.github_repo,
+                state.pr_number,
+                e,
+            )
+            head_sha = "unknown-head"
+
+        verdict = review_classifier(
+            comments=[],
+            ci=[_review_check_from_gh(c) for c in checks.runs],
+            snapshot=ReviewSnapshot(head_sha=head_sha, head_committed_at=""),
+        )
+        if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
+            return
+        if verdict.rule != "failing_ci":
+            return
+        if not should_dispatch_fix_run(
+            prev_signature=state.last_trigger_signature,
+            new_signature=verdict.trigger_signature,
+        ):
+            return
+        if has_hit_iteration_cap(
+            iteration=state.iteration, cap=self.config.review_iteration_cap
+        ):
+            await self._park_review_for_approval(
+                run=run,
+                binding=binding,
+                issue=issue,
+                trigger=verdict.trigger_signature,
+            )
+            return
+
+        iteration = await db.review_state.bump_iteration(self._conn, issue.id)
+        await db.review_state.set_signature(
+            self._conn, issue.id, verdict.trigger_signature
+        )
+        await self._dispatch_ci_fix_run(
+            run=run,
+            binding=binding,
+            issue=issue,
+            checks=checks,
+            verdict=verdict,
+            iteration=iteration,
+        )
+
+    async def _dispatch_ci_fix_run(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        checks: PRChecks,
+        verdict: Verdict,
+        iteration: int,
+    ) -> None:
+        log_tail = await self._failing_check_log_tail(
+            checks=checks,
+            verdict=verdict,
+            repo=binding.github_repo,
+        )
+        trigger = (
+            f"Failing required CI checks: {', '.join(verdict.failing_checks)}\n"
+            f"Trigger signature: {verdict.trigger_signature}\n"
+            f"Review iteration: {iteration}/{self.config.review_iteration_cap}"
+        )
+        prompt = review_fix_prompt(
+            issue_title=issue.title,
+            issue_body=issue.description,
+            labels=list(issue.labels),
+            trigger=trigger,
+            failing_check_log_tail=log_tail,
+        )
+
+        try:
+            workspace_path = await self._workspace.acquire(binding, issue)
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "workspace acquire failed for review fix-run %s", issue.identifier
+            )
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"workspace acquire failed: {e}",
+                last_log=str(e),
+            )
+            return
+
+        try:
+            cost, final_kind, final_returncode = await self._run_fix_agent(
+                binding=binding,
+                run_id=run.id,
+                workspace_path=workspace_path,
+                prompt=prompt,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("review fix-run execution failed for %s", issue.identifier)
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"review fix-run execution failed: {e}",
+                last_log=str(e),
+            )
+            return
+        finally:
+            self._workspace.release(binding, issue)
+
+        if cost > 0:
+            await db.runs.add_cost(self._conn, run.id, cost)
+
+        transition = on_runner_event(
+            stage="review",
+            event_kind=final_kind,
+            returncode=final_returncode,
+        )
+        if transition.next_run_status != "completed":
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"review fix-run ended with {final_kind}",
+                last_log="",
+            )
+            return
+
+        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        try:
+            await self._push_fn(workspace_path, branch)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "git push failed for review fix-run %s: %s", issue.identifier, e
+            )
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"push failed: {e}",
+                last_log=str(e),
+            )
+            return
+
+        state = await db.review_state.get(self._conn, issue.id)
+        if state.pr_number is not None:
+            try:
+                await self._gh.pr_comment(
+                    state.pr_number,
+                    "@codex review",
+                    repo=binding.github_repo,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not re-trigger @codex review on %s#%d: %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    e,
+                )
+
+    async def _failing_check_log_tail(
+        self,
+        *,
+        checks: PRChecks,
+        verdict: Verdict,
+        repo: str,
+    ) -> str:
+        failing_names = set(verdict.failing_checks)
+        sections: list[str] = []
+        for check in checks.runs:
+            if check.name not in failing_names:
+                continue
+            try:
+                tail = await self._gh.check_log_tail(check, repo=repo)
+            except GitHubError as e:
+                tail = f"(could not fetch failing-check log: {e})"
+            if not tail:
+                suffix = f"; see {check.link}" if check.link else ""
+                tail = f"(no failing-check log excerpt available{suffix})"
+            sections.append(f"## {check.name}\n\n{tail}")
+        return "\n\n".join(sections)
+
+    async def _fail_review_run(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        error: str,
+        last_log: str,
+    ) -> None:
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            "failed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+        state = await db.review_state.get(self._conn, issue.id)
+        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        body = failed(
+            CommentVars(
+                stage="review",
+                repo=binding.github_repo,
+                issue=0,
+                pr_url=_pr_url_for_state(
+                    repo=binding.github_repo,
+                    pr_number=state.pr_number,
+                    pr_url=state.pr_url,
+                ),
+                run_id=run.id,
+                cost=f"${cost:.4f}",
+                error=error,
+                last_log=last_log,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("review failed comment failed on %s: %s", issue.identifier, e)
+
+    async def _park_review_for_approval(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        trigger: str,
+    ) -> None:
+        state = await db.review_state.get(self._conn, issue.id)
+        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        body = stuck_loop_escape(
+            CommentVars(
+                stage="review",
+                repo=binding.github_repo,
+                issue=0,
+                pr_url=_pr_url_for_state(
+                    repo=binding.github_repo,
+                    pr_number=state.pr_number,
+                    pr_url=state.pr_url,
+                ),
+                run_id=run.id,
+                cost=f"${cost:.4f}",
+                review_iter=state.iteration,
+                trigger=trigger,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("stuck-loop comment failed on %s: %s", issue.identifier, e)
+        try:
+            states = await self._states_for_binding(binding)
+            needs_approval_id = states.get(binding.linear_states.needs_approval)
+            if needs_approval_id is not None:
+                await self.linear.move_issue(issue.id, needs_approval_id)
+        except LinearError as e:
+            log.warning("could not park %s for approval: %s", issue.identifier, e)
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            "completed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
 
     async def _scan_binding(
         self, binding: RepoBinding
@@ -770,14 +1178,19 @@ class Orchestrator:
         issue: LinearIssue,
         pr_url: str,
     ) -> str | None:
-        """Post `@codex review` and record a completed review handoff row.
+        """Post `@codex review` and record a live Review monitor row.
 
         Idempotent in spirit: failure to post the bot ping does not block
         the run row from being created, but is logged loudly so an
         operator can re-ping with a slash command if needed.
         """
-        await db.review_state.reset(self._conn, issue.id)
         pr_number = pr_number_from_url(pr_url)
+        await db.review_state.begin_review(
+            self._conn,
+            issue.id,
+            pr_number=pr_number,
+            pr_url=pr_url,
+        )
         if pr_number is None:
             log.warning(
                 "could not parse PR number from %r for %s — skipping @codex review",
@@ -805,7 +1218,7 @@ class Orchestrator:
             id=review_run_id,
             issue_id=issue.id,
             stage="review",
-            status="completed",
+            status="running",
             pid=None,
             started_at=datetime.now(UTC).isoformat(),
         )
@@ -828,12 +1241,45 @@ class Orchestrator:
             labels=list(issue.labels),
         )
         command = build_runner_command(binding.agent, prompt)
+        return await self._run_runner(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            stage="implement",
+        )
+
+    async def _run_fix_agent(
+        self,
+        *,
+        binding: RepoBinding,
+        run_id: str,
+        workspace_path: Path,
+        prompt: str,
+    ) -> tuple[float, str, int | None]:
+        command = build_fix_runner_command(binding.agent, prompt)
+        return await self._run_runner(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            stage="review",
+            clear_pid_on_finish=True,
+        )
+
+    async def _run_runner(
+        self,
+        *,
+        run_id: str,
+        workspace_path: Path,
+        command: list[str],
+        stage: str,
+        clear_pid_on_finish: bool = False,
+    ) -> tuple[float, str, int | None]:
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
             stall_secs=self.config.stall_timeout_secs,
-            stage="implement",
+            stage=stage,
         )
 
         log_path = self.config.log_root / f"{run_id}.log"
@@ -861,6 +1307,8 @@ class Orchestrator:
                         break
         finally:
             self._active_run_ids.discard(run_id)
+            if clear_pid_on_finish:
+                await db.runs.update_pid(self._conn, run_id, None)
         return cumulative_cost, final_kind, final_returncode
 
     async def _fail_run(self, run_id: str, _reason: str) -> None:

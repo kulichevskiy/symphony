@@ -23,6 +23,7 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
+from symphony.github.client import CheckRun, GitHub, PRChecks
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import (
     Orchestrator,
@@ -68,6 +69,21 @@ def _issue() -> LinearIssue:
         state_id="state-todo",
         state_name="Todo",
         state_type="unstarted",
+        team_key="ENG",
+        labels=["feature"],
+    )
+
+
+def _issue_in_progress() -> LinearIssue:
+    return LinearIssue(
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        description="Need OAuth.",
+        url="https://linear.app/team/issue/ENG-1",
+        state_id="state-progress",
+        state_name="In Progress",
+        state_type="started",
         team_key="ENG",
         labels=["feature"],
     )
@@ -158,14 +174,274 @@ async def test_implement_success_posts_codex_review_and_records_review_handoff(
             f"but got {gh.pr_comment.await_args_list!r}"
         )
 
-        # A review-stage handoff row exists for this issue, but it is not
-        # live because no local review worker was spawned.
+        # A review-stage monitor row exists for this issue. It remains live
+        # so later ticks can poll CI and review signals.
         history = await db.runs.history_for_issue(conn, "iss-1")
         stages = [r.stage for r in history]
         assert "review" in stages
         review_runs = [r for r in history if r.stage == "review"]
-        assert review_runs[0].status == "completed"
-        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+        assert review_runs[0].status == "running"
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is True
+    finally:
+        await conn.close()
+
+
+# --- CI red-check fix-runs -------------------------------------------------
+
+
+async def _seed_active_review(
+    conn,
+    *,
+    run_id: str = "review-run",
+    failures: int = 0,
+    signature: str = "",
+) -> None:  # type: ignore[no-untyped-def]
+    await db.issues.upsert(
+        conn,
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        team_key="ENG",
+    )
+    await db.review_state.begin_review(
+        conn,
+        "iss-1",
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+    )
+    for _ in range(failures):
+        await db.review_state.bump_ci_fetch_failures(conn, "iss-1")
+    if signature:
+        await db.review_state.set_signature(conn, "iss-1", signature)
+    await db.runs.create(
+        conn,
+        id=run_id,
+        issue_id="iss-1",
+        stage="review",
+        status="running",
+        pid=None,
+        started_at="2026-05-10T00:00:00+00:00",
+    )
+
+
+@pytest.mark.asyncio
+async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding(agent="codex")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [
+                    CheckRun(
+                        name="lint",
+                        state="FAILURE",
+                        bucket="fail",
+                        link="https://github.com/org/repo/actions/runs/1/jobs/2",
+                    )
+                ]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.check_log_tail = AsyncMock(return_value="ruff found a lint failure")
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [
+                RunnerEvent(kind="started", pid=999),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "total_cost_usd": 0.2,
+                        }
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._poll_review_runs()  # noqa: SLF001
+
+        assert runner.captured_spec is not None
+        assert runner.captured_spec.stage == "review"
+        assert runner.captured_spec.command[0] == "codex"
+        prompt = runner.captured_spec.command[-1]
+        assert prompt.startswith("# Failing check log tail")
+        assert "ruff found a lint failure" in prompt
+        assert "Failing required CI checks: lint" in prompt
+
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
+
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 1
+        assert state.last_trigger_signature == "ci:head-sha:lint"
+        assert state.ci_fetch_failures == 0
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "running"
+        assert history[0].pid is None
+        assert history[0].cost_usd == pytest.approx(0.2)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_dedup_skips_identical_back_to_back_fix_run(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, signature="ci:head-sha:lint")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="lint", state="FAILURE", bucket="fail", link=None)]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.check_log_tail = AsyncMock()
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        await orch._poll_review_runs()  # noqa: SLF001
+
+        assert runner.captured_spec is None
+        gh.check_log_tail.assert_not_awaited()
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pr_checks_success_resets_persisted_fetch_failure_counter(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, failures=4)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+
+        await orch._poll_review_runs()  # noqa: SLF001
+
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.ci_fetch_failures == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_five_consecutive_pr_checks_failures_fail_review_run(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, failures=4)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh_shim = tmp_path / "gh"
+        gh_shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stderr.write('network down\\n')\n"
+            "sys.exit(1)\n"
+        )
+        gh_shim.chmod(0o755)
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=GitHub(gh_path=str(gh_shim)),
+        )
+
+        await orch._poll_review_runs()  # noqa: SLF001
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "failed"
+        posted = linear.post_comment.await_args.args[1]
+        assert "gh pr checks failed 5 consecutive times" in posted
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.ci_fetch_failures == 5
     finally:
         await conn.close()
 
