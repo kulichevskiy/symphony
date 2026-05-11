@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-
 import aiosqlite
 
 
@@ -31,22 +29,6 @@ async def claim(
     )
     await conn.commit()
     return (cur.rowcount or 0) > 0
-
-
-async def mark_many(
-    conn: aiosqlite.Connection,
-    *,
-    issue_id: str,
-    comments: Iterable[tuple[str, str]],
-) -> None:
-    await conn.executemany(
-        """
-        INSERT OR IGNORE INTO comment_events (comment_id, issue_id, seen_at)
-        VALUES (?, ?, ?)
-        """,
-        [(comment_id, issue_id, seen_at) for comment_id, seen_at in comments],
-    )
-    await conn.commit()
 
 
 async def forget(conn: aiosqlite.Connection, comment_id: str) -> None:

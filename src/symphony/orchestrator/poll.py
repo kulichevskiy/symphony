@@ -362,12 +362,20 @@ class Orchestrator:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
             fresh: list[LinearComment] = []
+            claimed_comment_ids: list[str] = []
             for comment in comments:
                 if comment.id in seen_ids:
                     continue
-                if await db.comment_events.seen(self._conn, comment.id):
+                claimed = await db.comment_events.claim(
+                    self._conn,
+                    issue_id=issue_id,
+                    comment_id=comment.id,
+                    seen_at=comment.created_at,
+                )
+                if not claimed:
                     continue
                 fresh.append(comment)
+                claimed_comment_ids.append(comment.id)
             if not fresh:
                 continue
             fresh_with_times = [(c, _parse_rfc3339(c.created_at)) for c in fresh]
@@ -381,8 +389,12 @@ class Orchestrator:
             # known IDs so we keep deduping any we already handled.
             if latest_dt == after:
                 latest_ids |= seen_ids
-            await self._handle_slash_comments(issue_id, run_id, fresh)
-            await self._record_seen_comments(issue_id, fresh)
+            try:
+                await self._handle_slash_comments(issue_id, run_id, fresh)
+            except Exception:
+                for comment_id in claimed_comment_ids:
+                    await db.comment_events.forget(self._conn, comment_id)
+                raise
             await self._advance_comment_cursor(issue_id, latest, latest_ids)
 
     async def _handle_slash_comments(
@@ -390,15 +402,6 @@ class Orchestrator:
     ) -> None:
         for intent in slash.parse(comments):
             await self._handle_slash_intent(issue_id, run_id, intent)
-
-    async def _record_seen_comments(
-        self, issue_id: str, comments: list[LinearComment]
-    ) -> None:
-        await db.comment_events.mark_many(
-            self._conn,
-            issue_id=issue_id,
-            comments=((comment.id, comment.created_at) for comment in comments),
-        )
 
     async def _advance_comment_cursor(
         self, issue_id: str, latest: str, latest_ids: set[str]
