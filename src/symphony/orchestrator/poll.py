@@ -350,7 +350,7 @@ class Orchestrator:
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
         try:
-            await self._poll_merge_candidates()
+            scheduled.extend(await self._poll_merge_candidates())
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("merge candidate poll failed")
         try:
@@ -639,8 +639,9 @@ class Orchestrator:
                 return binding
         return None
 
-    async def _poll_merge_candidates(self) -> None:
+    async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""
+        scheduled: list[asyncio.Task[None]] = []
         candidates = await db.issue_prs.list_merge_candidates(self._conn)
         for candidate in candidates:
             binding = self._binding_for_pr(candidate)
@@ -650,6 +651,8 @@ class Orchestrator:
                     candidate.identifier,
                     candidate.github_repo,
                 )
+                continue
+            if candidate.issue_id in self._scheduled_issue_ids:
                 continue
             if await db.runs.has_active(self._conn, candidate.issue_id):
                 continue
@@ -691,11 +694,22 @@ class Orchestrator:
                 continue
 
             if verdict.kind is VerdictKind.APPROVED:
-                await self._merge_approved_pr(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=candidate.pr_number,
-                    pr_url=candidate.pr_url,
+                if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
+                    continue
+                binding_key = _binding_key(binding)
+                if (
+                    len(self._scheduled_issue_ids) >= self.config.global_max_concurrent
+                    or self._scheduled_binding_counts.get(binding_key, 0)
+                    >= binding.max_concurrent
+                ):
+                    continue
+                scheduled.append(
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                    )
                 )
             elif verdict.merge_conflict:
                 await self._mark_merge_needs_approval(
@@ -706,6 +720,66 @@ class Orchestrator:
                     reason="merge conflict against base",
                     create_run=True,
                 )
+        return scheduled
+
+    def _schedule_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> asyncio.Task[None]:
+        binding_key = _binding_key(binding)
+        self._scheduled_issue_ids.add(issue.id)
+        self._scheduled_binding_counts[binding_key] = (
+            self._scheduled_binding_counts.get(binding_key, 0) + 1
+        )
+        task = asyncio.create_task(
+            self._merge_with_limits(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
+        )
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(
+            partial(
+                self._dispatch_task_done,
+                issue_id=issue.id,
+                binding_key=binding_key,
+            )
+        )
+        return task
+
+    async def _merge_with_limits(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> None:
+        key = _binding_key(binding)
+        binding_sem = self._binding_dispatch_sems.setdefault(
+            key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        try:
+            async with self._global_dispatch_sem:
+                async with binding_sem:
+                    await self._merge_approved_pr(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
+        except asyncio.CancelledError:
+            run_id = self._dispatch_run_ids.get(issue.id)
+            if run_id is not None:
+                await self._fail_run(run_id, "merge cancelled")
+            raise
 
     async def _review_verdict_for_pr(
         self,
@@ -1266,46 +1340,57 @@ class Orchestrator:
             if not inserted:
                 return
 
-        states = await self._states_for_binding(binding)
-        needs_approval_id = states.get(binding.linear_states.needs_approval)
-        total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
-        body = awaiting_approval(
-            CommentVars(
-                stage="merge",
-                next_stage="done",
-                repo=binding.github_repo,
-                issue=0,
-                pr_url=pr_url,
-                run_id=run_id,
-                cost=f"${total_cost:.4f}",
-                error=reason,
-            )
-        )
-        if needs_approval_id is not None:
+        try:
+            needs_approval_id: str | None = None
             try:
-                await self.linear.move_issue(issue.id, needs_approval_id)
+                states = await self._states_for_binding(binding)
+                needs_approval_id = states.get(binding.linear_states.needs_approval)
             except LinearError as e:
                 log.warning(
-                    "could not move %s to needs approval after merge failure: %s",
+                    "could not load states while parking %s in needs approval: %s",
                     issue.identifier,
                     e,
                 )
-        else:
-            log.warning(
-                "missing Linear state %r for %s after merge failure",
-                binding.linear_states.needs_approval,
-                issue.identifier,
+
+            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            body = awaiting_approval(
+                CommentVars(
+                    stage="merge",
+                    next_stage="done",
+                    repo=binding.github_repo,
+                    issue=0,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    cost=f"${total_cost:.4f}",
+                    error=reason,
+                )
             )
-        try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning("needs approval comment failed on %s: %s", issue.identifier, e)
-        await db.runs.update_status(
-            self._conn,
-            run_id,
-            "needs_approval",
-            ended_at=datetime.now(UTC).isoformat(),
-        )
+            if needs_approval_id is not None:
+                try:
+                    await self.linear.move_issue(issue.id, needs_approval_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to needs approval after merge failure: %s",
+                        issue.identifier,
+                        e,
+                    )
+            else:
+                log.warning(
+                    "missing Linear state %r for %s after merge failure",
+                    binding.linear_states.needs_approval,
+                    issue.identifier,
+                )
+            try:
+                await self.linear.post_comment(issue.id, truncate_body(body))
+            except LinearError as e:
+                log.warning("needs approval comment failed on %s: %s", issue.identifier, e)
+        finally:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "needs_approval",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
 
     async def _start_review_stage(
         self,
