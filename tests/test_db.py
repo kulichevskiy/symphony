@@ -253,6 +253,80 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_issue_prs_scopes_candidates_to_current_pr_cycle(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="old-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="old-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="done",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=43,
+            pr_url="https://github.com/org/repo/pull/43",
+            created_at="2026-05-10T01:00:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        await db.runs.create(
+            conn,
+            id="new-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T01:01:00+00:00",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 43
+
+        await db.runs.create(
+            conn,
+            id="new-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T01:02:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_comment_cursor_advance(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
