@@ -184,6 +184,21 @@ def _binding_storage_key(binding: RepoBinding) -> str:
     return json.dumps(_binding_key(binding), separators=(",", ":"))
 
 
+def _binding_label_from_storage_key(binding_key: str) -> str | None:
+    if not binding_key:
+        return None
+    try:
+        raw = json.loads(binding_key)
+    except ValueError:
+        return None
+    if not isinstance(raw, list) or len(raw) < 3:
+        return None
+    label = raw[2]
+    if label is None:
+        return ""
+    return str(label)
+
+
 def _parse_rfc3339(s: str) -> datetime:
     """Linear timestamps end in `Z`; Python's `fromisoformat` accepts the
     `+00:00` form. Normalize before parsing."""
@@ -933,17 +948,31 @@ class Orchestrator:
             log.exception("dispatch task crashed for issue_id=%s", issue_id)
 
     def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None:
+        stored_label = _binding_label_from_storage_key(candidate.binding_key)
         if candidate.binding_key:
             for binding in self.config.repos:
                 if _binding_storage_key(binding) == candidate.binding_key:
                     return binding
 
-        for binding in self.config.repos:
+        matches = [
+            binding
+            for binding in self.config.repos
             if (
                 binding.linear_team_key == candidate.team_key
                 and binding.github_repo == candidate.github_repo
-            ):
-                return binding
+            )
+        ]
+        if stored_label is not None:
+            labeled_matches = [
+                binding
+                for binding in matches
+                if (binding.issue_label or "") == stored_label
+            ]
+            if len(labeled_matches) == 1:
+                return labeled_matches[0]
+            return None
+        if len(matches) == 1:
+            return matches[0]
         return None
 
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:

@@ -295,6 +295,90 @@ async def test_merge_candidate_falls_back_when_recorded_binding_key_is_stale(
 
 
 @pytest.mark.asyncio
+async def test_stale_binding_key_fallback_uses_recorded_label(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(
+            conn,
+            binding_key='["ENG","org/repo","backend","legacy"]',
+        )
+        target = _binding(
+            agent="codex",
+            issue_label="backend",
+            branch_prefix="backend",
+        )
+        cfg = Config(
+            repos=[
+                _binding(
+                    agent="claude",
+                    issue_label="frontend",
+                    branch_prefix="frontend",
+                ),
+                target,
+            ],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        candidate = (await db.issue_prs.list_merge_candidates(conn))[0]
+
+        assert orch._binding_for_pr(candidate) == target  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_binding_fallback_returns_none(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn, binding_key="old-shape:backend")
+        cfg = Config(
+            repos=[
+                _binding(
+                    agent="claude",
+                    issue_label="frontend",
+                    branch_prefix="frontend",
+                ),
+                _binding(
+                    agent="codex",
+                    issue_label="backend",
+                    branch_prefix="backend",
+                ),
+            ],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        candidate = (await db.issue_prs.list_merge_candidates(conn))[0]
+
+        assert orch._binding_for_pr(candidate) is None  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
