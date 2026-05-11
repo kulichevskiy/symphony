@@ -127,6 +127,25 @@ def test_parses_codex_command_and_file_activity(tmp_path: Path) -> None:
         file_path="tests/test_activity.py",
     )
 
+    multi_changes_line = _line(
+        "item.completed",
+        {
+            "id": "file-3",
+            "type": "file_change",
+            "changes": [
+                {"path": str(workspace / "src/one.py")},
+                {"path": str(workspace / "src/two.py")},
+            ],
+        },
+    )
+    multi_changes_event = parse_codex_activity_line(multi_changes_line, workspace)
+    assert multi_changes_event == ActivityEvent(
+        kind="file_changed",
+        item_id="file-3",
+        file_path="src/one.py",
+        file_paths=("src/one.py", "src/two.py"),
+    )
+
     legacy_line = _line(
         "item.started",
         {
@@ -274,7 +293,12 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
         now + timedelta(seconds=10),
     )
     session.record_event(
-        ActivityEvent(kind="file_changed", item_id="file-1", file_path="src/app.py"),
+        ActivityEvent(
+            kind="file_changed",
+            item_id="file-1",
+            file_path="src/app.py",
+            file_paths=("src/app.py", "tests/test_app.py"),
+        ),
         now + timedelta(seconds=11),
     )
 
@@ -294,6 +318,7 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
     assert "AssertionError: nope" in body
     assert "third line omitted" not in body
     assert "src/app.py" in body
+    assert "tests/test_app.py" in body
     assert str(workspace) not in body
     assert "supersecret" not in body
     assert "$1.2345" in body
@@ -595,5 +620,61 @@ async def test_orchestrator_tick_skips_heartbeat_db_before_candidate(
             cumulative_total=0.0,
         )
         heartbeat_marks.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_tick_caches_heartbeat_marks_between_repeats(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        start = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "workspaces",
+            db_path=tmp_path / "s.sqlite",
+        )
+        clock = _Clock(
+            [
+                start + timedelta(seconds=301),
+                start + timedelta(seconds=302),
+            ]
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, clock=clock)
+        session = ActivitySession(
+            settings=ActivitySettings(long_running_secs=300, long_running_repeat_secs=600),
+            run_id="run-1",
+            stage="implement",
+            workspace_path=tmp_path,
+        )
+        session.record_event(
+            ActivityEvent(kind="command_started", item_id="cmd-1", command="pytest"),
+            start,
+        )
+        heartbeat_marks = AsyncMock(
+            return_value={"cmd-1": "2026-05-11T10:05:00+00:00"}
+        )
+        monkeypatch.setattr(db.activity_comments, "heartbeat_marks", heartbeat_marks)
+
+        await orch._record_activity_tick(  # noqa: SLF001
+            session=session,
+            binding=_binding(),
+            issue=_issue(),
+            cumulative_total=0.0,
+        )
+        await orch._record_activity_tick(  # noqa: SLF001
+            session=session,
+            binding=_binding(),
+            issue=_issue(),
+            cumulative_total=0.0,
+        )
+
+        heartbeat_marks.assert_awaited_once()
+        linear.post_comment.assert_not_awaited()
     finally:
         await conn.close()

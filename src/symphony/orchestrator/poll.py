@@ -2833,19 +2833,19 @@ class Orchestrator:
         now = self._now()
         if not session.has_heartbeat_candidate(now):
             return
-        raw_marks = await db.activity_comments.heartbeat_marks(
-            self._conn,
-            run_id=session.run_id,
-        )
-        marks = {
-            item_id: parsed
-            for item_id, raw in raw_marks.items()
-            if (parsed := _parse_optional_datetime(raw)) is not None
-        }
-        due_item_ids = session.heartbeat_due_item_ids(
-            now,
-            last_heartbeat_at_by_item=marks,
-        )
+        if session.needs_heartbeat_mark_lookup(now):
+            raw_marks = await db.activity_comments.heartbeat_marks(
+                self._conn,
+                run_id=session.run_id,
+            )
+            session.cache_heartbeat_marks(
+                {
+                    item_id: parsed
+                    for item_id, raw in raw_marks.items()
+                    if (parsed := _parse_optional_datetime(raw)) is not None
+                }
+            )
+        due_item_ids = session.heartbeat_due_item_ids(now)
         if not due_item_ids:
             return
         await self._publish_activity_digest(
@@ -2925,6 +2925,7 @@ class Orchestrator:
                 item_id=item_id,
                 posted_at=now.isoformat(),
             )
+        session.mark_heartbeat_posted(heartbeat_item_ids, now)
         session.mark_published()
         return True
 

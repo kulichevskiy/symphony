@@ -47,6 +47,7 @@ class ActivityEvent:
     exit_code: int | None = None
     output_lines: tuple[str, ...] = ()
     file_path: str = ""
+    file_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,8 @@ class ActivitySession:
     completed_command_examples: list[str] = field(default_factory=list)
     failed_commands: list[FailedCommandDigest] = field(default_factory=list)
     changed_files: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    heartbeat_marks_loaded: bool = False
+    last_heartbeat_at_by_item: dict[str, datetime] = field(default_factory=dict)
 
     def record_line(self, line: str, now: datetime) -> bool:
         event = parse_codex_activity_line(line, self.workspace_path)
@@ -153,8 +156,10 @@ class ActivitySession:
                 )
             return
 
-        if event.kind == "file_changed" and event.file_path:
-            self.changed_files[event.file_path] = None
+        if event.kind == "file_changed":
+            paths = event.file_paths or ((event.file_path,) if event.file_path else ())
+            for path in paths:
+                self.changed_files[path] = None
 
     def due_reason(
         self, now: datetime, *, last_posted_at: datetime | None
@@ -176,8 +181,13 @@ class ActivitySession:
         self,
         now: datetime,
         *,
-        last_heartbeat_at_by_item: Mapping[str, datetime],
+        last_heartbeat_at_by_item: Mapping[str, datetime] | None = None,
     ) -> tuple[str, ...]:
+        marks = (
+            self.last_heartbeat_at_by_item
+            if last_heartbeat_at_by_item is None
+            else last_heartbeat_at_by_item
+        )
         due: list[str] = []
         for command in sorted(
             self.active_commands.values(),
@@ -186,7 +196,7 @@ class ActivitySession:
             age = max((now - command.started_at).total_seconds(), 0.0)
             if age < self.settings.long_running_secs:
                 continue
-            last = last_heartbeat_at_by_item.get(command.item_id)
+            last = marks.get(command.item_id)
             if last is None:
                 due.append(command.item_id)
                 continue
@@ -201,6 +211,18 @@ class ActivitySession:
             if age >= self.settings.long_running_secs:
                 return True
         return False
+
+    def needs_heartbeat_mark_lookup(self, now: datetime) -> bool:
+        return self.has_heartbeat_candidate(now) and not self.heartbeat_marks_loaded
+
+    def cache_heartbeat_marks(self, marks: Mapping[str, datetime]) -> None:
+        self.last_heartbeat_at_by_item = dict(marks)
+        self.heartbeat_marks_loaded = True
+
+    def mark_heartbeat_posted(self, item_ids: Sequence[str], posted_at: datetime) -> None:
+        self.heartbeat_marks_loaded = True
+        for item_id in item_ids:
+            self.last_heartbeat_at_by_item[item_id] = posted_at
 
     def has_unpublished_events(self) -> bool:
         return self.pending_event_count > 0
@@ -344,13 +366,14 @@ def _file_activity_event(
     item: Mapping[str, object],
     workspace_path: Path,
 ) -> ActivityEvent | None:
-    path = _extract_file_path(item, workspace_path)
-    if path is None:
+    paths = _extract_file_paths(item, workspace_path)
+    if not paths:
         return None
     return ActivityEvent(
         kind="file_changed",
-        item_id=_item_id(raw, item, fallback=path),
-        file_path=path,
+        item_id=_item_id(raw, item, fallback=paths[0]),
+        file_path=paths[0],
+        file_paths=paths if len(paths) > 1 else (),
     )
 
 
@@ -440,32 +463,30 @@ def _output_value_to_lines(value: object, workspace_path: Path) -> list[str]:
     return out
 
 
-def _extract_file_path(item: Mapping[str, object], workspace_path: Path) -> str | None:
+def _extract_file_paths(item: Mapping[str, object], workspace_path: Path) -> tuple[str, ...]:
+    paths: OrderedDict[str, None] = OrderedDict()
+
+    def add(raw_path: object) -> None:
+        if not isinstance(raw_path, str):
+            return
+        normalized = normalize_workspace_path(raw_path, workspace_path)
+        if normalized is not None:
+            paths[normalized] = None
+
     for key in ("path", "file_path", "file"):
-        value = item.get(key)
-        if isinstance(value, str):
-            normalized = normalize_workspace_path(value, workspace_path)
-            if normalized is not None:
-                return normalized
+        add(item.get(key))
     for key in ("files", "paths"):
         value = item.get(key)
         if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
             for entry in value:
-                if isinstance(entry, str):
-                    normalized = normalize_workspace_path(entry, workspace_path)
-                    if normalized is not None:
-                        return normalized
+                add(entry)
     changes = item.get("changes")
     if isinstance(changes, Sequence) and not isinstance(changes, (bytes, bytearray, str)):
         for change in changes:
             if not isinstance(change, Mapping):
                 continue
-            value = change.get("path")
-            if isinstance(value, str):
-                normalized = normalize_workspace_path(value, workspace_path)
-                if normalized is not None:
-                    return normalized
-    return None
+            add(change.get("path"))
+    return tuple(paths.keys())
 
 
 def normalize_workspace_path(raw_path: str, workspace_path: Path) -> str | None:
