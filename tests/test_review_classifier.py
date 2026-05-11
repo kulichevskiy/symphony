@@ -21,6 +21,11 @@ helper fires at the configured cap.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from symphony.pipeline.review_classifier import (
@@ -303,6 +308,75 @@ def test_trigger_signature_stable_across_runs() -> None:
     a = review_classifier(comments=[], ci=ci, snapshot=_snap())
     b = review_classifier(comments=[], ci=ci, snapshot=_snap())
     assert a.trigger_signature == b.trigger_signature
+
+
+def _signatures_from_child(hash_seed: str) -> list[str]:
+    env = os.environ.copy()
+    env["PYTHONHASHSEED"] = hash_seed
+    code = textwrap.dedent(
+        """
+        from symphony.pipeline.review_classifier import (
+            CODEX_BOT_LOGIN,
+            Review,
+            ReviewComment,
+            ReviewSnapshot,
+            review_classifier,
+        )
+
+        head_sha = "deadbeef"
+        later = "2025-01-01T13:00:00Z"
+        snapshot = ReviewSnapshot(
+            head_sha=head_sha,
+            head_committed_at="2025-01-01T12:00:00Z",
+            mergeable="MERGEABLE",
+        )
+        inline = review_classifier(
+            comments=[
+                ReviewComment(
+                    user_login=CODEX_BOT_LOGIN,
+                    body="Consider extracting this into a helper.",
+                    commit_sha=head_sha,
+                    created_at=later,
+                    path="src/foo.py",
+                    line=42,
+                )
+            ],
+            ci=[],
+            snapshot=snapshot,
+        ).trigger_signature
+        review_body = "These are detailed feedback notes. " * 30
+        review = review_classifier(
+            comments=[],
+            ci=[],
+            snapshot=ReviewSnapshot(
+                head_sha=head_sha,
+                head_committed_at="2025-01-01T12:00:00Z",
+                reviews=(
+                    Review(
+                        user_login=CODEX_BOT_LOGIN,
+                        state="COMMENTED",
+                        commit_sha=head_sha,
+                        submitted_at=later,
+                        body=review_body,
+                    ),
+                ),
+                mergeable="MERGEABLE",
+            ),
+        ).trigger_signature
+        print(inline)
+        print(review)
+        """
+    )
+    output = subprocess.check_output(
+        [sys.executable, "-c", code],
+        env=env,
+        text=True,
+    )
+    return output.strip().splitlines()
+
+
+def test_trigger_signature_stable_across_hash_seeds() -> None:
+    assert _signatures_from_child("1") == _signatures_from_child("2")
 
 
 def test_should_dispatch_fix_run_dedupes_identical_signatures() -> None:

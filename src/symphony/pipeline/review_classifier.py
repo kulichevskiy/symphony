@@ -24,6 +24,8 @@ Rules (priority order — first match wins):
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -131,6 +133,15 @@ def _comment_key(c: ReviewComment) -> str:
     return f"{c.commit_sha}|{c.path}|{c.line}|{c.body[:120]}"
 
 
+def _stable_digest(parts: Iterable[str]) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        data = part.encode("utf-8")
+        h.update(f"{len(data)}:".encode("ascii"))
+        h.update(data)
+    return h.hexdigest()[:16]
+
+
 def review_classifier(
     *,
     comments: list[ReviewComment],
@@ -170,9 +181,9 @@ def review_classifier(
     ]
     if codex_on_head:
         keys = sorted(_comment_key(c) for c in codex_on_head)
-        # A short hash keeps the signature compact while still being content-
-        # sensitive enough to dedup identical-trigger pairs.
-        digest = hex(abs(hash(tuple(keys))) & 0xFFFFFFFFFFFFFFFF)
+        # Keep the signature compact while staying stable across interpreter
+        # restarts so persisted dedup state remains meaningful.
+        digest = _stable_digest(keys)
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
             trigger_signature=f"codex_inline:{digest}",
@@ -190,7 +201,7 @@ def review_classifier(
     ]
     if codex_substantive:
         body = codex_substantive[-1].body
-        digest = hex(abs(hash(body)) & 0xFFFFFFFFFFFFFFFF)
+        digest = _stable_digest((body,))
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
             trigger_signature=f"codex_review:{digest}",
