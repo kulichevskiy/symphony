@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
 
 
 def _expand(path: str | Path) -> Path:
@@ -56,12 +58,25 @@ class RepoBinding(BaseModel):
     linear_team_key: str
     github_repo: str
     agent: Literal["claude", "codex"] = "claude"
+    codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None
     branch_prefix: str = "symphony"
     base_branch: str | None = None
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
+    # Per-binding cost knobs. `None` falls back to the global default; an
+    # explicit `0` disables the cap (useful when one team is exempt).
+    cost_cap_usd: float | None = None
+    cost_warning_pct: int | None = None
     linear_states: LinearStates
+
+    @field_validator("codex_model")
+    @classmethod
+    def _known_codex_model(cls, value: str) -> str:
+        if value not in SUPPORTED_CODEX_MODELS:
+            supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
+            raise ValueError(f"unknown Codex model {value!r}; supported: {supported}")
+        return value
 
 
 class Secrets(BaseSettings):
@@ -99,7 +114,8 @@ class Config(BaseModel):
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 6
-    cost_cap_per_issue_usd: float = 5.0
+    cost_cap_per_issue_usd: float = 15.0
+    cost_warning_pct: int = 75
     stall_timeout_secs: int = 300
 
     # Filled in from Secrets.

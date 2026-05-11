@@ -12,7 +12,16 @@ Each table has its own DAO module exposing typed read/write functions:
 
 from __future__ import annotations
 
-from . import comment_cursors, comment_events, issues, review_state, runs, webhook_deliveries
+from . import (
+    comment_cursors,
+    comment_events,
+    cost_marks,
+    issues,
+    operator_waits,
+    review_state,
+    runs,
+    webhook_deliveries,
+)
 from .schema import apply_schema, connect
 
 __all__ = [
@@ -20,7 +29,9 @@ __all__ = [
     "comment_cursors",
     "comment_events",
     "connect",
+    "cost_marks",
     "issues",
+    "operator_waits",
     "review_state",
     "runs",
     "webhook_deliveries",
