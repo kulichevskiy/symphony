@@ -24,7 +24,7 @@ async def test_connect_creates_tables_and_persists(tmp_path: Path) -> None:
     finally:
         await conn.close()
 
-    for table in ("repos", "issues", "runs", "comment_cursors"):
+    for table in ("repos", "issues", "runs", "issue_prs", "comment_cursors"):
         assert table in names, f"expected {table} in {names}"
 
     assert p.exists()
@@ -197,6 +197,48 @@ async def test_runs_cost_aggregation_per_issue(tmp_path: Path) -> None:
             conn, id="iss-3", identifier="ENG-3", title="t", team_key="ENG"
         )
         assert await db.runs.cost_for_issue(conn, "iss-3") == pytest.approx(0.0)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        await db.runs.create(
+            conn,
+            id="review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 42
+        assert candidates[0].github_repo == "org/repo"
+
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            merged_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
         await conn.close()
 

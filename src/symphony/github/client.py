@@ -127,6 +127,18 @@ class GitHub:
     def _repo_args(repo: str | None) -> list[str]:
         return ["--repo", repo] if repo else []
 
+    @staticmethod
+    def _api_repo(repo: str) -> tuple[list[str], str]:
+        parts = repo.split("/")
+        if len(parts) == 3:
+            host, owner, name = parts
+            return ["--hostname", host], f"{owner}/{name}"
+        if len(parts) == 2:
+            return [], repo
+        raise GitHubError(
+            f"invalid repo {repo!r} (expected [HOST/]OWNER/REPO)"
+        )
+
     # ---- high-level ----
 
     async def repo_clone(self, repo: str, dest: Path) -> None:
@@ -231,6 +243,78 @@ class GitHub:
             )
         return PRChecks(runs=runs)
 
+    async def pr_review_comments(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]:
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_json(
+            [
+                "api",
+                *host_args,
+                f"repos/{owner_repo}/pulls/{pr}/comments",
+            ]
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"pull review comments: expected array, got {type(result).__name__}"
+            )
+        return [entry for entry in result if isinstance(entry, dict)]
+
+    async def pr_reviews(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]:
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_json(
+            [
+                "api",
+                *host_args,
+                f"repos/{owner_repo}/pulls/{pr}/reviews",
+            ]
+        )
+        if not isinstance(result, list):
+            raise GitHubError(f"pull reviews: expected array, got {type(result).__name__}")
+        return [entry for entry in result if isinstance(entry, dict)]
+
+    async def pr_reactions(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]:
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_json(
+            [
+                "api",
+                *host_args,
+                "-H",
+                "Accept: application/vnd.github+json",
+                f"repos/{owner_repo}/issues/{pr}/reactions",
+            ]
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"issue reactions: expected array, got {type(result).__name__}"
+            )
+        return [entry for entry in result if isinstance(entry, dict)]
+
+    async def commit_committed_at(self, repo: str, sha: str) -> str:
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_json(
+            [
+                "api",
+                *host_args,
+                f"repos/{owner_repo}/commits/{sha}",
+            ]
+        )
+        if not isinstance(result, dict):
+            raise GitHubError(
+                f"commit view: expected object, got {type(result).__name__}"
+            )
+        commit = result.get("commit")
+        if not isinstance(commit, dict):
+            raise GitHubError("commit view: missing commit object")
+        committer = commit.get("committer")
+        if not isinstance(committer, dict) or not committer.get("date"):
+            raise GitHubError("commit view: missing committer date")
+        return str(committer["date"])
+
     async def pr_merge(
         self,
         pr: int | str,
@@ -259,18 +343,7 @@ class GitHub:
         non-default hosts work; only `OWNER/REPO` is interpolated into the
         API path.
         """
-        parts = repo.split("/")
-        if len(parts) == 3:
-            host, owner, name = parts
-            host_args = ["--hostname", host]
-            owner_repo = f"{owner}/{name}"
-        elif len(parts) == 2:
-            host_args = []
-            owner_repo = repo
-        else:
-            raise GitHubError(
-                f"branch_list: invalid repo {repo!r} (expected [HOST/]OWNER/REPO)"
-            )
+        host_args, owner_repo = self._api_repo(repo)
         argv = [
             "api",
             *host_args,

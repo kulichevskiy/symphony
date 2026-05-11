@@ -8,17 +8,19 @@ Each table has its own DAO module exposing typed read/write functions:
     await db.issues.upsert(conn, ...)
     await db.runs.create(conn, ...)
     await db.comment_cursors.set(conn, ...)
+    await db.issue_prs.upsert(conn, ...)
 """
 
 from __future__ import annotations
 
-from . import comment_cursors, issues, review_state, runs
+from . import comment_cursors, issue_prs, issues, review_state, runs
 from .schema import apply_schema, connect
 
 __all__ = [
     "apply_schema",
     "comment_cursors",
     "connect",
+    "issue_prs",
     "issues",
     "review_state",
     "runs",
