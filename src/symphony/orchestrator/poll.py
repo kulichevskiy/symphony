@@ -1983,11 +1983,12 @@ class Orchestrator:
                 reason = "merge conflict against base"
             elif verdict.rule:
                 reason = f"review readiness regressed: {verdict.rule}"
-            log.info(
-                "submitted merge for %s#%d is not ready yet: %s",
-                binding.github_repo,
-                pr_number,
-                reason,
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=reason,
             )
 
     async def _finalize_pr_if_closed(

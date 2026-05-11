@@ -795,7 +795,9 @@ async def test_auto_merge_submission_waits_until_pr_reports_merged(
 
 
 @pytest.mark.asyncio
-async def test_submitted_merge_regression_stays_pollable(tmp_path: Path) -> None:
+async def test_submitted_merge_regression_moves_to_needs_approval(
+    tmp_path: Path,
+) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_review_candidate(conn)
@@ -846,15 +848,17 @@ async def test_submitted_merge_regression_stays_pollable(tmp_path: Path) -> None
             workspace=MagicMock(),
             push_fn=AsyncMock(),
         )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
 
         await _poll_and_wait(orch)
 
-        linear.move_issue.assert_not_awaited()
-        linear.post_comment.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history[-1].stage == "merge"
-        assert history[-1].status == "completed"
-        assert (await db.issue_prs.list_merge_candidates(conn))[0].pr_number == 42
+        assert history[-1].status == "needs_approval"
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "required CI failed: test" in comment_body
     finally:
         await conn.close()
 
