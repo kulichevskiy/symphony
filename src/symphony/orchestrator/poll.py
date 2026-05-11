@@ -151,6 +151,7 @@ class Orchestrator:
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
+        self._schedule_lock = asyncio.Lock()
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
         self._runs_moved_to_in_progress: set[str] = set()
@@ -298,12 +299,12 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="issue", handled=False, detail="issue is not dispatchable"
             )
-        if self._dispatch_capacity(binding) <= 0:
-            return WebhookDispatchResult(
-                kind="issue", handled=False, detail="dispatch capacity is full"
-            )
         task = await self._schedule_ready_issue(binding, issue)
-        return WebhookDispatchResult(kind="issue", handled=task is not None)
+        return WebhookDispatchResult(
+            kind="issue",
+            handled=task is not None,
+            detail="" if task is not None else "issue is already scheduled or active",
+        )
 
     async def _poll_slash_commands(self) -> None:
         """For each active run, fetch new comments and dispatch slash intents.
@@ -509,11 +510,14 @@ class Orchestrator:
     async def _schedule_ready_issue(
         self, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None] | None:
-        if issue.id in self._scheduled_issue_ids:
-            return None
-        if await db.runs.has_running_or_completed(self._conn, issue.id):
-            return None
-        return self._schedule_dispatch(binding, issue)
+        async with self._schedule_lock:
+            if self._dispatch_capacity(binding) <= 0:
+                return None
+            if issue.id in self._scheduled_issue_ids:
+                return None
+            if await db.runs.has_running_or_completed(self._conn, issue.id):
+                return None
+            return self._schedule_dispatch(binding, issue)
 
     def _ready_binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
         issue_labels = set(issue.labels)

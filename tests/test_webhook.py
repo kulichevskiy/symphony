@@ -338,3 +338,33 @@ async def test_webhook_issue_event_schedules_ready_issue(tmp_path: Path) -> None
         orch._schedule_dispatch.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_ready_issue_schedule_claim_is_atomic(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        orch = _make_orch(cfg, linear, conn)
+        binding = _binding()
+        issue = _issue()
+        release = asyncio.Event()
+
+        async def hold_dispatch(
+            _binding: RepoBinding, _issue: LinearIssue
+        ) -> None:
+            await release.wait()
+
+        orch._dispatch_with_limits = hold_dispatch  # type: ignore[method-assign]  # noqa: SLF001
+
+        first, second = await asyncio.gather(
+            orch._schedule_ready_issue(binding, issue),  # noqa: SLF001
+            orch._schedule_ready_issue(binding, issue),  # noqa: SLF001
+        )
+        release.set()
+        await orch.drain_dispatch_tasks()
+
+        assert sum(task is not None for task in (first, second)) == 1
+    finally:
+        await conn.close()
