@@ -118,7 +118,10 @@ def test_parses_codex_turn_completed_usage() -> None:
         }
     )
     assert parse_event_line(line) == Usage(
-        cost_usd=0.0, input_tokens=2100, output_tokens=550
+        cost_usd=0.0,
+        input_tokens=2100,
+        output_tokens=550,
+        cached_input_tokens=400,
     )
 
 

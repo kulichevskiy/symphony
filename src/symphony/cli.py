@@ -22,6 +22,7 @@ from .config import Config, RepoBinding
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
+from .webhook import WebhookSettings, build_server_config, create_app
 
 
 def _setup_logging() -> None:
@@ -102,10 +103,45 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 await orch._tick()  # pylint: disable=protected-access
                 await orch.drain_dispatch_tasks()
                 return
+            webhook_server: object | None = None
+            webhook_task: asyncio.Task[None] | None = None
+            if cfg.linear_webhook_secret:
+                import uvicorn
+
+                app = create_app(
+                    orch,
+                    conn,
+                    WebhookSettings(
+                        secret=cfg.linear_webhook_secret,
+                        dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
+                        timestamp_tolerance_secs=(
+                            cfg.webhook_timestamp_tolerance_secs
+                        ),
+                    ),
+                )
+                server = uvicorn.Server(
+                    build_server_config(
+                        app,
+                        host=cfg.webhook_host,
+                        port=cfg.webhook_port,
+                    )
+                )
+                webhook_server = server
+                webhook_task = asyncio.create_task(server.serve())
+                logging.getLogger(__name__).info(
+                    "linear webhook receiver listening on %s:%d",
+                    cfg.webhook_host,
+                    cfg.webhook_port,
+                )
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(orch.shutdown()))
-            await orch.run()
+            try:
+                await orch.run()
+            finally:
+                if webhook_server is not None and webhook_task is not None:
+                    webhook_server.should_exit = True  # type: ignore[attr-defined]
+                    await webhook_task
         finally:
             await conn.close()
 

@@ -61,3 +61,12 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE review_state ADD COLUMN issue_label TEXT NOT NULL DEFAULT ''"
         )
+
+    cur = await conn.execute("PRAGMA table_info(webhook_deliveries)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "status" not in cols:
+        await conn.execute(
+            "ALTER TABLE webhook_deliveries "
+            "ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+        )
+        await conn.execute("UPDATE webhook_deliveries SET status = 'handled'")

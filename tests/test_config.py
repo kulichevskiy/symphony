@@ -55,6 +55,39 @@ def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # 
     )
     cfg = Config.load(p)
     assert cfg.repos[0].runner == "local"
+    assert cfg.repos[0].codex_model == "gpt-5.1-codex"
+
+
+def test_codex_model_can_be_configured(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    codex_model: gpt-5.1-codex-max
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].codex_model == "gpt-5.1-codex-max"
+
+
+def test_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    codex_model: future-codex
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Codex model"):
+        Config.load(p)
 
 
 def test_linear_states_ready_has_no_default() -> None:

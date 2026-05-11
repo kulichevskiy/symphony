@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
 
 
 def _expand(path: str | Path) -> Path:
@@ -56,12 +58,25 @@ class RepoBinding(BaseModel):
     linear_team_key: str
     github_repo: str
     agent: Literal["claude", "codex"] = "claude"
+    codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None
     branch_prefix: str = "symphony"
     base_branch: str | None = None
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
+    # Per-binding cost knobs. `None` falls back to the global default; an
+    # explicit `0` disables the cap (useful when one team is exempt).
+    cost_cap_usd: float | None = None
+    cost_warning_pct: int | None = None
     linear_states: LinearStates
+
+    @field_validator("codex_model")
+    @classmethod
+    def _known_codex_model(cls, value: str) -> str:
+        if value not in SUPPORTED_CODEX_MODELS:
+            supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
+            raise ValueError(f"unknown Codex model {value!r}; supported: {supported}")
+        return value
 
 
 class Secrets(BaseSettings):
@@ -78,6 +93,9 @@ class Secrets(BaseSettings):
     )
 
     linear_api_key: str = Field(default="", validation_alias="LINEAR_API_KEY")
+    linear_webhook_secret: str = Field(
+        default="", validation_alias="LINEAR_WEBHOOK_SECRET"
+    )
 
 
 class Config(BaseModel):
@@ -88,22 +106,33 @@ class Config(BaseModel):
     workspace_root: Path = Path("~/symphony/workspaces")
     log_root: Path = Path("~/symphony/logs")
     db_path: Path = Path("~/symphony/state.sqlite")
+    webhook_host: Literal["127.0.0.1"] = "127.0.0.1"
+    webhook_port: int = Field(default=8787, ge=1, le=65535)
+    webhook_dedupe_ttl_secs: int = Field(default=600, ge=1)
+    webhook_timestamp_tolerance_secs: int = Field(default=60, ge=1)
 
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 12
-    cost_cap_per_issue_usd: float = 5.0
+    cost_cap_per_issue_usd: float = 15.0
+    cost_warning_pct: int = 75
     stall_timeout_secs: int = 300
 
     # Filled in from Secrets.
     linear_api_key: str = ""
+    linear_webhook_secret: str = ""
 
     @classmethod
     def load(cls, path: Path) -> Config:
         raw = yaml.safe_load(path.read_text())
         cfg = cls.model_validate(raw)
         secrets = Secrets()
-        cfg = cfg.model_copy(update={"linear_api_key": secrets.linear_api_key})
+        cfg = cfg.model_copy(
+            update={
+                "linear_api_key": secrets.linear_api_key,
+                "linear_webhook_secret": secrets.linear_webhook_secret,
+            }
+        )
         # Expand ~ now so downstream code can assume absolute paths.
         cfg = cfg.model_copy(
             update={

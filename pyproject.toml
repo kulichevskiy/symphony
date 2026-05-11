@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "Headless, Linear-native, multi-repo orchestrator for AI coding agents."
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115",
     "httpx>=0.28",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -11,6 +12,7 @@ dependencies = [
     "structlog>=24.4",
     "pyyaml>=6.0",
     "click>=8.1",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
