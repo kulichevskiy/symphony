@@ -322,6 +322,31 @@ def test_rule_5_human_changes_requested_on_head() -> None:
     assert v.trigger_signature.startswith("human_cr:")
 
 
+def test_rule_5_human_changes_requested_signature_is_scoped_to_head_sha() -> None:
+    def review_for(head_sha: str) -> Verdict:
+        return review_classifier(
+            comments=[],
+            ci=[],
+            snapshot=_snap(
+                head_sha=head_sha,
+                reviews=(
+                    Review(
+                        user_login="alice",
+                        state="CHANGES_REQUESTED",
+                        commit_sha=head_sha,
+                        submitted_at=LATER,
+                    ),
+                ),
+            ),
+        )
+
+    first = review_for("first-head")
+    second = review_for("second-head")
+    assert first.trigger_signature.startswith("human_cr:first-head:")
+    assert second.trigger_signature.startswith("human_cr:second-head:")
+    assert first.trigger_signature != second.trigger_signature
+
+
 def test_rule_5_latest_human_changes_requested_wins_over_prior_approval() -> None:
     reviews = (
         Review(

@@ -257,7 +257,7 @@ def review_classifier(
         logins = sorted({r.user_login for r in human_cr})
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
-            trigger_signature="human_cr:" + ",".join(logins),
+            trigger_signature=f"human_cr:{snapshot.head_sha}:" + ",".join(logins),
             rule="human_changes_requested",
             last_review_body=human_cr[-1].body,
         )
