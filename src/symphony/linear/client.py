@@ -155,13 +155,24 @@ class Linear:
 
     async def comments_since(self, issue_uuid: str, after: datetime) -> list[LinearComment]:
         """Inbound steering source. Caller passes a dedupe cursor."""
-        data = await self._query(
-            queries.ISSUE_COMMENTS_SINCE,
-            {"id": issue_uuid, "after": after.isoformat()},
-        )
-        issue = data.get("issue") or {}
-        nodes = (issue.get("comments") or {}).get("nodes") or []
-        return [LinearComment.from_node(n) for n in nodes]
+        comments: list[LinearComment] = []
+        cursor: str | None = None
+        while True:
+            data = await self._query(
+                queries.ISSUE_COMMENTS_SINCE,
+                {"id": issue_uuid, "after": after.isoformat(), "cursor": cursor},
+            )
+            issue = data.get("issue") or {}
+            connection = issue.get("comments") or {}
+            comments.extend(LinearComment.from_node(n) for n in connection.get("nodes") or [])
+
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
+        return comments
 
     async def post_comment(self, issue_uuid: str, body: str) -> str:
         """Returns the comment id (useful for threading later)."""
