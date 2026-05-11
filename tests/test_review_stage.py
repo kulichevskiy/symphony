@@ -334,9 +334,27 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
                     kind="stdout",
                     line=json.dumps(
                         {
-                            "type": "result",
-                            "subtype": "success",
-                            "total_cost_usd": 0.2,
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 1_000,
+                                    "cached_input_tokens": 100,
+                                    "output_tokens": 500,
+                                }
+                            },
+                        }
+                    ),
+                ),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "turn.completed",
+                            "usage": {
+                                "input_tokens": 1_800,
+                                "cached_input_tokens": 200,
+                                "output_tokens": 900,
+                            },
                         }
                     ),
                 ),
@@ -382,7 +400,7 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert monitor.cost_usd == pytest.approx(0.0)
         assert fix_runs[0].status == "completed"
         assert fix_runs[0].pid == 999
-        assert fix_runs[0].cost_usd == pytest.approx(0.2)
+        assert fix_runs[0].cost_usd == pytest.approx(0.011025)
     finally:
         await conn.close()
 
