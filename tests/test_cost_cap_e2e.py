@@ -646,10 +646,10 @@ async def test_per_binding_cap_overrides_global(tmp_path: Path) -> None:
         await conn.close()
 
 
-def test_default_cost_cap_is_15_usd() -> None:
-    """The acceptance criteria pin the global default to $15."""
+def test_default_cost_cap_is_100_usd() -> None:
+    """The acceptance criteria pin the global default to $100."""
     cfg = Config()
-    assert cfg.cost_cap_per_issue_usd == 15.0
+    assert cfg.cost_cap_per_issue_usd == 100.0
     assert cfg.cost_warning_pct == 75
 
 

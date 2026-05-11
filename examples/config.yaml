@@ -48,4 +48,4 @@ repos:
 
 # Stuck-loop escapes (mirrors today's Symphony defaults).
 review_iteration_cap: 6
-cost_cap_per_issue_usd: 5.0
+cost_cap_per_issue_usd: 100.0
