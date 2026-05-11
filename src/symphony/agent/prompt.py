@@ -1,7 +1,7 @@
 """Per-stage prompt builders.
 
 Pure functions of (issue, binding). One module per stage's prompt makes
-template diffs reviewable; for now Implement is the only one wired.
+template diffs reviewable.
 """
 
 from __future__ import annotations
@@ -69,6 +69,33 @@ def review_fix_prompt(
         "- Make the smallest change that resolves the failing review signal.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n"
+    )
+
+
+def merge_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    pr_url: str,
+) -> str:
+    """Build the prompt for the Merge stage's final local pass."""
+    label_line = ", ".join(labels) if labels else "(no labels)"
+    body = issue_body.strip() if issue_body else "(no description)"
+    return (
+        "You are Symphony's Merge-stage agent.\n"
+        "The PR has passed review and required CI. Do one final local cleanup "
+        "pass before the orchestrator merges it.\n\n"
+        "# Issue\n\n"
+        f"## Title\n{issue_title}\n\n"
+        f"## Labels\n{label_line}\n\n"
+        f"## Description\n{body}\n\n"
+        f"## PR\n{pr_url}\n\n"
+        "# Working agreement\n\n"
+        "- Inspect the current branch for obvious final commit work only.\n"
+        "- If a small final fix is needed, make it and commit it on the current branch.\n"
+        "- If no change is needed, exit successfully without creating a commit.\n"
+        "- Do not merge the PR, push, or edit unrelated files.\n"
     )
 
 

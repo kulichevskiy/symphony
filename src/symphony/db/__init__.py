@@ -8,6 +8,7 @@ Each table has its own DAO module exposing typed read/write functions:
     await db.issues.upsert(conn, ...)
     await db.runs.create(conn, ...)
     await db.comment_cursors.set(conn, ...)
+    await db.issue_prs.upsert(conn, ...)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from . import (
     comment_cursors,
     comment_events,
     cost_marks,
+    issue_prs,
     issues,
     operator_waits,
     review_state,
@@ -30,6 +32,7 @@ __all__ = [
     "comment_events",
     "connect",
     "cost_marks",
+    "issue_prs",
     "issues",
     "operator_waits",
     "review_state",

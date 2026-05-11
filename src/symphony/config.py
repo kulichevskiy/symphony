@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
+from .github.client import MergeStrategy
 
 
 def _expand(path: str | Path) -> Path:
@@ -62,6 +63,7 @@ class RepoBinding(BaseModel):
     issue_label: str | None = None
     branch_prefix: str = "symphony"
     base_branch: str | None = None
+    merge_strategy: MergeStrategy = "squash"
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
     # Per-binding cost knobs. `None` falls back to the global default; an

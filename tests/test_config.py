@@ -42,6 +42,7 @@ repos:
     assert cfg.repos[0].linear_team_key == "ENG"
     assert cfg.repos[0].github_repo == "org/api-svc"
     assert cfg.repos[0].agent == "claude"  # default
+    assert cfg.repos[0].merge_strategy == "squash"  # default
     assert cfg.repos[0].issue_label == "symphony"
     assert cfg.linear_api_key == "lin_api_test"
     assert cfg.repos[0].linear_states.ready == "Todo"

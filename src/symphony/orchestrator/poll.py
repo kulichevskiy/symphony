@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import uuid
@@ -35,7 +36,7 @@ import aiosqlite
 from .. import db
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.process import Usage, parse_event_line
-from ..agent.prompt import implement_prompt, review_fix_prompt
+from ..agent.prompt import implement_prompt, merge_prompt, review_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
@@ -46,6 +47,7 @@ from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
 from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import (
     CommentVars,
+    awaiting_approval,
     cost_cap_reached,
     cost_warning,
     failed,
@@ -65,6 +67,9 @@ from ..pipeline.review_classifier import (
     CheckRun as ReviewCheckRun,
 )
 from ..pipeline.review_classifier import (
+    Reaction,
+    Review,
+    ReviewComment,
     ReviewSnapshot,
     Verdict,
     VerdictKind,
@@ -176,6 +181,22 @@ def build_fix_runner_command(
     return build_runner_command(agent, prompt, codex_model=codex_model)
 
 
+def build_merge_runner_command(
+    agent: str,
+    prompt: str,
+    *,
+    max_budget_usd: float | None = None,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+) -> list[str]:
+    """argv for the Merge-stage final local pass."""
+    return build_runner_command(
+        agent,
+        prompt,
+        max_budget_usd=max_budget_usd,
+        codex_model=codex_model,
+    )
+
+
 _PR_URL_RE = re.compile(r"/pull/(\d+)")
 
 
@@ -205,8 +226,35 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
     )
 
 
+def _binding_storage_key(binding: RepoBinding) -> str:
+    return json.dumps(_binding_key(binding), separators=(",", ":"))
+
+
+def _binding_label_from_storage_key(binding_key: str) -> str | None:
+    if not binding_key:
+        return None
+    try:
+        raw = json.loads(binding_key)
+    except ValueError:
+        return None
+    if not isinstance(raw, list) or len(raw) < 3:
+        return None
+    label = raw[2]
+    if label is None:
+        return ""
+    return str(label)
+
+
 def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
     return issue.state_name == binding.linear_states.in_progress
+
+
+def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bool:
+    return (
+        issue.team_key == binding.linear_team_key
+        and _review_issue_is_active(issue, binding)
+        and (binding.issue_label is None or binding.issue_label in issue.labels)
+    )
 
 
 def _parse_rfc3339(s: str) -> datetime:
@@ -215,6 +263,107 @@ def _parse_rfc3339(s: str) -> datetime:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s)
+
+
+def _user_login(entry: dict[str, object]) -> str:
+    user = entry.get("user")
+    if isinstance(user, dict):
+        login = user.get("login")
+        if login is not None:
+            return str(login)
+    return ""
+
+
+def _review_check_from_github(run: GitHubCheckRun) -> ReviewCheckRun:
+    if run.bucket in ("pass", "skipping"):
+        return ReviewCheckRun(
+            name=run.name,
+            status="completed",
+            conclusion="success",
+            required=True,
+        )
+    if run.bucket == "cancel":
+        return ReviewCheckRun(
+            name=run.name,
+            status="completed",
+            conclusion="cancelled",
+            required=True,
+        )
+    if run.bucket == "fail":
+        return ReviewCheckRun(
+            name=run.name,
+            status="completed",
+            conclusion="failure",
+            required=True,
+        )
+    return ReviewCheckRun(
+        name=run.name,
+        status="in_progress",
+        conclusion=None,
+        required=True,
+    )
+
+
+def _review_comments_from_github(
+    entries: list[dict[str, object]],
+) -> list[ReviewComment]:
+    comments: list[ReviewComment] = []
+    for entry in entries:
+        line_value = entry.get("line")
+        line = line_value if isinstance(line_value, int) else None
+        comments.append(
+            ReviewComment(
+                user_login=_user_login(entry),
+                body=str(entry.get("body") or ""),
+                commit_sha=str(
+                    entry.get("commit_id") or entry.get("original_commit_id") or ""
+                ),
+                created_at=str(entry.get("created_at") or ""),
+                path=str(entry.get("path") or ""),
+                line=line,
+            )
+        )
+    return comments
+
+
+def _reviews_from_github(entries: list[dict[str, object]]) -> tuple[Review, ...]:
+    reviews: list[Review] = []
+    for entry in entries:
+        reviews.append(
+            Review(
+                user_login=_user_login(entry),
+                state=str(entry.get("state") or ""),
+                commit_sha=str(entry.get("commit_id") or ""),
+                submitted_at=str(entry.get("submitted_at") or ""),
+                body=str(entry.get("body") or ""),
+            )
+        )
+    return tuple(reviews)
+
+
+def _reactions_from_github(entries: list[dict[str, object]]) -> tuple[Reaction, ...]:
+    reactions: list[Reaction] = []
+    for entry in entries:
+        reactions.append(
+            Reaction(
+                user_login=_user_login(entry),
+                content=str(entry.get("content") or ""),
+                created_at=str(entry.get("created_at") or ""),
+            )
+        )
+    return tuple(reactions)
+
+
+def _pr_view_is_merged(view: dict[str, object]) -> bool:
+    return (
+        bool(view.get("mergedAt"))
+        or bool(view.get("merged"))
+        or str(view.get("state") or "").upper() == "MERGED"
+    )
+
+
+def _pr_view_is_closed(view: dict[str, object]) -> bool:
+    return str(view.get("state") or "").upper() == "CLOSED"
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -393,6 +542,10 @@ class Orchestrator:
             log.exception("review poll failed")
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
+        try:
+            scheduled.extend(await self._poll_merge_candidates())
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("merge candidate poll failed")
         try:
             await self._poll_slash_commands()
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -1507,6 +1660,399 @@ class Orchestrator:
         except Exception:
             log.exception("dispatch task crashed for issue_id=%s", issue_id)
 
+    def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None:
+        stored_label = _binding_label_from_storage_key(candidate.binding_key)
+        if candidate.binding_key:
+            for binding in self.config.repos:
+                if _binding_storage_key(binding) == candidate.binding_key:
+                    return binding
+
+        matches = [
+            binding
+            for binding in self.config.repos
+            if (
+                binding.linear_team_key == candidate.team_key
+                and binding.github_repo == candidate.github_repo
+            )
+        ]
+        if stored_label is not None:
+            labeled_matches = [
+                binding
+                for binding in matches
+                if (binding.issue_label or "") == stored_label
+            ]
+            if len(labeled_matches) == 1:
+                return labeled_matches[0]
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
+        """Advance approved Review PRs into Merge without operator action."""
+        scheduled: list[asyncio.Task[None]] = []
+        candidates = await db.issue_prs.list_merge_candidates(self._conn)
+        for candidate in candidates:
+            binding = self._binding_for_pr(candidate)
+            if binding is None:
+                log.warning(
+                    "no binding for merge candidate %s in %s",
+                    candidate.identifier,
+                    candidate.github_repo,
+                )
+                continue
+            if candidate.issue_id in self._scheduled_issue_ids:
+                continue
+            if await db.runs.has_active(
+                self._conn,
+                candidate.issue_id,
+                ignored_stage="review",
+            ):
+                continue
+            try:
+                issue = await self.linear.lookup_issue(candidate.issue_id)
+            except LinearError as e:
+                log.warning(
+                    "could not refresh %s before merge: %s",
+                    candidate.identifier,
+                    e,
+                )
+                continue
+            if not _merge_issue_matches_binding(issue, binding):
+                log.info(
+                    "skipping merge candidate %s: issue is no longer active for "
+                    "binding %s/%s",
+                    issue.identifier,
+                    binding.github_repo,
+                    binding.issue_label or "",
+                )
+                continue
+            latest_merge = await db.runs.latest_for_issue_stage(
+                self._conn,
+                issue_id=candidate.issue_id,
+                stage="merge",
+                started_at_gte=candidate.created_at,
+            )
+            if latest_merge is not None and latest_merge.status == "completed":
+                await self._poll_submitted_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                    run_id=latest_merge.id,
+                )
+                continue
+            try:
+                view = await self._gh.pr_view(
+                    candidate.pr_number,
+                    repo=binding.github_repo,
+                )
+                if await self._finalize_pr_if_closed(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                    run_id=str(uuid.uuid4()),
+                    create_run=True,
+                    view=view,
+                ):
+                    continue
+            except Exception as e:  # noqa: BLE001 — retry finalization next tick
+                log.warning(
+                    "could not check finalized PR state for %s#%d: %s",
+                    binding.github_repo,
+                    candidate.pr_number,
+                    e,
+                )
+                continue
+            try:
+                verdict = await self._review_verdict_for_pr(
+                    binding=binding,
+                    pr_number=candidate.pr_number,
+                    view=view,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not classify review for %s#%d: %s",
+                    binding.github_repo,
+                    candidate.pr_number,
+                    e,
+                )
+                continue
+
+            if verdict.kind is VerdictKind.APPROVED:
+                if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
+                    continue
+                binding_key = _binding_key(binding)
+                if (
+                    len(self._scheduled_issue_ids) >= self.config.global_max_concurrent
+                    or self._scheduled_binding_counts.get(binding_key, 0)
+                    >= binding.max_concurrent
+                ):
+                    continue
+                scheduled.append(
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                    )
+                )
+            elif verdict.merge_conflict:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=candidate.pr_url,
+                    run_id=str(uuid.uuid4()),
+                    reason="merge conflict against base",
+                    create_run=True,
+                )
+        return scheduled
+
+    def _schedule_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> asyncio.Task[None]:
+        binding_key = _binding_key(binding)
+        self._scheduled_issue_ids.add(issue.id)
+        self._scheduled_binding_counts[binding_key] = (
+            self._scheduled_binding_counts.get(binding_key, 0) + 1
+        )
+        task = asyncio.create_task(
+            self._merge_with_limits(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
+        )
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(
+            partial(
+                self._dispatch_task_done,
+                issue_id=issue.id,
+                binding_key=binding_key,
+            )
+        )
+        return task
+
+    async def _merge_with_limits(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> None:
+        key = _binding_key(binding)
+        binding_sem = self._binding_dispatch_sems.setdefault(
+            key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        try:
+            async with self._global_dispatch_sem:
+                async with binding_sem:
+                    current = await self._refresh_merge_candidate(binding, issue)
+                    if current is None:
+                        return
+                    await self._merge_approved_pr(
+                        binding=binding,
+                        issue=current,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
+        except asyncio.CancelledError:
+            run_id = self._dispatch_run_ids.get(issue.id)
+            if run_id is not None:
+                await self._fail_run(run_id, "merge cancelled")
+            raise
+
+    async def _refresh_merge_candidate(
+        self,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> LinearIssue | None:
+        try:
+            current = await self.linear.lookup_issue(issue.id)
+        except LinearError as e:
+            log.warning(
+                "could not revalidate %s before merge execution: %s",
+                issue.identifier,
+                e,
+            )
+            return None
+        if not _merge_issue_matches_binding(current, binding):
+            log.info(
+                "skipping merge for %s: issue is no longer active for binding %s/%s",
+                current.identifier,
+                binding.github_repo,
+                binding.issue_label or "",
+            )
+            return None
+        return current
+
+    async def _review_verdict_for_pr(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_number: int,
+        view: dict[str, object] | None = None,
+    ) -> Verdict:
+        if view is None:
+            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        head_sha = str(view.get("headRefOid") or "")
+        if not head_sha:
+            raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
+
+        checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
+        comments = await self._gh.pr_review_comments(
+            pr_number,
+            repo=binding.github_repo,
+        )
+        reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+        reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+        committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
+
+        ci = [_review_check_from_github(run) for run in checks.runs]
+        snapshot = ReviewSnapshot(
+            head_sha=head_sha,
+            head_committed_at=committed_at,
+            reactions=_reactions_from_github(reactions),
+            reviews=_reviews_from_github(reviews),
+            mergeable=str(view.get("mergeable") or ""),
+        )
+        return review_classifier(
+            comments=_review_comments_from_github(comments),
+            ci=ci,
+            snapshot=snapshot,
+        )
+
+    async def _poll_submitted_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+    ) -> None:
+        try:
+            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+            if await self._finalize_pr_if_closed(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+                create_run=False,
+                view=view,
+            ):
+                return
+        except Exception as e:  # noqa: BLE001 — retry finalization next tick
+            log.warning(
+                "could not verify submitted merge for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return
+
+        try:
+            verdict = await self._review_verdict_for_pr(
+                binding=binding,
+                pr_number=pr_number,
+                view=view,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not reclassify submitted merge for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return
+        if verdict.kind is VerdictKind.CHANGES_REQUESTED:
+            reason = "merge readiness regressed"
+            if verdict.failing_checks:
+                reason = "required CI failed: " + ", ".join(verdict.failing_checks)
+            elif verdict.merge_conflict:
+                reason = "merge conflict against base"
+            elif verdict.rule:
+                reason = f"review readiness regressed: {verdict.rule}"
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=reason,
+            )
+
+    async def _finalize_pr_if_closed(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+        create_run: bool,
+        view: dict[str, object],
+    ) -> bool:
+        if _pr_view_is_merged(view):
+            if create_run:
+                inserted = await db.runs.create_if_no_active(
+                    self._conn,
+                    id=run_id,
+                    issue_id=issue.id,
+                    stage="merge",
+                    status="running",
+                    pid=None,
+                    started_at=datetime.now(UTC).isoformat(),
+                    ignored_stage="review",
+                )
+                if not inserted:
+                    return True
+            try:
+                await self._mark_merge_done(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                )
+            except Exception as e:
+                if not create_run:
+                    raise
+                log.warning(
+                    "could not finalize externally merged PR %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"merge finalization failed: {e}",
+                    create_run=False,
+                )
+            return True
+        if _pr_view_is_closed(view):
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason="pull request closed before merge",
+                create_run=create_run,
+            )
+            return True
+        return False
+
     async def _dispatch_one(
         self, binding: RepoBinding, issue: LinearIssue
     ) -> str | None:
@@ -1776,6 +2322,309 @@ class Orchestrator:
         )
         return run_id
 
+    async def _merge_approved_pr(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> str | None:
+        run_id = str(uuid.uuid4())
+        now = datetime.now(UTC).isoformat()
+        inserted = await db.runs.create_if_no_active(
+            self._conn,
+            id=run_id,
+            issue_id=issue.id,
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at=now,
+            ignored_stage="review",
+        )
+        if not inserted:
+            return None
+
+        self._dispatch_run_ids[issue.id] = run_id
+        workspace_path: Path | None = None
+        try:
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.exception("workspace acquire failed for merge %s", issue.identifier)
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"workspace acquire failed: {e}",
+                )
+                return run_id
+
+            try:
+                prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+                (
+                    cumulative_cost,
+                    final_kind,
+                    final_returncode,
+                    cap_breached,
+                ) = await self._run_merge_agent(
+                    binding=binding,
+                    issue=issue,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                    pr_url=pr_url,
+                    prior_total=prior_total,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("merge agent execution failed for %s", issue.identifier)
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"merge agent execution failed: {e}",
+                )
+                return run_id
+
+            if cumulative_cost > 0:
+                await self._conn.execute(
+                    "UPDATE runs SET cost_usd = ? WHERE id = ?",
+                    (cumulative_cost, run_id),
+                )
+                await self._conn.commit()
+
+            if cap_breached:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=(
+                        "cost cap reached: "
+                        f"${prior_total + cumulative_cost:.4f}"
+                    ),
+                )
+                return run_id
+
+            transition = on_runner_event(
+                stage="merge",
+                event_kind=final_kind,
+                returncode=final_returncode,
+            )
+            if transition.next_run_status != "completed":
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"merge runner ended with {final_kind}",
+                )
+                return run_id
+
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await self._push_fn(workspace_path, branch)
+                await self._gh.pr_merge(
+                    pr_number,
+                    strategy=binding.merge_strategy,
+                    auto=True,
+                    repo=binding.github_repo,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("merge failed for %s#%d: %s", binding.github_repo, pr_number, e)
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=str(e),
+                )
+                return run_id
+
+            try:
+                merged = await self._mark_merge_done_if_merged(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not verify merge completion for %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"merge finalization failed: {e}",
+                )
+                return run_id
+            if not merged:
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "completed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+            return run_id
+        finally:
+            if workspace_path is not None:
+                self._workspace.release(binding, issue)
+            self._dispatch_run_ids.pop(issue.id, None)
+
+    async def _mark_merge_done_if_merged(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+    ) -> bool:
+        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        if not _pr_view_is_merged(view):
+            return False
+        await self._mark_merge_done(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            run_id=run_id,
+        )
+        return True
+
+    async def _mark_merge_done(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        run_id: str,
+    ) -> None:
+        states = await self._states_for_binding(binding)
+        done_id = states.get(binding.linear_states.done)
+        if done_id is None:
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=f"missing Linear state: {binding.linear_states.done}",
+            )
+            return
+
+        total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        await self.linear.move_issue(issue.id, done_id)
+        await self._workspace.cleanup(issue)
+        final_body = stage_done(
+            CommentVars(
+                stage="merge",
+                next_stage="done",
+                repo=binding.github_repo,
+                issue=0,
+                pr_url=pr_url,
+                run_id=run_id,
+                cost=f"${total_cost:.4f}",
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(final_body))
+        except LinearError as e:
+            log.warning(
+                "could not post final merge comment for %s: %s",
+                issue.identifier,
+                e,
+            )
+        ended_at = datetime.now(UTC).isoformat()
+        await db.issue_prs.mark_merged(
+            self._conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            merged_at=ended_at,
+        )
+        await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
+
+    async def _mark_merge_needs_approval(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        run_id: str,
+        reason: str,
+        create_run: bool = False,
+    ) -> None:
+        if create_run:
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=run_id,
+                issue_id=issue.id,
+                stage="merge",
+                status="running",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+                ignored_stage="review",
+            )
+            if not inserted:
+                return
+
+        try:
+            needs_approval_id: str | None = None
+            try:
+                states = await self._states_for_binding(binding)
+                needs_approval_id = states.get(binding.linear_states.needs_approval)
+            except LinearError as e:
+                log.warning(
+                    "could not load states while parking %s in needs approval: %s",
+                    issue.identifier,
+                    e,
+                )
+
+            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            body = awaiting_approval(
+                CommentVars(
+                    stage="merge",
+                    next_stage="done",
+                    repo=binding.github_repo,
+                    issue=0,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    cost=f"${total_cost:.4f}",
+                    error=reason,
+                )
+            )
+            if needs_approval_id is not None:
+                try:
+                    await self.linear.move_issue(issue.id, needs_approval_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to needs approval after merge failure: %s",
+                        issue.identifier,
+                        e,
+                    )
+            else:
+                log.warning(
+                    "missing Linear state %r for %s after merge failure",
+                    binding.linear_states.needs_approval,
+                    issue.identifier,
+                )
+            try:
+                await self.linear.post_comment(issue.id, truncate_body(body))
+            except LinearError as e:
+                log.warning("needs approval comment failed on %s: %s", issue.identifier, e)
+        finally:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "needs_approval",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+
     async def _start_review_stage(
         self,
         *,
@@ -1805,6 +2654,15 @@ class Orchestrator:
                 issue.identifier,
             )
         else:
+            await db.issue_prs.upsert(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+                binding_key=_binding_storage_key(binding),
+                pr_number=pr_number,
+                pr_url=pr_url,
+                created_at=datetime.now(UTC).isoformat(),
+            )
             try:
                 await self._gh.pr_comment(
                     pr_number,
@@ -1879,12 +2737,92 @@ class Orchestrator:
             max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
         )
+        return await self._run_stage_command(
+            binding=binding,
+            issue=issue,
+            command=command,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            stage="implement",
+            prior_total=prior_total,
+            cap_usd=cap_usd,
+            warning_pct=warning_pct,
+            warning_already_fired=warning_already_fired,
+        )
+
+    async def _run_merge_agent(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        workspace_path: Path,
+        pr_url: str,
+        prior_total: float,
+    ) -> tuple[float, str, int | None, bool]:
+        cap_usd = effective_cap(
+            global_cap_usd=self.config.cost_cap_per_issue_usd,
+            binding_override=binding.cost_cap_usd,
+        )
+        warning_pct = effective_warning_pct(
+            global_pct=self.config.cost_warning_pct,
+            binding_override=binding.cost_warning_pct,
+        )
+        warning_already_fired = (
+            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+        )
+
+        max_budget_usd: float | None = None
+        if cap_usd > 0:
+            max_budget_usd = cap_usd - prior_total
+            if max_budget_usd <= 0:
+                return 0.0, "cost_cap", None, True
+
+        prompt = merge_prompt(
+            issue_title=issue.title,
+            issue_body=issue.description,
+            labels=list(issue.labels),
+            pr_url=pr_url,
+        )
+        command = build_merge_runner_command(
+            binding.agent,
+            prompt,
+            max_budget_usd=max_budget_usd,
+            codex_model=binding.codex_model,
+        )
+        return await self._run_stage_command(
+            binding=binding,
+            issue=issue,
+            command=command,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            stage="merge",
+            prior_total=prior_total,
+            cap_usd=cap_usd,
+            warning_pct=warning_pct,
+            warning_already_fired=warning_already_fired,
+        )
+
+    async def _run_stage_command(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        command: list[str],
+        run_id: str,
+        workspace_path: Path,
+        stage: str,
+        prior_total: float,
+        cap_usd: float,
+        warning_pct: int,
+        warning_already_fired: bool,
+    ) -> tuple[float, str, int | None, bool]:
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
             stall_secs=self.config.stall_timeout_secs,
-            stage="implement",
+            stage=stage,
         )
 
         log_path = self.config.log_root / f"{run_id}.log"
@@ -1926,6 +2864,7 @@ class Orchestrator:
                                     binding=binding,
                                     issue=issue,
                                     run_id=run_id,
+                                    stage=stage,
                                     cumulative_total=new_total,
                                     cap_usd=cap_usd,
                                 )
@@ -2019,13 +2958,14 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         run_id: str,
+        stage: str,
         cumulative_total: float,
         cap_usd: float,
     ) -> bool:
         pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
         body = cost_warning(
             CommentVars(
-                stage="implement",
+                stage=stage,
                 repo=binding.github_repo,
                 issue=0,
                 run_id=run_id,
@@ -2157,6 +3097,7 @@ __all__ = [
     "Orchestrator",
     "WebhookDispatchResult",
     "build_fix_runner_command",
+    "build_merge_runner_command",
     "build_pr_body",
     "build_pr_title",
     "build_runner_command",

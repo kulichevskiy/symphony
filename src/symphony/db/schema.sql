@@ -3,6 +3,8 @@
 -- Status values used in `runs.status`:
 --   running      live (subprocess attached or dispatched)
 --   completed    finished cleanly
+--   done         terminal pipeline success
+--   needs_approval terminal operator handoff after an unrecoverable stage failure
 --   failed       finished with non-zero exit / spawn failure
 --   interrupted  marked dead by startup reconcile (host restarted)
 
@@ -35,6 +37,23 @@ CREATE INDEX IF NOT EXISTS idx_runs_status_pid ON runs(status, pid);
 
 -- Per-issue cost aggregation (cost_cap_per_issue_usd enforcement).
 CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
+
+-- PR opened for an issue. The row bridges the async Review/Merge ticks:
+-- Implement creates the PR and Review handoff, later ticks poll the same PR
+-- until Review + CI are green, then Merge marks it merged.
+CREATE TABLE IF NOT EXISTS issue_prs (
+    issue_id    TEXT NOT NULL REFERENCES issues(id),
+    github_repo TEXT NOT NULL,
+    binding_key TEXT NOT NULL DEFAULT '',
+    pr_number   INTEGER NOT NULL,
+    pr_url      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    merged_at   TEXT,
+    PRIMARY KEY (issue_id, github_repo)
+);
+
+CREATE INDEX IF NOT EXISTS idx_issue_prs_unmerged
+    ON issue_prs(merged_at, created_at);
 
 -- `last_seen_ids` is a JSON array of comment IDs that share `last_seen_at`.
 -- Combined with a `gte` filter on the next fetch, this prevents losing

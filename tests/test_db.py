@@ -24,7 +24,14 @@ async def test_connect_creates_tables_and_persists(tmp_path: Path) -> None:
     finally:
         await conn.close()
 
-    for table in ("repos", "issues", "runs", "comment_cursors", "operator_waits"):
+    for table in (
+        "repos",
+        "issues",
+        "runs",
+        "issue_prs",
+        "comment_cursors",
+        "operator_waits",
+    ):
         assert table in names, f"expected {table} in {names}"
 
     assert p.exists()
@@ -100,6 +107,21 @@ async def test_runs_create_and_has_active(tmp_path: Path) -> None:
             conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00"
         )
         assert await db.runs.has_active(conn, "iss-1") is False
+
+        await db.runs.create(
+            conn,
+            id="review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.runs.has_active(conn, "iss-1") is True
+        assert (
+            await db.runs.has_active(conn, "iss-1", ignored_stage="review")
+            is False
+        )
     finally:
         await conn.close()
 
@@ -197,6 +219,174 @@ async def test_runs_cost_aggregation_per_issue(tmp_path: Path) -> None:
             conn, id="iss-3", identifier="ENG-3", title="t", team_key="ENG"
         )
         assert await db.runs.cost_for_issue(conn, "iss-3") == pytest.approx(0.0)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key='["ENG","org/repo","backend"]',
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        await db.runs.create(
+            conn,
+            id="review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 42
+        assert candidates[0].github_repo == "org/repo"
+        assert candidates[0].binding_key == '["ENG","org/repo","backend"]'
+
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            merged_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_issue_prs_scopes_candidates_to_current_pr_cycle(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="old-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="old-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="done",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=43,
+            pr_url="https://github.com/org/repo/pull/43",
+            created_at="2026-05-10T01:00:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        await db.runs.create(
+            conn,
+            id="new-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T01:01:00+00:00",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 43
+
+        await db.runs.create(
+            conn,
+            id="new-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T01:02:00+00:00",
+        )
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_latest_for_issue_stage_can_scope_to_current_cycle(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="old-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        assert (
+            await db.runs.latest_for_issue_stage(
+                conn,
+                issue_id="iss-1",
+                stage="merge",
+                started_at_gte="2026-05-10T01:00:00+00:00",
+            )
+            is None
+        )
+
+        await db.runs.create(
+            conn,
+            id="new-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T01:01:00+00:00",
+        )
+        latest = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="merge",
+            started_at_gte="2026-05-10T01:00:00+00:00",
+        )
+        assert latest is not None
+        assert latest.id == "new-merge"
     finally:
         await conn.close()
 
@@ -318,6 +508,30 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
             started_at="2026-05-10T00:03:00+00:00",
         )
         assert third is True
+
+        merge = await db.runs.create_if_no_active(
+            conn,
+            id="run-d",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:04:00+00:00",
+            ignored_stage="review",
+        )
+        assert merge is True
+
+        blocked = await db.runs.create_if_no_active(
+            conn,
+            id="run-e",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:05:00+00:00",
+            ignored_stage="review",
+        )
+        assert blocked is False
     finally:
         await conn.close()
 

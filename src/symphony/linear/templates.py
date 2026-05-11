@@ -75,17 +75,22 @@ def stage_done(v: CommentVars) -> str:
 
 
 def awaiting_approval(v: CommentVars) -> str:
-    return (
+    body = (
         f"🟡 **Awaiting approval — {v.stage} → next stage**\n\n"
         f"Symphony has paused on `{v.repo}#{v.issue}` after **{v.stage}**.\n\n"
         f"- PR: {v.pr_url}\n"
         f"- Cost so far: **{v.cost}**\n"
         f"- Run ID: `{v.run_id}`\n\n"
-        f"Reply on this issue with:\n"
-        f"- `/approve` — advance to the next stage\n"
-        f"- `/reject` — stop the pipeline here\n"
-        f"- Free-form text — queued as steering for the next stage's prompt\n"
     )
+    if v.error:
+        body += f"- Error: `{v.error}`\n\n"
+    body += (
+        "Reply on this issue with:\n"
+        "- `/approve` — advance to the next stage\n"
+        "- `/reject` — stop the pipeline here\n"
+        "- Free-form text — queued as steering for the next stage's prompt\n"
+    )
+    return body
 
 
 def stuck_loop_escape(v: CommentVars) -> str:

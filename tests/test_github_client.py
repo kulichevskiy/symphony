@@ -287,6 +287,11 @@ async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  
     call = _calls(log)[0]
     assert call["env_GH_TOKEN"] == "ghs_test_token"
     assert call["env_GH_ENTERPRISE_TOKEN"] == "ghs_test_token"
+    argv = call["argv"]
+    assert isinstance(argv, list)
+    fields = str(argv[argv.index("--json") + 1])
+    assert "mergedAt" in fields
+    assert "merged," not in fields
 
 
 # ---- head_sha + branch_list + repo_clone + pr_comment + pr_close ----
@@ -365,3 +370,45 @@ async def test_pr_close_invokes_pr_close(fake_gh) -> None:  # type: ignore[no-un
     argv = _calls(log)[0]["argv"]
     assert isinstance(argv, list)
     assert argv[:3] == ["pr", "close", "8"]
+
+
+async def test_pr_reviews_fetches_all_pages(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps(
+        [
+            [{"id": 1, "state": "COMMENTED"}],
+            [{"id": 2, "state": "APPROVED"}],
+        ]
+    )
+    log = fake_gh({"pulls/7/reviews": [0, payload]})
+    gh = GitHub()
+    result = await gh.pr_reviews(7, repo="org/r")
+    assert [entry["id"] for entry in result] == [1, 2]
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["api", "--paginate", "--slurp"]
+    assert "repos/org/r/pulls/7/reviews" in argv
+
+
+async def test_pr_review_comments_fetches_all_pages(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps([[{"id": 1}], [{"id": 2}]])
+    log = fake_gh({"pulls/7/comments": [0, payload]})
+    gh = GitHub()
+    result = await gh.pr_review_comments(7, repo="org/r")
+    assert [entry["id"] for entry in result] == [1, 2]
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["api", "--paginate", "--slurp"]
+    assert "repos/org/r/pulls/7/comments" in argv
+
+
+async def test_pr_reactions_fetches_all_pages(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps([[{"id": 1, "content": "eyes"}], [{"id": 2, "content": "+1"}]])
+    log = fake_gh({"issues/7/reactions": [0, payload]})
+    gh = GitHub()
+    result = await gh.pr_reactions(7, repo="org/r")
+    assert [entry["id"] for entry in result] == [1, 2]
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:3] == ["api", "--paginate", "--slurp"]
+    assert "repos/org/r/issues/7/reactions" in argv
+    assert "Accept: application/vnd.github+json" in argv
