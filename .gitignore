@@ -21,5 +21,9 @@ state.sqlite
 logs/
 workspaces/
 
+# Local operator config / tool state
+config.local.yaml
+.claude/
+
 # OS
 .DS_Store
