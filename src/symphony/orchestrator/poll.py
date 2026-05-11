@@ -69,17 +69,25 @@ def build_pr_body(issue: LinearIssue) -> str:
     return f"Relates to {issue.url}"
 
 
-def build_runner_command(agent: str, prompt: str) -> list[str]:
+def build_runner_command(
+    agent: str,
+    prompt: str,
+    *,
+    max_budget_usd: float | None = None,
+) -> list[str]:
     """Per-runner argv for the Implement stage prompt."""
     if agent == "claude":
-        return [
+        command = [
             "claude",
             "--print",
             "--output-format",
             "stream-json",
             "--verbose",
-            prompt,
         ]
+        if max_budget_usd is not None:
+            command.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
+        command.append(prompt)
+        return command
     if agent == "codex":
         return ["codex", "exec", "--json", prompt]
     raise ValueError(f"unknown agent {agent!r}")
@@ -658,23 +666,6 @@ class Orchestrator:
         runner is killed and the loop exits with `cap_breached=True` so
         the caller can park the issue at `needs_approval`.
         """
-        prompt = implement_prompt(
-            issue_title=issue.title,
-            issue_body=issue.description,
-            labels=list(issue.labels),
-        )
-        command = build_runner_command(binding.agent, prompt)
-        spec = RunnerSpec(
-            run_id=run_id,
-            workspace_path=workspace_path,
-            command=command,
-            stall_secs=self.config.stall_timeout_secs,
-            stage="implement",
-        )
-
-        log_path = self.config.log_root / f"{run_id}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
         cap_usd = effective_cap(
             global_cap_usd=self.config.cost_cap_per_issue_usd,
             binding_override=binding.cost_cap_usd,
@@ -686,6 +677,33 @@ class Orchestrator:
         warning_already_fired = (
             await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
         )
+
+        max_budget_usd: float | None = None
+        if cap_usd > 0:
+            max_budget_usd = cap_usd - prior_total
+            if max_budget_usd <= 0:
+                return 0.0, "cost_cap", None, True
+
+        prompt = implement_prompt(
+            issue_title=issue.title,
+            issue_body=issue.description,
+            labels=list(issue.labels),
+        )
+        command = build_runner_command(
+            binding.agent,
+            prompt,
+            max_budget_usd=max_budget_usd,
+        )
+        spec = RunnerSpec(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            stall_secs=self.config.stall_timeout_secs,
+            stage="implement",
+        )
+
+        log_path = self.config.log_root / f"{run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
 
         cumulative_cost = 0.0
         final_kind = "exit"

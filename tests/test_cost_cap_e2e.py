@@ -29,8 +29,10 @@ class _CostStreamRunner:
         self.cost_increments = cost_increments
         self.kill_calls: list[str] = []
         self.events_consumed = 0
+        self.captured_spec: RunnerSpec | None = None
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.captured_spec = spec
         return self._aiter()
 
     async def _aiter(self) -> AsyncIterator[RunnerEvent]:
@@ -214,6 +216,55 @@ async def test_cap_uses_per_issue_total_across_runs(tmp_path: Path) -> None:
 
         await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
 
+        assert runner.captured_spec is not None
+        assert "--max-budget-usd" in runner.captured_spec.command
+        budget_idx = runner.captured_spec.command.index("--max-budget-usd") + 1
+        assert runner.captured_spec.command[budget_idx] == "5.0000"
+
+        moves = [c.args for c in linear.move_issue.await_args_list]
+        assert ("iss-1", "state-na") in moves
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Stuck-loop escape" in b for b in bodies)
+        gh.pr_create.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cap_already_reached_skips_runner_and_parks(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=15.0,
+            cost_warning_pct=75,
+        )
+
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="prior",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T00:00:00+00:00",
+            cost_usd=15.0,
+        )
+
+        ws = tmp_path / "ws" / "org_srepo" / "eng-1"
+        ws.mkdir(parents=True)
+        runner = _CostStreamRunner([1.0])
+        orch, linear, gh, _ws = _orch(cfg, conn, runner, ws)
+
+        await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+
+        assert runner.captured_spec is None
         moves = [c.args for c in linear.move_issue.await_args_list]
         assert ("iss-1", "state-na") in moves
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
