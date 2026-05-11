@@ -47,6 +47,7 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     fake_workspace.release = MagicMock()
     fake_gh = MagicMock()
     fake_gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
+    fake_gh.pr_comment = AsyncMock()
     fake_gh.repo_clone = AsyncMock()
     fake_gh.repo_default_branch = AsyncMock(return_value="main")
     fake_runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
@@ -246,8 +247,10 @@ def test_once_drains_scheduled_dispatch_before_exit(
             history = await db.runs.history_for_issue(conn, "iss-once")
         finally:
             await conn.close()
-        assert len(history) == 1
+        # implement (completed) + review handoff (completed) after Implement→Review.
+        assert [r.stage for r in history] == ["implement", "review"]
         assert history[0].status == "completed"
+        assert history[1].status == "completed"
 
     asyncio.run(_check())
     assert len(fake.posted) == 2
@@ -320,8 +323,9 @@ def test_dispatch_creates_run_for_known_team_binding(
         conn = await db.connect(db_path)
         try:
             history = await db.runs.history_for_issue(conn, "iss-1")
-            assert len(history) == 1
+            assert [r.stage for r in history] == ["implement", "review"]
             assert history[0].status == "completed"
+            assert history[1].status == "completed"
         finally:
             await conn.close()
 

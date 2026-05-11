@@ -209,14 +209,16 @@ async def test_comment_cursor_advance(tmp_path: Path) -> None:
             conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
         )
         assert await db.comment_cursors.get(conn, "iss-1") is None
-        await db.comment_cursors.set(conn, "iss-1", "2026-05-10T00:00:00+00:00")
-        assert (
-            await db.comment_cursors.get(conn, "iss-1") == "2026-05-10T00:00:00+00:00"
+        await db.comment_cursors.set(
+            conn, "iss-1", "2026-05-10T00:00:00+00:00", ["c1"]
         )
-        await db.comment_cursors.set(conn, "iss-1", "2026-05-10T01:00:00+00:00")
-        assert (
-            await db.comment_cursors.get(conn, "iss-1") == "2026-05-10T01:00:00+00:00"
+        got = await db.comment_cursors.get(conn, "iss-1")
+        assert got == ("2026-05-10T00:00:00+00:00", ["c1"])
+        await db.comment_cursors.set(
+            conn, "iss-1", "2026-05-10T01:00:00+00:00", ["c2", "c3"]
         )
+        got = await db.comment_cursors.get(conn, "iss-1")
+        assert got == ("2026-05-10T01:00:00+00:00", ["c2", "c3"])
     finally:
         await conn.close()
 
