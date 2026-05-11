@@ -931,7 +931,6 @@ class Orchestrator:
             for binding in self.config.repos:
                 if _binding_storage_key(binding) == candidate.binding_key:
                     return binding
-            return None
 
         for binding in self.config.repos:
             if (
@@ -1227,12 +1226,30 @@ class Orchestrator:
                 )
                 if not inserted:
                     return True
-            await self._mark_merge_done(
-                binding=binding,
-                issue=issue,
-                pr_url=pr_url,
-                run_id=run_id,
-            )
+            try:
+                await self._mark_merge_done(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                )
+            except Exception as e:
+                if not create_run:
+                    raise
+                log.warning(
+                    "could not finalize externally merged PR %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"merge finalization failed: {e}",
+                    create_run=False,
+                )
             return True
         if _pr_view_is_closed(view):
             await self._mark_merge_needs_approval(

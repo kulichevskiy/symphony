@@ -259,6 +259,41 @@ async def test_merge_candidate_uses_recorded_binding_key(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_merge_candidate_falls_back_when_recorded_binding_key_is_stale(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn, binding_key="old-shape:backend")
+        target = _binding(
+            agent="codex",
+            issue_label="backend",
+            branch_prefix="backend",
+        )
+        cfg = Config(
+            repos=[target],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        candidate = (await db.issue_prs.list_merge_candidates(conn))[0]
+
+        assert orch._binding_for_pr(candidate) == target  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -571,6 +606,70 @@ async def test_externally_merged_candidate_finishes_before_review_classification
         assert history[-1].stage == "merge"
         assert history[-1].status == "done"
         assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_externally_merged_candidate_closes_run_when_done_move_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        workspace = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(side_effect=[LinearError("move down"), None])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "state": "MERGED",
+                "mergedAt": "2026-05-10T00:04:00Z",
+            }
+        )
+        gh.pr_checks = AsyncMock()
+        gh.pr_review_comments = AsyncMock()
+        gh.pr_reviews = AsyncMock()
+        gh.pr_reactions = AsyncMock()
+        gh.commit_committed_at = AsyncMock()
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        gh.pr_checks.assert_not_awaited()
+        workspace.cleanup.assert_not_awaited()
+        assert linear.move_issue.await_count == 2
+        linear.move_issue.assert_any_await("iss-1", "state-done")
+        linear.move_issue.assert_any_await("iss-1", "state-na")
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "needs_approval"
+        assert await db.runs.has_active(conn, "iss-1") is False
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "merge finalization failed: move down" in comment_body
     finally:
         await conn.close()
 
