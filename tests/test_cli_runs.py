@@ -247,9 +247,10 @@ def test_once_drains_scheduled_dispatch_before_exit(
             history = await db.runs.history_for_issue(conn, "iss-once")
         finally:
             await conn.close()
-        # implement (completed) + review (running) after Implement→Review.
+        # implement (completed) + review handoff (completed) after Implement→Review.
         assert [r.stage for r in history] == ["implement", "review"]
         assert history[0].status == "completed"
+        assert history[1].status == "completed"
 
     asyncio.run(_check())
     assert len(fake.posted) == 2
@@ -324,6 +325,7 @@ def test_dispatch_creates_run_for_known_team_binding(
             history = await db.runs.history_for_issue(conn, "iss-1")
             assert [r.stage for r in history] == ["implement", "review"]
             assert history[0].status == "completed"
+            assert history[1].status == "completed"
         finally:
             await conn.close()
 

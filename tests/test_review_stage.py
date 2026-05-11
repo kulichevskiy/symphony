@@ -2,7 +2,7 @@
 
 Acceptance criteria covered here:
 - On Implement success, orchestrator posts `@codex review` on the PR and
-  creates a `runs` row with `stage='review'`, `status='running'`.
+  records a completed `runs` row with `stage='review'`.
 - Fix-runs spawn the agent CLI configured on the binding (claude or
   codex), NOT the Codex GitHub bot. The bot is only consulted via the
   PR-comment side-channel.
@@ -87,7 +87,7 @@ def _states() -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_implement_success_posts_codex_review_and_starts_review_run(
+async def test_implement_success_posts_codex_review_and_records_review_handoff(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -158,12 +158,14 @@ async def test_implement_success_posts_codex_review_and_starts_review_run(
             f"but got {gh.pr_comment.await_args_list!r}"
         )
 
-        # A review-stage run row exists for this issue.
+        # A review-stage handoff row exists for this issue, but it is not
+        # live because no local review worker was spawned.
         history = await db.runs.history_for_issue(conn, "iss-1")
         stages = [r.stage for r in history]
         assert "review" in stages
         review_runs = [r for r in history if r.stage == "review"]
-        assert review_runs[0].status == "running"
+        assert review_runs[0].status == "completed"
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
     finally:
         await conn.close()
 

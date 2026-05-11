@@ -644,10 +644,9 @@ class Orchestrator:
         )
 
         # 6. Start the Review stage: ping `@codex review` on the PR and
-        #    open a review-stage run row so the poll loop has something
-        #    to drive. The Codex bot is the reviewer regardless of the
-        #    binding's `agent` field; fix-runs spawned later go through
-        #    the binding's CLI.
+        #    record the handoff. The Codex bot is the reviewer regardless
+        #    of the binding's `agent` field; fix-runs spawned later go
+        #    through the binding's CLI.
         await self._start_review_stage(
             binding=binding,
             issue=issue,
@@ -662,7 +661,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_url: str,
     ) -> str | None:
-        """Post `@codex review` and create a review-stage run row.
+        """Post `@codex review` and record a completed review handoff row.
 
         Idempotent in spirit: failure to post the bot ping does not block
         the run row from being created, but is logged loudly so an
@@ -697,7 +696,7 @@ class Orchestrator:
             id=review_run_id,
             issue_id=issue.id,
             stage="review",
-            status="running",
+            status="completed",
             pid=None,
             started_at=datetime.now(UTC).isoformat(),
         )
