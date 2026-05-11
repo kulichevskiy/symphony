@@ -449,6 +449,87 @@ async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_merge_candidate_skips_when_issue_left_active_state(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        paused = _issue()
+        paused.state_name = "Needs Approval"
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=paused)
+        gh = MagicMock()
+        gh.pr_view = AsyncMock()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        assert await orch._poll_merge_candidates() == []  # noqa: SLF001
+
+        linear.lookup_issue.assert_awaited_once_with("iss-1")
+        gh.pr_view.assert_not_awaited()
+        workspace.acquire.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_candidate_skips_when_binding_label_no_longer_matches(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude", issue_label="backend")
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock()
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        assert await orch._poll_merge_candidates() == []  # noqa: SLF001
+
+        linear.lookup_issue.assert_awaited_once_with("iss-1")
+        gh.pr_view.assert_not_awaited()
+        workspace.acquire.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

@@ -209,6 +209,14 @@ def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
     return issue.state_name == binding.linear_states.in_progress
 
 
+def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bool:
+    return (
+        issue.team_key == binding.linear_team_key
+        and _review_issue_is_active(issue, binding)
+        and (binding.issue_label is None or binding.issue_label in issue.labels)
+    )
+
+
 def _parse_rfc3339(s: str) -> datetime:
     """Linear timestamps end in `Z`; Python's `fromisoformat` accepts the
     `+00:00` form. Normalize before parsing."""
@@ -1664,6 +1672,15 @@ class Orchestrator:
                     "could not refresh %s before merge: %s",
                     candidate.identifier,
                     e,
+                )
+                continue
+            if not _merge_issue_matches_binding(issue, binding):
+                log.info(
+                    "skipping merge candidate %s: issue is no longer active for "
+                    "binding %s/%s",
+                    issue.identifier,
+                    binding.github_repo,
+                    binding.issue_label or "",
                 )
                 continue
             latest_merge = await db.runs.latest_for_issue_stage(
