@@ -122,6 +122,46 @@ async def test_duplicate_delivery_id_is_200_noop(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pending_delivery_id_is_retryable_without_handling(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        handler = _Handler()
+        app = create_app(
+            handler,
+            conn,
+            WebhookSettings(secret=SECRET),
+            clock=lambda: NOW,
+        )
+        assert await db.webhook_deliveries.begin(
+            conn,
+            "evt-pending",
+            received_at=NOW,
+            ttl_secs=600,
+        ) == "new"
+
+        body = _body(_payload())
+        headers = _headers(body, delivery="evt-pending")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            pending = await client.post("/linear/webhook", content=body, headers=headers)
+            await db.webhook_deliveries.finish(conn, "evt-pending")
+            duplicate = await client.post(
+                "/linear/webhook", content=body, headers=headers
+            )
+
+        assert pending.status_code == 503
+        assert duplicate.status_code == 200
+        assert duplicate.json() == {"status": "duplicate", "handled": False}
+        assert handler.payloads == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_bad_or_missing_hmac_returns_401_without_parsing_body(
     tmp_path: Path,
 ) -> None:
@@ -310,7 +350,45 @@ async def test_webhook_comment_does_not_drop_older_out_of_order_command(
 
 
 @pytest.mark.asyncio
-async def test_poll_claims_comment_before_webhook_can_double_handle(
+async def test_poll_and_webhook_comment_share_post_success_marker(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("/stop")])
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        orch._active_run_ids.add("run-1")  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+        kill_started = asyncio.Event()
+        release_kill = asyncio.Event()
+
+        async def slow_kill(_run_id: str) -> None:
+            kill_started.set()
+            await release_kill.wait()
+
+        orch._runner.kill.side_effect = slow_kill  # type: ignore[attr-defined]  # noqa: SLF001
+
+        poll_task = asyncio.create_task(orch._poll_slash_commands())  # noqa: SLF001
+        await kill_started.wait()
+        webhook_task = asyncio.create_task(orch.handle_linear_webhook(_payload()))
+        await asyncio.sleep(0)
+        release_kill.set()
+
+        await poll_task
+        duplicate = await webhook_task
+
+        assert duplicate.handled is False
+        assert orch._runner.kill.await_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
+        assert await db.comment_events.seen(conn, "c1")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_marks_comment_only_after_successful_slash_handling(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -323,22 +401,24 @@ async def test_poll_claims_comment_before_webhook_can_double_handle(
         orch._active_run_ids.add("run-1")  # noqa: SLF001
         orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
 
-        original = orch._handle_slash_comments  # noqa: SLF001
-
-        async def interleaved_handler(
-            issue_id: str,
-            run_id: str,
-            comments: list[LinearComment],
+        async def fail_intent(
+            _issue_id: str,
+            _run_id: str,
+            _intent: object,
         ) -> None:
-            duplicate = await orch.handle_linear_webhook(_payload())
-            assert duplicate.handled is False
-            await original(issue_id, run_id, comments)
+            raise RuntimeError("boom")
 
-        orch._handle_slash_comments = interleaved_handler  # type: ignore[method-assign]  # noqa: SLF001
+        orch._handle_slash_intent = fail_intent  # type: ignore[method-assign]  # noqa: SLF001
 
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert not await db.comment_events.seen(conn, "c1")
+
+        orch._handle_slash_intent = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
         await orch._poll_slash_commands()  # noqa: SLF001
 
-        assert orch._runner.kill.await_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
+        assert await db.comment_events.seen(conn, "c1")
     finally:
         await conn.close()
 

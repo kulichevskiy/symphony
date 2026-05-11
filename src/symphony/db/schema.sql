@@ -59,9 +59,13 @@ CREATE INDEX IF NOT EXISTS idx_comment_events_issue ON comment_events(issue_id);
 
 -- Linear webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
 -- pruned opportunistically before each insert based on the configured TTL.
+-- `status` remains pending until the handler succeeds, so retries are not
+-- acknowledged as duplicates before their side effects are durable.
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id          TEXT PRIMARY KEY,
-    received_at TEXT NOT NULL
+    received_at TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'handled'))
 );
 
 -- Review-stage state per issue.

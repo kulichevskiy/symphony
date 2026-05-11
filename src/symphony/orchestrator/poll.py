@@ -185,6 +185,7 @@ class Orchestrator:
         self._scheduled_issue_ids: set[str] = set()
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._schedule_lock = asyncio.Lock()
+        self._comment_event_lock = asyncio.Lock()
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
         self._runs_moved_to_in_progress: set[str] = set()
@@ -287,25 +288,11 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
             )
-        if not await db.comment_events.claim(
-            self._conn,
-            issue_id=issue_id,
-            comment_id=comment.id,
-            seen_at=comment.created_at,
-        ):
+        handled = await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+        if not handled:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="comment already handled"
             )
-        try:
-            await self._handle_slash_comments(issue_id, run_id, [comment])
-        except Exception:
-            await db.comment_events.forget(self._conn, comment.id)
-            raise
-        await self._advance_comment_cursor(
-            issue_id,
-            comment.created_at,
-            {comment.id},
-        )
         return WebhookDispatchResult(kind="comment", handled=True)
 
     async def _handle_webhook_issue(
@@ -361,41 +348,26 @@ class Orchestrator:
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
-            fresh: list[LinearComment] = []
-            claimed_comment_ids: list[str] = []
             for comment in comments:
                 if comment.id in seen_ids:
                     continue
-                claimed = await db.comment_events.claim(
-                    self._conn,
-                    issue_id=issue_id,
-                    comment_id=comment.id,
-                    seen_at=comment.created_at,
-                )
-                if not claimed:
-                    continue
-                fresh.append(comment)
-                claimed_comment_ids.append(comment.id)
-            if not fresh:
-                continue
-            fresh_with_times = [(c, _parse_rfc3339(c.created_at)) for c in fresh]
-            latest_dt = max(created_at for _, created_at in fresh_with_times)
-            latest_comments = [
-                c for c, created_at in fresh_with_times if created_at == latest_dt
-            ]
-            latest = latest_comments[0].created_at
-            latest_ids = {c.id for c in latest_comments}
-            # If the new boundary equals the previous boundary, accumulate the
-            # known IDs so we keep deduping any we already handled.
-            if latest_dt == after:
-                latest_ids |= seen_ids
-            try:
-                await self._handle_slash_comments(issue_id, run_id, fresh)
-            except Exception:
-                for comment_id in claimed_comment_ids:
-                    await db.comment_events.forget(self._conn, comment_id)
-                raise
-            await self._advance_comment_cursor(issue_id, latest, latest_ids)
+                await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+
+    async def _handle_unseen_slash_comment(
+        self, issue_id: str, run_id: str, comment: LinearComment
+    ) -> bool:
+        async with self._comment_event_lock:
+            if await db.comment_events.seen(self._conn, comment.id):
+                return False
+            await self._handle_slash_comments(issue_id, run_id, [comment])
+            await db.comment_events.mark(
+                self._conn,
+                issue_id=issue_id,
+                comment_id=comment.id,
+                seen_at=comment.created_at,
+            )
+        await self._advance_comment_cursor(issue_id, comment.created_at, {comment.id})
+        return True
 
     async def _handle_slash_comments(
         self, issue_id: str, run_id: str, comments: list[LinearComment]

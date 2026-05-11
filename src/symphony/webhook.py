@@ -88,20 +88,23 @@ def create_app(
         if not delivery_id:
             raise HTTPException(status_code=400, detail="missing Linear-Delivery")
 
-        claimed = await db.webhook_deliveries.claim(
+        claim_state = await db.webhook_deliveries.begin(
             conn,
             delivery_id,
             received_at=now,
             ttl_secs=settings.dedupe_ttl_secs,
         )
-        if not claimed:
+        if claim_state == "duplicate":
             return JSONResponse({"status": "duplicate", "handled": False})
+        if claim_state == "pending":
+            raise HTTPException(status_code=503, detail="delivery already pending")
 
         try:
             result = await handler.handle_linear_webhook(payload)
         except Exception:
             await db.webhook_deliveries.forget(conn, delivery_id)
             raise
+        await db.webhook_deliveries.finish(conn, delivery_id)
 
         return JSONResponse(
             {
