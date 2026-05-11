@@ -44,6 +44,7 @@ from ..linear.templates import (
     CommentVars,
     cost_cap_reached,
     cost_warning,
+    resumed,
     run_started,
     stage_done,
     truncate_body,
@@ -200,6 +201,8 @@ class Orchestrator:
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
+        self._operator_wait_run_ids: set[str] = set()
+        self._cost_cap_run_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
@@ -271,7 +274,10 @@ class Orchestrator:
         """
         pairs = list(self._dispatch_run_ids.items())
         for issue_id, run_id in pairs:
-            if run_id not in self._active_run_ids:
+            if (
+                run_id not in self._active_run_ids
+                and run_id not in self._operator_wait_run_ids
+            ):
                 continue
             try:
                 after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
@@ -338,6 +344,9 @@ class Orchestrator:
     async def _handle_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
+        if run_id in self._cost_cap_run_bindings:
+            await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
+            return
         if intent.kind is SlashKind.STOP:
             log.info(
                 "/stop received for run %s (issue %s) — terminating runner",
@@ -355,6 +364,69 @@ class Orchestrator:
             intent.kind,
             run_id,
         )
+
+    async def _handle_cost_cap_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._cost_cap_run_bindings.get(run_id)
+        if binding is None:
+            return
+
+        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
+            states = await self._states_for_binding(binding)
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                log.warning(
+                    "could not resume cost-capped run %s: missing ready state %r",
+                    run_id,
+                    binding.linear_states.ready,
+                )
+                return
+            await self.linear.move_issue(issue_id, ready_id)
+            body = resumed(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    next_stage=binding.linear_states.ready,
+                )
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "cost-cap resume comment failed for issue %s: %s", issue_id, e
+                )
+            self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            states = await self._states_for_binding(binding)
+            blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is not None:
+                await self.linear.move_issue(issue_id, blocked_id)
+            self._clear_operator_wait(issue_id, run_id)
+            return
+
+        log.info(
+            "slash %s received for cost-capped run %s (ignored)",
+            intent.kind,
+            run_id,
+        )
+
+    def _track_operator_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._cost_cap_run_bindings[run_id] = binding
+
+    def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
+        if self._dispatch_run_ids.get(issue_id) == run_id:
+            self._dispatch_run_ids.pop(issue_id, None)
+        self._operator_wait_run_ids.discard(run_id)
+        self._cost_cap_run_bindings.pop(run_id, None)
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
@@ -418,6 +490,8 @@ class Orchestrator:
         for issue in issues:
             if issue.id in self._scheduled_issue_ids:
                 continue
+            if issue.id in self._dispatch_run_ids:
+                continue
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 continue
             scheduled.append(self._schedule_dispatch(binding, issue))
@@ -463,8 +537,10 @@ class Orchestrator:
             await self._mark_cancelled_dispatch(issue)
             raise
         finally:
-            run_id = self._dispatch_run_ids.pop(issue.id, None)
+            run_id = self._dispatch_run_ids.get(issue.id)
             if run_id is not None:
+                if run_id not in self._operator_wait_run_ids:
+                    self._dispatch_run_ids.pop(issue.id, None)
                 self._runs_moved_to_in_progress.discard(run_id)
 
     async def _mark_cancelled_dispatch(self, issue: LinearIssue) -> None:
@@ -1092,6 +1168,7 @@ class Orchestrator:
                 log.warning(
                     "cost_cap_reached comment failed on %s: %s", issue.identifier, e
                 )
+            self._track_operator_wait(issue.id, run_id, binding)
         finally:
             await db.runs.update_status(
                 self._conn,

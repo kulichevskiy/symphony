@@ -108,8 +108,8 @@ def cost_cap_reached(v: CommentVars) -> str:
         f"cost reached **{v.cost}** during **{v.stage}**.\n\n"
         f"- Run ID: `{v.run_id}`\n"
         f"- PR: {v.pr_url}\n\n"
-        f"Reply with `/approve` to force-advance, `/reject` to stop, or "
-        f"free-form steering after raising the cap or retrying manually.\n"
+        f"After raising the cap, reply with `/approve` or `/retry` to requeue. "
+        f"Reply with `/reject` or `/stop` to leave the issue halted.\n"
     )
 
 

@@ -202,6 +202,35 @@ async def test_cap_breach_parks_issue_at_needs_approval(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cap_breach_keeps_run_waiting_for_operator_slash(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=15.0,
+            cost_warning_pct=75,
+        )
+        ws = tmp_path / "ws" / "org_srepo" / "eng-1"
+        ws.mkdir(parents=True)
+        runner = _CostStreamRunner([16.0])
+        orch, _linear, _gh, _ws = _orch(cfg, conn, runner, ws)
+
+        await orch._dispatch_with_limits(cfg.repos[0], _issue())  # noqa: SLF001
+
+        run_id = orch._dispatch_run_ids.get("iss-1")  # noqa: SLF001
+        assert run_id is not None
+        assert run_id in orch._operator_wait_run_ids  # noqa: SLF001
+        assert run_id not in orch._active_run_ids  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_cap_breach_keeps_counting_late_cost_events(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
