@@ -218,6 +218,50 @@ def test_activity_session_threshold_rate_limit_and_reset(tmp_path: Path) -> None
             start + timedelta(seconds=420),
             last_posted_at=start + timedelta(seconds=120),
         )
+        is None
+    )
+    assert (
+        session.due_reason(
+            start + timedelta(seconds=430),
+            last_posted_at=start + timedelta(seconds=120),
+        )
+        == "interval"
+    )
+
+
+def test_activity_session_interval_anchors_to_first_unpublished_event(
+    tmp_path: Path,
+) -> None:
+    session = ActivitySession(
+        settings=ActivitySettings(
+            interval_secs=300,
+            min_interval_secs=120,
+            event_threshold=20,
+        ),
+        run_id="run-1",
+        stage="implement",
+        workspace_path=tmp_path,
+    )
+    start = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+    first_after_idle = start + timedelta(seconds=900)
+
+    session.record_event(
+        ActivityEvent(kind="file_changed", item_id="file-1", file_path="src/app.py"),
+        first_after_idle,
+    )
+
+    assert (
+        session.due_reason(
+            first_after_idle + timedelta(seconds=1),
+            last_posted_at=start,
+        )
+        is None
+    )
+    assert (
+        session.due_reason(
+            first_after_idle + timedelta(seconds=300),
+            last_posted_at=start,
+        )
         == "interval"
     )
 

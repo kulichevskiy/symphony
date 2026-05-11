@@ -166,7 +166,7 @@ class ActivitySession:
     ) -> ActivityPublishReason | None:
         if self.pending_event_count <= 0:
             return None
-        anchor = last_posted_at or self.first_unpublished_at or now
+        anchor = self.first_unpublished_at or last_posted_at or now
         elapsed = max((now - anchor).total_seconds(), 0.0)
         if (
             self.pending_event_count >= self.settings.event_threshold
