@@ -241,14 +241,14 @@ class Orchestrator:
             # known IDs so we keep deduping any we already handled.
             if latest_dt == after:
                 latest_ids |= seen_ids
+            for intent in slash.parse(fresh):
+                await self._handle_slash_intent(issue_id, run_id, intent)
             try:
                 await db.comment_cursors.set(
                     self._conn, issue_id, latest, latest_ids
                 )
             except Exception:  # noqa: BLE001
                 log.exception("failed to persist comment cursor for %s", issue_id)
-            for intent in slash.parse(fresh):
-                await self._handle_slash_intent(issue_id, run_id, intent)
 
     async def _resolve_comment_cursor(
         self, issue_id: str, run_id: str
