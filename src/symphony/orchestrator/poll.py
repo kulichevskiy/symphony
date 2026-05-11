@@ -310,8 +310,9 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="missing issue id"
             )
+        await self._restore_operator_waits()
         run_id = self._dispatch_run_ids.get(issue_id)
-        if run_id is None or run_id not in self._active_run_ids:
+        if run_id is None or not self._slash_command_run_eligible(run_id):
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
             )
@@ -353,6 +354,9 @@ class Orchestrator:
             detail="" if task is not None else "issue is already scheduled or active",
         )
 
+    def _slash_command_run_eligible(self, run_id: str) -> bool:
+        return run_id in self._active_run_ids or run_id in self._operator_wait_run_ids
+
     async def _poll_slash_commands(self) -> None:
         """For each active run, fetch new comments and dispatch slash intents.
 
@@ -364,10 +368,7 @@ class Orchestrator:
         await self._restore_operator_waits()
         pairs = list(self._dispatch_run_ids.items())
         for issue_id, run_id in pairs:
-            if (
-                run_id not in self._active_run_ids
-                and run_id not in self._operator_wait_run_ids
-            ):
+            if not self._slash_command_run_eligible(run_id):
                 continue
             try:
                 after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
