@@ -250,6 +250,37 @@ async def test_stale_cursor_clamped_to_run_start(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cursor_boundary_uses_datetime_order(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(
+            return_value=[
+                _comment(
+                    "noise",
+                    cid="offset",
+                    created_at="2026-05-10T12:30:00+01:00",
+                ),
+                _comment("noise", cid="utc", created_at="2026-05-10T12:00:00Z"),
+            ]
+        )
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        orch._active_run_ids.add("run-1")  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        cursor = await db.comment_cursors.get(conn, "iss-1")
+        assert cursor == ("2026-05-10T12:00:00Z", ["utc"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_self_authored_stop_is_ignored(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

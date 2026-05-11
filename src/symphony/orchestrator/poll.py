@@ -230,11 +230,16 @@ class Orchestrator:
             fresh = [c for c in comments if c.id not in seen_ids]
             if not fresh:
                 continue
-            latest = max(c.created_at for c in fresh)
-            latest_ids = {c.id for c in fresh if c.created_at == latest}
+            fresh_with_times = [(c, _parse_rfc3339(c.created_at)) for c in fresh]
+            latest_dt = max(created_at for _, created_at in fresh_with_times)
+            latest_comments = [
+                c for c, created_at in fresh_with_times if created_at == latest_dt
+            ]
+            latest = latest_comments[0].created_at
+            latest_ids = {c.id for c in latest_comments}
             # If the new boundary equals the previous boundary, accumulate the
             # known IDs so we keep deduping any we already handled.
-            if _parse_rfc3339(latest) == after:
+            if latest_dt == after:
                 latest_ids |= seen_ids
             try:
                 await db.comment_cursors.set(
