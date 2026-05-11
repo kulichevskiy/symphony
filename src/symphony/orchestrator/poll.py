@@ -253,11 +253,20 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
             )
-        if await self._comment_already_seen(issue_id, comment):
+        if not await db.comment_events.claim(
+            self._conn,
+            issue_id=issue_id,
+            comment_id=comment.id,
+            seen_at=comment.created_at,
+        ):
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="comment already handled"
             )
-        await self._handle_slash_comments(issue_id, run_id, [comment])
+        try:
+            await self._handle_slash_comments(issue_id, run_id, [comment])
+        except Exception:
+            await db.comment_events.forget(self._conn, comment.id)
+            raise
         await self._advance_comment_cursor(
             issue_id,
             comment.created_at,
@@ -318,7 +327,13 @@ class Orchestrator:
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
-            fresh = [c for c in comments if c.id not in seen_ids]
+            fresh: list[LinearComment] = []
+            for comment in comments:
+                if comment.id in seen_ids:
+                    continue
+                if await db.comment_events.seen(self._conn, comment.id):
+                    continue
+                fresh.append(comment)
             if not fresh:
                 continue
             fresh_with_times = [(c, _parse_rfc3339(c.created_at)) for c in fresh]
@@ -333,6 +348,7 @@ class Orchestrator:
             if latest_dt == after:
                 latest_ids |= seen_ids
             await self._handle_slash_comments(issue_id, run_id, fresh)
+            await self._record_seen_comments(issue_id, fresh)
             await self._advance_comment_cursor(issue_id, latest, latest_ids)
 
     async def _handle_slash_comments(
@@ -340,6 +356,15 @@ class Orchestrator:
     ) -> None:
         for intent in slash.parse(comments):
             await self._handle_slash_intent(issue_id, run_id, intent)
+
+    async def _record_seen_comments(
+        self, issue_id: str, comments: list[LinearComment]
+    ) -> None:
+        await db.comment_events.mark_many(
+            self._conn,
+            issue_id=issue_id,
+            comments=((comment.id, comment.created_at) for comment in comments),
+        )
 
     async def _advance_comment_cursor(
         self, issue_id: str, latest: str, latest_ids: set[str]
@@ -357,19 +382,6 @@ class Orchestrator:
             await db.comment_cursors.set(self._conn, issue_id, latest, latest_ids)
         except Exception:  # noqa: BLE001
             log.exception("failed to persist comment cursor for %s", issue_id)
-
-    async def _comment_already_seen(
-        self, issue_id: str, comment: LinearComment
-    ) -> bool:
-        stored = await db.comment_cursors.get(self._conn, issue_id)
-        if stored is None:
-            return False
-        stored_at, stored_ids = stored
-        stored_dt = _parse_rfc3339(stored_at)
-        comment_dt = _parse_rfc3339(comment.created_at)
-        return stored_dt > comment_dt or (
-            stored_dt == comment_dt and comment.id in stored_ids
-        )
 
     async def _resolve_comment_cursor(
         self, issue_id: str, run_id: str

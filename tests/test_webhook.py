@@ -268,12 +268,43 @@ async def test_webhook_comment_uses_slash_path_and_poll_does_not_refire(
         orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
 
         result = await orch.handle_linear_webhook(_payload())
+        duplicate = await orch.handle_linear_webhook(_payload())
         await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert result.handled is True
+        assert duplicate.handled is False
+        assert orch._runner.kill.await_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
+        cursor = await db.comment_cursors.get(conn, "iss-1")
+        assert cursor == ("2026-05-11T12:00:00+00:00", ["c1"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_comment_does_not_drop_older_out_of_order_command(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        orch._active_run_ids.add("run-1")  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+        await db.comment_cursors.set(
+            conn,
+            "iss-1",
+            "2026-05-11T12:01:00+00:00",
+            {"newer-noise"},
+        )
+
+        result = await orch.handle_linear_webhook(_payload())
 
         assert result.handled is True
         assert orch._runner.kill.await_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
         cursor = await db.comment_cursors.get(conn, "iss-1")
-        assert cursor == ("2026-05-11T12:00:00+00:00", ["c1"])
+        assert cursor == ("2026-05-11T12:01:00+00:00", ["newer-noise"])
     finally:
         await conn.close()
 

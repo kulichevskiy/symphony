@@ -46,6 +46,17 @@ CREATE TABLE IF NOT EXISTS comment_cursors (
     last_seen_ids TEXT NOT NULL DEFAULT '[]'
 );
 
+-- Comment IDs handled by either webhook or poll delivery. This lets webhook
+-- delivery order differ from comment creation order without dropping an older
+-- slash command merely because the cursor has already moved past it.
+CREATE TABLE IF NOT EXISTS comment_events (
+    comment_id TEXT PRIMARY KEY,
+    issue_id   TEXT NOT NULL REFERENCES issues(id),
+    seen_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_comment_events_issue ON comment_events(issue_id);
+
 -- Linear webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
 -- pruned opportunistically before each insert based on the configured TTL.
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
