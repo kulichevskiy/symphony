@@ -448,6 +448,16 @@ def _extract_file_path(item: Mapping[str, object], workspace_path: Path) -> str 
                     normalized = normalize_workspace_path(entry, workspace_path)
                     if normalized is not None:
                         return normalized
+    changes = item.get("changes")
+    if isinstance(changes, Sequence) and not isinstance(changes, (bytes, bytearray, str)):
+        for change in changes:
+            if not isinstance(change, Mapping):
+                continue
+            value = change.get("path")
+            if isinstance(value, str):
+                normalized = normalize_workspace_path(value, workspace_path)
+                if normalized is not None:
+                    return normalized
     return None
 
 

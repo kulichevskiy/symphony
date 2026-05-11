@@ -112,6 +112,21 @@ def test_parses_codex_command_and_file_activity(tmp_path: Path) -> None:
         file_path="src/symphony/activity.py",
     )
 
+    changes_line = _line(
+        "item.completed",
+        {
+            "id": "file-2",
+            "type": "file_change",
+            "changes": [{"path": str(workspace / "tests/test_activity.py")}],
+        },
+    )
+    changes_event = parse_codex_activity_line(changes_line, workspace)
+    assert changes_event == ActivityEvent(
+        kind="file_changed",
+        item_id="file-2",
+        file_path="tests/test_activity.py",
+    )
+
     assert (
         parse_codex_activity_line(
             json.dumps({"type": "todo_list", "items": []}),
