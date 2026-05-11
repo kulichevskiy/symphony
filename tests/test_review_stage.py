@@ -16,7 +16,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -935,6 +935,96 @@ async def test_review_poll_respects_global_dispatch_limit(tmp_path: Path) -> Non
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         gh.pr_checks.assert_awaited_once_with(42, repo="org/repo")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_review_poll_revalidates_issue_state_before_ci(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            global_max_concurrent=1,
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            side_effect=[_issue_in_progress(), _issue_done()]
+        )
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+
+        await orch._global_dispatch_sem.acquire()  # noqa: SLF001
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            tasks = await orch._poll_review_runs()  # noqa: SLF001
+            await asyncio.sleep(0)
+
+            assert len(tasks) == 1
+            assert not tasks[0].done()
+        finally:
+            orch._global_dispatch_sem.release()  # noqa: SLF001
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        gh.pr_checks.assert_not_awaited()
+        assert linear.lookup_issue.await_args_list == [call("iss-1"), call("iss-1")]
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("global_cap", "binding_cap"),
+    [
+        (0, 2),
+        (1, 0),
+    ],
+)
+async def test_review_poll_respects_zero_capacity_config(
+    tmp_path: Path,
+    global_cap: int,
+    binding_cap: int,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding().model_copy(update={"max_concurrent": binding_cap})
+        cfg = Config(
+            repos=[binding],
+            global_max_concurrent=global_cap,
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+
+        tasks = await _poll_review_and_wait(orch)
+
+        assert tasks == []
+        gh.pr_checks.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "running"
     finally:
         await conn.close()
 

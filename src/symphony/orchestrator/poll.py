@@ -494,6 +494,16 @@ class Orchestrator:
                 )
                 await self._close_review_run(run)
                 continue
+            if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
+                log.info(
+                    "review run %s for %s: dispatch capacity is zero "
+                    "(global=%d, binding=%d)",
+                    run.id,
+                    issue.identifier,
+                    self.config.global_max_concurrent,
+                    binding.max_concurrent,
+                )
+                continue
             scheduled.append(self._schedule_review_poll(run, binding, issue))
         return scheduled
 
@@ -536,6 +546,16 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
     ) -> None:
+        if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
+            log.info(
+                "review run %s for %s: dispatch capacity is zero "
+                "(global=%d, binding=%d)",
+                run.id,
+                issue.identifier,
+                self.config.global_max_concurrent,
+                binding.max_concurrent,
+            )
+            return
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
             key,
@@ -543,7 +563,66 @@ class Orchestrator:
         )
         async with self._global_dispatch_sem:
             async with binding_sem:
-                await self._poll_review_run(run, binding, issue)
+                current = await self._refresh_review_poll_candidate(run, binding, issue)
+                if current is None:
+                    return
+                current_binding, current_issue = current
+                await self._poll_review_run(run, current_binding, current_issue)
+
+    async def _refresh_review_poll_candidate(
+        self,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> tuple[RepoBinding, LinearIssue] | None:
+        live_review_runs = await db.runs.list_live_by_stage(self._conn, stage="review")
+        if not any(live_run.id == run.id for live_run in live_review_runs):
+            log.info("skipping review run %s: run is no longer live", run.id)
+            return None
+        try:
+            current = await self.linear.lookup_issue(run.issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not revalidate %s before review polling: %s",
+                issue.identifier,
+                e,
+            )
+            return None
+        state = await db.review_state.get(self._conn, current.id)
+        current_binding = self._binding_for_review(current, state)
+        if current_binding is None:
+            log.warning(
+                "no repo binding found for active review run %s (%s)",
+                run.id,
+                current.identifier,
+            )
+            await self._fail_orphaned_review_run(
+                run=run,
+                issue=current,
+                state=state,
+                error=(
+                    "review monitor no longer matches any configured "
+                    "repository binding"
+                ),
+            )
+            return None
+        if _binding_key(current_binding) != _binding_key(binding):
+            log.info(
+                "skipping review run %s for %s: binding changed before polling",
+                run.id,
+                current.identifier,
+            )
+            return None
+        if not _review_issue_is_active(current, current_binding):
+            log.info(
+                "closing review run %s for %s because issue is in %s",
+                run.id,
+                current.identifier,
+                current.state_name,
+            )
+            await self._close_review_run(run)
+            return None
+        return current_binding, current
 
     def _review_poll_done(self, task: asyncio.Task[None], run_id: str) -> None:
         self._review_poll_tasks.discard(task)
