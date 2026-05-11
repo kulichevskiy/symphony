@@ -26,19 +26,18 @@ def evaluate_cost(
     warning_pct: int,
     warning_already_fired: bool,
 ) -> CostDecision:
-    """Pure decision: did this tick cross the warning threshold for the
-    first time, and does the new cumulative total breach the cap?
+    """Pure decision: should the warning be posted, and did cost breach the cap?
 
     `warning_already_fired` is the persisted "we have posted the cost
-    warning for this issue" flag. The function also refuses to signal a
-    fresh warning when `previous_total` already cleared the threshold —
-    that catches missed-mark cases (e.g. a crash between posting the
-    comment and writing the flag) so the caller does not double-post.
+    warning for this issue" flag. Until that mark exists, keep asking the
+    caller to post the warning once the total is at or above the threshold;
+    this lets transient Linear failures retry on later ticks or runs.
     """
     threshold = cap_usd * (warning_pct / 100.0)
     fire_warning = (
         not warning_already_fired
-        and previous_total < threshold <= new_total
+        and cap_usd > 0
+        and new_total >= threshold
     )
     cap_breached = cap_usd > 0 and new_total >= cap_usd
     return CostDecision(fire_warning=fire_warning, cap_breached=cap_breached)

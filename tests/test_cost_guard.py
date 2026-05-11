@@ -72,11 +72,10 @@ def test_cap_breach_at_or_above_cap() -> None:
     assert over.cap_breached is True
 
 
-def test_threshold_already_passed_does_not_refire() -> None:
-    """If `previous_total` already cleared the threshold the crossing has
-    happened earlier in the trajectory; the function must not signal a
-    second warning even if no flag has been persisted yet (defence in
-    depth against a missed mark write)."""
+def test_unmarked_warning_retries_after_threshold() -> None:
+    """If no warning mark was persisted, later ticks above the threshold
+    should still ask the caller to post the warning. This lets transient
+    comment failures retry instead of permanently suppressing the notice."""
     d = evaluate_cost(
         previous_total=12.0,
         new_total=12.5,
@@ -84,7 +83,7 @@ def test_threshold_already_passed_does_not_refire() -> None:
         warning_pct=75,
         warning_already_fired=False,
     )
-    assert d.fire_warning is False
+    assert d.fire_warning is True
 
 
 def test_warning_and_breach_can_fire_in_same_tick() -> None:

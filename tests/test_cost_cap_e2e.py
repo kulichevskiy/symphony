@@ -18,7 +18,7 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.linear.client import LinearIssue
+from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 
 
@@ -318,6 +318,41 @@ async def test_warning_does_not_repost_after_persistent_mark(tmp_path: Path) -> 
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert not any("Cost notice" in b for b in bodies), bodies
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_warning_retries_after_transient_comment_failure(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=15.0,
+            cost_warning_pct=75,
+        )
+
+        ws = tmp_path / "ws" / "org_srepo" / "eng-1"
+        ws.mkdir(parents=True)
+        # 12 crosses the 11.25 threshold, then 13 remains over it without
+        # breaching the cap. The failed first warning should retry on 13.
+        runner = _CostStreamRunner([12.0, 1.0])
+        orch, linear, _gh, _ws = _orch(cfg, conn, runner, ws)
+        linear.post_comment.side_effect = [
+            "start-cmt",
+            LinearError("linear temporarily down"),
+            "warning-cmt",
+            "done-cmt",
+        ]
+
+        await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert sum(1 for b in bodies if "Cost notice" in b) == 2
+        assert await db.cost_marks.warning_posted_at(conn, "iss-1") is not None
     finally:
         await conn.close()
 

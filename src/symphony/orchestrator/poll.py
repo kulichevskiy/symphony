@@ -736,14 +736,13 @@ class Orchestrator:
                                 warning_already_fired=warning_already_fired,
                             )
                             if decision.fire_warning:
-                                await self._post_cost_warning(
+                                warning_already_fired = await self._post_cost_warning(
                                     binding=binding,
                                     issue=issue,
                                     run_id=run_id,
                                     cumulative_total=new_total,
                                     cap_usd=cap_usd,
                                 )
-                                warning_already_fired = True
                             if decision.cap_breached:
                                 cap_breached = True
                                 await self._kill_active_runner(run_id)
@@ -765,7 +764,7 @@ class Orchestrator:
         run_id: str,
         cumulative_total: float,
         cap_usd: float,
-    ) -> None:
+    ) -> bool:
         pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
         body = cost_warning(
             CommentVars(
@@ -781,10 +780,11 @@ class Orchestrator:
             await self.linear.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("cost_warning comment failed on %s: %s", issue.identifier, e)
-            return
+            return False
         await db.cost_marks.mark_warning_posted(
             self._conn, issue.id, datetime.now(UTC).isoformat()
         )
+        return True
 
     async def _handle_cap_breach(
         self,
