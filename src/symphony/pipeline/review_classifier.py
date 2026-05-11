@@ -180,6 +180,13 @@ def review_classifier(
         )
 
     pending = [c for c in ci if c.required is True and c.status != "completed"]
+    # Rule 2 — pending required CI check (no failures).
+    if pending:
+        return Verdict(
+            kind=VerdictKind.PENDING,
+            rule="pending_ci",
+            pending_checks=tuple(c.name for c in pending),
+        )
 
     fresh_reviews = [
         r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha
@@ -235,14 +242,6 @@ def review_classifier(
             trigger_signature="human_cr:" + ",".join(logins),
             rule="human_changes_requested",
             last_review_body=human_cr[-1].body,
-        )
-
-    # Rule 2 — pending required CI check (no failures, no fresh CR signals).
-    if pending:
-        return Verdict(
-            kind=VerdictKind.PENDING,
-            rule="pending_ci",
-            pending_checks=tuple(c.name for c in pending),
         )
 
     # Rule 6 — approval signals.

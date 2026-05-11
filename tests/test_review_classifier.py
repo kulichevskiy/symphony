@@ -156,6 +156,24 @@ def test_rule_2_pending_required_ci_marks_pending() -> None:
     assert "unit" in v.pending_checks
 
 
+def test_rule_2_pending_required_ci_wins_over_codex_feedback() -> None:
+    ci = [
+        CheckRun(name="unit", status="queued", conclusion=None, required=True),
+    ]
+    comments = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body="Fresh feedback should wait until CI settles.",
+            commit_sha=HEAD_SHA,
+            created_at=LATER,
+        ),
+    ]
+    v = review_classifier(comments=comments, ci=ci, snapshot=_snap())
+    assert v.kind == VerdictKind.PENDING
+    assert v.rule == "pending_ci"
+    assert "unit" in v.pending_checks
+
+
 # --- Rule 3: Codex inline comments on HEAD --------------------------------
 
 
