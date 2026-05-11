@@ -362,7 +362,7 @@ async def test_run_row_is_persisted_before_post_comment(tmp_path: Path) -> None:
 async def test_failed_announce_clears_dedupe_so_next_tick_retries(
     tmp_path: Path,
 ) -> None:
-    """If the ▶ `post_comment` raises, the run row must be marked
+    """If the 🚀 `post_comment` raises, the run row must be marked
     non-live so the next poll can retry. Otherwise a transient Linear
     error would jam the issue forever behind its own dedupe row."""
     from symphony.linear.client import LinearError
@@ -372,7 +372,7 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
-        # First scan's ▶ comment raises; second scan succeeds.
+        # First scan's 🚀 comment raises; second scan succeeds.
         linear.post_comment = AsyncMock(
             side_effect=[LinearError("boom"), "cmt-1", "cmt-2"]
         )

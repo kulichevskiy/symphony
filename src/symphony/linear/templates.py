@@ -59,7 +59,7 @@ class CommentVars:
 
 def run_started(v: CommentVars) -> str:
     return (
-        f"▶ **Implement starting** on `{v.repo}#{v.issue}`\n\n"
+        f"🚀 **Implement starting** on `{v.repo}#{v.issue}`\n\n"
         f"- Run ID: `{v.run_id}`\n"
         f"- Workspace cloned, agent dispatched.\n"
     )
