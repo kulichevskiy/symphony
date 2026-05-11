@@ -532,6 +532,46 @@ async def test_active_review_uses_persisted_binding_when_label_removed(
 
 
 @pytest.mark.asyncio
+async def test_active_review_does_not_rebind_stored_pr_to_different_repo(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, issue_label="feature")
+        cfg = Config(
+            repos=[
+                _binding().model_copy(update={"github_repo": "org/other-repo"}),
+            ],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        tasks = await _poll_review_and_wait(orch)
+
+        assert tasks == []
+        gh.pr_checks.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_fix_run_does_not_block_poll_tick(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

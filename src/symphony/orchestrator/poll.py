@@ -474,6 +474,7 @@ class Orchestrator:
                 if (binding.issue_label or "") != state.issue_label:
                     continue
                 return binding
+            return None
         return self._binding_for_issue(issue)
 
     def _schedule_review_poll(
