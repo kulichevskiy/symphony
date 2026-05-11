@@ -21,6 +21,7 @@ from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
 class _FakeRunner:
     def __init__(self, events: list[RunnerEvent]) -> None:
         self.events = events
+        self.kill_calls: list[str] = []
         self.captured_spec: RunnerSpec | None = None
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
@@ -32,7 +33,7 @@ class _FakeRunner:
             yield ev
 
     async def kill(self, run_id: str) -> None:
-        pass
+        self.kill_calls.append(run_id)
 
 
 class _BlockingRunner:
@@ -542,6 +543,165 @@ async def test_auto_merge_submission_waits_until_pr_reports_merged(
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history[-1].status == "done"
         assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_submitted_merge_regression_stays_pollable(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.create(
+            conn,
+            id="merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "state": "OPEN",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="FAILURE", bucket="fail")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        await _poll_and_wait(orch)
+
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "completed"
+        assert (await db.issue_prs.list_merge_candidates(conn))[0].pr_number == 42
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_agent_enforces_issue_cost_cap(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "total_cost_usd": 0.75,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        )
+        runner = _FakeRunner(
+            [
+                RunnerEvent(kind="started", pid=123),
+                RunnerEvent(kind="stdout", line=result_line),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_merge = AsyncMock()
+        push_fn = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=1.0,
+            cost_warning_pct=75,
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        assert runner.kill_calls
+        push_fn.assert_not_awaited()
+        gh.pr_merge.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        workspace.cleanup.assert_not_awaited()
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Cost notice" in body for body in bodies)
+        assert any("cost cap reached: $1.2500" in body for body in bodies)
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "needs_approval"
+        assert history[-1].cost_usd == pytest.approx(0.75)
     finally:
         await conn.close()
 

@@ -139,10 +139,16 @@ def build_merge_runner_command(
     agent: str,
     prompt: str,
     *,
+    max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
 ) -> list[str]:
     """argv for the Merge-stage final local pass."""
-    return build_runner_command(agent, prompt, codex_model=codex_model)
+    return build_runner_command(
+        agent,
+        prompt,
+        max_budget_usd=max_budget_usd,
+        codex_model=codex_model,
+    )
 
 
 _PR_URL_RE = re.compile(r"/pull/(\d+)")
@@ -1194,12 +1200,11 @@ class Orchestrator:
                 reason = "merge conflict against base"
             elif verdict.rule:
                 reason = f"review readiness regressed: {verdict.rule}"
-            await self._mark_merge_needs_approval(
-                binding=binding,
-                issue=issue,
-                pr_url=pr_url,
-                run_id=run_id,
-                reason=reason,
+            log.info(
+                "submitted merge for %s#%d is not ready yet: %s",
+                binding.github_repo,
+                pr_number,
+                reason,
             )
 
     async def _finalize_pr_if_closed(
@@ -1571,12 +1576,19 @@ class Orchestrator:
                 return run_id
 
             try:
-                cumulative_cost, final_kind, final_returncode = await self._run_merge_agent(
+                prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+                (
+                    cumulative_cost,
+                    final_kind,
+                    final_returncode,
+                    cap_breached,
+                ) = await self._run_merge_agent(
                     binding=binding,
                     issue=issue,
                     run_id=run_id,
                     workspace_path=workspace_path,
                     pr_url=pr_url,
+                    prior_total=prior_total,
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception("merge agent execution failed for %s", issue.identifier)
@@ -1595,6 +1607,19 @@ class Orchestrator:
                     (cumulative_cost, run_id),
                 )
                 await self._conn.commit()
+
+            if cap_breached:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=(
+                        "cost cap reached: "
+                        f"${prior_total + cumulative_cost:.4f}"
+                    ),
+                )
+                return run_id
 
             transition = on_runner_event(
                 stage="merge",
@@ -1925,7 +1950,26 @@ class Orchestrator:
         run_id: str,
         workspace_path: Path,
         pr_url: str,
-    ) -> tuple[float, str, int | None]:
+        prior_total: float,
+    ) -> tuple[float, str, int | None, bool]:
+        cap_usd = effective_cap(
+            global_cap_usd=self.config.cost_cap_per_issue_usd,
+            binding_override=binding.cost_cap_usd,
+        )
+        warning_pct = effective_warning_pct(
+            global_pct=self.config.cost_warning_pct,
+            binding_override=binding.cost_warning_pct,
+        )
+        warning_already_fired = (
+            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+        )
+
+        max_budget_usd: float | None = None
+        if cap_usd > 0:
+            max_budget_usd = cap_usd - prior_total
+            if max_budget_usd <= 0:
+                return 0.0, "cost_cap", None, True
+
         prompt = merge_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
@@ -1935,21 +1979,21 @@ class Orchestrator:
         command = build_merge_runner_command(
             binding.agent,
             prompt,
+            max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
         )
-        cumulative_cost, final_kind, final_returncode, _ = await self._run_stage_command(
+        return await self._run_stage_command(
             binding=binding,
             issue=issue,
             command=command,
             run_id=run_id,
             workspace_path=workspace_path,
             stage="merge",
-            prior_total=0.0,
-            cap_usd=0.0,
-            warning_pct=0,
-            warning_already_fired=True,
+            prior_total=prior_total,
+            cap_usd=cap_usd,
+            warning_pct=warning_pct,
+            warning_already_fired=warning_already_fired,
         )
-        return cumulative_cost, final_kind, final_returncode
 
     async def _run_stage_command(
         self,
@@ -2040,6 +2084,7 @@ class Orchestrator:
                                     binding=binding,
                                     issue=issue,
                                     run_id=run_id,
+                                    stage=stage,
                                     cumulative_total=new_total,
                                     cap_usd=cap_usd,
                                 )
@@ -2062,13 +2107,14 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         run_id: str,
+        stage: str,
         cumulative_total: float,
         cap_usd: float,
     ) -> bool:
         pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
         body = cost_warning(
             CommentVars(
-                stage="implement",
+                stage=stage,
                 repo=binding.github_repo,
                 issue=0,
                 run_id=run_id,
