@@ -53,3 +53,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE review_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''"
         )
+    if "github_repo" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''"
+        )
+    if "issue_label" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state ADD COLUMN issue_label TEXT NOT NULL DEFAULT ''"
+        )

@@ -24,12 +24,21 @@ class ReviewState:
     ci_fetch_failures: int
     pr_number: int | None
     pr_url: str
+    github_repo: str
+    issue_label: str
 
 
 async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
     cur = await conn.execute(
         """
-        SELECT iteration, last_trigger_signature, ci_fetch_failures, pr_number, pr_url
+        SELECT
+            iteration,
+            last_trigger_signature,
+            ci_fetch_failures,
+            pr_number,
+            pr_url,
+            github_repo,
+            issue_label
         FROM review_state
         WHERE issue_id = ?
         """,
@@ -43,6 +52,8 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
             ci_fetch_failures=0,
             pr_number=None,
             pr_url="",
+            github_repo="",
+            issue_label="",
         )
     return ReviewState(
         iteration=int(row["iteration"]),
@@ -50,6 +61,8 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
         ci_fetch_failures=int(row["ci_fetch_failures"]),
         pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
         pr_url=str(row["pr_url"]),
+        github_repo=str(row["github_repo"]),
+        issue_label=str(row["issue_label"]),
     )
 
 
@@ -59,23 +72,27 @@ async def begin_review(
     *,
     pr_number: int | None,
     pr_url: str,
+    github_repo: str,
+    issue_label: str | None,
 ) -> None:
     """Initialize durable state for a fresh Review stage."""
     await conn.execute(
         """
         INSERT INTO review_state (
             issue_id, iteration, last_trigger_signature,
-            ci_fetch_failures, pr_number, pr_url
+            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label
         )
-        VALUES (?, 0, '', 0, ?, ?)
+        VALUES (?, 0, '', 0, ?, ?, ?, ?)
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             last_trigger_signature = '',
             ci_fetch_failures = 0,
             pr_number = excluded.pr_number,
-            pr_url = excluded.pr_url
+            pr_url = excluded.pr_url,
+            github_repo = excluded.github_repo,
+            issue_label = excluded.issue_label
         """,
-        (issue_id, pr_number, pr_url),
+        (issue_id, pr_number, pr_url, github_repo, issue_label or ""),
     )
     await conn.commit()
 
@@ -164,15 +181,17 @@ async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
         """
         INSERT INTO review_state (
             issue_id, iteration, last_trigger_signature,
-            ci_fetch_failures, pr_number, pr_url
+            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label
         )
-        VALUES (?, 0, '', 0, NULL, '')
+        VALUES (?, 0, '', 0, NULL, '', '', '')
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             last_trigger_signature = '',
             ci_fetch_failures = 0,
             pr_number = NULL,
-            pr_url = ''
+            pr_url = '',
+            github_repo = '',
+            issue_label = ''
         """,
         (issue_id,),
     )

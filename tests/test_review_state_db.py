@@ -31,6 +31,8 @@ async def test_review_state_starts_at_zero(tmp_path: Path) -> None:
         assert state.ci_fetch_failures == 0
         assert state.pr_number is None
         assert state.pr_url == ""
+        assert state.github_repo == ""
+        assert state.issue_label == ""
     finally:
         await conn.close()
 
@@ -96,6 +98,8 @@ async def test_review_state_reset_clears_counter(tmp_path: Path) -> None:
         assert s.ci_fetch_failures == 0
         assert s.pr_number is None
         assert s.pr_url == ""
+        assert s.github_repo == ""
+        assert s.issue_label == ""
     finally:
         await conn.close()
 
@@ -112,6 +116,8 @@ async def test_review_state_begin_review_records_pr_metadata(tmp_path: Path) -> 
             "iss-1",
             pr_number=42,
             pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label="auto",
         )
         s = await review_state.get(conn, "iss-1")
         assert s.iteration == 0
@@ -119,6 +125,8 @@ async def test_review_state_begin_review_records_pr_metadata(tmp_path: Path) -> 
         assert s.ci_fetch_failures == 0
         assert s.pr_number == 42
         assert s.pr_url == "https://github.com/org/repo/pull/42"
+        assert s.github_repo == "org/repo"
+        assert s.issue_label == "auto"
     finally:
         await conn.close()
 

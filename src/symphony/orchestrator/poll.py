@@ -233,6 +233,8 @@ class Orchestrator:
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
         self._runs_moved_to_in_progress: set[str] = set()
+        self._review_poll_tasks: set[asyncio.Task[None]] = set()
+        self._review_poll_run_ids: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -286,7 +288,7 @@ class Orchestrator:
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
         try:
-            await self._poll_review_runs()
+            scheduled.extend(await self._poll_review_runs())
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("review poll failed")
         for binding in self.config.repos:
@@ -403,9 +405,16 @@ class Orchestrator:
             )
             for task in tuple(self._dispatch_tasks):
                 task.cancel()
+            for task in tuple(self._review_poll_tasks):
+                task.cancel()
         while self._dispatch_tasks:
             await asyncio.gather(
                 *tuple(self._dispatch_tasks),
+                return_exceptions=True,
+            )
+        while self._review_poll_tasks:
+            await asyncio.gather(
+                *tuple(self._review_poll_tasks),
                 return_exceptions=True,
             )
 
@@ -415,7 +424,7 @@ class Orchestrator:
         except Exception:
             log.exception("failed to kill runner for run_id=%s", run_id)
 
-    async def _poll_review_runs(self) -> None:
+    async def _poll_review_runs(self) -> list[asyncio.Task[None]]:
         """Poll CI for each active Review monitor row.
 
         Review uses a live `runs` row as the durable stage monitor. Local
@@ -423,15 +432,17 @@ class Orchestrator:
         remains `running` after a successful fix so the next tick can keep
         polling the same PR.
         """
+        scheduled: list[asyncio.Task[None]] = []
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
-            if run.id in self._active_run_ids:
+            if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
             try:
                 issue = await self.linear.lookup_issue(run.issue_id)
             except LinearError as e:
                 log.warning("could not resolve issue for review run %s: %s", run.id, e)
                 continue
-            binding = self._binding_for_issue(issue)
+            state = await db.review_state.get(self._conn, issue.id)
+            binding = self._binding_for_review(issue, state)
             if binding is None:
                 log.warning(
                     "no repo binding found for active review run %s (%s)",
@@ -439,7 +450,8 @@ class Orchestrator:
                     issue.identifier,
                 )
                 continue
-            await self._poll_review_run(run, binding, issue)
+            scheduled.append(self._schedule_review_poll(run, binding, issue))
+        return scheduled
 
     def _binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
         for binding in self.config.repos:
@@ -449,6 +461,39 @@ class Orchestrator:
                 continue
             return binding
         return None
+
+    def _binding_for_review(
+        self, issue: LinearIssue, state: db.review_state.ReviewState
+    ) -> RepoBinding | None:
+        if state.github_repo:
+            for binding in self.config.repos:
+                if binding.linear_team_key != issue.team_key:
+                    continue
+                if binding.github_repo != state.github_repo:
+                    continue
+                if (binding.issue_label or "") != state.issue_label:
+                    continue
+                return binding
+        return self._binding_for_issue(issue)
+
+    def _schedule_review_poll(
+        self, run: db.runs.Run, binding: RepoBinding, issue: LinearIssue
+    ) -> asyncio.Task[None]:
+        self._review_poll_run_ids.add(run.id)
+        task = asyncio.create_task(self._poll_review_run(run, binding, issue))
+        self._review_poll_tasks.add(task)
+        task.add_done_callback(partial(self._review_poll_done, run_id=run.id))
+        return task
+
+    def _review_poll_done(self, task: asyncio.Task[None], run_id: str) -> None:
+        self._review_poll_tasks.discard(task)
+        self._review_poll_run_ids.discard(run_id)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("review poll task crashed for run_id=%s", run_id)
 
     async def _poll_review_run(
         self,
@@ -1190,6 +1235,8 @@ class Orchestrator:
             issue.id,
             pr_number=pr_number,
             pr_url=pr_url,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label,
         )
         if pr_number is None:
             log.warning(
