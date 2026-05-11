@@ -45,3 +45,10 @@ CREATE TABLE IF NOT EXISTS comment_cursors (
     last_seen_at  TEXT NOT NULL,
     last_seen_ids TEXT NOT NULL DEFAULT '[]'
 );
+
+-- Linear webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
+-- pruned opportunistically before each insert based on the configured TTL.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id          TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL
+);

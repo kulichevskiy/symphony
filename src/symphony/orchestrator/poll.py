@@ -21,10 +21,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -36,7 +38,7 @@ from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import GitHub, GitHubError
 from ..linear import slash
-from ..linear.client import Linear, LinearError, LinearIssue
+from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
 from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import CommentVars, run_started, stage_done, truncate_body
 from ..pipeline.state_machine import on_runner_event
@@ -46,6 +48,13 @@ log = logging.getLogger(__name__)
 
 PushFn = Callable[[Path, str], Awaitable[None]]
 BindingKey = tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class WebhookDispatchResult:
+    kind: str
+    handled: bool
+    detail: str = ""
 
 
 def build_pr_title(issue: LinearIssue) -> str:
@@ -205,6 +214,88 @@ class Orchestrator:
             log.exception("slash command poll failed")
         return scheduled
 
+    async def handle_linear_webhook(
+        self, payload: dict[str, Any]
+    ) -> WebhookDispatchResult:
+        """Handle a verified Linear webhook payload.
+
+        Webhooks are just another low-latency source for the same work the
+        poll loop already performs: issue state changes enter the normal
+        dispatch scheduler, and comment events enter the slash-command
+        handler shared with `_poll_slash_commands`.
+        """
+        event_type = str(payload.get("type") or "").casefold()
+        if event_type == "comment":
+            return await self._handle_webhook_comment(payload)
+        if event_type == "issue":
+            return await self._handle_webhook_issue(payload)
+        return WebhookDispatchResult(
+            kind=event_type or "unknown",
+            handled=False,
+            detail="ignored event type",
+        )
+
+    async def _handle_webhook_comment(
+        self, payload: Mapping[str, Any]
+    ) -> WebhookDispatchResult:
+        comment = _comment_from_webhook_payload(payload)
+        if comment is None:
+            return WebhookDispatchResult(
+                kind="comment", handled=False, detail="missing comment fields"
+            )
+        issue_id = _comment_issue_id_from_webhook_payload(payload)
+        if issue_id is None:
+            return WebhookDispatchResult(
+                kind="comment", handled=False, detail="missing issue id"
+            )
+        run_id = self._dispatch_run_ids.get(issue_id)
+        if run_id is None or run_id not in self._active_run_ids:
+            return WebhookDispatchResult(
+                kind="comment", handled=False, detail="no active run"
+            )
+        if await self._comment_already_seen(issue_id, comment):
+            return WebhookDispatchResult(
+                kind="comment", handled=False, detail="comment already handled"
+            )
+        await self._handle_slash_comments(issue_id, run_id, [comment])
+        await self._advance_comment_cursor(
+            issue_id,
+            comment.created_at,
+            {comment.id},
+        )
+        return WebhookDispatchResult(kind="comment", handled=True)
+
+    async def _handle_webhook_issue(
+        self, payload: Mapping[str, Any]
+    ) -> WebhookDispatchResult:
+        action = str(payload.get("action") or "").casefold()
+        if action and action not in {"create", "update"}:
+            return WebhookDispatchResult(
+                kind="issue", handled=False, detail="ignored action"
+            )
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return WebhookDispatchResult(
+                kind="issue", handled=False, detail="missing issue data"
+            )
+        issue_id = data.get("id")
+        if not isinstance(issue_id, str) or not issue_id:
+            return WebhookDispatchResult(
+                kind="issue", handled=False, detail="missing issue id"
+            )
+        issue = await self.linear.lookup_issue(issue_id)
+        binding = self._ready_binding_for_issue(issue)
+        if binding is None:
+            return WebhookDispatchResult(
+                kind="issue", handled=False, detail="issue is not dispatchable"
+            )
+        if self._dispatch_capacity(binding) <= 0:
+            return WebhookDispatchResult(
+                kind="issue", handled=False, detail="dispatch capacity is full"
+            )
+        task = await self._schedule_ready_issue(binding, issue)
+        return WebhookDispatchResult(kind="issue", handled=task is not None)
+
     async def _poll_slash_commands(self) -> None:
         """For each active run, fetch new comments and dispatch slash intents.
 
@@ -241,14 +332,44 @@ class Orchestrator:
             # known IDs so we keep deduping any we already handled.
             if latest_dt == after:
                 latest_ids |= seen_ids
-            for intent in slash.parse(fresh):
-                await self._handle_slash_intent(issue_id, run_id, intent)
-            try:
-                await db.comment_cursors.set(
-                    self._conn, issue_id, latest, latest_ids
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("failed to persist comment cursor for %s", issue_id)
+            await self._handle_slash_comments(issue_id, run_id, fresh)
+            await self._advance_comment_cursor(issue_id, latest, latest_ids)
+
+    async def _handle_slash_comments(
+        self, issue_id: str, run_id: str, comments: list[LinearComment]
+    ) -> None:
+        for intent in slash.parse(comments):
+            await self._handle_slash_intent(issue_id, run_id, intent)
+
+    async def _advance_comment_cursor(
+        self, issue_id: str, latest: str, latest_ids: set[str]
+    ) -> None:
+        try:
+            stored = await db.comment_cursors.get(self._conn, issue_id)
+            if stored is not None:
+                stored_at, stored_ids = stored
+                stored_dt = _parse_rfc3339(stored_at)
+                latest_dt = _parse_rfc3339(latest)
+                if stored_dt > latest_dt:
+                    return
+                if stored_dt == latest_dt:
+                    latest_ids |= set(stored_ids)
+            await db.comment_cursors.set(self._conn, issue_id, latest, latest_ids)
+        except Exception:  # noqa: BLE001
+            log.exception("failed to persist comment cursor for %s", issue_id)
+
+    async def _comment_already_seen(
+        self, issue_id: str, comment: LinearComment
+    ) -> bool:
+        stored = await db.comment_cursors.get(self._conn, issue_id)
+        if stored is None:
+            return False
+        stored_at, stored_ids = stored
+        stored_dt = _parse_rfc3339(stored_at)
+        comment_dt = _parse_rfc3339(comment.created_at)
+        return stored_dt > comment_dt or (
+            stored_dt == comment_dt and comment.id in stored_ids
+        )
 
     async def _resolve_comment_cursor(
         self, issue_id: str, run_id: str
@@ -350,24 +471,49 @@ class Orchestrator:
                 binding.max_concurrent,
             )
             return scheduled
-        binding_key = _binding_key(binding)
-        capacity = min(
-            self.config.global_max_concurrent - len(self._scheduled_issue_ids),
-            binding.max_concurrent
-            - self._scheduled_binding_counts.get(binding_key, 0),
-        )
+        capacity = self._dispatch_capacity(binding)
         if capacity <= 0:
             log.info("scan %s: dispatch capacity is full", binding.linear_team_key)
             return scheduled
         for issue in issues:
-            if issue.id in self._scheduled_issue_ids:
+            task = await self._schedule_ready_issue(binding, issue)
+            if task is None:
                 continue
-            if await db.runs.has_running_or_completed(self._conn, issue.id):
-                continue
-            scheduled.append(self._schedule_dispatch(binding, issue))
+            scheduled.append(task)
             if len(scheduled) >= capacity:
                 break
         return scheduled
+
+    def _dispatch_capacity(self, binding: RepoBinding) -> int:
+        if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
+            return 0
+        binding_key = _binding_key(binding)
+        return min(
+            self.config.global_max_concurrent - len(self._scheduled_issue_ids),
+            binding.max_concurrent
+            - self._scheduled_binding_counts.get(binding_key, 0),
+        )
+
+    async def _schedule_ready_issue(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> asyncio.Task[None] | None:
+        if issue.id in self._scheduled_issue_ids:
+            return None
+        if await db.runs.has_running_or_completed(self._conn, issue.id):
+            return None
+        return self._schedule_dispatch(binding, issue)
+
+    def _ready_binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
+        issue_labels = set(issue.labels)
+        for binding in self.config.repos:
+            if binding.linear_team_key != issue.team_key:
+                continue
+            if issue.state_name != binding.linear_states.ready:
+                continue
+            if binding.issue_label and binding.issue_label not in issue_labels:
+                continue
+            return binding
+        return None
 
     def _schedule_dispatch(
         self, binding: RepoBinding, issue: LinearIssue
@@ -801,7 +947,60 @@ class Orchestrator:
 
 __all__ = [
     "Orchestrator",
+    "WebhookDispatchResult",
     "build_pr_body",
     "build_pr_title",
     "build_runner_command",
 ]
+
+
+def _comment_issue_id_from_webhook_payload(payload: Mapping[str, Any]) -> str | None:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    issue_id = data.get("issueId")
+    if isinstance(issue_id, str) and issue_id:
+        return issue_id
+    issue = data.get("issue")
+    if isinstance(issue, Mapping):
+        nested = issue.get("id")
+        if isinstance(nested, str) and nested:
+            return nested
+    return None
+
+
+def _comment_from_webhook_payload(
+    payload: Mapping[str, Any]
+) -> LinearComment | None:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    comment_id = data.get("id")
+    body = data.get("body")
+    created_at = data.get("createdAt") or payload.get("createdAt")
+    if not isinstance(comment_id, str) or not comment_id:
+        return None
+    if not isinstance(body, str):
+        return None
+    if not isinstance(created_at, str) or not created_at:
+        return None
+    actor = payload.get("actor")
+    author_name = ""
+    author_is_me = False
+    if isinstance(actor, Mapping):
+        raw_name = actor.get("name")
+        author_name = raw_name if isinstance(raw_name, str) else ""
+        author_is_me = bool(actor.get("isMe", False))
+    external_thread_type: str | None = None
+    ext = data.get("externalThread")
+    if isinstance(ext, Mapping):
+        raw_type = ext.get("type")
+        external_thread_type = raw_type if isinstance(raw_type, str) else None
+    return LinearComment(
+        id=comment_id,
+        body=body,
+        created_at=created_at,
+        author_name=author_name,
+        author_is_me=author_is_me,
+        external_thread_type=external_thread_type,
+    )

@@ -78,6 +78,9 @@ class Secrets(BaseSettings):
     )
 
     linear_api_key: str = Field(default="", validation_alias="LINEAR_API_KEY")
+    linear_webhook_secret: str = Field(
+        default="", validation_alias="LINEAR_WEBHOOK_SECRET"
+    )
 
 
 class Config(BaseModel):
@@ -88,6 +91,10 @@ class Config(BaseModel):
     workspace_root: Path = Path("~/symphony/workspaces")
     log_root: Path = Path("~/symphony/logs")
     db_path: Path = Path("~/symphony/state.sqlite")
+    webhook_host: Literal["127.0.0.1"] = "127.0.0.1"
+    webhook_port: int = Field(default=8787, ge=1, le=65535)
+    webhook_dedupe_ttl_secs: int = Field(default=600, ge=1)
+    webhook_timestamp_tolerance_secs: int = Field(default=60, ge=1)
 
     repos: list[RepoBinding] = Field(default_factory=list)
 
@@ -97,13 +104,19 @@ class Config(BaseModel):
 
     # Filled in from Secrets.
     linear_api_key: str = ""
+    linear_webhook_secret: str = ""
 
     @classmethod
     def load(cls, path: Path) -> Config:
         raw = yaml.safe_load(path.read_text())
         cfg = cls.model_validate(raw)
         secrets = Secrets()
-        cfg = cfg.model_copy(update={"linear_api_key": secrets.linear_api_key})
+        cfg = cfg.model_copy(
+            update={
+                "linear_api_key": secrets.linear_api_key,
+                "linear_webhook_secret": secrets.linear_webhook_secret,
+            }
+        )
         # Expand ~ now so downstream code can assume absolute paths.
         cfg = cfg.model_copy(
             update={
