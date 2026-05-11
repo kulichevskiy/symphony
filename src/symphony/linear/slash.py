@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .client import LinearComment
 
 _PATTERN = re.compile(r"^\s*/(approve|reject|retry|stop|skip-review)\b", re.IGNORECASE)
+_THUMBS_UP = {"👍", ":+1:", ":+1"}
 
 
 class SlashKind(StrEnum):
@@ -49,7 +50,11 @@ def parse(comments: list[LinearComment]) -> list[SlashIntent]:
         if c.external_thread_type is not None:
             # Mirrored from elsewhere; the originating side's poll handles it.
             continue
-        m = _PATTERN.match(c.body or "")
+        body = (c.body or "").strip()
+        if body in _THUMBS_UP:
+            out.append(SlashIntent(kind=SlashKind.APPROVE, comment_id=c.id, created_at=c.created_at))
+            continue
+        m = _PATTERN.match(body)
         if not m:
             continue
         kind = SlashKind(m.group(1).lower())

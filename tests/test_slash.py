@@ -62,3 +62,12 @@ def test_ignores_free_form() -> None:
 
 def test_ignores_unknown_slash() -> None:
     assert parse([_c("/yolo")]) == []
+
+
+def test_treats_thumbs_up_as_approve() -> None:
+    intents = parse([_c("👍", cid="c-1"), _c(":+1:", cid="c-2"), _c(":+1", cid="c-3")])
+    assert [i.kind for i in intents] == [
+        SlashKind.APPROVE,
+        SlashKind.APPROVE,
+        SlashKind.APPROVE,
+    ]
