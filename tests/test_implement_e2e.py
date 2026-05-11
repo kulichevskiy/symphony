@@ -1,7 +1,7 @@
 """End-to-end Implement dispatch with mocked external surfaces.
 
 Drag a Linear issue into `ready` → orchestrator clones the workspace,
-posts ▶ comment, moves the issue to `in_progress`, spawns the agent
+posts 🚀 comment, moves the issue to `in_progress`, spawns the agent
 runner with the implement prompt, parses cost/tokens from streaming
 JSON, persists run state to SQLite, opens a PR with the right title /
 body, posts a stage-transition comment, and **halts** at "In Progress".
@@ -163,7 +163,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # ▶ starting comment + stage-transition comment.
+        # 🚀 starting comment + stage-transition comment.
         assert linear.post_comment.await_count == 2
 
         # Issue moved to In Progress (and never further — Implement halts here).

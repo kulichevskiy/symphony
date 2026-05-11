@@ -175,8 +175,8 @@ async def test_cap_breach_parks_issue_at_needs_approval(tmp_path: Path) -> None:
         assert ("iss-1", "state-na") in moves
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        # ▶ start, 💸 cost notice, 🟠 cost-cap pause — exactly one of each.
-        assert sum(1 for b in bodies if b.startswith("▶")) == 1
+        # 🚀 start, 💸 cost notice, 🟠 cost-cap pause — exactly one of each.
+        assert sum(1 for b in bodies if b.startswith("🚀")) == 1
         assert sum(1 for b in bodies if "Cost notice" in b) == 1
         assert sum(1 for b in bodies if "Cost cap reached" in b) == 1
 

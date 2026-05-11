@@ -4,7 +4,7 @@ End-to-end scope (issue #7): scan each configured Linear team for issues
 in the "ready" state with the configured label, then for each one:
 
 1. Atomically insert a `runs` row (dedupe).
-2. Post a ▶ "starting" Linear comment.
+2. Post a 🚀 "starting" Linear comment.
 3. Move the issue to the binding's `in_progress` state.
 4. Acquire a per-issue workspace clone.
 5. Spawn the binding's runner with the Implement prompt; stream events
@@ -2060,7 +2060,7 @@ class Orchestrator:
 
         Persists first, announces second: if the host crashed after
         `post_comment` succeeded but before the row was written, the next
-        poll would post a duplicate ▶. Inserting first closes that
+        poll would post a duplicate 🚀. Inserting first closes that
         window. The insert is atomic against a racing dispatch.
         """
         run_id = str(uuid.uuid4())
@@ -2133,7 +2133,7 @@ class Orchestrator:
             run_id,
         )
 
-        # 1. ▶ "starting" Linear comment.
+        # 1. 🚀 "starting" Linear comment.
         starting = run_started(
             CommentVars(
                 stage="implement",
