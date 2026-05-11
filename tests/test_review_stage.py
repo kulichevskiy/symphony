@@ -72,12 +72,16 @@ class _BlockingRunner:
 
 
 def _binding(
-    *, agent: str = "claude", issue_label: str | None = None
+    *,
+    agent: str = "claude",
+    codex_model: str = "gpt-5.1-codex",
+    issue_label: str | None = None,
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
         agent=agent,  # type: ignore[arg-type]
+        codex_model=codex_model,
         issue_label=issue_label,
         branch_prefix="symphony",
         linear_states=LinearStates(ready="Todo"),
@@ -293,7 +297,7 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
     try:
         await _seed_active_review(conn)
         cfg = Config(
-            repos=[_binding(agent="codex")],
+            repos=[_binding(agent="codex", codex_model="gpt-5.1-codex-max")],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -360,7 +364,13 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
 
         assert runner.captured_spec is not None
         assert runner.captured_spec.stage == "review"
-        assert runner.captured_spec.command[0] == "codex"
+        assert runner.captured_spec.command[:5] == [
+            "codex",
+            "exec",
+            "--json",
+            "--model",
+            "gpt-5.1-codex-max",
+        ]
         prompt = runner.captured_spec.command[-1]
         assert prompt.startswith("# Failing check log tail")
         assert "ruff found a lint failure" in prompt
@@ -1102,8 +1112,18 @@ def test_build_fix_runner_command_uses_claude_when_binding_is_claude() -> None:
 
 
 def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
-    argv = build_fix_runner_command("codex", "fix this")
-    assert argv[0] == "codex"
+    argv = build_fix_runner_command(
+        "codex",
+        "fix this",
+        codex_model="gpt-5.1-codex-max",
+    )
+    assert argv[:5] == [
+        "codex",
+        "exec",
+        "--json",
+        "--model",
+        "gpt-5.1-codex-max",
+    ]
     assert "fix this" in argv
 
 
