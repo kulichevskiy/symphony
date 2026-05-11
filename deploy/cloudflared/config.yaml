@@ -1,0 +1,8 @@
+# Copy to /home/symphony/.cloudflared/config.yml and replace the placeholders.
+tunnel: symphonyd
+credentials-file: /home/symphony/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: symphonyd.example.com
+    service: http://127.0.0.1:8787
+  - service: http_status:404
