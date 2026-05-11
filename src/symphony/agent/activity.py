@@ -195,6 +195,13 @@ class ActivitySession:
                 due.append(command.item_id)
         return tuple(due)
 
+    def has_heartbeat_candidate(self, now: datetime) -> bool:
+        for command in self.active_commands.values():
+            age = max((now - command.started_at).total_seconds(), 0.0)
+            if age >= self.settings.long_running_secs:
+                return True
+        return False
+
     def has_unpublished_events(self) -> bool:
         return self.pending_event_count > 0
 
@@ -251,7 +258,7 @@ def parse_codex_activity_line(line: str, workspace_path: Path) -> ActivityEvent 
     if event_type not in {"item.started", "item.completed"}:
         return None
     item = _as_mapping(raw.get("item"))
-    item_type = str(item.get("type") or "")
+    item_type = str(item.get("type") or item.get("item_type") or raw.get("item_type") or "")
     if item_type == "command_execution":
         return _command_activity_event(
             raw=raw,

@@ -2831,6 +2831,8 @@ class Orchestrator:
         if session is None:
             return
         now = self._now()
+        if not session.has_heartbeat_candidate(now):
+            return
         raw_marks = await db.activity_comments.heartbeat_marks(
             self._conn,
             run_id=session.run_id,

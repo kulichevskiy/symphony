@@ -127,6 +127,21 @@ def test_parses_codex_command_and_file_activity(tmp_path: Path) -> None:
         file_path="tests/test_activity.py",
     )
 
+    legacy_line = _line(
+        "item.started",
+        {
+            "id": "cmd-legacy",
+            "item_type": "command_execution",
+            "command": "pytest",
+        },
+    )
+    legacy_event = parse_codex_activity_line(legacy_line, workspace)
+    assert legacy_event == ActivityEvent(
+        kind="command_started",
+        item_id="cmd-legacy",
+        command="pytest",
+    )
+
     assert (
         parse_codex_activity_line(
             json.dumps({"type": "todo_list", "items": []}),
@@ -213,7 +228,9 @@ def test_activity_session_long_running_heartbeat_repeats_by_command_id(
         )
         == ()
     )
+    assert session.has_heartbeat_candidate(start + timedelta(seconds=299)) is False
     first_due = start + timedelta(seconds=300)
+    assert session.has_heartbeat_candidate(first_due) is True
     assert session.heartbeat_due_item_ids(first_due, last_heartbeat_at_by_item={}) == ("cmd-1",)
     assert (
         session.heartbeat_due_item_ids(
@@ -527,5 +544,56 @@ async def test_orchestrator_posts_long_running_heartbeat_without_new_output(
             )
             == "2026-05-11T10:05:01+00:00"
         )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_tick_skips_heartbeat_db_before_candidate(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        start = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "workspaces",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            clock=lambda: start + timedelta(seconds=10),
+        )
+        session = ActivitySession(
+            settings=ActivitySettings(long_running_secs=300),
+            run_id="run-1",
+            stage="implement",
+            workspace_path=tmp_path,
+        )
+        heartbeat_marks = AsyncMock(return_value={})
+        monkeypatch.setattr(db.activity_comments, "heartbeat_marks", heartbeat_marks)
+
+        await orch._record_activity_tick(  # noqa: SLF001
+            session=session,
+            binding=_binding(),
+            issue=_issue(),
+            cumulative_total=0.0,
+        )
+        heartbeat_marks.assert_not_awaited()
+
+        session.record_event(
+            ActivityEvent(kind="command_started", item_id="cmd-1", command="pytest"),
+            start,
+        )
+        await orch._record_activity_tick(  # noqa: SLF001
+            session=session,
+            binding=_binding(),
+            issue=_issue(),
+            cumulative_total=0.0,
+        )
+        heartbeat_marks.assert_not_awaited()
     finally:
         await conn.close()
