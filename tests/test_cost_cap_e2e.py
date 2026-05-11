@@ -80,6 +80,7 @@ class _EventRunner:
 def _binding(
     *,
     agent: Literal["claude", "codex"] = "claude",
+    codex_model: str = "gpt-5.1-codex",
     cost_cap_usd: float | None = None,
     cost_warning_pct: int | None = None,
 ) -> RepoBinding:
@@ -87,6 +88,7 @@ def _binding(
         linear_team_key="ENG",
         github_repo="org/repo",
         agent=agent,
+        codex_model=codex_model,
         branch_prefix="symphony",
         cost_cap_usd=cost_cap_usd,
         cost_warning_pct=cost_warning_pct,
@@ -172,10 +174,10 @@ async def test_cap_breach_parks_issue_at_needs_approval(tmp_path: Path) -> None:
         assert ("iss-1", "state-na") in moves
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        # ▶ start, 💸 cost notice, 🟠 stuck-loop escape — exactly one of each.
+        # ▶ start, 💸 cost notice, 🟠 cost-cap pause — exactly one of each.
         assert sum(1 for b in bodies if b.startswith("▶")) == 1
         assert sum(1 for b in bodies if "Cost notice" in b) == 1
-        assert sum(1 for b in bodies if "Stuck-loop escape" in b) == 1
+        assert sum(1 for b in bodies if "Cost cap reached" in b) == 1
 
         gh.pr_create.assert_not_awaited()
         assert runner.kill_calls == [orch._dispatch_run_ids.get("iss-1") or ""] or runner.kill_calls  # noqa: SLF001
@@ -270,7 +272,7 @@ async def test_cap_uses_per_issue_total_across_runs(tmp_path: Path) -> None:
         moves = [c.args for c in linear.move_issue.await_args_list]
         assert ("iss-1", "state-na") in moves
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("Stuck-loop escape" in b for b in bodies)
+        assert any("Cost cap reached" in b for b in bodies)
         gh.pr_create.assert_not_awaited()
     finally:
         await conn.close()
@@ -314,7 +316,7 @@ async def test_cap_already_reached_skips_runner_and_parks(tmp_path: Path) -> Non
         moves = [c.args for c in linear.move_issue.await_args_list]
         assert ("iss-1", "state-na") in moves
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("Stuck-loop escape" in b for b in bodies)
+        assert any("Cost cap reached" in b for b in bodies)
         gh.pr_create.assert_not_awaited()
     finally:
         await conn.close()
@@ -350,7 +352,7 @@ async def test_cap_breach_marks_run_failed_when_state_lookup_fails(
         assert history[0].status == "failed"
         assert history[0].ended_at is not None
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("Stuck-loop escape" in b for b in bodies)
+        assert any("Cost cap reached" in b for b in bodies)
         gh.pr_create.assert_not_awaited()
     finally:
         await conn.close()
@@ -473,6 +475,14 @@ async def test_codex_token_usage_estimates_cost_for_cap(tmp_path: Path) -> None:
 
         await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
 
+        assert runner.captured_spec is not None
+        assert runner.captured_spec.command[:5] == [
+            "codex",
+            "exec",
+            "--json",
+            "--model",
+            "gpt-5.1-codex",
+        ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"

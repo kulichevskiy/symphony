@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
 
 
 def _expand(path: str | Path) -> Path:
@@ -56,6 +58,7 @@ class RepoBinding(BaseModel):
     linear_team_key: str
     github_repo: str
     agent: Literal["claude", "codex"] = "claude"
+    codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None
     branch_prefix: str = "symphony"
     base_branch: str | None = None
@@ -66,6 +69,14 @@ class RepoBinding(BaseModel):
     cost_cap_usd: float | None = None
     cost_warning_pct: int | None = None
     linear_states: LinearStates
+
+    @field_validator("codex_model")
+    @classmethod
+    def _known_codex_model(cls, value: str) -> str:
+        if value not in SUPPORTED_CODEX_MODELS:
+            supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
+            raise ValueError(f"unknown Codex model {value!r}; supported: {supported}")
+        return value
 
 
 class Secrets(BaseSettings):

@@ -101,6 +101,18 @@ def stuck_loop_escape(v: CommentVars) -> str:
     )
 
 
+def cost_cap_reached(v: CommentVars) -> str:
+    return (
+        f"🟠 **Cost cap reached — pipeline paused**\n\n"
+        f"Symphony paused `{v.repo}#{v.issue}` because cumulative agent "
+        f"cost reached **{v.cost}** during **{v.stage}**.\n\n"
+        f"- Run ID: `{v.run_id}`\n"
+        f"- PR: {v.pr_url}\n\n"
+        f"Reply with `/approve` to force-advance, `/reject` to stop, or "
+        f"free-form steering after raising the cap or retrying manually.\n"
+    )
+
+
 def failed(v: CommentVars) -> str:
     body = (
         f"🔴 **{v.stage.title()} stage failed — pipeline halted**\n\n"

@@ -29,6 +29,7 @@ from pathlib import Path
 import aiosqlite
 
 from .. import db
+from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.process import parse_event_line
 from ..agent.prompt import implement_prompt
 from ..agent.runner import Runner, RunnerSpec
@@ -38,10 +39,10 @@ from ..github.client import GitHub, GitHubError
 from ..linear.client import Linear, LinearError, LinearIssue
 from ..linear.templates import (
     CommentVars,
+    cost_cap_reached,
     cost_warning,
     run_started,
     stage_done,
-    stuck_loop_escape,
     truncate_body,
 )
 from ..pipeline.cost_guard import (
@@ -75,6 +76,7 @@ def build_runner_command(
     prompt: str,
     *,
     max_budget_usd: float | None = None,
+    codex_model: str = DEFAULT_CODEX_MODEL,
 ) -> list[str]:
     """Per-runner argv for the Implement stage prompt."""
     if agent == "claude":
@@ -90,7 +92,7 @@ def build_runner_command(
         command.append(prompt)
         return command
     if agent == "codex":
-        return ["codex", "exec", "--json", prompt]
+        return ["codex", "exec", "--json", "--model", codex_model, prompt]
     raise ValueError(f"unknown agent {agent!r}")
 
 
@@ -548,8 +550,7 @@ class Orchestrator:
             )
             await self._conn.commit()
 
-        # Cost cap breach: park the issue at `needs_approval` with the
-        # stuck-loop-escape template, do not open a PR.
+        # Cost cap breach: park the issue for operator action; do not open a PR.
         if cap_breached:
             await self._handle_cap_breach(
                 binding=binding,
@@ -694,6 +695,7 @@ class Orchestrator:
             binding.agent,
             prompt,
             max_budget_usd=max_budget_usd,
+            codex_model=binding.codex_model,
         )
         spec = RunnerSpec(
             run_id=run_id,
@@ -751,6 +753,7 @@ class Orchestrator:
                                     input_tokens=input_delta,
                                     cached_input_tokens=cached_input_delta,
                                     output_tokens=output_delta,
+                                    model=binding.codex_model,
                                 )
                             previous_total = prior_total + cumulative_cost
                             cumulative_cost += cost_delta
@@ -823,10 +826,8 @@ class Orchestrator:
         run_id: str,
         cumulative_total: float,
     ) -> None:
-        """Park a cost-capped issue and post stuck-loop-escape."""
+        """Park a cost-capped issue and post a cost-cap escalation."""
         try:
-            history = await db.runs.history_for_issue(self._conn, issue.id)
-            review_iter = sum(1 for r in history if r.stage == "review")
             try:
                 states = await self._states_for_binding(binding)
             except LinearError as e:
@@ -875,14 +876,13 @@ class Orchestrator:
                     binding.linear_team_key,
                     issue.identifier,
                 )
-            body = stuck_loop_escape(
+            body = cost_cap_reached(
                 CommentVars(
                     stage="implement",
                     repo=binding.github_repo,
                     issue=0,
                     run_id=run_id,
                     cost=f"${cumulative_total:.4f}",
-                    review_iter=review_iter,
                     trigger="cost_cap",
                 )
             )
@@ -890,7 +890,7 @@ class Orchestrator:
                 await self.linear.post_comment(issue.id, truncate_body(body))
             except LinearError as e:
                 log.warning(
-                    "stuck_loop_escape comment failed on %s: %s", issue.identifier, e
+                    "cost_cap_reached comment failed on %s: %s", issue.identifier, e
                 )
         finally:
             await db.runs.update_status(

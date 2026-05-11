@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..agent.codex_models import DEFAULT_CODEX_MODEL, pricing_for_codex_model
+
 
 @dataclass(frozen=True)
 class CostDecision:
@@ -18,24 +20,21 @@ class CostDecision:
     cap_breached: bool
 
 
-CODEX_INPUT_USD_PER_MILLION_TOKENS = 1.25
-CODEX_CACHED_INPUT_USD_PER_MILLION_TOKENS = 0.125
-CODEX_OUTPUT_USD_PER_MILLION_TOKENS = 10.0
-
-
 def estimate_codex_cost_usd(
     *,
     input_tokens: int,
     output_tokens: int,
     cached_input_tokens: int = 0,
+    model: str = DEFAULT_CODEX_MODEL,
 ) -> float:
     """Estimate Codex USD cost from token usage when CLI output has no price."""
+    pricing = pricing_for_codex_model(model)
     cached = max(cached_input_tokens, 0)
     billable_input = max(input_tokens - cached, 0)
     return (
-        (billable_input * CODEX_INPUT_USD_PER_MILLION_TOKENS)
-        + (cached * CODEX_CACHED_INPUT_USD_PER_MILLION_TOKENS)
-        + (max(output_tokens, 0) * CODEX_OUTPUT_USD_PER_MILLION_TOKENS)
+        (billable_input * pricing.input_usd_per_million_tokens)
+        + (cached * pricing.cached_input_usd_per_million_tokens)
+        + (max(output_tokens, 0) * pricing.output_usd_per_million_tokens)
     ) / 1_000_000
 
 
