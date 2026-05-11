@@ -451,9 +451,8 @@ class Orchestrator:
         """Poll CI for each active Review monitor row.
 
         Review uses a live `runs` row as the durable stage monitor. Local
-        fix-runs reuse that row's run id while the runner is active; the row
-        remains `running` after a successful fix so the next tick can keep
-        polling the same PR.
+        fix-runs get separate `review_fix` rows so subprocess PIDs and
+        interruption reconciliation never mutate the monitor row.
         """
         scheduled: list[asyncio.Task[None]] = []
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
@@ -661,15 +660,33 @@ class Orchestrator:
             )
             return
 
+        fix_run_id = str(uuid.uuid4())
+        await db.runs.create(
+            self._conn,
+            id=fix_run_id,
+            issue_id=issue.id,
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+        self._dispatch_run_ids[issue.id] = fix_run_id
+
         try:
             cost, final_kind, final_returncode = await self._run_fix_agent(
                 binding=binding,
-                run_id=run.id,
+                run_id=fix_run_id,
                 workspace_path=workspace_path,
                 prompt=prompt,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("review fix-run execution failed for %s", issue.identifier)
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "failed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
             await self._fail_review_run(
                 run=run,
                 binding=binding,
@@ -679,10 +696,12 @@ class Orchestrator:
             )
             return
         finally:
+            if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                self._dispatch_run_ids.pop(issue.id, None)
             self._workspace.release(binding, issue)
 
         if cost > 0:
-            await db.runs.add_cost(self._conn, run.id, cost)
+            await db.runs.add_cost(self._conn, fix_run_id, cost)
 
         transition = on_runner_event(
             stage="review",
@@ -690,6 +709,12 @@ class Orchestrator:
             returncode=final_returncode,
         )
         if transition.next_run_status != "completed":
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                transition.next_run_status,
+                ended_at=datetime.now(UTC).isoformat(),
+            )
             await self._fail_review_run(
                 run=run,
                 binding=binding,
@@ -698,6 +723,13 @@ class Orchestrator:
                 last_log="",
             )
             return
+
+        await db.runs.update_status(
+            self._conn,
+            fix_run_id,
+            "completed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
 
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
@@ -1335,7 +1367,6 @@ class Orchestrator:
             workspace_path=workspace_path,
             command=command,
             stage="review",
-            clear_pid_on_finish=True,
         )
 
     async def _run_runner(

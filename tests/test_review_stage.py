@@ -24,7 +24,7 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
-from symphony.linear.client import LinearIssue
+from symphony.linear.client import LinearComment, LinearIssue
 from symphony.orchestrator.poll import (
     Orchestrator,
     build_fix_runner_command,
@@ -54,6 +54,7 @@ class _BlockingRunner:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.captured_spec: RunnerSpec | None = None
+        self.killed_run_ids: list[str] = []
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         self.captured_spec = spec
@@ -66,6 +67,7 @@ class _BlockingRunner:
         yield RunnerEvent(kind="exit", returncode=0)
 
     async def kill(self, run_id: str) -> None:
+        self.killed_run_ids.append(run_id)
         self.release.set()
 
 
@@ -109,6 +111,17 @@ def _issue_in_progress(*, labels: list[str] | None = None) -> LinearIssue:
         state_type="started",
         team_key="ENG",
         labels=labels if labels is not None else ["feature"],
+    )
+
+
+def _comment(body: str, *, cid: str = "c1") -> LinearComment:
+    return LinearComment(
+        id=cid,
+        body=body,
+        created_at="2026-05-11T12:00:00+00:00",
+        author_name="user",
+        author_is_me=False,
+        external_thread_type=None,
     )
 
 
@@ -346,9 +359,15 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert state.last_trigger_signature == "ci:head-sha:lint"
         assert state.ci_fetch_failures == 0
         history = await db.runs.history_for_issue(conn, "iss-1")
-        assert history[0].status == "running"
-        assert history[0].pid is None
-        assert history[0].cost_usd == pytest.approx(0.2)
+        monitor = next(r for r in history if r.id == "review-run")
+        fix_runs = [r for r in history if r.stage == "review_fix"]
+        assert len(fix_runs) == 1
+        assert monitor.status == "running"
+        assert monitor.pid is None
+        assert monitor.cost_usd == pytest.approx(0.0)
+        assert fix_runs[0].status == "completed"
+        assert fix_runs[0].pid == 999
+        assert fix_runs[0].cost_usd == pytest.approx(0.2)
     finally:
         await conn.close()
 
@@ -684,6 +703,69 @@ async def test_review_fix_run_does_not_block_poll_tick(tmp_path: Path) -> None:
             linear.issues_in_state.assert_awaited_once_with("ENG", "Todo", None)
             assert len(tasks) == 1
             assert not tasks[0].done()
+        finally:
+            runner.release.set()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_intent_kills_active_review_fix_run(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.comments_since = AsyncMock(return_value=[_comment("/stop")])
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="lint", state="FAILURE", bucket="fail", link=None)]
+            )
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_comment = AsyncMock()
+
+        runner = _BlockingRunner()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        tasks = await orch._poll_review_runs()  # noqa: SLF001
+        try:
+            await asyncio.wait_for(runner.started.wait(), timeout=1)
+            fix_run_id = orch._dispatch_run_ids["iss-1"]  # noqa: SLF001
+
+            await orch._poll_slash_commands()  # noqa: SLF001
+
+            assert runner.killed_run_ids == [fix_run_id]
+            assert runner.release.is_set()
+            monitor = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+            assert monitor.id == "review-run"
+            assert monitor.pid is None
         finally:
             runner.release.set()
             if tasks:
