@@ -64,13 +64,15 @@ query IssuesInState($team: String!, $stateName: String!) {
 """
 
 ISSUE_COMMENTS_SINCE = """
-query IssueComments($id: String!, $after: DateTime!) {
+query IssueComments($id: String!, $after: DateTime!, $cursor: String) {
   issue(id: $id) {
     comments(
       first: 50,
-      filter: { createdAt: { gt: $after } },
+      after: $cursor,
+      filter: { createdAt: { gte: $after } },
       orderBy: createdAt
     ) {
+      pageInfo { hasNextPage endCursor }
       nodes {
         id body createdAt
         user { id name email isMe }

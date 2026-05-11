@@ -36,7 +36,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_status_pid ON runs(status, pid);
 -- Per-issue cost aggregation (cost_cap_per_issue_usd enforcement).
 CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 
+-- `last_seen_ids` is a JSON array of comment IDs that share `last_seen_at`.
+-- Combined with a `gte` filter on the next fetch, this prevents losing
+-- comments tied at the boundary timestamp (e.g. bursty creation, pagination
+-- splitting a same-millisecond batch) without re-firing already-handled ones.
 CREATE TABLE IF NOT EXISTS comment_cursors (
-    issue_id     TEXT PRIMARY KEY REFERENCES issues(id),
-    last_seen_at TEXT NOT NULL
+    issue_id      TEXT PRIMARY KEY REFERENCES issues(id),
+    last_seen_at  TEXT NOT NULL,
+    last_seen_ids TEXT NOT NULL DEFAULT '[]'
 );

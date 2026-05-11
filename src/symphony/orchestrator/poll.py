@@ -35,7 +35,9 @@ from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import GitHub, GitHubError
+from ..linear import slash
 from ..linear.client import Linear, LinearError, LinearIssue
+from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import CommentVars, run_started, stage_done, truncate_body
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
@@ -79,6 +81,14 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
         binding.github_repo,
         binding.issue_label or "",
     )
+
+
+def _parse_rfc3339(s: str) -> datetime:
+    """Linear timestamps end in `Z`; Python's `fromisoformat` accepts the
+    `+00:00` form. Normalize before parsing."""
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -189,7 +199,106 @@ class Orchestrator:
         scheduled: list[asyncio.Task[None]] = []
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
+        try:
+            await self._poll_slash_commands()
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("slash command poll failed")
         return scheduled
+
+    async def _poll_slash_commands(self) -> None:
+        """For each active run, fetch new comments and dispatch slash intents.
+
+        The cursor (`(timestamp, ids_at_timestamp)`) lives in `comment_cursors`.
+        We query with `gte` and drop any comment whose ID is in the cursor's
+        boundary set, which both (a) avoids re-firing handled commands across
+        restarts and (b) avoids losing comments tied at the boundary timestamp.
+        """
+        pairs = list(self._dispatch_run_ids.items())
+        for issue_id, run_id in pairs:
+            if run_id not in self._active_run_ids:
+                continue
+            try:
+                after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
+            except Exception:  # noqa: BLE001 — keep loop alive
+                log.exception("failed to resolve cursor for issue %s", issue_id)
+                continue
+            try:
+                comments = await self.linear.comments_since(issue_id, after)
+            except LinearError as e:
+                log.warning("comments_since failed for %s: %s", issue_id, e)
+                continue
+            fresh = [c for c in comments if c.id not in seen_ids]
+            if not fresh:
+                continue
+            fresh_with_times = [(c, _parse_rfc3339(c.created_at)) for c in fresh]
+            latest_dt = max(created_at for _, created_at in fresh_with_times)
+            latest_comments = [
+                c for c, created_at in fresh_with_times if created_at == latest_dt
+            ]
+            latest = latest_comments[0].created_at
+            latest_ids = {c.id for c in latest_comments}
+            # If the new boundary equals the previous boundary, accumulate the
+            # known IDs so we keep deduping any we already handled.
+            if latest_dt == after:
+                latest_ids |= seen_ids
+            for intent in slash.parse(fresh):
+                await self._handle_slash_intent(issue_id, run_id, intent)
+            try:
+                await db.comment_cursors.set(
+                    self._conn, issue_id, latest, latest_ids
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("failed to persist comment cursor for %s", issue_id)
+
+    async def _resolve_comment_cursor(
+        self, issue_id: str, run_id: str
+    ) -> tuple[datetime, set[str]]:
+        """Resolve the cursor, clamped to the current run's `started_at`.
+
+        Without the clamp, a stale slash comment posted between two runs on
+        the same issue would still be `> stored_cursor` when the next run
+        starts, and the first poll tick could immediately kill it even though
+        the command was not intended for it.
+        """
+        run_started = await self._run_started_at(run_id)
+        stored = await db.comment_cursors.get(self._conn, issue_id)
+        if stored is None:
+            return run_started, set()
+        stored_at, stored_ids = stored
+        stored_dt = _parse_rfc3339(stored_at)
+        if stored_dt < run_started:
+            return run_started, set()
+        return stored_dt, set(stored_ids)
+
+    async def _run_started_at(self, run_id: str) -> datetime:
+        cur = await self._conn.execute(
+            "SELECT started_at FROM runs WHERE id = ?", (run_id,)
+        )
+        row = await cur.fetchone()
+        if row is not None and row[0]:
+            return _parse_rfc3339(row[0])
+        return datetime(1970, 1, 1, tzinfo=UTC)
+
+    async def _handle_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        if intent.kind is SlashKind.STOP:
+            log.info(
+                "/stop received for run %s (issue %s) — terminating runner",
+                run_id,
+                issue_id,
+            )
+            try:
+                await self._runner.kill(run_id)
+            except Exception:  # noqa: BLE001
+                log.exception("runner.kill failed for run %s", run_id)
+                raise
+            return
+        log.info(
+            "slash %s received for run %s (handler not implemented in this slice)",
+            intent.kind,
+            run_id,
+        )
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
