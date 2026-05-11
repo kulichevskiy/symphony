@@ -136,6 +136,25 @@ def test_rule_1_failing_ci_with_unknown_required_still_blocks() -> None:
     assert v.rule == "failing_ci"
 
 
+def test_rule_1_failing_ci_signature_is_scoped_to_head_sha() -> None:
+    ci = [
+        CheckRun(name="lint", status="completed", conclusion="failure", required=True),
+    ]
+    first = review_classifier(
+        comments=[],
+        ci=ci,
+        snapshot=_snap(head_sha="first-head"),
+    )
+    second = review_classifier(
+        comments=[],
+        ci=ci,
+        snapshot=_snap(head_sha="second-head"),
+    )
+    assert first.trigger_signature.startswith("ci:first-head:")
+    assert second.trigger_signature.startswith("ci:second-head:")
+    assert first.trigger_signature != second.trigger_signature
+
+
 def test_rule_1_explicitly_optional_failure_does_not_block() -> None:
     ci = [
         CheckRun(name="flaky", status="completed", conclusion="failure", required=False),

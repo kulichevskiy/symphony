@@ -188,7 +188,7 @@ def review_classifier(
         names = sorted(c.name for c in failing)
         return Verdict(
             kind=VerdictKind.CHANGES_REQUESTED,
-            trigger_signature="ci:" + ",".join(names),
+            trigger_signature=f"ci:{snapshot.head_sha}:" + ",".join(names),
             rule="failing_ci",
             failing_checks=tuple(names),
         )
