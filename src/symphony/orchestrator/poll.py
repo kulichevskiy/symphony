@@ -823,7 +823,7 @@ class Orchestrator:
         run_id: str,
         cumulative_total: float,
     ) -> None:
-        """Park the issue at `needs_approval` and post stuck-loop-escape."""
+        """Park a cost-capped issue and post stuck-loop-escape."""
         try:
             history = await db.runs.history_for_issue(self._conn, issue.id)
             review_iter = sum(1 for r in history if r.stage == "review")
@@ -836,9 +836,9 @@ class Orchestrator:
                     issue.identifier,
                     e,
                 )
-                needs_approval_id = None
-            else:
-                needs_approval_id = states.get(binding.linear_states.needs_approval)
+                states = {}
+            needs_approval_id = states.get(binding.linear_states.needs_approval)
+            blocked_id = states.get(binding.linear_states.blocked)
             parked = False
             if needs_approval_id is not None:
                 try:
@@ -857,15 +857,24 @@ class Orchestrator:
                     binding.linear_team_key,
                     issue.identifier,
                 )
-            if not parked:
+            if not parked and blocked_id is not None:
                 try:
-                    await self.linear.move_issue(issue.id, issue.state_id)
+                    await self.linear.move_issue(issue.id, blocked_id)
                 except LinearError as e:
                     log.warning(
-                        "could not reset %s after cap-breach parking failed: %s",
+                        "could not move %s to blocked after cap breach: %s",
                         issue.identifier,
                         e,
                     )
+                else:
+                    parked = True
+            if not parked and blocked_id is None:
+                log.warning(
+                    "no blocked state for team %s; leaving %s out of the ready queue "
+                    "after cap breach",
+                    binding.linear_team_key,
+                    issue.identifier,
+                )
             body = stuck_loop_escape(
                 CommentVars(
                     stage="implement",
