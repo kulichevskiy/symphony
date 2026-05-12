@@ -2562,39 +2562,48 @@ class Orchestrator:
         if state.pr_number is None:
             log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
             return
+        pr_number = state.pr_number
         pr_url = state.pr_url or (
-            f"https://github.com/{binding.github_repo}/pull/{state.pr_number}"
+            f"https://github.com/{binding.github_repo}/pull/{pr_number}"
         )
         log.info(
             "merge re-dispatch: scheduling merge for %s (PR #%d)",
             issue.identifier,
-            state.pr_number,
+            pr_number,
         )
+
+        async def on_merge_started(new_run_id: str) -> None:
+            await self._clear_operator_wait(issue_id, run_id)
+            try:
+                await self.linear.post_comment(
+                    issue_id,
+                    truncate_body(
+                        resumed(
+                            CommentVars(
+                                stage="merge",
+                                repo=binding.github_repo,
+                                issue=pr_number,
+                                pr_url=pr_url,
+                                run_id=new_run_id,
+                                next_stage="merge",
+                            )
+                        )
+                    ),
+                )
+            except LinearError as e:
+                log.warning(
+                    "merge re-dispatch comment failed for %s: %s",
+                    issue.identifier,
+                    e,
+                )
+
         self._schedule_merge(
             binding=binding,
             issue=issue,
-            pr_number=state.pr_number,
+            pr_number=pr_number,
             pr_url=pr_url,
+            on_started=on_merge_started,
         )
-        await self._clear_operator_wait(issue_id, run_id)
-        try:
-            await self.linear.post_comment(
-                issue_id,
-                truncate_body(
-                    resumed(
-                        CommentVars(
-                            stage="merge",
-                            repo=binding.github_repo,
-                            issue=state.pr_number,
-                            pr_url=pr_url,
-                            run_id=run_id,
-                            next_stage="merge",
-                        )
-                    )
-                ),
-            )
-        except LinearError as e:
-            log.warning("merge re-dispatch comment failed for %s: %s", issue.identifier, e)
 
     async def _handle_skip_review_intent(self, issue_id: str, run_id: str) -> None:
         """Handle `$skip-review`: stop the review monitor and dispatch merge directly.
@@ -3291,6 +3300,7 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
         skip_review: bool = False,
+        on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> asyncio.Task[None]:
         binding_key = _binding_key(binding)
         self._scheduled_issue_ids.add(issue.id)
@@ -3304,6 +3314,7 @@ class Orchestrator:
                 pr_number=pr_number,
                 pr_url=pr_url,
                 skip_review=skip_review,
+                on_started=on_started,
             )
         )
         self._dispatch_tasks.add(task)
@@ -3324,6 +3335,7 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
         skip_review: bool = False,
+        on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
@@ -3342,6 +3354,7 @@ class Orchestrator:
                         pr_number=pr_number,
                         pr_url=pr_url,
                         skip_review=skip_review,
+                        on_started=on_started,
                     )
         except asyncio.CancelledError:
             run_id = self._dispatch_run_ids.get(issue.id)
@@ -3905,6 +3918,7 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
         skip_review: bool = False,
+        on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
@@ -3923,6 +3937,15 @@ class Orchestrator:
             return None
 
         self._dispatch_run_ids[issue.id] = run_id
+        if on_started is not None:
+            try:
+                await on_started(run_id)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "merge start callback failed for %s run %s",
+                    issue.identifier,
+                    run_id,
+                )
         workspace_path: Path | None = None
         try:
             try:

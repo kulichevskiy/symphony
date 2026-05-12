@@ -1681,6 +1681,95 @@ async def test_merge_command_keeps_operator_wait_when_lookup_fails(
 
 
 @pytest.mark.asyncio
+async def test_merge_command_keeps_operator_wait_when_merge_dispatch_dedupes(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add auth",
+            team_key="ENG",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="fix-run",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label="",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        orch._dispatch_run_ids["iss-1"] = "merge-run"  # noqa: SLF001
+        orch._operator_wait_run_ids.add("merge-run")  # noqa: SLF001
+        orch._merge_needs_approval_bindings["merge-run"] = binding  # noqa: SLF001
+
+        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "merge-run",
+            SlashIntent(
+                kind=SlashKind.APPROVE,
+                comment_id="c-command",
+                created_at="2026-05-10T00:01:00+00:00",
+            ),
+        )
+        tasks = list(orch._dispatch_tasks)  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "merge-run"
+        assert orch._dispatch_run_ids["iss-1"] == "merge-run"  # noqa: SLF001
+        assert "merge-run" in orch._operator_wait_run_ids  # noqa: SLF001
+        assert orch._merge_needs_approval_bindings["merge-run"] is binding  # noqa: SLF001
+        linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_review_advances_to_merge(tmp_path: Path) -> None:
     """`$skip-review` during active review polling marks the review run completed
     and directly schedules merge, bypassing the Codex verdict."""
