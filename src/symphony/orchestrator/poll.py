@@ -2545,7 +2545,7 @@ class Orchestrator:
             CommentVars(
                 stage="review",
                 repo=binding.github_repo,
-                issue=0,
+                issue=state.pr_number or 0,
                 pr_url=_pr_url_for_state(
                     repo=binding.github_repo,
                     pr_number=state.pr_number,
