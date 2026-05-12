@@ -600,8 +600,13 @@ async def _git_conflicted_files(workspace_path: Path) -> list[str]:
 
 async def _git_add_and_continue_rebase(
     workspace_path: Path, files: list[str]
-) -> None:
-    """Stage *files* and run ``git rebase --continue``."""
+) -> bool:
+    """Stage *files* and run ``git rebase --continue``.
+
+    Returns ``True`` when the rebase completed. Returns ``False`` when Git
+    stopped again, which may be a later conflicting commit in a multi-commit
+    rebase.
+    """
     if files:
         add_proc = await asyncio.create_subprocess_exec(
             "git", "add", "--", *files,
@@ -625,11 +630,8 @@ async def _git_add_and_continue_rebase(
         stdin=asyncio.subprocess.DEVNULL,
         env=env,
     )
-    _, stderr = await cont_proc.communicate()
-    if cont_proc.returncode != 0:
-        raise RuntimeError(
-            f"git rebase --continue failed: {stderr.decode(errors='replace').strip()}"
-        )
+    await cont_proc.communicate()
+    return cont_proc.returncode == 0
 
 
 async def _workspace_head_sha(workspace_path: Path) -> str:
@@ -2144,13 +2146,13 @@ class Orchestrator:
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
+                cost: float = 0.0
                 if rebase_clean:
                     # No conflicts: skip the agent entirely.
                     log.info(
                         "rebase was clean for %s; skipping agent", issue.identifier
                     )
-                    cost: float = 0.0
-                else:
+                while not rebase_clean:
                     # Step 3: dispatch the agent to resolve conflict markers (no git cmds).
                     prompt = merge_conflict_fix_prompt(
                         issue_title=issue.title,
@@ -2160,8 +2162,10 @@ class Orchestrator:
                         conflicted_files=conflicted_files,
                     )
                     try:
-                        prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-                        cost, final_kind, final_returncode = await self._run_fix_agent(
+                        prior_total = (
+                            await db.runs.cost_for_issue(self._conn, issue.id)
+                        ) + cost
+                        run_cost, final_kind, final_returncode = await self._run_fix_agent(
                             binding=binding,
                             issue=issue,
                             run_id=fix_run_id,
@@ -2193,6 +2197,7 @@ class Orchestrator:
                             last_log=str(e),
                         )
                         return False
+                    cost += run_cost
 
                     transition = on_runner_event(
                         stage="review",
@@ -2222,7 +2227,7 @@ class Orchestrator:
 
                     # Step 4: stage resolved files and continue the rebase.
                     try:
-                        await _git_add_and_continue_rebase(
+                        rebase_clean = await _git_add_and_continue_rebase(
                             workspace_path, conflicted_files
                         )
                     except Exception as e:  # noqa: BLE001
@@ -2248,6 +2253,32 @@ class Orchestrator:
                             last_log=str(e),
                         )
                         return False
+                    if not rebase_clean:
+                        conflicted_files = await _git_conflicted_files(workspace_path)
+                        if not conflicted_files:
+                            log.warning(
+                                "rebase --continue non-zero but no conflict markers for %s",
+                                issue.identifier,
+                            )
+                            await _abort_rebase_safely(
+                                workspace_path,
+                                issue_identifier=issue.identifier,
+                                reason="rebase --continue with no conflict markers",
+                            )
+                            await db.runs.update_status(
+                                self._conn,
+                                fix_run_id,
+                                "failed",
+                                ended_at=datetime.now(UTC).isoformat(),
+                            )
+                            await self._fail_review_run(
+                                run=run,
+                                binding=binding,
+                                issue=issue,
+                                error="rebase --continue failed with no conflict markers",
+                                last_log="",
+                            )
+                            return False
 
             finally:
                 if self._dispatch_run_ids.get(issue.id) == fix_run_id:

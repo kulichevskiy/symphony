@@ -1824,6 +1824,89 @@ async def test_merge_conflict_fix_run_aborts_rebase_on_failure(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_merge_conflict_fix_run_continues_through_later_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.repo_default_branch = AsyncMock(return_value="main")
+        gh.pr_comment = AsyncMock()
+
+        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=False))
+        conflicted_files = AsyncMock(side_effect=[["first.py"], ["second.py"]])
+        monkeypatch.setattr(
+            poll_module,
+            "_git_conflicted_files",
+            conflicted_files,
+        )
+        abort_rebase = AsyncMock(return_value=None)
+        monkeypatch.setattr(poll_module, "_git_abort_rebase", abort_rebase)
+        add_and_continue = AsyncMock(side_effect=[False, True])
+        monkeypatch.setattr(
+            poll_module,
+            "_git_add_and_continue_rebase",
+            add_and_continue,
+        )
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        force_push = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            force_push_fn=force_push,
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        issue = _issue_in_progress()
+        result = await orch._dispatch_merge_conflict_fix_run(  # noqa: SLF001
+            run=run,
+            binding=cfg.repos[0],
+            issue=issue,
+            iteration=1,
+        )
+
+        assert result is True
+        assert conflicted_files.await_count == 2
+        assert add_and_continue.await_args_list == [
+            call(workspace_path, ["first.py"]),
+            call(workspace_path, ["second.py"]),
+        ]
+        abort_rebase.assert_not_awaited()
+        force_push.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert fix_run.status == "completed"
+    finally:
+        await conn.close()
+
+
 # --- Reviewer comment fix-runs ---------------------------------------------
 
 
