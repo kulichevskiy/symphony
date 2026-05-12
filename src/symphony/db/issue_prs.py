@@ -114,7 +114,7 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
                 AND r.stage = 'merge'
-                AND r.status IN ('running', 'done', 'needs_approval')
+                AND r.status IN ('running', 'completed', 'done', 'needs_approval')
           )
         ORDER BY p.created_at ASC
         """
