@@ -337,6 +337,7 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         assert any("Implement stage failed" in b for b in posted_bodies), (
             "expected a failed() comment to be posted"
         )
+        assert not any("Will auto-retry shortly." in b for b in posted_bodies)
     finally:
         await conn.close()
 

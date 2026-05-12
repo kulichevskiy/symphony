@@ -161,6 +161,17 @@ def _comment(body: str, *, cid: str = "c1") -> LinearComment:
     )
 
 
+def test_github_commit_url_uses_configured_host() -> None:
+    assert (
+        poll_module._github_commit_url("ghe.example.com/org/repo", "abc123")
+        == "https://ghe.example.com/org/repo/commit/abc123"
+    )
+    assert (
+        poll_module._github_commit_url("org/repo", "abc123")
+        == "https://github.com/org/repo/commit/abc123"
+    )
+
+
 def _states() -> dict[str, str]:
     return {
         "Todo": "state-todo",

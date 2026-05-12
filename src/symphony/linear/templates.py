@@ -56,6 +56,7 @@ class CommentVars:
     next_stage: str = ""
     pct: int = 0
     commit_url: str = ""
+    auto_retry: bool = False
 
 
 def run_started(v: CommentVars) -> str:
@@ -130,7 +131,8 @@ def failed(v: CommentVars) -> str:
     )
     if v.last_log:
         body += f"\nLast log lines:\n\n```\n{v.last_log}\n```\n"
-    body += "\nWill auto-retry shortly.\n"
+    if v.auto_retry:
+        body += "\nWill auto-retry shortly.\n"
     return body
 
 

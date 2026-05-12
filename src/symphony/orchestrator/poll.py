@@ -652,10 +652,18 @@ async def _workspace_head_sha(workspace_path: Path) -> str:
 
 
 def _github_commit_url(repo: str, sha: str) -> str:
-    """Return a GitHub commit URL for *sha* in *repo* (owner/name form)."""
+    """Return a browser commit URL for *sha* in [HOST/]OWNER/REPO."""
     if not sha:
         return ""
-    return f"https://github.com/{repo}/commit/{sha}"
+    parts = repo.split("/")
+    if len(parts) == 3:
+        host, owner, name = parts
+    elif len(parts) == 2:
+        host = "github.com"
+        owner, name = parts
+    else:
+        return ""
+    return f"https://{host}/{owner}/{name}/commit/{sha}"
 
 
 def _review_check_from_gh(run: GitHubCheckRun) -> ReviewCheckRun:
@@ -2822,6 +2830,7 @@ class Orchestrator:
                 cost=f"${cost:.4f}",
                 error=error,
                 last_log=last_log,
+                auto_retry=True,
             )
         )
         try:
@@ -2859,6 +2868,7 @@ class Orchestrator:
                 cost=f"${cost:.4f}",
                 error=error,
                 last_log="",
+                auto_retry=True,
             )
         )
         try:
