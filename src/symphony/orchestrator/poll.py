@@ -3381,13 +3381,21 @@ class Orchestrator:
             return
 
         lgtm_comment: dict[str, Any] | None = None
+        cycle_started_raw = run.started_at
+        issue_pr = await db.issue_prs.get(
+            self._conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+        )
+        if issue_pr is not None:
+            cycle_started_raw = issue_pr.created_at
         try:
-            run_started_at = _parse_rfc3339(run.started_at)
+            cycle_started_at = _parse_rfc3339(cycle_started_raw)
         except ValueError:
             log.warning(
-                "could not parse review run started_at for %s: %s",
-                run.id,
-                run.started_at,
+                "could not parse review cycle start for %s: %s",
+                issue.identifier,
+                cycle_started_raw,
             )
             return
         for entry in raw:
@@ -3405,7 +3413,7 @@ class Orchestrator:
                     created_at_raw,
                 )
                 continue
-            if created_at < run_started_at:
+            if created_at < cycle_started_at:
                 continue
             if is_codex_author(login) and self._CODEX_NO_ISSUES_MARKER in body.lower():
                 lgtm_comment = entry

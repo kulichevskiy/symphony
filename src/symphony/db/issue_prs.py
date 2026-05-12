@@ -64,6 +64,28 @@ async def upsert(
     await conn.commit()
 
 
+async def get(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+) -> IssuePR | None:
+    cur = await conn.execute(
+        """
+        SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+        FROM issue_prs p
+        JOIN issues i ON i.id = p.issue_id
+        WHERE p.issue_id = ? AND p.github_repo = ?
+        """,
+        (issue_id, github_repo),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_issue_pr(row)
+
+
 async def mark_merged(
     conn: aiosqlite.Connection,
     *,

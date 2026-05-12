@@ -284,6 +284,7 @@ async def _seed_active_review(
     failures: int = 0,
     signature: str = "",
     issue_label: str | None = None,
+    started_at: str = "2026-05-10T00:00:00+00:00",
 ) -> None:  # type: ignore[no-untyped-def]
     await db.issues.upsert(
         conn,
@@ -311,7 +312,7 @@ async def _seed_active_review(
         stage="review",
         status="running",
         pid=None,
-        started_at="2026-05-10T00:00:00+00:00",
+        started_at=started_at,
     )
 
 
@@ -2354,5 +2355,65 @@ async def test_codex_lgtm_comment_ignores_previous_review_cycle(
         linear.post_comment.assert_not_awaited()
         state = await db.review_state.get(conn, "iss-1")
         assert state.codex_lgtm_comment_id == ""
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_lgtm_comment_survives_review_monitor_restart(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(
+            conn,
+            started_at="2026-05-10T00:10:00+00:00",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+        gh.pr_issue_comments = AsyncMock(
+            return_value=[
+                {
+                    "id": 9999,
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Codex Review: Didn't find any major issues. Delightful!",
+                    "created_at": "2026-05-10T00:05:00Z",
+                }
+            ]
+        )
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        state = await db.review_state.get(conn, "iss-1")
+
+        await orch._maybe_post_codex_lgtm(  # noqa: SLF001
+            run=run,
+            binding=cfg.repos[0],
+            issue=_issue_in_progress(),
+            state=state,
+            pr_number=42,
+        )
+
+        linear.post_comment.assert_awaited_once()
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.codex_lgtm_comment_id == "9999"
     finally:
         await conn.close()
