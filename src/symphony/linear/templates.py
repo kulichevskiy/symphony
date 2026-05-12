@@ -55,6 +55,7 @@ class CommentVars:
     last_log: str = ""
     next_stage: str = ""
     pct: int = 0
+    commit_url: str = ""
 
 
 def run_started(v: CommentVars) -> str:
@@ -86,8 +87,8 @@ def awaiting_approval(v: CommentVars) -> str:
         body += f"- Error: `{v.error}`\n\n"
     body += (
         "Reply on this issue with:\n"
-        "- `/approve` — advance to the next stage\n"
-        "- `/reject` — stop the pipeline here\n"
+        "- `$approve` — advance to the next stage\n"
+        "- `$reject` — stop the pipeline here\n"
         "- Free-form text — queued as steering for the next stage's prompt\n"
     )
     return body
@@ -101,7 +102,7 @@ def stuck_loop_escape(v: CommentVars) -> str:
         f"- Last trigger: **{v.trigger}**\n"
         f"- Cumulative cost: **{v.cost}**\n\n"
         f"PR: {v.pr_url}\n\n"
-        f"Reply with `/approve` to force-advance, `/reject` to stop, or "
+        f"Reply with `$approve` to force-advance, `$reject` to stop, or "
         f"free-form steering for one more attempt.\n"
     )
 
@@ -113,8 +114,8 @@ def cost_cap_reached(v: CommentVars) -> str:
         f"cost reached **{v.cost}** during **{v.stage}**.\n\n"
         f"- Run ID: `{v.run_id}`\n"
         f"- PR: {v.pr_url}\n\n"
-        f"After raising the cap, reply with `/approve` or `/retry` to requeue. "
-        f"Reply with `/reject` or `/stop` to leave the issue halted.\n"
+        f"After raising the cap, reply with `$approve` or `$retry` to requeue. "
+        f"Reply with `$reject` or `$stop` to leave the issue halted.\n"
     )
 
 
@@ -129,7 +130,7 @@ def failed(v: CommentVars) -> str:
     )
     if v.last_log:
         body += f"\nLast log lines:\n\n```\n{v.last_log}\n```\n"
-    body += "\nReply `/retry` in this thread to dispatch again.\n"
+    body += "\nWill auto-retry shortly.\n"
     return body
 
 
@@ -145,5 +146,57 @@ def resumed(v: CommentVars) -> str:
     return f"✅ Resumed — advancing `{v.repo}#{v.issue}` to **{v.next_stage}**\n"
 
 
+def reviewing_feedback(v: CommentVars) -> str:
+    return (
+        f"👀 **Reviewer feedback detected** on `{v.repo}#{v.issue}` "
+        f"(review iteration {v.review_iter})\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Trigger: `{v.trigger}`\n"
+        f"- Dispatching fix-run…\n"
+    )
+
+
+def fixing_merge_conflict(v: CommentVars) -> str:
+    return (
+        f"🔀 **Merge conflict detected** on `{v.repo}#{v.issue}` "
+        f"(review iteration {v.review_iter})\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Rebasing onto base branch and resolving conflicts…\n"
+    )
+
+
+def fix_pushed(v: CommentVars) -> str:
+    commit_line = (
+        f"- Commit: [{v.commit_url.split('/')[-1][:8]}]({v.commit_url})\n"
+        if v.commit_url
+        else ""
+    )
+    return (
+        f"📤 **Fix pushed** for `{v.repo}#{v.issue}`\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"{commit_line}"
+        f"- Re-triggered `@codex review` — waiting for re-review.\n"
+        f"- Cost so far: **{v.cost}**\n"
+    )
+
+
 def command_rejected(slash: str, reason: str) -> str:
     return f"🚫 `{slash}` ignored: {reason}\n"
+
+
+def codex_lgtm(v: CommentVars) -> str:
+    return (
+        f"✅ **Codex reviewed — no issues** on `{v.repo}#{v.issue}`\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Codex found no blocking issues.\n"
+    )
+
+
+def skip_review_forced(v: CommentVars) -> str:
+    return (
+        f"⏭️ **Review skipped — advancing to merge**\n\n"
+        f"`$skip-review` received on `{v.repo}#{v.issue}`.\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n\n"
+        f"Review stage cancelled. Dispatching merge now.\n"
+    )

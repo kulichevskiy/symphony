@@ -26,6 +26,7 @@ class ReviewState:
     pr_url: str
     github_repo: str
     issue_label: str
+    codex_lgtm_comment_id: str
 
 
 async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
@@ -38,7 +39,8 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
             pr_number,
             pr_url,
             github_repo,
-            issue_label
+            issue_label,
+            codex_lgtm_comment_id
         FROM review_state
         WHERE issue_id = ?
         """,
@@ -54,6 +56,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
             pr_url="",
             github_repo="",
             issue_label="",
+            codex_lgtm_comment_id="",
         )
     return ReviewState(
         iteration=int(row["iteration"]),
@@ -63,6 +66,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
         pr_url=str(row["pr_url"]),
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"]),
+        codex_lgtm_comment_id=str(row["codex_lgtm_comment_id"]),
     )
 
 
@@ -80,9 +84,10 @@ async def begin_review(
         """
         INSERT INTO review_state (
             issue_id, iteration, last_trigger_signature,
-            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label
+            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label,
+            codex_lgtm_comment_id
         )
-        VALUES (?, 0, '', 0, ?, ?, ?, ?)
+        VALUES (?, 0, '', 0, ?, ?, ?, ?, '')
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             last_trigger_signature = '',
@@ -90,7 +95,8 @@ async def begin_review(
             pr_number = excluded.pr_number,
             pr_url = excluded.pr_url,
             github_repo = excluded.github_repo,
-            issue_label = excluded.issue_label
+            issue_label = excluded.issue_label,
+            codex_lgtm_comment_id = ''
         """,
         (issue_id, pr_number, pr_url, github_repo, issue_label or ""),
     )
@@ -174,16 +180,37 @@ async def reset_ci_fetch_failures(
     await conn.commit()
 
 
+async def set_codex_lgtm_comment_id(
+    conn: aiosqlite.Connection, issue_id: str, comment_id: str
+) -> None:
+    """Record the GitHub comment ID of the Codex 'no issues' comment so we
+    don't re-post the Linear notification on subsequent polls."""
+    await conn.execute(
+        """
+        INSERT INTO review_state (
+            issue_id, iteration, last_trigger_signature, ci_fetch_failures,
+            codex_lgtm_comment_id
+        )
+        VALUES (?, 0, '', 0, ?)
+        ON CONFLICT(issue_id) DO UPDATE SET
+            codex_lgtm_comment_id = excluded.codex_lgtm_comment_id
+        """,
+        (issue_id, comment_id),
+    )
+    await conn.commit()
+
+
 async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
     """Clear iteration and signature — used when leaving Review (e.g.
-    Merge starts, or `/retry` re-enters the stage)."""
+    Merge starts, or `$retry` re-enters the stage)."""
     await conn.execute(
         """
         INSERT INTO review_state (
             issue_id, iteration, last_trigger_signature,
-            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label
+            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label,
+            codex_lgtm_comment_id
         )
-        VALUES (?, 0, '', 0, NULL, '', '', '')
+        VALUES (?, 0, '', 0, NULL, '', '', '', '')
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             last_trigger_signature = '',
@@ -191,7 +218,8 @@ async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
             pr_number = NULL,
             pr_url = '',
             github_repo = '',
-            issue_label = ''
+            issue_label = '',
+            codex_lgtm_comment_id = ''
         """,
         (issue_id,),
     )
@@ -206,5 +234,6 @@ __all__ = [
     "get",
     "reset",
     "reset_ci_fetch_failures",
+    "set_codex_lgtm_comment_id",
     "set_signature",
 ]

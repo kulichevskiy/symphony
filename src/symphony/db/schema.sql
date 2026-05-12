@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS review_state (
     pr_number              INTEGER,
     pr_url                 TEXT NOT NULL DEFAULT '',
     github_repo            TEXT NOT NULL DEFAULT '',
-    issue_label            TEXT NOT NULL DEFAULT ''
+    issue_label            TEXT NOT NULL DEFAULT '',
+    codex_lgtm_comment_id  TEXT NOT NULL DEFAULT ''
 );
 
 -- Per-issue cost-warning idempotency. The cost warning template fires
