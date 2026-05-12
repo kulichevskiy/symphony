@@ -8,7 +8,7 @@ Mirrors the load-bearing parts of the Rust `agent/process.rs`:
 - SIGTERM on stall, then SIGKILL after a short grace period. The Rust code
   only sends SIGTERM; in Python we add the grace+kill because asyncio
   doesn't always reap zombies cleanly otherwise.
-- `kill()` is callable from another coroutine for `/stop` and shutdown.
+- `kill()` is callable from another coroutine for `$stop` and shutdown.
 """
 
 from __future__ import annotations

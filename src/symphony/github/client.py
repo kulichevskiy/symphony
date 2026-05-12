@@ -240,10 +240,13 @@ class GitHub:
         ]
         stdout, stderr, returncode = await self._run_capture(argv)
         # `gh pr checks --required` exits 1 when the branch has no reported
-        # checks at all. That is equivalent to an empty required-check list,
-        # not a transient GitHub failure.
+        # checks, or when it has checks but none are required. Both cases are
+        # equivalent to an empty required-check list, not a transient failure.
         output = f"{stderr}\n{stdout}".casefold()
-        if returncode == 1 and "no checks reported" in output:
+        if returncode == 1 and (
+            "no checks reported" in output
+            or "no required checks reported" in output
+        ):
             return PRChecks()
         if returncode not in (0, 8):
             raise GitHubError(
@@ -293,6 +296,20 @@ class GitHub:
                 "api",
                 *host_args,
                 f"repos/{owner_repo}/pulls/{pr}/reviews",
+            ]
+        )
+        return result
+
+    async def pr_issue_comments(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]:
+        """Regular PR comments (issue comments), not inline review comments."""
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_paginated_list(
+            [
+                "api",
+                *host_args,
+                f"repos/{owner_repo}/issues/{pr}/comments",
             ]
         )
         return result

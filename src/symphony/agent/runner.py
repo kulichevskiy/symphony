@@ -57,7 +57,7 @@ class Runner(Protocol):
       line, then yields a single terminal event (`exit` | `stall_timeout` |
       `spawn_failed`) and stops.
     - `kill(run_id)` is a best-effort terminator for the case where the
-      orchestrator decides to abort mid-run (user `/stop`, shutdown).
+      orchestrator decides to abort mid-run (user `$stop`, shutdown).
     """
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]: ...

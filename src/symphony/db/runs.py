@@ -74,6 +74,7 @@ async def create_if_no_active(
     started_at: str,
     cost_usd: float = 0.0,
     ignored_stage: str | None = None,
+    ignored_stages: tuple[str, ...] = (),
 ) -> bool:
     """Atomic dedupe: insert iff no `LIVE_STATUSES` row exists for `issue_id`.
 
@@ -85,14 +86,20 @@ async def create_if_no_active(
 
     Returns True if the row was inserted, False if a live run already
     existed and the insert was skipped.
+
+    `ignored_stage` (single) and `ignored_stages` (tuple) are additive.
     """
+    all_ignored: tuple[str, ...] = ignored_stages
+    if ignored_stage is not None:
+        all_ignored = (ignored_stage, *all_ignored)
     placeholders = ",".join("?" * len(LIVE_STATUSES))
-    stage_filter = "" if ignored_stage is None else " AND stage != ?"
-    dedupe_params: tuple[str, ...] = (
-        (*LIVE_STATUSES,)
-        if ignored_stage is None
-        else (*LIVE_STATUSES, ignored_stage)
-    )
+    if all_ignored:
+        ph = ",".join("?" * len(all_ignored))
+        stage_filter = f" AND stage NOT IN ({ph})"
+        dedupe_params: tuple[str, ...] = (*LIVE_STATUSES, *all_ignored)
+    else:
+        stage_filter = ""
+        dedupe_params = (*LIVE_STATUSES,)
     cur = await conn.execute(
         f"""
         INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
@@ -205,6 +212,23 @@ async def has_active(
         LIMIT 1
         """,
         params,
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def has_live_stage(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    stage: str,
+) -> bool:
+    """True if *issue_id* has a live run in *stage*."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"SELECT 1 FROM runs WHERE issue_id = ? AND stage = ? "
+        f"AND status IN ({placeholders}) LIMIT 1",
+        (issue_id, stage, *LIVE_STATUSES),
     )
     row = await cur.fetchone()
     return row is not None

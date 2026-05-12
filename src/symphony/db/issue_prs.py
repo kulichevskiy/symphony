@@ -64,6 +64,28 @@ async def upsert(
     await conn.commit()
 
 
+async def get(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+) -> IssuePR | None:
+    cur = await conn.execute(
+        """
+        SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+        FROM issue_prs p
+        JOIN issues i ON i.id = p.issue_id
+        WHERE p.issue_id = ? AND p.github_repo = ?
+        """,
+        (issue_id, github_repo),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_issue_pr(row)
+
+
 async def mark_merged(
     conn: aiosqlite.Connection,
     *,
@@ -80,6 +102,48 @@ async def mark_merged(
         (merged_at, issue_id, github_repo),
     )
     await conn.commit()
+
+
+async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
+    """PRs whose review run died (last review run is failed, none running).
+
+    Used to auto-resurrect review monitors that crashed mid-flight.
+    The cooldown (don't restart if a review run started recently) is enforced
+    in the caller.
+    """
+    cur = await conn.execute(
+        """
+        SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+        FROM issue_prs p
+        JOIN issues i ON i.id = p.issue_id
+        WHERE p.merged_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'review'
+                AND r.status = 'running'
+          )
+          AND (
+              SELECT r.status FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'review'
+                AND r.started_at >= p.created_at
+              ORDER BY r.started_at DESC, r.rowid DESC
+              LIMIT 1
+          ) = 'failed'
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'merge'
+                AND r.status IN ('running', 'completed', 'done', 'needs_approval')
+                AND r.started_at >= p.created_at
+          )
+        ORDER BY p.created_at ASC
+        """
+    )
+    rows = await cur.fetchall()
+    return [_row_to_issue_pr(r) for r in rows]
 
 
 async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:

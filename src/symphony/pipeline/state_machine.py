@@ -4,10 +4,9 @@ Given the current stage and the terminal runner event, return the next
 run status, the Linear state to move the issue to (if any), and whether
 the pipeline halts here.
 
-Issue #7 only wires Implement; on success it halts at "In Progress"
-because Review and Merge land in their own slices. The signature
-(`stage` is a parameter) is shaped so Review / Merge transitions slot in
-later without changing call sites.
+The transition decision only classifies the runner result. The orchestrator
+owns side effects such as moving Linear between workflow states, opening PRs,
+and starting Review/Merge monitor rows.
 """
 
 from __future__ import annotations
@@ -30,8 +29,6 @@ def on_runner_event(
 ) -> Transition:
     if event_kind == "exit" and returncode == 0:
         if stage == "implement":
-            # Implement halts at "In Progress" for this slice; Review and
-            # Merge will hand back a non-halting transition later.
             return Transition(
                 next_run_status="completed", next_linear_state=None, halt=True
             )

@@ -637,11 +637,14 @@ async def test_per_binding_cap_overrides_global(tmp_path: Path) -> None:
 
         await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
 
-        moves = [c.args for c in linear.move_issue.await_args_list]
-        # Did not park at needs_approval.
-        assert ("iss-1", "state-na") not in moves
         # PR was opened — the run completed normally under the higher cap.
         gh.pr_create.assert_awaited_once()
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert not any("Cost cap reached" in body for body in bodies)
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [r.stage for r in history] == ["implement", "review"]
+        assert history[0].status == "completed"
+        assert history[1].status == "running"
     finally:
         await conn.close()
 

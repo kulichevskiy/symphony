@@ -456,7 +456,7 @@ async def test_merge_candidate_skips_when_issue_left_active_state(
     try:
         await _seed_review_candidate(conn)
         paused = _issue()
-        paused.state_name = "Needs Approval"
+        paused.state_name = "Blocked"
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=paused)
         gh = MagicMock()
@@ -566,6 +566,7 @@ async def test_queued_merge_revalidates_issue_before_execution(
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
         workspace = MagicMock()
@@ -654,6 +655,7 @@ async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
         push_fn = AsyncMock()
@@ -750,6 +752,7 @@ async def test_auto_merge_submission_waits_until_pr_reports_merged(
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
 
@@ -839,6 +842,7 @@ async def test_merge_finalization_exception_moves_to_needs_approval(
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
 
@@ -913,6 +917,7 @@ async def test_submitted_merge_regression_moves_to_needs_approval(
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
 
         cfg = Config(
@@ -998,6 +1003,7 @@ async def test_merge_agent_enforces_issue_cost_cap(tmp_path: Path) -> None:
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
         push_fn = AsyncMock()
@@ -1065,6 +1071,7 @@ async def test_externally_merged_candidate_finishes_before_review_classification
         gh.pr_review_comments = AsyncMock()
         gh.pr_reviews = AsyncMock()
         gh.pr_reactions = AsyncMock()
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock()
         gh.pr_merge = AsyncMock()
 
@@ -1130,6 +1137,7 @@ async def test_externally_merged_candidate_records_done_when_final_comment_fails
         gh.pr_review_comments = AsyncMock()
         gh.pr_reviews = AsyncMock()
         gh.pr_reactions = AsyncMock()
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock()
         gh.pr_merge = AsyncMock()
 
@@ -1194,6 +1202,7 @@ async def test_externally_merged_candidate_closes_run_when_done_move_fails(
         gh.pr_review_comments = AsyncMock()
         gh.pr_reviews = AsyncMock()
         gh.pr_reactions = AsyncMock()
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock()
         gh.pr_merge = AsyncMock()
 
@@ -1258,6 +1267,7 @@ async def test_closed_candidate_moves_to_needs_approval_before_review_classifica
         gh.pr_review_comments = AsyncMock()
         gh.pr_reviews = AsyncMock()
         gh.pr_reactions = AsyncMock()
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock()
         gh.pr_merge = AsyncMock()
 
@@ -1340,6 +1350,7 @@ async def test_merge_failure_moves_issue_to_needs_approval(tmp_path: Path) -> No
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock(side_effect=GitHubError("branch protection blocked"))
 
@@ -1422,6 +1433,7 @@ async def test_merge_conflict_closes_run_when_state_lookup_fails(
             ]
         )
         gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
 

@@ -13,12 +13,14 @@ Rules (priority order — first match wins):
 
   1. Failing required (or unknown-required) CI check → CHANGES_REQUESTED.
   2. Pending required CI check (no failures) → PENDING.
-  3. Codex inline review comment on HEAD → CHANGES_REQUESTED.
-  4. Substantive Codex `COMMENTED` review on HEAD → CHANGES_REQUESTED.
-  5. Human `CHANGES_REQUESTED` on HEAD → CHANGES_REQUESTED.
-  6. Codex `+1` reaction (after HEAD commit time) or human `APPROVED` →
+  3. mergeable=CONFLICTING → CHANGES_REQUESTED (merge_conflict). Checked
+     before comment/review rules so a conflict is always detected even
+     when stale Codex inline comments from a prior fix-run sit on HEAD.
+  4. Codex inline review comment on HEAD → CHANGES_REQUESTED.
+  5. Substantive Codex `COMMENTED` review on HEAD → CHANGES_REQUESTED.
+  6. Human `CHANGES_REQUESTED` on HEAD → CHANGES_REQUESTED.
+  7. Codex `+1` reaction (after HEAD commit time) or human `APPROVED` →
      APPROVED when mergeable.
-  7. Approved + mergeable=CONFLICTING → CHANGES_REQUESTED (merge_conflict).
   8. Approved + mergeable=UNKNOWN → PENDING.
 """
 
@@ -202,6 +204,17 @@ def review_classifier(
             pending_checks=tuple(c.name for c in pending),
         )
 
+    # Rule 3 — merge conflict blocks regardless of review/approval state.
+    # Checked before comment rules so a conflict is always detected even
+    # when stale Codex inline comments from a prior fix-run sit on HEAD.
+    if snapshot.mergeable == "CONFLICTING":
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            trigger_signature=f"merge_conflict:{snapshot.head_sha}",
+            rule="merge_conflict",
+            merge_conflict=True,
+        )
+
     fresh_reviews = [
         r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha
     ]
@@ -211,7 +224,7 @@ def review_classifier(
         if not is_codex_author(r.user_login)
     ]
 
-    # Rule 3 — Codex inline review comments on HEAD.
+    # Rule 4 — Codex inline review comments on HEAD.
     codex_on_head = [
         c
         for c in comments
@@ -229,7 +242,7 @@ def review_classifier(
             codex_comments=tuple(codex_on_head),
         )
 
-    # Rule 4 — Codex `COMMENTED` review with substantive body on HEAD.
+    # Rule 5 — Codex `COMMENTED` review with substantive body on HEAD.
     codex_substantive = [
         r
         for r in fresh_reviews
@@ -247,7 +260,7 @@ def review_classifier(
             last_review_body=body,
         )
 
-    # Rule 5 — human `CHANGES_REQUESTED` on HEAD.
+    # Rule 6 — human `CHANGES_REQUESTED` on HEAD.
     human_cr = [
         r
         for r in latest_human_reviews
@@ -262,7 +275,7 @@ def review_classifier(
             last_review_body=human_cr[-1].body,
         )
 
-    # Rule 6 — approval signals.
+    # Rule 7 — approval signals.
     head_dt = _parse_iso(snapshot.head_committed_at)
     codex_approval_at: datetime | None = None
     for rxn in snapshot.reactions:
@@ -279,14 +292,6 @@ def review_classifier(
     approved = codex_approval_at is not None or human_approved
 
     if approved:
-        # Rule 7 — approval blocked by a merge conflict against base.
-        if snapshot.mergeable == "CONFLICTING":
-            return Verdict(
-                kind=VerdictKind.CHANGES_REQUESTED,
-                trigger_signature=f"merge_conflict:{snapshot.head_sha}",
-                rule="merge_conflict",
-                merge_conflict=True,
-            )
         # Rule 8 — mergeable still computing or unavailable; do not race
         # `gh pr merge`.
         if snapshot.mergeable != "MERGEABLE":

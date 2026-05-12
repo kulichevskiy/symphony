@@ -52,7 +52,7 @@ def _headers(body: bytes, *, delivery: str = "evt-1") -> dict[str, str]:
     }
 
 
-def _payload(body: str = "/stop") -> dict[str, Any]:
+def _payload(body: str = "$stop") -> dict[str, Any]:
     return {
         "type": "Comment",
         "action": "create",
@@ -301,7 +301,7 @@ async def test_webhook_comment_uses_slash_path_and_poll_does_not_refire(
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/stop")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop")])
         orch = _make_orch(cfg, linear, conn)
         await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
         orch._active_run_ids.add("run-1")  # noqa: SLF001
@@ -347,7 +347,7 @@ async def test_webhook_comment_resumes_operator_waiting_run(tmp_path: Path) -> N
             created_at="2026-05-10T01:00:00+00:00",
         )
 
-        result = await orch.handle_linear_webhook(_payload("/approve"))
+        result = await orch.handle_linear_webhook(_payload("$approve"))
 
         assert result.handled is True
         linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
@@ -397,7 +397,7 @@ async def test_poll_and_webhook_comment_share_post_success_marker(
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/stop")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop")])
         orch = _make_orch(cfg, linear, conn)
         await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
         orch._active_run_ids.add("run-1")  # noqa: SLF001
@@ -435,7 +435,7 @@ async def test_poll_marks_comment_only_after_successful_slash_handling(
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/stop")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop")])
         orch = _make_orch(cfg, linear, conn)
         await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
         orch._active_run_ids.add("run-1")  # noqa: SLF001

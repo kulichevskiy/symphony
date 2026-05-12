@@ -444,6 +444,33 @@ def test_rule_6_latest_human_approval_supersedes_prior_changes_requested() -> No
     assert v.rule == "approved"
 
 
+# --- Rule 3: merge conflict beats inline comments -------------------------
+
+
+def test_rule_3_conflict_beats_codex_inline_comments() -> None:
+    """CONFLICTING fires as Rule 3, before Codex inline comments (Rule 4).
+
+    This is the ADJ-1 regression case: a prior fix-run left stale Codex
+    inline comments on HEAD, and the PR developed a merge conflict.
+    Without this ordering the dedup gate would see the same codex_inline
+    signature as last time and refuse to dispatch the conflict fix.
+    """
+    comment = ReviewComment(
+        user_login=CODEX_BOT_LOGIN,
+        body="Please fix this.",
+        commit_sha=HEAD_SHA,
+        created_at=LATER,
+        path="src/foo.py",
+        line=10,
+    )
+    snap = _snap(mergeable="CONFLICTING")
+    v = review_classifier(comments=[comment], ci=[], snapshot=snap)
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.rule == "merge_conflict"
+    assert v.merge_conflict is True
+    assert v.trigger_signature.startswith("merge_conflict:")
+
+
 # --- Rule 7: approved + CONFLICTING ---------------------------------------
 
 

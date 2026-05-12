@@ -1,5 +1,5 @@
 """Startup reconciliation: dead-PID runs flip to `interrupted` and we
-post a Linear comment telling the user to `/retry`."""
+post a Linear comment telling the user to `$retry`."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ async def test_reconcile_marks_dead_pids_interrupted_and_comments(tmp_path: Path
         # First positional arg is the issue UUID; second is the body.
         assert call.args[0] == "iss-dead"
         body = call.args[1]
-        assert "/retry" in body
+        assert "$retry" in body
 
         # Live row stays live; dead row no longer appears as live.
         rows = await db.runs.list_live_with_pid(conn)
@@ -79,7 +79,7 @@ async def test_reconcile_treats_eperm_pid_as_alive(
 ) -> None:
     """A PID owned by another user/session raises PermissionError from
     `os.kill(pid, 0)`. That means the process exists — reconcile must NOT
-    flip the run to `interrupted`, otherwise we'd invite `/retry` while a
+    flip the run to `interrupted`, otherwise we'd invite `$retry` while a
     real worker is still running and risk duplicate execution."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

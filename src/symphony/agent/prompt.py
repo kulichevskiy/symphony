@@ -72,6 +72,76 @@ def review_fix_prompt(
     )
 
 
+def review_comment_fix_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    trigger: str,
+) -> str:
+    """Build the prompt for a Review-stage fix-run triggered by reviewer comments."""
+    label_line = ", ".join(labels) if labels else "(no labels)"
+    body = issue_body.strip() if issue_body else "(no description)"
+    return (
+        "You are Symphony's Review-stage fix-run agent.\n"
+        "Address the reviewer feedback on the current branch.\n\n"
+        "# Review trigger\n\n"
+        f"{trigger}\n\n"
+        "# Issue\n\n"
+        f"## Title\n{issue_title}\n\n"
+        f"## Labels\n{label_line}\n\n"
+        f"## Description\n{body}\n\n"
+        "# Working agreement\n\n"
+        "- Make the smallest change that addresses the reviewer feedback.\n"
+        "- Commit your changes on the current branch (do not push).\n"
+        "- Do not edit unrelated files.\n"
+    )
+
+
+def merge_conflict_fix_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    base_branch: str,
+    conflicted_files: list[str],
+) -> str:
+    """Build the prompt for a Review-stage merge-conflict fix-run.
+
+    The orchestrator has already run ``git fetch`` and ``git rebase``; this
+    prompt tells the agent to resolve the conflict markers left in the listed
+    files.  No git commands should be run by the agent.
+    """
+    label_line = ", ".join(labels) if labels else "(no labels)"
+    body = issue_body.strip() if issue_body else "(no description)"
+    files_list = "\n".join(f"- {f}" for f in conflicted_files) if conflicted_files else "(none)"
+    return (
+        "You are Symphony's merge-conflict resolver.\n"
+        f"The orchestrator has started `git rebase origin/{base_branch}` and it stopped\n"
+        "because the following files have conflict markers. Your only job is to resolve\n"
+        "the `<<<<<<<` / `=======` / `>>>>>>>` markers in each file.\n\n"
+        "# Conflicted files\n\n"
+        f"{files_list}\n\n"
+        "# How to resolve\n\n"
+        "For each file above:\n"
+        "1. Read the full file content.\n"
+        "2. For every conflict block, decide which side to keep (or merge both sides).\n"
+        "3. Write the resolved content back — no `<<<<<<<`, `=======`, or `>>>>>>>`"
+        " lines.\n\n"
+        "Do NOT run any git commands. The orchestrator will stage and continue the"
+        " rebase after you finish.\n\n"
+        "# Issue\n\n"
+        f"## Title\n{issue_title}\n\n"
+        f"## Labels\n{label_line}\n\n"
+        f"## Description\n{body}\n\n"
+        "# Working agreement\n\n"
+        "- Resolve conflicts so the PR's intended feature logic is preserved while\n"
+        "  integrating any new upstream changes from the base branch.\n"
+        "- Do not edit files that are not in the conflicted list above.\n"
+        "- Do not run git commands.\n"
+    )
+
+
 def merge_prompt(
     *,
     issue_title: str,
