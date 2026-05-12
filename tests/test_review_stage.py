@@ -1761,7 +1761,9 @@ async def test_skip_review_works_when_fix_run_active(tmp_path: Path) -> None:
 
         from symphony.linear.client import LinearComment
 
-        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        runner = MagicMock()
+        runner.kill = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=runner, gh=gh)
 
         # Register the review monitor.
         review_run_id = "review-run"
@@ -1799,6 +1801,66 @@ async def test_skip_review_works_when_fix_run_active(tmp_path: Path) -> None:
         for call in linear.post_comment.call_args_list:
             body = call[0][1]
             assert "cannot skip" not in body
+        runner.kill.assert_awaited_once_with(fix_run_id)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_review_aborts_when_active_fix_run_cannot_be_killed(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+        runner = MagicMock()
+        runner.kill = AsyncMock(side_effect=RuntimeError("still running"))
+
+        from symphony.linear.client import LinearComment
+
+        orch = Orchestrator(cfg, linear, conn, runner=runner, gh=gh)
+
+        review_run_id = "review-run"
+        orch._review_poll_run_ids.add(review_run_id)  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = review_run_id  # noqa: SLF001
+
+        fix_run_id = "fix-run"
+        orch._dispatch_run_ids["iss-1"] = fix_run_id  # noqa: SLF001
+        orch._active_run_ids.add(fix_run_id)  # noqa: SLF001
+
+        skip_comment = LinearComment(
+            id="c-skip",
+            body="$skip-review",
+            created_at="2026-05-10T01:00:00+00:00",
+            author_name="user",
+            author_is_me=False,
+            external_thread_type=None,
+        )
+        linear.comments_since = AsyncMock(return_value=[skip_comment])
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_run = next(r for r in history if r.stage == "review")
+        assert review_run.status == "running"
+        assert not [r for r in history if r.stage == "merge"]
+        assert orch._dispatch_run_ids["iss-1"] == fix_run_id  # noqa: SLF001
+        assert orch._review_poll_issue_ids["iss-1"] == review_run_id  # noqa: SLF001
+        runner.kill.assert_awaited_once_with(fix_run_id)
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("could not stop active review fix-run" in b for b in posted)
     finally:
         await conn.close()
 

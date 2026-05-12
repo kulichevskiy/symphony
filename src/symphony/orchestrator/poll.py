@@ -2646,20 +2646,10 @@ class Orchestrator:
             log.warning("no binding for skip-review on %s", issue.identifier)
             return
 
-        # Mark the review run completed and cancel its asyncio task immediately so
-        # it cannot dispatch any more fix runs mid-iteration.
-        now = datetime.now(UTC).isoformat()
-        await db.runs.update_status(self._conn, monitor_run_id, "completed", ended_at=now)
-        monitor_task = self._review_poll_run_tasks.pop(monitor_run_id, None)
-        if monitor_task is not None and not monitor_task.done():
-            monitor_task.cancel()
-        self._review_poll_run_ids.discard(monitor_run_id)
-        if self._review_poll_issue_ids.get(issue_id) == monitor_run_id:
-            self._review_poll_issue_ids.pop(issue_id, None)
-
         # A review_fix run might have been dispatched concurrently (or just
         # dispatched by the monitor task before it noticed the DB change).
-        # Kill it so create_if_no_active doesn't block the merge.
+        # Kill it before completing the monitor; if the process cannot be
+        # stopped, leave Review active and do not race Merge against it.
         fix_run_id = self._dispatch_run_ids.get(issue_id)
         if fix_run_id is not None and fix_run_id != monitor_run_id:
             log.info(
@@ -2671,10 +2661,41 @@ class Orchestrator:
                 await self._runner.kill(fix_run_id)
             except Exception:  # noqa: BLE001
                 log.exception("skip-review: could not kill fix run %s", fix_run_id)
+                try:
+                    await self.linear.post_comment(
+                        issue_id,
+                        truncate_body(
+                            command_rejected(
+                                "$skip-review",
+                                "could not stop active review fix-run",
+                            )
+                        ),
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "could not post skip-review rejection for %s: %s",
+                        issue.identifier,
+                        e,
+                    )
+                return
+
+        # Mark the review run completed and cancel its asyncio task immediately so
+        # it cannot dispatch any more fix runs mid-iteration.
+        now = datetime.now(UTC).isoformat()
+        await db.runs.update_status(self._conn, monitor_run_id, "completed", ended_at=now)
+        monitor_task = self._review_poll_run_tasks.pop(monitor_run_id, None)
+        if monitor_task is not None and not monitor_task.done():
+            monitor_task.cancel()
+        self._review_poll_run_ids.discard(monitor_run_id)
+        if self._review_poll_issue_ids.get(issue_id) == monitor_run_id:
+            self._review_poll_issue_ids.pop(issue_id, None)
+
+        if fix_run_id is not None and fix_run_id != monitor_run_id:
             await db.runs.update_status(
                 self._conn, fix_run_id, "interrupted", ended_at=now
             )
             self._dispatch_run_ids.pop(issue_id, None)
+            self._active_run_ids.discard(fix_run_id)
 
         # Dispatch merge directly, bypassing the review verdict check.
         self._schedule_merge(

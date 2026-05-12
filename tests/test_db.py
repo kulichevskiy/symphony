@@ -401,6 +401,18 @@ async def test_orphaned_review_prs_require_latest_review_run_failed(
 
         await db.runs.create(
             conn,
+            id="old-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T23:59:00+00:00",
+        )
+        candidates = await db.issue_prs.list_orphaned_review_prs(conn)
+        assert [c.pr_number for c in candidates] == [42]
+
+        await db.runs.create(
+            conn,
             id="submitted-merge",
             issue_id="iss-1",
             stage="merge",
