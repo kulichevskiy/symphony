@@ -1280,6 +1280,47 @@ async def test_stop_intent_kills_active_review_fix_run(tmp_path: Path) -> None:
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_stop_intent_cancels_review_monitor_run(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        runner = AsyncMock()
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=runner, gh=MagicMock())
+        review_task = asyncio.create_task(asyncio.Event().wait())
+        orch._review_poll_run_ids.add("review-run")  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = "review-run"  # noqa: SLF001
+        orch._review_poll_run_tasks["review-run"] = review_task  # noqa: SLF001
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "review-run",
+            SlashIntent(
+                kind=SlashKind.STOP,
+                comment_id="c-stop",
+                created_at="2026-05-10T00:01:00+00:00",
+            ),
+        )
+        await asyncio.gather(review_task, return_exceptions=True)
+
+        runner.kill.assert_not_awaited()
+        assert "review-run" not in orch._review_poll_run_ids  # noqa: SLF001
+        assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
+        assert "review-run" not in orch._review_poll_run_tasks  # noqa: SLF001
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        assert run.status == "interrupted"
+    finally:
+        await conn.close()
+
+
 # --- Fix-runs go through the binding agent ---------------------------------
 
 
@@ -1538,9 +1579,14 @@ async def test_retry_slash_command_restarts_review_monitor(tmp_path: Path) -> No
         await conn.close()
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [SlashKind.APPROVE, SlashKind.REJECT, SlashKind.STOP],
+)
 @pytest.mark.asyncio
-async def test_merge_retry_keeps_operator_wait_when_lookup_fails(
+async def test_merge_command_keeps_operator_wait_when_lookup_fails(
     tmp_path: Path,
+    kind: SlashKind,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -1587,6 +1633,7 @@ async def test_merge_retry_keeps_operator_wait_when_lookup_fails(
             db_path=tmp_path / "s.sqlite",
         )
         linear = AsyncMock()
+        linear.team_states = AsyncMock(return_value=_states())
         linear.lookup_issue = AsyncMock(side_effect=LinearError("lookup down"))
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
         orch._dispatch_run_ids["iss-1"] = "merge-run"  # noqa: SLF001
@@ -1597,8 +1644,8 @@ async def test_merge_retry_keeps_operator_wait_when_lookup_fails(
             "iss-1",
             "merge-run",
             SlashIntent(
-                kind=SlashKind.APPROVE,
-                comment_id="c-approve",
+                kind=kind,
+                comment_id="c-command",
                 created_at="2026-05-10T00:01:00+00:00",
             ),
         )

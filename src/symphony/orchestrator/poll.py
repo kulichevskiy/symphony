@@ -1057,6 +1057,9 @@ class Orchestrator:
         if run_id in self._merge_needs_approval_bindings:
             await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
             return
+        if intent.kind is SlashKind.STOP and run_id in self._review_poll_run_ids:
+            await self._stop_review_monitor(issue_id, run_id)
+            return
         if intent.kind is SlashKind.STOP:
             log.info(
                 "$stop received for run %s (issue %s) — terminating runner",
@@ -1076,6 +1079,23 @@ class Orchestrator:
             "slash %s received for run %s (handler not implemented in this slice)",
             intent.kind,
             run_id,
+        )
+
+    async def _stop_review_monitor(self, issue_id: str, run_id: str) -> None:
+        log.info("$stop received for review monitor %s (issue %s)", run_id, issue_id)
+        task = self._review_poll_run_tasks.get(run_id)
+        if task is not None:
+            self._review_poll_tasks.discard(task)
+            task.cancel()
+        self._review_poll_run_ids.discard(run_id)
+        self._review_poll_run_tasks.pop(run_id, None)
+        if self._review_poll_issue_ids.get(issue_id) == run_id:
+            self._review_poll_issue_ids.pop(issue_id, None)
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            "interrupted",
+            ended_at=datetime.now(UTC).isoformat(),
         )
 
     async def _handle_cost_cap_slash_intent(
@@ -2488,7 +2508,6 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
-                await self._clear_operator_wait(issue_id, run_id)
                 return
             if blocked_id is not None:
                 try:
