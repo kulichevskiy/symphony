@@ -1094,6 +1094,34 @@ class Orchestrator:
         log.info("$stop received for review monitor %s (issue %s)", run_id, issue_id)
         now = datetime.now(UTC).isoformat()
         fix_run_id = self._dispatch_run_ids.get(issue_id)
+        if fix_run_id is not None and fix_run_id != run_id:
+            log.info(
+                "$stop received for review monitor %s: killing concurrent run %s",
+                run_id,
+                fix_run_id,
+            )
+            try:
+                await self._runner.kill(fix_run_id)
+            except Exception:  # noqa: BLE001
+                log.exception("could not kill concurrent review run %s", fix_run_id)
+                try:
+                    await self.linear.post_comment(
+                        issue_id,
+                        truncate_body(
+                            command_rejected(
+                                "$stop",
+                                "could not stop active review fix-run",
+                            )
+                        ),
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "could not post stop rejection for %s: %s",
+                        issue_id,
+                        e,
+                    )
+                return
+
         task = self._review_poll_run_tasks.get(run_id)
         if task is not None:
             self._review_poll_tasks.discard(task)
@@ -1109,15 +1137,6 @@ class Orchestrator:
             ended_at=now,
         )
         if fix_run_id is not None and fix_run_id != run_id:
-            log.info(
-                "$stop received for review monitor %s: killing concurrent run %s",
-                run_id,
-                fix_run_id,
-            )
-            try:
-                await self._runner.kill(fix_run_id)
-            except Exception:  # noqa: BLE001
-                log.exception("could not kill concurrent review run %s", fix_run_id)
             await db.runs.update_status(
                 self._conn,
                 fix_run_id,
@@ -1125,6 +1144,7 @@ class Orchestrator:
                 ended_at=now,
             )
             self._dispatch_run_ids.pop(issue_id, None)
+            self._active_run_ids.discard(fix_run_id)
 
     async def _handle_cost_cap_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent

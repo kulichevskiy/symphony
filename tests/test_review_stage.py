@@ -1301,6 +1301,70 @@ async def test_stop_intent_cancels_review_monitor_and_active_fix_run(
 
 
 @pytest.mark.asyncio
+async def test_stop_intent_keeps_review_live_when_active_fix_run_kill_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    review_task: asyncio.Task[bool] | None = None
+    try:
+        await _seed_active_review(conn)
+        fix_run_id = "fix-run"
+        await db.runs.create(
+            conn,
+            id=fix_run_id,
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop")])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        runner = MagicMock()
+        runner.kill = AsyncMock(side_effect=RuntimeError("still running"))
+        orch = Orchestrator(cfg, linear, conn, runner=runner, gh=MagicMock())
+
+        review_task = asyncio.create_task(asyncio.Event().wait())
+        orch._review_poll_run_ids.add("review-run")  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = "review-run"  # noqa: SLF001
+        orch._review_poll_run_tasks["review-run"] = review_task  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = fix_run_id  # noqa: SLF001
+        orch._active_run_ids.add(fix_run_id)  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        runner.kill.assert_awaited_once_with(fix_run_id)
+        assert "review-run" in orch._review_poll_run_ids  # noqa: SLF001
+        assert orch._review_poll_issue_ids["iss-1"] == "review-run"  # noqa: SLF001
+        assert orch._review_poll_run_tasks["review-run"] is review_task  # noqa: SLF001
+        assert orch._dispatch_run_ids["iss-1"] == fix_run_id  # noqa: SLF001
+        assert fix_run_id in orch._active_run_ids  # noqa: SLF001
+        assert not review_task.cancelled()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_run = next(r for r in history if r.id == "review-run")
+        fix_run = next(r for r in history if r.id == fix_run_id)
+        assert review_run.status == "running"
+        assert fix_run.status == "running"
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("could not stop active review fix-run" in b for b in posted)
+    finally:
+        if review_task is not None:
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_stop_intent_cancels_review_monitor_run(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
