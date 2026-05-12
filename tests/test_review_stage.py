@@ -1216,7 +1216,9 @@ async def test_review_poll_respects_zero_capacity_config(
 
 
 @pytest.mark.asyncio
-async def test_stop_intent_kills_active_review_fix_run(tmp_path: Path) -> None:
+async def test_stop_intent_cancels_review_monitor_and_active_fix_run(
+    tmp_path: Path,
+) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_active_review(conn)
@@ -1269,9 +1271,15 @@ async def test_stop_intent_kills_active_review_fix_run(tmp_path: Path) -> None:
 
             assert runner.killed_run_ids == [fix_run_id]
             assert runner.release.is_set()
-            monitor = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+            assert "review-run" not in orch._review_poll_run_ids  # noqa: SLF001
+            assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
+            assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+            history = await db.runs.history_for_issue(conn, "iss-1")
+            monitor = history[0]
             assert monitor.id == "review-run"
-            assert monitor.pid is None
+            assert monitor.status == "interrupted"
+            fix_run = next(r for r in history if r.id == fix_run_id)
+            assert fix_run.status == "interrupted"
         finally:
             runner.release.set()
             if tasks:
@@ -2200,6 +2208,7 @@ async def test_codex_lgtm_comment_posts_to_linear_once(tmp_path: Path) -> None:
                     "id": 9999,
                     "user": {"login": "chatgpt-codex-connector[bot]"},
                     "body": "Codex Review: Didn't find any major issues. Delightful!",
+                    "created_at": "2026-05-10T00:01:00Z",
                 }
             ]
         )
@@ -2264,6 +2273,7 @@ async def test_codex_lgtm_comment_linear_failure_does_not_crash_or_dedupe(
                     "id": 9999,
                     "user": {"login": "chatgpt-codex-connector[bot]"},
                     "body": "Codex Review: Didn't find any major issues. Delightful!",
+                    "created_at": "2026-05-10T00:01:00Z",
                 }
             ]
         )
@@ -2282,6 +2292,55 @@ async def test_codex_lgtm_comment_linear_failure_does_not_crash_or_dedupe(
         )
 
         linear.post_comment.assert_awaited_once()
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.codex_lgtm_comment_id == ""
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_lgtm_comment_ignores_previous_review_cycle(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+        gh.pr_issue_comments = AsyncMock(
+            return_value=[
+                {
+                    "id": 9999,
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Codex Review: Didn't find any major issues. Delightful!",
+                    "created_at": "2026-05-09T23:59:59Z",
+                }
+            ]
+        )
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        state = await db.review_state.get(conn, "iss-1")
+
+        await orch._maybe_post_codex_lgtm(  # noqa: SLF001
+            run=run,
+            binding=cfg.repos[0],
+            issue=_issue_in_progress(),
+            state=state,
+            pr_number=42,
+        )
+
+        linear.post_comment.assert_not_awaited()
         state = await db.review_state.get(conn, "iss-1")
         assert state.codex_lgtm_comment_id == ""
     finally:

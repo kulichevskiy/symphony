@@ -1057,10 +1057,11 @@ class Orchestrator:
         if run_id in self._merge_needs_approval_bindings:
             await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
             return
-        if intent.kind is SlashKind.STOP and run_id in self._review_poll_run_ids:
-            await self._stop_review_monitor(issue_id, run_id)
-            return
         if intent.kind is SlashKind.STOP:
+            monitor_run_id = self._review_poll_issue_ids.get(issue_id)
+            if monitor_run_id is not None and monitor_run_id in self._review_poll_run_ids:
+                await self._stop_review_monitor(issue_id, monitor_run_id)
+                return
             log.info(
                 "$stop received for run %s (issue %s) — terminating runner",
                 run_id,
@@ -1083,6 +1084,8 @@ class Orchestrator:
 
     async def _stop_review_monitor(self, issue_id: str, run_id: str) -> None:
         log.info("$stop received for review monitor %s (issue %s)", run_id, issue_id)
+        now = datetime.now(UTC).isoformat()
+        fix_run_id = self._dispatch_run_ids.get(issue_id)
         task = self._review_poll_run_tasks.get(run_id)
         if task is not None:
             self._review_poll_tasks.discard(task)
@@ -1095,8 +1098,25 @@ class Orchestrator:
             self._conn,
             run_id,
             "interrupted",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=now,
         )
+        if fix_run_id is not None and fix_run_id != run_id:
+            log.info(
+                "$stop received for review monitor %s: killing concurrent run %s",
+                run_id,
+                fix_run_id,
+            )
+            try:
+                await self._runner.kill(fix_run_id)
+            except Exception:  # noqa: BLE001
+                log.exception("could not kill concurrent review run %s", fix_run_id)
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "interrupted",
+                ended_at=now,
+            )
+            self._dispatch_run_ids.pop(issue_id, None)
 
     async def _handle_cost_cap_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
@@ -3351,10 +3371,32 @@ class Orchestrator:
             return
 
         lgtm_comment: dict[str, Any] | None = None
+        try:
+            run_started_at = _parse_rfc3339(run.started_at)
+        except ValueError:
+            log.warning(
+                "could not parse review run started_at for %s: %s",
+                run.id,
+                run.started_at,
+            )
+            return
         for entry in raw:
             user: dict[str, Any] = entry.get("user") or {}
             login = str(user.get("login") or "")
             body = str(entry.get("body") or "")
+            created_at_raw = str(entry.get("created_at") or entry.get("createdAt") or "")
+            if not created_at_raw:
+                continue
+            try:
+                created_at = _parse_rfc3339(created_at_raw)
+            except ValueError:
+                log.warning(
+                    "ignoring Codex LGTM comment with invalid created_at: %s",
+                    created_at_raw,
+                )
+                continue
+            if created_at < run_started_at:
+                continue
             if is_codex_author(login) and self._CODEX_NO_ISSUES_MARKER in body.lower():
                 lgtm_comment = entry
 
