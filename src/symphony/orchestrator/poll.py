@@ -2475,7 +2475,6 @@ class Orchestrator:
             return
 
         # $approve or $retry: re-dispatch the merge.
-        await self._clear_operator_wait(issue_id, run_id)
         try:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
@@ -2499,6 +2498,7 @@ class Orchestrator:
             pr_number=state.pr_number,
             pr_url=pr_url,
         )
+        await self._clear_operator_wait(issue_id, run_id)
         try:
             await self.linear.post_comment(
                 issue_id,

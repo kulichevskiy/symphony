@@ -25,6 +25,7 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearComment, LinearError, LinearIssue
+from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import (
     Orchestrator,
@@ -1533,6 +1534,81 @@ async def test_retry_slash_command_restarts_review_monitor(tmp_path: Path) -> No
         gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
         # Operator wait should be cleared.
         assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_retry_keeps_operator_wait_when_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add auth",
+            team_key="ENG",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label="",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(side_effect=LinearError("lookup down"))
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        orch._dispatch_run_ids["iss-1"] = "merge-run"  # noqa: SLF001
+        orch._operator_wait_run_ids.add("merge-run")  # noqa: SLF001
+        orch._merge_needs_approval_bindings["merge-run"] = binding  # noqa: SLF001
+
+        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "merge-run",
+            SlashIntent(
+                kind=SlashKind.APPROVE,
+                comment_id="c-approve",
+                created_at="2026-05-10T00:01:00+00:00",
+            ),
+        )
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "merge-run"
+        assert orch._dispatch_run_ids["iss-1"] == "merge-run"  # noqa: SLF001
+        assert "merge-run" in orch._operator_wait_run_ids  # noqa: SLF001
+        assert orch._merge_needs_approval_bindings["merge-run"] is binding  # noqa: SLF001
     finally:
         await conn.close()
 

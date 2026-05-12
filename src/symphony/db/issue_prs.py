@@ -102,13 +102,14 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
                 AND r.stage = 'review'
                 AND r.status = 'running'
           )
-          AND EXISTS (
-              SELECT 1 FROM runs r
+          AND (
+              SELECT r.status FROM runs r
               WHERE r.issue_id = p.issue_id
                 AND r.stage = 'review'
-                AND r.status = 'failed'
                 AND r.started_at >= p.created_at
-          )
+              ORDER BY r.started_at DESC, r.rowid DESC
+              LIMIT 1
+          ) = 'failed'
           AND NOT EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
