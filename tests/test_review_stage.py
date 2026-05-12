@@ -24,7 +24,8 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
-from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.client import LinearComment, LinearError, LinearIssue
+from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import (
     Orchestrator,
     build_fix_runner_command,
@@ -1505,7 +1506,6 @@ async def test_retry_slash_command_restarts_review_monitor(tmp_path: Path) -> No
         gh.pr_comment = AsyncMock()
         gh.pr_issue_comments = AsyncMock(return_value=[])
 
-        from symphony.db import operator_waits
         from symphony.linear.client import LinearComment
 
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
@@ -1660,6 +1660,94 @@ async def test_skip_review_works_when_fix_run_active(tmp_path: Path) -> None:
         await conn.close()
 
 
+@pytest.mark.parametrize("failure_mode", ["agent", "continue"])
+@pytest.mark.asyncio
+async def test_merge_conflict_fix_run_aborts_rebase_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.repo_default_branch = AsyncMock(return_value="main")
+
+        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=False))
+        monkeypatch.setattr(
+            poll_module,
+            "_git_conflicted_files",
+            AsyncMock(return_value=["conflicted.py"]),
+        )
+        abort_rebase = AsyncMock(return_value=None)
+        monkeypatch.setattr(poll_module, "_git_abort_rebase", abort_rebase)
+        add_and_continue = AsyncMock(
+            side_effect=RuntimeError("continue failed")
+            if failure_mode == "continue"
+            else None
+        )
+        monkeypatch.setattr(
+            poll_module,
+            "_git_add_and_continue_rebase",
+            add_and_continue,
+        )
+
+        returncode = 0 if failure_mode == "continue" else 1
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=returncode)])
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            force_push_fn=AsyncMock(),
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        issue = _issue_in_progress()
+        result = await orch._dispatch_merge_conflict_fix_run(  # noqa: SLF001
+            run=run,
+            binding=cfg.repos[0],
+            issue=issue,
+            iteration=1,
+        )
+
+        assert result is False
+        abort_rebase.assert_awaited_once_with(workspace_path)
+        if failure_mode == "continue":
+            add_and_continue.assert_awaited_once_with(workspace_path, ["conflicted.py"])
+        else:
+            add_and_continue.assert_not_awaited()
+        workspace.release.assert_called_once_with(cfg.repos[0], issue)
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert monitor.status == "failed"
+        assert fix_run.status == "failed"
+    finally:
+        await conn.close()
+
+
 # --- Reviewer comment fix-runs ---------------------------------------------
 
 
@@ -1769,7 +1857,7 @@ async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity
 async def test_codex_inline_comment_dedup_skips_identical_back_to_back(
     tmp_path: Path,
 ) -> None:
-    from symphony.pipeline.review_classifier import ReviewComment, _stable_digest, _comment_key
+    from symphony.pipeline.review_classifier import ReviewComment, _comment_key, _stable_digest
 
     comment = _codex_inline_comment()
     rc = ReviewComment(
@@ -1942,5 +2030,53 @@ async def test_codex_lgtm_comment_posts_to_linear_once(tmp_path: Path) -> None:
         await _poll_review_and_wait(orch)
         posted_again = [c.args[1] for c in linear.post_comment.await_args_list]
         assert not any("Codex reviewed" in b for b in posted_again), posted_again
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_lgtm_comment_linear_failure_does_not_crash_or_dedupe(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(side_effect=LinearError("linear down"))
+
+        gh = MagicMock()
+        gh.pr_issue_comments = AsyncMock(
+            return_value=[
+                {
+                    "id": 9999,
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Codex Review: Didn't find any major issues. Delightful!",
+                }
+            ]
+        )
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        state = await db.review_state.get(conn, "iss-1")
+
+        await orch._maybe_post_codex_lgtm(  # noqa: SLF001
+            run=run,
+            binding=cfg.repos[0],
+            issue=_issue_in_progress(),
+            state=state,
+            pr_number=42,
+        )
+
+        linear.post_comment.assert_awaited_once()
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.codex_lgtm_comment_id == ""
     finally:
         await conn.close()

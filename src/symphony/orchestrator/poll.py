@@ -84,7 +84,6 @@ from ..pipeline.cost_guard import (
 )
 from ..pipeline.review_classifier import (
     BLOCKING_CHECK_CONCLUSIONS,
-    CheckRun as ReviewCheckRun,
     Reaction,
     Review,
     ReviewComment,
@@ -95,6 +94,9 @@ from ..pipeline.review_classifier import (
     is_codex_author,
     review_classifier,
     should_dispatch_fix_run,
+)
+from ..pipeline.review_classifier import (
+    CheckRun as ReviewCheckRun,
 )
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
@@ -551,6 +553,36 @@ async def _git_rebase(workspace_path: Path, upstream: str) -> bool:
     )
     await proc.communicate()
     return proc.returncode == 0
+
+
+async def _git_abort_rebase(workspace_path: Path) -> None:
+    """Abort an in-progress rebase in *workspace_path*."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rebase", "--abort",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git rebase --abort failed: {stderr.decode(errors='replace').strip()}"
+        )
+
+
+async def _abort_rebase_safely(
+    workspace_path: Path, *, issue_identifier: str, reason: str
+) -> None:
+    try:
+        await _git_abort_rebase(workspace_path)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "could not abort rebase after %s for %s: %s",
+            reason,
+            issue_identifier,
+            e,
+        )
 
 
 async def _git_conflicted_files(workspace_path: Path) -> list[str]:
@@ -2083,13 +2115,11 @@ class Orchestrator:
                         "rebase non-zero but no conflict markers for %s",
                         issue.identifier,
                     )
-                    abort_proc = await asyncio.create_subprocess_exec(
-                        "git", "rebase", "--abort",
-                        cwd=str(workspace_path),
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
+                    await _abort_rebase_safely(
+                        workspace_path,
+                        issue_identifier=issue.identifier,
+                        reason="rebase with no conflict markers",
                     )
-                    await abort_proc.wait()
                     self._workspace.release(binding, issue)
                     await self._fail_review_run(
                         run=run,
@@ -2144,6 +2174,11 @@ class Orchestrator:
                             "merge-conflict fix-run execution failed for %s",
                             issue.identifier,
                         )
+                        await _abort_rebase_safely(
+                            workspace_path,
+                            issue_identifier=issue.identifier,
+                            reason="merge-conflict fix-run execution failure",
+                        )
                         await db.runs.update_status(
                             self._conn,
                             fix_run_id,
@@ -2165,6 +2200,11 @@ class Orchestrator:
                         returncode=final_returncode,
                     )
                     if transition.next_run_status != "completed":
+                        await _abort_rebase_safely(
+                            workspace_path,
+                            issue_identifier=issue.identifier,
+                            reason=f"merge-conflict fix-run {final_kind}",
+                        )
                         await db.runs.update_status(
                             self._conn,
                             fix_run_id,
@@ -2188,6 +2228,11 @@ class Orchestrator:
                     except Exception as e:  # noqa: BLE001
                         log.warning(
                             "rebase --continue failed for %s: %s", issue.identifier, e
+                        )
+                        await _abort_rebase_safely(
+                            workspace_path,
+                            issue_identifier=issue.identifier,
+                            reason="rebase --continue failure",
                         )
                         await db.runs.update_status(
                             self._conn,
@@ -3278,7 +3323,15 @@ class Orchestrator:
             pr_url=pr_url,
             run_id=str(run.id),
         )
-        await self.linear.post_comment(issue.id, codex_lgtm(v))
+        try:
+            await self.linear.post_comment(issue.id, codex_lgtm(v))
+        except LinearError as e:
+            log.warning(
+                "could not post codex_lgtm comment for %s: %s",
+                issue.identifier,
+                e,
+            )
+            return
         await db.review_state.set_codex_lgtm_comment_id(self._conn, issue.id, comment_id)
 
     async def _review_verdict_for_pr(
