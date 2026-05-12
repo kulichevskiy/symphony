@@ -166,8 +166,12 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         # 🚀 starting comment + stage-transition comment.
         assert linear.post_comment.await_count == 2
 
-        # Issue moved to In Progress (and never further — Implement halts here).
-        linear.move_issue.assert_awaited_once_with("iss-1", "state-progress")
+        # Issue enters Implement, then moves into the configured Review lane
+        # after the PR is opened.
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-na"),
+        ]
 
         # Workspace was acquired + released.
         workspace.acquire.assert_awaited_once()
@@ -328,6 +332,11 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        # Failure comment is now posted so the operator knows what went wrong.
+        posted_bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("Implement stage failed" in b for b in posted_bodies), (
+            "expected a failed() comment to be posted"
+        )
     finally:
         await conn.close()
 

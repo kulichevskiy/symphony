@@ -3,7 +3,7 @@
 Runs that were live when the host died still show as `running` with the
 old PID. We can't resume the subprocess (it's gone), so we mark each
 dead-PID row `interrupted` and post a Linear comment telling the user to
-`/retry`. Live PIDs are left alone — they belong to runs the orchestrator
+`$retry`. Live PIDs are left alone — they belong to runs the orchestrator
 adopts on the next poll.
 """
 
@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 _RETRY_BODY = (
     "🔁 **Host restarted — run interrupted**\n\n"
     "The Symphony host was restarted while this run was in flight, so the "
-    "agent subprocess is gone. Reply `/retry` to dispatch again.\n"
+    "agent subprocess is gone. Reply `$retry` to dispatch again.\n"
 )
 
 
@@ -35,7 +35,7 @@ def _process_alive(pid: int) -> bool:
     can't decide. ESRCH is the only signal that proves death — anything
     else means the process might still be alive. Defaulting unknown-state
     errors to dead would either mark a sibling-owned run `interrupted` (and
-    invite `/retry` while a worker is still running) or, worse, crash
+    invite `$retry` while a worker is still running) or, worse, crash
     `reconcile()` at startup and prevent the orchestrator from booting."""
     try:
         os.kill(pid, 0)

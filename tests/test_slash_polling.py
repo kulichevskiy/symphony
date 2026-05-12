@@ -1,7 +1,7 @@
 """Slash-command polling tests.
 
 Issue #10: on every poll tick the orchestrator fetches `comments_since`
-for each active run, dispatches intents (e.g. `/stop` kills the runner),
+for each active run, dispatches intents (e.g. `$stop` kills the runner),
 and persists the cursor so a restart does not re-fire old commands.
 
 Filter regressions (self-author, externalThread) are pure-function tested
@@ -116,7 +116,7 @@ async def test_stop_intent_kills_active_runner(tmp_path: Path) -> None:
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/stop")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop")])
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -138,7 +138,7 @@ async def test_approve_resumes_cost_cap_waiting_run(tmp_path: Path) -> None:
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/approve")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -173,7 +173,7 @@ async def test_reject_stops_cost_cap_waiting_run(tmp_path: Path) -> None:
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/reject")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$reject")])
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -206,7 +206,7 @@ async def test_approve_resumes_cost_cap_wait_after_restart(tmp_path: Path) -> No
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/approve")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -252,7 +252,7 @@ async def test_cursor_persisted_after_fetch(tmp_path: Path) -> None:
         linear.comments_since = AsyncMock(
             return_value=[
                 _comment("noise", cid="c1", created_at="2026-05-10T11:00:00+00:00"),
-                _comment("/stop", cid="c2", created_at="2026-05-10T12:00:00+00:00"),
+                _comment("$stop", cid="c2", created_at="2026-05-10T12:00:00+00:00"),
             ]
         )
         linear.move_issue = AsyncMock()
@@ -281,7 +281,7 @@ async def test_boundary_tied_comment_not_double_fired(tmp_path: Path) -> None:
         linear = AsyncMock()
         boundary = "2026-05-10T12:00:00+00:00"
         linear.comments_since = AsyncMock(
-            return_value=[_comment("/stop", cid="c1", created_at=boundary)]
+            return_value=[_comment("$stop", cid="c1", created_at=boundary)]
         )
         linear.move_issue = AsyncMock()
 
@@ -297,8 +297,8 @@ async def test_boundary_tied_comment_not_double_fired(tmp_path: Path) -> None:
         # comment that wasn't visible on tick 1 (e.g. pagination split).
         # The already-handled c1 must be deduped; only c2 should fire.
         linear.comments_since.return_value = [
-            _comment("/stop", cid="c1", created_at=boundary),
-            _comment("/stop", cid="c2", created_at=boundary),
+            _comment("$stop", cid="c1", created_at=boundary),
+            _comment("$stop", cid="c2", created_at=boundary),
         ]
         await orch._poll_slash_commands()  # noqa: SLF001
         # One additional kill — for c2 only, not c1.
@@ -315,7 +315,7 @@ async def test_boundary_tied_comment_not_double_fired(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_stale_cursor_clamped_to_run_start(tmp_path: Path) -> None:
-    """A stale `/stop` posted between runs (after run A ended, before run B
+    """A stale `$stop` posted between runs (after run A ended, before run B
     started) must NOT be replayed against run B."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -397,7 +397,7 @@ async def test_handler_failure_does_not_advance_cursor(tmp_path: Path) -> None:
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/stop", cid="c1")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop", cid="c1")])
         linear.move_issue = AsyncMock()
 
         orch = _make_orch(cfg, linear, conn)
@@ -422,7 +422,7 @@ async def test_stop_kill_failure_does_not_advance_cursor(tmp_path: Path) -> None
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(return_value=[_comment("/stop", cid="c1")])
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop", cid="c1")])
         linear.move_issue = AsyncMock()
 
         orch = _make_orch(cfg, linear, conn)
@@ -446,7 +446,7 @@ async def test_self_authored_stop_is_ignored(tmp_path: Path) -> None:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
         linear.comments_since = AsyncMock(
-            return_value=[_comment("/stop", is_me=True)]
+            return_value=[_comment("$stop", is_me=True)]
         )
         linear.move_issue = AsyncMock()
 
@@ -470,7 +470,7 @@ async def test_mirrored_from_github_stop_is_ignored(tmp_path: Path) -> None:
         linear = AsyncMock()
         linear.comments_since = AsyncMock(
             return_value=[
-                _comment("/stop", external_thread_type="githubPullRequest")
+                _comment("$stop", external_thread_type="githubPullRequest")
             ]
         )
         linear.move_issue = AsyncMock()

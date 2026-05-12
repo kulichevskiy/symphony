@@ -30,11 +30,11 @@ def _c(
 def test_parses_known_commands() -> None:
     intents = parse(
         [
-            _c("/approve"),
-            _c("/REJECT"),
-            _c("/retry now"),
-            _c("/stop"),
-            _c("/skip-review"),
+            _c("$approve"),
+            _c("$REJECT"),
+            _c("$retry now"),
+            _c("$stop"),
+            _c("$skip-review"),
         ]
     )
     assert [i.kind for i in intents] == [
@@ -47,13 +47,13 @@ def test_parses_known_commands() -> None:
 
 
 def test_ignores_self_authored() -> None:
-    assert parse([_c("/approve", is_me=True)]) == []
+    assert parse([_c("$approve", is_me=True)]) == []
 
 
 def test_ignores_mirrored_from_github() -> None:
     # The GitHub-side review poll handles these; double-firing is the bug
     # we explicitly avoid (see `linear-integration-research.md` §31).
-    assert parse([_c("/approve", external_thread_type="githubPullRequest")]) == []
+    assert parse([_c("$approve", external_thread_type="githubPullRequest")]) == []
 
 
 def test_ignores_free_form() -> None:

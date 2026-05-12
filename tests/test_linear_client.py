@@ -12,7 +12,7 @@ from symphony.linear.client import Linear
 def _comment(cid: str, created_at: str = "2026-05-10T12:00:00+00:00") -> dict[str, Any]:
     return {
         "id": cid,
-        "body": "/stop",
+        "body": "$stop",
         "createdAt": created_at,
         "user": {"name": "user", "isMe": False},
         "externalThread": None,

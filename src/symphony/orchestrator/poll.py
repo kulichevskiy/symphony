@@ -487,6 +487,39 @@ async def _default_force_push(workspace_path: Path, branch: str) -> None:
         )
 
 
+async def _sync_workspace_to_remote(workspace_path: Path, branch: str) -> None:
+    """Fetch and hard-reset the workspace to origin/branch.
+
+    Called before the merge agent so that local commits left behind by
+    review-fix runs (which may have diverged from the remote) do not cause
+    a non-fast-forward push failure later.
+    """
+    fetch_proc = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin", branch,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await fetch_proc.communicate()
+    if fetch_proc.returncode != 0:
+        raise RuntimeError(
+            f"git fetch failed: {stderr.decode(errors='replace').strip()}"
+        )
+    reset_proc = await asyncio.create_subprocess_exec(
+        "git", "reset", "--hard", f"origin/{branch}",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await reset_proc.communicate()
+    if reset_proc.returncode != 0:
+        raise RuntimeError(
+            f"git reset --hard failed: {stderr.decode(errors='replace').strip()}"
+        )
+
+
 async def _git_fetch(workspace_path: Path) -> None:
     """Run ``git fetch origin`` in *workspace_path*."""
     proc = await asyncio.create_subprocess_exec(
@@ -693,6 +726,7 @@ class Orchestrator:
         self._operator_wait_run_ids: set[str] = set()
         self._cost_cap_run_bindings: dict[str, RepoBinding] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
+        self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
         self._review_poll_tasks: set[asyncio.Task[None]] = set()
         self._review_poll_run_ids: set[str] = set()
@@ -700,6 +734,9 @@ class Orchestrator:
         # Populated alongside _review_poll_run_ids so skip-review slash commands
         # can be received even when no fix-run is active.
         self._review_poll_issue_ids: dict[str, str] = {}
+        # Maps review monitor run_id → its asyncio Task so _handle_skip_review_intent
+        # can cancel the task immediately, preventing mid-iteration fix-run dispatch.
+        self._review_poll_run_tasks: dict[str, asyncio.Task[None]] = {}
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -983,6 +1020,9 @@ class Orchestrator:
         if run_id in self._review_failed_run_bindings:
             await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._merge_needs_approval_bindings:
+            await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
+            return
         if intent.kind is SlashKind.STOP:
             log.info(
                 "$stop received for run %s (issue %s) — terminating runner",
@@ -1060,6 +1100,7 @@ class Orchestrator:
             if wait.kind not in (
                 db.operator_waits.KIND_COST_CAP,
                 db.operator_waits.KIND_REVIEW_FAILED,
+                db.operator_waits.KIND_MERGE,
             ):
                 log.warning(
                     "ignoring unsupported operator wait kind %r for issue %s",
@@ -1083,6 +1124,8 @@ class Orchestrator:
                 self._cost_cap_run_bindings[wait.run_id] = binding
             elif wait.kind == db.operator_waits.KIND_REVIEW_FAILED:
                 self._review_failed_run_bindings[wait.run_id] = binding
+            elif wait.kind == db.operator_waits.KIND_MERGE:
+                self._merge_needs_approval_bindings[wait.run_id] = binding
 
     def _binding_for_operator_wait(
         self, wait: db.operator_waits.OperatorWait
@@ -1119,6 +1162,7 @@ class Orchestrator:
         self._operator_wait_run_ids.discard(run_id)
         self._cost_cap_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
+        self._merge_needs_approval_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
@@ -1238,6 +1282,7 @@ class Orchestrator:
         self._review_poll_issue_ids[issue.id] = run.id
         task = asyncio.create_task(self._poll_review_run_with_limits(run, binding, issue))
         self._review_poll_tasks.add(task)
+        self._review_poll_run_tasks[run.id] = task
         task.add_done_callback(
             partial(self._review_poll_done, run_id=run.id, issue_id=issue.id)
         )
@@ -1332,6 +1377,7 @@ class Orchestrator:
     ) -> None:
         self._review_poll_tasks.discard(task)
         self._review_poll_run_ids.discard(run_id)
+        self._review_poll_run_tasks.pop(run_id, None)
         if issue_id and self._review_poll_issue_ids.get(issue_id) == run_id:
             self._review_poll_issue_ids.pop(issue_id, None)
         try:
@@ -2342,7 +2388,7 @@ class Orchestrator:
             CommentVars(
                 stage="review",
                 repo=binding.github_repo,
-                issue=0,
+                issue=state.pr_number or 0,
                 run_id=new_run_id,
                 next_stage="review",
             )
@@ -2352,13 +2398,93 @@ class Orchestrator:
         except LinearError as e:
             log.warning("retry comment failed for %s: %s", issue_id, e)
 
+    async def _handle_merge_needs_approval_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        """Handle `$approve`/`$reject`/`$stop` on a merge `needs_approval` run."""
+        binding = self._merge_needs_approval_bindings.get(run_id)
+        if binding is None:
+            return
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            states = await self._states_for_binding(binding)
+            blocked_id = states.get(binding.linear_states.blocked)
+            try:
+                issue = await self.linear.lookup_issue(issue_id)
+            except LinearError as e:
+                log.warning("could not look up %s for merge reject: %s", issue_id, e)
+                await self._clear_operator_wait(issue_id, run_id)
+                return
+            if blocked_id is not None:
+                try:
+                    await self.linear.move_issue(issue_id, blocked_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to blocked after merge reject: %s",
+                        issue.identifier,
+                        e,
+                    )
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+        if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
+            log.info("slash %s for merge-needs-approval run %s ignored", intent.kind, run_id)
+            return
+
+        # $approve or $retry: re-dispatch the merge.
+        await self._clear_operator_wait(issue_id, run_id)
+        try:
+            issue = await self.linear.lookup_issue(issue_id)
+        except LinearError as e:
+            log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
+            return
+        state = await db.review_state.get(self._conn, issue_id)
+        if state.pr_number is None:
+            log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
+            return
+        pr_url = state.pr_url or (
+            f"https://github.com/{binding.github_repo}/pull/{state.pr_number}"
+        )
+        log.info(
+            "merge re-dispatch: scheduling merge for %s (PR #%d)",
+            issue.identifier,
+            state.pr_number,
+        )
+        self._schedule_merge(
+            binding=binding,
+            issue=issue,
+            pr_number=state.pr_number,
+            pr_url=pr_url,
+        )
+        try:
+            await self.linear.post_comment(
+                issue_id,
+                truncate_body(
+                    resumed(
+                        CommentVars(
+                            stage="merge",
+                            repo=binding.github_repo,
+                            issue=state.pr_number,
+                            pr_url=pr_url,
+                            run_id=run_id,
+                            next_stage="merge",
+                        )
+                    )
+                ),
+            )
+        except LinearError as e:
+            log.warning("merge re-dispatch comment failed for %s: %s", issue.identifier, e)
+
     async def _handle_skip_review_intent(self, issue_id: str, run_id: str) -> None:
         """Handle `$skip-review`: stop the review monitor and dispatch merge directly.
 
         This bypasses the Codex review verdict and is useful when the operator
-        trusts the PR as-is. Only valid when `run_id` is an active review poll run.
+        trusts the PR as-is. Valid whenever a review monitor is active for the
+        issue — even if a concurrent review_fix run is the active dispatch run.
         """
-        if run_id not in self._review_poll_run_ids:
+        # A review_fix run may be active at the same time as the review monitor.
+        # run_id may point to the fix run, not the monitor. Always look up the
+        # monitor run ID directly so skip-review works regardless.
+        monitor_run_id = self._review_poll_issue_ids.get(issue_id)
+        if monitor_run_id is None or monitor_run_id not in self._review_poll_run_ids:
             try:
                 await self.linear.post_comment(
                     issue_id,
@@ -2397,10 +2523,35 @@ class Orchestrator:
             log.warning("no binding for skip-review on %s", issue.identifier)
             return
 
-        # Mark the review run completed — the review poll task will exit naturally
-        # on its next iteration because list_live_by_stage no longer returns it.
+        # Mark the review run completed and cancel its asyncio task immediately so
+        # it cannot dispatch any more fix runs mid-iteration.
         now = datetime.now(UTC).isoformat()
-        await db.runs.update_status(self._conn, run_id, "completed", ended_at=now)
+        await db.runs.update_status(self._conn, monitor_run_id, "completed", ended_at=now)
+        monitor_task = self._review_poll_run_tasks.pop(monitor_run_id, None)
+        if monitor_task is not None and not monitor_task.done():
+            monitor_task.cancel()
+        self._review_poll_run_ids.discard(monitor_run_id)
+        if self._review_poll_issue_ids.get(issue_id) == monitor_run_id:
+            self._review_poll_issue_ids.pop(issue_id, None)
+
+        # A review_fix run might have been dispatched concurrently (or just
+        # dispatched by the monitor task before it noticed the DB change).
+        # Kill it so create_if_no_active doesn't block the merge.
+        fix_run_id = self._dispatch_run_ids.get(issue_id)
+        if fix_run_id is not None and fix_run_id != monitor_run_id:
+            log.info(
+                "skip-review: killing concurrent review_fix run %s for %s",
+                fix_run_id,
+                issue.identifier,
+            )
+            try:
+                await self._runner.kill(fix_run_id)
+            except Exception:  # noqa: BLE001
+                log.exception("skip-review: could not kill fix run %s", fix_run_id)
+            await db.runs.update_status(
+                self._conn, fix_run_id, "interrupted", ended_at=now
+            )
+            self._dispatch_run_ids.pop(issue_id, None)
 
         # Dispatch merge directly, bypassing the review verdict check.
         self._schedule_merge(
@@ -2408,6 +2559,7 @@ class Orchestrator:
             issue=issue,
             pr_number=state.pr_number,
             pr_url=state.pr_url,
+            skip_review=True,
         )
         log.info(
             "skip-review: advancing %s (PR #%d) directly to merge",
@@ -2420,7 +2572,7 @@ class Orchestrator:
             repo=binding.github_repo,
             issue=state.pr_number,
             pr_url=state.pr_url,
-            run_id=run_id,
+            run_id=monitor_run_id,
             next_stage="merge",
         )
         try:
@@ -2493,7 +2645,7 @@ class Orchestrator:
                 CommentVars(
                     stage="review",
                     repo=binding.github_repo,
-                    issue=0,
+                    issue=state.pr_number or 0,
                     run_id=review_run_id,
                     pr_url=_pr_url_for_state(
                         repo=binding.github_repo,
@@ -2992,6 +3144,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        skip_review: bool = False,
     ) -> asyncio.Task[None]:
         binding_key = _binding_key(binding)
         self._scheduled_issue_ids.add(issue.id)
@@ -3004,6 +3157,7 @@ class Orchestrator:
                 issue=issue,
                 pr_number=pr_number,
                 pr_url=pr_url,
+                skip_review=skip_review,
             )
         )
         self._dispatch_tasks.add(task)
@@ -3023,6 +3177,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        skip_review: bool = False,
     ) -> None:
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
@@ -3040,6 +3195,7 @@ class Orchestrator:
                         issue=current,
                         pr_number=pr_number,
                         pr_url=pr_url,
+                        skip_review=skip_review,
                     )
         except asyncio.CancelledError:
             run_id = self._dispatch_run_ids.get(issue.id)
@@ -3564,6 +3720,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        skip_review: bool = False,
     ) -> str | None:
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
@@ -3576,6 +3733,7 @@ class Orchestrator:
             pid=None,
             started_at=now,
             ignored_stage="review",
+            ignored_stages=("review_fix",) if skip_review else (),
         )
         if not inserted:
             return None
@@ -3595,6 +3753,20 @@ class Orchestrator:
                     reason=f"workspace acquire failed: {e}",
                 )
                 return run_id
+
+            # Sync workspace to the remote branch so the agent starts from a
+            # clean state and any subsequent push succeeds (fast-forward).
+            # Review-fix runs may have left behind local commits that diverge
+            # from the remote; resetting here avoids a non-fast-forward failure.
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _sync_workspace_to_remote(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "workspace sync failed for merge %s, proceeding anyway: %s",
+                    issue.identifier,
+                    e,
+                )
 
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
@@ -3657,13 +3829,12 @@ class Orchestrator:
                 )
                 return run_id
 
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
             try:
                 await self._push_fn(workspace_path, branch)
                 await self._gh.pr_merge(
                     pr_number,
                     strategy=binding.merge_strategy,
-                    auto=True,
+                    auto=binding.allow_auto_merge,
                     repo=binding.github_repo,
                 )
             except Exception as e:  # noqa: BLE001
@@ -3859,6 +4030,28 @@ class Orchestrator:
                 "needs_approval",
                 ended_at=datetime.now(UTC).isoformat(),
             )
+            # Register so $approve/$reject can be received after restart.
+            # Done inside finally so it runs even when a non-LinearError above escapes.
+            self._dispatch_run_ids[issue.id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._merge_needs_approval_bindings[run_id] = binding
+            try:
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue.id,
+                    run_id=run_id,
+                    kind=db.operator_waits.KIND_MERGE,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            except Exception:
+                log.warning(
+                    "could not persist operator_wait for %s run %s",
+                    issue.identifier,
+                    run_id,
+                )
 
     async def _start_review_stage(
         self,

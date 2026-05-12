@@ -5,8 +5,8 @@ terminal runner event (exit / stall_timeout / spawn_failed), return the
 next run status, the Linear state to move the issue to (if any), and
 whether the pipeline halts here.
 
-For this slice (issue #7) only Implement is wired, and Implement always
-halts at "In Progress" on success — Review and Merge are out of scope.
+The state machine does not move Linear itself; the orchestrator performs
+stage handoff side effects after a successful runner transition.
 """
 
 from __future__ import annotations
@@ -19,8 +19,7 @@ from symphony.pipeline.state_machine import Transition, on_runner_event
 @pytest.mark.parametrize(
     "stage,event_kind,returncode,expected",
     [
-        # Implement clean exit completes the run and halts the pipeline
-        # (Review / Merge land in a later slice).
+        # Implement clean exit completes the runner-owned part of the stage.
         (
             "implement",
             "exit",

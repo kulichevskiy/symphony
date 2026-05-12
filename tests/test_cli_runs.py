@@ -254,7 +254,10 @@ def test_once_drains_scheduled_dispatch_before_exit(
 
     asyncio.run(_check())
     assert len(fake.posted) == 2
-    assert fake.moved == [("iss-once", "state-progress")]
+    assert fake.moved == [
+        ("iss-once", "state-progress"),
+        ("iss-once", "state-needs-approval"),
+    ]
 
 
 def _yaml_two_bindings(team: str, db_path: Path) -> str:
@@ -331,7 +334,10 @@ def test_dispatch_creates_run_for_known_team_binding(
 
     asyncio.run(_check())
     assert len(fake.posted) >= 1, "dispatch should announce on Linear"
-    assert fake.moved == [("iss-1", "state-progress")]
+    assert fake.moved == [
+        ("iss-1", "state-progress"),
+        ("iss-1", "state-needs-approval"),
+    ]
 
 
 def test_runs_ls_rejects_non_positive_limit(tmp_path: Path) -> None:

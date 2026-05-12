@@ -1,7 +1,7 @@
 """Slash-command parser for inbound Linear comments.
 
 Per `docs/python-port-research.md` §13.2 and the prior doc's §35 Strategy 1
-(slash-command-only), v1 only acts on `/approve|reject|retry|stop|skip-review`
+(slash-command-only), v1 only acts on `$approve|$reject|$retry|$stop|$skip-review`
 exactly. Free-form steering is *not* dispatched in v1 because we don't have
 a safe authorship allowlist on the GitHub side; defer to v1.1.
 
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .client import LinearComment
 
-_PATTERN = re.compile(r"^\s*/(approve|reject|retry|stop|skip-review)\b", re.IGNORECASE)
+_PATTERN = re.compile(r"^\s*\$(approve|reject|retry|stop|skip-review)\b", re.IGNORECASE)
 _THUMBS_UP = {"👍", ":+1:", ":+1"}
 _THUMBS_UP_EMOJI = "👍"
 _VARIATION_SELECTORS = {"\ufe0e", "\ufe0f"}

@@ -1596,6 +1596,70 @@ async def test_skip_review_advances_to_merge(tmp_path: Path) -> None:
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_skip_review_works_when_fix_run_active(tmp_path: Path) -> None:
+    """`$skip-review` must succeed even when a concurrent review_fix run is the
+    active dispatch run — the monitor run_id is looked up from _review_poll_issue_ids."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+
+        from symphony.linear.client import LinearComment
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+
+        # Register the review monitor.
+        review_run_id = "review-run"
+        orch._review_poll_run_ids.add(review_run_id)  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = review_run_id  # noqa: SLF001
+
+        # Simulate a concurrent fix-run being the active dispatch run.
+        fix_run_id = "fix-run"
+        orch._dispatch_run_ids["iss-1"] = fix_run_id  # noqa: SLF001
+        orch._active_run_ids.add(fix_run_id)  # noqa: SLF001
+
+        skip_comment = LinearComment(
+            id="c-skip",
+            body="$skip-review",
+            created_at="2026-05-10T01:00:00+00:00",
+            author_name="user",
+            author_is_me=False,
+            external_thread_type=None,
+        )
+        linear.comments_since = AsyncMock(return_value=[skip_comment])
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+        await asyncio.sleep(0)
+
+        # Review run should now be completed (not rejected).
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_run = next(r for r in history if r.stage == "review")
+        assert review_run.status == "completed"
+
+        # A merge run should have been created.
+        merge_runs = [r for r in history if r.stage == "merge"]
+        assert len(merge_runs) >= 1
+
+        # Must NOT have posted a rejection message.
+        for call in linear.post_comment.call_args_list:
+            body = call[0][1]
+            assert "cannot skip" not in body
+    finally:
+        await conn.close()
+
+
 # --- Reviewer comment fix-runs ---------------------------------------------
 
 

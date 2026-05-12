@@ -2,7 +2,7 @@
 
 Rows represent stopped runs that are still waiting for an operator slash
 command. The initial use case is cost-cap approval/rejection, where the
-runner is failed intentionally but `/approve` or `/reject` must survive an
+runner is failed intentionally but `$approve` or `$reject` must survive an
 orchestrator restart.
 """
 
@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import aiosqlite
 
 KIND_COST_CAP = "cost_cap"
+KIND_REVIEW_FAILED = "review_failed"
+KIND_MERGE = "merge"
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,8 @@ async def delete(
 
 __all__ = [
     "KIND_COST_CAP",
+    "KIND_MERGE",
+    "KIND_REVIEW_FAILED",
     "OperatorWait",
     "delete",
     "get",
