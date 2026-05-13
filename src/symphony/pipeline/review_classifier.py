@@ -19,9 +19,11 @@ Rules (priority order — first match wins):
   4. Codex inline review comment on HEAD → CHANGES_REQUESTED.
   5. Substantive Codex `COMMENTED` review on HEAD → CHANGES_REQUESTED.
   6. Human `CHANGES_REQUESTED` on HEAD → CHANGES_REQUESTED.
-  7. Codex `+1` reaction (after HEAD commit time) or human `APPROVED` →
-     APPROVED when mergeable.
-  8. Approved + mergeable=UNKNOWN → PENDING.
+  7. Codex approval signals: "Didn't find any major issues" in COMMENTED
+     review, or `+1` reaction (after HEAD commit time) → APPROVED when
+     mergeable.
+  8. Human `APPROVED` → APPROVED when mergeable.
+  9. Approved + mergeable=UNKNOWN → PENDING.
 """
 
 from __future__ import annotations
@@ -215,6 +217,14 @@ def review_classifier(
             merge_conflict=True,
         )
 
+    head_dt = _parse_iso(snapshot.head_committed_at)
+
+    def fresh_for_head(ts: str) -> bool:
+        if head_dt is None:
+            return True
+        signal_dt = _parse_iso(ts)
+        return signal_dt is not None and signal_dt >= head_dt
+
     fresh_reviews = [
         r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha
     ]
@@ -228,7 +238,9 @@ def review_classifier(
     codex_on_head = [
         c
         for c in comments
-        if is_codex_author(c.user_login) and c.commit_sha == snapshot.head_sha
+        if is_codex_author(c.user_login)
+        and c.commit_sha == snapshot.head_sha
+        and fresh_for_head(c.created_at)
     ]
     if codex_on_head:
         keys = sorted(_comment_key(c) for c in codex_on_head)
@@ -275,9 +287,9 @@ def review_classifier(
             last_review_body=human_cr[-1].body,
         )
 
-    # Rule 7 — approval signals.
-    head_dt = _parse_iso(snapshot.head_committed_at)
+    # Rule 7 — Codex approval signals.
     codex_approval_at: datetime | None = None
+    # Check for Codex +1 reaction after HEAD commit
     for rxn in snapshot.reactions:
         if not is_codex_author(rxn.user_login) or rxn.content != "+1":
             continue
@@ -286,20 +298,42 @@ def review_classifier(
             continue
         if codex_approval_at is None or rxn_dt > codex_approval_at:
             codex_approval_at = rxn_dt
+    # Check for Codex "Didn't find any major issues" in COMMENTED review
+    codex_no_issues = any(
+        r.state == "COMMENTED"
+        and is_codex_author(r.user_login)
+        and "Didn't find any major issues" in r.body
+        for r in fresh_reviews
+    )
+    # Check for 👍 emoji in Codex COMMENTED review body
+    codex_emoji_approve = any(
+        r.state == "COMMENTED"
+        and is_codex_author(r.user_login)
+        and "👍" in r.body
+        for r in fresh_reviews
+    )
+    codex_approved = codex_approval_at is not None or codex_no_issues or codex_emoji_approve
+
+    # Rule 8 — human `APPROVED`.
     human_approved = any(
         r.state == "APPROVED" for r in latest_human_reviews
     )
-    approved = codex_approval_at is not None or human_approved
+    approved = codex_approved or human_approved
 
     if approved:
-        # Rule 8 — mergeable still computing or unavailable; do not race
+        # Rule 9 — mergeable still computing or unavailable; do not race
         # `gh pr merge`.
         if snapshot.mergeable != "MERGEABLE":
             return Verdict(
                 kind=VerdictKind.PENDING,
                 rule="approved_unknown_mergeable",
             )
-        return Verdict(kind=VerdictKind.APPROVED, rule="approved")
+        rule_name = (
+            "codex_approved"
+            if codex_approved
+            else "human_approved"
+        )
+        return Verdict(kind=VerdictKind.APPROVED, rule=rule_name)
 
     return Verdict(kind=VerdictKind.PENDING, rule="no_signal")
 
