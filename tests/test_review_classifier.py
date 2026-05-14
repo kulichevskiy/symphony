@@ -414,7 +414,7 @@ def test_rule_6_codex_plus_one_after_head_commit_marks_approved() -> None:
     )
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.APPROVED
-    assert v.rule == "approved"
+    assert v.rule == "codex_approved"
 
 
 def test_rule_6_codex_plus_one_before_head_commit_is_stale() -> None:
@@ -456,7 +456,7 @@ def test_rule_6_latest_human_approval_supersedes_prior_changes_requested() -> No
     )
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
     assert v.kind == VerdictKind.APPROVED
-    assert v.rule == "approved"
+    assert v.rule == "human_approved"
 
 
 # --- Rule 3: merge conflict beats inline comments -------------------------

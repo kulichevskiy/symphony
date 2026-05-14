@@ -23,7 +23,7 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import GitHubError
-from symphony.linear.client import LinearIssue
+from symphony.linear.client import LinearComment, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 
 
@@ -327,17 +327,57 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         gh.pr_create.assert_not_awaited()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
-            call("iss-1", "state-todo"),
+            call("iss-1", "state-na"),
         ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+        assert wait.run_id == history[0].id
         # Failure comment is now posted so the operator knows what went wrong.
         posted_bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
         assert any("Implement stage failed" in b for b in posted_bodies), (
             "expected a failed() comment to be posted"
         )
+        assert any("$retry" in b for b in posted_bodies)
         assert not any("Will auto-retry shortly." in b for b in posted_bodies)
+
+        # Even if Linear still reports the issue in the ready lane before the
+        # state move is visible, the durable operator wait suppresses a retry
+        # loop in the same process.
+        assert await orch._scan_binding(cfg.repos[0]) == []  # noqa: SLF001
+
+        # After a daemon restart, the persisted wait is restored and `$retry`
+        # clears it by moving the issue back to Ready for the next poll.
+        retry_comment = LinearComment(
+            id="c-retry",
+            body="$retry",
+            created_at="2026-05-10T01:00:00+00:00",
+            author_name="user",
+            author_is_me=False,
+            external_thread_type=None,
+        )
+        restarted_linear = AsyncMock()
+        restarted_linear.comments_since = AsyncMock(return_value=[retry_comment])
+        restarted_linear.move_issue = AsyncMock(return_value=None)
+        restarted_linear.post_comment = AsyncMock(return_value="cmt-2")
+        restarted = Orchestrator(
+            cfg,
+            restarted_linear,
+            conn,
+            runner=_FakeRunner([]),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        restarted._states = {"ENG": _states()}  # noqa: SLF001
+
+        await restarted._poll_slash_commands()  # noqa: SLF001
+
+        restarted_linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()
 
@@ -388,11 +428,14 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
         workspace.release.assert_called_once()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
-            call("iss-1", "state-todo"),
+            call("iss-1", "state-na"),
         ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
 
