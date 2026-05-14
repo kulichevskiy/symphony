@@ -1327,12 +1327,34 @@ class Orchestrator:
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
             blocked_id = states.get(binding.linear_states.blocked)
-            if blocked_id is not None:
+            if blocked_id is None:
+                log.warning(
+                    "could not stop failed implement run %s: missing blocked state %r",
+                    run_id,
+                    binding.linear_states.blocked,
+                )
                 try:
-                    await self.linear.move_issue(issue_id, blocked_id)
+                    await self.linear.post_comment(
+                        issue_id,
+                        truncate_body(
+                            command_rejected(
+                                f"${intent.kind}",
+                                "missing blocked state; keeping issue parked",
+                            )
+                        ),
+                    )
                 except LinearError as e:
-                    log.warning("could not move %s to blocked: %s", issue_id, e)
-                    return
+                    log.warning(
+                        "implement stop rejection comment failed for %s: %s",
+                        issue_id,
+                        e,
+                    )
+                return
+            try:
+                await self.linear.move_issue(issue_id, blocked_id)
+            except LinearError as e:
+                log.warning("could not move %s to blocked: %s", issue_id, e)
+                return
             await self._clear_operator_wait(issue_id, run_id)
             return
 

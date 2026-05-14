@@ -51,6 +51,7 @@ def test_parses_markdown_wrapped_commands_and_approved_alias() -> None:
         [
             _c("`$approve`"),
             _c("```\n$reject\n```"),
+            _c("```bash\n$stop\n```"),
             _c("$approved"),
         ]
     )
@@ -58,6 +59,7 @@ def test_parses_markdown_wrapped_commands_and_approved_alias() -> None:
     assert [i.kind for i in intents] == [
         SlashKind.APPROVE,
         SlashKind.REJECT,
+        SlashKind.STOP,
         SlashKind.APPROVE,
     ]
 

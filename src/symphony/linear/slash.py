@@ -61,7 +61,13 @@ def _is_thumbs_up(body: str) -> bool:
 def _command_text(body: str) -> str:
     text = body.strip()
     if text.startswith("```") and text.endswith("```"):
-        return text[3:-3].strip()
+        inner = text[3:-3].strip()
+        lines = inner.splitlines()
+        if len(lines) > 1 and not lines[0].lstrip().startswith("$"):
+            language = lines[0].strip()
+            if re.fullmatch(r"[A-Za-z0-9_.+-]+", language):
+                return "\n".join(lines[1:]).strip()
+        return inner
     if text.startswith("`") and text.endswith("`") and "\n" not in text[1:-1]:
         return text[1:-1].strip()
     return text

@@ -148,7 +148,7 @@ Full unit suite:
 uv run pytest
 ```
 
-Result: 330 passed. Pytest emitted five existing mock cleanup warnings from
+Result: 331 passed. Pytest emitted five existing mock cleanup warnings from
 test code using unawaited `AsyncMock` objects.
 
 Lint:
