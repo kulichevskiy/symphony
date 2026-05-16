@@ -1622,6 +1622,120 @@ async def test_merge_failure_moves_issue_to_needs_approval(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_merge_dispatch_closes_active_review_monitor_before_needs_approval(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    review_task: asyncio.Task[bool] | None = None
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.update_status(conn, "review", "running")
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "abc123", "mergeable": "MERGEABLE"}
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[
+                    CheckRun(
+                        name="test",
+                        state="SUCCESS",
+                        bucket="pass",
+                    )
+                ]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_merge = AsyncMock(side_effect=GitHubError("branch protection blocked"))
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        review_task = asyncio.create_task(asyncio.Event().wait())
+        orch._review_poll_tasks.add(review_task)  # noqa: SLF001
+        orch._review_poll_run_ids.add("review")  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = "review"  # noqa: SLF001
+        orch._review_poll_run_tasks["review"] = review_task  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+        await asyncio.gather(review_task, return_exceptions=True)
+
+        assert review_task.cancelled()
+        assert "review" not in orch._review_poll_run_ids  # noqa: SLF001
+        assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
+        assert "review" not in orch._review_poll_run_tasks  # noqa: SLF001
+        assert review_task not in orch._review_poll_tasks  # noqa: SLF001
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_run = next(r for r in history if r.id == "review")
+        assert review_run.status == "completed"
+        assert review_run.ended_at is not None
+        merge_run = next(r for r in history if r.stage == "merge")
+        assert merge_run.status == "needs_approval"
+
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Late inline comment on the approved head",
+                    "commit_id": "abc123",
+                    "original_commit_id": "abc123",
+                    "created_at": "2026-05-10T00:05:00Z",
+                    "path": "app.py",
+                    "line": 1,
+                }
+            ]
+        )
+        assert await orch._poll_review_runs() == []  # noqa: SLF001
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert not [r for r in history if r.stage == "review_fix"]
+        gh.pr_review_comments.assert_not_awaited()
+    finally:
+        if review_task is not None and not review_task.done():
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_conflict_closes_run_when_state_lookup_fails(
     tmp_path: Path,
 ) -> None:
