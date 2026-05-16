@@ -827,6 +827,7 @@ class Orchestrator:
         self._states: dict[str, dict[str, str]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
+        self._scheduled_issue_refcounts: dict[str, int] = {}
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._schedule_lock = asyncio.Lock()
         self._comment_event_lock = asyncio.Lock()
@@ -2103,27 +2104,7 @@ class Orchestrator:
         if state.pr_number is None:
             return
         try:
-            issue_comments = await self._gh.pr_issue_comments(
-                state.pr_number,
-                repo=binding.github_repo,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "could not check PR comments before re-triggering @codex review "
-                "on %s#%d: %s",
-                binding.github_repo,
-                state.pr_number,
-                e,
-            )
-            issue_comments = []
-        if not _codex_lgtm_reactions_from_issue_comments(issue_comments):
-            await self._retrigger_codex_review(
-                binding=binding,
-                state=state,
-            )
-            return
-        try:
-            verdict = await self._review_verdict_for_pr(
+            verdict = await self._review_approval_verdict_for_pr(
                 binding=binding,
                 pr_number=state.pr_number,
             )
@@ -2149,6 +2130,48 @@ class Orchestrator:
             binding=binding,
             state=state,
         )
+
+    async def _review_approval_verdict_for_pr(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_number: int,
+    ) -> Verdict:
+        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        head_sha = str(view.get("headRefOid") or "")
+        if not head_sha:
+            raise GitHubError(
+                f"pr view missing headRefOid for {binding.github_repo}#{pr_number}"
+            )
+
+        reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+        reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+        try:
+            issue_comments = await self._gh.pr_issue_comments(
+                pr_number,
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR issue comments for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            issue_comments = []
+        committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
+
+        snapshot = ReviewSnapshot(
+            head_sha=head_sha,
+            head_committed_at=committed_at,
+            reactions=(
+                *_reactions_from_github(reactions),
+                *_codex_lgtm_reactions_from_issue_comments(issue_comments),
+            ),
+            reviews=_reviews_from_github(reviews),
+            mergeable=str(view.get("mergeable") or ""),
+        )
+        return review_classifier(comments=[], ci=[], snapshot=snapshot)
 
     async def _retrigger_codex_review(
         self,
@@ -3326,15 +3349,24 @@ class Orchestrator:
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
             return 0
         binding_key = _binding_key(binding)
-        return min(
-            self.config.global_max_concurrent - len(self._scheduled_issue_ids),
-            binding.max_concurrent
-            - self._scheduled_binding_counts.get(binding_key, 0),
+        return max(
+            0,
+            min(
+                self.config.global_max_concurrent - self._scheduled_slot_count(),
+                binding.max_concurrent
+                - self._scheduled_binding_counts.get(binding_key, 0),
+            ),
         )
+
+    def _scheduled_slot_count(self) -> int:
+        return sum(self._scheduled_issue_refcounts.values())
 
     def _reserve_scheduled_slot(
         self, *, issue_id: str, binding_key: BindingKey
     ) -> None:
+        self._scheduled_issue_refcounts[issue_id] = (
+            self._scheduled_issue_refcounts.get(issue_id, 0) + 1
+        )
         self._scheduled_issue_ids.add(issue_id)
         self._scheduled_binding_counts[binding_key] = (
             self._scheduled_binding_counts.get(binding_key, 0) + 1
@@ -3343,7 +3375,12 @@ class Orchestrator:
     def _release_scheduled_slot(
         self, *, issue_id: str, binding_key: BindingKey
     ) -> None:
-        self._scheduled_issue_ids.discard(issue_id)
+        issue_count = self._scheduled_issue_refcounts.get(issue_id, 0)
+        if issue_count <= 1:
+            self._scheduled_issue_refcounts.pop(issue_id, None)
+            self._scheduled_issue_ids.discard(issue_id)
+        else:
+            self._scheduled_issue_refcounts[issue_id] = issue_count - 1
         count = self._scheduled_binding_counts.get(binding_key, 0)
         if count <= 1:
             self._scheduled_binding_counts.pop(binding_key, None)
@@ -3632,7 +3669,7 @@ class Orchestrator:
                     continue
                 binding_key = _binding_key(binding)
                 if (
-                    len(self._scheduled_issue_ids) >= self.config.global_max_concurrent
+                    self._scheduled_slot_count() >= self.config.global_max_concurrent
                     or self._scheduled_binding_counts.get(binding_key, 0)
                     >= binding.max_concurrent
                 ):

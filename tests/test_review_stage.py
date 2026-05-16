@@ -1235,6 +1235,49 @@ async def test_active_review_fix_reserves_capacity_before_new_implementation(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_slot_release_preserves_shared_issue_owner(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(update={"max_concurrent": 3})
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            global_max_concurrent=1,
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+        )
+        binding_key = poll_module._binding_key(binding)  # noqa: SLF001
+
+        orch._reserve_scheduled_slot(  # noqa: SLF001
+            issue_id="iss-1",
+            binding_key=binding_key,
+        )
+        orch._reserve_scheduled_slot(  # noqa: SLF001
+            issue_id="iss-1",
+            binding_key=binding_key,
+        )
+        orch._release_scheduled_slot(  # noqa: SLF001
+            issue_id="iss-1",
+            binding_key=binding_key,
+        )
+
+        assert "iss-1" in orch._scheduled_issue_ids  # noqa: SLF001
+        assert orch._scheduled_issue_refcounts["iss-1"] == 1  # noqa: SLF001
+        assert orch._dispatch_capacity(binding) == 0  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_queued_review_poll_revalidates_issue_state_before_ci(
     tmp_path: Path,
 ) -> None:
@@ -1782,14 +1825,7 @@ async def test_merge_command_keeps_operator_wait_when_lookup_fails(
             title="Add auth",
             team_key="ENG",
         )
-        await db.review_state.begin_review(
-            conn,
-            "iss-1",
-            pr_number=42,
-            pr_url="https://github.com/org/repo/pull/42",
-            github_repo="org/repo",
-            issue_label=None,
-        )
+        await _seed_active_review(conn)
         await db.runs.create(
             conn,
             id="merge-run",
@@ -1858,14 +1894,7 @@ async def test_merge_command_keeps_operator_wait_when_merge_dispatch_dedupes(
             title="Add auth",
             team_key="ENG",
         )
-        await db.review_state.begin_review(
-            conn,
-            "iss-1",
-            pr_number=42,
-            pr_url="https://github.com/org/repo/pull/42",
-            github_repo="org/repo",
-            issue_label=None,
-        )
+        await _seed_active_review(conn)
         await db.runs.create(
             conn,
             id="merge-run",
@@ -2480,6 +2509,67 @@ async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity
 
 
 @pytest.mark.asyncio
+async def test_review_fix_skips_retrigger_when_pr_is_already_approved(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        await _seed_active_review(conn)
+
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "head-sha",
+                    "submitted_at": "2026-05-11T18:00:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-11T17:55:00Z")
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+        )
+        state = await db.review_state.get(conn, "iss-1")
+
+        await orch._retrigger_codex_review_unless_approved(  # noqa: SLF001
+            binding=binding,
+            issue=_issue_in_progress(),
+            state=state,
+        )
+
+        gh.pr_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_fix_skips_retrigger_when_codex_lgtm_already_arrived(
     tmp_path: Path,
 ) -> None:
@@ -2688,10 +2778,10 @@ async def test_codex_inline_comment_dedup_skips_identical_back_to_back(
 
 
 @pytest.mark.asyncio
-async def test_failing_ci_still_dispatches_without_review_api_calls(
+async def test_failing_ci_dispatch_retrigger_checks_existing_approval(
     tmp_path: Path,
 ) -> None:
-    """A fresh red CI signature need not call review signal APIs."""
+    """A fresh red CI signature still avoids inline review reads."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_active_review(conn)
@@ -2736,10 +2826,11 @@ async def test_failing_ci_still_dispatches_without_review_api_calls(
         await _poll_review_and_wait(orch)
 
         assert runner.captured_spec is not None
-        # Review signal APIs must NOT have been called.
-        gh.pr_reviews.assert_not_awaited()
+        # The retrigger guard checks approval state, but does not need inline
+        # review comments once red CI has already selected the fix path.
+        gh.pr_reviews.assert_awaited_once_with(42, repo="org/repo")
         gh.pr_review_comments.assert_not_awaited()
-        gh.pr_reactions.assert_not_awaited()
+        gh.pr_reactions.assert_awaited_once_with(42, repo="org/repo")
     finally:
         await conn.close()
 
