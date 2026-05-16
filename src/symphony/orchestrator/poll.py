@@ -1687,6 +1687,43 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
 
+    async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None:
+        """Retire review polling once a merge run owns the issue."""
+        live_review_runs = [
+            run
+            for run in await db.runs.list_live_by_stage(self._conn, stage="review")
+            if run.issue_id == issue.id
+        ]
+        if not live_review_runs:
+            return
+
+        now = datetime.now(UTC).isoformat()
+        closed_run_ids: set[str] = set()
+        for run in live_review_runs:
+            await db.runs.update_status(
+                self._conn,
+                run.id,
+                "completed",
+                ended_at=now,
+            )
+            closed_run_ids.add(run.id)
+            task = self._review_poll_run_tasks.pop(run.id, None)
+            if task is not None:
+                self._review_poll_tasks.discard(task)
+                if not task.done():
+                    task.cancel()
+            self._review_poll_run_ids.discard(run.id)
+
+        for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
+            if mapped_issue_id == issue.id or mapped_run_id in closed_run_ids:
+                self._review_poll_issue_ids.pop(mapped_issue_id, None)
+
+        log.info(
+            "completed review monitor(s) %s for %s before merge",
+            ", ".join(sorted(closed_run_ids)),
+            issue.identifier,
+        )
+
     async def _poll_review_run(
         self,
         run: db.runs.Run,
@@ -4465,6 +4502,7 @@ class Orchestrator:
         if not inserted:
             return None
 
+        await self._complete_review_monitors_for_merge(issue)
         self._dispatch_run_ids[issue.id] = run_id
         if on_started is not None:
             try:
