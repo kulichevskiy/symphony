@@ -49,4 +49,20 @@ repos:
 
 # Stuck-loop escapes (mirrors today's Symphony defaults).
 review_iteration_cap: 6
+# Local-review uses its own cap (defaults to 6). Set lower for
+# bindings where local-review should give up fast and fall back to
+# the remote @codex bot; set higher for finicky codebases where
+# the reviewer needs more rounds.
+local_review_iteration_cap: 6
 cost_cap_per_issue_usd: 100.0
+
+# Review-strategy notes (per-binding `review_strategy`):
+#   remote (default): post `@codex review` on every PR. Today's behavior.
+#   hybrid: run the in-workspace reviewer first (tightens fix loop), then
+#           still ping `@codex review` for the final pass.
+#   local:  in-workspace reviewer is authoritative. `@codex review` is
+#           only pinged as a safety net when the local pass exhausts,
+#           stalls, or fails. Pair with `reviewer_agent` for a second
+#           opinion (defaults to the opposite family of `agent`).
+# Example: change `agent: claude` + `review_strategy: hybrid` on a low-risk
+# binding to halve typical review wall time without losing the bot check.

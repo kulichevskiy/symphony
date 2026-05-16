@@ -401,3 +401,78 @@ async def cost_for_issue(conn: aiosqlite.Connection, issue_id: str) -> float:
     if row is None:
         return 0.0
     return float(row[0])
+
+
+@dataclass
+class LocalReviewStats:
+    """Aggregate telemetry over `runs` rows with `stage='local_review'`.
+
+    Surfaced via `symphony runs local-review-stats` so operators can
+    answer "is the local-review actually saving time vs. the remote
+    @codex bot?" without writing SQL. All values are over rows
+    *whose `ended_at` is set* — running rows are not counted in
+    averages but ARE counted in `running_count` so the operator can
+    see in-flight work.
+    """
+
+    completed_count: int  # APPROVED — the local pass converged
+    interrupted_count: int  # SKIPPED — operator hit $skip-local-review
+    failed_count: int  # everything else (exhaust, stuck, cost-cap, err)
+    running_count: int  # status='running' (in-flight when query ran)
+    total_cost_usd: float
+    avg_cost_usd: float  # over rows with ended_at
+    avg_duration_secs: float  # over rows with ended_at AND started_at
+    approval_rate: float  # completed / (completed + interrupted + failed)
+
+
+async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
+    """Pure (read-only) aggregator for the local-review phase.
+
+    The duration calculation parses `started_at`/`ended_at` via
+    SQLite's `strftime('%s', ...)` so timezone-aware ISO-8601 strings
+    (the format the orchestrator writes) work without round-tripping
+    through Python.
+    """
+    cur = await conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(status = 'completed'), 0) AS completed,
+            COALESCE(SUM(status = 'interrupted'), 0) AS interrupted,
+            COALESCE(SUM(status = 'failed'), 0) AS failed,
+            COALESCE(SUM(status = 'running'), 0) AS running,
+            COALESCE(SUM(cost_usd), 0.0) AS total_cost,
+            COALESCE(
+                AVG(CASE WHEN ended_at IS NOT NULL THEN cost_usd END), 0.0
+            ) AS avg_cost,
+            COALESCE(
+                AVG(
+                    CASE
+                        WHEN ended_at IS NOT NULL AND started_at IS NOT NULL
+                        THEN strftime('%s', ended_at) -
+                             strftime('%s', started_at)
+                    END
+                ),
+                0.0
+            ) AS avg_duration
+        FROM runs
+        WHERE stage = 'local_review'
+        """
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return LocalReviewStats(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+    completed = int(row["completed"])
+    interrupted = int(row["interrupted"])
+    failed = int(row["failed"])
+    finished = completed + interrupted + failed
+    approval_rate = (completed / finished) if finished > 0 else 0.0
+    return LocalReviewStats(
+        completed_count=completed,
+        interrupted_count=interrupted,
+        failed_count=failed,
+        running_count=int(row["running"]),
+        total_cost_usd=float(row["total_cost"]),
+        avg_cost_usd=float(row["avg_cost"]),
+        avg_duration_secs=float(row["avg_duration"]),
+        approval_rate=approval_rate,
+    )

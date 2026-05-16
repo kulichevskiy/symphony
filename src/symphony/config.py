@@ -73,6 +73,31 @@ class RepoBinding(BaseModel):
     allow_auto_merge: bool = True
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
+    # Review strategy controls who reviews the PR. `remote` keeps today's
+    # @codex-bot loop. `local` runs the reviewer in-workspace before opening
+    # the PR. `hybrid` does the local loop first, then one final @codex
+    # check before merge. See `docs/local-review-flow.md`.
+    review_strategy: Literal["remote", "local", "hybrid"] = "remote"
+    # Reviewer agent for local/hybrid strategies. `None` picks the opposite
+    # family of `agent` (claude ↔ codex) so the reviewer has independent
+    # blind spots from the implementer.
+    reviewer_agent: Literal["claude", "codex"] | None = None
+    # Codex model for the reviewer when `reviewer_agent` resolves to
+    # `codex`. Defaults to the binding's `codex_model` if unset.
+    reviewer_codex_model: str | None = None
+    # Per-binding override for the local-review iteration cap. The
+    # right number is usually smaller than the remote `review_iteration_cap`
+    # because the local loop converges fast or it isn't going to — many
+    # rounds usually means the reviewer is stuck on a pathological case,
+    # and the cost cap should catch that anyway. `None` falls back to
+    # `Config.local_review_iteration_cap`.
+    local_review_iteration_cap: int | None = Field(default=None, ge=1)
+    # Per-binding override for the GitHub PR summary comment posted on
+    # local-review APPROVED. `None` falls back to
+    # `Config.post_local_review_pr_summary`. Some repos prefer quieter
+    # PR threads (already wired into a GitHub-side dashboard); others
+    # want every verdict surfaced for human reviewers.
+    post_local_review_pr_summary: bool | None = None
     # Per-binding cost knobs. `None` falls back to the global default; an
     # explicit `0` disables the cap (useful when one team is exempt).
     cost_cap_usd: float | None = None
@@ -93,6 +118,42 @@ class RepoBinding(BaseModel):
             supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
             raise ValueError(f"unknown Codex model {value!r}; supported: {supported}")
         return value
+
+    @field_validator("reviewer_codex_model")
+    @classmethod
+    def _known_reviewer_codex_model(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value not in SUPPORTED_CODEX_MODELS:
+            supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
+            raise ValueError(
+                f"unknown reviewer Codex model {value!r}; supported: {supported}"
+            )
+        return value
+
+    def resolved_reviewer_agent(self) -> Literal["claude", "codex"]:
+        """Reviewer agent after applying the implementer-opposite default."""
+        if self.reviewer_agent is not None:
+            return self.reviewer_agent
+        return "codex" if self.agent == "claude" else "claude"
+
+    def resolved_reviewer_codex_model(self) -> str:
+        """Codex model for the reviewer when it's the codex agent."""
+        return self.reviewer_codex_model or self.codex_model
+
+    def resolved_local_review_iteration_cap(self, global_cap: int) -> int:
+        """Per-binding override wins; falls back to the global default."""
+        return (
+            self.local_review_iteration_cap
+            if self.local_review_iteration_cap is not None
+            else global_cap
+        )
+
+    def resolved_post_local_review_pr_summary(self, global_value: bool) -> bool:
+        """Per-binding override wins; falls back to the global default."""
+        if self.post_local_review_pr_summary is None:
+            return global_value
+        return self.post_local_review_pr_summary
 
 
 class Secrets(BaseSettings):
@@ -130,6 +191,16 @@ class Config(BaseModel):
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 12
+    # Local-review converges fast or it doesn't. The right cap is well
+    # below `review_iteration_cap`: more rounds means the in-workspace
+    # reviewer is stuck and the cost cap (or `$skip-local-review`)
+    # should take over. Per-binding overrides live on `RepoBinding`.
+    local_review_iteration_cap: int = Field(default=6, ge=1)
+    # When the local-review APPROVES, post a summary PR comment with
+    # the iteration count + cost so human reviewers visiting GitHub
+    # see the verdict trail (not just the Linear thread). Set to false
+    # on bindings where the PR thread should stay quiet.
+    post_local_review_pr_summary: bool = True
     cost_cap_per_issue_usd: float = 100.0
     cost_warning_pct: int = 75
     stall_timeout_secs: int = 300

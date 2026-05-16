@@ -161,6 +161,291 @@ repos:
     assert cfg.repos[1].linear_states.ready == "Todo"
 
 
+def test_review_strategy_defaults_to_remote(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Default behavior must keep today's @codex-bot loop until operators opt in."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    )
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+    assert binding.review_strategy == "remote"
+    assert binding.reviewer_agent is None
+    assert binding.reviewer_codex_model is None
+
+
+def test_review_strategy_can_be_overridden(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    review_strategy: hybrid
+    reviewer_agent: codex
+    reviewer_codex_model: gpt-5.1-codex-max
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+    assert binding.review_strategy == "hybrid"
+    assert binding.reviewer_agent == "codex"
+    assert binding.reviewer_codex_model == "gpt-5.1-codex-max"
+
+
+def test_resolved_reviewer_agent_defaults_to_opposite_family(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+    agent: codex
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_reviewer_agent() == "codex"
+    assert cfg.repos[1].resolved_reviewer_agent() == "claude"
+
+
+def test_resolved_reviewer_agent_honors_explicit_override(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """An operator who wants same-family review (e.g. for cost) can pin it."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    reviewer_agent: claude
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_reviewer_agent() == "claude"
+
+
+def test_resolved_reviewer_codex_model_inherits_implementer_default(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    codex_model: gpt-5.1-codex-max
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_reviewer_codex_model() == "gpt-5.1-codex-max"
+
+
+def test_unknown_reviewer_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    reviewer_agent: codex
+    reviewer_codex_model: future-codex
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown reviewer Codex model"):
+        Config.load(p)
+
+
+def test_invalid_review_strategy_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    review_strategy: rubber_stamp
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError):
+        Config.load(p)
+
+
+def test_local_review_iteration_cap_default_global_is_6(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Global default cap is 6 — well below remote's 12 because the
+    local loop should converge fast or not at all."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    )
+    cfg = Config.load(p)
+    assert cfg.local_review_iteration_cap == 6
+    # Remote cap unchanged.
+    assert cfg.review_iteration_cap == 12
+    binding = cfg.repos[0]
+    assert binding.local_review_iteration_cap is None
+    # Resolved cap falls back to global default.
+    assert (
+        binding.resolved_local_review_iteration_cap(
+            cfg.local_review_iteration_cap
+        )
+        == 6
+    )
+
+
+def test_local_review_iteration_cap_per_binding_override(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+local_review_iteration_cap: 8
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    local_review_iteration_cap: 3
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.local_review_iteration_cap == 8
+    # ENG overrides; WEB inherits.
+    assert cfg.repos[0].local_review_iteration_cap == 3
+    assert (
+        cfg.repos[0].resolved_local_review_iteration_cap(
+            cfg.local_review_iteration_cap
+        )
+        == 3
+    )
+    assert cfg.repos[1].local_review_iteration_cap is None
+    assert (
+        cfg.repos[1].resolved_local_review_iteration_cap(
+            cfg.local_review_iteration_cap
+        )
+        == 8
+    )
+
+
+def test_local_review_iteration_cap_must_be_positive(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """ge=1: a zero/negative cap would never enter the loop and is
+    almost certainly a typo. Reject at load time."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    local_review_iteration_cap: 0
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError):
+        Config.load(p)
+
+
+def test_post_local_review_pr_summary_default_global_true(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    )
+    cfg = Config.load(p)
+    assert cfg.post_local_review_pr_summary is True
+    assert cfg.repos[0].post_local_review_pr_summary is None
+    assert (
+        cfg.repos[0].resolved_post_local_review_pr_summary(
+            cfg.post_local_review_pr_summary
+        )
+        is True
+    )
+
+
+def test_post_local_review_pr_summary_per_binding_override_off(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Global ON, but this binding's PR thread should stay quiet."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+post_local_review_pr_summary: true
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    post_local_review_pr_summary: false
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.post_local_review_pr_summary is True
+    # ENG overrides off; WEB inherits global True.
+    assert cfg.repos[0].post_local_review_pr_summary is False
+    assert (
+        cfg.repos[0].resolved_post_local_review_pr_summary(
+            cfg.post_local_review_pr_summary
+        )
+        is False
+    )
+    assert cfg.repos[1].post_local_review_pr_summary is None
+    assert (
+        cfg.repos[1].resolved_post_local_review_pr_summary(
+            cfg.post_local_review_pr_summary
+        )
+        is True
+    )
+
+
+def test_post_local_review_pr_summary_per_binding_override_on_when_global_off(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Global OFF, but this binding's reviewers want the summary."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+post_local_review_pr_summary: false
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    post_local_review_pr_summary: true
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.post_local_review_pr_summary is False
+    assert (
+        cfg.repos[0].resolved_post_local_review_pr_summary(
+            cfg.post_local_review_pr_summary
+        )
+        is True
+    )
+
+
 def test_yaml_missing_ready_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """A binding without `ready` must be rejected at load time."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")

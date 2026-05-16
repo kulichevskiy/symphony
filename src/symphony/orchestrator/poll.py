@@ -44,7 +44,7 @@ from ..agent.activity import (
     format_activity_digest,
 )
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
-from ..agent.process import Usage, parse_event_line
+from ..agent.process import parse_event_line
 from ..agent.prompt import (
     implement_prompt,
     merge_conflict_fix_prompt,
@@ -81,11 +81,14 @@ from ..linear.templates import (
     truncate_body,
 )
 from ..pipeline.cost_guard import (
+    UsageCostEstimator,
     effective_cap,
     effective_warning_pct,
-    estimate_codex_cost_usd,
     evaluate_cost,
 )
+from ..pipeline.local_review import LocalVerdict
+from ..pipeline.local_review_loop import LoopOutcome, LoopResult
+from ..pipeline.local_review_session import run_local_review_session
 from ..pipeline.review_classifier import (
     BLOCKING_CHECK_CONCLUSIONS,
     Reaction,
@@ -114,39 +117,7 @@ REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
 
 
-@dataclass
-class _UsageCostEstimator:
-    agent: str
-    codex_model: str
-    last_estimated_input_tokens: int = 0
-    last_estimated_cached_input_tokens: int = 0
-    last_estimated_output_tokens: int = 0
-
-    def delta(self, usage: Usage) -> float:
-        if self.agent != "codex" or usage.cost_usd > 0:
-            return usage.cost_usd
-        input_delta = max(usage.input_tokens - self.last_estimated_input_tokens, 0)
-        cached_input_delta = max(
-            usage.cached_input_tokens - self.last_estimated_cached_input_tokens,
-            0,
-        )
-        output_delta = max(usage.output_tokens - self.last_estimated_output_tokens, 0)
-        self.last_estimated_input_tokens = max(
-            self.last_estimated_input_tokens, usage.input_tokens
-        )
-        self.last_estimated_cached_input_tokens = max(
-            self.last_estimated_cached_input_tokens,
-            usage.cached_input_tokens,
-        )
-        self.last_estimated_output_tokens = max(
-            self.last_estimated_output_tokens, usage.output_tokens
-        )
-        return estimate_codex_cost_usd(
-            input_tokens=input_delta,
-            cached_input_tokens=cached_input_delta,
-            output_tokens=output_delta,
-            model=self.codex_model,
-        )
+_UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
 
 
 def _activity_settings_for(config: Config, binding: RepoBinding) -> ActivitySettings:
@@ -214,6 +185,54 @@ def build_pr_body(issue: LinearIssue) -> str:
     (which appends `Relates to ...`), so the body itself is empty by
     default. Returning the URL here keeps the format pinned in tests."""
     return f"Relates to {issue.url}"
+
+
+def _local_review_status_from_result(result: LoopResult | None) -> str:
+    """Map a `LoopResult` to a `runs.status` literal.
+
+    Symmetric with how Implement uses `completed` / `failed`; SKIPPED
+    maps to `interrupted` so it stands out from genuine model failures
+    in run-history queries (and matches `$skip-review`, which also
+    leaves a row with `status='interrupted'`).
+    """
+    if result is None:
+        return "failed"
+    if result.outcome == LoopOutcome.APPROVED:
+        return "completed"
+    if result.outcome == LoopOutcome.SKIPPED:
+        return "interrupted"
+    return "failed"
+
+
+def _should_post_codex_review(
+    *,
+    review_strategy: str,
+    local_review_result: LoopResult | None,
+) -> bool:
+    """Decide whether to ping `@codex review` after opening the PR.
+
+    Rules:
+      - `remote`              → always post (legacy behavior).
+      - `hybrid`              → always post (defense in depth: the
+                                remote bot is the second pair of eyes
+                                regardless of the local outcome).
+      - `local` + APPROVED    → suppress; the local pre-flight already
+                                approved the diff and the operator
+                                opted in to single-reviewer mode.
+      - `local` + anything else → post (safety net for failures,
+                                exhaustion, stuck loops, cost-cap
+                                breach, and operator-issued
+                                `$skip-local-review`).
+    """
+    if review_strategy == "remote" or review_strategy == "hybrid":
+        return True
+    # local strategy
+    if (
+        local_review_result is not None
+        and local_review_result.outcome == LoopOutcome.APPROVED
+    ):
+        return False
+    return True
 
 
 def build_runner_command(
@@ -842,6 +861,15 @@ class Orchestrator:
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
+        # `$skip-local-review` toggles the issue's flag here. The
+        # local-review loop reads it between iterations and exits with
+        # `SKIPPED`. Removed after the local-review phase returns.
+        self._local_review_skip_flags: dict[str, bool] = {}
+        # The session updates this with the run_id of the in-flight
+        # reviewer/fixer subprocess so the slash handler can kill it
+        # immediately (otherwise an operator has to wait up to
+        # `stall_secs` for the current subprocess to finish naturally).
+        self._local_review_active_run_ids: dict[str, str] = {}
         self._review_poll_tasks: set[asyncio.Task[None]] = set()
         self._review_poll_run_ids: set[str] = set()
         # Maps issue_id → review poll run_id for issues in active review monitoring.
@@ -1175,11 +1203,70 @@ class Orchestrator:
         if intent.kind is SlashKind.SKIP_REVIEW:
             await self._handle_skip_review_intent(issue_id, run_id)
             return
+        if intent.kind is SlashKind.SKIP_LOCAL_REVIEW:
+            await self._handle_skip_local_review_intent(issue_id)
+            return
         log.info(
             "slash %s received for run %s (handler not implemented in this slice)",
             intent.kind,
             run_id,
         )
+
+    async def _handle_skip_local_review_intent(self, issue_id: str) -> None:
+        """Handle `$skip-local-review`: kill the in-flight subprocess
+        and ask the loop to exit.
+
+        Order matters: set the flag first so the loop classifies the
+        ensuing killed-subprocess failure as `SKIPPED` rather than
+        `REVIEWER_FAILED` / `FIX_RUN_FAILED`. Then kill the active
+        subprocess so the operator doesn't wait `stall_secs` for it to
+        finish naturally. If no local-review is in flight, the slash
+        is a no-op.
+        """
+        if issue_id not in self._local_review_skip_flags:
+            log.info(
+                "$skip-local-review for %s: no active local-review phase; "
+                "ignoring",
+                issue_id,
+            )
+            try:
+                await self.linear.post_comment(
+                    issue_id,
+                    truncate_body(
+                        command_rejected(
+                            "$skip-local-review",
+                            "no active local-review phase",
+                        )
+                    ),
+                )
+            except LinearError as e:
+                log.warning(
+                    "could not post skip-local-review rejection for %s: %s",
+                    issue_id,
+                    e,
+                )
+            return
+        log.info("$skip-local-review for %s: setting skip flag", issue_id)
+        self._local_review_skip_flags[issue_id] = True
+        active_run_id = self._local_review_active_run_ids.get(issue_id)
+        if active_run_id is not None:
+            log.info(
+                "$skip-local-review for %s: killing active subprocess %s",
+                issue_id,
+                active_run_id,
+            )
+            try:
+                await self._runner.kill(active_run_id)
+            except Exception:  # noqa: BLE001
+                # A kill failure shouldn't dead-end the slash: the loop
+                # will still exit at the next iteration boundary via
+                # the skip flag. The runner's kill is best-effort by
+                # design (`runner.py` docstring).
+                log.exception(
+                    "could not kill local-review subprocess %s for %s",
+                    active_run_id,
+                    issue_id,
+                )
 
     async def _stop_review_monitor(self, issue_id: str, run_id: str) -> None:
         log.info("$stop received for review monitor %s (issue %s)", run_id, issue_id)
@@ -4455,6 +4542,20 @@ class Orchestrator:
             )
             return run_id
 
+        # 4.5. Local-review pre-flight. When `binding.review_strategy` is
+        # `local` or `hybrid`, run the reviewer in-workspace before pushing.
+        # This shortens the iteration loop dramatically: the slow part of
+        # the existing flow is round-tripping each fix through GitHub for
+        # the remote `@codex` bot. See `docs/local-review-flow.md`.
+        local_review_result: LoopResult | None = None
+        if binding.review_strategy != "remote":
+            local_review_result = await self._run_local_review_phase(
+                binding=binding,
+                issue=issue,
+                workspace_path=workspace_path,
+                parent_run_id=run_id,
+            )
+
         # 5. Push branch, open PR, post stage-transition comment.
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
@@ -4524,15 +4625,42 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
 
-        # 6. Start the Review stage: ping `@codex review` on the PR and
-        #    record the handoff. The Codex bot is the reviewer regardless
-        #    of the binding's `agent` field; fix-runs spawned later go
-        #    through the binding's CLI.
+        # 6. Start the Review stage. In `local` mode, when the in-workspace
+        #    reviewer already APPROVED, suppress the `@codex review` ping —
+        #    the local pass has done the work. Any other outcome (hybrid
+        #    strategy, local-reviewer failed / exhausted / stuck, or no
+        #    local pre-flight at all) still pings the remote bot as a
+        #    safety net so a flaky reviewer can't dead-end the PR.
+        post_codex_review = _should_post_codex_review(
+            review_strategy=binding.review_strategy,
+            local_review_result=local_review_result,
+        )
         await self._start_review_stage(
             binding=binding,
             issue=issue,
             pr_url=pr_url,
+            post_codex_review=post_codex_review,
         )
+        # 7. Surface the local-review verdict on the GitHub PR thread
+        #    (not just on Linear) so human reviewers see the audit
+        #    trail. Only fires when local-review APPROVED — failures
+        #    are already covered by the @codex fallback ping. The
+        #    binding-level override wins over the global config so an
+        #    operator can keep one repo's PR thread quiet without
+        #    disabling the feature everywhere.
+        if (
+            binding.resolved_post_local_review_pr_summary(
+                self.config.post_local_review_pr_summary
+            )
+            and local_review_result is not None
+            and local_review_result.outcome == LoopOutcome.APPROVED
+        ):
+            await self._post_local_review_pr_summary(
+                binding=binding,
+                pr_url=pr_url,
+                reviewer_agent=binding.resolved_reviewer_agent(),
+                result=local_review_result,
+            )
         return run_id
 
     async def _merge_approved_pr(
@@ -4894,14 +5022,345 @@ class Orchestrator:
                     run_id,
                 )
 
+    async def _run_local_review_phase(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        workspace_path: Path,
+        parent_run_id: str,
+    ) -> LoopResult | None:
+        """Run the local-review session and surface its outcome on Linear.
+
+        Returns the `LoopResult` so future iterations can use the verdict
+        to gate downstream behavior. Today the result is logged and
+        commented on Linear but does not change the flow — that ramp-up
+        is intentional, so we can prove the loop converges on real diffs
+        before letting it drive the PR.
+
+        Errors here are caught and logged: a broken local-review path
+        must never dead-end an issue. The remote `@codex` flow runs
+        afterwards regardless.
+        """
+        try:
+            base_branch = binding.base_branch
+            if base_branch is None:
+                try:
+                    base_branch = await self._gh.repo_default_branch(
+                        binding.github_repo
+                    )
+                except GitHubError as e:
+                    log.warning(
+                        "repo_default_branch failed during local review on %s: %s; "
+                        "falling back to 'main'",
+                        issue.identifier,
+                        e,
+                    )
+                    base_branch = "main"
+
+            reviewer_agent = binding.resolved_reviewer_agent()
+            reviewer_codex_model = binding.resolved_reviewer_codex_model()
+            last_message_dir = (
+                self.config.log_root / "local_review" / parent_run_id
+            )
+            # Local-review uses its own cap (default 6) which is
+            # typically lower than `review_iteration_cap` (default 12)
+            # used by the remote `@codex` loop. The two loops have
+            # different convergence shapes; conflating their caps was
+            # forcing a compromise.
+            cap = binding.resolved_local_review_iteration_cap(
+                self.config.local_review_iteration_cap
+            )
+
+            await self._post_local_review_starting_comment(
+                issue=issue,
+                reviewer_agent=reviewer_agent,
+                strategy=binding.review_strategy,
+                cap=cap,
+            )
+
+            cost_cap_usd = effective_cap(
+                global_cap_usd=self.config.cost_cap_per_issue_usd,
+                binding_override=binding.cost_cap_usd,
+            )
+            # Read prior cost BEFORE creating the local_review row so
+            # the local-review cost-cap check uses the implement cost
+            # alone — the new row would otherwise contribute $0 and
+            # noisy up the trace.
+            prior_cost_usd = await db.runs.cost_for_issue(
+                self._conn, issue.id
+            )
+
+            # Create a `runs` row so the local-review cost participates
+            # in `cost_for_issue` going forward (re-dispatches see the
+            # full historical cost) and so the runs-history audit trail
+            # shows the local-review phase alongside implement/review/
+            # merge stages.
+            local_review_run_id = str(uuid.uuid4())
+            await db.runs.create(
+                self._conn,
+                id=local_review_run_id,
+                issue_id=issue.id,
+                stage="local_review",
+                status="running",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+
+            # Keep the implement run_id slash-eligible during the
+            # local-review phase so `$skip-local-review` posted on the
+            # Linear issue is picked up by `_poll_slash_commands`. The
+            # `_active_run_ids` set was discarded when the implement
+            # subprocess exited; we re-add it for the duration of the
+            # local-review phase and clean up in `finally`.
+            self._local_review_skip_flags[issue.id] = False
+            self._active_run_ids.add(parent_run_id)
+
+            def _should_skip() -> bool:
+                return bool(self._local_review_skip_flags.get(issue.id))
+
+            async def _on_iteration(
+                i: int, verdict: LocalVerdict, cost_so_far: float
+            ) -> None:
+                await self._post_local_review_iteration_comment(
+                    issue=issue,
+                    iteration=i,
+                    verdict=verdict,
+                    cost_so_far=cost_so_far,
+                )
+
+            async def _report_active(run_id: str | None) -> None:
+                if run_id is None:
+                    self._local_review_active_run_ids.pop(issue.id, None)
+                else:
+                    self._local_review_active_run_ids[issue.id] = run_id
+
+            result: LoopResult | None = None
+            try:
+                result = await run_local_review_session(
+                    runner=self._runner,
+                    workspace_path=workspace_path,
+                    base_branch=base_branch,
+                    parent_run_id=parent_run_id,
+                    issue_title=issue.title,
+                    issue_body=issue.description,
+                    labels=list(issue.labels),
+                    implementer_agent=binding.agent,
+                    implementer_codex_model=binding.codex_model,
+                    reviewer_agent=reviewer_agent,
+                    reviewer_codex_model=reviewer_codex_model,
+                    cap=cap,
+                    stall_secs=self.config.stall_timeout_secs,
+                    last_message_dir=last_message_dir,
+                    head_sha_provider=_workspace_head_sha,
+                    cost_cap_usd=cost_cap_usd,
+                    prior_cost_usd=prior_cost_usd,
+                    should_skip=_should_skip,
+                    on_iteration=_on_iteration,
+                    report_active_run_id=_report_active,
+                )
+            finally:
+                self._active_run_ids.discard(parent_run_id)
+                self._local_review_skip_flags.pop(issue.id, None)
+                self._local_review_active_run_ids.pop(issue.id, None)
+                await self._finalize_local_review_run(
+                    run_id=local_review_run_id,
+                    result=result,
+                )
+
+            log.info(
+                "local-review phase for %s ended in %s (iterations=%d, "
+                "strategy=%s, reviewer=%s)",
+                issue.identifier,
+                result.outcome.value,
+                result.iterations,
+                binding.review_strategy,
+                reviewer_agent,
+            )
+            await self._post_local_review_comment(issue=issue, result=result)
+            return result
+        except Exception as e:  # noqa: BLE001
+            # Never break the pipeline because of a local-review fault.
+            log.warning(
+                "local-review phase raised on %s: %s; continuing with remote review",
+                issue.identifier,
+                e,
+            )
+            return None
+
+    async def _finalize_local_review_run(
+        self, *, run_id: str, result: LoopResult | None
+    ) -> None:
+        """Close the local-review `runs` row started by the phase.
+
+        Always called from the phase's `finally`, even when the session
+        raised. `result=None` means the session never returned a
+        `LoopResult` (uncaught exception inside the session); mark the
+        row failed with zero cost so the row reflects the abort.
+        """
+        cost = result.total_cost_usd if result is not None else 0.0
+        if cost > 0:
+            try:
+                await db.runs.add_cost(self._conn, run_id, cost)
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "could not persist local-review cost for run %s",
+                    run_id,
+                )
+        status = _local_review_status_from_result(result)
+        try:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                status,
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "could not finalize local-review run %s (status=%s)",
+                run_id,
+                status,
+            )
+
+    async def _post_local_review_pr_summary(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_url: str,
+        reviewer_agent: str,
+        result: LoopResult,
+    ) -> None:
+        """Post a short verdict trail to the GitHub PR thread.
+
+        Visible to anyone reviewing the PR on GitHub. Mirrors the
+        Linear comment but in the language GitHub reviewers expect:
+        which reviewer ran, how many iterations, what it cost. The
+        intent is not to *replace* human review — it's to give a
+        human reviewer enough context to decide "I trust this and
+        will skim" vs. "I'll review carefully."
+        """
+        pr_number = pr_number_from_url(pr_url)
+        if pr_number is None:
+            log.warning(
+                "could not parse PR number from %r — skipping local-review "
+                "PR summary",
+                pr_url,
+            )
+            return
+        body = (
+            f"**Symphony local reviewer ({reviewer_agent}) approved this PR.**\n\n"
+            f"- iterations: {result.iterations}\n"
+            f"- cost: ${result.total_cost_usd:.4f}\n"
+            f"- strategy: `{binding.review_strategy}`\n"
+        )
+        try:
+            await self._gh.pr_comment(
+                pr_number, body, repo=binding.github_repo
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not post local-review PR summary on %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+
+    async def _post_local_review_starting_comment(
+        self,
+        *,
+        issue: LinearIssue,
+        reviewer_agent: str,
+        strategy: str,
+        cap: int,
+    ) -> None:
+        body = (
+            "**Local review starting** "
+            f"(strategy=`{strategy}`, reviewer=`{reviewer_agent}`, "
+            f"cap={cap})."
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "local-review starting comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
+    async def _post_local_review_iteration_comment(
+        self,
+        *,
+        issue: LinearIssue,
+        iteration: int,
+        verdict: LocalVerdict,
+        cost_so_far: float,
+    ) -> None:
+        """Per-iteration heartbeat so a 5-minute review doesn't look dead.
+
+        Posted right after the verdict is parsed (before any fix-run
+        dispatch), so operators can see "iteration 1: changes_requested
+        — first finding…" while the fix-run is still running. Short
+        snippets keep the issue thread readable.
+        """
+        snippet = ""
+        if verdict.findings:
+            snippet = verdict.findings.strip().splitlines()[0][:280]
+        body_parts = [
+            f"**Local review iter {iteration}:** "
+            f"`{verdict.kind.value}` (cost so far ${cost_so_far:.4f})",
+        ]
+        if snippet:
+            body_parts.append(f"> {snippet}")
+        body = "\n\n".join(body_parts)
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "local-review iter comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
+    async def _post_local_review_comment(
+        self, *, issue: LinearIssue, result: LoopResult
+    ) -> None:
+        outcome = result.outcome.value
+        last_findings = ""
+        if result.last_verdict is not None and result.last_verdict.findings:
+            last_findings = result.last_verdict.findings
+        body_parts = [
+            f"**Local-review outcome:** `{outcome}` "
+            f"(iterations={result.iterations}, "
+            f"cost=${result.total_cost_usd:.4f})",
+        ]
+        if result.error:
+            body_parts.append(f"_Error:_ {result.error}")
+        if last_findings:
+            body_parts.append("Last findings:\n\n" + last_findings)
+        body = "\n\n".join(body_parts)
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "local-review comment post failed on %s: %s", issue.identifier, e
+            )
+
     async def _start_review_stage(
         self,
         *,
         binding: RepoBinding,
         issue: LinearIssue,
         pr_url: str,
+        post_codex_review: bool = True,
     ) -> str | None:
-        """Post `@codex review` and record a live Review monitor row.
+        """Persist the review state row, optionally ping `@codex review`.
+
+        `post_codex_review=False` is the local-review-mode entry point: the
+        in-workspace reviewer already produced an `APPROVED` verdict, so
+        sending the remote bot another pass would just burn cost and
+        latency. State tracking, PR persistence, and the Linear state
+        move still happen — the review monitor still polls CI and human
+        approvals; only the bot ping is suppressed.
 
         Idempotent in spirit: failure to post the bot ping does not block
         the run row from being created, but is logged loudly so an
@@ -4932,19 +5391,20 @@ class Orchestrator:
                 pr_url=pr_url,
                 created_at=datetime.now(UTC).isoformat(),
             )
-            try:
-                await self._gh.pr_comment(
-                    pr_number,
-                    "@codex review",
-                    repo=binding.github_repo,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not post @codex review on %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
+            if post_codex_review:
+                try:
+                    await self._gh.pr_comment(
+                        pr_number,
+                        "@codex review",
+                        repo=binding.github_repo,
+                    )
+                except GitHubError as e:
+                    log.warning(
+                        "could not post @codex review on %s#%d: %s",
+                        binding.github_repo,
+                        pr_number,
+                        e,
+                    )
 
         await self._move_issue_to_review_state(binding=binding, issue=issue)
 
@@ -5669,6 +6129,8 @@ class Orchestrator:
 __all__ = [
     "Orchestrator",
     "WebhookDispatchResult",
+    "_local_review_status_from_result",
+    "_should_post_codex_review",
     "build_fix_runner_command",
     "build_merge_runner_command",
     "build_pr_body",

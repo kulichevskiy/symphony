@@ -60,3 +60,18 @@ while `Blocked` remains the agent-error parking lane for cost caps, merge
 rejects, and other pipeline failures. On each poll tick, Symphony also scans
 `Waiting` and silently returns issues to `ready` once all dependency blockers
 are completed, canceled, or archived.
+
+## Faster reviews (optional)
+
+Each binding can opt into a local-reviewer flow that collapses the
+review/fix iteration loop into a single workspace pass before opening
+the PR. The default (`review_strategy: remote`) preserves today's
+`@codex review` behavior.
+
+- [docs/local-review-handoff.md](docs/local-review-handoff.md) —
+  one-page overview: what shipped, where to start, what's deferred.
+- [docs/local-review-flow.md](docs/local-review-flow.md) — full
+  design, gate semantics, operator workflows, and tuning knobs.
+- `symphony local-review-dry-run --workspace . --reviewer codex` —
+  pre-flight on any local branch without touching SQLite, Linear, or
+  GitHub.

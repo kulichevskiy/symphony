@@ -13,6 +13,7 @@ import asyncio
 import logging
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import click
@@ -293,6 +294,301 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
         click.echo(
             f"  {marker} {h.started_at}  {h.stage:<10}  {h.status:<11}  {h.id}"
         )
+
+
+@runs.command("local-review-trace")
+@click.argument("issue_identifier")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Path to the symphonyd SQLite file.",
+)
+def runs_local_review_trace(issue_identifier: str, db_path: Path) -> None:
+    """List local-review phases for a single issue.
+
+    Postmortem tool. Accepts the Linear identifier (`ENG-123`) and
+    prints each `stage='local_review'` row's status, cost, and
+    duration — most recent first. Run-row IDs are surfaced so the
+    operator can `symphony runs show <id>` for full detail.
+    """
+    asyncio.run(_runs_local_review_trace(issue_identifier, db_path))
+
+
+async def _runs_local_review_trace(
+    issue_identifier: str, db_path: Path
+) -> None:
+    conn = await db.connect(db_path)
+    try:
+        # Resolve identifier ("ENG-123") → issue_id.
+        cur = await conn.execute(
+            "SELECT id FROM issues WHERE identifier = ?",
+            (issue_identifier,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            click.echo(
+                f"no issue found with identifier {issue_identifier!r}",
+                err=True,
+            )
+            sys.exit(1)
+        issue_id = row[0]
+        history = await db.runs.history_for_issue(conn, issue_id)
+    finally:
+        await conn.close()
+    local_rows = [h for h in history if h.stage == "local_review"]
+    if not local_rows:
+        click.echo(
+            f"no local-review runs recorded for {issue_identifier}"
+        )
+        return
+    # `history_for_issue` returns chronologically; reverse for "newest first".
+    click.echo(
+        f"local-review runs for {issue_identifier} ({len(local_rows)} total):"
+    )
+    click.echo(
+        "started_at                       status        cost      duration  id"
+    )
+    for h in reversed(local_rows):
+        duration = _duration_secs(h.started_at, h.ended_at)
+        duration_str = f"{duration:7.1f}s" if duration is not None else "      —"
+        click.echo(
+            f"{h.started_at:<32} {h.status:<13} ${h.cost_usd:<8.4f} "
+            f"{duration_str}  {h.id}"
+        )
+
+
+def _duration_secs(started_at: str | None, ended_at: str | None) -> float | None:
+    if not started_at or not ended_at:
+        return None
+    from datetime import datetime
+
+    try:
+        st = datetime.fromisoformat(started_at)
+        en = datetime.fromisoformat(ended_at)
+    except ValueError:
+        return None
+    return (en - st).total_seconds()
+
+
+@runs.command("local-review-stats")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Path to the symphonyd SQLite file.",
+)
+def runs_local_review_stats(db_path: Path) -> None:
+    """Aggregate local-review telemetry: approval rate, cost, duration.
+
+    Answers "is local-review actually saving time?" without writing SQL.
+    """
+    asyncio.run(_runs_local_review_stats(db_path))
+
+
+async def _runs_local_review_stats(db_path: Path) -> None:
+    conn = await db.connect(db_path)
+    try:
+        stats = await db.runs.local_review_stats(conn)
+    finally:
+        await conn.close()
+    finished = (
+        stats.completed_count + stats.interrupted_count + stats.failed_count
+    )
+    click.echo(f"completed (APPROVED):    {stats.completed_count}")
+    click.echo(f"interrupted (SKIPPED):   {stats.interrupted_count}")
+    click.echo(f"failed (other):          {stats.failed_count}")
+    click.echo(f"running (in-flight):     {stats.running_count}")
+    click.echo(f"approval rate:           {stats.approval_rate:.1%}")
+    click.echo(f"total cost:              ${stats.total_cost_usd:.4f}")
+    click.echo(f"avg cost per session:    ${stats.avg_cost_usd:.4f}")
+    click.echo(f"avg duration per session: {stats.avg_duration_secs:.1f}s")
+    if finished == 0:
+        click.echo("(no finished local-review sessions yet)")
+
+
+@main.command("local-review-dry-run")
+@click.option(
+    "--workspace",
+    "workspace_path",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    required=True,
+    help="Path to a checked-out git worktree to review.",
+)
+@click.option(
+    "--base",
+    "base_branch",
+    default="main",
+    help="Base branch to diff against (the reviewer reads "
+    "`origin/<base>...HEAD`, with a silent fallback to `<base>...HEAD`).",
+)
+@click.option(
+    "--reviewer",
+    "reviewer_agent",
+    type=click.Choice(["claude", "codex"]),
+    default="codex",
+    help="Reviewer agent CLI.",
+)
+@click.option(
+    "--reviewer-model",
+    "reviewer_codex_model",
+    default=None,
+    help="Codex model to use when --reviewer=codex. Omit to use the "
+    "CLI's account default.",
+)
+@click.option(
+    "--title",
+    "issue_title",
+    default="(dry-run; no issue title)",
+    help="Issue title threaded into the prompt.",
+)
+@click.option(
+    "--body",
+    "issue_body",
+    default="",
+    help="Issue description threaded into the prompt.",
+)
+@click.option(
+    "--label",
+    "labels",
+    multiple=True,
+    help="Repeatable. Issue label(s) threaded into the prompt.",
+)
+@click.option(
+    "--stall-secs",
+    type=click.IntRange(min=5),
+    default=300,
+    help="Per-process stall timeout passed to the runner.",
+)
+def local_review_dry_run(
+    workspace_path: Path,
+    base_branch: str,
+    reviewer_agent: str,
+    reviewer_codex_model: str | None,
+    issue_title: str,
+    issue_body: str,
+    labels: tuple[str, ...],
+    stall_secs: int,
+) -> None:
+    """Run the local reviewer on a workspace without touching Linear/GitHub.
+
+    Use this before flipping a binding to `review_strategy: local` in
+    production: point at a real branch in a real workspace, supply the
+    issue context, and eyeball the verdict + findings the reviewer
+    produces. Nothing is written to SQLite, no Linear comments are
+    posted, no `runs` row is created.
+    """
+    _setup_logging()
+    asyncio.run(
+        _local_review_dry_run(
+            workspace_path=workspace_path,
+            base_branch=base_branch,
+            reviewer_agent=reviewer_agent,
+            reviewer_codex_model=reviewer_codex_model,
+            issue_title=issue_title,
+            issue_body=issue_body,
+            labels=list(labels),
+            stall_secs=stall_secs,
+        )
+    )
+
+
+async def _local_review_dry_run(
+    *,
+    workspace_path: Path,
+    base_branch: str,
+    reviewer_agent: str,
+    reviewer_codex_model: str | None,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    stall_secs: int,
+) -> None:
+    from .agent.codex_models import DEFAULT_CODEX_MODEL
+    from .agent.runner import RunnerSpec
+    from .pipeline.local_review import (
+        build_local_review_command,
+        local_review_prompt,
+        parse_local_review_output,
+    )
+    from .pipeline.local_review_io import collect_runner_output
+
+    prompt = local_review_prompt(
+        issue_title=issue_title,
+        issue_body=issue_body,
+        labels=labels,
+        base_branch=base_branch,
+    )
+    last_msg = workspace_path / ".symphony-dry-run-last.txt"
+    if last_msg.exists():
+        try:
+            last_msg.unlink()
+        except OSError:
+            pass
+    command = build_local_review_command(
+        agent=reviewer_agent,  # type: ignore[arg-type]
+        prompt=prompt,
+        base_branch=base_branch,
+        codex_model=reviewer_codex_model or DEFAULT_CODEX_MODEL,
+        last_message_path=str(last_msg) if reviewer_agent == "codex" else None,
+    )
+    # Honour `--reviewer-model None` for codex by stripping --model so
+    # the CLI uses the operator's account default — matches the iter-5
+    # smoke harness convention.
+    if reviewer_codex_model is None and reviewer_agent == "codex":
+        if "--model" in command:
+            idx = command.index("--model")
+            del command[idx : idx + 2]
+    spec = RunnerSpec(
+        run_id="dry-run",
+        workspace_path=workspace_path,
+        command=command,
+        stall_secs=stall_secs,
+        stage="local_review",
+    )
+    runner = _DRY_RUN_RUNNER_FACTORY()
+    click.echo(f"running {reviewer_agent} reviewer against {workspace_path}…")
+    out = await collect_runner_output(runner, spec)
+    last_text = (
+        last_msg.read_text(encoding="utf-8", errors="replace")
+        if last_msg.exists()
+        else None
+    )
+    verdict = parse_local_review_output(
+        agent=reviewer_agent,  # type: ignore[arg-type]
+        stdout=out.stdout,
+        head_sha="dry-run",  # signature is meaningless without persistence
+        last_message_file=last_text,
+    )
+    click.echo("─" * 60)
+    click.echo(f"verdict: {verdict.kind.value}")
+    click.echo(f"terminal: {out.terminal_kind} (rc={out.returncode})")
+    if verdict.findings:
+        click.echo("findings:")
+        click.echo(verdict.findings)
+    elif verdict.raw_message:
+        click.echo("raw message:")
+        click.echo(verdict.raw_message)
+    if last_msg.exists():
+        try:
+            last_msg.unlink()
+        except OSError:
+            pass
+
+
+# Indirection so tests can inject a fake runner without monkeypatching
+# the local-CLI imports. Production calls `LocalRunner()`.
+def _default_dry_run_runner() -> Runner:  # noqa: F821 — forward ref
+    from .agent.runners.local import LocalRunner
+
+    return LocalRunner()
+
+
+from .agent.runner import Runner  # noqa: E402 — placed here to match factory
+
+_DRY_RUN_RUNNER_FACTORY: Callable[[], Runner] = _default_dry_run_runner
 
 
 @main.command()

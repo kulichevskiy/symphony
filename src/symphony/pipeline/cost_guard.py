@@ -9,9 +9,10 @@ trajectories easy to test and lets the orchestrator stay focused on I/O.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..agent.codex_models import DEFAULT_CODEX_MODEL, pricing_for_codex_model
+from ..agent.process import Usage
 
 
 @dataclass(frozen=True)
@@ -76,8 +77,63 @@ def effective_warning_pct(*, global_pct: int, binding_override: int | None) -> i
     return binding_override
 
 
+@dataclass
+class UsageCostEstimator:
+    """Maps stream-json `Usage` events to dollar deltas.
+
+    Claude reports `total_cost_usd` directly so deltas are trivial.
+    Codex reports cumulative *token* counts per turn and never prices
+    the run itself, so this estimator keeps the running max per token
+    bucket and prices the delta via `estimate_codex_cost_usd`. Sharing
+    one estimator across multiple subprocess calls (e.g. across local-
+    review iterations) preserves the cumulative-token invariant so
+    each successive call only pays for *new* tokens.
+    """
+
+    agent: str
+    codex_model: str
+    last_estimated_input_tokens: int = 0
+    last_estimated_cached_input_tokens: int = 0
+    last_estimated_output_tokens: int = 0
+    total_cost_usd: float = field(default=0.0, init=False)
+
+    def delta(self, usage: Usage) -> float:
+        if self.agent != "codex" or usage.cost_usd > 0:
+            self.total_cost_usd += usage.cost_usd
+            return usage.cost_usd
+        input_delta = max(
+            usage.input_tokens - self.last_estimated_input_tokens, 0
+        )
+        cached_input_delta = max(
+            usage.cached_input_tokens - self.last_estimated_cached_input_tokens,
+            0,
+        )
+        output_delta = max(
+            usage.output_tokens - self.last_estimated_output_tokens, 0
+        )
+        self.last_estimated_input_tokens = max(
+            self.last_estimated_input_tokens, usage.input_tokens
+        )
+        self.last_estimated_cached_input_tokens = max(
+            self.last_estimated_cached_input_tokens,
+            usage.cached_input_tokens,
+        )
+        self.last_estimated_output_tokens = max(
+            self.last_estimated_output_tokens, usage.output_tokens
+        )
+        cost = estimate_codex_cost_usd(
+            input_tokens=input_delta,
+            cached_input_tokens=cached_input_delta,
+            output_tokens=output_delta,
+            model=self.codex_model,
+        )
+        self.total_cost_usd += cost
+        return cost
+
+
 __all__ = [
     "CostDecision",
+    "UsageCostEstimator",
     "effective_cap",
     "effective_warning_pct",
     "estimate_codex_cost_usd",

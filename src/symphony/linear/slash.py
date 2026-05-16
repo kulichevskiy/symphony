@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from .client import LinearComment
 
 _PATTERN = re.compile(
-    r"^\s*\$(approve|approved|reject|retry|stop|skip-review)\b",
+    r"^\s*\$(approve|approved|reject|retry|stop|skip-local-review|skip-review)\b",
     re.IGNORECASE,
 )
 _THUMBS_UP = {"👍", ":+1:", ":+1"}
@@ -38,6 +38,7 @@ class SlashKind(StrEnum):
     RETRY = "retry"
     STOP = "stop"
     SKIP_REVIEW = "skip-review"
+    SKIP_LOCAL_REVIEW = "skip-local-review"
 
 
 @dataclass

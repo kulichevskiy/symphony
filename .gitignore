@@ -21,6 +21,10 @@ state.sqlite
 logs/
 workspaces/
 
+# Local backup files (e.g. state.sqlite.<ts>.bak, workspaces.<ts>.bak/)
+*.bak
+*.bak/
+
 # Local operator config / tool state
 config.local.yaml
 .claude/
