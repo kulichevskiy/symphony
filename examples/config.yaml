@@ -33,6 +33,7 @@ repos:
       in_progress: In Progress
       needs_approval: Needs Approval
       blocked: Blocked
+      # waiting: Waiting   # optional dep-wait lane for Linear blockedBy pickup gates
       done: Done
   - linear_team_key: WEB
     github_repo: org/marketing-web

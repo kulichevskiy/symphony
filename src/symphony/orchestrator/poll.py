@@ -56,6 +56,7 @@ from ..config import Config, RepoBinding
 from ..github.client import CheckRun as GitHubCheckRun
 from ..github.client import GitHub, GitHubError, PRChecks
 from ..linear import slash
+from ..linear.blockers import is_blocked, open_blocker_ids
 from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
 from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import (
@@ -68,6 +69,7 @@ from ..linear.templates import (
     failed,
     fix_pushed,
     fixing_merge_conflict,
+    moved_to_waiting,
     resumed,
     reviewing_feedback,
     run_started,
@@ -809,6 +811,21 @@ class Orchestrator:
                 continue
             self._states[binding.linear_team_key] = await self.linear.team_states(
                 binding.linear_team_key
+            )
+            self._validate_waiting_state(binding, self._states[binding.linear_team_key])
+
+    def _validate_waiting_state(
+        self, binding: RepoBinding, states: dict[str, str]
+    ) -> None:
+        waiting = binding.linear_states.waiting
+        if waiting is None:
+            return
+        if waiting not in states:
+            available = sorted(states.keys())
+            raise LinearError(
+                f"{binding.linear_team_key} declares waiting state {waiting!r} "
+                f"for {binding.github_repo}, but it is not in the Linear workflow; "
+                f"available states: {available}"
             )
 
     async def shutdown(self) -> None:
@@ -3034,7 +3051,89 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
+            if binding.linear_states.waiting is not None and is_blocked(issue):
+                await self._park_blocked_by_deps(binding, issue)
+                return None
             return self._schedule_dispatch(binding, issue)
+
+    async def _park_blocked_by_deps(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> None:
+        blockers = open_blocker_ids(issue)
+        if not blockers:
+            return
+        waiting = binding.linear_states.waiting
+        if waiting is None:
+            return
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states before moving %s to waiting for blockers %s: %s",
+                issue.identifier,
+                blockers,
+                e,
+            )
+            return
+
+        waiting_id = states.get(waiting)
+        if waiting_id is None:
+            log.warning(
+                "could not move %s to waiting: missing Linear state %r for team %s",
+                issue.identifier,
+                waiting,
+                binding.linear_team_key,
+            )
+            return
+        ready_id = states.get(binding.linear_states.ready)
+
+        try:
+            await self.linear.move_issue(issue.id, waiting_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s to waiting for dependency blockers %s: %s",
+                issue.identifier,
+                blockers,
+                e,
+            )
+            return
+
+        body = moved_to_waiting(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                next_stage=waiting,
+                linear_identifier=issue.identifier,
+            ),
+            blockers,
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "could not comment after moving %s to waiting for blockers %s: %s",
+                issue.identifier,
+                blockers,
+                e,
+            )
+            if ready_id is not None:
+                try:
+                    await self.linear.move_issue(issue.id, ready_id)
+                except LinearError as rollback_error:
+                    log.warning(
+                        "could not move %s back to ready after waiting comment failed: %s",
+                        issue.identifier,
+                        rollback_error,
+                    )
+            return
+
+        log.info(
+            "moved %s to %s because it is blocked by %s",
+            issue.identifier,
+            waiting,
+            ", ".join(blockers),
+        )
 
     def _ready_binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
         issue_labels = set(issue.labels)

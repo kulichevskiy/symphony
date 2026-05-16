@@ -21,6 +21,26 @@ query LookupIssue($id: String!) {
     state { id name type }
     team { id key }
     labels { nodes { name } }
+    relations(first: 50, includeArchived: true) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        type
+        relatedIssue {
+          id identifier archivedAt
+          state { type }
+        }
+      }
+    }
+    inverseRelations(first: 50, includeArchived: true) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        type
+        issue {
+          id identifier archivedAt
+          state { type }
+        }
+      }
+    }
   }
 }
 """
@@ -40,6 +60,26 @@ query IssuesInState($team: String!, $stateName: String!, $label: String) {
       state { id name type }
       team { id key }
       labels { nodes { name } }
+      relations(first: 50, includeArchived: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          type
+          relatedIssue {
+            id identifier archivedAt
+            state { type }
+          }
+        }
+      }
+      inverseRelations(first: 50, includeArchived: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          type
+          issue {
+            id identifier archivedAt
+            state { type }
+          }
+        }
+      }
     }
   }
 }
@@ -59,6 +99,60 @@ query IssuesInState($team: String!, $stateName: String!) {
       state { id name type }
       team { id key }
       labels { nodes { name } }
+      relations(first: 50, includeArchived: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          type
+          relatedIssue {
+            id identifier archivedAt
+            state { type }
+          }
+        }
+      }
+      inverseRelations(first: 50, includeArchived: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          type
+          issue {
+            id identifier archivedAt
+            state { type }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_RELATIONS_PAGE = """
+query IssueRelationsPage($id: String!, $cursor: String) {
+  issue(id: $id) {
+    relations(first: 50, after: $cursor, includeArchived: true) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        type
+        relatedIssue {
+          id identifier archivedAt
+          state { type }
+        }
+      }
+    }
+  }
+}
+"""
+
+ISSUE_INVERSE_RELATIONS_PAGE = """
+query IssueInverseRelationsPage($id: String!, $cursor: String) {
+  issue(id: $id) {
+    inverseRelations(first: 50, after: $cursor, includeArchived: true) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        type
+        issue {
+          id identifier archivedAt
+          state { type }
+        }
+      }
     }
   }
 }

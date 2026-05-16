@@ -46,6 +46,7 @@ repos:
     assert cfg.repos[0].issue_label == "symphony"
     assert cfg.linear_api_key == "lin_api_test"
     assert cfg.repos[0].linear_states.ready == "Todo"
+    assert cfg.repos[0].linear_states.waiting is None
 
 
 def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -140,6 +141,7 @@ repos:
       in_progress: Doing
       needs_approval: Review
       blocked: Blocked
+      waiting: Waiting
       done: Done
   - linear_team_key: WEB
     github_repo: org/web
@@ -155,6 +157,7 @@ repos:
     cfg = Config.load(p)
     assert cfg.repos[0].linear_states.ready == "Backlog"
     assert cfg.repos[0].linear_states.in_progress == "Doing"
+    assert cfg.repos[0].linear_states.waiting == "Waiting"
     assert cfg.repos[1].linear_states.ready == "Todo"
 
 
