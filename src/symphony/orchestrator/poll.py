@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -109,6 +111,7 @@ PushFn = Callable[[Path, str], Awaitable[None]]
 BindingKey = tuple[str, str, str]
 CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
+CODEX_NO_ISSUES_MARKER = "any major issues"
 
 
 @dataclass
@@ -439,6 +442,55 @@ def _reactions_from_github(entries: list[dict[str, object]]) -> tuple[Reaction, 
     return tuple(reactions)
 
 
+def _codex_lgtm_reactions_from_issue_comments(
+    entries: list[dict[str, object]],
+) -> tuple[Reaction, ...]:
+    """Treat Codex's "no major issues" PR issue comment as an approval signal.
+
+    Codex sometimes reports the 👍 as text inside a top-level PR comment instead
+    of as a GitHub reaction. The classifier already knows how to validate +1
+    signals against the head commit time, so normalize this shape into the same
+    representation.
+    """
+    reactions: list[Reaction] = []
+    for entry in entries:
+        login = _user_login(entry)
+        body = str(entry.get("body") or "")
+        created_at = str(entry.get("created_at") or entry.get("createdAt") or "")
+        if not created_at:
+            continue
+        if is_codex_author(login) and CODEX_NO_ISSUES_MARKER in body.casefold():
+            reactions.append(
+                Reaction(
+                    user_login=login,
+                    content="+1",
+                    created_at=created_at,
+                )
+            )
+    return tuple(reactions)
+
+
+async def _commit_committed_at_or_empty(
+    gh: GitHub,
+    *,
+    repo: str,
+    sha: str,
+) -> str:
+    if not sha:
+        return ""
+    try:
+        result = gh.commit_committed_at(repo, sha)
+        if inspect.isawaitable(result):
+            return str(await result)
+        if isinstance(result, str):
+            return result
+    except GitHubError as e:
+        log.warning("could not fetch commit time for %s@%s: %s", repo, sha, e)
+    except (AttributeError, TypeError) as e:
+        log.debug("commit time unavailable for %s@%s: %s", repo, sha, e)
+    return ""
+
+
 def _pr_view_is_merged(view: dict[str, object]) -> bool:
     return (
         bool(view.get("mergedAt"))
@@ -538,6 +590,21 @@ async def _git_fetch(workspace_path: Path) -> None:
         raise RuntimeError(
             f"git fetch failed: {stderr.decode(errors='replace').strip()}"
         )
+
+
+async def _git_status_short(workspace_path: Path) -> str:
+    """Return ``git status --short`` output for failure diagnostics."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "status", "--short", "--untracked-files=all",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return f"<git status failed: {stderr.decode(errors='replace').strip()}>"
+    return stdout.decode(errors="replace").strip()
 
 
 async def _git_rebase(workspace_path: Path, upstream: str) -> bool:
@@ -762,6 +829,7 @@ class Orchestrator:
         self._states: dict[str, dict[str, str]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
+        self._scheduled_issue_refcounts: dict[str, int] = {}
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._schedule_lock = asyncio.Lock()
         self._comment_event_lock = asyncio.Lock()
@@ -769,6 +837,7 @@ class Orchestrator:
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
         self._cost_cap_run_bindings: dict[str, RepoBinding] = {}
+        self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
@@ -785,8 +854,9 @@ class Orchestrator:
             max(config.global_max_concurrent, 1)
         )
         self._binding_dispatch_sems: dict[BindingKey, asyncio.Semaphore] = {}
-        # Review fix-runs use a separate semaphore pool so implement-stage
-        # dispatches never block reviewer feedback from being addressed.
+        # Review fix-runs also reserve normal dispatch capacity so they outrank
+        # new implementation work, while this separate pool still lets us cap
+        # review-fix concurrency independently.
         self._review_fix_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -861,6 +931,10 @@ class Orchestrator:
         scheduled: list[asyncio.Task[None]] = []
         await self._restore_operator_waits()
         try:
+            scheduled.extend(await self._poll_merge_candidates())
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("merge candidate poll failed")
+        try:
             scheduled.extend(await self._poll_review_runs())
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("review poll failed")
@@ -870,10 +944,6 @@ class Orchestrator:
             log.exception("review resurrection failed")
         for binding in self.config.repos:
             scheduled.extend(await self._scan_binding(binding))
-        try:
-            scheduled.extend(await self._poll_merge_candidates())
-        except Exception:  # noqa: BLE001 — must not kill the loop
-            log.exception("merge candidate poll failed")
         try:
             await self._poll_slash_commands()
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -1076,6 +1146,9 @@ class Orchestrator:
         if run_id in self._cost_cap_run_bindings:
             await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._implement_failed_run_bindings:
+            await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
+            return
         if run_id in self._review_failed_run_bindings:
             await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
             return
@@ -1213,11 +1286,108 @@ class Orchestrator:
             run_id,
         )
 
+    async def _track_implement_failed_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._implement_failed_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def _handle_implement_failed_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._implement_failed_run_bindings.get(run_id)
+        if binding is None:
+            return
+
+        states = await self._states_for_binding(binding)
+        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                log.warning(
+                    "could not retry failed implement run %s: missing ready state %r",
+                    run_id,
+                    binding.linear_states.ready,
+                )
+                return
+            try:
+                await self.linear.move_issue(issue_id, ready_id)
+            except LinearError as e:
+                log.warning("could not move %s to ready for retry: %s", issue_id, e)
+                return
+            body = resumed(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    next_stage=binding.linear_states.ready,
+                )
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "implement retry comment failed for issue %s: %s", issue_id, e
+                )
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is None:
+                log.warning(
+                    "could not stop failed implement run %s: missing blocked state %r",
+                    run_id,
+                    binding.linear_states.blocked,
+                )
+                try:
+                    await self.linear.post_comment(
+                        issue_id,
+                        truncate_body(
+                            command_rejected(
+                                f"${intent.kind}",
+                                "missing blocked state; keeping issue parked",
+                            )
+                        ),
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "implement stop rejection comment failed for %s: %s",
+                        issue_id,
+                        e,
+                    )
+                return
+            try:
+                await self.linear.move_issue(issue_id, blocked_id)
+            except LinearError as e:
+                log.warning("could not move %s to blocked: %s", issue_id, e)
+                return
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        log.info(
+            "slash %s received for failed implement run %s (ignored)",
+            intent.kind,
+            run_id,
+        )
+
     async def _restore_operator_waits(self) -> None:
         waits = await db.operator_waits.list_all(self._conn)
         for wait in waits:
             if wait.kind not in (
                 db.operator_waits.KIND_COST_CAP,
+                db.operator_waits.KIND_IMPLEMENT_FAILED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_MERGE,
             ):
@@ -1241,6 +1411,8 @@ class Orchestrator:
             self._operator_wait_run_ids.add(wait.run_id)
             if wait.kind == db.operator_waits.KIND_COST_CAP:
                 self._cost_cap_run_bindings[wait.run_id] = binding
+            elif wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+                self._implement_failed_run_bindings[wait.run_id] = binding
             elif wait.kind == db.operator_waits.KIND_REVIEW_FAILED:
                 self._review_failed_run_bindings[wait.run_id] = binding
             elif wait.kind == db.operator_waits.KIND_MERGE:
@@ -1280,6 +1452,7 @@ class Orchestrator:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
         self._cost_cap_run_bindings.pop(run_id, None)
+        self._implement_failed_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
@@ -1423,9 +1596,9 @@ class Orchestrator:
                 binding.max_concurrent,
             )
             return
-        # Polling runs unconditionally — no semaphore. Fix-run dispatch
-        # acquires _review_fix_sem inside the dispatch methods so implement-
-        # stage runs can never delay reviewer feedback.
+        # Polling runs unconditionally — no semaphore. If feedback requires a
+        # fix-run, the dispatch helper reserves normal capacity so review fixes
+        # are scheduled ahead of fresh implementations.
         current = await self._refresh_review_poll_candidate(run, binding, issue)
         if current is None:
             return
@@ -1574,6 +1747,11 @@ class Orchestrator:
                 e,
             )
 
+        head_committed_at = await _commit_committed_at_or_empty(
+            self._gh,
+            repo=binding.github_repo,
+            sha=head_sha,
+        )
         ci_runs = [_review_check_from_gh(c) for c in checks.runs]
 
         # Only fetch review signals when CI is clean — Rule 1 (failing CI)
@@ -1590,10 +1768,72 @@ class Orchestrator:
                 ci=ci_runs,
                 snapshot=ReviewSnapshot(
                     head_sha=head_sha,
-                    head_committed_at="",
+                    head_committed_at=head_committed_at,
                     mergeable=mergeable,
                 ),
             )
+            if not should_dispatch_fix_run(
+                prev_signature=state.last_trigger_signature,
+                new_signature=verdict.trigger_signature,
+            ):
+                # Red CI normally pre-empts review signals, but once that exact
+                # CI failure has already dispatched a fix-run we still need to
+                # notice later Codex/human review comments on the same head.
+                try:
+                    raw_reviews = await self._gh.pr_reviews(
+                        state.pr_number, repo=binding.github_repo
+                    )
+                    review_signal_reviews = _reviews_from_github(raw_reviews)
+                except GitHubError as e:
+                    log.warning(
+                        "could not fetch PR reviews for %s#%d: %s",
+                        binding.github_repo,
+                        state.pr_number,
+                        e,
+                    )
+                    review_signal_reviews = ()
+
+                try:
+                    raw_comments = await self._gh.pr_review_comments(
+                        state.pr_number, repo=binding.github_repo
+                    )
+                    review_signal_comments = _review_comments_from_github(raw_comments)
+                except GitHubError as e:
+                    log.warning(
+                        "could not fetch PR review comments for %s#%d: %s",
+                        binding.github_repo,
+                        state.pr_number,
+                        e,
+                    )
+                    review_signal_comments = []
+
+                try:
+                    raw_reactions = await self._gh.pr_reactions(
+                        state.pr_number, repo=binding.github_repo
+                    )
+                    review_signal_reactions = _reactions_from_github(raw_reactions)
+                except GitHubError as e:
+                    log.warning(
+                        "could not fetch PR reactions for %s#%d: %s",
+                        binding.github_repo,
+                        state.pr_number,
+                        e,
+                    )
+                    review_signal_reactions = ()
+
+                review_verdict = review_classifier(
+                    comments=review_signal_comments,
+                    ci=[],
+                    snapshot=ReviewSnapshot(
+                        head_sha=head_sha,
+                        head_committed_at=head_committed_at,
+                        reviews=review_signal_reviews,
+                        reactions=review_signal_reactions,
+                        mergeable=mergeable,
+                    ),
+                )
+                if review_verdict.kind is VerdictKind.CHANGES_REQUESTED:
+                    verdict = review_verdict
         else:
             try:
                 raw_reviews = await self._gh.pr_reviews(
@@ -1642,7 +1882,7 @@ class Orchestrator:
                 ci=ci_runs,
                 snapshot=ReviewSnapshot(
                     head_sha=head_sha,
-                    head_committed_at="",
+                    head_committed_at=head_committed_at,
                     reviews=reviews,
                     reactions=reactions,
                     mergeable=mergeable,
@@ -1655,6 +1895,7 @@ class Orchestrator:
             issue=issue,
             state=state,
             pr_number=state.pr_number,
+            head_committed_at=head_committed_at,
         )
 
         if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
@@ -1756,11 +1997,7 @@ class Orchestrator:
             failing_check_log_tail=log_tail,
         )
 
-        _key = _binding_key(binding)
-        _review_binding_sem = self._review_fix_binding_sems.setdefault(
-            _key, asyncio.Semaphore(max(binding.max_concurrent, 1))
-        )
-        async with self._review_fix_sem, _review_binding_sem:
+        async with self._review_fix_dispatch_slot(binding, issue):
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
             except Exception as e:  # noqa: BLE001
@@ -1867,21 +2104,113 @@ class Orchestrator:
                 return False
 
             state = await db.review_state.get(self._conn, issue.id)
-            if state.pr_number is not None:
-                try:
-                    await self._gh.pr_comment(
-                        state.pr_number,
-                        "@codex review",
-                        repo=binding.github_repo,
-                    )
-                except GitHubError as e:
-                    log.warning(
-                        "could not re-trigger @codex review on %s#%d: %s",
-                        binding.github_repo,
-                        state.pr_number,
-                        e,
-                    )
+            await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
             return True
+
+    async def _retrigger_codex_review_unless_approved(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+    ) -> None:
+        if state.pr_number is None:
+            return
+        try:
+            verdict = await self._review_approval_verdict_for_pr(
+                binding=binding,
+                pr_number=state.pr_number,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not classify approval before re-triggering @codex review "
+                "on %s#%d: %s",
+                binding.github_repo,
+                state.pr_number,
+                e,
+            )
+        else:
+            if verdict.kind is VerdictKind.APPROVED:
+                log.info(
+                    "skipping @codex review re-trigger on %s#%d for %s: "
+                    "approval already present",
+                    binding.github_repo,
+                    state.pr_number,
+                    issue.identifier,
+                )
+                return
+        await self._retrigger_codex_review(
+            binding=binding,
+            state=state,
+        )
+
+    async def _review_approval_verdict_for_pr(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_number: int,
+    ) -> Verdict:
+        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        head_sha = str(view.get("headRefOid") or "")
+        if not head_sha:
+            raise GitHubError(
+                f"pr view missing headRefOid for {binding.github_repo}#{pr_number}"
+            )
+
+        reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+        reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+        try:
+            issue_comments = await self._gh.pr_issue_comments(
+                pr_number,
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR issue comments for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            issue_comments = []
+        committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
+
+        snapshot = ReviewSnapshot(
+            head_sha=head_sha,
+            head_committed_at=committed_at,
+            reactions=(
+                *_reactions_from_github(reactions),
+                *_codex_lgtm_reactions_from_issue_comments(issue_comments),
+            ),
+            reviews=_reviews_from_github(reviews),
+            mergeable=str(view.get("mergeable") or ""),
+        )
+        return review_classifier(comments=[], ci=[], snapshot=snapshot)
+
+    async def _retrigger_codex_review(
+        self,
+        *,
+        binding: RepoBinding,
+        state: db.review_state.ReviewState,
+    ) -> None:
+        if state.pr_number is None:
+            return
+        try:
+            await self._gh.pr_comment(
+                state.pr_number,
+                "@codex review",
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not re-trigger @codex review on %s#%d: %s",
+                binding.github_repo,
+                state.pr_number,
+                e,
+            )
 
     def _format_comment_trigger(self, verdict: Verdict, iteration: int) -> str:
         cap = self.config.review_iteration_cap
@@ -1923,11 +2252,7 @@ class Orchestrator:
             trigger=trigger,
         )
 
-        _key = _binding_key(binding)
-        _review_binding_sem = self._review_fix_binding_sems.setdefault(
-            _key, asyncio.Semaphore(max(binding.max_concurrent, 1))
-        )
-        async with self._review_fix_sem, _review_binding_sem:
+        async with self._review_fix_dispatch_slot(binding, issue):
             # Post the "starting" comment once we have a slot — this ensures
             # the message is accurate ("dispatching now", not "queued").
             prior_cost = await db.runs.cost_for_issue(self._conn, issue.id)
@@ -2077,20 +2402,11 @@ class Orchestrator:
                 )
 
             state = await db.review_state.get(self._conn, issue.id)
-            if state.pr_number is not None:
-                try:
-                    await self._gh.pr_comment(
-                        state.pr_number,
-                        "@codex review",
-                        repo=binding.github_repo,
-                    )
-                except GitHubError as e:
-                    log.warning(
-                        "could not re-trigger @codex review on %s#%d: %s",
-                        binding.github_repo,
-                        state.pr_number,
-                        e,
-                    )
+            await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
             return True
 
     async def _dispatch_merge_conflict_fix_run(
@@ -2120,11 +2436,7 @@ class Orchestrator:
             pr_url=state.pr_url,
         )
 
-        _key = _binding_key(binding)
-        _review_binding_sem = self._review_fix_binding_sems.setdefault(
-            _key, asyncio.Semaphore(max(binding.max_concurrent, 1))
-        )
-        async with self._review_fix_sem, _review_binding_sem:
+        async with self._review_fix_dispatch_slot(binding, issue):
             # Post the "fixing" comment once we have a slot.
             prior_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v_start = CommentVars(
@@ -2163,6 +2475,21 @@ class Orchestrator:
                 return False
 
             # Step 1: orchestrator fetches origin.
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _sync_workspace_to_remote(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning("workspace sync failed for %s: %s", issue.identifier, e)
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"workspace sync failed: {e}",
+                    last_log=str(e),
+                )
+                return False
+
             try:
                 await _git_fetch(workspace_path)
             except Exception as e:  # noqa: BLE001
@@ -2197,23 +2524,31 @@ class Orchestrator:
             if not rebase_clean:
                 conflicted_files = await _git_conflicted_files(workspace_path)
                 if not conflicted_files:
-                    # Rebase exited non-zero but no conflict markers — abort and fail.
+                    # Rebase exited non-zero but Git did not leave unresolved
+                    # paths. This commonly means a dirty workspace or another
+                    # non-content-conflict failure; surface status so operators
+                    # can debug the real state instead of seeing a blank error.
+                    status_short = await _git_status_short(workspace_path)
                     log.warning(
-                        "rebase non-zero but no conflict markers for %s",
+                        "rebase non-zero but no unresolved paths for %s; git status:\n%s",
                         issue.identifier,
+                        status_short or "<clean>",
                     )
                     await _abort_rebase_safely(
                         workspace_path,
                         issue_identifier=issue.identifier,
-                        reason="rebase with no conflict markers",
+                        reason="rebase with no unresolved paths",
                     )
                     self._workspace.release(binding, issue)
+                    error = "rebase failed with no unresolved paths"
+                    if status_short:
+                        error += f"; git status: {status_short}"
                     await self._fail_review_run(
                         run=run,
                         binding=binding,
                         issue=issue,
-                        error="rebase failed with no conflict markers",
-                        last_log="",
+                        error=error,
+                        last_log=status_short,
                     )
                     return False
 
@@ -2341,15 +2676,21 @@ class Orchestrator:
                     if not rebase_clean:
                         conflicted_files = await _git_conflicted_files(workspace_path)
                         if not conflicted_files:
+                            status_short = await _git_status_short(workspace_path)
                             log.warning(
-                                "rebase --continue non-zero but no conflict markers for %s",
+                                "rebase --continue non-zero but no unresolved paths "
+                                "for %s; git status:\n%s",
                                 issue.identifier,
+                                status_short or "<clean>",
                             )
                             await _abort_rebase_safely(
                                 workspace_path,
                                 issue_identifier=issue.identifier,
-                                reason="rebase --continue with no conflict markers",
+                                reason="rebase --continue with no unresolved paths",
                             )
+                            error = "rebase --continue failed with no unresolved paths"
+                            if status_short:
+                                error += f"; git status: {status_short}"
                             await db.runs.update_status(
                                 self._conn,
                                 fix_run_id,
@@ -2360,8 +2701,8 @@ class Orchestrator:
                                 run=run,
                                 binding=binding,
                                 issue=issue,
-                                error="rebase --continue failed with no conflict markers",
-                                last_log="",
+                                error=error,
+                                last_log=status_short,
                             )
                             return False
 
@@ -2381,7 +2722,6 @@ class Orchestrator:
             )
 
             # Step 5: force-push the rebased branch.
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
             try:
                 await self._force_push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
@@ -2420,20 +2760,11 @@ class Orchestrator:
                 )
 
             state = await db.review_state.get(self._conn, issue.id)
-            if state.pr_number is not None:
-                try:
-                    await self._gh.pr_comment(
-                        state.pr_number,
-                        "@codex review",
-                        repo=binding.github_repo,
-                    )
-                except GitHubError as e:
-                    log.warning(
-                        "could not re-trigger @codex review on %s#%d: %s",
-                        binding.github_repo,
-                        state.pr_number,
-                        e,
-                    )
+            await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
             return True
 
     async def _failing_check_log_tail(
@@ -3035,11 +3366,70 @@ class Orchestrator:
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
             return 0
         binding_key = _binding_key(binding)
-        return min(
-            self.config.global_max_concurrent - len(self._scheduled_issue_ids),
-            binding.max_concurrent
-            - self._scheduled_binding_counts.get(binding_key, 0),
+        return max(
+            0,
+            min(
+                self.config.global_max_concurrent - self._scheduled_slot_count(),
+                binding.max_concurrent
+                - self._scheduled_binding_counts.get(binding_key, 0),
+            ),
         )
+
+    def _scheduled_slot_count(self) -> int:
+        return sum(self._scheduled_issue_refcounts.values())
+
+    def _reserve_scheduled_slot(
+        self, *, issue_id: str, binding_key: BindingKey
+    ) -> None:
+        self._scheduled_issue_refcounts[issue_id] = (
+            self._scheduled_issue_refcounts.get(issue_id, 0) + 1
+        )
+        self._scheduled_issue_ids.add(issue_id)
+        self._scheduled_binding_counts[binding_key] = (
+            self._scheduled_binding_counts.get(binding_key, 0) + 1
+        )
+
+    def _release_scheduled_slot(
+        self, *, issue_id: str, binding_key: BindingKey
+    ) -> None:
+        issue_count = self._scheduled_issue_refcounts.get(issue_id, 0)
+        if issue_count <= 1:
+            self._scheduled_issue_refcounts.pop(issue_id, None)
+            self._scheduled_issue_ids.discard(issue_id)
+        else:
+            self._scheduled_issue_refcounts[issue_id] = issue_count - 1
+        count = self._scheduled_binding_counts.get(binding_key, 0)
+        if count <= 1:
+            self._scheduled_binding_counts.pop(binding_key, None)
+        else:
+            self._scheduled_binding_counts[binding_key] = count - 1
+
+    @asynccontextmanager
+    async def _review_fix_dispatch_slot(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> AsyncIterator[None]:
+        """Reserve priority capacity for a review-fix job.
+
+        Review monitors may run without consuming dispatch slots, but once a
+        monitor finds work that changes code, that work should sit ahead of new
+        implementation jobs in both the global and per-binding queues.
+        """
+        binding_key = _binding_key(binding)
+        binding_sem = self._binding_dispatch_sems.setdefault(
+            binding_key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        review_binding_sem = self._review_fix_binding_sems.setdefault(
+            binding_key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        try:
+            async with self._review_fix_sem, review_binding_sem:
+                async with self._global_dispatch_sem, binding_sem:
+                    yield
+        finally:
+            self._release_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
 
     async def _schedule_ready_issue(
         self, binding: RepoBinding, issue: LinearIssue
@@ -3048,6 +3438,8 @@ class Orchestrator:
             if self._dispatch_capacity(binding) <= 0:
                 return None
             if issue.id in self._scheduled_issue_ids:
+                return None
+            if issue.id in self._dispatch_run_ids:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
@@ -3151,10 +3543,7 @@ class Orchestrator:
         self, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None]:
         binding_key = _binding_key(binding)
-        self._scheduled_issue_ids.add(issue.id)
-        self._scheduled_binding_counts[binding_key] = (
-            self._scheduled_binding_counts.get(binding_key, 0) + 1
-        )
+        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
         task = asyncio.create_task(self._dispatch_with_limits(binding, issue))
         self._dispatch_tasks.add(task)
         task.add_done_callback(
@@ -3246,12 +3635,7 @@ class Orchestrator:
         self, task: asyncio.Task[None], issue_id: str, binding_key: BindingKey
     ) -> None:
         self._dispatch_tasks.discard(task)
-        self._scheduled_issue_ids.discard(issue_id)
-        count = self._scheduled_binding_counts.get(binding_key, 0)
-        if count <= 1:
-            self._scheduled_binding_counts.pop(binding_key, None)
-        else:
-            self._scheduled_binding_counts[binding_key] = count - 1
+        self._release_scheduled_slot(issue_id=issue_id, binding_key=binding_key)
         try:
             task.result()
         except asyncio.CancelledError:
@@ -3384,7 +3768,7 @@ class Orchestrator:
                     continue
                 binding_key = _binding_key(binding)
                 if (
-                    len(self._scheduled_issue_ids) >= self.config.global_max_concurrent
+                    self._scheduled_slot_count() >= self.config.global_max_concurrent
                     or self._scheduled_binding_counts.get(binding_key, 0)
                     >= binding.max_concurrent
                 ):
@@ -3422,10 +3806,7 @@ class Orchestrator:
         on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> asyncio.Task[None]:
         binding_key = _binding_key(binding)
-        self._scheduled_issue_ids.add(issue.id)
-        self._scheduled_binding_counts[binding_key] = (
-            self._scheduled_binding_counts.get(binding_key, 0) + 1
-        )
+        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
         task = asyncio.create_task(
             self._merge_with_limits(
                 binding=binding,
@@ -3507,7 +3888,7 @@ class Orchestrator:
 
     # Substring that identifies a Codex "no issues found" issue comment.
     # Codex posts: "Didn't find any major issues. Delightful!"
-    _CODEX_NO_ISSUES_MARKER = "any major issues"
+    _CODEX_NO_ISSUES_MARKER = CODEX_NO_ISSUES_MARKER
 
     async def _maybe_post_codex_lgtm(
         self,
@@ -3517,6 +3898,7 @@ class Orchestrator:
         issue: LinearIssue,
         state: db.review_state.ReviewState,
         pr_number: int | None,
+        head_committed_at: str = "",
     ) -> None:
         """Fetch PR issue comments; if Codex posted a 'no issues' comment that
         hasn't been announced in Linear yet, post the notification once."""
@@ -3551,6 +3933,18 @@ class Orchestrator:
                 cycle_started_raw,
             )
             return
+        min_created_at = cycle_started_at
+        if head_committed_at:
+            try:
+                head_dt = _parse_rfc3339(head_committed_at)
+            except ValueError:
+                log.warning(
+                    "could not parse PR head commit time for %s: %s",
+                    issue.identifier,
+                    head_committed_at,
+                )
+            else:
+                min_created_at = max(min_created_at, head_dt)
         for entry in raw:
             user: dict[str, Any] = entry.get("user") or {}
             login = str(user.get("login") or "")
@@ -3566,7 +3960,7 @@ class Orchestrator:
                     created_at_raw,
                 )
                 continue
-            if created_at < cycle_started_at:
+            if created_at < min_created_at:
                 continue
             if is_codex_author(login) and self._CODEX_NO_ISSUES_MARKER in body.lower():
                 lgtm_comment = entry
@@ -3617,13 +4011,29 @@ class Orchestrator:
         )
         reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
         reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+        try:
+            issue_comments = await self._gh.pr_issue_comments(
+                pr_number,
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR issue comments for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            issue_comments = []
         committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
 
         ci = [_review_check_from_github(run) for run in checks.runs]
         snapshot = ReviewSnapshot(
             head_sha=head_sha,
             head_committed_at=committed_at,
-            reactions=_reactions_from_github(reactions),
+            reactions=(
+                *_reactions_from_github(reactions),
+                *_codex_lgtm_reactions_from_issue_comments(issue_comments),
+            ),
             reviews=_reviews_from_github(reviews),
             mergeable=str(view.get("mergeable") or ""),
         )
@@ -4252,7 +4662,6 @@ class Orchestrator:
 
         total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
         await self.linear.move_issue(issue.id, done_id)
-        await self._workspace.cleanup(issue)
         final_body = stage_done(
             CommentVars(
                 stage="merge",
@@ -4280,6 +4689,15 @@ class Orchestrator:
             merged_at=ended_at,
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
+        await self._clear_operator_wait(issue.id, run_id)
+        try:
+            await self._workspace.cleanup(issue)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "workspace cleanup failed after merge finalization for %s: %s",
+                issue.identifier,
+                e,
+            )
 
     async def _mark_merge_needs_approval(
         self,
@@ -5101,16 +5519,35 @@ class Orchestrator:
         binding: RepoBinding | None = None,
     ) -> None:
         await self._fail_run(run_id, reason)
+        target_state_id = rollback_state_id
+        if binding is not None:
+            try:
+                states = await self._states_for_binding(binding)
+            except LinearError as e:
+                log.warning(
+                    "could not load states while parking failed implement %s: %s",
+                    issue.identifier,
+                    e,
+                )
+            else:
+                ready_id = states.get(binding.linear_states.ready)
+                if issue.state_id == ready_id:
+                    target_state_id = (
+                        states.get(binding.linear_states.needs_approval)
+                        or states.get(binding.linear_states.blocked)
+                        or rollback_state_id
+                    )
         try:
-            await self.linear.move_issue(issue.id, rollback_state_id)
+            await self.linear.move_issue(issue.id, target_state_id)
         except LinearError as e:
             log.warning(
-                "could not roll %s back after failed dispatch: %s",
+                "could not park %s after failed dispatch: %s",
                 issue.identifier,
                 e,
             )
         if binding is None:
             return
+        await self._track_implement_failed_wait(issue.id, run_id, binding)
         cost = await db.runs.cost_for_issue(self._conn, issue.id)
         body = failed(
             CommentVars(
@@ -5121,6 +5558,10 @@ class Orchestrator:
                 cost=f"${cost:.4f}",
                 error=reason,
             )
+        )
+        body += (
+            "\nReply with `$retry` or `$approve` to requeue this issue. "
+            "Reply with `$reject` or `$stop` to leave it halted.\n"
         )
         try:
             await self.linear.post_comment(issue.id, truncate_body(body))

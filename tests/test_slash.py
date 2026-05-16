@@ -46,6 +46,24 @@ def test_parses_known_commands() -> None:
     ]
 
 
+def test_parses_markdown_wrapped_commands_and_approved_alias() -> None:
+    intents = parse(
+        [
+            _c("`$approve`"),
+            _c("```\n$reject\n```"),
+            _c("```bash\n$stop\n```"),
+            _c("$approved"),
+        ]
+    )
+
+    assert [i.kind for i in intents] == [
+        SlashKind.APPROVE,
+        SlashKind.REJECT,
+        SlashKind.STOP,
+        SlashKind.APPROVE,
+    ]
+
+
 def test_ignores_self_authored() -> None:
     assert parse([_c("$approve", is_me=True)]) == []
 
@@ -58,6 +76,7 @@ def test_ignores_mirrored_from_github() -> None:
 
 def test_ignores_free_form() -> None:
     assert parse([_c("looks good — please ship it")]) == []
+    assert parse([_c("please `$approve`")]) == []
 
 
 def test_ignores_unknown_slash() -> None:

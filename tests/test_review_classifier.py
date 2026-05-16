@@ -241,6 +241,21 @@ def test_rule_3_codex_comment_on_stale_sha_ignored() -> None:
     assert v.kind != VerdictKind.CHANGES_REQUESTED
 
 
+def test_rule_3_codex_inline_comment_before_head_commit_is_stale() -> None:
+    comments = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body="This was left before the current head was created.",
+            commit_sha=HEAD_SHA,
+            created_at=EARLIER,
+            path="src/foo.py",
+            line=42,
+        ),
+    ]
+    v = review_classifier(comments=comments, ci=[], snapshot=_snap())
+    assert v.kind != VerdictKind.CHANGES_REQUESTED
+
+
 def test_rule_3_codex_inline_signature_uses_full_comment_body() -> None:
     prefix = "Shared feedback prefix. " * 8
     comments_a = [
@@ -399,7 +414,7 @@ def test_rule_6_codex_plus_one_after_head_commit_marks_approved() -> None:
     )
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.APPROVED
-    assert v.rule == "approved"
+    assert v.rule == "codex_approved"
 
 
 def test_rule_6_codex_plus_one_before_head_commit_is_stale() -> None:
@@ -441,7 +456,7 @@ def test_rule_6_latest_human_approval_supersedes_prior_changes_requested() -> No
     )
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
     assert v.kind == VerdictKind.APPROVED
-    assert v.rule == "approved"
+    assert v.rule == "human_approved"
 
 
 # --- Rule 3: merge conflict beats inline comments -------------------------
@@ -503,6 +518,73 @@ def test_rule_8_approved_but_unset_mergeable_stays_pending() -> None:
         Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
     )
     snap = _snap(reactions=reactions, mergeable=None)
+    v = review_classifier(comments=[], ci=[], snapshot=snap)
+    assert v.kind == VerdictKind.PENDING
+    assert v.rule == "approved_unknown_mergeable"
+
+
+# --- Codex approval signals: "no issues" and emoji ---
+
+
+def test_codex_no_major_issues_comment_marks_approved() -> None:
+    """Codex COMMENTED review with 'Didn't find any major issues' is approved."""
+    reviews = (
+        Review(
+            user_login=CODEX_BOT_LOGIN,
+            state="COMMENTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="Codex Review: Didn't find any major issues. Keep them coming!\n\n<details>...",
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
+def test_codex_no_major_issues_comment_is_case_insensitive() -> None:
+    reviews = (
+        Review(
+            user_login=CODEX_BOT_LOGIN,
+            state="COMMENTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="Codex Review: didn't FIND any MAJOR issues.",
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
+def test_codex_emoji_approval_marks_approved() -> None:
+    """Codex COMMENTED review with 👍 emoji is approved."""
+    reviews = (
+        Review(
+            user_login=CODEX_BOT_LOGIN,
+            state="COMMENTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="👍 Looks good to me!",
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
+def test_codex_no_issues_still_requires_mergeable() -> None:
+    """Codex "no issues" approval still requires mergeable to be MERGEABLE."""
+    reviews = (
+        Review(
+            user_login=CODEX_BOT_LOGIN,
+            state="COMMENTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="Codex Review: Didn't find any major issues.",
+        ),
+    )
+    snap = _snap(reviews=reviews, mergeable="UNKNOWN")
     v = review_classifier(comments=[], ci=[], snapshot=snap)
     assert v.kind == VerdictKind.PENDING
     assert v.rule == "approved_unknown_mergeable"

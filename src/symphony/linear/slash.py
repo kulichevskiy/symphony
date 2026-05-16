@@ -1,9 +1,10 @@
 """Slash-command parser for inbound Linear comments.
 
 Per `docs/python-port-research.md` §13.2 and the prior doc's §35 Strategy 1
-(slash-command-only), v1 only acts on `$approve|$reject|$retry|$stop|$skip-review`
-exactly. Free-form steering is *not* dispatched in v1 because we don't have
-a safe authorship allowlist on the GitHub side; defer to v1.1.
+(slash-command-only), v1 acts on `$approve|$approved|$reject|$retry|$stop|
+$skip-review`, plus a standalone thumbs-up as `$approve`. Free-form steering
+is *not* dispatched in v1 because we don't have a safe authorship allowlist on
+the GitHub side; defer to v1.1.
 
 Filter rules:
 - `external_thread_type is None` → comment was authored natively in Linear
@@ -22,7 +23,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .client import LinearComment
 
-_PATTERN = re.compile(r"^\s*\$(approve|reject|retry|stop|skip-review)\b", re.IGNORECASE)
+_PATTERN = re.compile(
+    r"^\s*\$(approve|approved|reject|retry|stop|skip-review)\b",
+    re.IGNORECASE,
+)
 _THUMBS_UP = {"👍", ":+1:", ":+1"}
 _THUMBS_UP_EMOJI = "👍"
 _VARIATION_SELECTORS = {"\ufe0e", "\ufe0f"}
@@ -54,6 +58,21 @@ def _is_thumbs_up(body: str) -> bool:
     return normalized == _THUMBS_UP_EMOJI
 
 
+def _command_text(body: str) -> str:
+    text = body.strip()
+    if text.startswith("```") and text.endswith("```"):
+        inner = text[3:-3].strip()
+        lines = inner.splitlines()
+        if len(lines) > 1 and not lines[0].lstrip().startswith("$"):
+            language = lines[0].strip()
+            if re.fullmatch(r"[A-Za-z0-9_.+-]+", language):
+                return "\n".join(lines[1:]).strip()
+        return inner
+    if text.startswith("`") and text.endswith("`") and "\n" not in text[1:-1]:
+        return text[1:-1].strip()
+    return text
+
+
 def parse(comments: list[LinearComment]) -> list[SlashIntent]:
     """Pure function: filter and classify. No I/O."""
     out: list[SlashIntent] = []
@@ -73,9 +92,10 @@ def parse(comments: list[LinearComment]) -> list[SlashIntent]:
                 )
             )
             continue
-        m = _PATTERN.match(body)
+        m = _PATTERN.match(_command_text(body))
         if not m:
             continue
-        kind = SlashKind(m.group(1).lower())
+        raw_kind = m.group(1).lower()
+        kind = SlashKind.APPROVE if raw_kind == "approved" else SlashKind(raw_kind)
         out.append(SlashIntent(kind=kind, comment_id=c.id, created_at=c.created_at))
     return out

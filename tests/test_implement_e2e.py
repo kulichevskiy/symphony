@@ -23,7 +23,8 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import GitHubError
-from symphony.linear.client import LinearIssue
+from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 
 
@@ -327,17 +328,57 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         gh.pr_create.assert_not_awaited()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
-            call("iss-1", "state-todo"),
+            call("iss-1", "state-na"),
         ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+        assert wait.run_id == history[0].id
         # Failure comment is now posted so the operator knows what went wrong.
         posted_bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
         assert any("Implement stage failed" in b for b in posted_bodies), (
             "expected a failed() comment to be posted"
         )
+        assert any("$retry" in b for b in posted_bodies)
         assert not any("Will auto-retry shortly." in b for b in posted_bodies)
+
+        # Even if Linear still reports the issue in the ready lane before the
+        # state move is visible, the durable operator wait suppresses a retry
+        # loop in the same process.
+        assert await orch._scan_binding(cfg.repos[0]) == []  # noqa: SLF001
+
+        # After a daemon restart, the persisted wait is restored and `$retry`
+        # clears it by moving the issue back to Ready for the next poll.
+        retry_comment = LinearComment(
+            id="c-retry",
+            body="$retry",
+            created_at="2026-05-10T01:00:00+00:00",
+            author_name="user",
+            author_is_me=False,
+            external_thread_type=None,
+        )
+        restarted_linear = AsyncMock()
+        restarted_linear.comments_since = AsyncMock(return_value=[retry_comment])
+        restarted_linear.move_issue = AsyncMock(return_value=None)
+        restarted_linear.post_comment = AsyncMock(return_value="cmt-2")
+        restarted = Orchestrator(
+            cfg,
+            restarted_linear,
+            conn,
+            runner=_FakeRunner([]),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        restarted._states = {"ENG": _states()}  # noqa: SLF001
+
+        await restarted._poll_slash_commands()  # noqa: SLF001
+
+        restarted_linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()
 
@@ -388,11 +429,14 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
         workspace.release.assert_called_once()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
-            call("iss-1", "state-todo"),
+            call("iss-1", "state-na"),
         ]
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
 
@@ -451,6 +495,71 @@ async def test_manual_dispatch_failure_rolls_back_to_original_state(
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_implement_stop_keeps_wait_when_blocked_state_missing(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"linear_states": LinearStates(ready="Todo", blocked="Missing")}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id="failed-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = Orchestrator(cfg, linear, conn, runner=_FakeRunner([]), gh=MagicMock())
+        orch._states = {"ENG": {"Todo": "state-todo"}}  # noqa: SLF001
+        await orch._track_implement_failed_wait(  # noqa: SLF001
+            "iss-1",
+            "failed-run",
+            binding,
+        )
+
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "failed-run",
+            SlashIntent(
+                kind=SlashKind.STOP,
+                comment_id="c-stop",
+                created_at="2026-05-10T00:05:00+00:00",
+            ),
+        )
+
+        linear.move_issue.assert_not_awaited()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+        assert orch._dispatch_run_ids["iss-1"] == "failed-run"  # noqa: SLF001
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("missing blocked state" in body for body in posted)
     finally:
         await conn.close()
 
