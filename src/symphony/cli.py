@@ -195,9 +195,10 @@ async def _preflight(config_path: Path) -> None:
                     binding.linear_states.in_progress,
                     binding.linear_states.needs_approval,
                     binding.linear_states.blocked,
+                    binding.linear_states.waiting,
                     binding.linear_states.done,
                 )
-                if name not in states
+                if name is not None and name not in states
             ]
             if missing:
                 click.echo(

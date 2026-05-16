@@ -38,12 +38,18 @@ class LinearStates(BaseModel):
     create or rename states. `ready` has no default — every binding must
     declare which state the orchestrator picks issues up from, since teams
     rename or replace it (Backlog, Todo, Up Next, …).
+
+    `blocked` is the agent-error parking lane for cost caps, failed merges,
+    and rejected work. `waiting` is a separate optional dependency-waiting
+    lane used only when pickup should bounce tickets blocked by other Linear
+    issues.
     """
 
     ready: str = Field(min_length=1)
     in_progress: str = "In Progress"
     needs_approval: str = "Needs Approval"
     blocked: str = "Blocked"
+    waiting: str | None = None
     done: str = "Done"
 
 

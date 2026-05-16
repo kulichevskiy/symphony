@@ -30,6 +30,14 @@ class LinearError(RuntimeError):
 
 
 @dataclass
+class Blocker:
+    id: str
+    identifier: str
+    state_type: str
+    archived: bool
+
+
+@dataclass
 class LinearIssue:
     id: str  # UUID
     identifier: str  # "ENG-123"
@@ -38,9 +46,10 @@ class LinearIssue:
     url: str
     state_id: str
     state_name: str
-    state_type: str  # backlog|unstarted|started|completed|canceled
+    state_type: str  # backlog|unstarted|started|triage|completed|canceled
     team_key: str
     labels: list[str] = field(default_factory=list)
+    blocked_by: list[Blocker] = field(default_factory=list)
 
     @classmethod
     def from_node(cls, node: dict[str, Any]) -> LinearIssue:
@@ -55,6 +64,7 @@ class LinearIssue:
             state_type=node["state"]["type"],
             team_key=node["team"]["key"],
             labels=[lbl["name"] for lbl in node.get("labels", {}).get("nodes", [])],
+            blocked_by=_blocked_by_from_node(node),
         )
 
 
@@ -129,7 +139,7 @@ class Linear:
         node = data.get("issue")
         if not node:
             raise LinearError(f"issue not found: {identifier_or_uuid}")
-        return LinearIssue.from_node(node)
+        return await self._issue_from_node(node)
 
     async def issues_in_state(
         self, team_key: str, state_name: str, label: str | None = None
@@ -151,7 +161,10 @@ class Linear:
                 {"team": team_key, "stateName": state_name},
             )
         nodes = data["issues"]["nodes"]
-        return [LinearIssue.from_node(n) for n in nodes]
+        issues: list[LinearIssue] = []
+        for node in nodes:
+            issues.append(await self._issue_from_node(node))
+        return issues
 
     async def comments_since(self, issue_uuid: str, after: datetime) -> list[LinearComment]:
         """Inbound steering source. Caller passes a dedupe cursor."""
@@ -212,3 +225,128 @@ class Linear:
         data = await self._query(queries.VIEWER_TEAMS, {})
         viewer = data.get("viewer") or {}
         return [t["key"] for t in (viewer.get("teams") or {}).get("nodes", [])]
+
+    async def _issue_from_node(self, node: dict[str, Any]) -> LinearIssue:
+        issue = LinearIssue.from_node(node)
+        issue.blocked_by.extend(
+            await self._remaining_blockers_from_paginated_relations(issue, node)
+        )
+        return issue
+
+    async def _remaining_blockers_from_paginated_relations(
+        self, issue: LinearIssue, node: dict[str, Any]
+    ) -> list[Blocker]:
+        seen = {blocker.id for blocker in issue.blocked_by}
+        blockers: list[Blocker] = []
+        blockers.extend(
+            await self._remaining_relation_blockers(
+                issue.id,
+                node,
+                connection_name="relations",
+                query=queries.ISSUE_RELATIONS_PAGE,
+                inverse=False,
+                seen=seen,
+            )
+        )
+        blockers.extend(
+            await self._remaining_relation_blockers(
+                issue.id,
+                node,
+                connection_name="inverseRelations",
+                query=queries.ISSUE_INVERSE_RELATIONS_PAGE,
+                inverse=True,
+                seen=seen,
+            )
+        )
+        return blockers
+
+    async def _remaining_relation_blockers(
+        self,
+        issue_id: str,
+        node: dict[str, Any],
+        *,
+        connection_name: str,
+        query: str,
+        inverse: bool,
+        seen: set[str],
+    ) -> list[Blocker]:
+        page_info = _relation_page_info(node, connection_name)
+        if not page_info.get("hasNextPage"):
+            return []
+        cursor = page_info.get("endCursor")
+        blockers: list[Blocker] = []
+        while cursor:
+            data = await self._query(query, {"id": issue_id, "cursor": cursor})
+            issue_node = data.get("issue") or {}
+            connection = issue_node.get(connection_name) or {}
+            blockers.extend(
+                _blockers_from_relation_nodes(
+                    connection.get("nodes") or [],
+                    inverse=inverse,
+                    seen=seen,
+                )
+            )
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+        return blockers
+
+
+def _normalized_relation_type(raw: str) -> str:
+    return raw.replace("_", "").replace("-", "").casefold()
+
+
+def _blocker_from_issue_node(node: dict[str, Any] | None) -> Blocker | None:
+    if not node:
+        return None
+    state = node.get("state") or {}
+    return Blocker(
+        id=node["id"],
+        identifier=node["identifier"],
+        state_type=state.get("type", ""),
+        archived=bool(node.get("archivedAt")),
+    )
+
+
+def _blockers_from_relation_nodes(
+    nodes: list[dict[str, Any]], *, inverse: bool, seen: set[str]
+) -> list[Blocker]:
+    blockers: list[Blocker] = []
+    for relation in nodes:
+        relation_type = _normalized_relation_type(str(relation.get("type") or ""))
+        if inverse:
+            if relation_type != "blocks":
+                continue
+            blocker = _blocker_from_issue_node(relation.get("issue"))
+        else:
+            if relation_type != "blockedby":
+                continue
+            blocker = _blocker_from_issue_node(relation.get("relatedIssue"))
+        if blocker is not None and blocker.id not in seen:
+            blockers.append(blocker)
+            seen.add(blocker.id)
+    return blockers
+
+
+def _blocked_by_from_node(node: dict[str, Any]) -> list[Blocker]:
+    seen: set[str] = set()
+    blockers = _blockers_from_relation_nodes(
+        (node.get("relations") or {}).get("nodes", []),
+        inverse=False,
+        seen=seen,
+    )
+    blockers.extend(
+        _blockers_from_relation_nodes(
+            (node.get("inverseRelations") or {}).get("nodes", []),
+            inverse=True,
+            seen=seen,
+        )
+    )
+    return blockers
+
+
+def _relation_page_info(node: dict[str, Any], connection_name: str) -> dict[str, Any]:
+    connection = node.get(connection_name) or {}
+    page_info: dict[str, Any] = connection.get("pageInfo") or {}
+    return page_info

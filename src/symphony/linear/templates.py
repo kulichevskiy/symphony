@@ -54,6 +54,7 @@ class CommentVars:
     error: str = ""
     last_log: str = ""
     next_stage: str = ""
+    linear_identifier: str = ""
     pct: int = 0
     commit_url: str = ""
     auto_retry: bool = False
@@ -64,6 +65,18 @@ def run_started(v: CommentVars) -> str:
         f"🚀 **Implement starting** on `{v.repo}#{v.issue}`\n\n"
         f"- Run ID: `{v.run_id}`\n"
         f"- Workspace cloned, agent dispatched.\n"
+    )
+
+
+def moved_to_waiting(v: CommentVars, blockers: list[str]) -> str:
+    blocker_list = ", ".join(f"`{identifier}`" for identifier in blockers)
+    target = v.linear_identifier or f"{v.repo}#{v.issue}"
+    return (
+        f"🟠 **Moved to {v.next_stage} — dependency blocked**\n\n"
+        f"Symphony did not start `{target}` because Linear says it "
+        f"is blocked by: {blocker_list}.\n\n"
+        "Return this issue to the ready lane manually after the blocker closes. "
+        "Automatic return-to-ready is planned for the next dependency slice.\n"
     )
 
 
