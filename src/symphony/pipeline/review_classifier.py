@@ -19,7 +19,7 @@ Rules (priority order — first match wins):
   4. Codex inline review comment on HEAD → CHANGES_REQUESTED.
   5. Substantive Codex `COMMENTED` review on HEAD → CHANGES_REQUESTED.
   6. Human `CHANGES_REQUESTED` on HEAD → CHANGES_REQUESTED.
-  7. Codex approval signals: "Didn't find any major issues" in COMMENTED
+  7. Codex approval signals: "any major issues" in COMMENTED
      review, or `+1` reaction (after HEAD commit time) → APPROVED when
      mergeable.
   8. Human `APPROVED` → APPROVED when mergeable.
@@ -44,6 +44,7 @@ CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
 # feedback. False negatives here are acceptable — we just stay PENDING and
 # re-poll.
 CODEX_BOILERPLATE_THRESHOLD = 750
+CODEX_NO_ISSUES_MARKER = "any major issues"
 
 # PRD §pipeline: review iteration cap = 12. The orchestrator escapes to
 # Needs Approval once this many fix-runs have been dispatched.
@@ -298,11 +299,11 @@ def review_classifier(
             continue
         if codex_approval_at is None or rxn_dt > codex_approval_at:
             codex_approval_at = rxn_dt
-    # Check for Codex "Didn't find any major issues" in COMMENTED review
+    # Check for Codex "no major issues" text in COMMENTED review
     codex_no_issues = any(
         r.state == "COMMENTED"
         and is_codex_author(r.user_login)
-        and "Didn't find any major issues" in r.body
+        and CODEX_NO_ISSUES_MARKER in r.body.casefold()
         for r in fresh_reviews
     )
     # Check for 👍 emoji in Codex COMMENTED review body

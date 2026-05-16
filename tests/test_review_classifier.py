@@ -542,6 +542,21 @@ def test_codex_no_major_issues_comment_marks_approved() -> None:
     assert v.rule == "codex_approved"
 
 
+def test_codex_no_major_issues_comment_is_case_insensitive() -> None:
+    reviews = (
+        Review(
+            user_login=CODEX_BOT_LOGIN,
+            state="COMMENTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body="Codex Review: didn't FIND any MAJOR issues.",
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
 def test_codex_emoji_approval_marks_approved() -> None:
     """Codex COMMENTED review with 👍 emoji is approved."""
     reviews = (

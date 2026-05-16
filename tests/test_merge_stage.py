@@ -620,6 +620,60 @@ async def test_queued_merge_revalidates_issue_before_execution(
 
 
 @pytest.mark.asyncio
+async def test_review_verdict_treats_issue_comment_fetch_failure_as_empty(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude")
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(side_effect=GitHubError("boom"))
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+
+        orch = Orchestrator(
+            cfg,
+            MagicMock(),
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+        )
+        verdict = await orch._review_verdict_for_pr(  # noqa: SLF001
+            binding=binding,
+            pr_number=45,
+            view={"headRefOid": "abc123", "mergeable": "MERGEABLE"},
+        )
+
+        assert verdict.kind == "approved"
+        assert verdict.rule == "human_approved"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

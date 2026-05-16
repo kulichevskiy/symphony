@@ -3875,9 +3875,19 @@ class Orchestrator:
         )
         reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
         reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
-        issue_comments = await self._gh.pr_issue_comments(
-            pr_number, repo=binding.github_repo
-        )
+        try:
+            issue_comments = await self._gh.pr_issue_comments(
+                pr_number,
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR issue comments for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            issue_comments = []
         committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
 
         ci = [_review_check_from_github(run) for run in checks.runs]
