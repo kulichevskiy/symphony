@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
 
@@ -829,6 +829,7 @@ class Orchestrator:
         self._states: dict[str, dict[str, str]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
+        self._known_waiting_issue_ids: set[str] = set()
         self._scheduled_issue_refcounts: dict[str, int] = {}
         self._scheduled_binding_counts: dict[BindingKey, int] = {}
         self._schedule_lock = asyncio.Lock()
@@ -3364,10 +3365,35 @@ class Orchestrator:
     ) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
         ready_state = binding.linear_states.ready
+        waiting_state = binding.linear_states.waiting
+        waiting_issues: list[LinearIssue] = []
         try:
-            issues = await self.linear.issues_in_state(
-                binding.linear_team_key, ready_state, binding.issue_label
-            )
+            if waiting_state is None:
+                issues = await self.linear.issues_in_state(
+                    binding.linear_team_key, ready_state, binding.issue_label
+                )
+            else:
+                ready_result, waiting_result = await asyncio.gather(
+                    self.linear.issues_in_state(
+                        binding.linear_team_key, ready_state, binding.issue_label
+                    ),
+                    self.linear.issues_in_state(
+                        binding.linear_team_key, waiting_state, binding.issue_label
+                    ),
+                    return_exceptions=True,
+                )
+                scan_failed = False
+                for result in (ready_result, waiting_result):
+                    if isinstance(result, LinearError):
+                        log.warning("scan failed for %s: %s", binding.linear_team_key, result)
+                        scan_failed = True
+                    elif isinstance(result, BaseException):
+                        raise result
+                if scan_failed:
+                    return scheduled
+                issues = cast(list[LinearIssue], ready_result)
+                waiting_issues = cast(list[LinearIssue], waiting_result)
+                self._known_waiting_issue_ids = {issue.id for issue in waiting_issues}
         except LinearError as e:
             log.warning("scan failed for %s: %s", binding.linear_team_key, e)
             return scheduled
@@ -3378,6 +3404,7 @@ class Orchestrator:
             ready_state,
             f" with label '{binding.issue_label}'" if binding.issue_label else "",
         )
+        await self._auto_unblock_waiting(binding, waiting_issues)
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
             log.info(
                 "scan %s: dispatch capacity is zero (global=%d, binding=%d)",
@@ -3398,6 +3425,38 @@ class Orchestrator:
             if len(scheduled) >= capacity:
                 break
         return scheduled
+
+    async def _auto_unblock_waiting(
+        self, binding: RepoBinding, waiting_issues: list[LinearIssue]
+    ) -> None:
+        unblocked_issues = [issue for issue in waiting_issues if not is_blocked(issue)]
+        if not unblocked_issues:
+            return
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states before auto-unblocking waiting issues for %s: %s",
+                binding.linear_team_key,
+                e,
+            )
+            return
+        ready_id = states.get(binding.linear_states.ready)
+        if ready_id is None:
+            log.warning(
+                "could not auto-unblock waiting issues for %s: missing Linear state %r",
+                binding.linear_team_key,
+                binding.linear_states.ready,
+            )
+            return
+
+        for issue in unblocked_issues:
+            try:
+                await self.linear.move_issue(issue.id, ready_id)
+            except LinearError as e:
+                log.warning("could not auto-unblock %s to Ready: %s", issue.identifier, e)
+                continue
+            log.info("auto-unblocked %s -> Ready", issue.identifier)
 
     def _dispatch_capacity(self, binding: RepoBinding) -> int:
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:

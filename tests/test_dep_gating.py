@@ -60,20 +60,35 @@ def _blocker(
     )
 
 
-def _issue(blockers: list[Blocker]) -> LinearIssue:
+def _issue(
+    blockers: list[Blocker],
+    *,
+    id: str = "iss-1",
+    identifier: str = "ENG-1",
+    state_id: str = "state-todo",
+    state_name: str = "Todo",
+    state_type: str = "unstarted",
+) -> LinearIssue:
     return LinearIssue(
-        id="iss-1",
-        identifier="ENG-1",
+        id=id,
+        identifier=identifier,
         title="Blocked work",
         description="",
-        url="https://linear.app/team/issue/ENG-1/blocked-work",
-        state_id="state-todo",
-        state_name="Todo",
-        state_type="unstarted",
+        url=f"https://linear.app/team/issue/{identifier}/blocked-work",
+        state_id=state_id,
+        state_name=state_name,
+        state_type=state_type,
         team_key="ENG",
         labels=["symphony"],
         blocked_by=blockers,
     )
+
+
+def _scan_results(
+    ready_issues: list[LinearIssue],
+    waiting_issues: list[LinearIssue] | None = None,
+) -> AsyncMock:
+    return AsyncMock(side_effect=[ready_issues, [] if waiting_issues is None else waiting_issues])
 
 
 def _make_orch(
@@ -122,7 +137,7 @@ async def test_pickup_with_open_blocker_moves_to_waiting_without_run(
         cfg = Config(repos=[binding])
         issue = _issue([_blocker("WEB-99", state_type)])
         linear = AsyncMock()
-        linear.issues_in_state = AsyncMock(return_value=[issue])
+        linear.issues_in_state = _scan_results([issue])
         linear.lookup_issue = AsyncMock(return_value=issue)
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
@@ -160,7 +175,7 @@ async def test_pickup_with_closed_or_archived_blocker_starts_normally(
         cfg = Config(repos=[binding])
         issue = _issue([_blocker("ENG-2", state_type, archived=archived)])
         linear = AsyncMock()
-        linear.issues_in_state = AsyncMock(return_value=[issue])
+        linear.issues_in_state = _scan_results([issue])
         linear.lookup_issue = AsyncMock(return_value=issue)
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
@@ -169,6 +184,9 @@ async def test_pickup_with_closed_or_archived_blocker_starts_normally(
 
         await _scan_and_wait(orch, binding)
 
+        linear.issues_in_state.assert_has_awaits(
+            [call("ENG", "Todo", None), call("ENG", "Waiting", None)]
+        )
         orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
         linear.move_issue.assert_not_awaited()
         linear.post_comment.assert_not_awaited()
@@ -229,7 +247,7 @@ async def test_waiting_move_failure_does_not_dispatch_or_comment(
         cfg = Config(repos=[binding])
         issue = _issue([_blocker("ENG-2", "started")])
         linear = AsyncMock()
-        linear.issues_in_state = AsyncMock(return_value=[issue])
+        linear.issues_in_state = _scan_results([issue])
         linear.move_issue = AsyncMock(side_effect=LinearError("move failed"))
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -259,7 +277,7 @@ async def test_waiting_comment_failure_rolls_issue_back_to_ready(
         cfg = Config(repos=[binding])
         issue = _issue([_blocker("ENG-2", "started")])
         linear = AsyncMock()
-        linear.issues_in_state = AsyncMock(return_value=[issue])
+        linear.issues_in_state = _scan_results([issue])
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(side_effect=LinearError("comment failed"))
 
@@ -277,5 +295,334 @@ async def test_waiting_comment_failure_rolls_issue_back_to_ready(
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history == []
         assert "could not comment after moving ENG-1 to waiting" in caplog.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_queries_ready_and_waiting_in_parallel(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        ready_started = asyncio.Event()
+        waiting_started = asyncio.Event()
+
+        async def _issues_in_state(
+            _team_key: str, state_name: str, _label: str | None
+        ) -> list[LinearIssue]:
+            if state_name == "Todo":
+                ready_started.set()
+                await waiting_started.wait()
+            elif state_name == "Waiting":
+                waiting_started.set()
+                await ready_started.wait()
+            return []
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(side_effect=_issues_in_state)
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await asyncio.wait_for(_scan_and_wait(orch, binding), timeout=1)
+
+        assert ready_started.is_set()
+        assert waiting_started.is_set()
+        assert linear.issues_in_state.await_args_list == [
+            call("ENG", "Todo", None),
+            call("ENG", "Waiting", None),
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_state", ["Todo", "Waiting"])
+async def test_ready_or_waiting_scan_failure_aborts_scan(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failed_state: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+
+        async def _issues_in_state(
+            _team_key: str, state_name: str, _label: str | None
+        ) -> list[LinearIssue]:
+            if state_name == failed_state:
+                raise LinearError(f"{state_name} failed")
+            return []
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(side_effect=_issues_in_state)
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        with caplog.at_level(logging.WARNING):
+            await _scan_and_wait(orch, binding)
+
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+        assert "scan failed for ENG" in caplog.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state_type", "archived"),
+    [("completed", False), ("canceled", False), ("started", True)],
+)
+async def test_auto_unblock_waiting_with_closed_or_archived_blocker_moves_to_ready(
+    tmp_path: Path,
+    state_type: str,
+    archived: bool,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue(
+            [_blocker("ENG-2", state_type, archived=archived)],
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = _scan_results([], [issue])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await _scan_and_wait(orch, binding)
+
+        linear.issues_in_state.assert_has_awaits(
+            [call("ENG", "Todo", None), call("ENG", "Waiting", None)]
+        )
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        linear.post_comment.assert_not_awaited()
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+        assert orch._known_waiting_issue_ids == {"iss-1"}  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_unblock_waiting_with_open_blocker_stays_waiting(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue(
+            [_blocker("ENG-2", "started"), _blocker("ENG-3", "completed")],
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = _scan_results([], [issue])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await _scan_and_wait(orch, binding)
+
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_unblock_waiting_with_multiple_closed_blockers_moves_to_ready(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue(
+            [
+                _blocker("ENG-2", "completed"),
+                _blocker("ENG-3", "canceled"),
+                _blocker("ENG-4", "started", archived=True),
+            ],
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = _scan_results([], [issue])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await _scan_and_wait(orch, binding)
+
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        linear.post_comment.assert_not_awaited()
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_unblock_move_failure_logs_and_continues(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        first = _issue(
+            [_blocker("ENG-10", "completed")],
+            id="iss-1",
+            identifier="ENG-1",
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        second = _issue(
+            [_blocker("ENG-20", "completed")],
+            id="iss-2",
+            identifier="ENG-2",
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = _scan_results([], [first, second])
+        linear.move_issue = AsyncMock(side_effect=[LinearError("move failed"), None])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        with caplog.at_level(logging.WARNING):
+            await _scan_and_wait(orch, binding)
+
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-todo"),
+            call("iss-2", "state-todo"),
+        ]
+        linear.post_comment.assert_not_awaited()
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+        assert "could not auto-unblock ENG-1 to Ready" in caplog.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_unblock_cascade_chain_across_ticks(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue15_ready_blocked = _issue(
+            [_blocker("VIB-14", "unstarted")],
+            id="iss-15",
+            identifier="VIB-15",
+        )
+        issue14_waiting_blocked = _issue(
+            [_blocker("VIB-13", "started")],
+            id="iss-14",
+            identifier="VIB-14",
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        issue14_waiting_unblocked = _issue(
+            [_blocker("VIB-13", "completed")],
+            id="iss-14",
+            identifier="VIB-14",
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        issue14_ready = _issue(
+            [_blocker("VIB-13", "completed")],
+            id="iss-14",
+            identifier="VIB-14",
+        )
+        issue15_waiting_blocked = _issue(
+            [_blocker("VIB-14", "started")],
+            id="iss-15",
+            identifier="VIB-15",
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        issue15_waiting_unblocked = _issue(
+            [_blocker("VIB-14", "completed")],
+            id="iss-15",
+            identifier="VIB-15",
+            state_id="state-waiting",
+            state_name="Waiting",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(
+            side_effect=[
+                [issue15_ready_blocked],
+                [issue14_waiting_blocked],
+                [],
+                [issue14_waiting_unblocked],
+                [issue14_ready],
+                [issue15_waiting_blocked],
+                [],
+                [issue15_waiting_unblocked],
+            ]
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.lookup_issue = AsyncMock(return_value=issue14_ready)
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await _scan_and_wait(orch, binding)
+        await _scan_and_wait(orch, binding)
+        await _scan_and_wait(orch, binding)
+        await _scan_and_wait(orch, binding)
+
+        assert linear.move_issue.await_args_list == [
+            call("iss-15", "state-waiting"),
+            call("iss-14", "state-todo"),
+            call("iss-15", "state-todo"),
+        ]
+        linear.post_comment.assert_awaited_once()
+        orch._dispatch_one.assert_awaited_once_with(binding, issue14_ready)  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_only_opted_in_binding_scans_waiting_on_same_team(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        waiting_binding = _binding()
+        plain_binding = _binding(waiting=None)
+        cfg = Config(repos=[waiting_binding, plain_binding])
+        linear = AsyncMock()
+        linear.issues_in_state = _scan_results([], [])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await _scan_and_wait(orch, waiting_binding)
+
+        assert linear.issues_in_state.await_args_list == [
+            call("ENG", "Todo", None),
+            call("ENG", "Waiting", None),
+        ]
+
+        linear.issues_in_state = AsyncMock(return_value=[])
+        await _scan_and_wait(orch, plain_binding)
+
+        linear.issues_in_state.assert_awaited_once_with("ENG", "Todo", None)
     finally:
         await conn.close()

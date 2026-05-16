@@ -57,5 +57,6 @@ dispatches work. If the ready issue is blocked by any open, unarchived blocker
 
 `Waiting` is separate from `Blocked`: `Waiting` means "dependency not ready",
 while `Blocked` remains the agent-error parking lane for cost caps, merge
-rejects, and other pipeline failures. Returning dependency-waiting issues to
-Ready is manual in this slice.
+rejects, and other pipeline failures. On each poll tick, Symphony also scans
+`Waiting` and silently returns issues to `ready` once all dependency blockers
+are completed, canceled, or archived.
