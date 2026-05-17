@@ -78,7 +78,7 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
         for binding in enabled_bindings
         if binding.webhook_secret
     }
-    if not cfg.github_webhook_secret and not repo_secrets:
+    if not enabled_bindings and not cfg.github_webhook_secret and not repo_secrets:
         return None
     try:
         return GitHubWebhookSettings(

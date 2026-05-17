@@ -47,6 +47,20 @@ class GitHubWebhookSettings:
     dedupe_ttl_secs: int = 600
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "repo_secrets",
+            {
+                _normalize_repo(repo): secret
+                for repo, secret in self.repo_secrets.items()
+            },
+        )
+        if self.enabled_repos is not None:
+            object.__setattr__(
+                self,
+                "enabled_repos",
+                frozenset(_normalize_repo(repo) for repo in self.enabled_repos),
+            )
         if self.secret or self.enabled_repos is None:
             return
         missing = sorted(
@@ -64,10 +78,10 @@ class GitHubWebhookSettings:
     def repo_enabled(self, repo: str | None) -> bool:
         if self.enabled_repos is None:
             return True
-        return repo in self.enabled_repos
+        return repo is not None and _normalize_repo(repo) in self.enabled_repos
 
     def secrets_for_repo(self, repo: str) -> tuple[str, ...]:
-        repo_secret = self.repo_secrets.get(repo)
+        repo_secret = self.repo_secrets.get(_normalize_repo(repo))
         if repo_secret:
             return (repo_secret,)
         return (self.secret,) if self.secret else ()
@@ -77,6 +91,10 @@ class GitHubWebhookSettings:
 class GitHubWebhookHandler(Protocol):
     def handle_github_webhook(self, event: GitHubWebhookEvent) -> Awaitable[Any]:
         """Handle a verified, deduped GitHub webhook event."""
+
+
+def _normalize_repo(repo: str) -> str:
+    return repo.casefold()
 
 
 def verify_github_signature(secret: str, body: bytes, signature: str | None) -> bool:

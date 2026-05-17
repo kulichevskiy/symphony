@@ -10,9 +10,12 @@ from typing import Any
 
 import httpx
 import pytest
+from click import ClickException
 
 from symphony import db
 from symphony.app import create_app
+from symphony.cli import _github_webhook_settings
+from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.webhook import GitHubWebhookEvent, GitHubWebhookSettings
 
 SECRET = "github-webhook-secret"
@@ -71,6 +74,20 @@ def _pull_request_payload(*, merged: bool = True, action: str = "closed") -> dic
     }
 
 
+def _binding(
+    *,
+    webhook_enabled: bool = True,
+    webhook_secret: str | None = None,
+) -> RepoBinding:
+    return RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        webhook_enabled=webhook_enabled,
+        webhook_secret=webhook_secret,
+        linear_states=LinearStates(ready="Todo"),
+    )
+
+
 def _issue_comment_payload() -> dict[str, Any]:
     return {
         "action": "created",
@@ -87,6 +104,28 @@ def test_github_webhook_settings_require_secret_for_enabled_repos() -> None:
             repo_secrets={"org/repo": REPO_SECRET},
             enabled_repos=frozenset({"org/repo", "org/web"}),
         )
+
+
+def test_cli_rejects_enabled_github_webhook_repo_without_secret() -> None:
+    cfg = Config(
+        repos=[
+            _binding(webhook_secret=REPO_SECRET),
+            RepoBinding(
+                linear_team_key="WEB",
+                github_repo="org/web",
+                linear_states=LinearStates(ready="Todo"),
+            ),
+        ]
+    )
+
+    with pytest.raises(ClickException, match="enabled repos lack webhook_secret: org/web"):
+        _github_webhook_settings(cfg)
+
+
+def test_cli_skips_github_webhook_settings_when_repos_are_disabled() -> None:
+    cfg = Config(repos=[_binding(webhook_enabled=False)])
+
+    assert _github_webhook_settings(cfg) is None
 
 
 async def _delivery_rows(conn: object) -> list[tuple[str, str]]:
@@ -145,6 +184,40 @@ async def test_valid_pull_request_webhook_is_verified_persisted_and_emitted(
         assert await _delivery_rows(conn) == [("delivery-1", "handled")]
         assert await conn.execute_fetchall("SELECT * FROM issue_prs") == []
         assert await conn.execute_fetchall("SELECT * FROM operator_waits") == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_matching_is_case_insensitive(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        handler = _Handler()
+        app = create_app(
+            handler,
+            conn,
+            github_webhook_settings=GitHubWebhookSettings(
+                repo_secrets={"org/repo": REPO_SECRET},
+                enabled_repos=frozenset({"org/repo"}),
+            ),
+            ui_enabled=False,
+            clock=lambda: NOW,
+        )
+        payload = _pull_request_payload()
+        payload["repository"] = {"full_name": "Org/Repo"}
+        body = _body(payload)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/github/webhook",
+                content=body,
+                headers=_headers(body, secret=REPO_SECRET),
+            )
+
+        assert response.status_code == 200
+        assert handler.events[0].repo == "Org/Repo"
     finally:
         await conn.close()
 
