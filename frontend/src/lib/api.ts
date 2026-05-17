@@ -14,6 +14,8 @@ export type CanonicalStatus = {
   stuck_for: number | null;
 };
 
+export type IssueScope = "active" | "recent" | "all";
+
 export interface IssueSummary {
   id: string;
   identifier: string;
@@ -98,9 +100,21 @@ async function fetchJson<T>(
   return (await response.json()) as T;
 }
 
-export function fetchIssues(): Promise<IssueSummary[]> {
+export function fetchIssues({
+  q,
+  scope = "active",
+}: {
+  q?: string;
+  scope?: IssueScope;
+} = {}): Promise<IssueSummary[]> {
+  const params = new URLSearchParams({ scope });
+  const normalizedQ = q?.trim();
+  if (normalizedQ) {
+    params.set("q", normalizedQ);
+  }
+
   return fetchJson<IssueSummary[]>(
-    "/api/issues",
+    `/api/issues?${params.toString()}`,
     "Issue list not found",
     "Failed to load issues",
   );
