@@ -918,6 +918,7 @@ class Orchestrator:
             clock=clock,
         )
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._reconcile_event_tasks: set[asyncio.Task[None]] = set()
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -991,7 +992,47 @@ class Orchestrator:
                     await self._reconcile_task
                 except asyncio.CancelledError:
                     pass
+            await self.drain_reconcile_event_tasks(cancel=True)
             await self.drain_dispatch_tasks(cancel=True)
+
+    def _schedule_reconcile_task(
+        self, awaitable: Awaitable[int], *, source: str
+    ) -> asyncio.Task[None]:
+        task = asyncio.create_task(
+            self._run_reconcile_task(awaitable, source=source)
+        )
+        self._reconcile_event_tasks.add(task)
+        task.add_done_callback(self._reconcile_event_task_done)
+        return task
+
+    async def _run_reconcile_task(
+        self, awaitable: Awaitable[int], *, source: str
+    ) -> None:
+        try:
+            observed = await awaitable
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("external reconcile task failed source=%s", source)
+            return
+        log.info(
+            "external reconcile task complete source=%s observations=%d",
+            source,
+            observed,
+        )
+
+    def _reconcile_event_task_done(self, task: asyncio.Task[None]) -> None:
+        self._reconcile_event_tasks.discard(task)
+
+    async def drain_reconcile_event_tasks(self, *, cancel: bool = False) -> None:
+        if cancel:
+            for task in tuple(self._reconcile_event_tasks):
+                task.cancel()
+        while self._reconcile_event_tasks:
+            await asyncio.gather(
+                *tuple(self._reconcile_event_tasks),
+                return_exceptions=True,
+            )
 
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
@@ -1049,11 +1090,14 @@ class Orchestrator:
             event.pr_number,
             event.delivery_id,
         )
-        observed = await self._reconciler.reconcile_github_event(event)
+        self._schedule_reconcile_task(
+            self._reconciler.reconcile_github_event(event),
+            source=f"github.{event.event_type}.{event.action or 'unknown'}",
+        )
         return WebhookDispatchResult(
             kind=f"github.{event.event_type}",
             handled=True,
-            detail=f"observations={observed}",
+            detail="reconcile scheduled",
         )
 
     async def _handle_webhook_comment(
@@ -1103,9 +1147,12 @@ class Orchestrator:
                 kind="issue", handled=False, detail="missing issue id"
             )
         if _linear_issue_state_changed(payload):
-            await self._reconciler.reconcile_linear_issue_event(
-                issue_id=issue_id,
-                action=action or "update",
+            self._schedule_reconcile_task(
+                self._reconciler.reconcile_linear_issue_event(
+                    issue_id=issue_id,
+                    action=action or "update",
+                ),
+                source=f"linear.issue.{action or 'update'}",
             )
         issue = await self.linear.lookup_issue(issue_id)
         binding = self._ready_binding_for_issue(issue)

@@ -512,21 +512,39 @@ async def test_webhook_issue_state_change_triggers_reconcile_hook(
         task = asyncio.create_task(done())
         orch._schedule_dispatch = MagicMock(return_value=task)  # type: ignore[method-assign]  # noqa: SLF001
         spy = MagicMock()
-        spy.reconcile_linear_issue_event = AsyncMock(return_value=2)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_reconcile(*, issue_id: str, action: str) -> int:
+            started.set()
+            await release.wait()
+            return 2
+
+        spy.reconcile_linear_issue_event = AsyncMock(side_effect=slow_reconcile)
         orch._reconciler = spy  # noqa: SLF001
 
-        result = await orch.handle_linear_webhook(
-            {
-                "type": "Issue",
-                "action": "update",
-                "webhookTimestamp": int(NOW.timestamp() * 1000),
-                "updatedFrom": {"stateId": "old-state"},
-                "data": {"id": "iss-1", "state": {"id": "state-todo"}},
-            }
-        )
+        try:
+            result = await asyncio.wait_for(
+                orch.handle_linear_webhook(
+                    {
+                        "type": "Issue",
+                        "action": "update",
+                        "webhookTimestamp": int(NOW.timestamp() * 1000),
+                        "updatedFrom": {"stateId": "old-state"},
+                        "data": {"id": "iss-1", "state": {"id": "state-todo"}},
+                    }
+                ),
+                timeout=1,
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert result.handled is True
+            release.set()
+            await orch.drain_reconcile_event_tasks()
+        finally:
+            release.set()
+            await orch.drain_reconcile_event_tasks(cancel=True)
         await task
 
-        assert result.handled is True
         spy.reconcile_linear_issue_event.assert_awaited_once_with(
             issue_id="iss-1",
             action="update",

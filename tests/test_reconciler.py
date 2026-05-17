@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -589,7 +590,15 @@ async def test_orchestrator_github_webhook_calls_reconciler(tmp_path: Path) -> N
             push_fn=AsyncMock(),
         )
         spy = MagicMock()
-        spy.reconcile_github_event = AsyncMock(return_value=2)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_reconcile(event: GitHubWebhookEvent) -> int:
+            started.set()
+            await release.wait()
+            return 2
+
+        spy.reconcile_github_event = AsyncMock(side_effect=slow_reconcile)
         orch._reconciler = spy  # noqa: SLF001
         event = GitHubWebhookEvent(
             event_type="pull_request",
@@ -599,10 +608,17 @@ async def test_orchestrator_github_webhook_calls_reconciler(tmp_path: Path) -> N
             pr_number=42,
         )
 
-        result = await orch.handle_github_webhook(event)
+        try:
+            result = await asyncio.wait_for(orch.handle_github_webhook(event), timeout=1)
+            await asyncio.wait_for(started.wait(), timeout=1)
+            assert result.handled is True
+            assert result.detail == "reconcile scheduled"
+            release.set()
+            await orch.drain_reconcile_event_tasks()
+        finally:
+            release.set()
+            await orch.drain_reconcile_event_tasks(cancel=True)
     finally:
         await conn.close()
 
-    assert result.handled is True
-    assert result.detail == "observations=2"
     spy.reconcile_github_event.assert_awaited_once_with(event)
