@@ -296,6 +296,7 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     queryKey: ["issue-timeline", issueId],
     queryFn: () => fetchIssueTimeline(issueId),
     enabled: issueId.length > 0,
+    refetchInterval: 5000,
     refetchOnWindowFocus: true,
     staleTime: 0,
   });
