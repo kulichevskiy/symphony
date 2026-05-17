@@ -47,7 +47,7 @@ class _FakeGitHub:
         return response
 
 
-def _config() -> Config:
+def _config(*, done_state: str = "Done") -> Config:
     return Config(
         linear_api_key="x",
         repos=[
@@ -55,7 +55,7 @@ def _config() -> Config:
                 linear_team_key="ENG",
                 github_repo="org/repo",
                 issue_label="symphony",
-                linear_states=LinearStates(ready="Todo"),
+                linear_states=LinearStates(ready="Todo", done=done_state),
             )
         ],
     )
@@ -193,6 +193,52 @@ async def test_compute_drift_ignores_matching_external_state(tmp_path: Path) -> 
     )
 
     assert flags == []
+
+
+@pytest.mark.asyncio
+async def test_compute_drift_uses_configured_linear_done_state(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _seed_external_issue(conn)
+        sqlite_view = await sqlite_external_view(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert sqlite_view is not None
+    hard_coded_done = compute_drift(
+        sqlite_view,
+        {"linear": _linear_payload(state="Done")},
+        linear_done_state="Completed",
+    )
+    configured_done = compute_drift(
+        sqlite_view,
+        {"linear": _linear_payload(state="Completed")},
+        linear_done_state="Completed",
+    )
+
+    assert [flag.field for flag in hard_coded_done] == []
+    assert [flag.field for flag in configured_done] == ["linear.state"]
+
+
+@pytest.mark.asyncio
+async def test_external_snapshot_uses_binding_done_state(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    linear = _FakeLinear(_linear_payload(state="Completed"))
+    github = _FakeGitHub(_github_payload(state="OPEN", merged_at=None, failing=0))
+    service = ExternalSnapshotService(
+        _config(done_state="Completed"),
+        linear,
+        github,
+        clock=lambda: NOW,
+    )
+    try:
+        await _seed_external_issue(conn)
+        snapshot = await service.get_issue_external(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert snapshot is not None
+    assert [flag["field"] for flag in snapshot["drift_flags"]] == ["linear.state"]
 
 
 @pytest.mark.asyncio

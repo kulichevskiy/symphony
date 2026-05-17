@@ -300,7 +300,12 @@ def _matching_pr_row(sqlite_view: JsonDict, github: JsonDict) -> JsonDict | None
     return None
 
 
-def compute_drift(sqlite_view: JsonDict, snapshot: JsonDict) -> list[DriftFlag]:
+def compute_drift(
+    sqlite_view: JsonDict,
+    snapshot: JsonDict,
+    *,
+    linear_done_state: str = "Done",
+) -> list[DriftFlag]:
     flags: list[DriftFlag] = []
     linear = snapshot.get(SOURCE_LINEAR)
     github = snapshot.get(SOURCE_GITHUB)
@@ -308,7 +313,7 @@ def compute_drift(sqlite_view: JsonDict, snapshot: JsonDict) -> list[DriftFlag]:
     if isinstance(linear, dict) and not linear.get("error"):
         linear_state = _as_str(linear.get("state"))
         operator_waits = sqlite_view["operator_waits"]
-        if linear_state == "Done" and operator_waits:
+        if linear_state == linear_done_state and operator_waits:
             flags.append(
                 DriftFlag(
                     field="linear.state",
@@ -399,6 +404,7 @@ class ExternalSnapshotService:
         if sqlite_view is None:
             return None
 
+        binding = _resolve_binding(self._config, sqlite_view)
         fetched_at = _iso(now)
         linear = await self._pull_linear(issue_id, fetched_at=fetched_at, now=now)
         github = await self._pull_github(sqlite_view, fetched_at=fetched_at, now=now)
@@ -408,7 +414,14 @@ class ExternalSnapshotService:
             SOURCE_GITHUB: github,
         }
         payload["drift_flags"] = [
-            flag.to_dict() for flag in compute_drift(sqlite_view, payload)
+            flag.to_dict()
+            for flag in compute_drift(
+                sqlite_view,
+                payload,
+                linear_done_state=(
+                    binding.linear_states.done if binding is not None else "Done"
+                ),
+            )
         ]
         self.cache.remember_payload(issue_id, fetched_at=now, payload=payload)
         return payload
