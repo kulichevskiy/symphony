@@ -12,12 +12,8 @@ import {
 } from "@/components/ui/table";
 import { fetchIssues } from "@/lib/api";
 
-const LINEAR_WORKSPACE_SLUG = "adjust";
-
 function linearIssueUrl(identifier: string): string {
-  return `https://linear.app/${LINEAR_WORKSPACE_SLUG}/issue/${encodeURIComponent(
-    identifier,
-  )}`;
+  return `https://linear.app/issue/${encodeURIComponent(identifier)}`;
 }
 
 export function HomePage() {
