@@ -218,6 +218,45 @@ async def test_canonical_status_detects_open_pr_and_pr_threshold(
 
 
 @pytest.mark.asyncio
+async def test_canonical_status_prefers_open_pr_over_stale_review_state(
+    tmp_path: Path,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "pr-review")
+        await conn.execute(
+            """
+            INSERT INTO review_state (issue_id, iteration)
+            VALUES ('pr-review', 2)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES (
+                'pr-review', 'org/repo', 'ENG|org/repo', 42,
+                'https://github.com/org/repo/pull/42', '2026-05-16T11:00:00Z',
+                NULL
+            )
+            """
+        )
+        await conn.commit()
+
+        status = await compute_canonical_status(conn, "pr-review", now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.to_dict() == {
+        "state": "pr_open",
+        "since": "2026-05-16T11:00:00Z",
+        "subtitle": "#42",
+        "stuck_for": 90000,
+    }
+
+
+@pytest.mark.asyncio
 async def test_canonical_status_marks_issue_done_when_all_prs_are_merged(
     tmp_path: Path,
 ) -> None:
@@ -238,6 +277,45 @@ async def test_canonical_status_marks_issue_done_when_all_prs_are_merged(
         await conn.commit()
 
         status = await compute_canonical_status(conn, "done", now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.to_dict() == {
+        "state": "done",
+        "since": "2026-05-17T10:00:00Z",
+        "subtitle": None,
+        "stuck_for": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_prefers_done_over_stale_review_state(
+    tmp_path: Path,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "done-review")
+        await conn.execute(
+            """
+            INSERT INTO review_state (issue_id, iteration)
+            VALUES ('done-review', 2)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES (
+                'done-review', 'org/repo', 'ENG|org/repo', 43,
+                'https://github.com/org/repo/pull/43', '2026-05-16T11:00:00Z',
+                '2026-05-17T10:00:00Z'
+            )
+            """
+        )
+        await conn.commit()
+
+        status = await compute_canonical_status(conn, "done-review", now=NOW)
     finally:
         await conn.close()
 

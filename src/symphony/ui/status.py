@@ -209,40 +209,6 @@ async def compute_canonical_status(
             thresholds=thresholds,
         )
 
-    review_state = await _fetch_one(
-        conn,
-        """
-        SELECT iteration
-        FROM review_state
-        WHERE issue_id = ? AND iteration > 0
-        """,
-        (issue_id,),
-    )
-    if review_state is not None:
-        latest_comment = await _fetch_one(
-            conn,
-            """
-            SELECT seen_at
-            FROM comment_events
-            WHERE issue_id = ?
-            ORDER BY seen_at DESC, comment_id DESC
-            LIMIT 1
-            """,
-            (issue_id,),
-        )
-        since = None
-        if latest_comment is not None:
-            since = _as_str(latest_comment["seen_at"])
-        if since is None and latest_run is not None:
-            since = _as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"])
-        return _status(
-            CanonicalState.AWAITING_REVIEW_TRIGGER,
-            since=since,
-            subtitle=f"iteration={int(review_state['iteration'])}",
-            now=effective_now,
-            thresholds=thresholds,
-        )
-
     open_pr = await _fetch_one(
         conn,
         """
@@ -279,6 +245,40 @@ async def compute_canonical_status(
             CanonicalState.DONE,
             since=_as_str(latest_pr["merged_at"]),
             subtitle=None,
+            now=effective_now,
+            thresholds=thresholds,
+        )
+
+    review_state = await _fetch_one(
+        conn,
+        """
+        SELECT iteration
+        FROM review_state
+        WHERE issue_id = ? AND iteration > 0
+        """,
+        (issue_id,),
+    )
+    if review_state is not None:
+        latest_comment = await _fetch_one(
+            conn,
+            """
+            SELECT seen_at
+            FROM comment_events
+            WHERE issue_id = ?
+            ORDER BY seen_at DESC, comment_id DESC
+            LIMIT 1
+            """,
+            (issue_id,),
+        )
+        since = None
+        if latest_comment is not None:
+            since = _as_str(latest_comment["seen_at"])
+        if since is None and latest_run is not None:
+            since = _as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"])
+        return _status(
+            CanonicalState.AWAITING_REVIEW_TRIGGER,
+            since=since,
+            subtitle=f"iteration={int(review_state['iteration'])}",
             now=effective_now,
             thresholds=thresholds,
         )
