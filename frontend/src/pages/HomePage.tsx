@@ -150,6 +150,7 @@ export function HomePage() {
   const issuesQuery = useQuery({
     queryKey: ["issues", { q, scope }],
     queryFn: () => fetchIssues({ q, scope }),
+    refetchInterval: 10_000,
     refetchOnWindowFocus: true,
     staleTime: 0,
     placeholderData: (previousData) => previousData,
