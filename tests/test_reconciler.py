@@ -480,6 +480,43 @@ async def test_github_webhook_event_reconciles_linked_issue(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_github_issue_comment_event_does_not_reconcile(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    fake_linear = _FakeLinear()
+    fake_gh = _FakeGitHub()
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake_linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+        event = GitHubWebhookEvent(
+            event_type="issue_comment",
+            action="created",
+            repo="ORG/REPO",
+            delivery_id="delivery-1",
+            pr_number=42,
+            comment_id=123,
+            comment_body="@codex review",
+        )
+
+        assert await reconciler.reconcile_github_event(event) == 0
+        cur = await conn.execute("SELECT COUNT(*) AS count FROM external_observations")
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert fake_linear.calls == 0
+    assert fake_gh.calls == []
+    assert row is not None
+    assert row["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_github_5xx_enters_backoff_without_partial_rows(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     fake_gh = _FakeGitHub(error=GitHubError("gh api exited 1: HTTP 503"))

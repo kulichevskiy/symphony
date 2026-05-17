@@ -261,6 +261,10 @@ class Reconciler:
         return 2
 
     async def reconcile_github_event(self, event: GitHubWebhookEvent) -> int:
+        if event.event_type != "pull_request":
+            return 0
+        if event.action not in {"closed", "merged", "reopened"}:
+            return 0
         if event.pr_number is None:
             return 0
         cur = await self._conn.execute(
