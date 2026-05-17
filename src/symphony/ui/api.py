@@ -31,7 +31,15 @@ def create_api_router(ui_db_pool: ReadOnlyDbPool | None = None) -> APIRouter:
                 """
                 SELECT id, identifier, title, team_key
                 FROM issues
-                ORDER BY identifier ASC
+                ORDER BY
+                    team_key ASC,
+                    CASE
+                        WHEN instr(identifier, '-') > 0
+                             AND substr(identifier, instr(identifier, '-') + 1) GLOB '[0-9]*'
+                        THEN CAST(substr(identifier, instr(identifier, '-') + 1) AS INTEGER)
+                        ELSE NULL
+                    END ASC,
+                    identifier ASC
                 """
             )
             rows = await cur.fetchall()

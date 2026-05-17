@@ -165,6 +165,20 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             title="Earlier issue",
             team_key="ADJ",
         )
+        await db.issues.upsert(
+            conn,
+            id="issue-ten",
+            identifier="ADJ-10",
+            title="Later issue",
+            team_key="ADJ",
+        )
+        await db.issues.upsert(
+            conn,
+            id="issue-web",
+            identifier="WEB-1",
+            title="Other team issue",
+            team_key="WEB",
+        )
         app = create_app(
             _Handler(),
             conn,
@@ -194,6 +208,18 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-2",
             "title": "Known tracked issue",
             "team_key": "ADJ",
+        },
+        {
+            "id": "issue-ten",
+            "identifier": "ADJ-10",
+            "title": "Later issue",
+            "team_key": "ADJ",
+        },
+        {
+            "id": "issue-web",
+            "identifier": "WEB-1",
+            "title": "Other team issue",
+            "team_key": "WEB",
         },
     ]
 
