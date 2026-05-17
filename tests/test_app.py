@@ -156,6 +156,26 @@ async def _seed_issue_timeline(conn: aiosqlite.Connection) -> None:
         VALUES ('iss-timeline', '2026-05-17T10:04:00Z')
         """
     )
+    await conn.execute(
+        """
+        INSERT INTO state_transitions (
+            issue_id, table_name, field, old_value, new_value, ts
+        )
+        VALUES
+            (
+                'iss-timeline', 'review_state', 'iteration', '1', '2',
+                '2026-05-17T10:03:30Z'
+            ),
+            (
+                'iss-timeline', 'operator_waits', 'kind', NULL, 'review_stopped',
+                '2026-05-17T10:04:30Z'
+            ),
+            (
+                'iss-timeline', 'operator_waits', 'kind', 'review_stopped', NULL,
+                '2026-05-17T10:05:30Z'
+            )
+        """
+    )
     await conn.commit()
 
 
@@ -396,9 +416,19 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
             "payload": {"run_id": "run-timeline", "fingerprint": "fp-timeline"},
         },
         {
+            "ts": "2026-05-17T10:03:30Z",
+            "kind": "review_state_changed",
+            "payload": {"field": "iteration", "old": "1", "new": "2"},
+        },
+        {
             "ts": "2026-05-17T10:04:00Z",
             "kind": "cost_warning_posted",
             "payload": {},
+        },
+        {
+            "ts": "2026-05-17T10:04:30Z",
+            "kind": "operator_wait_started",
+            "payload": {"kind": "review_stopped"},
         },
         {
             "ts": "2026-05-17T10:05:00Z",
@@ -409,6 +439,11 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
                 "status": "completed",
                 "cost_usd": 2.5,
             },
+        },
+        {
+            "ts": "2026-05-17T10:05:30Z",
+            "kind": "operator_wait_ended",
+            "payload": {"kind": "review_stopped"},
         },
         {
             "ts": "2026-05-17T10:06:00Z",

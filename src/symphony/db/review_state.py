@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import aiosqlite
 
+from . import state_transitions
+
 
 @dataclass(frozen=True)
 class ReviewState:
@@ -29,7 +31,18 @@ class ReviewState:
     codex_lgtm_comment_id: str
 
 
-async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
+_TRACKED_FIELDS = (
+    "iteration",
+    "last_trigger_signature",
+    "ci_fetch_failures",
+    "pr_number",
+    "codex_lgtm_comment_id",
+)
+
+
+async def _get_existing(
+    conn: aiosqlite.Connection, issue_id: str
+) -> ReviewState | None:
     cur = await conn.execute(
         """
         SELECT
@@ -48,16 +61,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
     )
     row = await cur.fetchone()
     if row is None:
-        return ReviewState(
-            iteration=0,
-            last_trigger_signature="",
-            ci_fetch_failures=0,
-            pr_number=None,
-            pr_url="",
-            github_repo="",
-            issue_label="",
-            codex_lgtm_comment_id="",
-        )
+        return None
     return ReviewState(
         iteration=int(row["iteration"]),
         last_trigger_signature=str(row["last_trigger_signature"]),
@@ -67,6 +71,43 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"]),
         codex_lgtm_comment_id=str(row["codex_lgtm_comment_id"]),
+    )
+
+
+async def _record_transitions(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    old: ReviewState | None,
+    new: ReviewState,
+) -> None:
+    if old is None:
+        await state_transitions.record_transition(
+            conn, issue_id, "review_state", "__row__", None, "created"
+        )
+        return
+
+    for field in _TRACKED_FIELDS:
+        old_value = getattr(old, field)
+        new_value = getattr(new, field)
+        if old_value != new_value:
+            await state_transitions.record_transition(
+                conn, issue_id, "review_state", field, old_value, new_value
+            )
+
+
+async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
+    existing = await _get_existing(conn, issue_id)
+    if existing is not None:
+        return existing
+    return ReviewState(
+        iteration=0,
+        last_trigger_signature="",
+        ci_fetch_failures=0,
+        pr_number=None,
+        pr_url="",
+        github_repo="",
+        issue_label="",
+        codex_lgtm_comment_id="",
     )
 
 
@@ -80,6 +121,7 @@ async def begin_review(
     issue_label: str | None,
 ) -> None:
     """Initialize durable state for a fresh Review stage."""
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -100,11 +142,15 @@ async def begin_review(
         """,
         (issue_id, pr_number, pr_url, github_repo, issue_label or ""),
     )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
     await conn.commit()
 
 
 async def bump_iteration(conn: aiosqlite.Connection, issue_id: str) -> int:
     """Increment the counter atomically and return the new value."""
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -115,19 +161,23 @@ async def bump_iteration(conn: aiosqlite.Connection, issue_id: str) -> int:
         """,
         (issue_id,),
     )
-    await conn.commit()
     cur = await conn.execute(
         "SELECT iteration FROM review_state WHERE issue_id = ?",
         (issue_id,),
     )
     row = await cur.fetchone()
     assert row is not None
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
+    await conn.commit()
     return int(row["iteration"])
 
 
 async def set_signature(
     conn: aiosqlite.Connection, issue_id: str, signature: str
 ) -> None:
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -138,11 +188,15 @@ async def set_signature(
         """,
         (issue_id, signature),
     )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
     await conn.commit()
 
 
 async def bump_ci_fetch_failures(conn: aiosqlite.Connection, issue_id: str) -> int:
     """Increment consecutive `gh pr checks` fetch failures and return the count."""
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -154,19 +208,23 @@ async def bump_ci_fetch_failures(conn: aiosqlite.Connection, issue_id: str) -> i
         """,
         (issue_id,),
     )
-    await conn.commit()
     cur = await conn.execute(
         "SELECT ci_fetch_failures FROM review_state WHERE issue_id = ?",
         (issue_id,),
     )
     row = await cur.fetchone()
     assert row is not None
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
+    await conn.commit()
     return int(row["ci_fetch_failures"])
 
 
 async def reset_ci_fetch_failures(
     conn: aiosqlite.Connection, issue_id: str
 ) -> None:
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -177,6 +235,9 @@ async def reset_ci_fetch_failures(
         """,
         (issue_id,),
     )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
     await conn.commit()
 
 
@@ -185,6 +246,7 @@ async def set_codex_lgtm_comment_id(
 ) -> None:
     """Record the GitHub comment ID of the Codex 'no issues' comment so we
     don't re-post the Linear notification on subsequent polls."""
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -197,12 +259,16 @@ async def set_codex_lgtm_comment_id(
         """,
         (issue_id, comment_id),
     )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
     await conn.commit()
 
 
 async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
     """Clear iteration and signature — used when leaving Review (e.g.
     Merge starts, or `$retry` re-enters the stage)."""
+    old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO review_state (
@@ -223,6 +289,9 @@ async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
         """,
         (issue_id,),
     )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
     await conn.commit()
 
 

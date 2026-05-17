@@ -35,6 +35,7 @@ async def test_connect_creates_tables_and_persists(tmp_path: Path) -> None:
         "activity_comment_marks",
         "activity_command_marks",
         "operator_waits",
+        "state_transitions",
     ):
         assert table in names, f"expected {table} in {names}"
 
@@ -577,9 +578,21 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
         assert got.kind == db.operator_waits.KIND_COST_CAP
         assert got.issue_label == "ready"
         assert await db.operator_waits.list_all(conn) == [got]
+        transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
+        assert [(t.field, t.old_value, t.new_value) for t in transitions] == [
+            ("__row__", None, "created"),
+            ("kind", None, db.operator_waits.KIND_COST_CAP),
+        ]
 
         await db.operator_waits.delete(conn, "iss-1", "run-1")
         assert await db.operator_waits.get(conn, "iss-1") is None
+        transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
+        assert [(t.field, t.old_value, t.new_value) for t in transitions] == [
+            ("__row__", None, "created"),
+            ("kind", None, db.operator_waits.KIND_COST_CAP),
+            ("__row__", "removed", None),
+            ("kind", db.operator_waits.KIND_COST_CAP, None),
+        ]
     finally:
         await conn.close()
 

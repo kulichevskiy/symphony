@@ -70,6 +70,14 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
         }
     elif kind == "cost_warning_posted":
         payload = {}
+    elif kind == "review_state_changed":
+        payload = {
+            "field": row["field"],
+            "old": row["old_value"],
+            "new": row["new_value"],
+        }
+    elif kind in {"operator_wait_started", "operator_wait_ended"}:
+        payload = {"kind": row["wait_kind"]}
     else:
         raise ValueError(f"unknown timeline kind: {kind}")
 
@@ -198,7 +206,9 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT started_at AS ts, 'run_started' AS kind,
                        id AS run_id, stage, pid, NULL AS status, NULL AS cost_usd,
                        NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
-                       NULL AS comment_id, NULL AS fingerprint
+                       NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM runs
                 WHERE issue_id = ?
 
@@ -207,7 +217,9 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT ended_at AS ts, 'run_ended' AS kind,
                        id AS run_id, stage, NULL AS pid, status, cost_usd,
                        NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
-                       NULL AS comment_id, NULL AS fingerprint
+                       NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM runs
                 WHERE issue_id = ? AND ended_at IS NOT NULL
 
@@ -216,7 +228,9 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT created_at AS ts, 'pr_opened' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, github_repo, pr_number, pr_url,
-                       NULL AS comment_id, NULL AS fingerprint
+                       NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM issue_prs
                 WHERE issue_id = ?
 
@@ -225,7 +239,9 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT merged_at AS ts, 'pr_merged' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, github_repo, pr_number, NULL AS pr_url,
-                       NULL AS comment_id, NULL AS fingerprint
+                       NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM issue_prs
                 WHERE issue_id = ? AND merged_at IS NOT NULL
 
@@ -234,7 +250,9 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT seen_at AS ts, 'comment_seen' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, comment_id, NULL AS fingerprint
+                       NULL AS pr_url, comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM comment_events
                 WHERE issue_id = ?
 
@@ -243,7 +261,9 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT m.last_posted_at AS ts, 'activity_comment_posted' AS kind,
                        m.run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, m.last_fingerprint AS fingerprint
+                       NULL AS pr_url, NULL AS comment_id, m.last_fingerprint AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM activity_comment_marks m
                 JOIN runs r ON r.id = m.run_id
                 WHERE r.issue_id = ? AND m.last_posted_at IS NOT NULL
@@ -253,13 +273,52 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
                 SELECT warning_posted_at AS ts, 'cost_warning_posted' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint
+                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind
                 FROM issue_cost_marks
                 WHERE issue_id = ? AND warning_posted_at IS NOT NULL
+
+                UNION ALL
+
+                SELECT ts, 'review_state_changed' AS kind,
+                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+                       field, old_value, new_value, NULL AS wait_kind
+                FROM state_transitions
+                WHERE issue_id = ? AND table_name = 'review_state'
+
+                UNION ALL
+
+                SELECT ts,
+                       CASE
+                           WHEN new_value IS NULL THEN 'operator_wait_ended'
+                           ELSE 'operator_wait_started'
+                       END AS kind,
+                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       COALESCE(new_value, old_value) AS wait_kind
+                FROM state_transitions
+                WHERE issue_id = ?
+                  AND table_name = 'operator_waits'
+                  AND field = 'kind'
             )
             ORDER BY ts ASC, kind ASC
             """,
-            (issue_id, issue_id, issue_id, issue_id, issue_id, issue_id, issue_id),
+            (
+                issue_id,
+                issue_id,
+                issue_id,
+                issue_id,
+                issue_id,
+                issue_id,
+                issue_id,
+                issue_id,
+                issue_id,
+            ),
         )
         return [_timeline_event(row) for row in rows]
 

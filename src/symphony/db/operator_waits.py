@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import aiosqlite
 
+from . import state_transitions
+
 KIND_COST_CAP = "cost_cap"
 KIND_IMPLEMENT_FAILED = "implement_failed"
 KIND_REVIEW_FAILED = "review_failed"
@@ -40,6 +42,7 @@ async def upsert(
     issue_label: str,
     created_at: str,
 ) -> None:
+    old = await get(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO operator_waits (
@@ -70,6 +73,17 @@ async def upsert(
             created_at,
         ),
     )
+    if old is None:
+        await state_transitions.record_transition(
+            conn, issue_id, "operator_waits", "__row__", None, "created"
+        )
+        await state_transitions.record_transition(
+            conn, issue_id, "operator_waits", "kind", None, kind
+        )
+    elif old.kind != kind:
+        await state_transitions.record_transition(
+            conn, issue_id, "operator_waits", "kind", old.kind, kind
+        )
     await conn.commit()
 
 
@@ -136,12 +150,22 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
 async def delete(
     conn: aiosqlite.Connection, issue_id: str, run_id: str | None = None
 ) -> None:
+    old = await get(conn, issue_id)
     if run_id is None:
-        await conn.execute("DELETE FROM operator_waits WHERE issue_id = ?", (issue_id,))
+        cur = await conn.execute(
+            "DELETE FROM operator_waits WHERE issue_id = ?", (issue_id,)
+        )
     else:
-        await conn.execute(
+        cur = await conn.execute(
             "DELETE FROM operator_waits WHERE issue_id = ? AND run_id = ?",
             (issue_id, run_id),
+        )
+    if old is not None and (cur.rowcount or 0) > 0:
+        await state_transitions.record_transition(
+            conn, issue_id, "operator_waits", "__row__", "removed", None
+        )
+        await state_transitions.record_transition(
+            conn, issue_id, "operator_waits", "kind", old.kind, None
         )
     await conn.commit()
 
