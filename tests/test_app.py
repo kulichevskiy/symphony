@@ -513,7 +513,8 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
             ("run-ended", "ENG-2", "Completed run"),
             ("comment-activity", "ENG-3", "Comment and activity mark"),
             ("merged-pr", "ENG-4", "Merged PR"),
-            ("idle", "ENG-5", "No activity"),
+            ("operator-wait", "ENG-5", "Operator wait"),
+            ("idle", "ENG-6", "No activity"),
         ]:
             await db.issues.upsert(
                 conn,
@@ -531,7 +532,9 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
                 ('run-ended-1', 'run-ended', 'implement', 'completed', NULL,
                  '2026-05-17T11:00:00Z', '2026-05-17T11:20:00Z', 0),
                 ('run-activity-1', 'comment-activity', 'review', 'completed', NULL,
-                 '2026-05-17T11:10:00Z', '2026-05-17T11:15:00Z', 0)
+                 '2026-05-17T11:10:00Z', '2026-05-17T11:15:00Z', 0),
+                ('run-wait-1', 'operator-wait', 'review', 'completed', NULL,
+                 '2026-05-17T11:00:00Z', '2026-05-17T11:05:00Z', 0)
             """
         )
         await conn.execute(
@@ -578,6 +581,17 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
             )
             """
         )
+        await conn.execute(
+            """
+            INSERT INTO operator_waits (
+                issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
+            )
+            VALUES (
+                'operator-wait', 'run-wait-1', 'review_stopped', 'ENG', 'org/repo',
+                'symphony', '2026-05-17T11:52:00Z'
+            )
+            """
+        )
         await conn.commit()
         app = create_app(
             _Handler(),
@@ -606,6 +620,8 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
     assert rows["comment-activity"]["latest_activity_age_secs"] == 900
     assert rows["merged-pr"]["latest_activity_ts"] == "2026-05-17T11:55:00Z"
     assert rows["merged-pr"]["latest_activity_age_secs"] == 300
+    assert rows["operator-wait"]["latest_activity_ts"] == "2026-05-17T11:52:00Z"
+    assert rows["operator-wait"]["latest_activity_age_secs"] == 480
     assert rows["idle"]["latest_activity_ts"] is None
     assert rows["idle"]["latest_activity_age_secs"] is None
 

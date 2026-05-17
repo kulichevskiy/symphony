@@ -102,6 +102,8 @@ latest_activity_sources(issue_id, ts) AS (
     WHERE m.last_event_at IS NOT NULL
     UNION ALL
     SELECT issue_id, COALESCE(merged_at, created_at) FROM issue_prs
+    UNION ALL
+    SELECT issue_id, created_at FROM operator_waits
 ),
 latest_activity(issue_id, latest_activity_ts) AS (
     SELECT issue_id, MAX(ts)
