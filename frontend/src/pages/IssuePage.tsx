@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
+import { StatusCluster, StatusSinceLine } from "@/components/CanonicalStatus";
 import { IssueTimeline } from "@/components/IssueTimeline";
 import {
   Table,
@@ -11,81 +12,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { fetchIssueDetail } from "@/lib/api";
 
 type CellValue = string | number | null;
-
-type IssueDetail = {
-  issue: {
-    id: string;
-    identifier: string;
-    title: string;
-    team_key: string;
-  };
-  runs: Array<{
-    id: string;
-    stage: string;
-    status: string;
-    pid: number | null;
-    started_at: string;
-    ended_at: string | null;
-    cost_usd: number;
-  }>;
-  issue_prs: Array<{
-    github_repo: string;
-    binding_key: string;
-    pr_number: number;
-    pr_url: string;
-    created_at: string;
-    merged_at: string | null;
-  }>;
-  operator_waits: Array<{
-    run_id: string;
-    kind: string;
-    linear_team_key: string;
-    github_repo: string;
-    issue_label: string;
-    created_at: string;
-  }>;
-  review_state: {
-    iteration: number;
-    last_trigger_signature: string;
-    ci_fetch_failures: number;
-    pr_number: number | null;
-    pr_url: string;
-    github_repo: string;
-    issue_label: string;
-    codex_lgtm_comment_id: string;
-  } | null;
-  comment_events: Array<{
-    comment_id: string;
-    seen_at: string;
-  }>;
-  activity_comment_marks: Array<{
-    run_id: string;
-    first_unpublished_at: string | null;
-    last_event_at: string | null;
-    event_count_since_post: number;
-    last_posted_at: string | null;
-    last_fingerprint: string;
-  }>;
-  issue_cost_marks: {
-    warning_posted_at: string | null;
-  } | null;
-};
 
 type Column<T extends object> = {
   key: Extract<keyof T, string>;
   label: string;
   render?: (row: T) => ReactNode;
 };
-
-async function fetchIssueDetail(id: string): Promise<IssueDetail> {
-  const response = await fetch(`/api/issues/${encodeURIComponent(id)}`);
-  if (!response.ok) {
-    throw new Error(response.status === 404 ? "Issue not found" : "Failed to load issue");
-  }
-  return (await response.json()) as IssueDetail;
-}
 
 function formatCell(value: CellValue) {
   if (value === null || value === "") {
@@ -150,11 +85,22 @@ export function IssuePage() {
     <main className="min-h-screen bg-background text-foreground">
       <header className="border-b px-6 py-4">
         <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4">
-          <div>
+          <div className="min-w-0">
             <Link to="/" className="text-sm font-medium text-muted-foreground hover:text-foreground">
               Back
             </Link>
-            <h1 className="mt-2 text-2xl font-semibold tracking-normal">Issue {issueId}</h1>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              <h1 className="text-2xl font-semibold tracking-normal">
+                {data?.issue.identifier ?? `Issue ${issueId}`}
+              </h1>
+              {data ? <StatusCluster status={data.canonical_status} /> : null}
+            </div>
+            {data ? (
+              <>
+                <p className="mt-1 text-sm text-muted-foreground">{data.issue.title}</p>
+                <StatusSinceLine status={data.canonical_status} />
+              </>
+            ) : null}
           </div>
           <div className="text-sm text-muted-foreground">{isFetching ? "Refreshing" : "Live"}</div>
         </div>

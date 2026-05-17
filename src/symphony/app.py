@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -17,6 +18,7 @@ from uvicorn import Config as UvicornConfig
 from .ui.api import create_api_router
 from .ui.db import ReadOnlyDbPool
 from .ui.issues import create_issue_detail_router
+from .ui.status import CanonicalState
 from .webhook import (
     LOOPBACK_HOST,
     Clock,
@@ -48,6 +50,7 @@ def create_app(
     ui_enabled: bool = True,
     ui_db_path: Path | None = None,
     ui_dist_dir: Path | None = None,
+    ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     ui_pool = (
@@ -78,9 +81,21 @@ def create_app(
 
     if ui_enabled:
         if ui_pool is not None:
-            app.include_router(create_issue_detail_router(ui_pool))
+            app.include_router(
+                create_issue_detail_router(
+                    ui_pool,
+                    clock=clock,
+                    status_thresholds=ui_status_thresholds,
+                )
+            )
 
-        app.include_router(create_api_router(ui_pool))
+        app.include_router(
+            create_api_router(
+                ui_pool,
+                clock=clock,
+                status_thresholds=ui_status_thresholds,
+            )
+        )
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST
         if dist_dir.exists():
             app.mount(
