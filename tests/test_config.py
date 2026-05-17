@@ -97,6 +97,23 @@ repos: []
     assert thresholds[CanonicalState.PR_OPEN] == timedelta(seconds=3600)
 
 
+def test_ui_status_thresholds_accept_legacy_awaiting_operator_key(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+ui:
+  status_stuck_thresholds:
+    awaiting_operator_secs: 300
+repos: []
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    thresholds = cfg.ui.status_stuck_thresholds.to_timedeltas()
+    assert thresholds[CanonicalState.PAUSED] == timedelta(seconds=300)
+
+
 def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"

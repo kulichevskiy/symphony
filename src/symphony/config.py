@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
@@ -180,7 +180,11 @@ class Secrets(BaseSettings):
 class UIStatusThresholds(BaseModel):
     """Per-state stuck thresholds for canonical UI status."""
 
-    paused_secs: int = Field(default=15 * 60, ge=0)
+    paused_secs: int = Field(
+        default=15 * 60,
+        ge=0,
+        validation_alias=AliasChoices("paused_secs", "awaiting_operator_secs"),
+    )
     awaiting_merge_secs: int = Field(default=4 * 60 * 60, ge=0)
     running_secs: int = Field(default=30 * 60, ge=0)
     awaiting_review_trigger_secs: int = Field(default=10 * 60, ge=0)
