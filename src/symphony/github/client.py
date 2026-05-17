@@ -248,7 +248,7 @@ class GitHub:
         if not isinstance(view, dict):
             raise GitHubError(f"pr view: expected object, got {type(view).__name__}")
 
-        comments = await self.pr_review_comments(pr, repo=repo)
+        comments = await self.pr_review_comments_recent(pr, repo=repo, limit=5)
         comments.sort(
             key=lambda comment: str(
                 comment.get("updated_at") or comment.get("created_at") or ""
@@ -345,6 +345,28 @@ class GitHub:
             ]
         )
         return result
+
+    async def pr_review_comments_recent(
+        self,
+        pr: int | str,
+        *,
+        repo: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_json(
+            [
+                "api",
+                *host_args,
+                f"repos/{owner_repo}/pulls/{pr}/comments"
+                f"?per_page={limit}&sort=updated&direction=desc",
+            ]
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"recent review comments: expected array, got {type(result).__name__}"
+            )
+        return [entry for entry in result if isinstance(entry, dict)]
 
     async def pr_reviews(
         self, pr: int | str, *, repo: str

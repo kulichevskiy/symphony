@@ -85,19 +85,16 @@ async def test_issue_external_snapshot_returns_latest_comments_desc() -> None:
                     "state": {"name": "Done"},
                     "labels": {"nodes": [{"name": "symphony"}]},
                     "comments": {
-                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
-                        "nodes": [comment(0), comment(1), comment(2)],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "ignored"},
+                        "nodes": [
+                            comment(0),
+                            comment(1),
+                            comment(2),
+                            comment(3),
+                            comment(4),
+                            comment(5),
+                        ],
                     },
-                }
-            }
-        if gql == queries.ISSUE_EXTERNAL_COMMENTS_PAGE:
-            assert variables == {"id": "iss-1", "cursor": "cursor-1"}
-            return {
-                "issue": {
-                    "comments": {
-                        "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        "nodes": [comment(3), comment(4), comment(5)],
-                    }
                 }
             }
         raise AssertionError(f"unexpected query: {gql}")
@@ -118,10 +115,12 @@ async def test_issue_external_snapshot_returns_latest_comments_desc() -> None:
         "c2",
         "c1",
     ]
-    assert calls[0] == (
-        queries.ISSUE_EXTERNAL_SNAPSHOT,
-        {"id": "iss-1", "cursor": None},
-    )
+    assert calls == [
+        (
+            queries.ISSUE_EXTERNAL_SNAPSHOT,
+            {"id": "iss-1", "cursor": None},
+        )
+    ]
 
 
 def test_comments_since_uses_linear_filter_timestamp_type() -> None:

@@ -187,23 +187,7 @@ query IssueExternalSnapshot($id: String!, $cursor: String) {
     updatedAt
     state { name }
     labels { nodes { name } }
-    comments(first: 50, after: $cursor, orderBy: createdAt) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        id
-        body
-        createdAt
-        user { name }
-      }
-    }
-  }
-}
-"""
-
-ISSUE_EXTERNAL_COMMENTS_PAGE = """
-query IssueExternalCommentsPage($id: String!, $cursor: String) {
-  issue(id: $id) {
-    comments(first: 50, after: $cursor, orderBy: createdAt) {
+    comments(first: 5, after: $cursor, orderBy: createdAt) {
       pageInfo { hasNextPage endCursor }
       nodes {
         id

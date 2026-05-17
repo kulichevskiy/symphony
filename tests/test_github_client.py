@@ -159,24 +159,22 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
     )
     comments = json.dumps(
         [
-            [
-                {
-                    "id": 1,
-                    "body": "older",
-                    "created_at": "2026-05-17T10:00:00Z",
-                    "updated_at": "2026-05-17T10:00:00Z",
-                    "html_url": "https://github.com/org/r/pull/42#discussion_r1",
-                    "user": {"login": "reviewer-a"},
-                },
-                {
-                    "id": 2,
-                    "body": "newer",
-                    "created_at": "2026-05-17T10:05:00Z",
-                    "updated_at": "2026-05-17T10:06:00Z",
-                    "html_url": "https://github.com/org/r/pull/42#discussion_r2",
-                    "user": {"login": "reviewer-b"},
-                },
-            ]
+            {
+                "id": 1,
+                "body": "older",
+                "created_at": "2026-05-17T10:00:00Z",
+                "updated_at": "2026-05-17T10:00:00Z",
+                "html_url": "https://github.com/org/r/pull/42#discussion_r1",
+                "user": {"login": "reviewer-a"},
+            },
+            {
+                "id": 2,
+                "body": "newer",
+                "created_at": "2026-05-17T10:05:00Z",
+                "updated_at": "2026-05-17T10:06:00Z",
+                "html_url": "https://github.com/org/r/pull/42#discussion_r2",
+                "user": {"login": "reviewer-b"},
+            },
         ]
     )
     log = fake_gh(
@@ -201,6 +199,10 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
     calls = _calls(log)
     assert calls[0]["argv"][:3] == ["pr", "view", "42"]
     assert "statusCheckRollup" in calls[0]["argv"][-1]
+    assert calls[1]["argv"] == [
+        "api",
+        "repos/org/r/pulls/42/comments?per_page=5&sort=updated&direction=desc",
+    ]
 
 
 # ---- pr_checks ------------------------------------------------------

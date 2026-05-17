@@ -200,18 +200,6 @@ class Linear:
         comments: list[dict[str, Any]] = []
         connection = node.get("comments") or {}
         comments.extend(connection.get("nodes") or [])
-        page_info = connection.get("pageInfo") or {}
-        cursor = page_info.get("endCursor")
-        while page_info.get("hasNextPage") and cursor:
-            data = await self._query(
-                queries.ISSUE_EXTERNAL_COMMENTS_PAGE,
-                {"id": identifier_or_uuid, "cursor": cursor},
-            )
-            page_node = data.get("issue") or {}
-            connection = page_node.get("comments") or {}
-            comments.extend(connection.get("nodes") or [])
-            page_info = connection.get("pageInfo") or {}
-            cursor = page_info.get("endCursor")
 
         comments.sort(key=lambda comment: str(comment.get("createdAt") or ""), reverse=True)
         issue_url = str(node.get("url") or "")
