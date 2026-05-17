@@ -23,6 +23,8 @@ export interface IssueSummary {
   identifier: string;
   title: string;
   team_key: string;
+  latest_activity_ts: string | null;
+  latest_activity_age_secs: number | null;
   canonical_status: CanonicalStatus;
 }
 

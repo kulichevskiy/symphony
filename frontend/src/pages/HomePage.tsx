@@ -16,7 +16,15 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { fetchIssues } from "@/lib/api";
-import type { IssueScope } from "@/lib/api";
+import type { IssueScope, IssueSummary } from "@/lib/api";
+import { cn } from "@/lib/utils";
+
+import {
+  activityAgeSeconds,
+  activityTintClass,
+  formatRelativeTimestamp,
+  formatUtcTimestamp,
+} from "./activityFreshness";
 
 const ISSUE_SCOPES: IssueScope[] = ["active", "recent", "all"];
 const SCOPE_LABELS: Record<IssueScope, string> = {
@@ -31,6 +39,67 @@ function parseIssueScope(value: string | null): IssueScope {
 
 function linearIssueUrl(identifier: string): string {
   return `https://linear.app/issue/${encodeURIComponent(identifier)}`;
+}
+
+function useRelativeActivityClock() {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNowMs(Date.now()), 10000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  return nowMs;
+}
+
+export function IssueListRow({
+  issue,
+  activityNowMs,
+}: {
+  issue: IssueSummary;
+  activityNowMs: number;
+}) {
+  const activityAgeSecs = activityAgeSeconds(
+    issue.latest_activity_ts,
+    issue.latest_activity_age_secs,
+    activityNowMs,
+  );
+
+  return (
+    <TableRow className={cn(activityTintClass(activityAgeSecs))}>
+      <TableCell className="font-medium">
+        <a
+          className="text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          href={linearIssueUrl(issue.identifier)}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {issue.identifier}
+        </a>
+      </TableCell>
+      <TableCell>
+        <StatusCluster status={issue.canonical_status} />
+      </TableCell>
+      <TableCell className="w-32 whitespace-nowrap text-muted-foreground">
+        {issue.latest_activity_ts ? (
+          <span title={formatUtcTimestamp(issue.latest_activity_ts)}>
+            {formatRelativeTimestamp(issue.latest_activity_ts, activityNowMs)}
+          </span>
+        ) : (
+          <span>No activity</span>
+        )}
+      </TableCell>
+      <TableCell className="max-w-[48rem] whitespace-normal">
+        <Link
+          to={`/issue/${encodeURIComponent(issue.id)}`}
+          className="text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {issue.title}
+        </Link>
+      </TableCell>
+      <TableCell className="text-muted-foreground">{issue.team_key}</TableCell>
+    </TableRow>
+  );
 }
 
 export function HomePage() {
@@ -88,6 +157,7 @@ export function HomePage() {
   });
 
   const issues = issuesQuery.data ?? [];
+  const activityNowMs = useRelativeActivityClock();
   const emptyMessage =
     q.length > 0
       ? "No matching issues"
@@ -168,36 +238,14 @@ export function HomePage() {
               <TableRow>
                 <TableHead className="w-36">Identifier</TableHead>
                 <TableHead className="w-64">Status</TableHead>
+                <TableHead className="w-32">Last activity</TableHead>
                 <TableHead>Title</TableHead>
                 <TableHead className="w-28">Team</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {issues.map((issue) => (
-                <TableRow key={issue.id}>
-                  <TableCell className="font-medium">
-                    <a
-                      className="text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      href={linearIssueUrl(issue.identifier)}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {issue.identifier}
-                    </a>
-                  </TableCell>
-                  <TableCell>
-                    <StatusCluster status={issue.canonical_status} />
-                  </TableCell>
-                  <TableCell className="max-w-[48rem] whitespace-normal">
-                    <Link
-                      to={`/issue/${encodeURIComponent(issue.id)}`}
-                      className="text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    >
-                      {issue.title}
-                    </Link>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">{issue.team_key}</TableCell>
-                </TableRow>
+                <IssueListRow key={issue.id} issue={issue} activityNowMs={activityNowMs} />
               ))}
             </TableBody>
           </Table>

@@ -286,6 +286,8 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-1",
             "title": "Earlier issue",
             "team_key": "ADJ",
+            "latest_activity_ts": None,
+            "latest_activity_age_secs": None,
             "canonical_status": {
                 "state": "idle",
                 "since": None,
@@ -298,6 +300,8 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-2",
             "title": "Known tracked issue",
             "team_key": "ADJ",
+            "latest_activity_ts": None,
+            "latest_activity_age_secs": None,
             "canonical_status": {
                 "state": "idle",
                 "since": None,
@@ -310,6 +314,8 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-10",
             "title": "Later issue",
             "team_key": "ADJ",
+            "latest_activity_ts": None,
+            "latest_activity_age_secs": None,
             "canonical_status": {
                 "state": "idle",
                 "since": None,
@@ -322,6 +328,8 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "WEB-1",
             "title": "Other team issue",
             "team_key": "WEB",
+            "latest_activity_ts": None,
+            "latest_activity_age_secs": None,
             "canonical_status": {
                 "state": "idle",
                 "since": None,
@@ -439,6 +447,8 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-1",
             "title": "Stuck PR issue",
             "team_key": "ENG",
+            "latest_activity_ts": "2026-05-16T11:00:00Z",
+            "latest_activity_age_secs": 90000,
             "canonical_status": {
                 "state": "pr_open",
                 "since": "2026-05-16T11:00:00Z",
@@ -451,6 +461,8 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-2",
             "title": "Running issue",
             "team_key": "ENG",
+            "latest_activity_ts": "2026-05-17T11:45:00Z",
+            "latest_activity_age_secs": 900,
             "canonical_status": {
                 "state": "running",
                 "since": "2026-05-17T11:45:00Z",
@@ -463,6 +475,8 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-3",
             "title": "Awaiting review issue",
             "team_key": "ENG",
+            "latest_activity_ts": "2026-05-17T11:55:00Z",
+            "latest_activity_age_secs": 300,
             "canonical_status": {
                 "state": "awaiting_review_trigger",
                 "since": "2026-05-17T11:55:00Z",
@@ -475,6 +489,8 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-4",
             "title": "Idle issue",
             "team_key": "ENG",
+            "latest_activity_ts": None,
+            "latest_activity_age_secs": None,
             "canonical_status": {
                 "state": "idle",
                 "since": None,
@@ -483,6 +499,131 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_api_issues_includes_latest_activity_from_existing_timestamps(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for issue_id, identifier, title in [
+            ("run-running", "ENG-1", "Running run fallback"),
+            ("run-ended", "ENG-2", "Completed run"),
+            ("comment-activity", "ENG-3", "Comment and activity mark"),
+            ("merged-pr", "ENG-4", "Merged PR"),
+            ("operator-wait", "ENG-5", "Operator wait"),
+            ("idle", "ENG-6", "No activity"),
+        ]:
+            await db.issues.upsert(
+                conn,
+                id=issue_id,
+                identifier=identifier,
+                title=title,
+                team_key="ENG",
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES
+                ('run-running-1', 'run-running', 'implement', 'running', NULL,
+                 '2026-05-17T11:58:00Z', NULL, 0),
+                ('run-ended-1', 'run-ended', 'implement', 'completed', NULL,
+                 '2026-05-17T11:00:00Z', '2026-05-17T11:20:00Z', 0),
+                ('run-activity-1', 'comment-activity', 'review', 'completed', NULL,
+                 '2026-05-17T11:10:00Z', '2026-05-17T11:15:00Z', 0),
+                ('run-wait-1', 'operator-wait', 'review', 'completed', NULL,
+                 '2026-05-17T11:00:00Z', '2026-05-17T11:05:00Z', 0)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO state_transitions (
+                issue_id, table_name, field, old_value, new_value, ts
+            )
+            VALUES (
+                'run-ended', 'runs', 'status', 'running', 'completed',
+                '2026-05-17T11:19:00Z'
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO comment_events (comment_id, issue_id, seen_at)
+            VALUES (
+                'comment-activity-1', 'comment-activity', '2026-05-17T11:30:00Z'
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO activity_comment_marks (
+                run_id, first_unpublished_at, last_event_at, event_count_since_post,
+                last_posted_at, last_fingerprint
+            )
+            VALUES (
+                'run-activity-1', '2026-05-17T11:40:00Z',
+                '2026-05-17T11:45:00Z', 2,
+                '2026-05-17T11:50:00Z', 'fp'
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES (
+                'merged-pr', 'org/repo', 'ENG|org/repo', 45,
+                'https://github.com/org/repo/pull/45',
+                '2026-05-17T10:00:00Z', '2026-05-17T11:55:00Z'
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO operator_waits (
+                issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
+            )
+            VALUES (
+                'operator-wait', 'run-wait-1', 'review_stopped', 'ENG', 'org/repo',
+                'symphony', '2026-05-17T11:52:00Z'
+            )
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues?scope=all")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    rows = {row["id"]: row for row in response.json()}
+    assert rows["run-running"]["latest_activity_ts"] == "2026-05-17T11:58:00Z"
+    assert rows["run-running"]["latest_activity_age_secs"] == 120
+    assert rows["run-ended"]["latest_activity_ts"] == "2026-05-17T11:20:00Z"
+    assert rows["run-ended"]["latest_activity_age_secs"] == 2400
+    assert rows["comment-activity"]["latest_activity_ts"] == "2026-05-17T11:45:00Z"
+    assert rows["comment-activity"]["latest_activity_age_secs"] == 900
+    assert rows["merged-pr"]["latest_activity_ts"] == "2026-05-17T11:55:00Z"
+    assert rows["merged-pr"]["latest_activity_age_secs"] == 300
+    assert rows["operator-wait"]["latest_activity_ts"] == "2026-05-17T11:52:00Z"
+    assert rows["operator-wait"]["latest_activity_age_secs"] == 480
+    assert rows["idle"]["latest_activity_ts"] is None
+    assert rows["idle"]["latest_activity_age_secs"] is None
 
 
 @pytest.mark.asyncio
