@@ -111,6 +111,8 @@ class RepoBinding(BaseModel):
     activity_comment_long_running_secs: int | None = Field(default=None, ge=1)
     activity_comment_long_running_repeat_secs: int | None = Field(default=None, ge=1)
     activity_comment_include_failed_output_lines: int | None = Field(default=None, ge=0)
+    webhook_enabled: bool = True
+    webhook_secret: str | None = None
     linear_states: LinearStates
 
     @field_validator("codex_model")
@@ -174,6 +176,9 @@ class Secrets(BaseSettings):
     linear_api_key: str = Field(default="", validation_alias="LINEAR_API_KEY")
     linear_webhook_secret: str = Field(
         default="", validation_alias="LINEAR_WEBHOOK_SECRET"
+    )
+    github_webhook_secret: str = Field(
+        default="", validation_alias="GITHUB_WEBHOOK_SECRET"
     )
 
 
@@ -248,6 +253,7 @@ class Config(BaseModel):
     # Filled in from Secrets.
     linear_api_key: str = ""
     linear_webhook_secret: str = ""
+    github_webhook_secret: str = ""
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -258,6 +264,7 @@ class Config(BaseModel):
             update={
                 "linear_api_key": secrets.linear_api_key,
                 "linear_webhook_secret": secrets.linear_webhook_secret,
+                "github_webhook_secret": secrets.github_webhook_secret,
             }
         )
         # Expand ~ now so downstream code can assume absolute paths.

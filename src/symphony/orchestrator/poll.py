@@ -58,6 +58,7 @@ from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import CheckRun as GitHubCheckRun
 from ..github.client import GitHub, GitHubError, PRChecks
+from ..github.webhook import GitHubWebhookEvent
 from ..linear import slash
 from ..linear.blockers import is_blocked, open_blocker_ids
 from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
@@ -908,6 +909,7 @@ class Orchestrator:
             max(config.global_max_concurrent, 1)
         )
         self._review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore] = {}
+        self._github_webhook_events: asyncio.Queue[GitHubWebhookEvent] = asyncio.Queue()
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -1017,6 +1019,13 @@ class Orchestrator:
             handled=False,
             detail="ignored event type",
         )
+
+    async def handle_github_webhook(
+        self, event: GitHubWebhookEvent
+    ) -> WebhookDispatchResult:
+        """Queue a verified GitHub webhook event for a later reconciler slice."""
+        await self._github_webhook_events.put(event)
+        return WebhookDispatchResult(kind=f"github.{event.event_type}", handled=True)
 
     async def _handle_webhook_comment(
         self, payload: Mapping[str, Any]

@@ -6,5 +6,13 @@ fake the wrapper rather than mocking subprocesses.
 """
 
 from .client import CheckRun, GitHub, GitHubError, PRChecks
+from .webhook import GitHubWebhookEvent, GitHubWebhookSettings
 
-__all__ = ["CheckRun", "GitHub", "GitHubError", "PRChecks"]
+__all__ = [
+    "CheckRun",
+    "GitHub",
+    "GitHubError",
+    "GitHubWebhookEvent",
+    "GitHubWebhookSettings",
+    "PRChecks",
+]

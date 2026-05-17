@@ -78,7 +78,11 @@ scp .env "$VPS:/tmp/symphonyd.env"
 ssh "$VPS" 'install -o symphony -g symphony -m 0600 /tmp/symphonyd.env /opt/symphonyd/.env && rm -f /tmp/symphonyd.env && chown -R symphony:symphony /opt/symphonyd'
 ```
 
-Put the generated hex value in `.env` as `LINEAR_WEBHOOK_SECRET`. Use the same value when configuring the Linear webhook signing secret.
+Put generated hex values in `.env` as `LINEAR_WEBHOOK_SECRET` and
+`GITHUB_WEBHOOK_SECRET`. Use the Linear value when configuring the Linear
+webhook signing secret, and the GitHub value when configuring GitHub repository
+webhooks. A repo can override the global GitHub secret with
+`repos[].webhook_secret` in `/opt/symphonyd/config.yaml`.
 
 Run on the VPS as `root`:
 
@@ -106,6 +110,9 @@ Set:
 - `webhook_port: 8787`
 - `workspace_root`, `log_root`, and `db_path` to directories writable by `symphony`.
 - Each `repos[].github_repo` to a watched GitHub repo.
+- Leave `repos[].webhook_enabled: true` for watched repos that should accept
+  GitHub webhook events; set it to `false` for repos that should keep polling
+  only.
 - Each `repos[].linear_team_key`, `issue_label`, and `linear_states` entry to match the Linear workspace.
 
 ## 3. Authenticate headless tools
@@ -202,6 +209,18 @@ https://symphonyd.example.org/linear/webhook
 ```
 
 Use the same signing secret as `LINEAR_WEBHOOK_SECRET`.
+
+Configure each watched GitHub repository under **Settings -> Webhooks**:
+
+- Payload URL: `https://symphonyd.example.org/github/webhook`
+- Content type: `application/json`
+- Secret: the matching `repos[].webhook_secret` when set, otherwise
+  `GITHUB_WEBHOOK_SECRET`
+- Events: select **Pull requests** and **Issue comments** only
+
+The receiver accepts `pull_request` actions `closed`, `merged`, and `reopened`,
+and `issue_comment` action `created`. Other GitHub events return 200 without
+triggering the reconciler hook.
 
 ## 6. Smoke test with Linear
 

@@ -1,6 +1,7 @@
 # Example symphonyd config. Copy this and edit the two LINEAR_TEAM_KEY /
 # GITHUB_REPO entries plus the LINEAR_API_KEY env var.
-# Set LINEAR_WEBHOOK_SECRET to also start the loopback-only webhook receiver.
+# Set LINEAR_WEBHOOK_SECRET and/or GITHUB_WEBHOOK_SECRET to start the
+# loopback-only webhook receiver.
 #
 # All paths are expanded with ~ and env vars.
 
@@ -28,6 +29,8 @@ repos:
     agent: claude
     issue_label: symphony
     branch_prefix: symphony
+    webhook_enabled: true
+    # webhook_secret: repo-specific-github-webhook-secret
     max_concurrent: 2
     runner: local
     linear_states:

@@ -15,6 +15,11 @@ from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
+from .github.webhook import (
+    GitHubWebhookHandler,
+    GitHubWebhookSettings,
+    create_github_webhook_router,
+)
 from .ui.api import create_api_router
 from .ui.db import ReadOnlyDbPool
 from .ui.issues import create_issue_detail_router
@@ -46,7 +51,9 @@ def create_app(
     handler: WebhookHandler,
     conn: aiosqlite.Connection,
     webhook_settings: WebhookSettings | None = None,
+    github_webhook_settings: GitHubWebhookSettings | None = None,
     *,
+    github_handler: GitHubWebhookHandler | None = None,
     ui_enabled: bool = True,
     ui_db_path: Path | None = None,
     ui_dist_dir: Path | None = None,
@@ -75,6 +82,23 @@ def create_app(
                 handler,
                 conn,
                 webhook_settings,
+                clock=clock,
+            )
+        )
+
+    if github_webhook_settings is not None:
+        resolved_github_handler = github_handler
+        if resolved_github_handler is None:
+            if not isinstance(handler, GitHubWebhookHandler):
+                raise TypeError(
+                    "github webhook settings require a GitHub webhook handler"
+                )
+            resolved_github_handler = handler
+        app.include_router(
+            create_github_webhook_router(
+                resolved_github_handler,
+                conn,
+                github_webhook_settings,
                 clock=clock,
             )
         )
