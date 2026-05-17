@@ -43,6 +43,7 @@ from ..agent.activity import (
     digest_fingerprint,
     format_activity_digest,
 )
+from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.process import parse_event_line
 from ..agent.prompt import (
@@ -256,16 +257,10 @@ def build_runner_command(
         command.append(prompt)
         return command
     if agent == "codex":
-        return [
-            "codex",
-            "exec",
-            "--json",
-            "--sandbox",
-            "workspace-write",
-            "--model",
-            codex_model,
-            prompt,
-        ]
+        return build_codex_workspace_write_command(
+            prompt=prompt,
+            codex_model=codex_model,
+        )
     raise ValueError(f"unknown agent {agent!r}")
 
 

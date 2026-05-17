@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from symphony import db
+from symphony.agent.codex_cli import CODEX_ALLOW_GIT_WRITES_CONFIG
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearError, LinearIssue
@@ -510,15 +511,16 @@ async def test_codex_token_usage_estimates_cost_for_cap(tmp_path: Path) -> None:
         await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
 
         assert runner.captured_spec is not None
-        assert runner.captured_spec.command[:7] == [
+        command = runner.captured_spec.command
+        assert command[:5] == [
             "codex",
             "exec",
             "--json",
             "--sandbox",
             "workspace-write",
-            "--model",
-            "gpt-5.1-codex",
         ]
+        assert command[command.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+        assert command[command.index("--model") + 1] == "gpt-5.1-codex"
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
