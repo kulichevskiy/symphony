@@ -86,6 +86,63 @@ export type IssueDetail = {
   } | null;
 };
 
+export type DriftSeverity = "drift" | "warning";
+
+export type DriftFlag = {
+  field: string;
+  sqlite_value: string | null;
+  source_value: string | null;
+  source_name: string;
+  severity: DriftSeverity;
+};
+
+export type ExternalComment = {
+  author: string;
+  ts: string;
+  body: string;
+  comment_id: string | number;
+  url: string | null;
+  truncated?: boolean;
+};
+
+export type LinearSnapshot = {
+  state?: string | null;
+  updated_at?: string | null;
+  comments?: ExternalComment[];
+  labels?: string[];
+  error?: string;
+  stale?: boolean;
+  stale_fetched_at?: string;
+};
+
+export type GithubPrSnapshot = {
+  pr_number?: number | null;
+  github_repo?: string | null;
+  state?: string | null;
+  url?: string | null;
+  mergeable?: string | boolean | null;
+  merge_state_status?: string | null;
+  merged_at?: string | null;
+  merged_by?: string | null;
+  check_summary?: {
+    passing: number;
+    failing: number;
+    pending: number;
+    total: number;
+  };
+  comments?: ExternalComment[];
+  error?: string;
+  stale?: boolean;
+  stale_fetched_at?: string;
+};
+
+export type IssueExternalSnapshot = {
+  fetched_at: string;
+  linear: LinearSnapshot;
+  github: GithubPrSnapshot;
+  drift_flags: DriftFlag[];
+};
+
 async function fetchJson<T>(
   path: string,
   notFoundMessage: string,
@@ -127,5 +184,17 @@ export function fetchIssueDetail(id: string): Promise<IssueDetail> {
     `/api/issues/${encodeURIComponent(id)}`,
     "Issue not found",
     "Failed to load issue",
+  );
+}
+
+export function fetchIssueExternal(
+  id: string,
+  { refresh = false }: { refresh?: boolean } = {},
+): Promise<IssueExternalSnapshot> {
+  const params = new URLSearchParams({ refresh: refresh ? "1" : "0" });
+  return fetchJson<IssueExternalSnapshot>(
+    `/api/issues/${encodeURIComponent(id)}/external?${params.toString()}`,
+    "Issue not found",
+    "Failed to load external issue state",
   );
 }

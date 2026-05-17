@@ -60,6 +60,70 @@ async def test_comments_since_paginates_all_matching_comments() -> None:
     assert [call["cursor"] for call in calls] == [None, "cursor-1"]
 
 
+@pytest.mark.asyncio
+async def test_issue_external_snapshot_returns_latest_comments_desc() -> None:
+    linear = Linear("test-key")
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def comment(idx: int) -> dict[str, Any]:
+        return {
+            "id": f"c{idx}",
+            "body": f"comment {idx}",
+            "createdAt": f"2026-05-17T11:0{idx}:00Z",
+            "user": {"name": f"User {idx}"},
+        }
+
+    async def fake_query(gql: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append((gql, variables))
+        if gql == queries.ISSUE_EXTERNAL_SNAPSHOT:
+            return {
+                "issue": {
+                    "id": "iss-1",
+                    "identifier": "ENG-1",
+                    "url": "https://linear.app/issue/ENG-1/title",
+                    "updatedAt": "2026-05-17T11:10:00Z",
+                    "state": {"name": "Done"},
+                    "labels": {"nodes": [{"name": "symphony"}]},
+                    "comments": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        "nodes": [comment(0), comment(1), comment(2)],
+                    },
+                }
+            }
+        if gql == queries.ISSUE_EXTERNAL_COMMENTS_PAGE:
+            assert variables == {"id": "iss-1", "cursor": "cursor-1"}
+            return {
+                "issue": {
+                    "comments": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        "nodes": [comment(3), comment(4), comment(5)],
+                    }
+                }
+            }
+        raise AssertionError(f"unexpected query: {gql}")
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    try:
+        snapshot = await linear.issue_external_snapshot("iss-1")
+    finally:
+        await linear.aclose()
+
+    assert snapshot["state"] == "Done"
+    assert snapshot["updated_at"] == "2026-05-17T11:10:00Z"
+    assert snapshot["labels"] == ["symphony"]
+    assert [comment["comment_id"] for comment in snapshot["comments"]] == [
+        "c5",
+        "c4",
+        "c3",
+        "c2",
+        "c1",
+    ]
+    assert calls[0] == (
+        queries.ISSUE_EXTERNAL_SNAPSHOT,
+        {"id": "iss-1", "cursor": None},
+    )
+
+
 def test_comments_since_uses_linear_filter_timestamp_type() -> None:
     assert "$after: DateTimeOrDuration!" in queries.ISSUE_COMMENTS_SINCE
     assert "$after: DateTime!" not in queries.ISSUE_COMMENTS_SINCE

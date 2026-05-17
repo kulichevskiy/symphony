@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 
 import aiosqlite
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from .db import ReadOnlyDbPool
+from .external import ExternalSnapshotService
 from .status import DEFAULT_STUCK_THRESHOLDS, CanonicalState, compute_canonical_status
 
 
@@ -90,6 +91,7 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
 def create_issue_detail_router(
     pool: ReadOnlyDbPool,
     *,
+    external_service: ExternalSnapshotService | None = None,
     clock: Callable[[], datetime] | None = None,
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
 ) -> APIRouter:
@@ -205,6 +207,26 @@ def create_issue_detail_router(
             "activity_comment_marks": activity_comment_marks,
             "issue_cost_marks": issue_cost_marks,
         }
+
+    @router.get("/issues/{issue_id}/external")
+    async def issue_external(
+        issue_id: str,
+        refresh: Annotated[int, Query(ge=0, le=1)] = 0,
+    ) -> dict[str, Any]:
+        if external_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="External issue pull is not configured",
+            )
+        conn = await pool.connection()
+        payload = await external_service.get_issue_external(
+            conn,
+            issue_id,
+            refresh=bool(refresh),
+        )
+        if payload is None:
+            raise HTTPException(status_code=404, detail="Issue not found")
+        return payload
 
     @router.get("/issues/{issue_id}/timeline")
     async def issue_timeline(issue_id: str) -> list[dict[str, Any]]:

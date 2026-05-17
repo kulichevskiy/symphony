@@ -187,6 +187,54 @@ class Linear:
                 break
         return comments
 
+    async def issue_external_snapshot(self, identifier_or_uuid: str) -> dict[str, Any]:
+        """Current Linear issue state plus recent comments for the UI."""
+        data = await self._query(
+            queries.ISSUE_EXTERNAL_SNAPSHOT,
+            {"id": identifier_or_uuid, "cursor": None},
+        )
+        node = data.get("issue")
+        if not node:
+            raise LinearError(f"issue not found: {identifier_or_uuid}")
+
+        comments: list[dict[str, Any]] = []
+        connection = node.get("comments") or {}
+        comments.extend(connection.get("nodes") or [])
+        page_info = connection.get("pageInfo") or {}
+        cursor = page_info.get("endCursor")
+        while page_info.get("hasNextPage") and cursor:
+            data = await self._query(
+                queries.ISSUE_EXTERNAL_COMMENTS_PAGE,
+                {"id": identifier_or_uuid, "cursor": cursor},
+            )
+            page_node = data.get("issue") or {}
+            connection = page_node.get("comments") or {}
+            comments.extend(connection.get("nodes") or [])
+            page_info = connection.get("pageInfo") or {}
+            cursor = page_info.get("endCursor")
+
+        comments.sort(key=lambda comment: str(comment.get("createdAt") or ""), reverse=True)
+        issue_url = str(node.get("url") or "")
+        return {
+            "state": (node.get("state") or {}).get("name"),
+            "updated_at": node.get("updatedAt"),
+            "labels": [
+                str(label.get("name"))
+                for label in (node.get("labels") or {}).get("nodes", [])
+                if label.get("name")
+            ],
+            "comments": [
+                {
+                    "author": str((comment.get("user") or {}).get("name") or ""),
+                    "ts": comment.get("createdAt"),
+                    "body": comment.get("body") or "",
+                    "comment_id": comment.get("id"),
+                    "url": f"{issue_url}#comment-{comment.get('id')}" if issue_url else None,
+                }
+                for comment in comments[:5]
+            ],
+        }
+
     async def post_comment(self, issue_uuid: str, body: str) -> str:
         """Returns the comment id (useful for threading later)."""
         data = await self._query(

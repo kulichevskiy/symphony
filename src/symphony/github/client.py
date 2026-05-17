@@ -222,6 +222,65 @@ class GitHub:
             raise GitHubError(f"pr view: expected object, got {type(result).__name__}")
         return result
 
+    async def pr_external_snapshot(self, pr: int | str, *, repo: str) -> dict[str, Any]:
+        """Current PR state/checks plus recent review comments for the UI."""
+        view = await self._run_json(
+            [
+                "pr",
+                "view",
+                str(pr),
+                *self._repo_args(repo),
+                "--json",
+                ",".join(
+                    [
+                        "number",
+                        "state",
+                        "url",
+                        "mergeable",
+                        "mergeStateStatus",
+                        "mergedAt",
+                        "mergedBy",
+                        "statusCheckRollup",
+                    ]
+                ),
+            ]
+        )
+        if not isinstance(view, dict):
+            raise GitHubError(f"pr view: expected object, got {type(view).__name__}")
+
+        comments = await self.pr_review_comments(pr, repo=repo)
+        comments.sort(
+            key=lambda comment: str(
+                comment.get("updated_at") or comment.get("created_at") or ""
+            ),
+            reverse=True,
+        )
+        merged_by = view.get("mergedBy")
+        return {
+            "pr_number": view.get("number"),
+            "state": view.get("state"),
+            "url": view.get("url"),
+            "mergeable": view.get("mergeable"),
+            "merge_state_status": view.get("mergeStateStatus"),
+            "merged_at": view.get("mergedAt"),
+            "merged_by": (
+                merged_by.get("login")
+                if isinstance(merged_by, dict)
+                else merged_by
+            ),
+            "check_summary": _status_check_summary(view.get("statusCheckRollup")),
+            "comments": [
+                {
+                    "author": str((comment.get("user") or {}).get("login") or ""),
+                    "ts": comment.get("updated_at") or comment.get("created_at"),
+                    "body": comment.get("body") or "",
+                    "comment_id": comment.get("id"),
+                    "url": comment.get("html_url"),
+                }
+                for comment in comments[:5]
+            ],
+        }
+
     async def pr_comment(self, pr: int | str, body: str, *, repo: str | None = None) -> None:
         argv = ["pr", "comment", str(pr), "--body", body, *self._repo_args(repo)]
         await self._run(argv)
@@ -467,3 +526,74 @@ def _tail_utf8(text: str, *, max_bytes: int) -> str:
         return suffix[:max_bytes].decode("utf-8", errors="ignore")
     tail = encoded[-(max_bytes - len(suffix)) :].decode("utf-8", errors="ignore")
     return suffix.decode("utf-8") + tail
+
+
+def _status_check_summary(raw: object) -> dict[str, int]:
+    checks = _status_check_nodes(raw)
+    passing = 0
+    failing = 0
+    pending = 0
+    for check in checks:
+        state = str(
+            check.get("state")
+            or check.get("status")
+            or check.get("__typename")
+            or ""
+        ).upper()
+        conclusion = str(check.get("conclusion") or "").upper()
+        if conclusion in {
+            "FAILURE",
+            "FAILED",
+            "ERROR",
+            "CANCELLED",
+            "CANCELED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+        }:
+            failing += 1
+        elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+            passing += 1
+        elif state in {"SUCCESS", "PASS", "PASSED", "NEUTRAL", "SKIPPED"}:
+            passing += 1
+        elif state in {
+            "FAILURE",
+            "FAILED",
+            "ERROR",
+            "CANCELLED",
+            "CANCELED",
+            "TIMED_OUT",
+            "ACTION_REQUIRED",
+        }:
+            failing += 1
+        else:
+            pending += 1
+    return {
+        "passing": passing,
+        "failing": failing,
+        "pending": pending,
+        "total": len(checks),
+    }
+
+
+def _status_check_nodes(raw: object) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [entry for entry in raw if isinstance(entry, dict)]
+    if not isinstance(raw, dict):
+        return []
+
+    nodes = raw.get("nodes")
+    if isinstance(nodes, list):
+        return [entry for entry in nodes if isinstance(entry, dict)]
+
+    edges = raw.get("edges")
+    if isinstance(edges, list):
+        return [
+            edge["node"]
+            for edge in edges
+            if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+        ]
+
+    contexts = raw.get("contexts")
+    if isinstance(contexts, list):
+        return [entry for entry in contexts if isinstance(entry, dict)]
+    return []

@@ -151,6 +151,9 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
+                    ui_external_config=cfg,
+                    ui_external_linear=linear,
+                    ui_external_github=orch._gh,  # pylint: disable=protected-access
                 )
                 server = uvicorn.Server(
                     build_server_config(

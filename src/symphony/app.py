@@ -15,13 +15,17 @@ from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
+from .config import Config
+from .github.client import GitHub
 from .github.webhook import (
     GitHubWebhookHandler,
     GitHubWebhookSettings,
     create_github_webhook_router,
 )
+from .linear.client import Linear
 from .ui.api import create_api_router
 from .ui.db import ReadOnlyDbPool
+from .ui.external import ExternalSnapshotService
 from .ui.issues import create_issue_detail_router
 from .ui.status import CanonicalState
 from .webhook import (
@@ -58,6 +62,10 @@ def create_app(
     ui_db_path: Path | None = None,
     ui_dist_dir: Path | None = None,
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
+    ui_external_config: Config | None = None,
+    ui_external_linear: Linear | None = None,
+    ui_external_github: GitHub | None = None,
+    ui_external_service: ExternalSnapshotService | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     ui_pool = (
@@ -65,16 +73,34 @@ def create_app(
         if ui_enabled and ui_db_path is not None
         else None
     )
+    external_service = ui_external_service
+    if (
+        external_service is None
+        and ui_external_config is not None
+        and ui_external_linear is not None
+    ):
+        external_service = ExternalSnapshotService(
+            ui_external_config,
+            ui_external_linear,
+            ui_external_github or GitHub(),
+            clock=clock,
+        )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
+            if external_service is not None:
+                external_service.cache.clear()
             if ui_pool is not None:
                 await ui_pool.close()
 
-    app = FastAPI(lifespan=lifespan if ui_pool is not None else None)
+    app = FastAPI(
+        lifespan=lifespan if ui_pool is not None or external_service is not None else None
+    )
+    if external_service is not None:
+        app.state.external_snapshot_cache = external_service.cache
 
     if webhook_settings is not None:
         app.include_router(
@@ -108,6 +134,7 @@ def create_app(
             app.include_router(
                 create_issue_detail_router(
                     ui_pool,
+                    external_service=external_service,
                     clock=clock,
                     status_thresholds=ui_status_thresholds,
                 )
