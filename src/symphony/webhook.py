@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from uvicorn import Config as UvicornConfig
 
@@ -54,17 +54,17 @@ def _webhook_timestamp_is_fresh(
     return abs((now - sent_at).total_seconds()) <= tolerance_secs
 
 
-def create_app(
+def create_linear_webhook_router(
     handler: WebhookHandler,
     conn: aiosqlite.Connection,
     settings: WebhookSettings,
     *,
     clock: Clock | None = None,
-) -> FastAPI:
-    app = FastAPI()
+) -> APIRouter:
+    router = APIRouter()
     now_fn = clock if clock is not None else lambda: datetime.now(UTC)
 
-    @app.post("/linear/webhook")
+    @router.post("/linear/webhook")
     async def linear_webhook(request: Request) -> JSONResponse:
         body = await request.body()
         signature = request.headers.get(LINEAR_SIGNATURE_HEADER)
@@ -114,7 +114,19 @@ def create_app(
             }
         )
 
-    return app
+    return router
+
+
+def create_app(
+    handler: WebhookHandler,
+    conn: aiosqlite.Connection,
+    settings: WebhookSettings,
+    *,
+    clock: Clock | None = None,
+) -> FastAPI:
+    from .app import create_app as create_shared_app
+
+    return create_shared_app(handler, conn, settings, ui_enabled=False, clock=clock)
 
 
 def build_server_config(
@@ -123,6 +135,6 @@ def build_server_config(
     host: str = LOOPBACK_HOST,
     port: int = 8787,
 ) -> UvicornConfig:
-    if host != LOOPBACK_HOST:
-        raise ValueError("Linear webhook server must bind 127.0.0.1 only")
-    return UvicornConfig(app=app, host=host, port=port, log_level="info")
+    from .app import build_server_config as build_shared_server_config
+
+    return build_shared_server_config(app, host=host, port=port)

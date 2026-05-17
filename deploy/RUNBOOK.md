@@ -57,9 +57,10 @@ sudo -iu symphony
 npm config set prefix "$HOME/.local"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.profile"
 export PATH="$HOME/.local/bin:$PATH"
-npm install -g @anthropic-ai/claude-code @openai/codex
+npm install -g pnpm @anthropic-ai/claude-code @openai/codex
 claude --version
 codex --version
+pnpm --version
 exit
 ```
 
@@ -72,7 +73,7 @@ export VPS=root@symphonyd.example.org
 test -f .env || cp .env.example .env
 openssl rand -hex 32
 ${EDITOR:-vi} .env
-rsync -a --delete --exclude .git --exclude .venv --exclude .env ./ "$VPS:/opt/symphonyd/"
+rsync -a --delete --exclude .git --exclude .venv --exclude .env --exclude frontend/node_modules --exclude frontend/dist ./ "$VPS:/opt/symphonyd/"
 scp .env "$VPS:/tmp/symphonyd.env"
 ssh "$VPS" 'install -o symphony -g symphony -m 0600 /tmp/symphonyd.env /opt/symphonyd/.env && rm -f /tmp/symphonyd.env && chown -R symphony:symphony /opt/symphonyd'
 ```
@@ -85,6 +86,10 @@ Run on the VPS as `root`:
 sudo -iu symphony
 cd /opt/symphonyd
 uv sync
+cd frontend
+pnpm install
+pnpm build
+cd ..
 cp examples/config.yaml config.yaml
 exit
 ```
@@ -146,6 +151,11 @@ journalctl -u symphonyd.service -f
 The unit must show a webhook listener on `127.0.0.1:8787` when `LINEAR_WEBHOOK_SECRET` is set. It must never listen on `0.0.0.0`.
 
 The maintenance timer runs daily. It reads `db_path` and `log_root` from `/opt/symphonyd/config.yaml`, creates online-safe SQLite backups next to the DB using `sqlite3 .backup`, keeps the 7 newest backups by default, and prunes `*.log` files older than 14 days by default. Override the defaults by editing `SYMPHONYD_BACKUP_KEEP` and `SYMPHONYD_LOG_RETENTION_DAYS` in `/etc/systemd/system/symphonyd-maintenance.service`, then run `systemctl daemon-reload`.
+
+SQLite now runs in WAL mode. Expect `state.sqlite-wal` and `state.sqlite-shm`
+companion files next to `state.sqlite` while the daemon is running. For
+backup/restore, keep using `sqlite3 .backup` or stop the daemon before copying
+the database files directly so the WAL contents are not split from the main DB.
 
 To run maintenance immediately:
 
@@ -232,6 +242,6 @@ To update from the operator workstation:
 ```bash
 export VPS=root@symphonyd.example.org
 ssh "$VPS" 'systemctl stop symphonyd.service'
-rsync -a --delete --exclude .git --exclude .venv --exclude .env ./ "$VPS:/opt/symphonyd/"
-ssh "$VPS" 'chown -R symphony:symphony /opt/symphonyd && sudo -iu symphony -- sh -lc "cd /opt/symphonyd && uv sync" && systemctl start symphonyd.service'
+rsync -a --delete --exclude .git --exclude .venv --exclude .env --exclude frontend/node_modules --exclude frontend/dist ./ "$VPS:/opt/symphonyd/"
+ssh "$VPS" 'chown -R symphony:symphony /opt/symphonyd && sudo -iu symphony -- sh -lc "cd /opt/symphonyd && uv sync && cd frontend && pnpm install && pnpm build" && systemctl start symphonyd.service'
 ```

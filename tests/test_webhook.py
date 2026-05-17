@@ -15,10 +15,11 @@ import pytest
 from pydantic import ValidationError
 
 from symphony import db
+from symphony.app import build_server_config
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearComment, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
-from symphony.webhook import WebhookSettings, build_server_config, create_app
+from symphony.webhook import WebhookSettings, create_app
 
 SECRET = "whsec_test"
 NOW = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)

@@ -13,6 +13,8 @@ webhook_host: 127.0.0.1
 webhook_port: 8787
 webhook_dedupe_ttl_secs: 600
 webhook_timestamp_tolerance_secs: 60
+ui:
+  enabled: true
 
 # Per-(linear-team, github-repo) bindings. The orchestrator scans each
 # team's issues and routes implementation to the paired repo.

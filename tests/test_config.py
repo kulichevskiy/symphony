@@ -47,6 +47,20 @@ repos:
     assert cfg.linear_api_key == "lin_api_test"
     assert cfg.repos[0].linear_states.ready == "Todo"
     assert cfg.repos[0].linear_states.waiting is None
+    assert cfg.ui.enabled is True
+
+
+def test_ui_can_be_disabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+ui:
+  enabled: false
+repos: []
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.ui.enabled is False
 
 
 def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

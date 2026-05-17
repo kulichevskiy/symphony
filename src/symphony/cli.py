@@ -19,11 +19,12 @@ from pathlib import Path
 import click
 
 from . import db
+from .app import build_server_config, create_app
 from .config import Config, RepoBinding
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
-from .webhook import WebhookSettings, build_server_config, create_app
+from .webhook import WebhookSettings
 
 
 def _setup_logging() -> None:
@@ -106,19 +107,25 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
-            if cfg.linear_webhook_secret:
+            if cfg.linear_webhook_secret or cfg.ui.enabled:
                 import uvicorn
 
-                app = create_app(
-                    orch,
-                    conn,
+                webhook_settings = (
                     WebhookSettings(
                         secret=cfg.linear_webhook_secret,
                         dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
                         timestamp_tolerance_secs=(
                             cfg.webhook_timestamp_tolerance_secs
                         ),
-                    ),
+                    )
+                    if cfg.linear_webhook_secret
+                    else None
+                )
+                app = create_app(
+                    orch,
+                    conn,
+                    webhook_settings,
+                    ui_enabled=cfg.ui.enabled,
                 )
                 server = uvicorn.Server(
                     build_server_config(
@@ -130,7 +137,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 webhook_server = server
                 webhook_task = asyncio.create_task(server.serve())
                 logging.getLogger(__name__).info(
-                    "linear webhook receiver listening on %s:%d",
+                    "http surface listening on %s:%d",
                     cfg.webhook_host,
                     cfg.webhook_port,
                 )

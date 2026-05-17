@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from symphony import db
+from symphony.ui.db import open_read_only_pool
 
 
 @pytest.mark.asyncio
@@ -46,6 +48,51 @@ async def test_connect_creates_tables_and_persists(tmp_path: Path) -> None:
         assert names == names2
     finally:
         await conn2.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_enables_wal_mode(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        cur = await conn.execute("PRAGMA journal_mode")
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert row is not None
+    assert row[0].casefold() == "wal"
+
+
+@pytest.mark.asyncio
+async def test_ui_read_only_pool_rejects_writes(tmp_path: Path) -> None:
+    p = tmp_path / "state.sqlite"
+    conn = await db.connect(p)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="t",
+            team_key="ENG",
+        )
+    finally:
+        await conn.close()
+
+    pool = await open_read_only_pool(p)
+    try:
+        ro_conn = await pool.connection()
+        cur = await ro_conn.execute("SELECT title FROM issues WHERE id = ?", ("iss-1",))
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == "t"
+
+        with pytest.raises(aiosqlite.OperationalError, match="readonly"):
+            await ro_conn.execute(
+                "UPDATE issues SET title = ? WHERE id = ?",
+                ("changed", "iss-1"),
+            )
+    finally:
+        await pool.close()
 
 
 @pytest.mark.asyncio
