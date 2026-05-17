@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
@@ -13,6 +15,8 @@ from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
+from .ui.db import ReadOnlyDbPool
+from .ui.issues import create_issue_detail_router
 from .webhook import (
     LOOPBACK_HOST,
     Clock,
@@ -55,10 +59,25 @@ def create_app(
     webhook_settings: WebhookSettings | None = None,
     *,
     ui_enabled: bool = True,
+    ui_db_path: Path | None = None,
     ui_dist_dir: Path | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
-    app = FastAPI()
+    ui_pool = (
+        ReadOnlyDbPool(ui_db_path)
+        if ui_enabled and ui_db_path is not None
+        else None
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if ui_pool is not None:
+                await ui_pool.close()
+
+    app = FastAPI(lifespan=lifespan if ui_pool is not None else None)
 
     if webhook_settings is not None:
         app.include_router(
@@ -71,6 +90,9 @@ def create_app(
         )
 
     if ui_enabled:
+        if ui_pool is not None:
+            app.include_router(create_issue_detail_router(ui_pool))
+
         app.include_router(create_api_router())
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST
         if dist_dir.exists():

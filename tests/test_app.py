@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import aiosqlite
 import httpx
 import pytest
 
@@ -19,6 +20,87 @@ def _dist(tmp_path: Path) -> Path:
         "<!doctype html><html><body>symphonyd UI v0</body></html>"
     )
     return dist
+
+
+async def _seed_issue_detail(conn: aiosqlite.Connection) -> None:
+    await db.issues.upsert(
+        conn,
+        id="iss-1",
+        identifier="ENG-1",
+        title="Fix the thing",
+        team_key="ENG",
+    )
+    await conn.execute(
+        """
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+        VALUES
+            ('run-1', 'iss-1', 'implement', 'completed', 123, '2026-05-17T10:00:00Z',
+             '2026-05-17T10:10:00Z', 1.25),
+            ('run-2', 'iss-1', 'review', 'running', NULL, '2026-05-17T10:20:00Z',
+             NULL, 0.5)
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'iss-1', 'org/repo', 'ENG|org/repo', 42,
+            'https://github.com/org/repo/pull/42', '2026-05-17T10:11:00Z', NULL
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO operator_waits (
+            issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
+        )
+        VALUES (
+            'iss-1', 'run-2', 'review_stopped', 'ENG', 'org/repo', 'symphony',
+            '2026-05-17T10:30:00Z'
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO review_state (
+            issue_id, iteration, last_trigger_signature, ci_fetch_failures, pr_number,
+            pr_url, github_repo, issue_label, codex_lgtm_comment_id
+        )
+        VALUES (
+            'iss-1', 3, 'sig', 1, 42, 'https://github.com/org/repo/pull/42',
+            'org/repo', 'symphony', 'comment-9'
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO activity_comment_marks (
+            run_id, first_unpublished_at, last_event_at, event_count_since_post,
+            last_posted_at, last_fingerprint
+        )
+        VALUES (
+            'run-2', '2026-05-17T10:21:00Z', '2026-05-17T10:22:00Z', 7,
+            '2026-05-17T10:25:00Z', 'fp'
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_cost_marks (issue_id, warning_posted_at)
+        VALUES ('iss-1', '2026-05-17T10:40:00Z')
+        """
+    )
+    for idx in range(55):
+        await conn.execute(
+            """
+            INSERT INTO comment_events (comment_id, issue_id, seen_at)
+            VALUES (?, 'iss-1', ?)
+            """,
+            (f"comment-{idx:02d}", f"2026-05-17T11:{idx:02d}:00Z"),
+        )
+    await conn.commit()
 
 
 @pytest.mark.asyncio
@@ -82,6 +164,131 @@ async def test_api_namespace_is_reserved_with_placeholder_404(tmp_path: Path) ->
     assert response.status_code == 404
     assert response.json() == {"detail": "Not Found"}
     assert "/api/{path:path}" in {route.path for route in app.routes}
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_issue_detail(conn)
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/iss-1")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "issue": {
+            "id": "iss-1",
+            "identifier": "ENG-1",
+            "title": "Fix the thing",
+            "team_key": "ENG",
+        },
+        "runs": [
+            {
+                "id": "run-2",
+                "stage": "review",
+                "status": "running",
+                "pid": None,
+                "started_at": "2026-05-17T10:20:00Z",
+                "ended_at": None,
+                "cost_usd": 0.5,
+            },
+            {
+                "id": "run-1",
+                "stage": "implement",
+                "status": "completed",
+                "pid": 123,
+                "started_at": "2026-05-17T10:00:00Z",
+                "ended_at": "2026-05-17T10:10:00Z",
+                "cost_usd": 1.25,
+            },
+        ],
+        "issue_prs": [
+            {
+                "github_repo": "org/repo",
+                "binding_key": "ENG|org/repo",
+                "pr_number": 42,
+                "pr_url": "https://github.com/org/repo/pull/42",
+                "created_at": "2026-05-17T10:11:00Z",
+                "merged_at": None,
+            }
+        ],
+        "operator_waits": [
+            {
+                "run_id": "run-2",
+                "kind": "review_stopped",
+                "linear_team_key": "ENG",
+                "github_repo": "org/repo",
+                "issue_label": "symphony",
+                "created_at": "2026-05-17T10:30:00Z",
+            }
+        ],
+        "review_state": {
+            "iteration": 3,
+            "last_trigger_signature": "sig",
+            "ci_fetch_failures": 1,
+            "pr_number": 42,
+            "pr_url": "https://github.com/org/repo/pull/42",
+            "github_repo": "org/repo",
+            "issue_label": "symphony",
+            "codex_lgtm_comment_id": "comment-9",
+        },
+        "comment_events": [
+            {
+                "comment_id": f"comment-{idx:02d}",
+                "seen_at": f"2026-05-17T11:{idx:02d}:00Z",
+            }
+            for idx in range(54, 4, -1)
+        ],
+        "activity_comment_marks": [
+            {
+                "run_id": "run-2",
+                "first_unpublished_at": "2026-05-17T10:21:00Z",
+                "last_event_at": "2026-05-17T10:22:00Z",
+                "event_count_since_post": 7,
+                "last_posted_at": "2026-05-17T10:25:00Z",
+                "last_fingerprint": "fp",
+            }
+        ],
+        "issue_cost_marks": {"warning_posted_at": "2026-05-17T10:40:00Z"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_api_404s_for_unknown_issue(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/missing")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
