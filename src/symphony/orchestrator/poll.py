@@ -74,6 +74,7 @@ from ..linear.templates import (
     fixing_merge_conflict,
     moved_to_waiting,
     resumed,
+    review_stopped,
     reviewing_feedback,
     run_started,
     skip_review_forced,
@@ -1318,6 +1319,31 @@ class Orchestrator:
             )
             self._dispatch_run_ids.pop(issue_id, None)
             self._active_run_ids.discard(fix_run_id)
+        state = await db.review_state.get(self._conn, issue_id)
+        binding = await self._binding_for_review_issue_id(issue_id, state=state)
+        if binding is None:
+            log.warning(
+                "could not persist stopped review wait for issue %s: no matching binding",
+                issue_id,
+            )
+            return
+        await self._track_review_stopped_wait(issue_id, run_id, binding)
+        pr_url = state.pr_url
+        if not pr_url and state.pr_number is not None:
+            pr_url = f"https://github.com/{binding.github_repo}/pull/{state.pr_number}"
+        body = review_stopped(
+            CommentVars(
+                stage="review",
+                repo=binding.github_repo,
+                issue=state.pr_number or 0,
+                pr_url=pr_url or "(no PR yet)",
+                run_id=run_id,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue_id, truncate_body(body))
+        except LinearError as e:
+            log.warning("review stop confirmation failed for %s: %s", issue_id, e)
 
     async def _handle_cost_cap_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
@@ -1472,6 +1498,7 @@ class Orchestrator:
                 db.operator_waits.KIND_COST_CAP,
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
                 db.operator_waits.KIND_REVIEW_FAILED,
+                db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
             ):
                 log.warning(
@@ -1496,10 +1523,32 @@ class Orchestrator:
                 self._cost_cap_run_bindings[wait.run_id] = binding
             elif wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
                 self._implement_failed_run_bindings[wait.run_id] = binding
-            elif wait.kind == db.operator_waits.KIND_REVIEW_FAILED:
+            elif wait.kind in (
+                db.operator_waits.KIND_REVIEW_FAILED,
+                db.operator_waits.KIND_REVIEW_STOPPED,
+            ):
                 self._review_failed_run_bindings[wait.run_id] = binding
             elif wait.kind == db.operator_waits.KIND_MERGE:
                 self._merge_needs_approval_bindings[wait.run_id] = binding
+
+    async def _binding_for_review_issue_id(
+        self, issue_id: str, *, state: db.review_state.ReviewState
+    ) -> RepoBinding | None:
+        cur = await self._conn.execute("SELECT team_key FROM issues WHERE id = ?", (issue_id,))
+        row = await cur.fetchone()
+        team_key = str(row["team_key"]) if row is not None else ""
+        for binding in self.config.repos:
+            if team_key and binding.linear_team_key != team_key:
+                continue
+            if state.github_repo and binding.github_repo != state.github_repo:
+                continue
+            if state.github_repo and (binding.issue_label or "") != state.issue_label:
+                continue
+            if not state.github_repo and state.issue_label:
+                if (binding.issue_label or "") != state.issue_label:
+                    continue
+            return binding
+        return None
 
     def _binding_for_operator_wait(
         self, wait: db.operator_waits.OperatorWait
@@ -2938,6 +2987,23 @@ class Orchestrator:
             issue_id=issue_id,
             run_id=run_id,
             kind=db.operator_waits.KIND_REVIEW_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def _track_review_stopped_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._review_failed_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_REVIEW_STOPPED,
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",

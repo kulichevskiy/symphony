@@ -1,9 +1,8 @@
 """DAO for the `operator_waits` table.
 
 Rows represent stopped runs that are still waiting for an operator slash
-command. The initial use case is cost-cap approval/rejection, where the
-runner is failed intentionally but `$approve` or `$reject` must survive an
-orchestrator restart.
+command, such as cost-cap approval/rejection or a manually stopped review
+monitor that can later resume via `$retry` or `$approve`.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import aiosqlite
 KIND_COST_CAP = "cost_cap"
 KIND_IMPLEMENT_FAILED = "implement_failed"
 KIND_REVIEW_FAILED = "review_failed"
+KIND_REVIEW_STOPPED = "review_stopped"
 KIND_MERGE = "merge"
 
 
@@ -151,6 +151,7 @@ __all__ = [
     "KIND_IMPLEMENT_FAILED",
     "KIND_MERGE",
     "KIND_REVIEW_FAILED",
+    "KIND_REVIEW_STOPPED",
     "OperatorWait",
     "delete",
     "get",

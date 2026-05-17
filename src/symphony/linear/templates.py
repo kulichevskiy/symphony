@@ -133,6 +133,17 @@ def cost_cap_reached(v: CommentVars) -> str:
     )
 
 
+def review_stopped(v: CommentVars) -> str:
+    return (
+        f"⏸️ **Review monitor stopped — pipeline paused**\n\n"
+        f"Symphony stopped review monitoring for `{v.repo}#{v.issue}`.\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n\n"
+        "Reply with `$retry` or `$approve` to resume review monitoring. "
+        "Reply with `$reject` or `$stop` to leave it halted.\n"
+    )
+
+
 def failed(v: CommentVars) -> str:
     body = (
         f"🔴 **{v.stage.title()} stage failed — pipeline halted**\n\n"
