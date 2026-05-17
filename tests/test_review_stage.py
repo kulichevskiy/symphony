@@ -183,6 +183,19 @@ def _comment(
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls_by_path: dict[str, int] = {}
+
+    async def fake_workspace_head_sha(workspace_path: Path) -> str:
+        key = str(workspace_path)
+        call_count = calls_by_path.get(key, 0)
+        calls_by_path[key] = call_count + 1
+        return "before-fix-sha" if call_count % 2 == 0 else "after-fix-sha"
+
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", fake_workspace_head_sha)
+
+
 def test_github_commit_url_uses_configured_host() -> None:
     assert (
         poll_module._github_commit_url("ghe.example.com/org/repo", "abc123")
@@ -2624,6 +2637,95 @@ async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity
         fix_runs = [r for r in history if r.stage == "review_fix"]
         assert len(fix_runs) == 1
         assert fix_runs[0].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_without_new_commit_parks_without_retrigger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unchanged_head(_workspace_path: Path) -> str:
+        return "same-head-sha"
+
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", unchanged_head)
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"})
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.pr_reviews = AsyncMock(return_value=[_codex_review_entry()])
+        gh.pr_review_comments = AsyncMock(return_value=[_codex_inline_comment()])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is not None
+        push_fn.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Reviewer feedback detected" in b for b in posted), posted
+        assert not any("Fix pushed" in b for b in posted), posted
+        assert any(
+            "completed without advancing symphony/eng-1" in b
+            and "Reply with `$retry` or `$approve`" in b
+            for b in posted
+        ), posted
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.run_id == "review-run"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert monitor.status == "failed"
+        assert fix_run.status == "failed"
     finally:
         await conn.close()
 
