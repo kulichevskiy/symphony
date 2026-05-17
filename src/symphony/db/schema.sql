@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS comment_events (
 
 CREATE INDEX IF NOT EXISTS idx_comment_events_issue ON comment_events(issue_id);
 
--- Linear webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
+-- Webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
 -- pruned opportunistically before each insert based on the configured TTL.
 -- `status` remains pending until the handler succeeds, so retries are not
 -- acknowledged as duplicates before their side effects are durable.

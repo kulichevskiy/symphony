@@ -58,6 +58,7 @@ from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import CheckRun as GitHubCheckRun
 from ..github.client import GitHub, GitHubError, PRChecks
+from ..github.webhook import GitHubWebhookEvent
 from ..linear import slash
 from ..linear.blockers import is_blocked, open_blocker_ids
 from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
@@ -1016,6 +1017,24 @@ class Orchestrator:
             kind=event_type or "unknown",
             handled=False,
             detail="ignored event type",
+        )
+
+    async def handle_github_webhook(
+        self, event: GitHubWebhookEvent
+    ) -> WebhookDispatchResult:
+        """Accept a verified GitHub webhook event without mutating state yet."""
+        log.info(
+            "github webhook event received: repo=%s type=%s action=%s pr=%s delivery=%s",
+            event.repo,
+            event.event_type,
+            event.action,
+            event.pr_number,
+            event.delivery_id,
+        )
+        return WebhookDispatchResult(
+            kind=f"github.{event.event_type}",
+            handled=True,
+            detail="accepted for future reconciler",
         )
 
     async def _handle_webhook_comment(

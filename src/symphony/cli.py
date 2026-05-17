@@ -21,6 +21,7 @@ import click
 from . import db
 from .app import build_server_config, create_app
 from .config import Config, RepoBinding
+from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
@@ -70,6 +71,26 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
     return None
 
 
+def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
+    enabled_bindings = [binding for binding in cfg.repos if binding.webhook_enabled]
+    repo_secrets = {
+        binding.github_repo: binding.webhook_secret
+        for binding in enabled_bindings
+        if binding.webhook_secret
+    }
+    if not enabled_bindings and not cfg.github_webhook_secret and not repo_secrets:
+        return None
+    try:
+        return GitHubWebhookSettings(
+            secret=cfg.github_webhook_secret,
+            repo_secrets=repo_secrets,
+            enabled_repos=frozenset(binding.github_repo for binding in enabled_bindings),
+            dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--config",
@@ -107,7 +128,8 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
-            if cfg.linear_webhook_secret or cfg.ui.enabled:
+            github_webhook_settings = _github_webhook_settings(cfg)
+            if cfg.linear_webhook_secret or github_webhook_settings or cfg.ui.enabled:
                 import uvicorn
 
                 webhook_settings = (
@@ -125,6 +147,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     orch,
                     conn,
                     webhook_settings,
+                    github_webhook_settings,
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),

@@ -121,6 +121,32 @@ repos:
     assert cfg.repos[0].activity_comment_event_threshold == 5
 
 
+def test_github_webhook_config_defaults_and_overrides(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "global-secret")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    webhook_secret: repo-secret
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+    webhook_enabled: false
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.github_webhook_secret == "global-secret"
+    assert cfg.repos[0].webhook_enabled is True
+    assert cfg.repos[0].webhook_secret == "repo-secret"
+    assert cfg.repos[1].webhook_enabled is False
+    assert cfg.repos[1].webhook_secret is None
+
+
 def test_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""

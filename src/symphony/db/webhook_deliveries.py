@@ -1,4 +1,4 @@
-"""DAO for Linear webhook delivery idempotency."""
+"""DAO for webhook delivery idempotency."""
 
 from __future__ import annotations
 
