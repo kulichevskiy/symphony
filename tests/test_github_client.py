@@ -205,6 +205,42 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
     ]
 
 
+async def test_pr_external_snapshot_keeps_metadata_when_recent_comments_fail(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    view = json.dumps(
+        {
+            "number": 42,
+            "state": "OPEN",
+            "url": "https://github.com/org/r/pull/42",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "mergedAt": None,
+            "mergedBy": None,
+            "statusCheckRollup": [{"state": "SUCCESS"}],
+        }
+    )
+    log = fake_gh(
+        {
+            "pr view 42": [0, view],
+            "repos/org/r/pulls/42/comments": [1, "missing scope"],
+        }
+    )
+    gh = GitHub()
+
+    snapshot = await gh.pr_external_snapshot(42, repo="org/r")
+
+    assert snapshot["state"] == "OPEN"
+    assert snapshot["check_summary"] == {
+        "passing": 1,
+        "failing": 0,
+        "pending": 0,
+        "total": 1,
+    }
+    assert snapshot["comments"] == []
+    assert "missing scope" in snapshot["comments_error"]
+    calls = _calls(log)
+    assert len(calls) == 2
+
+
 # ---- pr_checks ------------------------------------------------------
 
 

@@ -248,7 +248,12 @@ class GitHub:
         if not isinstance(view, dict):
             raise GitHubError(f"pr view: expected object, got {type(view).__name__}")
 
-        comments = await self.pr_review_comments_recent(pr, repo=repo, limit=5)
+        comments_error: str | None = None
+        try:
+            comments = await self.pr_review_comments_recent(pr, repo=repo, limit=5)
+        except GitHubError as exc:
+            comments = []
+            comments_error = str(exc)
         comments.sort(
             key=lambda comment: str(
                 comment.get("updated_at") or comment.get("created_at") or ""
@@ -256,7 +261,7 @@ class GitHub:
             reverse=True,
         )
         merged_by = view.get("mergedBy")
-        return {
+        snapshot: dict[str, Any] = {
             "pr_number": view.get("number"),
             "state": view.get("state"),
             "url": view.get("url"),
@@ -280,6 +285,9 @@ class GitHub:
                 for comment in comments[:5]
             ],
         }
+        if comments_error is not None:
+            snapshot["comments_error"] = comments_error
+        return snapshot
 
     async def pr_comment(self, pr: int | str, body: str, *, repo: str | None = None) -> None:
         argv = ["pr", "comment", str(pr), "--body", body, *self._repo_args(repo)]
