@@ -1878,6 +1878,7 @@ class Orchestrator:
             sha=head_sha,
         )
         ci_runs = [_review_check_from_gh(c) for c in checks.runs]
+        issue_comments: list[dict[str, object]] | None = None
 
         # Only fetch review signals when CI is clean — Rule 1 (failing CI)
         # pre-empts all comment/review rules, so avoid the extra API calls.
@@ -2002,6 +2003,19 @@ class Orchestrator:
                 )
                 reactions = ()
 
+            try:
+                issue_comments = await self._gh.pr_issue_comments(
+                    state.pr_number, repo=binding.github_repo
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not fetch PR issue comments for %s#%d: %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    e,
+                )
+                issue_comments = []
+
             verdict = review_classifier(
                 comments=comments,
                 ci=ci_runs,
@@ -2009,7 +2023,10 @@ class Orchestrator:
                     head_sha=head_sha,
                     head_committed_at=head_committed_at,
                     reviews=reviews,
-                    reactions=reactions,
+                    reactions=(
+                        *reactions,
+                        *_codex_lgtm_reactions_from_issue_comments(issue_comments),
+                    ),
                     mergeable=mergeable,
                 ),
             )
@@ -2021,6 +2038,7 @@ class Orchestrator:
             state=state,
             pr_number=state.pr_number,
             head_committed_at=head_committed_at,
+            issue_comments=issue_comments,
         )
 
         if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
@@ -4082,21 +4100,27 @@ class Orchestrator:
         state: db.review_state.ReviewState,
         pr_number: int | None,
         head_committed_at: str = "",
+        issue_comments: list[dict[str, object]] | None = None,
     ) -> None:
         """Fetch PR issue comments; if Codex posted a 'no issues' comment that
         hasn't been announced in Linear yet, post the notification once."""
         if pr_number is None:
             return
-        try:
-            raw = await self._gh.pr_issue_comments(pr_number, repo=binding.github_repo)
-        except GitHubError as e:
-            log.warning(
-                "could not fetch issue comments for %s#%d: %s",
-                binding.github_repo,
-                pr_number,
-                e,
-            )
-            return
+        if issue_comments is None:
+            try:
+                raw = await self._gh.pr_issue_comments(
+                    pr_number, repo=binding.github_repo
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not fetch issue comments for %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                return
+        else:
+            raw = issue_comments
 
         lgtm_comment: dict[str, Any] | None = None
         cycle_started_raw = run.started_at

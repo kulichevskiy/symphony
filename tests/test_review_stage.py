@@ -2724,6 +2724,71 @@ async def test_stale_codex_signals_before_head_commit_do_not_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_later_codex_lgtm_issue_comment_supersedes_inline_feedback(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"})
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-13T19:00:00Z")
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                _codex_inline_comment(
+                    commit_sha="head-sha",
+                    created_at="2026-05-13T19:05:00Z",
+                )
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(
+            return_value=[
+                {
+                    "id": 9999,
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Codex Review: Didn't find any major issues. Hooray!",
+                    "created_at": "2026-05-13T19:20:00Z",
+                }
+            ]
+        )
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        orch = Orchestrator(cfg, linear, conn, runner=runner, gh=gh)
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is None
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Codex reviewed" in b and "no issues" in b for b in posted), posted
+        assert not any("Reviewer feedback detected" in b for b in posted), posted
+
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 0
+        assert state.last_trigger_signature == ""
+        assert state.codex_lgtm_comment_id == "9999"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_codex_inline_comment_dedup_skips_identical_back_to_back(
     tmp_path: Path,
 ) -> None:
