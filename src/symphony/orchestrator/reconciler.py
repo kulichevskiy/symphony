@@ -207,11 +207,16 @@ class Reconciler:
         prs = await self._open_prs(issue_id)
         if wait is None and not prs:
             return 0
-        if not await self._candidate_enabled(issue_id, str(issue_row["team_key"])):
+        matched_bindings = self._matched_bindings(
+            team_key=str(issue_row["team_key"]),
+            wait=wait,
+            prs=prs,
+        )
+        if not any(binding.reconcile_enabled for binding in matched_bindings):
             return 0
 
         observed_at = self._now().isoformat()
-        done_state_names = self._done_state_names(str(issue_row["team_key"]))
+        done_state_names = self._done_state_names(matched_bindings)
         try:
             linear_issue, linear_payload = await self._linear_payload(issue_id)
             github_prs, github_payload = await self._github_payload(prs)
@@ -459,6 +464,16 @@ class Reconciler:
     async def _candidate_enabled(self, issue_id: str, team_key: str) -> bool:
         wait = await db.operator_waits.get(self._conn, issue_id)
         prs = await self._open_prs(issue_id)
+        matched = self._matched_bindings(team_key=team_key, wait=wait, prs=prs)
+        return any(binding.reconcile_enabled for binding in matched)
+
+    def _matched_bindings(
+        self,
+        *,
+        team_key: str,
+        wait: db.operator_waits.OperatorWait | None,
+        prs: list[LocalIssuePr],
+    ) -> list[RepoBinding]:
         matched: list[RepoBinding] = []
         if wait is not None:
             matched.extend(
@@ -470,9 +485,7 @@ class Reconciler:
             )
         for pr in prs:
             matched.extend(self._bindings_for_pr(team_key=team_key, pr=pr))
-        if not matched:
-            return False
-        return any(binding.reconcile_enabled for binding in matched)
+        return matched
 
     def _bindings_for_pr(
         self,
@@ -519,11 +532,11 @@ class Reconciler:
             bindings.append(binding)
         return bindings
 
-    def _done_state_names(self, team_key: str) -> set[str]:
+    def _done_state_names(self, bindings: list[RepoBinding]) -> set[str]:
         names = {
             binding.linear_states.done
-            for binding in self.config.repos
-            if binding.linear_team_key == team_key and binding.reconcile_enabled
+            for binding in bindings
+            if binding.reconcile_enabled
         }
         return names or {"Done"}
 

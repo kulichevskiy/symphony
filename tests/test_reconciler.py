@@ -85,13 +85,14 @@ def _binding(
     *,
     issue_label: str | None = "symphony",
     reconcile_enabled: bool = True,
+    done_state: str = "Done",
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
         issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
-        linear_states=LinearStates(ready="Todo", done="Done"),
+        linear_states=LinearStates(ready="Todo", done=done_state),
     )
 
 
@@ -117,7 +118,12 @@ async def _seed_run(conn: aiosqlite.Connection, issue_id: str, run_id: str) -> N
     )
 
 
-async def _seed_merge_wait(conn: aiosqlite.Connection, issue_id: str = "iss-1") -> None:
+async def _seed_merge_wait(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    issue_label: str = "symphony",
+) -> None:
     await _seed_run(conn, issue_id, f"run-{issue_id}")
     await db.operator_waits.upsert(
         conn,
@@ -126,7 +132,7 @@ async def _seed_merge_wait(conn: aiosqlite.Connection, issue_id: str = "iss-1") 
         kind=db.operator_waits.KIND_MERGE,
         linear_team_key="ENG",
         github_repo="org/repo",
-        issue_label="symphony",
+        issue_label=issue_label,
         created_at="2026-05-17T10:01:00Z",
     )
 
@@ -248,6 +254,36 @@ async def test_tick_writes_dry_run_observations_for_each_source(
     ]
     assert json.loads(rows[0][3])["reason"] == "periodic"
     assert json.loads(rows[1][3])["prs"][0]["merged"] is True
+
+
+@pytest.mark.asyncio
+async def test_linear_done_drift_uses_candidate_binding_done_state(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn, issue_label="backend")
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(issue_label="backend", done_state="Shipped"),
+                    _binding(issue_label="frontend", done_state="Done"),
+                ]
+            ),
+            conn,
+            _FakeLinear(state_name="Done"),  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+    finally:
+        await conn.close()
+
+    assert rows[0][0] == "linear"
+    assert rows[0][1] is None
 
 
 @pytest.mark.asyncio
