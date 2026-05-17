@@ -165,11 +165,16 @@ def _issue_done() -> LinearIssue:
     )
 
 
-def _comment(body: str, *, cid: str = "c1") -> LinearComment:
+def _comment(
+    body: str,
+    *,
+    cid: str = "c1",
+    created_at: str = "2026-05-11T12:00:00+00:00",
+) -> LinearComment:
     return LinearComment(
         id=cid,
         body=body,
-        created_at="2026-05-11T12:00:00+00:00",
+        created_at=created_at,
         author_name="user",
         author_is_me=False,
         external_thread_type=None,
@@ -581,6 +586,7 @@ async def test_red_ci_workspace_failure_does_not_consume_iteration(
             workspace=workspace,
             push_fn=AsyncMock(),
         )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
 
         await _poll_review_and_wait(orch)
 
@@ -1413,6 +1419,7 @@ async def test_stop_intent_cancels_review_monitor_and_active_fix_run(
             workspace=workspace,
             push_fn=AsyncMock(),
         )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
 
         tasks = await orch._poll_review_runs()  # noqa: SLF001
         try:
@@ -1425,13 +1432,20 @@ async def test_stop_intent_cancels_review_monitor_and_active_fix_run(
             assert runner.release.is_set()
             assert "review-run" not in orch._review_poll_run_ids  # noqa: SLF001
             assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
-            assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+            assert orch._dispatch_run_ids["iss-1"] == "review-run"  # noqa: SLF001
+            assert "review-run" in orch._operator_wait_run_ids  # noqa: SLF001
             history = await db.runs.history_for_issue(conn, "iss-1")
             monitor = history[0]
             assert monitor.id == "review-run"
             assert monitor.status == "interrupted"
             fix_run = next(r for r in history if r.id == fix_run_id)
             assert fix_run.status == "interrupted"
+            wait = await db.operator_waits.get(conn, "iss-1")
+            assert wait is not None
+            assert wait.run_id == "review-run"
+            assert wait.kind == db.operator_waits.KIND_REVIEW_STOPPED
+            posted = [c.args[1] for c in linear.post_comment.await_args_list]
+            assert any("$retry" in body and "$approve" in body for body in posted)
         finally:
             runner.release.set()
             if tasks:
@@ -1517,7 +1531,9 @@ async def test_stop_intent_cancels_review_monitor_run(tmp_path: Path) -> None:
         )
 
         runner = AsyncMock()
-        orch = Orchestrator(cfg, AsyncMock(), conn, runner=runner, gh=MagicMock())
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = Orchestrator(cfg, linear, conn, runner=runner, gh=MagicMock())
         review_task = asyncio.create_task(asyncio.Event().wait())
         orch._review_poll_run_ids.add("review-run")  # noqa: SLF001
         orch._review_poll_issue_ids["iss-1"] = "review-run"  # noqa: SLF001
@@ -1541,7 +1557,108 @@ async def test_stop_intent_cancels_review_monitor_run(tmp_path: Path) -> None:
         history = await db.runs.history_for_issue(conn, "iss-1")
         run = next(r for r in history if r.id == "review-run")
         assert run.status == "interrupted"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "review-run"
+        assert wait.kind == db.operator_waits.KIND_REVIEW_STOPPED
+        assert orch._dispatch_run_ids["iss-1"] == "review-run"  # noqa: SLF001
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Review monitor stopped" in body for body in posted)
     finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_after_stopped_review_monitor_restarts_review(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    review_task: asyncio.Task[bool] | None = None
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.comments_since = AsyncMock(
+            side_effect=[
+                [
+                    _comment(
+                        "$stop",
+                        cid="c-stop",
+                        created_at="2026-05-10T00:01:00+00:00",
+                    )
+                ],
+                [
+                    _comment(
+                        "$retry",
+                        cid="c-retry",
+                        created_at="2026-05-10T00:02:00+00:00",
+                    )
+                ],
+            ]
+        )
+
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        review_task = asyncio.create_task(asyncio.Event().wait())
+        orch._review_poll_run_ids.add("review-run")  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = "review-run"  # noqa: SLF001
+        orch._review_poll_run_tasks["review-run"] = review_task  # noqa: SLF001
+
+        poll_started = asyncio.Event()
+        poll_release = asyncio.Event()
+
+        async def blocked_review_poll(*_args) -> None:  # type: ignore[no-untyped-def]
+            poll_started.set()
+            await poll_release.wait()
+
+        orch._poll_review_run_with_limits = blocked_review_poll  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+        await asyncio.gather(review_task, return_exceptions=True)
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_STOPPED
+        assert wait.run_id == "review-run"
+        assert orch._dispatch_run_ids["iss-1"] == "review-run"  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+        await asyncio.wait_for(poll_started.wait(), timeout=1)
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        running = [r for r in history if r.stage == "review" and r.status == "running"]
+        assert len(running) == 1
+        assert running[0].id != "review-run"
+        assert orch._review_poll_issue_ids["iss-1"] == running[0].id  # noqa: SLF001
+        assert running[0].id in orch._review_poll_run_ids  # noqa: SLF001
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert "review-run" not in orch._operator_wait_run_ids  # noqa: SLF001
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Review monitor stopped" in body for body in bodies)
+        assert any("Resumed" in body for body in bodies)
+    finally:
+        if review_task is not None:
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
+        if "orch" in locals():
+            for task in tuple(orch._review_poll_tasks):  # noqa: SLF001
+                task.cancel()
+            await asyncio.gather(
+                *tuple(orch._review_poll_tasks),  # noqa: SLF001
+                return_exceptions=True,
+            )
         await conn.close()
 
 
@@ -1778,6 +1895,7 @@ async def test_retry_slash_command_restarts_review_monitor(tmp_path: Path) -> No
         from symphony.linear.client import LinearComment
 
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
         # Manually set up the operator wait as _fail_review_run would have.
         await orch._track_review_failed_wait("iss-1", "review-run", _binding())  # noqa: SLF001
 
@@ -2822,6 +2940,7 @@ async def test_failing_ci_dispatch_retrigger_checks_existing_approval(
         orch = Orchestrator(
             cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=AsyncMock(),
         )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
 
         await _poll_review_and_wait(orch)
 

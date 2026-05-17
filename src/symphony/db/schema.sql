@@ -136,8 +136,8 @@ CREATE TABLE IF NOT EXISTS activity_command_marks (
 );
 
 -- Runs waiting for an explicit operator slash command after the runner has
--- stopped. Cost-cap breaches use this so `/approve` and `/reject` remain
--- actionable after an orchestrator restart.
+-- stopped. Cost-cap breaches and manually stopped review monitors use this so
+-- resume/reject slash commands remain actionable after an orchestrator restart.
 CREATE TABLE IF NOT EXISTS operator_waits (
     issue_id        TEXT PRIMARY KEY REFERENCES issues(id),
     run_id          TEXT NOT NULL REFERENCES runs(id),
