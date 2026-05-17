@@ -608,6 +608,22 @@ async def _git_fetch(workspace_path: Path) -> None:
         )
 
 
+async def _git_fetch_branch(workspace_path: Path, branch: str) -> None:
+    """Fetch ``origin/branch`` so remote-head validation has a fresh baseline."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin", branch,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git fetch origin {branch} failed: {stderr.decode(errors='replace').strip()}"
+        )
+
+
 async def _git_status_short(workspace_path: Path) -> str:
     """Return ``git status --short`` output for failure diagnostics."""
     proc = await asyncio.create_subprocess_exec(
@@ -721,9 +737,14 @@ async def _git_add_and_continue_rebase(
 
 async def _workspace_head_sha(workspace_path: Path) -> str:
     """Return the HEAD commit SHA of *workspace_path*, or "" on error."""
+    return await _workspace_ref_sha(workspace_path, "HEAD")
+
+
+async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
+    """Return the commit SHA for *ref* in *workspace_path*, or "" on error."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "HEAD",
+            "git", "rev-parse", "--verify", ref,
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -2294,6 +2315,36 @@ class Orchestrator:
                 )
                 return False
 
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not read review fix-run remote HEAD for {branch}",
+                    last_log="",
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
             fix_run_id = str(uuid.uuid4())
             await db.runs.create(
                 self._conn,
@@ -2361,6 +2412,18 @@ class Orchestrator:
                 )
                 return False
 
+            pushed_sha = await self._validate_review_fix_advanced(
+                run=run,
+                fix_run_id=fix_run_id,
+                binding=binding,
+                issue=issue,
+                workspace_path=workspace_path,
+                branch=branch,
+                start_sha=start_sha,
+            )
+            if not pushed_sha:
+                return False
+
             await db.runs.update_status(
                 self._conn,
                 fix_run_id,
@@ -2368,7 +2431,6 @@ class Orchestrator:
                 ended_at=datetime.now(UTC).isoformat(),
             )
 
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
             try:
                 await self._push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
@@ -2572,6 +2634,36 @@ class Orchestrator:
                 )
                 return False
 
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not read review fix-run remote HEAD for {branch}",
+                    last_log="",
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
             fix_run_id = str(uuid.uuid4())
             await db.runs.create(
                 self._conn,
@@ -2639,6 +2731,18 @@ class Orchestrator:
                 )
                 return False
 
+            pushed_sha = await self._validate_review_fix_advanced(
+                run=run,
+                fix_run_id=fix_run_id,
+                binding=binding,
+                issue=issue,
+                workspace_path=workspace_path,
+                branch=branch,
+                start_sha=start_sha,
+            )
+            if not pushed_sha:
+                return False
+
             await db.runs.update_status(
                 self._conn,
                 fix_run_id,
@@ -2646,7 +2750,6 @@ class Orchestrator:
                 ended_at=datetime.now(UTC).isoformat(),
             )
 
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
             try:
                 await self._push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
@@ -2662,7 +2765,6 @@ class Orchestrator:
                 )
                 return False
 
-            pushed_sha = await _workspace_head_sha(workspace_path)
             total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v_done = CommentVars(
                 stage="review",
@@ -2768,6 +2870,20 @@ class Orchestrator:
                     issue=issue,
                     error=f"workspace sync failed: {e}",
                     last_log=str(e),
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not read review fix-run remote HEAD for {branch}",
+                    last_log="",
+                    auto_retry=False,
+                    operator_wait=True,
                 )
                 return False
 
@@ -2995,6 +3111,18 @@ class Orchestrator:
             if cost > 0:
                 await db.runs.add_cost(self._conn, fix_run_id, cost)
 
+            pushed_sha = await self._validate_review_fix_advanced(
+                run=run,
+                fix_run_id=fix_run_id,
+                binding=binding,
+                issue=issue,
+                workspace_path=workspace_path,
+                branch=branch,
+                start_sha=start_sha,
+            )
+            if not pushed_sha:
+                return False
+
             await db.runs.update_status(
                 self._conn,
                 fix_run_id,
@@ -3020,7 +3148,6 @@ class Orchestrator:
                 )
                 return False
 
-            pushed_sha = await _workspace_head_sha(workspace_path)
             total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v_done = CommentVars(
                 stage="review",
@@ -3047,6 +3174,44 @@ class Orchestrator:
                 state=state,
             )
             return True
+
+    async def _validate_review_fix_advanced(
+        self,
+        *,
+        run: db.runs.Run,
+        fix_run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        workspace_path: Path,
+        branch: str,
+        start_sha: str,
+    ) -> str:
+        current_sha = await _workspace_head_sha(workspace_path)
+        if current_sha and current_sha != start_sha:
+            return current_sha
+
+        short_sha = (current_sha or start_sha)[:12] or "(unknown)"
+        status_short = await _git_status_short(workspace_path)
+        last_log = f"git status --short:\n{status_short}" if status_short else ""
+        await db.runs.update_status(
+            self._conn,
+            fix_run_id,
+            "failed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+        await self._fail_review_run(
+            run=run,
+            binding=binding,
+            issue=issue,
+            error=(
+                f"review fix-run completed without advancing {branch}; "
+                f"HEAD stayed at {short_sha}"
+            ),
+            last_log=last_log,
+            auto_retry=False,
+            operator_wait=True,
+        )
+        return ""
 
     async def _failing_check_log_tail(
         self,
@@ -3503,6 +3668,8 @@ class Orchestrator:
         issue: LinearIssue,
         error: str,
         last_log: str,
+        auto_retry: bool = True,
+        operator_wait: bool = False,
     ) -> None:
         await db.runs.update_status(
             self._conn,
@@ -3510,6 +3677,8 @@ class Orchestrator:
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+        if operator_wait:
+            await self._track_review_failed_wait(issue.id, run.id, binding)
         state = await db.review_state.get(self._conn, issue.id)
         cost = await db.runs.cost_for_issue(self._conn, issue.id)
         body = failed(
@@ -3526,9 +3695,14 @@ class Orchestrator:
                 cost=f"${cost:.4f}",
                 error=error,
                 last_log=last_log,
-                auto_retry=True,
+                auto_retry=auto_retry,
             )
         )
+        if operator_wait:
+            body += (
+                "\nReply with `$retry` or `$approve` to resume review monitoring. "
+                "Reply with `$reject` or `$stop` to leave it halted.\n"
+            )
         try:
             await self.linear.post_comment(issue.id, truncate_body(body))
         except LinearError as e:

@@ -183,6 +183,22 @@ def _comment(
     )
 
 
+@pytest.fixture(autouse=True)
+def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_workspace_head_sha(_workspace_path: Path) -> str:
+        return "after-fix-sha"
+
+    async def fake_workspace_ref_sha(_workspace_path: Path, _ref: str) -> str:
+        return "before-fix-sha"
+
+    async def fake_git_fetch_branch(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", fake_workspace_head_sha)
+    monkeypatch.setattr(poll_module, "_workspace_ref_sha", fake_workspace_ref_sha)
+    monkeypatch.setattr(poll_module, "_git_fetch_branch", fake_git_fetch_branch)
+
+
 def test_github_commit_url_uses_configured_host() -> None:
     assert (
         poll_module._github_commit_url("ghe.example.com/org/repo", "abc123")
@@ -2512,6 +2528,93 @@ async def test_merge_conflict_fix_reports_status_when_rebase_has_no_unresolved_p
 
 
 @pytest.mark.asyncio
+async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.repo_default_branch = AsyncMock(return_value="main")
+        gh.pr_comment = AsyncMock()
+
+        synced = False
+
+        async def sync_workspace(_workspace_path: Path, _branch: str) -> None:
+            nonlocal synced
+            synced = True
+
+        async def workspace_head(_workspace_path: Path) -> str:
+            return "remote-head-sha" if synced else "stale-local-sha"
+
+        async def workspace_ref(_workspace_path: Path, _ref: str) -> str:
+            return "remote-head-sha" if synced else "stale-local-sha"
+
+        monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", sync_workspace)
+        monkeypatch.setattr(poll_module, "_workspace_head_sha", workspace_head)
+        monkeypatch.setattr(poll_module, "_workspace_ref_sha", workspace_ref)
+        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=True))
+
+        force_push = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_FakeRunner([]),
+            gh=gh,
+            workspace=workspace,
+            force_push_fn=force_push,
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+        issue = _issue_in_progress()
+        result = await orch._dispatch_merge_conflict_fix_run(  # noqa: SLF001
+            run=run,
+            binding=cfg.repos[0],
+            issue=issue,
+            iteration=1,
+        )
+
+        assert result is False
+        force_push.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert not any("Fix pushed" in b for b in posted), posted
+        assert any("completed without advancing symphony/eng-1" in b for b in posted), posted
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert monitor.status == "failed"
+        assert fix_run.status == "failed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_conflict_fix_run_continues_through_later_conflicts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2702,6 +2805,179 @@ async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity
         fix_runs = [r for r in history if r.stage == "review_fix"]
         assert len(fix_runs) == 1
         assert fix_runs[0].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_without_new_commit_parks_without_retrigger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unchanged_head(_workspace_path: Path) -> str:
+        return "same-head-sha"
+
+    async def unchanged_ref(_workspace_path: Path, _ref: str) -> str:
+        return "same-head-sha"
+
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", unchanged_head)
+    monkeypatch.setattr(poll_module, "_workspace_ref_sha", unchanged_ref)
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"})
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.pr_reviews = AsyncMock(return_value=[_codex_review_entry()])
+        gh.pr_review_comments = AsyncMock(return_value=[_codex_inline_comment()])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is not None
+        push_fn.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Reviewer feedback detected" in b for b in posted), posted
+        assert not any("Fix pushed" in b for b in posted), posted
+        assert any(
+            "completed without advancing symphony/eng-1" in b
+            and "Reply with `$retry` or `$approve`" in b
+            for b in posted
+        ), posted
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.run_id == "review-run"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert monitor.status == "failed"
+        assert fix_run.status == "failed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_pushes_existing_local_commit_from_prior_push_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def local_head(_workspace_path: Path) -> str:
+        return "local-unpushed-sha"
+
+    async def remote_ref(_workspace_path: Path, _ref: str) -> str:
+        return "remote-head-sha"
+
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", local_head)
+    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_ref)
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"})
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-11T17:50:00Z")
+        gh.pr_reviews = AsyncMock(side_effect=[[_codex_review_entry()], []])
+        gh.pr_review_comments = AsyncMock(side_effect=[[_codex_inline_comment()], []])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Fix pushed" in b for b in posted), posted
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert fix_run.status == "completed"
     finally:
         await conn.close()
 
