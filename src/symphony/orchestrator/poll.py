@@ -909,7 +909,6 @@ class Orchestrator:
             max(config.global_max_concurrent, 1)
         )
         self._review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore] = {}
-        self._github_webhook_events: asyncio.Queue[GitHubWebhookEvent] = asyncio.Queue()
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -1023,9 +1022,20 @@ class Orchestrator:
     async def handle_github_webhook(
         self, event: GitHubWebhookEvent
     ) -> WebhookDispatchResult:
-        """Queue a verified GitHub webhook event for a later reconciler slice."""
-        await self._github_webhook_events.put(event)
-        return WebhookDispatchResult(kind=f"github.{event.event_type}", handled=True)
+        """Accept a verified GitHub webhook event without mutating state yet."""
+        log.info(
+            "github webhook event received: repo=%s type=%s action=%s pr=%s delivery=%s",
+            event.repo,
+            event.event_type,
+            event.action,
+            event.pr_number,
+            event.delivery_id,
+        )
+        return WebhookDispatchResult(
+            kind=f"github.{event.event_type}",
+            handled=True,
+            detail="accepted for future reconciler",
+        )
 
     async def _handle_webhook_comment(
         self, payload: Mapping[str, Any]
