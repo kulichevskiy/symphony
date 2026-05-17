@@ -7,14 +7,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
-from fastapi import APIRouter, FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
+from .ui.api import create_api_router
 from .ui.db import ReadOnlyDbPool
 from .ui.issues import create_issue_detail_router
 from .webhook import (
@@ -38,19 +38,6 @@ class SPAStaticFiles(StaticFiles):
             if exc.status_code != 404:
                 raise
         return await super().get_response("index.html", scope)
-
-
-def create_api_router() -> APIRouter:
-    router = APIRouter(prefix="/api")
-
-    @router.api_route(
-        "/{path:path}",
-        methods=["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
-    )
-    async def api_placeholder(path: str) -> JSONResponse:
-        return JSONResponse({"detail": "Not Found"}, status_code=404)
-
-    return router
 
 
 def create_app(
@@ -93,7 +80,7 @@ def create_app(
         if ui_pool is not None:
             app.include_router(create_issue_detail_router(ui_pool))
 
-        app.include_router(create_api_router())
+        app.include_router(create_api_router(ui_pool))
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST
         if dist_dir.exists():
             app.mount(
