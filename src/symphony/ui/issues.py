@@ -291,24 +291,36 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
 
                 UNION ALL
 
-                SELECT ts,
-                       CASE
-                           WHEN new_value IS NULL THEN 'operator_wait_ended'
-                           ELSE 'operator_wait_started'
-                       END AS kind,
+                SELECT ts, 'operator_wait_ended' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       COALESCE(new_value, old_value) AS wait_kind
+                       old_value AS wait_kind
                 FROM state_transitions
                 WHERE issue_id = ?
                   AND table_name = 'operator_waits'
                   AND field = 'kind'
+                  AND old_value IS NOT NULL
+
+                UNION ALL
+
+                SELECT ts, 'operator_wait_started' AS kind,
+                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       new_value AS wait_kind
+                FROM state_transitions
+                WHERE issue_id = ?
+                  AND table_name = 'operator_waits'
+                  AND field = 'kind'
+                  AND new_value IS NOT NULL
             )
             ORDER BY ts ASC, kind ASC
             """,
             (
+                issue_id,
                 issue_id,
                 issue_id,
                 issue_id,

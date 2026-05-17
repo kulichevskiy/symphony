@@ -171,7 +171,11 @@ async def _seed_issue_timeline(conn: aiosqlite.Connection) -> None:
                 '2026-05-17T10:04:30Z'
             ),
             (
-                'iss-timeline', 'operator_waits', 'kind', 'review_stopped', NULL,
+                'iss-timeline', 'operator_waits', 'kind', 'review_stopped', 'merge',
+                '2026-05-17T10:04:45Z'
+            ),
+            (
+                'iss-timeline', 'operator_waits', 'kind', 'merge', NULL,
                 '2026-05-17T10:05:30Z'
             )
         """
@@ -431,6 +435,16 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
             "payload": {"kind": "review_stopped"},
         },
         {
+            "ts": "2026-05-17T10:04:45Z",
+            "kind": "operator_wait_ended",
+            "payload": {"kind": "review_stopped"},
+        },
+        {
+            "ts": "2026-05-17T10:04:45Z",
+            "kind": "operator_wait_started",
+            "payload": {"kind": "merge"},
+        },
+        {
             "ts": "2026-05-17T10:05:00Z",
             "kind": "run_ended",
             "payload": {
@@ -443,7 +457,7 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
         {
             "ts": "2026-05-17T10:05:30Z",
             "kind": "operator_wait_ended",
-            "payload": {"kind": "review_stopped"},
+            "payload": {"kind": "merge"},
         },
         {
             "ts": "2026-05-17T10:06:00Z",
