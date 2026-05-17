@@ -172,6 +172,15 @@ def resumed(v: CommentVars) -> str:
     return f"✅ Resumed — advancing `{v.repo}#{v.issue}` to **{v.next_stage}**\n"
 
 
+def review_retry_requested(v: CommentVars) -> str:
+    return (
+        f"✅ **Review retry requested** on `{v.repo}#{v.issue}`\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n"
+        "- Re-posted `@codex review`; the next review signal will be treated as fresh.\n"
+    )
+
+
 def reviewing_feedback(v: CommentVars) -> str:
     return (
         f"👀 **Reviewer feedback detected** on `{v.repo}#{v.issue}` "
