@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from symphony.config import Config, LinearStates
+from symphony.config import Config, LinearStates, UIStatusThresholds
+from symphony.ui.status import CanonicalState
 
 _BINDING_STATES = """
     linear_states:
@@ -61,6 +63,55 @@ repos: []
     p.write_text(raw)
     cfg = Config.load(p)
     assert cfg.ui.enabled is False
+
+
+def test_ui_status_threshold_defaults_and_overrides(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    defaults = UIStatusThresholds().to_timedeltas()
+    assert defaults[CanonicalState.PAUSED] == timedelta(minutes=15)
+    assert defaults[CanonicalState.AWAITING_MERGE] == timedelta(hours=4)
+    assert defaults[CanonicalState.RUNNING] == timedelta(minutes=30)
+    assert defaults[CanonicalState.AWAITING_REVIEW_TRIGGER] == timedelta(minutes=10)
+    assert defaults[CanonicalState.PR_OPEN] == timedelta(hours=24)
+
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+ui:
+  status_stuck_thresholds:
+    paused_secs: 120
+    awaiting_merge_secs: 7200
+    running_secs: 1800
+    awaiting_review_trigger_secs: 60
+    pr_open_secs: 3600
+repos: []
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    thresholds = cfg.ui.status_stuck_thresholds.to_timedeltas()
+    assert thresholds[CanonicalState.PAUSED] == timedelta(seconds=120)
+    assert thresholds[CanonicalState.AWAITING_MERGE] == timedelta(seconds=7200)
+    assert thresholds[CanonicalState.RUNNING] == timedelta(seconds=1800)
+    assert thresholds[CanonicalState.AWAITING_REVIEW_TRIGGER] == timedelta(seconds=60)
+    assert thresholds[CanonicalState.PR_OPEN] == timedelta(seconds=3600)
+
+
+def test_ui_status_thresholds_accept_legacy_awaiting_operator_key(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+ui:
+  status_stuck_thresholds:
+    awaiting_operator_secs: 300
+repos: []
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    thresholds = cfg.ui.status_stuck_thresholds.to_timedeltas()
+    assert thresholds[CanonicalState.PAUSED] == timedelta(seconds=300)
 
 
 def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

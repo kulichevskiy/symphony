@@ -10,9 +10,13 @@ from typing import Any
 
 import aiosqlite
 
+from ..db import operator_waits
+
 
 class CanonicalState(StrEnum):
-    AWAITING_OPERATOR = "awaiting_operator"
+    HALTED = "halted"
+    PAUSED = "paused"
+    AWAITING_MERGE = "awaiting_merge"
     RUNNING = "running"
     FAILED = "failed"
     AWAITING_REVIEW_TRIGGER = "awaiting_review_trigger"
@@ -38,20 +42,38 @@ class CanonicalStatus:
 
 
 DEFAULT_STUCK_THRESHOLDS: Mapping[CanonicalState, timedelta] = {
-    CanonicalState.AWAITING_OPERATOR: timedelta(minutes=15),
+    CanonicalState.PAUSED: timedelta(minutes=15),
+    CanonicalState.AWAITING_MERGE: timedelta(hours=4),
     CanonicalState.RUNNING: timedelta(minutes=30),
     CanonicalState.AWAITING_REVIEW_TRIGGER: timedelta(minutes=10),
     CanonicalState.PR_OPEN: timedelta(hours=24),
 }
 
 STATE_PRIORITY: Mapping[CanonicalState, int] = {
-    CanonicalState.AWAITING_OPERATOR: 0,
-    CanonicalState.RUNNING: 1,
-    CanonicalState.FAILED: 2,
-    CanonicalState.AWAITING_REVIEW_TRIGGER: 3,
-    CanonicalState.PR_OPEN: 4,
-    CanonicalState.DONE: 5,
-    CanonicalState.IDLE: 6,
+    CanonicalState.HALTED: 0,
+    CanonicalState.FAILED: 1,
+    CanonicalState.PAUSED: 2,
+    CanonicalState.AWAITING_MERGE: 3,
+    CanonicalState.RUNNING: 4,
+    CanonicalState.AWAITING_REVIEW_TRIGGER: 5,
+    CanonicalState.PR_OPEN: 6,
+    CanonicalState.DONE: 7,
+    CanonicalState.IDLE: 8,
+}
+
+ALWAYS_STUCK_STATES = frozenset(
+    {
+        CanonicalState.HALTED,
+        CanonicalState.FAILED,
+    }
+)
+
+OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
+    operator_waits.KIND_IMPLEMENT_FAILED: CanonicalState.HALTED,
+    operator_waits.KIND_REVIEW_FAILED: CanonicalState.HALTED,
+    operator_waits.KIND_REVIEW_STOPPED: CanonicalState.PAUSED,
+    operator_waits.KIND_COST_CAP: CanonicalState.PAUSED,
+    operator_waits.KIND_MERGE: CanonicalState.AWAITING_MERGE,
 }
 
 
@@ -108,7 +130,7 @@ def _stuck_for_seconds(
     if age.total_seconds() < 0:
         return None
 
-    if state is CanonicalState.FAILED:
+    if state in ALWAYS_STUCK_STATES:
         return int(age.total_seconds())
 
     threshold = thresholds.get(state)
@@ -161,10 +183,11 @@ async def compute_canonical_status(
         (issue_id,),
     )
     if operator_wait is not None:
+        wait_kind = _as_str(operator_wait["kind"])
         return _status(
-            CanonicalState.AWAITING_OPERATOR,
+            OPERATOR_WAIT_STATES.get(wait_kind or "", CanonicalState.PAUSED),
             since=_as_str(operator_wait["created_at"]),
-            subtitle=_as_str(operator_wait["kind"]),
+            subtitle=wait_kind,
             now=effective_now,
             thresholds=thresholds,
         )
