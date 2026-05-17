@@ -590,6 +590,70 @@ def test_codex_no_issues_still_requires_mergeable() -> None:
     assert v.rule == "approved_unknown_mergeable"
 
 
+def test_later_codex_approval_supersedes_older_inline_comment() -> None:
+    comments = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body="Please extract this helper.",
+            commit_sha=HEAD_SHA,
+            created_at=LATER,
+            path="src/foo.py",
+            line=42,
+        ),
+    ]
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER_STILL),
+    )
+    v = review_classifier(comments=comments, ci=[], snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+    assert v.codex_comments == ()
+
+
+def test_newer_codex_inline_comment_still_blocks_prior_approval() -> None:
+    comments = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body="This appeared after the approval.",
+            commit_sha=HEAD_SHA,
+            created_at=LATER_STILL,
+            path="src/foo.py",
+            line=42,
+        ),
+    ]
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
+    )
+    v = review_classifier(comments=comments, ci=[], snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.rule == "codex_inline"
+    assert v.codex_comments == tuple(comments)
+
+
+def test_codex_reaction_does_not_approve_when_head_time_is_unknown() -> None:
+    comments = [
+        ReviewComment(
+            user_login=CODEX_BOT_LOGIN,
+            body="This feedback is still current without a head timestamp.",
+            commit_sha=HEAD_SHA,
+            created_at=LATER,
+            path="src/foo.py",
+            line=42,
+        ),
+    ]
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER_STILL),
+    )
+    v = review_classifier(
+        comments=comments,
+        ci=[],
+        snapshot=_snap(head_committed_at="", reactions=reactions),
+    )
+    assert v.kind == VerdictKind.CHANGES_REQUESTED
+    assert v.rule == "codex_inline"
+    assert v.codex_comments == tuple(comments)
+
+
 # --- Substring rejection inside the classifier -----------------------------
 
 

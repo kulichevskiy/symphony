@@ -901,7 +901,19 @@ async def test_codex_no_issues_issue_comment_advances_merge(tmp_path: Path) -> N
                 runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
             )
         )
-        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "P2 Badge - derive duplicate alerts from the final rows.",
+                    "commit_id": "abc123",
+                    "original_commit_id": "abc123",
+                    "created_at": "2026-05-10T00:03:00Z",
+                    "path": "app.py",
+                    "line": 12,
+                }
+            ]
+        )
         gh.pr_reviews = AsyncMock(return_value=[])
         gh.pr_reactions = AsyncMock(return_value=[])
         gh.pr_issue_comments = AsyncMock(

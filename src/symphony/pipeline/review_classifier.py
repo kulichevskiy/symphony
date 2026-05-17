@@ -16,8 +16,10 @@ Rules (priority order — first match wins):
   3. mergeable=CONFLICTING → CHANGES_REQUESTED (merge_conflict). Checked
      before comment/review rules so a conflict is always detected even
      when stale Codex inline comments from a prior fix-run sit on HEAD.
-  4. Codex inline review comment on HEAD → CHANGES_REQUESTED.
-  5. Substantive Codex `COMMENTED` review on HEAD → CHANGES_REQUESTED.
+  4. Codex inline review comment on HEAD → CHANGES_REQUESTED, unless a
+     strictly newer Codex approval signal on HEAD supersedes all of them.
+  5. Substantive Codex `COMMENTED` review on HEAD → CHANGES_REQUESTED,
+     unless a strictly newer Codex approval signal supersedes it.
   6. Human `CHANGES_REQUESTED` on HEAD → CHANGES_REQUESTED.
   7. Codex approval signals: "any major issues" in COMMENTED
      review, or `+1` reaction (after HEAD commit time) → APPROVED when
@@ -226,6 +228,12 @@ def review_classifier(
         signal_dt = _parse_iso(ts)
         return signal_dt is not None and signal_dt >= head_dt
 
+    def after_head_or_unknown(ts: str) -> bool:
+        if head_dt is None:
+            return True
+        signal_dt = _parse_iso(ts)
+        return signal_dt is None or signal_dt >= head_dt
+
     fresh_reviews = [
         r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha
     ]
@@ -235,6 +243,65 @@ def review_classifier(
         if not is_codex_author(r.user_login)
     ]
 
+    def codex_review_has_no_issues_marker(r: Review) -> bool:
+        return (
+            r.state == "COMMENTED"
+            and is_codex_author(r.user_login)
+            and CODEX_NO_ISSUES_MARKER in r.body.casefold()
+            and after_head_or_unknown(r.submitted_at)
+        )
+
+    def codex_review_has_approval_emoji(r: Review) -> bool:
+        return (
+            r.state == "COMMENTED"
+            and is_codex_author(r.user_login)
+            and "👍" in r.body
+            and after_head_or_unknown(r.submitted_at)
+        )
+
+    def codex_review_is_approval(r: Review) -> bool:
+        return codex_review_has_no_issues_marker(r) or codex_review_has_approval_emoji(r)
+
+    codex_approval_at: datetime | None = None
+
+    def record_codex_approval_time(
+        ts: str,
+        *,
+        require_head_timestamp: bool,
+    ) -> None:
+        nonlocal codex_approval_at
+        if require_head_timestamp and head_dt is None:
+            return
+        signal_dt = _parse_iso(ts)
+        if signal_dt is None:
+            return
+        if head_dt is not None and signal_dt < head_dt:
+            return
+        if codex_approval_at is None or signal_dt > codex_approval_at:
+            codex_approval_at = signal_dt
+
+    # Codex +1 reactions also carry normalized top-level "no issues" issue
+    # comments, supplied by the orchestrator as Reaction(content="+1").
+    for rxn in snapshot.reactions:
+        if is_codex_author(rxn.user_login) and rxn.content == "+1":
+            record_codex_approval_time(
+                rxn.created_at,
+                require_head_timestamp=True,
+            )
+
+    for review in fresh_reviews:
+        if codex_review_is_approval(review):
+            record_codex_approval_time(
+                review.submitted_at,
+                require_head_timestamp=False,
+            )
+
+    def superseded_by_codex_approval(ts: str) -> bool:
+        if codex_approval_at is None:
+            return False
+        signal_dt = _parse_iso(ts)
+        return signal_dt is not None and codex_approval_at > signal_dt
+
     # Rule 4 — Codex inline review comments on HEAD.
     codex_on_head = [
         c
@@ -242,6 +309,7 @@ def review_classifier(
         if is_codex_author(c.user_login)
         and c.commit_sha == snapshot.head_sha
         and fresh_for_head(c.created_at)
+        and not superseded_by_codex_approval(c.created_at)
     ]
     if codex_on_head:
         keys = sorted(_comment_key(c) for c in codex_on_head)
@@ -262,6 +330,9 @@ def review_classifier(
         if is_codex_author(r.user_login)
         and r.state == "COMMENTED"
         and len(r.body) > CODEX_BOILERPLATE_THRESHOLD
+        and not codex_review_is_approval(r)
+        and after_head_or_unknown(r.submitted_at)
+        and not superseded_by_codex_approval(r.submitted_at)
     ]
     if codex_substantive:
         body = codex_substantive[-1].body
@@ -289,30 +360,8 @@ def review_classifier(
         )
 
     # Rule 7 — Codex approval signals.
-    codex_approval_at: datetime | None = None
-    # Check for Codex +1 reaction after HEAD commit
-    for rxn in snapshot.reactions:
-        if not is_codex_author(rxn.user_login) or rxn.content != "+1":
-            continue
-        rxn_dt = _parse_iso(rxn.created_at)
-        if rxn_dt is None or head_dt is None or rxn_dt < head_dt:
-            continue
-        if codex_approval_at is None or rxn_dt > codex_approval_at:
-            codex_approval_at = rxn_dt
-    # Check for Codex "no major issues" text in COMMENTED review
-    codex_no_issues = any(
-        r.state == "COMMENTED"
-        and is_codex_author(r.user_login)
-        and CODEX_NO_ISSUES_MARKER in r.body.casefold()
-        for r in fresh_reviews
-    )
-    # Check for 👍 emoji in Codex COMMENTED review body
-    codex_emoji_approve = any(
-        r.state == "COMMENTED"
-        and is_codex_author(r.user_login)
-        and "👍" in r.body
-        for r in fresh_reviews
-    )
+    codex_no_issues = any(codex_review_has_no_issues_marker(r) for r in fresh_reviews)
+    codex_emoji_approve = any(codex_review_has_approval_emoji(r) for r in fresh_reviews)
     codex_approved = codex_approval_at is not None or codex_no_issues or codex_emoji_approve
 
     # Rule 8 — human `APPROVED`.
