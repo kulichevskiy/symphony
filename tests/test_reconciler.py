@@ -80,11 +80,15 @@ class _FakeGitHub:
         return dict(self.view)
 
 
-def _binding(*, reconcile_enabled: bool = True) -> RepoBinding:
+def _binding(
+    *,
+    issue_label: str | None = "symphony",
+    reconcile_enabled: bool = True,
+) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
-        issue_label="symphony",
+        issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
         linear_states=LinearStates(ready="Todo", done="Done"),
     )
@@ -126,12 +130,17 @@ async def _seed_merge_wait(conn: aiosqlite.Connection, issue_id: str = "iss-1") 
     )
 
 
-async def _seed_pr(conn: aiosqlite.Connection, issue_id: str = "iss-1") -> None:
+async def _seed_pr(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    binding_key: str = '["ENG","org/repo","symphony"]',
+) -> None:
     await db.issue_prs.upsert(
         conn,
         issue_id=issue_id,
         github_repo="org/repo",
-        binding_key='["ENG","org/repo","symphony"]',
+        binding_key=binding_key,
         pr_number=42,
         pr_url="https://github.com/org/repo/pull/42",
         created_at="2026-05-17T10:02:00Z",
@@ -352,6 +361,63 @@ async def test_tick_skips_candidate_without_matching_binding(tmp_path: Path) -> 
     assert fake_gh.calls == []
     assert row is not None
     assert row["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_pr_with_ambiguous_missing_binding_key(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    fake_linear = _FakeLinear()
+    fake_gh = _FakeGitHub()
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn, binding_key="")
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(issue_label="backend", reconcile_enabled=False),
+                    _binding(issue_label="frontend", reconcile_enabled=True),
+                ]
+            ),
+            conn,
+            fake_linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 0
+        cur = await conn.execute("SELECT COUNT(*) AS count FROM external_observations")
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert fake_linear.calls == 0
+    assert fake_gh.calls == []
+    assert row is not None
+    assert row["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tick_allows_missing_binding_key_when_pr_binding_is_unambiguous(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn, binding_key="")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+    finally:
+        await conn.close()
+
+    assert [source for source, _, _, _ in rows] == ["linear", "github"]
 
 
 @pytest.mark.asyncio

@@ -456,16 +456,37 @@ class Reconciler:
                 )
             )
         for pr in prs:
-            matched.extend(
-                self._matching_bindings(
-                    team_key=team_key,
-                    github_repo=pr.github_repo,
-                    issue_label=_label_from_binding_key(pr.binding_key),
-                )
-            )
+            matched.extend(self._bindings_for_pr(team_key=team_key, pr=pr))
         if not matched:
             return False
         return any(binding.reconcile_enabled for binding in matched)
+
+    def _bindings_for_pr(
+        self,
+        *,
+        team_key: str,
+        pr: LocalIssuePr,
+    ) -> list[RepoBinding]:
+        if pr.binding_key:
+            for binding in self.config.repos:
+                if _binding_storage_key(binding) == pr.binding_key:
+                    return [binding]
+
+        matches = self._matching_bindings(
+            team_key=team_key,
+            github_repo=pr.github_repo,
+            issue_label=None,
+        )
+        stored_label = _label_from_binding_key(pr.binding_key)
+        if stored_label is not None:
+            return [
+                binding
+                for binding in matches
+                if (binding.issue_label or "") == stored_label
+            ]
+        if len(matches) == 1:
+            return matches
+        return []
 
     def _matching_bindings(
         self,
@@ -513,6 +534,13 @@ def _label_from_binding_key(binding_key: str) -> str | None:
     if label is None:
         return ""
     return str(label)
+
+
+def _binding_storage_key(binding: RepoBinding) -> str:
+    return json.dumps(
+        (binding.linear_team_key, binding.github_repo, binding.issue_label or ""),
+        separators=(",", ":"),
+    )
 
 
 def _action_for(drift_kind: str | None) -> str:
