@@ -19,6 +19,7 @@ async def connect(path: Path) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(str(path))
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
+    await conn.execute("PRAGMA journal_mode=WAL")
     await apply_schema(conn)
     return conn
 

@@ -17,9 +17,18 @@ __pycache__/
 # Local SQLite + log artefacts when running on a dev machine
 *.sqlite
 *.sqlite-journal
+state.sqlite-wal
+state.sqlite-shm
 state.sqlite
 logs/
 workspaces/
+
+# Frontend local deps / production build output
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.d.ts
+frontend/vite.config.js
 
 # Local backup files (e.g. state.sqlite.<ts>.bak, workspaces.<ts>.bak/)
 *.bak

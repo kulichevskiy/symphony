@@ -175,6 +175,12 @@ class Secrets(BaseSettings):
     )
 
 
+class UIConfig(BaseModel):
+    """Web UI exposure knobs."""
+
+    enabled: bool = True
+
+
 class Config(BaseModel):
     """Top-level config. Loaded from YAML, secrets layered on at the end."""
 
@@ -187,6 +193,7 @@ class Config(BaseModel):
     webhook_port: int = Field(default=8787, ge=1, le=65535)
     webhook_dedupe_ttl_secs: int = Field(default=600, ge=1)
     webhook_timestamp_tolerance_secs: int = Field(default=60, ge=1)
+    ui: UIConfig = Field(default_factory=UIConfig)
 
     repos: list[RepoBinding] = Field(default_factory=list)
 
