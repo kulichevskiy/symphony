@@ -2714,20 +2714,6 @@ class Orchestrator:
 
             # Step 1: orchestrator fetches origin.
             branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            start_sha = await _workspace_head_sha(workspace_path)
-            if not start_sha:
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"could not read review fix-run start HEAD for {branch}",
-                    last_log="",
-                    auto_retry=False,
-                    operator_wait=True,
-                )
-                return False
-
             try:
                 await _sync_workspace_to_remote(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
@@ -2739,6 +2725,20 @@ class Orchestrator:
                     issue=issue,
                     error=f"workspace sync failed: {e}",
                     last_log=str(e),
+                )
+                return False
+
+            start_sha = await _workspace_head_sha(workspace_path)
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not read review fix-run start HEAD for {branch}",
+                    last_log="",
+                    auto_retry=False,
+                    operator_wait=True,
                 )
                 return False
 
