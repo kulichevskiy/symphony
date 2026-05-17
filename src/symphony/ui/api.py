@@ -50,7 +50,13 @@ WITH active_issue_ids(issue_id) AS (
     UNION
     SELECT issue_id FROM issue_prs WHERE merged_at IS NULL
     UNION
-    SELECT issue_id FROM review_state WHERE iteration > 0
+    SELECT rs.issue_id
+    FROM review_state rs
+    WHERE rs.iteration > 0
+      AND NOT EXISTS (
+          SELECT 1 FROM issue_prs ip
+          WHERE ip.issue_id = rs.issue_id
+      )
 ),
 latest_events(issue_id, ts) AS (
     SELECT issue_id, started_at FROM runs

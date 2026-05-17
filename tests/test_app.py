@@ -546,7 +546,9 @@ async def test_api_issues_default_active_scope_filters_active_sources(
         await conn.execute(
             """
             INSERT INTO review_state (issue_id, iteration)
-            VALUES ('active-review', 1)
+            VALUES
+                ('active-review', 1),
+                ('done', 2)
             """
         )
         await conn.commit()
