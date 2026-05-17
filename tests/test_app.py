@@ -275,7 +275,7 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues")
+            response = await client.get("/api/issues?scope=all")
     finally:
         await conn.close()
 
@@ -353,7 +353,7 @@ async def test_api_namespace_keeps_placeholder_404(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_issues_returns_canonical_statuses_sorted_by_default(
+async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "state.sqlite"
@@ -428,7 +428,7 @@ async def test_api_issues_returns_canonical_statuses_sorted_by_default(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues")
+            response = await client.get("/api/issues?scope=all")
     finally:
         await conn.close()
 
@@ -486,6 +486,217 @@ async def test_api_issues_returns_canonical_statuses_sorted_by_default(
 
 
 @pytest.mark.asyncio
+async def test_api_issues_default_active_scope_filters_active_sources(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for issue_id, identifier, title in [
+            ("active-wait", "ENG-1", "Awaiting operator"),
+            ("active-running", "ENG-2", "Running issue"),
+            ("active-review", "ENG-3", "Awaiting review"),
+            ("active-pr", "ENG-4", "Open PR"),
+            ("done", "ENG-5", "Merged PR"),
+            ("idle", "ENG-6", "Idle issue"),
+        ]:
+            await db.issues.upsert(
+                conn,
+                id=issue_id,
+                identifier=identifier,
+                title=title,
+                team_key="ENG",
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES
+                ('run-wait', 'active-wait', 'review', 'completed', NULL,
+                 '2026-05-17T11:40:00Z', '2026-05-17T11:45:00Z', 0),
+                ('run-running', 'active-running', 'implement', 'running', NULL,
+                 '2026-05-17T11:50:00Z', NULL, 0),
+                ('run-review', 'active-review', 'review', 'completed', NULL,
+                 '2026-05-17T11:52:00Z', '2026-05-17T11:56:00Z', 0)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO operator_waits (
+                issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
+            )
+            VALUES (
+                'active-wait', 'run-wait', 'review_stopped', 'ENG', 'org/repo',
+                'symphony', '2026-05-17T11:55:00Z'
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES
+                ('active-pr', 'org/repo', 'ENG|org/repo', 44,
+                 'https://github.com/org/repo/pull/44', '2026-05-17T11:57:00Z', NULL),
+                ('done', 'org/repo', 'ENG|org/repo', 45,
+                 'https://github.com/org/repo/pull/45', '2026-05-17T11:00:00Z',
+                 '2026-05-17T11:30:00Z')
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO review_state (issue_id, iteration)
+            VALUES
+                ('active-review', 1),
+                ('done', 2)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()] == [
+        "active-wait",
+        "active-running",
+        "active-review",
+        "active-pr",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_api_issues_recent_scope_unions_active_with_latest_50_events(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="active-old",
+            identifier="ENG-999",
+            title="Active old issue",
+            team_key="ENG",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES (
+                'run-active-old', 'active-old', 'implement', 'running', NULL,
+                '2026-05-14T10:00:00Z', NULL, 0
+            )
+            """
+        )
+        for idx in range(55):
+            issue_id = f"recent-{idx:02d}"
+            await db.issues.upsert(
+                conn,
+                id=issue_id,
+                identifier=f"ENG-{idx}",
+                title=f"Recent event issue {idx}",
+                team_key="ENG",
+            )
+            await conn.execute(
+                """
+                INSERT INTO comment_events (comment_id, issue_id, seen_at)
+                VALUES (?, ?, ?)
+                """,
+                (f"comment-recent-{idx:02d}", issue_id, f"2026-05-17T10:{idx:02d}:00Z"),
+            )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues?scope=recent")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    ids = {row["id"] for row in response.json()}
+    assert len(ids) == 51
+    assert "active-old" in ids
+    assert "recent-54" in ids
+    assert "recent-05" in ids
+    assert "recent-04" not in ids
+    assert "recent-00" not in ids
+
+
+@pytest.mark.asyncio
+async def test_api_issues_q_filters_identifier_and_title_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="adj-12",
+            identifier="ADJ-12",
+            title="Implement dashboard filters",
+            team_key="ADJ",
+        )
+        await db.issues.upsert(
+            conn,
+            id="web-8",
+            identifier="WEB-8",
+            title="Repair Payments callback",
+            team_key="WEB",
+        )
+        await db.issues.upsert(
+            conn,
+            id="adj-99",
+            identifier="ADJ-99",
+            title="Unrelated work",
+            team_key="ADJ",
+        )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            by_identifier = await client.get("/api/issues?scope=all&q=adj-12")
+            by_title = await client.get("/api/issues?scope=all&q=PAYMENTS")
+    finally:
+        await conn.close()
+
+    assert by_identifier.status_code == 200
+    assert [row["id"] for row in by_identifier.json()] == ["adj-12"]
+    assert by_title.status_code == 200
+    assert [row["id"] for row in by_title.json()] == ["web-8"]
+
+
+@pytest.mark.asyncio
 async def test_api_issues_uses_one_clock_value_for_all_canonical_statuses(
     tmp_path: Path,
 ) -> None:
@@ -526,7 +737,7 @@ async def test_api_issues_uses_one_clock_value_for_all_canonical_statuses(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues")
+            response = await client.get("/api/issues?scope=all")
     finally:
         await conn.close()
 
@@ -567,7 +778,7 @@ async def test_api_issues_maps_canonical_status_db_errors_to_503(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues")
+            response = await client.get("/api/issues?scope=all")
     finally:
         await conn.close()
 
