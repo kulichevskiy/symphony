@@ -118,7 +118,7 @@ async def test_issue_external_snapshot_returns_latest_comments_desc() -> None:
     assert calls == [
         (
             queries.ISSUE_EXTERNAL_SNAPSHOT,
-            {"id": "iss-1", "cursor": None},
+            {"id": "iss-1"},
         )
     ]
 

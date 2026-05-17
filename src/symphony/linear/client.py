@@ -191,7 +191,7 @@ class Linear:
         """Current Linear issue state plus recent comments for the UI."""
         data = await self._query(
             queries.ISSUE_EXTERNAL_SNAPSHOT,
-            {"id": identifier_or_uuid, "cursor": None},
+            {"id": identifier_or_uuid},
         )
         node = data.get("issue")
         if not node:

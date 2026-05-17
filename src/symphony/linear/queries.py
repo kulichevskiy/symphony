@@ -179,7 +179,7 @@ query IssueComments($id: String!, $after: DateTimeOrDuration!, $cursor: String) 
 """
 
 ISSUE_EXTERNAL_SNAPSHOT = """
-query IssueExternalSnapshot($id: String!, $cursor: String) {
+query IssueExternalSnapshot($id: String!) {
   issue(id: $id) {
     id
     identifier
@@ -187,8 +187,8 @@ query IssueExternalSnapshot($id: String!, $cursor: String) {
     updatedAt
     state { name }
     labels { nodes { name } }
-    comments(first: 5, after: $cursor, orderBy: createdAt) {
-      pageInfo { hasNextPage endCursor }
+    comments(last: 5, orderBy: createdAt) {
+      pageInfo { hasPreviousPage startCursor }
       nodes {
         id
         body
