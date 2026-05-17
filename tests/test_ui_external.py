@@ -242,6 +242,39 @@ async def test_external_snapshot_uses_binding_done_state(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_external_snapshot_resolves_binding_by_issue_label(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    linear = _FakeLinear(_linear_payload(state="Completed"))
+    github = _FakeGitHub(_github_payload(state="OPEN", merged_at=None, failing=0))
+    config = Config(
+        linear_api_key="x",
+        repos=[
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="other",
+                linear_states=LinearStates(ready="Todo", done="Done"),
+            ),
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="symphony",
+                linear_states=LinearStates(ready="Todo", done="Completed"),
+            ),
+        ],
+    )
+    service = ExternalSnapshotService(config, linear, github, clock=lambda: NOW)
+    try:
+        await _seed_external_issue(conn)
+        snapshot = await service.get_issue_external(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert snapshot is not None
+    assert [flag["field"] for flag in snapshot["drift_flags"]] == ["linear.state"]
+
+
+@pytest.mark.asyncio
 async def test_external_snapshot_cache_ttl_and_refresh(tmp_path: Path) -> None:
     current = NOW
 

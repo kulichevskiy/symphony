@@ -213,7 +213,7 @@ async def sqlite_external_view(conn: aiosqlite.Connection, issue_id: str) -> Jso
     operator_waits = await _fetch_all(
         conn,
         """
-        SELECT run_id, kind, created_at
+        SELECT run_id, kind, issue_label, created_at
         FROM operator_waits
         WHERE issue_id = ?
         ORDER BY created_at DESC, run_id DESC
@@ -248,6 +248,19 @@ async def sqlite_external_view(conn: aiosqlite.Connection, issue_id: str) -> Jso
     }
 
 
+def _sqlite_issue_label(sqlite_view: JsonDict) -> str | None:
+    review_state = sqlite_view.get("review_state")
+    if isinstance(review_state, dict) and review_state.get("issue_label"):
+        return str(review_state["issue_label"])
+
+    operator_waits = sqlite_view.get("operator_waits")
+    if isinstance(operator_waits, list):
+        for wait in operator_waits:
+            if isinstance(wait, dict) and wait.get("issue_label"):
+                return str(wait["issue_label"])
+    return None
+
+
 def _resolve_binding(config: Config, sqlite_view: JsonDict) -> RepoBinding | None:
     issue = sqlite_view["issue"]
     team_key = str(issue["team_key"])
@@ -260,13 +273,28 @@ def _resolve_binding(config: Config, sqlite_view: JsonDict) -> RepoBinding | Non
         if isinstance(review_state, dict) and review_state.get("github_repo"):
             github_repo = str(review_state["github_repo"])
 
+    candidates: list[RepoBinding] = []
     for binding in config.repos:
         if binding.linear_team_key != team_key:
             continue
         if github_repo is not None and binding.github_repo != github_repo:
             continue
-        return binding
-    return None
+        candidates.append(binding)
+
+    if not candidates:
+        return None
+
+    issue_label = _sqlite_issue_label(sqlite_view)
+    if issue_label:
+        for binding in candidates:
+            if binding.issue_label == issue_label:
+                return binding
+        for binding in candidates:
+            if binding.issue_label is None:
+                return binding
+        return None
+
+    return candidates[0]
 
 
 def _github_pr_target(sqlite_view: JsonDict) -> tuple[str, int] | None:
