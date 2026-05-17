@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from symphony import db
+from symphony.agent.codex_cli import CODEX_ALLOW_GIT_WRITES_CONFIG
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
@@ -30,6 +31,7 @@ from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import (
     Orchestrator,
     build_fix_runner_command,
+    build_runner_command,
     pr_number_from_url,
 )
 
@@ -434,16 +436,17 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
 
         assert runner.captured_spec is not None
         assert runner.captured_spec.stage == "review"
-        assert runner.captured_spec.command[:7] == [
+        command = runner.captured_spec.command
+        assert command[:5] == [
             "codex",
             "exec",
             "--json",
             "--sandbox",
             "workspace-write",
-            "--model",
-            "gpt-5.1-codex-max",
         ]
-        prompt = runner.captured_spec.command[-1]
+        assert command[command.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+        assert command[command.index("--model") + 1] == "gpt-5.1-codex-max"
+        prompt = command[-1]
         assert prompt.startswith("# Failing check log tail")
         assert "ruff found a lint failure" in prompt
         assert "Failing required CI checks: lint" in prompt
@@ -1560,15 +1563,15 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
         "fix this",
         codex_model="gpt-5.1-codex-max",
     )
-    assert argv[:7] == [
+    assert argv[:5] == [
         "codex",
         "exec",
         "--json",
         "--sandbox",
         "workspace-write",
-        "--model",
-        "gpt-5.1-codex-max",
     ]
+    assert argv[argv.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+    assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert "fix this" in argv
 
 
@@ -1578,16 +1581,15 @@ def test_build_fix_runner_command_passes_configured_codex_model() -> None:
         "fix this",
         codex_model="gpt-5.1-codex-max",
     )
-    assert argv[:7] == [
-        "codex",
-        "exec",
-        "--json",
-        "--sandbox",
-        "workspace-write",
-        "--model",
-        "gpt-5.1-codex-max",
-    ]
+    assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert argv[-1] == "fix this"
+
+
+def test_build_runner_command_allows_git_writes_for_codex_implement() -> None:
+    argv = build_runner_command("codex", "implement this")
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert argv[argv.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+    assert argv[-1] == "implement this"
 
 
 # --- PR URL parser ---------------------------------------------------------

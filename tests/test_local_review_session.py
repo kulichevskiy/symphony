@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from symphony.agent.codex_cli import CODEX_ALLOW_GIT_WRITES_CONFIG
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -175,6 +176,49 @@ async def test_fix_then_approve_dispatches_fix_run_in_correct_workspace(
     # Findings text must be forwarded into the fix-run prompt.
     fix_prompt = fix_argv[-1]
     assert "bug in foo.py:10" in fix_prompt
+
+
+@pytest.mark.asyncio
+async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(
+                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
+            _ok_fix_stream(),
+            _codex_message_stream(f"fixed\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    sha_counter = {"i": 0}
+
+    async def head_sha(_: Path) -> str:
+        sha_counter["i"] += 1
+        return f"sha-{sha_counter['i']}"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=workspace,
+        base_branch="origin/main",
+        parent_run_id="run-abc",
+        issue_title="Add auth",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+        implementer_agent="codex",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    fix_argv = runner.specs[1].command
+    assert fix_argv[fix_argv.index("--sandbox") + 1] == "workspace-write"
+    assert fix_argv[fix_argv.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
 
 
 @pytest.mark.asyncio

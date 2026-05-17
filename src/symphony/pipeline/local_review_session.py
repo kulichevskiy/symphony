@@ -37,6 +37,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Literal
 
+from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.prompt import review_comment_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
@@ -101,16 +102,10 @@ def _build_fix_command(
             prompt,
         ]
     if agent == "codex":
-        return [
-            "codex",
-            "exec",
-            "--json",
-            "--sandbox",
-            "workspace-write",
-            "--model",
-            codex_model,
-            prompt,
-        ]
+        return build_codex_workspace_write_command(
+            prompt=prompt,
+            codex_model=codex_model,
+        )
     raise ValueError(f"unknown implementer agent {agent!r}")
 
 
