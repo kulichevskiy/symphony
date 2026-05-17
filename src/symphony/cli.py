@@ -126,6 +126,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     conn,
                     webhook_settings,
                     ui_enabled=cfg.ui.enabled,
+                    ui_db_path=cfg.db_path,
                 )
                 server = uvicorn.Server(
                     build_server_config(
