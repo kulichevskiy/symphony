@@ -607,6 +607,22 @@ async def _git_fetch(workspace_path: Path) -> None:
         )
 
 
+async def _git_fetch_branch(workspace_path: Path, branch: str) -> None:
+    """Fetch ``origin/branch`` so remote-head validation has a fresh baseline."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin", branch,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git fetch origin {branch} failed: {stderr.decode(errors='replace').strip()}"
+        )
+
+
 async def _git_status_short(workspace_path: Path) -> str:
     """Return ``git status --short`` output for failure diagnostics."""
     proc = await asyncio.create_subprocess_exec(
@@ -720,9 +736,14 @@ async def _git_add_and_continue_rebase(
 
 async def _workspace_head_sha(workspace_path: Path) -> str:
     """Return the HEAD commit SHA of *workspace_path*, or "" on error."""
+    return await _workspace_ref_sha(workspace_path, "HEAD")
+
+
+async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
+    """Return the commit SHA for *ref* in *workspace_path*, or "" on error."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "HEAD",
+            "git", "rev-parse", "--verify", ref,
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -2201,14 +2222,29 @@ class Orchestrator:
                 return False
 
             branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            start_sha = await _workspace_head_sha(workspace_path)
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    error=f"could not read review fix-run start HEAD for {branch}",
+                    error=f"could not read review fix-run remote HEAD for {branch}",
                     last_log="",
                     auto_retry=False,
                     operator_wait=True,
@@ -2505,14 +2541,29 @@ class Orchestrator:
                 return False
 
             branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            start_sha = await _workspace_head_sha(workspace_path)
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    error=f"could not read review fix-run start HEAD for {branch}",
+                    error=f"could not read review fix-run remote HEAD for {branch}",
                     last_log="",
                     auto_retry=False,
                     operator_wait=True,
@@ -2728,14 +2779,14 @@ class Orchestrator:
                 )
                 return False
 
-            start_sha = await _workspace_head_sha(workspace_path)
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    error=f"could not read review fix-run start HEAD for {branch}",
+                    error=f"could not read review fix-run remote HEAD for {branch}",
                     last_log="",
                     auto_retry=False,
                     operator_wait=True,
