@@ -103,6 +103,62 @@ async def _seed_issue_detail(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _seed_issue_timeline(conn: aiosqlite.Connection) -> None:
+    await db.issues.upsert(
+        conn,
+        id="iss-timeline",
+        identifier="ENG-2",
+        title="Watch the thing",
+        team_key="ENG",
+    )
+    await conn.execute(
+        """
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+        VALUES (
+            'run-timeline', 'iss-timeline', 'implement', 'completed', 456,
+            '2026-05-17T10:00:00Z', '2026-05-17T10:05:00Z', 2.5
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'iss-timeline', 'org/repo', 'ENG|org/repo', 43,
+            'https://github.com/org/repo/pull/43',
+            '2026-05-17T10:02:00Z', '2026-05-17T10:06:00Z'
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO comment_events (comment_id, issue_id, seen_at)
+        VALUES ('comment-timeline', 'iss-timeline', '2026-05-17T10:01:00Z')
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO activity_comment_marks (
+            run_id, first_unpublished_at, last_event_at, event_count_since_post,
+            last_posted_at, last_fingerprint
+        )
+        VALUES (
+            'run-timeline', '2026-05-17T10:02:30Z', '2026-05-17T10:03:00Z', 2,
+            '2026-05-17T10:03:00Z', 'fp-timeline'
+        )
+        """
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_cost_marks (issue_id, warning_posted_at)
+        VALUES ('iss-timeline', '2026-05-17T10:04:00Z')
+        """
+    )
+    await conn.commit()
+
+
 @pytest.mark.asyncio
 async def test_ui_mount_serves_index_and_spa_fallback(tmp_path: Path) -> None:
     app = create_app(
@@ -285,6 +341,101 @@ async def test_issue_detail_api_404s_for_unknown_issue(tmp_path: Path) -> None:
             base_url="http://test",
         ) as client:
             response = await client.get("/api/issues/missing")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_issue_timeline(conn)
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/iss-timeline/timeline")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "ts": "2026-05-17T10:00:00Z",
+            "kind": "run_started",
+            "payload": {"run_id": "run-timeline", "stage": "implement", "pid": 456},
+        },
+        {
+            "ts": "2026-05-17T10:01:00Z",
+            "kind": "comment_seen",
+            "payload": {"comment_id": "comment-timeline"},
+        },
+        {
+            "ts": "2026-05-17T10:02:00Z",
+            "kind": "pr_opened",
+            "payload": {
+                "github_repo": "org/repo",
+                "pr_number": 43,
+                "pr_url": "https://github.com/org/repo/pull/43",
+            },
+        },
+        {
+            "ts": "2026-05-17T10:03:00Z",
+            "kind": "activity_comment_posted",
+            "payload": {"run_id": "run-timeline", "fingerprint": "fp-timeline"},
+        },
+        {
+            "ts": "2026-05-17T10:04:00Z",
+            "kind": "cost_warning_posted",
+            "payload": {},
+        },
+        {
+            "ts": "2026-05-17T10:05:00Z",
+            "kind": "run_ended",
+            "payload": {
+                "run_id": "run-timeline",
+                "stage": "implement",
+                "status": "completed",
+                "cost_usd": 2.5,
+            },
+        },
+        {
+            "ts": "2026-05-17T10:06:00Z",
+            "kind": "pr_merged",
+            "payload": {"github_repo": "org/repo", "pr_number": 43},
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_issue_timeline_api_404s_for_unknown_issue(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/missing/timeline")
     finally:
         await conn.close()
 

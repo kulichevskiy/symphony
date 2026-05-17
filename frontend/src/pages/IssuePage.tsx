@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
+import { IssueTimeline } from "@/components/IssueTimeline";
 import {
   Table,
   TableBody,
@@ -176,6 +177,7 @@ export function IssuePage() {
                 { key: "team_key", label: "team_key" },
               ]}
             />
+            <IssueTimeline issueId={data.issue.id} />
             <SectionTable
               title="Runs"
               rows={data.runs}
