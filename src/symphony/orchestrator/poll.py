@@ -74,6 +74,7 @@ from ..linear.templates import (
     fixing_merge_conflict,
     moved_to_waiting,
     resumed,
+    review_retry_requested,
     review_stopped,
     reviewing_feedback,
     run_started,
@@ -1180,6 +1181,13 @@ class Orchestrator:
         if run_id in self._merge_needs_approval_bindings:
             await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
             return
+        if intent.kind is SlashKind.RETRY:
+            monitor_run_id = self._review_poll_issue_ids.get(issue_id)
+            if monitor_run_id is not None and monitor_run_id in self._review_poll_run_ids:
+                await self._handle_active_review_retry_intent(
+                    issue_id, monitor_run_id, intent
+                )
+                return
         if intent.kind is SlashKind.STOP:
             monitor_run_id = self._review_poll_issue_ids.get(issue_id)
             if monitor_run_id is not None and monitor_run_id in self._review_poll_run_ids:
@@ -1207,6 +1215,92 @@ class Orchestrator:
             intent.kind,
             run_id,
         )
+        if intent.kind is SlashKind.RETRY:
+            await self._post_command_rejected(
+                issue_id,
+                "$retry",
+                "no active retry handler for the current run state",
+            )
+
+    async def _post_command_rejected(
+        self, issue_id: str, slash_text: str, reason: str
+    ) -> None:
+        try:
+            await self.linear.post_comment(
+                issue_id, truncate_body(command_rejected(slash_text, reason))
+            )
+        except LinearError as e:
+            log.warning(
+                "could not post %s rejection for %s: %s",
+                slash_text,
+                issue_id,
+                e,
+            )
+
+    async def _handle_active_review_retry_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        state = await db.review_state.get(self._conn, issue_id)
+        binding = await self._binding_for_review_issue_id(issue_id, state=state)
+        if binding is None:
+            await self._post_command_rejected(
+                issue_id,
+                "$retry",
+                "no repository binding found for the active review monitor",
+            )
+            return
+        if state.pr_number is None:
+            await self._post_command_rejected(
+                issue_id,
+                "$retry",
+                "no PR found for the active review monitor",
+            )
+            return
+
+        pr_url = _pr_url_for_state(
+            repo=binding.github_repo,
+            pr_number=state.pr_number,
+            pr_url=state.pr_url,
+        )
+        try:
+            await self._gh.pr_comment(
+                state.pr_number, "@codex review", repo=binding.github_repo
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not re-post @codex review for active monitor %s#%d: %s",
+                binding.github_repo,
+                state.pr_number,
+                e,
+            )
+            await self._post_command_rejected(
+                issue_id,
+                "$retry",
+                f"could not re-post @codex review: {e}",
+            )
+            return
+
+        signature = f"manual_retry:{run_id}:{intent.comment_id}"
+        await db.review_state.set_signature(self._conn, issue_id, signature)
+        log.info(
+            "$retry received for active review monitor %s (issue %s); "
+            "re-triggered @codex review",
+            run_id,
+            issue_id,
+        )
+        body = review_retry_requested(
+            CommentVars(
+                stage="review",
+                repo=binding.github_repo,
+                issue=state.pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue_id, truncate_body(body))
+        except LinearError as e:
+            log.warning("active review retry comment failed for %s: %s", issue_id, e)
 
     async def _handle_skip_local_review_intent(self, issue_id: str) -> None:
         """Handle `$skip-local-review`: kill the in-flight subprocess

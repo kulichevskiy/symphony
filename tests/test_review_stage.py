@@ -2083,6 +2083,84 @@ async def test_merge_command_keeps_operator_wait_when_merge_dispatch_dedupes(
 
 
 @pytest.mark.asyncio
+async def test_retry_on_active_review_monitor_retriggers_review(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, signature="codex_inline:stale")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._review_poll_run_ids.add("review-run")  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = "review-run"  # noqa: SLF001
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "review-run",
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T00:01:00+00:00",
+            ),
+        )
+
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.last_trigger_signature == "manual_retry:review-run:c-retry"
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        running_review_runs = [
+            r for r in history if r.stage == "review" and r.status == "running"
+        ]
+        assert [r.id for r in running_review_runs] == ["review-run"]
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Review retry requested" in body for body in posted)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_unhandled_retry_slash_posts_rejection(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "implement-run",
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T00:01:00+00:00",
+            ),
+        )
+
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("$retry" in body and "ignored" in body for body in posted)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_review_advances_to_merge(tmp_path: Path) -> None:
     """`$skip-review` during active review polling marks the review run completed
     and directly schedules merge, bypassing the Codex verdict."""
