@@ -63,6 +63,36 @@ async def test_review_state_bump_iteration_persists(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_review_state_bump_iteration_records_transition(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO review_state (
+                issue_id, iteration, last_trigger_signature, ci_fetch_failures,
+                pr_number, pr_url, github_repo, issue_label, codex_lgtm_comment_id
+            )
+            VALUES ('iss-1', 1, '', 0, NULL, '', '', '', '')
+            """
+        )
+        await conn.commit()
+
+        assert await review_state.bump_iteration(conn, "iss-1") == 2
+
+        transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
+        assert [(t.table_name, t.field, t.old_value, t.new_value) for t in transitions] == [
+            ("review_state", "iteration", "1", "2")
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_state_signature_persists(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

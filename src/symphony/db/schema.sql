@@ -149,3 +149,18 @@ CREATE TABLE IF NOT EXISTS operator_waits (
 );
 
 CREATE INDEX IF NOT EXISTS idx_operator_waits_run ON operator_waits(run_id);
+
+-- Low-volume audit trail for state mutations that are otherwise only visible
+-- as the latest row value. Used by the UI timeline for race-condition debugging.
+CREATE TABLE IF NOT EXISTS state_transitions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id    TEXT NOT NULL REFERENCES issues(id),
+    table_name  TEXT NOT NULL,
+    field       TEXT NOT NULL,
+    old_value   TEXT,
+    new_value   TEXT,
+    ts          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_state_transitions_issue_ts
+    ON state_transitions(issue_id, ts);

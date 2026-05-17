@@ -23,6 +23,7 @@ from . import (
     operator_waits,
     review_state,
     runs,
+    state_transitions,
     webhook_deliveries,
 )
 from .schema import apply_schema, connect
@@ -39,5 +40,6 @@ __all__ = [
     "operator_waits",
     "review_state",
     "runs",
+    "state_transitions",
     "webhook_deliveries",
 ]

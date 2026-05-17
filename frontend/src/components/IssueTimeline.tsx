@@ -29,6 +29,9 @@ const TIMELINE_KINDS = [
   "comment_seen",
   "activity_comment_posted",
   "cost_warning_posted",
+  "review_state_changed",
+  "operator_wait_started",
+  "operator_wait_ended",
 ] as const;
 
 const KIND_LABELS: Record<string, string> = {
@@ -39,6 +42,9 @@ const KIND_LABELS: Record<string, string> = {
   comment_seen: "comment seen",
   activity_comment_posted: "activity comment",
   cost_warning_posted: "cost warning",
+  review_state_changed: "review state",
+  operator_wait_started: "operator wait started",
+  operator_wait_ended: "operator wait ended",
 };
 
 const KIND_COLORS: Record<string, string> = {
@@ -49,6 +55,9 @@ const KIND_COLORS: Record<string, string> = {
   comment_seen: "bg-amber-500",
   activity_comment_posted: "bg-cyan-500",
   cost_warning_posted: "bg-red-500",
+  review_state_changed: "bg-fuchsia-500",
+  operator_wait_started: "bg-orange-500",
+  operator_wait_ended: "bg-lime-600",
 };
 
 async function fetchIssueTimeline(id: string): Promise<TimelineEvent[]> {
