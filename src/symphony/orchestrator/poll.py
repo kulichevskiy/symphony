@@ -111,6 +111,7 @@ from ..pipeline.review_classifier import (
 )
 from ..pipeline.state_machine import on_runner_event
 from ..workspace import Workspace
+from .reconciler import Reconciler
 
 log = logging.getLogger(__name__)
 
@@ -909,6 +910,14 @@ class Orchestrator:
             max(config.global_max_concurrent, 1)
         )
         self._review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore] = {}
+        self._reconciler = Reconciler(
+            config,
+            conn,
+            linear,
+            self._gh,
+            clock=clock,
+        )
+        self._reconcile_task: asyncio.Task[None] | None = None
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -959,6 +968,9 @@ class Orchestrator:
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
+        self._reconcile_task = asyncio.create_task(
+            self._reconciler.run(self._shutdown)
+        )
         log.info("orchestrator entering poll loop (interval=%ds)", self.config.poll_interval_secs)
         try:
             while not self._shutdown.is_set():
@@ -973,6 +985,12 @@ class Orchestrator:
                 except TimeoutError:
                     pass
         finally:
+            if self._reconcile_task is not None:
+                self._reconcile_task.cancel()
+                try:
+                    await self._reconcile_task
+                except asyncio.CancelledError:
+                    pass
             await self.drain_dispatch_tasks(cancel=True)
 
     async def _tick(self) -> list[asyncio.Task[None]]:
@@ -1022,7 +1040,7 @@ class Orchestrator:
     async def handle_github_webhook(
         self, event: GitHubWebhookEvent
     ) -> WebhookDispatchResult:
-        """Accept a verified GitHub webhook event without mutating state yet."""
+        """Accept a verified GitHub webhook event and audit external truth."""
         log.info(
             "github webhook event received: repo=%s type=%s action=%s pr=%s delivery=%s",
             event.repo,
@@ -1031,10 +1049,11 @@ class Orchestrator:
             event.pr_number,
             event.delivery_id,
         )
+        observed = await self._reconciler.reconcile_github_event(event)
         return WebhookDispatchResult(
             kind=f"github.{event.event_type}",
             handled=True,
-            detail="accepted for future reconciler",
+            detail=f"observations={observed}",
         )
 
     async def _handle_webhook_comment(
@@ -1082,6 +1101,11 @@ class Orchestrator:
         if not isinstance(issue_id, str) or not issue_id:
             return WebhookDispatchResult(
                 kind="issue", handled=False, detail="missing issue id"
+            )
+        if _linear_issue_state_changed(payload):
+            await self._reconciler.reconcile_linear_issue_event(
+                issue_id=issue_id,
+                action=action or "update",
             )
         issue = await self.linear.lookup_issue(issue_id)
         binding = self._ready_binding_for_issue(issue)
@@ -6510,6 +6534,24 @@ __all__ = [
     "build_runner_command",
     "pr_number_from_url",
 ]
+
+
+def _linear_issue_state_changed(payload: Mapping[str, Any]) -> bool:
+    action = str(payload.get("action") or "").casefold()
+    if action and action not in {"update", "updated", "issue_updated"}:
+        return False
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return False
+    updated_from = payload.get("updatedFrom") or data.get("updatedFrom")
+    if isinstance(updated_from, Mapping) and any(
+        key in updated_from
+        for key in ("state", "stateId", "state_id", "stateName", "state_name")
+    ):
+        return True
+    if any(key in data for key in ("state", "stateId", "state_id", "stateName", "state_name")):
+        return True
+    return False
 
 
 def _comment_issue_id_from_webhook_payload(payload: Mapping[str, Any]) -> str | None:

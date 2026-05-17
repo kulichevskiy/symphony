@@ -108,14 +108,24 @@ Set:
 
 - `webhook_host: 127.0.0.1`
 - `webhook_port: 8787`
+- `reconcile_interval_secs: 300`, `reconcile_max_per_tick: 50`, and
+  `reconcile_backoff_secs: 600` unless you need a quieter or more aggressive
+  external-truth audit cadence.
 - `workspace_root`, `log_root`, and `db_path` to directories writable by `symphony`.
 - Each `repos[].github_repo` to a watched GitHub repo.
 - Leave `repos[].webhook_enabled: true` for watched repos that should accept
   GitHub webhook events; set it to `false` for repos that should keep polling
   only.
+- Leave `repos[].reconcile_enabled: true` for repos whose operator waits and
+  open PRs should be included in the background external-observation scan.
 - If `GITHUB_WEBHOOK_SECRET` is unset, every repo with
   `repos[].webhook_enabled: true` must define `repos[].webhook_secret`.
 - Each `repos[].linear_team_key`, `issue_label`, and `linear_states` entry to match the Linear workspace.
+
+Set `SYMPHONY_RECONCILE_DRYRUN=1` in `/opt/symphonyd/.env` during the first
+observation window. Drift rows then use `action_taken='would_clear'`; unset it
+or set it to `0` to keep writing `action_taken='observed'`. This slice never
+clears SQLite state automatically either way.
 
 ## 3. Authenticate headless tools
 

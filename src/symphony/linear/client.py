@@ -50,6 +50,7 @@ class LinearIssue:
     team_key: str
     labels: list[str] = field(default_factory=list)
     blocked_by: list[Blocker] = field(default_factory=list)
+    updated_at: str = ""
 
     @classmethod
     def from_node(cls, node: dict[str, Any]) -> LinearIssue:
@@ -65,6 +66,7 @@ class LinearIssue:
             team_key=node["team"]["key"],
             labels=[lbl["name"] for lbl in node.get("labels", {}).get("nodes", [])],
             blocked_by=_blocked_by_from_node(node),
+            updated_at=str(node.get("updatedAt") or ""),
         )
 
 

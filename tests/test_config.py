@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from symphony.config import Config, LinearStates, UIStatusThresholds
+from symphony.config import Config, LinearStates, RepoBinding, UIStatusThresholds
 from symphony.ui.status import CanonicalState
 
 _BINDING_STATES = """
@@ -196,6 +196,42 @@ repos:
     assert cfg.repos[0].webhook_secret == "repo-secret"
     assert cfg.repos[1].webhook_enabled is False
     assert cfg.repos[1].webhook_secret is None
+
+
+def test_reconcile_config_defaults_and_overrides(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+reconcile_interval_secs: 120
+reconcile_max_per_tick: 7
+reconcile_backoff_secs: 900
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    reconcile_enabled: false
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.reconcile_interval_secs == 120
+    assert cfg.reconcile_max_per_tick == 7
+    assert cfg.reconcile_backoff_secs == 900
+    assert cfg.repos[0].reconcile_enabled is False
+
+    default_cfg = Config()
+    assert default_cfg.reconcile_interval_secs == 300
+    assert default_cfg.reconcile_max_per_tick == 50
+    assert default_cfg.reconcile_backoff_secs == 600
+    assert (
+        RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            linear_states=LinearStates(ready="Todo"),
+        ).reconcile_enabled
+        is True
+    )
 
 
 def test_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
