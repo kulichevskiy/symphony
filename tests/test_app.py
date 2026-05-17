@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -11,6 +12,8 @@ from symphony.app import create_app
 from symphony.webhook import WebhookSettings
 
 from .test_webhook import NOW, SECRET, _body, _Handler, _headers, _payload
+
+UI_NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 
 
 def _dist(tmp_path: Path) -> Path:
@@ -258,24 +261,48 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-1",
             "title": "Earlier issue",
             "team_key": "ADJ",
+            "canonical_status": {
+                "state": "idle",
+                "since": None,
+                "subtitle": None,
+                "stuck_for": None,
+            },
         },
         {
             "id": "issue-known",
             "identifier": "ADJ-2",
             "title": "Known tracked issue",
             "team_key": "ADJ",
+            "canonical_status": {
+                "state": "idle",
+                "since": None,
+                "subtitle": None,
+                "stuck_for": None,
+            },
         },
         {
             "id": "issue-ten",
             "identifier": "ADJ-10",
             "title": "Later issue",
             "team_key": "ADJ",
+            "canonical_status": {
+                "state": "idle",
+                "since": None,
+                "subtitle": None,
+                "stuck_for": None,
+            },
         },
         {
             "id": "issue-web",
             "identifier": "WEB-1",
             "title": "Other team issue",
             "team_key": "WEB",
+            "canonical_status": {
+                "state": "idle",
+                "since": None,
+                "subtitle": None,
+                "stuck_for": None,
+            },
         },
     ]
 
@@ -301,6 +328,139 @@ async def test_api_namespace_keeps_placeholder_404(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_issues_returns_canonical_statuses_sorted_by_default(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="idle",
+            identifier="ENG-4",
+            title="Idle issue",
+            team_key="ENG",
+        )
+        await db.issues.upsert(
+            conn,
+            id="running",
+            identifier="ENG-2",
+            title="Running issue",
+            team_key="ENG",
+        )
+        await db.issues.upsert(
+            conn,
+            id="awaiting-review",
+            identifier="ENG-3",
+            title="Awaiting review issue",
+            team_key="ENG",
+        )
+        await db.issues.upsert(
+            conn,
+            id="stuck-pr",
+            identifier="ENG-1",
+            title="Stuck PR issue",
+            team_key="ENG",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES
+                ('run-running', 'running', 'implement', 'running', NULL,
+                 '2026-05-17T11:45:00Z', NULL, 0),
+                ('run-review', 'awaiting-review', 'review', 'completed', NULL,
+                 '2026-05-17T11:45:00Z', '2026-05-17T11:55:00Z', 0)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO review_state (issue_id, iteration)
+            VALUES ('awaiting-review', 1)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES (
+                'stuck-pr', 'org/repo', 'ENG|org/repo', 44,
+                'https://github.com/org/repo/pull/44', '2026-05-16T11:00:00Z', NULL
+            )
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "id": "stuck-pr",
+            "identifier": "ENG-1",
+            "title": "Stuck PR issue",
+            "team_key": "ENG",
+            "canonical_status": {
+                "state": "pr_open",
+                "since": "2026-05-16T11:00:00Z",
+                "subtitle": "#44",
+                "stuck_for": 90000,
+            },
+        },
+        {
+            "id": "running",
+            "identifier": "ENG-2",
+            "title": "Running issue",
+            "team_key": "ENG",
+            "canonical_status": {
+                "state": "running",
+                "since": "2026-05-17T11:45:00Z",
+                "subtitle": "implement",
+                "stuck_for": None,
+            },
+        },
+        {
+            "id": "awaiting-review",
+            "identifier": "ENG-3",
+            "title": "Awaiting review issue",
+            "team_key": "ENG",
+            "canonical_status": {
+                "state": "awaiting_review_trigger",
+                "since": "2026-05-17T11:55:00Z",
+                "subtitle": "iteration=1",
+                "stuck_for": None,
+            },
+        },
+        {
+            "id": "idle",
+            "identifier": "ENG-4",
+            "title": "Idle issue",
+            "team_key": "ENG",
+            "canonical_status": {
+                "state": "idle",
+                "since": None,
+                "subtitle": None,
+                "stuck_for": None,
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
@@ -312,6 +472,7 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
             ui_enabled=True,
             ui_db_path=db_path,
             ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
 
         async with httpx.AsyncClient(
@@ -329,6 +490,12 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
             "identifier": "ENG-1",
             "title": "Fix the thing",
             "team_key": "ENG",
+        },
+        "canonical_status": {
+            "state": "awaiting_operator",
+            "since": "2026-05-17T10:30:00Z",
+            "subtitle": "review_stopped",
+            "stuck_for": 5400,
         },
         "runs": [
             {

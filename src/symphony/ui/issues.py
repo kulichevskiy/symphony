@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import aiosqlite
 from fastapi import APIRouter, HTTPException
 
 from .db import ReadOnlyDbPool
+from .status import DEFAULT_STUCK_THRESHOLDS, CanonicalState, compute_canonical_status
 
 
 def _dict(row: aiosqlite.Row) -> dict[str, Any]:
@@ -76,8 +79,17 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
     return {"ts": row["ts"], "kind": kind, "payload": payload}
 
 
-def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
+def create_issue_detail_router(
+    pool: ReadOnlyDbPool,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api")
+    thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
+
+    def now() -> datetime:
+        return clock() if clock is not None else datetime.now(UTC)
 
     @router.get("/issues/{issue_id}")
     async def issue_detail(issue_id: str) -> dict[str, Any]:
@@ -93,6 +105,12 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
         )
         if issue is None:
             raise HTTPException(status_code=404, detail="Issue not found")
+        canonical_status = await compute_canonical_status(
+            conn,
+            issue_id,
+            now=now(),
+            thresholds=thresholds,
+        )
 
         runs = await _fetch_all(
             conn,
@@ -170,6 +188,7 @@ def create_issue_detail_router(pool: ReadOnlyDbPool) -> APIRouter:
 
         return {
             "issue": issue,
+            "canonical_status": canonical_status.to_dict(),
             "runs": runs,
             "issue_prs": issue_prs,
             "operator_waits": operator_waits,

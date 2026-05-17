@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .db import ReadOnlyDbPool
+from .status import (
+    DEFAULT_STUCK_THRESHOLDS,
+    CanonicalState,
+    canonical_status_sort_key,
+    compute_canonical_status,
+)
+
+
+class CanonicalStatusPayload(BaseModel):
+    state: str
+    since: str | None
+    subtitle: str | None
+    stuck_for: int | None
 
 
 class IssueSummary(BaseModel):
@@ -15,10 +31,27 @@ class IssueSummary(BaseModel):
     identifier: str
     title: str
     team_key: str
+    canonical_status: CanonicalStatusPayload
 
 
-def create_api_router(ui_db_pool: ReadOnlyDbPool | None = None) -> APIRouter:
+def _identifier_sort_key(identifier: str) -> tuple[str, int, str]:
+    team, separator, suffix = identifier.partition("-")
+    if separator and suffix.isdigit():
+        return (team, int(suffix), identifier)
+    return (identifier, 2**31 - 1, identifier)
+
+
+def create_api_router(
+    ui_db_pool: ReadOnlyDbPool | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
+    status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api")
+    thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
+
+    def now() -> datetime:
+        return clock() if clock is not None else datetime.now(UTC)
 
     @router.get("/issues", response_model=list[IssueSummary])
     async def list_issues() -> list[IssueSummary]:
@@ -31,15 +64,6 @@ def create_api_router(ui_db_pool: ReadOnlyDbPool | None = None) -> APIRouter:
                 """
                 SELECT id, identifier, title, team_key
                 FROM issues
-                ORDER BY
-                    team_key ASC,
-                    CASE
-                        WHEN instr(identifier, '-') > 0
-                             AND substr(identifier, instr(identifier, '-') + 1) GLOB '[0-9]*'
-                        THEN CAST(substr(identifier, instr(identifier, '-') + 1) AS INTEGER)
-                        ELSE NULL
-                    END ASC,
-                    identifier ASC
                 """
             )
             rows = await cur.fetchall()
@@ -49,7 +73,34 @@ def create_api_router(ui_db_pool: ReadOnlyDbPool | None = None) -> APIRouter:
                 detail="UI database is not available",
             ) from exc
 
-        return [IssueSummary.model_validate(dict(row)) for row in rows]
+        issues = [dict(row) for row in rows]
+        statuses = [
+            (
+                issue,
+                await compute_canonical_status(
+                    conn,
+                    str(issue["id"]),
+                    now=now(),
+                    thresholds=thresholds,
+                ),
+            )
+            for issue in issues
+        ]
+        statuses.sort(
+            key=lambda item: (
+                *canonical_status_sort_key(item[1]),
+                _identifier_sort_key(str(item[0]["identifier"])),
+            )
+        )
+        return [
+            IssueSummary.model_validate(
+                {
+                    **issue,
+                    "canonical_status": status.to_dict(),
+                }
+            )
+            for issue, status in statuses
+        ]
 
     @router.api_route(
         "/{path:path}",

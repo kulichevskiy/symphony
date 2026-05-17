@@ -127,6 +127,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     webhook_settings,
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
+                    ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                 )
                 server = uvicorn.Server(
                     build_server_config(

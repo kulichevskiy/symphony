@@ -13,6 +13,7 @@ provides at boot.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -22,6 +23,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
 from .github.client import MergeStrategy
+from .ui.status import CanonicalState
 
 
 def _expand(path: str | Path) -> Path:
@@ -175,10 +177,34 @@ class Secrets(BaseSettings):
     )
 
 
+class UIStatusThresholds(BaseModel):
+    """Per-state stuck thresholds for canonical UI status."""
+
+    awaiting_operator_secs: int = Field(default=15 * 60, ge=0)
+    running_secs: int = Field(default=30 * 60, ge=0)
+    awaiting_review_trigger_secs: int = Field(default=10 * 60, ge=0)
+    pr_open_secs: int = Field(default=24 * 60 * 60, ge=0)
+
+    def to_timedeltas(self) -> dict[CanonicalState, timedelta]:
+        return {
+            CanonicalState.AWAITING_OPERATOR: timedelta(
+                seconds=self.awaiting_operator_secs
+            ),
+            CanonicalState.RUNNING: timedelta(seconds=self.running_secs),
+            CanonicalState.AWAITING_REVIEW_TRIGGER: timedelta(
+                seconds=self.awaiting_review_trigger_secs
+            ),
+            CanonicalState.PR_OPEN: timedelta(seconds=self.pr_open_secs),
+        }
+
+
 class UIConfig(BaseModel):
     """Web UI exposure knobs."""
 
     enabled: bool = True
+    status_stuck_thresholds: UIStatusThresholds = Field(
+        default_factory=UIStatusThresholds
+    )
 
 
 class Config(BaseModel):
