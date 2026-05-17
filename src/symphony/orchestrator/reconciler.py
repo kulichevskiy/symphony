@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -36,6 +37,14 @@ DRIFT_PR_LOCALLY_MERGED = "pr_locally_merged"
 
 ACTION_OBSERVED = "observed"
 ACTION_WOULD_CLEAR = "would_clear"
+
+_TRANSIENT_STATUS_RE = re.compile(
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response(?:\s+status)?|"
+    r"server\s+error|api\s+error|error)\D{0,24}(?:429|5\d\d)\b"
+    r"|\b(?:429|5\d\d)\b\D{0,24}(?:too many requests|server\s+error|"
+    r"bad\s+gateway|service\s+unavailable|gateway\s+timeout)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -555,18 +564,12 @@ def _json_payload(payload: Mapping[str, object]) -> str:
 
 def _should_backoff(message: str) -> bool:
     text = message.casefold()
-    return any(
+    if any(
         marker in text
-        for marker in (
-            "429",
-            "500",
-            "502",
-            "503",
-            "504",
-            "rate limit",
-            "secondary rate",
-        )
-    )
+        for marker in ("rate limit", "secondary rate", "too many requests")
+    ):
+        return True
+    return _TRANSIENT_STATUS_RE.search(message) is not None
 
 
 __all__ = [

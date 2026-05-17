@@ -135,14 +135,15 @@ async def _seed_pr(
     issue_id: str = "iss-1",
     *,
     binding_key: str = '["ENG","org/repo","symphony"]',
+    pr_number: int = 42,
 ) -> None:
     await db.issue_prs.upsert(
         conn,
         issue_id=issue_id,
         github_repo="org/repo",
         binding_key=binding_key,
-        pr_number=42,
-        pr_url="https://github.com/org/repo/pull/42",
+        pr_number=pr_number,
+        pr_url=f"https://github.com/org/repo/pull/{pr_number}",
         created_at="2026-05-17T10:02:00Z",
     )
 
@@ -502,6 +503,33 @@ async def test_github_5xx_enters_backoff_without_partial_rows(tmp_path: Path) ->
     assert fake_gh.calls == [(42, "org/repo")]
     assert row is not None
     assert row["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_github_error_with_pr_number_500_does_not_backoff(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    fake_gh = _FakeGitHub(error=GitHubError("gh pr view 500 failed: not found"))
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn, pr_number=500)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+    finally:
+        await conn.close()
+
+    assert fake_gh.calls == [(500, "org/repo")]
+    assert rows[1][0] == "github"
+    assert json.loads(rows[1][3])["prs"][0]["error"] == "gh pr view 500 failed: not found"
 
 
 @pytest.mark.asyncio
