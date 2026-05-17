@@ -334,21 +334,30 @@ class Reconciler:
                 SELECT issue_id, created_at FROM operator_waits
                 UNION ALL
                 SELECT issue_id, created_at FROM issue_prs WHERE merged_at IS NULL
+            ),
+            candidate_summary AS (
+                SELECT issue_id, MIN(source_ts) AS first_candidate_at
+                FROM candidate_events
+                GROUP BY issue_id
+            ),
+            observation_summary AS (
+                SELECT issue_id, MAX(observed_at) AS last_observed_at
+                FROM external_observations
+                GROUP BY issue_id
             )
             SELECT
                 i.id AS issue_id,
                 i.identifier,
                 i.team_key,
-                MIN(c.source_ts) AS first_candidate_at,
-                MAX(o.observed_at) AS last_observed_at
-            FROM candidate_events c
+                c.first_candidate_at,
+                o.last_observed_at
+            FROM candidate_summary c
             JOIN issues i ON i.id = c.issue_id
-            LEFT JOIN external_observations o ON o.issue_id = c.issue_id
-            GROUP BY i.id, i.identifier, i.team_key
+            LEFT JOIN observation_summary o ON o.issue_id = c.issue_id
             ORDER BY
-                CASE WHEN MAX(o.observed_at) IS NULL THEN 0 ELSE 1 END ASC,
-                MAX(o.observed_at) ASC,
-                MIN(c.source_ts) ASC,
+                CASE WHEN o.last_observed_at IS NULL THEN 0 ELSE 1 END ASC,
+                o.last_observed_at ASC,
+                c.first_candidate_at ASC,
                 i.id ASC
             """
         )

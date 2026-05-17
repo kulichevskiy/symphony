@@ -365,6 +365,50 @@ async def test_tick_honors_max_per_tick(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_list_candidates_preaggregates_observation_history(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await db.external_observations.insert(
+            conn,
+            issue_id="iss-1",
+            source="linear",
+            observed_at="2026-05-17T10:05:00Z",
+            payload_json="{}",
+            drift_kind=None,
+            action_taken=ACTION_OBSERVED,
+        )
+        await db.external_observations.insert(
+            conn,
+            issue_id="iss-1",
+            source="github",
+            observed_at="2026-05-17T10:10:00Z",
+            payload_json="{}",
+            drift_kind=None,
+            action_taken=ACTION_OBSERVED,
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        candidates = await reconciler._list_candidates()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+    assert len(candidates) == 1
+    assert candidates[0].issue_id == "iss-1"
+    assert candidates[0].first_candidate_at == "2026-05-17T10:01:00Z"
+    assert candidates[0].last_observed_at == "2026-05-17T10:10:00Z"
+
+
+@pytest.mark.asyncio
 async def test_tick_skips_candidate_without_matching_binding(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     fake_linear = _FakeLinear()
