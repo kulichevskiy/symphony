@@ -9,6 +9,7 @@ import pytest
 
 from symphony import db
 from symphony.app import create_app
+from symphony.ui import api as ui_api
 from symphony.webhook import WebhookSettings
 
 from .test_webhook import NOW, SECRET, _body, _Handler, _headers, _payload
@@ -458,6 +459,96 @@ async def test_api_issues_returns_canonical_statuses_sorted_by_default(
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_api_issues_uses_one_clock_value_for_all_canonical_statuses(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    clock_calls = 0
+
+    def clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        return UI_NOW
+
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="issue-a",
+            identifier="ENG-1",
+            title="First issue",
+            team_key="ENG",
+        )
+        await db.issues.upsert(
+            conn,
+            id="issue-b",
+            identifier="ENG-2",
+            title="Second issue",
+            team_key="ENG",
+        )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=clock,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert clock_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_api_issues_maps_canonical_status_db_errors_to_503(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def raise_db_error(*_args: object, **_kwargs: object) -> object:
+        raise aiosqlite.OperationalError("database is locked")
+
+    monkeypatch.setattr(ui_api, "compute_canonical_status", raise_db_error)
+
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="issue-a",
+            identifier="ENG-1",
+            title="First issue",
+            team_key="ENG",
+        )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "UI database is not available"}
 
 
 @pytest.mark.asyncio

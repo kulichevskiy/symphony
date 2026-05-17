@@ -67,25 +67,26 @@ def create_api_router(
                 """
             )
             rows = await cur.fetchall()
+            request_now = now()
+            issues = [dict(row) for row in rows]
+            statuses = [
+                (
+                    issue,
+                    await compute_canonical_status(
+                        conn,
+                        str(issue["id"]),
+                        now=request_now,
+                        thresholds=thresholds,
+                    ),
+                )
+                for issue in issues
+            ]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503,
                 detail="UI database is not available",
             ) from exc
 
-        issues = [dict(row) for row in rows]
-        statuses = [
-            (
-                issue,
-                await compute_canonical_status(
-                    conn,
-                    str(issue["id"]),
-                    now=now(),
-                    thresholds=thresholds,
-                ),
-            )
-            for issue in issues
-        ]
         statuses.sort(
             key=lambda item: (
                 *canonical_status_sort_key(item[1]),
