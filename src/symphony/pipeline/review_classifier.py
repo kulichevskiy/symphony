@@ -264,8 +264,14 @@ def review_classifier(
 
     codex_approval_at: datetime | None = None
 
-    def record_codex_approval_time(ts: str) -> None:
+    def record_codex_approval_time(
+        ts: str,
+        *,
+        require_head_timestamp: bool,
+    ) -> None:
         nonlocal codex_approval_at
+        if require_head_timestamp and head_dt is None:
+            return
         signal_dt = _parse_iso(ts)
         if signal_dt is None:
             return
@@ -278,11 +284,17 @@ def review_classifier(
     # comments, supplied by the orchestrator as Reaction(content="+1").
     for rxn in snapshot.reactions:
         if is_codex_author(rxn.user_login) and rxn.content == "+1":
-            record_codex_approval_time(rxn.created_at)
+            record_codex_approval_time(
+                rxn.created_at,
+                require_head_timestamp=True,
+            )
 
     for review in fresh_reviews:
         if codex_review_is_approval(review):
-            record_codex_approval_time(review.submitted_at)
+            record_codex_approval_time(
+                review.submitted_at,
+                require_head_timestamp=False,
+            )
 
     def superseded_by_codex_approval(ts: str) -> bool:
         if codex_approval_at is None:
