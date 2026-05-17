@@ -318,6 +318,43 @@ async def test_tick_honors_max_per_tick(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tick_skips_candidate_without_matching_binding(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    fake_linear = _FakeLinear()
+    fake_gh = _FakeGitHub()
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    RepoBinding(
+                        linear_team_key="ENG",
+                        github_repo="org/other",
+                        issue_label="symphony",
+                        linear_states=LinearStates(ready="Todo"),
+                    )
+                ]
+            ),
+            conn,
+            fake_linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 0
+        cur = await conn.execute("SELECT COUNT(*) AS count FROM external_observations")
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert fake_linear.calls == 0
+    assert fake_gh.calls == []
+    assert row is not None
+    assert row["count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_enters_backoff_and_skips_followup_tick(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     fake_linear = _FakeLinear(error=LinearError("server error 429: slow down"))

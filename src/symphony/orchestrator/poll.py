@@ -6549,8 +6549,6 @@ def _linear_issue_state_changed(payload: Mapping[str, Any]) -> bool:
         for key in ("state", "stateId", "state_id", "stateName", "state_name")
     ):
         return True
-    if any(key in data for key in ("state", "stateId", "state_id", "stateName", "state_name")):
-        return True
     return False
 
 

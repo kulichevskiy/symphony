@@ -536,6 +536,43 @@ async def test_webhook_issue_state_change_triggers_reconcile_hook(
 
 
 @pytest.mark.asyncio
+async def test_webhook_issue_update_without_state_change_skips_reconcile_hook(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        orch = _make_orch(cfg, linear, conn)
+
+        async def done() -> None:
+            return None
+
+        task = asyncio.create_task(done())
+        orch._schedule_dispatch = MagicMock(return_value=task)  # type: ignore[method-assign]  # noqa: SLF001
+        spy = MagicMock()
+        spy.reconcile_linear_issue_event = AsyncMock(return_value=2)
+        orch._reconciler = spy  # noqa: SLF001
+
+        result = await orch.handle_linear_webhook(
+            {
+                "type": "Issue",
+                "action": "update",
+                "webhookTimestamp": int(NOW.timestamp() * 1000),
+                "updatedFrom": {"title": "Old title"},
+                "data": {"id": "iss-1", "state": {"id": "state-todo"}},
+            }
+        )
+        await task
+
+        assert result.handled is True
+        spy.reconcile_linear_issue_event.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_ready_issue_schedule_claim_is_atomic(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

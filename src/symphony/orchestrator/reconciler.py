@@ -464,7 +464,7 @@ class Reconciler:
                 )
             )
         if not matched:
-            return True
+            return False
         return any(binding.reconcile_enabled for binding in matched)
 
     def _matching_bindings(
