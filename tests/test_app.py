@@ -203,7 +203,85 @@ async def test_ui_disabled_skips_ui_and_api_mounts(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_namespace_is_reserved_with_placeholder_404(tmp_path: Path) -> None:
+async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="issue-known",
+            identifier="ADJ-2",
+            title="Known tracked issue",
+            team_key="ADJ",
+        )
+        await db.issues.upsert(
+            conn,
+            id="issue-first",
+            identifier="ADJ-1",
+            title="Earlier issue",
+            team_key="ADJ",
+        )
+        await db.issues.upsert(
+            conn,
+            id="issue-ten",
+            identifier="ADJ-10",
+            title="Later issue",
+            team_key="ADJ",
+        )
+        await db.issues.upsert(
+            conn,
+            id="issue-web",
+            identifier="WEB-1",
+            title="Other team issue",
+            team_key="WEB",
+        )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_dist_dir=_dist(tmp_path),
+            ui_db_path=db_path,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "id": "issue-first",
+            "identifier": "ADJ-1",
+            "title": "Earlier issue",
+            "team_key": "ADJ",
+        },
+        {
+            "id": "issue-known",
+            "identifier": "ADJ-2",
+            "title": "Known tracked issue",
+            "team_key": "ADJ",
+        },
+        {
+            "id": "issue-ten",
+            "identifier": "ADJ-10",
+            "title": "Later issue",
+            "team_key": "ADJ",
+        },
+        {
+            "id": "issue-web",
+            "identifier": "WEB-1",
+            "title": "Other team issue",
+            "team_key": "WEB",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_api_namespace_keeps_placeholder_404(tmp_path: Path) -> None:
     app = create_app(
         _Handler(),
         object(),  # type: ignore[arg-type]
@@ -215,7 +293,7 @@ async def test_api_namespace_is_reserved_with_placeholder_404(tmp_path: Path) ->
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        response = await client.get("/api/issues")
+        response = await client.get("/api/anything")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Not Found"}
