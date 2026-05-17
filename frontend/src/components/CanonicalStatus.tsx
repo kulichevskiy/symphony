@@ -5,7 +5,9 @@ import { cn } from "@/lib/utils";
 import type { CanonicalStatus, CanonicalStatusState } from "@/lib/api";
 
 const STATE_LABELS: Record<CanonicalStatusState, string> = {
-  awaiting_operator: "awaiting operator",
+  halted: "halted",
+  paused: "paused",
+  awaiting_merge: "awaiting merge",
   running: "running",
   failed: "failed",
   awaiting_review_trigger: "awaiting review trigger",
@@ -15,7 +17,9 @@ const STATE_LABELS: Record<CanonicalStatusState, string> = {
 };
 
 const STATE_CLASSES: Record<CanonicalStatusState, string> = {
-  awaiting_operator: "border-amber-300 bg-amber-50 text-amber-900",
+  halted: "border-red-300 bg-red-50 text-red-900",
+  paused: "border-amber-300 bg-amber-50 text-amber-900",
+  awaiting_merge: "border-blue-300 bg-blue-50 text-blue-900",
   running: "border-blue-300 bg-blue-50 text-blue-900",
   failed: "border-red-300 bg-red-50 text-red-900",
   awaiting_review_trigger: "border-violet-300 bg-violet-50 text-violet-900",

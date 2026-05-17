@@ -1,5 +1,7 @@
 export type CanonicalStatusState =
-  | "awaiting_operator"
+  | "halted"
+  | "paused"
+  | "awaiting_merge"
   | "running"
   | "failed"
   | "awaiting_review_trigger"

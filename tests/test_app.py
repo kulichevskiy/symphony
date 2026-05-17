@@ -570,12 +570,19 @@ async def test_api_issues_default_active_scope_filters_active_sources(
         await conn.close()
 
     assert response.status_code == 200
-    assert [row["id"] for row in response.json()] == [
+    rows = response.json()
+    assert [row["id"] for row in rows] == [
         "active-wait",
         "active-running",
         "active-review",
         "active-pr",
     ]
+    assert rows[0]["canonical_status"] == {
+        "state": "paused",
+        "since": "2026-05-17T11:55:00Z",
+        "subtitle": "review_stopped",
+        "stuck_for": None,
+    }
 
 
 @pytest.mark.asyncio
@@ -818,7 +825,7 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
             "team_key": "ENG",
         },
         "canonical_status": {
-            "state": "awaiting_operator",
+            "state": "paused",
             "since": "2026-05-17T10:30:00Z",
             "subtitle": "review_stopped",
             "stuck_for": 5400,

@@ -46,8 +46,37 @@ async def _run(
     await conn.commit()
 
 
+async def _operator_wait(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    run_id: str,
+    kind: str,
+    created_at: str,
+) -> None:
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO runs (
+            id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        )
+        VALUES (?, ?, 'review', 'completed', NULL, ?, ?, 0)
+        """,
+        (run_id, issue_id, created_at, created_at),
+    )
+    await conn.execute(
+        """
+        INSERT INTO operator_waits (
+            issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
+        )
+        VALUES (?, ?, ?, 'ENG', 'org/repo', 'symphony', ?)
+        """,
+        (issue_id, run_id, kind, created_at),
+    )
+    await conn.commit()
+
+
 @pytest.mark.asyncio
-async def test_canonical_status_prefers_operator_wait_and_marks_stuck(
+async def test_canonical_status_prefers_operator_wait_and_keeps_kind_subtitle(
     tmp_path: Path,
 ) -> None:
     conn = await _connect(tmp_path)
@@ -61,29 +90,97 @@ async def test_canonical_status_prefers_operator_wait_and_marks_stuck(
             status="running",
             started_at="2026-05-17T11:00:00Z",
         )
-        await conn.execute(
-            """
-            INSERT INTO operator_waits (
-                issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
-            )
-            VALUES (
-                'operator', 'run-operator', 'review_stopped', 'ENG', 'org/repo',
-                'symphony', '2026-05-17T11:30:00Z'
-            )
-            """
+        await _operator_wait(
+            conn,
+            issue_id="operator",
+            run_id="run-operator",
+            kind=db.operator_waits.KIND_REVIEW_STOPPED,
+            created_at="2026-05-17T11:30:00Z",
         )
-        await conn.commit()
 
         status = await compute_canonical_status(conn, "operator", now=NOW)
     finally:
         await conn.close()
 
     assert status.to_dict() == {
-        "state": "awaiting_operator",
+        "state": "paused",
         "since": "2026-05-17T11:30:00Z",
         "subtitle": "review_stopped",
         "stuck_for": 1800,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "expected_state"),
+    [
+        (db.operator_waits.KIND_IMPLEMENT_FAILED, "halted"),
+        (db.operator_waits.KIND_REVIEW_FAILED, "halted"),
+        (db.operator_waits.KIND_REVIEW_STOPPED, "paused"),
+        (db.operator_waits.KIND_COST_CAP, "paused"),
+        (db.operator_waits.KIND_MERGE, "awaiting_merge"),
+    ],
+)
+async def test_canonical_status_splits_operator_wait_kind(
+    tmp_path: Path,
+    kind: str,
+    expected_state: str,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        issue_id = f"operator-{kind}"
+        await _issue(conn, issue_id)
+        await _operator_wait(
+            conn,
+            issue_id=issue_id,
+            run_id=f"run-{kind}",
+            kind=kind,
+            created_at="2026-05-17T11:59:00Z",
+        )
+
+        status = await compute_canonical_status(conn, issue_id, now=NOW)
+    finally:
+        await conn.close()
+
+    payload = status.to_dict()
+    assert payload["state"] == expected_state
+    assert payload["subtitle"] == kind
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("issue_id", "kind", "created_at", "expected_stuck_for"),
+    [
+        ("halted-now", db.operator_waits.KIND_IMPLEMENT_FAILED, "2026-05-17T12:00:00Z", 0),
+        ("paused-fresh", db.operator_waits.KIND_REVIEW_STOPPED, "2026-05-17T11:46:00Z", None),
+        ("paused-stuck", db.operator_waits.KIND_REVIEW_STOPPED, "2026-05-17T11:45:00Z", 900),
+        ("merge-fresh", db.operator_waits.KIND_MERGE, "2026-05-17T08:01:00Z", None),
+        ("merge-stuck", db.operator_waits.KIND_MERGE, "2026-05-17T08:00:00Z", 14400),
+    ],
+)
+async def test_canonical_status_applies_operator_wait_stuck_thresholds(
+    tmp_path: Path,
+    issue_id: str,
+    kind: str,
+    created_at: str,
+    expected_stuck_for: int | None,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, issue_id)
+        await _operator_wait(
+            conn,
+            issue_id=issue_id,
+            run_id=f"run-{issue_id}",
+            kind=kind,
+            created_at=created_at,
+        )
+
+        status = await compute_canonical_status(conn, issue_id, now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.stuck_for == expected_stuck_for
 
 
 @pytest.mark.asyncio

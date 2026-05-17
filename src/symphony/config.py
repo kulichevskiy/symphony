@@ -180,15 +180,17 @@ class Secrets(BaseSettings):
 class UIStatusThresholds(BaseModel):
     """Per-state stuck thresholds for canonical UI status."""
 
-    awaiting_operator_secs: int = Field(default=15 * 60, ge=0)
+    paused_secs: int = Field(default=15 * 60, ge=0)
+    awaiting_merge_secs: int = Field(default=4 * 60 * 60, ge=0)
     running_secs: int = Field(default=30 * 60, ge=0)
     awaiting_review_trigger_secs: int = Field(default=10 * 60, ge=0)
     pr_open_secs: int = Field(default=24 * 60 * 60, ge=0)
 
     def to_timedeltas(self) -> dict[CanonicalState, timedelta]:
         return {
-            CanonicalState.AWAITING_OPERATOR: timedelta(
-                seconds=self.awaiting_operator_secs
+            CanonicalState.PAUSED: timedelta(seconds=self.paused_secs),
+            CanonicalState.AWAITING_MERGE: timedelta(
+                seconds=self.awaiting_merge_secs
             ),
             CanonicalState.RUNNING: timedelta(seconds=self.running_secs),
             CanonicalState.AWAITING_REVIEW_TRIGGER: timedelta(
