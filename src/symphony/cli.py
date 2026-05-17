@@ -80,12 +80,15 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
     }
     if not cfg.github_webhook_secret and not repo_secrets:
         return None
-    return GitHubWebhookSettings(
-        secret=cfg.github_webhook_secret,
-        repo_secrets=repo_secrets,
-        enabled_repos=frozenset(binding.github_repo for binding in enabled_bindings),
-        dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
-    )
+    try:
+        return GitHubWebhookSettings(
+            secret=cfg.github_webhook_secret,
+            repo_secrets=repo_secrets,
+            enabled_repos=frozenset(binding.github_repo for binding in enabled_bindings),
+            dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
+        )
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @click.group(invoke_without_command=True)

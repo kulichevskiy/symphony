@@ -81,6 +81,14 @@ def _issue_comment_payload() -> dict[str, Any]:
     }
 
 
+def test_github_webhook_settings_require_secret_for_enabled_repos() -> None:
+    with pytest.raises(ValueError, match="enabled repos lack webhook_secret: org/web"):
+        GitHubWebhookSettings(
+            repo_secrets={"org/repo": REPO_SECRET},
+            enabled_repos=frozenset({"org/repo", "org/web"}),
+        )
+
+
 async def _delivery_rows(conn: object) -> list[tuple[str, str]]:
     cur = await conn.execute("SELECT id, status FROM webhook_deliveries ORDER BY id")
     return [(str(row[0]), str(row[1])) for row in await cur.fetchall()]

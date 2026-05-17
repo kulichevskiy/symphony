@@ -113,6 +113,8 @@ Set:
 - Leave `repos[].webhook_enabled: true` for watched repos that should accept
   GitHub webhook events; set it to `false` for repos that should keep polling
   only.
+- If `GITHUB_WEBHOOK_SECRET` is unset, every repo with
+  `repos[].webhook_enabled: true` must define `repos[].webhook_secret`.
 - Each `repos[].linear_team_key`, `issue_label`, and `linear_states` entry to match the Linear workspace.
 
 ## 3. Authenticate headless tools

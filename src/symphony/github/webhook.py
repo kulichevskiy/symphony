@@ -46,6 +46,18 @@ class GitHubWebhookSettings:
     enabled_repos: frozenset[str] | None = None
     dedupe_ttl_secs: int = 600
 
+    def __post_init__(self) -> None:
+        if self.secret or self.enabled_repos is None:
+            return
+        missing = sorted(
+            repo for repo in self.enabled_repos if not self.repo_secrets.get(repo)
+        )
+        if missing:
+            raise ValueError(
+                "GITHUB_WEBHOOK_SECRET is empty and enabled repos lack "
+                f"webhook_secret: {', '.join(missing)}"
+            )
+
     def all_secrets(self) -> tuple[str, ...]:
         return tuple(s for s in (self.secret, *self.repo_secrets.values()) if s)
 
