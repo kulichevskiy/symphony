@@ -15,6 +15,12 @@ import aiosqlite
 # Statuses that mean "this run is supposed to be alive". Kept as a tuple so
 # callers (poll dedupe, reconcile) share a single source of truth.
 LIVE_STATUSES: tuple[str, ...] = ("running",)
+FAILED_STATUS: str = "failed"
+INTERRUPTED_STATUS: str = "interrupted"
+
+# Terminal review-monitor statuses that indicate the monitor died or was
+# stopped before it could keep polling the linked PR.
+REVIEW_RESURRECT_STATUSES: tuple[str, ...] = (FAILED_STATUS, INTERRUPTED_STATUS)
 
 
 @dataclass
