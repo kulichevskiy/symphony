@@ -305,7 +305,7 @@ class Reconciler:
         )
         github_drift = classify_github_drift(
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
-            prs=github_prs,
+            prs=_github_prs_for_drift(wait=wait, github_prs=github_prs),
         )
         active = reconcile_auto_clear_enabled()
         remaining = action_budget_remaining
@@ -326,7 +326,7 @@ class Reconciler:
         github_clearable = _github_clearable(
             github_drift=github_drift,
             wait=wait,
-            github_prs=github_prs,
+            github_prs=_github_prs_for_drift(wait=wait, github_prs=github_prs),
         )
         if active and github_clearable:
             if remaining is None or remaining > 0:
@@ -380,7 +380,7 @@ class Reconciler:
                     issue_id=issue_id,
                     wait=wait,
                     drift_kind=github_drift,
-                    github_prs=github_prs,
+                    github_prs=_github_prs_for_drift(wait=wait, github_prs=github_prs),
                 )
             await self._conn.commit()
         except Exception:
@@ -803,6 +803,20 @@ def _github_clearable(
     if github_drift == DRIFT_PR_LOCALLY_MERGED:
         return bool(_merged_prs_with_timestamps(github_prs))
     return False
+
+
+def _github_prs_for_drift(
+    *,
+    wait: db.operator_waits.OperatorWait | None,
+    github_prs: list[GithubPrObservation],
+) -> list[GithubPrObservation]:
+    if wait is None or wait.kind != db.operator_waits.KIND_MERGE:
+        return github_prs
+    return [
+        pr
+        for pr in github_prs
+        if pr.github_repo.casefold() == wait.github_repo.casefold()
+    ]
 
 
 def _merged_prs_with_timestamps(

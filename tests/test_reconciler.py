@@ -66,6 +66,7 @@ class _FakeGitHub:
         self,
         *,
         view: dict[str, object] | None = None,
+        views_by_repo: dict[str, dict[str, object]] | None = None,
         error: Exception | None = None,
     ) -> None:
         self.view = view or {
@@ -74,6 +75,7 @@ class _FakeGitHub:
             "mergedAt": None,
             "url": "https://github.com/org/repo/pull/42",
         }
+        self.views_by_repo = views_by_repo or {}
         self.error = error
         self.calls: list[tuple[int, str | None]] = []
 
@@ -81,18 +83,21 @@ class _FakeGitHub:
         self.calls.append((int(pr), repo))
         if self.error is not None:
             raise self.error
+        if repo is not None and repo in self.views_by_repo:
+            return dict(self.views_by_repo[repo])
         return dict(self.view)
 
 
 def _binding(
     *,
+    github_repo: str = "org/repo",
     issue_label: str | None = "symphony",
     reconcile_enabled: bool = True,
     done_state: str = "Done",
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
-        github_repo="org/repo",
+        github_repo=github_repo,
         issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
         linear_states=LinearStates(ready="Todo", done=done_state),
@@ -126,6 +131,7 @@ async def _seed_merge_wait(
     issue_id: str = "iss-1",
     *,
     issue_label: str = "symphony",
+    github_repo: str = "org/repo",
 ) -> None:
     await _seed_run(conn, issue_id, f"run-{issue_id}")
     await db.operator_waits.upsert(
@@ -134,7 +140,7 @@ async def _seed_merge_wait(
         run_id=f"run-{issue_id}",
         kind=db.operator_waits.KIND_MERGE,
         linear_team_key="ENG",
-        github_repo="org/repo",
+        github_repo=github_repo,
         issue_label=issue_label,
         created_at="2026-05-17T10:01:00Z",
     )
@@ -144,16 +150,22 @@ async def _seed_pr(
     conn: aiosqlite.Connection,
     issue_id: str = "iss-1",
     *,
-    binding_key: str = '["ENG","org/repo","symphony"]',
+    github_repo: str = "org/repo",
+    binding_key: str | None = None,
     pr_number: int = 42,
 ) -> None:
+    stored_binding_key = (
+        binding_key
+        if binding_key is not None
+        else f'["ENG","{github_repo}","symphony"]'
+    )
     await db.issue_prs.upsert(
         conn,
         issue_id=issue_id,
-        github_repo="org/repo",
-        binding_key=binding_key,
+        github_repo=github_repo,
+        binding_key=stored_binding_key,
         pr_number=pr_number,
-        pr_url=f"https://github.com/org/repo/pull/{pr_number}",
+        pr_url=f"https://github.com/{github_repo}/pull/{pr_number}",
         created_at="2026-05-17T10:02:00Z",
     )
 
@@ -183,10 +195,11 @@ async def _observation_rows(
 async def _merged_at(
     conn: aiosqlite.Connection,
     issue_id: str = "iss-1",
+    github_repo: str = "org/repo",
 ) -> str | None:
     cur = await conn.execute(
-        "SELECT merged_at FROM issue_prs WHERE issue_id = ?",
-        (issue_id,),
+        "SELECT merged_at FROM issue_prs WHERE issue_id = ? AND github_repo = ?",
+        (issue_id, github_repo),
     )
     row = await cur.fetchone()
     if row is None:
@@ -396,6 +409,66 @@ async def test_active_merge_zombie_clears_wait_and_marks_pr_merged(
     ]
     assert ("operator_waits", "kind", db.operator_waits.KIND_MERGE, None) in transitions
     assert ("issue_prs", "merged_at", None, merged_at) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_merge_wait_ignores_merged_pr_from_other_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn, github_repo="org/repo-a")
+        await _seed_pr(conn, github_repo="org/repo-a", pr_number=41)
+        await _seed_pr(conn, github_repo="org/repo-b", pr_number=42)
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(github_repo="org/repo-a"),
+                    _binding(github_repo="org/repo-b"),
+                ]
+            ),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                views_by_repo={
+                    "org/repo-a": {
+                        "state": "OPEN",
+                        "mergeable": "MERGEABLE",
+                        "mergedAt": None,
+                        "url": "https://github.com/org/repo-a/pull/41",
+                    },
+                    "org/repo-b": {
+                        "state": "MERGED",
+                        "mergeable": "UNKNOWN",
+                        "mergedAt": "2026-05-17T11:59:00Z",
+                        "url": "https://github.com/org/repo-b/pull/42",
+                    },
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        repo_a_merged_at = await _merged_at(conn, github_repo="org/repo-a")
+        cur = await conn.execute(
+            "SELECT merged_at FROM issue_prs WHERE issue_id = ? AND github_repo = ?",
+            ("iss-1", "org/repo-b"),
+        )
+        repo_b_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert repo_a_merged_at is None
+    assert repo_b_row is not None
+    assert repo_b_row["merged_at"] is None
+    assert rows[1][1] is None
+    assert rows[1][2] == ACTION_OBSERVED
 
 
 @pytest.mark.asyncio
