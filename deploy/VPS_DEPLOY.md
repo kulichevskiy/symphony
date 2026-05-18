@@ -187,12 +187,14 @@ exit
 `/opt/symphonyd/config.yaml`. Review stage постит `@codex review`, и бот сможет
 работать только в репозиториях, где app установлен.
 
-`symphony preflight` создаст профиль Codex `symphony-git` в
-`~/.codex/config.toml`, если других permissions-профилей еще нет. Если
-permissions уже настроены вручную без `symphony-git`, preflight попросит
-добавить профиль руками, не переписывая пользовательский TOML. После этого
-можно проверить тот же режим, который daemon использует для unattended
-`implement` и `review_fix`:
+Если хотя бы один binding может запускать локальный Codex CLI, `symphony
+preflight` создаст профиль Codex `symphony-git` в `~/.codex/config.toml`, если
+других permissions-профилей еще нет. Если permissions уже настроены вручную без
+`symphony-git`, preflight попросит добавить профиль руками, не переписывая
+пользовательский TOML. Binding-и, которые используют только Claude и remote
+`@codex review`, этот локальный профиль не требуют. После этого можно проверить
+тот же режим, который daemon использует для unattended `implement` и
+`review_fix`:
 
 ```bash
 codex exec --json \

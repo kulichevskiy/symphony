@@ -762,8 +762,10 @@ Preflight checks:
 - Linear auth works;
 - configured teams are visible;
 - configured Linear state names exist.
-- Codex has a `symphony-git` permissions profile in `~/.codex/config.toml`
-  so unattended Codex runs can commit inside managed worktrees. If custom
+- if any configured binding can run the local Codex CLI, Codex has a
+  `symphony-git` permissions profile in `~/.codex/config.toml` so unattended
+  Codex runs can commit inside managed worktrees. Bindings that only use Claude
+  plus remote `@codex review` do not require this local profile. If custom
   permissions already exist without `symphony-git`, preflight asks for a manual
   config edit instead of rewriting operator-owned TOML.
 

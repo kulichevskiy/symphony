@@ -103,16 +103,21 @@ def test_ensure_symphony_permissions_profile_reports_inline_permissions_table(
     assert config_path.read_text(encoding="utf-8") == existing
 
 
-def test_ensure_symphony_permissions_profile_reports_empty_inline_permissions_table(
+def test_ensure_symphony_permissions_profile_creates_empty_inline_permissions_table(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.toml"
     existing = "permissions = {}\n"
     config_path.write_text(existing, encoding="utf-8")
 
-    with pytest.raises(CodexPermissionsProfileError, match="safely updated"):
-        ensure_symphony_permissions_profile(config_path)
-    assert config_path.read_text(encoding="utf-8") == existing
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is True
+    updated = config_path.read_text(encoding="utf-8")
+    assert "permissions = {}" not in updated
+    parsed = tomllib.loads(updated)
+    assert SYMPHONY_PERMISSIONS_PROFILE in parsed["permissions"]
 
 
 def test_ensure_symphony_permissions_profile_reports_quoted_inline_permissions_key(
@@ -125,6 +130,23 @@ def test_ensure_symphony_permissions_profile_reports_quoted_inline_permissions_k
     with pytest.raises(CodexPermissionsProfileError, match="other permissions"):
         ensure_symphony_permissions_profile(config_path)
     assert config_path.read_text(encoding="utf-8") == existing
+
+
+def test_ensure_symphony_permissions_profile_creates_quoted_empty_inline_permissions_key(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    existing = '"permissions" = {} # no profiles yet\n'
+    config_path.write_text(existing, encoding="utf-8")
+
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is True
+    updated = config_path.read_text(encoding="utf-8")
+    assert '"permissions" = {}' not in updated
+    parsed = tomllib.loads(updated)
+    assert SYMPHONY_PERMISSIONS_PROFILE in parsed["permissions"]
 
 
 def test_ensure_symphony_permissions_profile_reports_other_permissions_table(

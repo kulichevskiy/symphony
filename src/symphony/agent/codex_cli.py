@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from pathlib import Path
 
@@ -26,6 +27,9 @@ SYMPHONY_PERMISSIONS_PROFILE_TOML = f"""
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
 enabled = false
 """.strip()
+_EMPTY_INLINE_PERMISSIONS_RE = re.compile(
+    r"""^\s*(?:"permissions"|'permissions'|permissions)\s*=\s*\{\s*\}\s*(?:#.*)?$"""
+)
 
 
 class CodexPermissionsProfileError(RuntimeError):
@@ -37,6 +41,22 @@ def codex_config_path() -> Path:
     if codex_home := os.environ.get("CODEX_HOME"):
         return Path(codex_home).expanduser() / "config.toml"
     return Path.home() / ".codex" / "config.toml"
+
+
+def _drop_empty_inline_permissions_assignment(config_text: str) -> tuple[str, bool]:
+    """Remove a root `permissions = {}` assignment before appending tables."""
+    lines: list[str] = []
+    removed = False
+    in_root = True
+    for raw_line in config_text.splitlines(keepends=True):
+        code = raw_line.split("#", 1)[0].strip()
+        if in_root and _EMPTY_INLINE_PERMISSIONS_RE.match(raw_line.rstrip("\r\n")):
+            removed = True
+            continue
+        if code.startswith("["):
+            in_root = False
+        lines.append(raw_line)
+    return "".join(lines), removed
 
 
 def ensure_symphony_permissions_profile(
@@ -79,9 +99,11 @@ def ensure_symphony_permissions_profile(
                 raise CodexPermissionsProfileError(
                     f"Codex config {path} defines {SYMPHONY_PERMISSIONS_PROFILE!r} "
                     "as a non-table value; add the permissions profile manually."
-                )
+            )
             if isinstance(profile, dict):
                 return path, False
+            if profile is None:
+                existing, _ = _drop_empty_inline_permissions_assignment(existing)
 
     separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
     updated = f"{existing}{separator}{SYMPHONY_PERMISSIONS_PROFILE_TOML}\n"
