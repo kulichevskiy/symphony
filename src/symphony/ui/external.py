@@ -263,13 +263,13 @@ async def sqlite_external_view(conn: aiosqlite.Connection, issue_id: str) -> Jso
 
 def _sqlite_issue_label(sqlite_view: JsonDict) -> str | None:
     review_state = sqlite_view.get("review_state")
-    if isinstance(review_state, dict) and review_state.get("issue_label"):
+    if isinstance(review_state, dict) and review_state.get("issue_label") is not None:
         return str(review_state["issue_label"])
 
     operator_waits = sqlite_view.get("operator_waits")
     if isinstance(operator_waits, list):
         for wait in operator_waits:
-            if isinstance(wait, dict) and wait.get("issue_label"):
+            if isinstance(wait, dict) and wait.get("issue_label") is not None:
                 return str(wait["issue_label"])
     return None
 
@@ -298,7 +298,7 @@ def _resolve_binding(config: Config, sqlite_view: JsonDict) -> RepoBinding | Non
         return None
 
     issue_label = _sqlite_issue_label(sqlite_view)
-    if issue_label:
+    if issue_label is not None:
         for binding in candidates:
             if binding.issue_label == issue_label:
                 return binding

@@ -70,6 +70,7 @@ async def _seed_external_issue(
     *,
     merged_at: str | None = None,
     with_pr: bool = True,
+    issue_label: str = "symphony",
 ) -> None:
     await db.issues.upsert(
         conn,
@@ -102,9 +103,10 @@ async def _seed_external_issue(
         INSERT INTO operator_waits (
             issue_id, run_id, kind, linear_team_key, github_repo, issue_label, created_at
         )
-        VALUES ('iss-1', 'run-1', 'merge', 'ENG', 'org/repo', 'symphony',
+        VALUES ('iss-1', 'run-1', 'merge', 'ENG', 'org/repo', ?,
                 '2026-05-17T11:10:00Z')
-        """
+        """,
+        (issue_label,),
     )
     await conn.commit()
 
@@ -272,6 +274,39 @@ async def test_external_snapshot_resolves_binding_by_issue_label(tmp_path: Path)
     service = ExternalSnapshotService(config, linear, github, clock=lambda: NOW)
     try:
         await _seed_external_issue(conn)
+        snapshot = await service.get_issue_external(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert snapshot is not None
+    assert [flag["field"] for flag in snapshot["drift_flags"]] == ["linear.state"]
+
+
+@pytest.mark.asyncio
+async def test_external_snapshot_resolves_empty_issue_label_binding(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    linear = _FakeLinear(_linear_payload(state="Completed"))
+    github = _FakeGitHub(_github_payload(state="OPEN", merged_at=None, failing=0))
+    config = Config(
+        linear_api_key="x",
+        repos=[
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="other",
+                linear_states=LinearStates(ready="Todo", done="Done"),
+            ),
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="",
+                linear_states=LinearStates(ready="Todo", done="Completed"),
+            ),
+        ],
+    )
+    service = ExternalSnapshotService(config, linear, github, clock=lambda: NOW)
+    try:
+        await _seed_external_issue(conn, issue_label="")
         snapshot = await service.get_issue_external(conn, "iss-1")
     finally:
         await conn.close()
