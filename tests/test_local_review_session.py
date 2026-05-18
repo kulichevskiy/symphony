@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from symphony.agent.codex_cli import CODEX_ALLOW_GIT_WRITES_CONFIG
+from symphony.agent.codex_cli import (
+    CODEX_APPROVAL_POLICY_CONFIG,
+    CODEX_DEFAULT_PERMISSIONS_CONFIG,
+)
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -217,8 +220,13 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
 
     assert result.outcome == LoopOutcome.APPROVED
     fix_argv = runner.specs[1].command
-    assert fix_argv[fix_argv.index("--sandbox") + 1] == "workspace-write"
-    assert fix_argv[fix_argv.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+    assert "--sandbox" not in fix_argv
+    assert "workspace-write" not in fix_argv
+    configs = [fix_argv[i + 1] for i, arg in enumerate(fix_argv) if arg == "--config"]
+    assert configs == [
+        CODEX_DEFAULT_PERMISSIONS_CONFIG,
+        CODEX_APPROVAL_POLICY_CONFIG,
+    ]
 
 
 @pytest.mark.asyncio

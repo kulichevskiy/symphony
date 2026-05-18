@@ -151,6 +151,43 @@ codex --version
 exit
 ```
 
+Configure the Codex permissions profile that Symphony uses for unattended
+`implement` and `review_fix` runs. `symphony preflight` creates this block in
+`~/.codex/config.toml` if it is missing and leaves it untouched if an operator
+has already customized it:
+
+```toml
+[permissions.symphony-git.filesystem]
+":root" = "read"
+"/tmp" = "write"
+
+[permissions.symphony-git.filesystem.":project_roots"]
+"." = "write"
+".git" = "write"
+".agents" = "read"
+".codex" = "read"
+
+[permissions.symphony-git.network]
+enabled = false
+```
+
+The runner deliberately does not pass `--sandbox workspace-write`. In current
+Codex versions that sandbox mode keeps `.git` read-only even when extra config
+or writable roots are provided, so agents can edit files but fail to create the
+commit that Symphony needs before opening a PR. The named profile is the
+permissions boundary for Symphony-managed worktrees and explicitly grants
+`.git` writes inside the project root.
+
+After the profile exists, smoke-test the argv shape that Symphony uses:
+
+```bash
+codex exec --json \
+  --config 'default_permissions="symphony-git"' \
+  --config 'approval_policy="never"' \
+  --model gpt-5.1-codex \
+  "say hello"
+```
+
 Install the Codex GitHub app on every watched repo listed in `/opt/symphonyd/config.yaml`. The review stage posts `@codex review`, and that bot can only inspect repositories where the app is installed.
 
 Run the built-in preflight:

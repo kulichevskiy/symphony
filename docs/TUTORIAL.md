@@ -450,7 +450,11 @@ Runner commands are built in `src/symphony/orchestrator/poll.py`:
 ```text
 claude --print --output-format stream-json --verbose [--max-budget-usd N] <prompt>
 
-codex exec --json --sandbox workspace-write --model <codex_model> <prompt>
+codex exec --json \
+  --config 'default_permissions="symphony-git"' \
+  --config 'approval_policy="never"' \
+  --model <codex_model> \
+  <prompt>
 ```
 
 ### 3.7. Prompts
@@ -694,7 +698,6 @@ Check Codex:
 
 ```bash
 codex --version
-codex exec --json --sandbox workspace-write --model gpt-5.1-codex "say hello"
 ```
 
 Check Claude if using `agent: claude`:
@@ -759,8 +762,21 @@ Preflight checks:
 - Linear auth works;
 - configured teams are visible;
 - configured Linear state names exist.
+- Codex has a `symphony-git` permissions profile in `~/.codex/config.toml`
+  so unattended Codex runs can commit inside managed worktrees.
 
 If preflight fails, do not start the daemon. Fix `.env` or YAML first.
+
+After preflight creates or verifies the profile, Codex can be smoke-tested with
+the same permission shape used by `implement` and `review_fix`:
+
+```bash
+codex exec --json \
+  --config 'default_permissions="symphony-git"' \
+  --config 'approval_policy="never"' \
+  --model gpt-5.1-codex \
+  "say hello"
+```
 
 ### 5.4. Smoke test
 

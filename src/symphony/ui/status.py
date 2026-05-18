@@ -285,6 +285,7 @@ async def compute_canonical_status(
     if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
         stage = _as_str(latest_run["stage"])
         run_status = _as_str(latest_run["status"])
+        subtitle: str | None
         if run_status and run_status != "failed":
             subtitle = f"{stage} ({run_status})" if stage else run_status
         else:

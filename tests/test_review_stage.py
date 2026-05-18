@@ -21,7 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from symphony import db
-from symphony.agent.codex_cli import CODEX_ALLOW_GIT_WRITES_CONFIG
+from symphony.agent.codex_cli import (
+    CODEX_APPROVAL_POLICY_CONFIG,
+    CODEX_DEFAULT_PERMISSIONS_CONFIG,
+)
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
@@ -458,14 +461,18 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert runner.captured_spec is not None
         assert runner.captured_spec.stage == "review"
         command = runner.captured_spec.command
-        assert command[:5] == [
+        assert command[:3] == [
             "codex",
             "exec",
             "--json",
-            "--sandbox",
-            "workspace-write",
         ]
-        assert command[command.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+        assert "--sandbox" not in command
+        assert "workspace-write" not in command
+        configs = [command[i + 1] for i, arg in enumerate(command) if arg == "--config"]
+        assert configs == [
+            CODEX_DEFAULT_PERMISSIONS_CONFIG,
+            CODEX_APPROVAL_POLICY_CONFIG,
+        ]
         assert command[command.index("--model") + 1] == "gpt-5.1-codex-max"
         prompt = command[-1]
         assert prompt.startswith("# Failing check log tail")
@@ -1696,14 +1703,18 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
         "fix this",
         codex_model="gpt-5.1-codex-max",
     )
-    assert argv[:5] == [
+    assert argv[:3] == [
         "codex",
         "exec",
         "--json",
-        "--sandbox",
-        "workspace-write",
     ]
-    assert argv[argv.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+    assert "--sandbox" not in argv
+    assert "workspace-write" not in argv
+    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
+    assert configs == [
+        CODEX_DEFAULT_PERMISSIONS_CONFIG,
+        CODEX_APPROVAL_POLICY_CONFIG,
+    ]
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert "fix this" in argv
 
@@ -1720,8 +1731,13 @@ def test_build_fix_runner_command_passes_configured_codex_model() -> None:
 
 def test_build_runner_command_allows_git_writes_for_codex_implement() -> None:
     argv = build_runner_command("codex", "implement this")
-    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
-    assert argv[argv.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+    assert "--sandbox" not in argv
+    assert "workspace-write" not in argv
+    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
+    assert configs == [
+        CODEX_DEFAULT_PERMISSIONS_CONFIG,
+        CODEX_APPROVAL_POLICY_CONFIG,
+    ]
     assert argv[-1] == "implement this"
 
 

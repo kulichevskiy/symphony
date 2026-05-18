@@ -178,7 +178,7 @@ gh auth login --hostname github.com --git-protocol ssh --scopes repo,workflow
 gh auth status
 
 claude --print "hello"
-codex exec --json --sandbox workspace-write --model gpt-5.1-codex "say hello"
+codex --version
 
 exit
 ```
@@ -186,6 +186,18 @@ exit
 Также нужно установить Codex GitHub App на каждый репозиторий из
 `/opt/symphonyd/config.yaml`. Review stage постит `@codex review`, и бот сможет
 работать только в репозиториях, где app установлен.
+
+`symphony preflight` создаст профиль Codex `symphony-git` в
+`~/.codex/config.toml`, если его еще нет. После этого можно проверить тот же
+режим, который daemon использует для unattended `implement` и `review_fix`:
+
+```bash
+codex exec --json \
+  --config 'default_permissions="symphony-git"' \
+  --config 'approval_policy="never"' \
+  --model gpt-5.1-codex \
+  "say hello"
+```
 
 ## 6. Прогнать preflight
 
