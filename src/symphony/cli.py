@@ -21,6 +21,11 @@ from pathlib import Path
 import click
 
 from . import db
+from .agent.codex_cli import (
+    SYMPHONY_PERMISSIONS_PROFILE,
+    CodexPermissionsProfileError,
+    ensure_symphony_permissions_profile,
+)
 from .app import build_server_config, create_app
 from .config import Config, RepoBinding
 from .github.webhook import GitHubWebhookSettings
@@ -146,6 +151,19 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
         raise click.ClickException(str(e)) from e
 
 
+def _binding_can_run_codex_cli(binding: RepoBinding) -> bool:
+    if binding.agent == "codex":
+        return True
+    return (
+        binding.review_strategy != "remote"
+        and binding.resolved_reviewer_agent() == "codex"
+    )
+
+
+def _config_can_run_codex_cli(cfg: Config) -> bool:
+    return any(_binding_can_run_codex_cli(binding) for binding in cfg.repos)
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--config",
@@ -258,6 +276,24 @@ async def _preflight(config_path: Path) -> None:
     if not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY is empty", err=True)
         sys.exit(2)
+    if _config_can_run_codex_cli(cfg):
+        try:
+            codex_config, created_profile = ensure_symphony_permissions_profile()
+        except CodexPermissionsProfileError as e:
+            click.echo(str(e), err=True)
+            sys.exit(1)
+        if created_profile:
+            click.echo(
+                f"codex permissions profile {SYMPHONY_PERMISSIONS_PROFILE!r} "
+                f"added to {codex_config}"
+            )
+        else:
+            click.echo(
+                f"codex permissions profile {SYMPHONY_PERMISSIONS_PROFILE!r} "
+                f"present in {codex_config}"
+            )
+    else:
+        click.echo("codex permissions profile not required by configured repos")
     async with Linear(cfg.linear_api_key) as linear:
         try:
             visible = await linear.viewer_team_keys()

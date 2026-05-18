@@ -17,7 +17,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from symphony import db
-from symphony.agent.codex_cli import CODEX_ALLOW_GIT_WRITES_CONFIG
+from symphony.agent.codex_cli import (
+    CODEX_APPROVAL_POLICY_CONFIG,
+    CODEX_DEFAULT_PERMISSIONS_CONFIG,
+)
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearError, LinearIssue
@@ -512,14 +515,18 @@ async def test_codex_token_usage_estimates_cost_for_cap(tmp_path: Path) -> None:
 
         assert runner.captured_spec is not None
         command = runner.captured_spec.command
-        assert command[:5] == [
+        assert command[:3] == [
             "codex",
             "exec",
             "--json",
-            "--sandbox",
-            "workspace-write",
         ]
-        assert command[command.index("--config") + 1] == CODEX_ALLOW_GIT_WRITES_CONFIG
+        assert "--sandbox" not in command
+        assert "workspace-write" not in command
+        configs = [command[i + 1] for i, arg in enumerate(command) if arg == "--config"]
+        assert configs == [
+            CODEX_DEFAULT_PERMISSIONS_CONFIG,
+            CODEX_APPROVAL_POLICY_CONFIG,
+        ]
         assert command[command.index("--model") + 1] == "gpt-5.1-codex"
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
