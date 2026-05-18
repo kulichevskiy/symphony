@@ -75,9 +75,19 @@ class _ColorFormatter(logging.Formatter):
 def _setup_logging() -> None:
     handler = logging.StreamHandler()
     fmt = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
-    use_color = handler.stream.isatty() and os.environ.get("NO_COLOR") is None
+    # NO_COLOR (https://no-color.org) wins; FORCE_COLOR overrides a non-TTY
+    # stream (handy when piping through tee or viewing via journalctl with
+    # SYSTEMD_COLORS=1) so colors aren't silently lost.
+    if os.environ.get("NO_COLOR") is not None:
+        use_color = False
+    elif os.environ.get("FORCE_COLOR") not in (None, "", "0"):
+        use_color = True
+    else:
+        use_color = handler.stream.isatty()
     handler.setFormatter(_ColorFormatter(fmt) if use_color else logging.Formatter(fmt))
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    # force=True so we win over any earlier handler an import may have attached
+    # to the root logger (otherwise basicConfig is a silent no-op).
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
 
 
 def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
