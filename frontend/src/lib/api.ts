@@ -88,6 +88,16 @@ export type IssueDetail = {
   } | null;
 };
 
+export type ExternalObservation = {
+  id: number;
+  issue_id: string;
+  source: "linear" | "github" | string;
+  observed_at: string;
+  payload_json: string;
+  drift_kind: string | null;
+  action_taken: string;
+};
+
 async function fetchJson<T>(
   path: string,
   notFoundMessage: string,
@@ -129,5 +139,13 @@ export function fetchIssueDetail(id: string): Promise<IssueDetail> {
     `/api/issues/${encodeURIComponent(id)}`,
     "Issue not found",
     "Failed to load issue",
+  );
+}
+
+export function fetchIssueObservations(id: string): Promise<ExternalObservation[]> {
+  return fetchJson<ExternalObservation[]>(
+    `/api/issues/${encodeURIComponent(id)}/observations`,
+    "Issue not found",
+    "Failed to load observations",
   );
 }

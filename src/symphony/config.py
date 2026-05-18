@@ -113,6 +113,7 @@ class RepoBinding(BaseModel):
     activity_comment_include_failed_output_lines: int | None = Field(default=None, ge=0)
     webhook_enabled: bool = True
     webhook_secret: str | None = None
+    reconcile_enabled: bool = True
     linear_states: LinearStates
 
     @field_validator("codex_model")
@@ -230,6 +231,9 @@ class Config(BaseModel):
     webhook_port: int = Field(default=8787, ge=1, le=65535)
     webhook_dedupe_ttl_secs: int = Field(default=600, ge=1)
     webhook_timestamp_tolerance_secs: int = Field(default=60, ge=1)
+    reconcile_interval_secs: int = Field(default=300, ge=1)
+    reconcile_max_per_tick: int = Field(default=50, ge=1)
+    reconcile_backoff_secs: int = Field(default=600, ge=1)
     ui: UIConfig = Field(default_factory=UIConfig)
 
     repos: list[RepoBinding] = Field(default_factory=list)

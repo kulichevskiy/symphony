@@ -1067,6 +1067,83 @@ async def test_issue_detail_api_404s_for_unknown_issue(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_issue_observations_api_returns_last_twenty_rows(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-observed",
+            identifier="ENG-9",
+            title="Observed issue",
+            team_key="ENG",
+        )
+        for idx in range(25):
+            await db.external_observations.insert(
+                conn,
+                issue_id="iss-observed",
+                source="github" if idx % 2 else "linear",
+                observed_at=f"2026-05-17T10:{idx:02d}:00Z",
+                payload_json=f'{{"idx":{idx}}}',
+                drift_kind="merge_zombie" if idx == 24 else None,
+                action_taken="would_clear" if idx == 24 else "observed",
+            )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/iss-observed/observations")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == 20
+    assert payload[0] == {
+        "id": 25,
+        "issue_id": "iss-observed",
+        "source": "linear",
+        "observed_at": "2026-05-17T10:24:00Z",
+        "payload_json": '{"idx":24}',
+        "drift_kind": "merge_zombie",
+        "action_taken": "would_clear",
+    }
+    assert payload[-1]["payload_json"] == '{"idx":5}'
+
+
+@pytest.mark.asyncio
+async def test_issue_observations_api_404s_for_unknown_issue(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/missing/observations")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
