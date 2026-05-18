@@ -392,7 +392,7 @@ async def test_issue_prs_scopes_candidates_to_current_pr_cycle(
 
 
 @pytest.mark.asyncio
-async def test_orphaned_review_prs_require_latest_review_run_failed(
+async def test_orphaned_review_prs_require_latest_review_run_dead(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -437,10 +437,10 @@ async def test_orphaned_review_prs_require_latest_review_run_failed(
 
         await db.runs.create(
             conn,
-            id="latest-failed-review",
+            id="latest-interrupted-review",
             issue_id="iss-1",
             stage="review",
-            status="failed",
+            status="interrupted",
             pid=None,
             started_at="2026-05-10T00:03:00+00:00",
         )

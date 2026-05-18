@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import aiosqlite
 
 from . import state_transitions
+from .runs import LIVE_STATUSES, REVIEW_RESURRECT_STATUSES
 
 
 @dataclass(frozen=True)
@@ -200,14 +201,16 @@ async def delete(
 
 
 async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
-    """PRs whose review run died (last review run is failed, none running).
+    """PRs whose review run died (last review run is dead, none running).
 
     Used to auto-resurrect review monitors that crashed mid-flight.
     The cooldown (don't restart if a review run started recently) is enforced
     in the caller.
     """
+    live_placeholders = ",".join("?" * len(LIVE_STATUSES))
+    resurrect_placeholders = ",".join("?" * len(REVIEW_RESURRECT_STATUSES))
     cur = await conn.execute(
-        """
+        f"""
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
                p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
         FROM issue_prs p
@@ -217,7 +220,7 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
                 AND r.stage = 'review'
-                AND r.status = 'running'
+                AND r.status IN ({live_placeholders})
           )
           AND (
               SELECT r.status FROM runs r
@@ -226,16 +229,17 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
                 AND r.started_at >= p.created_at
               ORDER BY r.started_at DESC, r.rowid DESC
               LIMIT 1
-          ) = 'failed'
+          ) IN ({resurrect_placeholders})
           AND NOT EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
                 AND r.stage = 'merge'
                 AND r.status IN ('running', 'completed', 'done', 'needs_approval')
                 AND r.started_at >= p.created_at
-          )
+        )
         ORDER BY p.created_at ASC
-        """
+        """,
+        (*LIVE_STATUSES, *REVIEW_RESURRECT_STATUSES),
     )
     rows = await cur.fetchall()
     return [_row_to_issue_pr(r) for r in rows]

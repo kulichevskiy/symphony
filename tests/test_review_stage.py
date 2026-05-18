@@ -1741,8 +1741,13 @@ def test_pr_number_from_url_returns_none_for_garbage() -> None:
 # --- Failure visibility and retry ------------------------------------------
 
 
-async def _seed_failed_review(conn, *, run_id: str = "review-run") -> None:  # type: ignore[no-untyped-def]
-    """Seed: review run exists but is failed (monitor died)."""
+async def _seed_failed_review(  # type: ignore[no-untyped-def]
+    conn,
+    *,
+    run_id: str = "review-run",
+    status: str = "failed",
+) -> None:
+    """Seed: review run exists but is dead (monitor died)."""
     await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG")
     await db.review_state.begin_review(
         conn, "iss-1", pr_number=42, pr_url="https://github.com/org/repo/pull/42",
@@ -1752,7 +1757,7 @@ async def _seed_failed_review(conn, *, run_id: str = "review-run") -> None:  # t
         conn, id=run_id, issue_id="iss-1", stage="review", status="running",
         pid=None, started_at="2026-05-10T00:00:00+00:00",
     )
-    await db.runs.update_status(conn, run_id, "failed", ended_at="2026-05-10T00:05:00+00:00")
+    await db.runs.update_status(conn, run_id, status, ended_at="2026-05-10T00:05:00+00:00")
     await db.issue_prs.upsert(
         conn, issue_id="iss-1", github_repo="org/repo", binding_key="",
         pr_number=42, pr_url="https://github.com/org/repo/pull/42",
@@ -1799,15 +1804,17 @@ async def test_review_failure_does_not_register_operator_wait(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["failed", "interrupted"])
 async def test_dead_review_monitor_is_resurrected_after_cooldown(
     tmp_path: Path,
+    terminal_status: str,
 ) -> None:
     """_resurrect_review_runs creates a new review run for an orphaned PR."""
     from datetime import UTC, datetime, timedelta
 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await _seed_failed_review(conn)
+        await _seed_failed_review(conn, status=terminal_status)
         # Simulate the run ended > REVIEW_RESURRECT_COOLDOWN_SECS ago.
         old_ended_at = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
         await conn.execute(

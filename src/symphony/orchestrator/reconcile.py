@@ -61,7 +61,9 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
             run.issue_id,
             run.pid,
         )
-        await db.runs.update_status(conn, run.id, "interrupted", ended_at=now)
+        await db.runs.update_status(
+            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+        )
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
         except LinearError as e:
