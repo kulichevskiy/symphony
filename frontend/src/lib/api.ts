@@ -133,6 +133,7 @@ export type GithubPrSnapshot = {
     total: number;
   };
   comments?: ExternalComment[];
+  comments_error?: string;
   error?: string;
   stale?: boolean;
   stale_fetched_at?: string;
