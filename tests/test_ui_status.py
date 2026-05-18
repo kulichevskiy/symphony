@@ -325,6 +325,35 @@ async def test_canonical_status_marks_latest_failed_run_always_stuck(
 
 
 @pytest.mark.asyncio
+async def test_canonical_status_treats_interrupted_run_as_failed(
+    tmp_path: Path,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "interrupted")
+        await _run(
+            conn,
+            run_id="run-interrupted",
+            issue_id="interrupted",
+            stage="review",
+            status="interrupted",
+            started_at="2026-05-17T11:40:00Z",
+            ended_at="2026-05-17T11:55:00Z",
+        )
+
+        status = await compute_canonical_status(conn, "interrupted", now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.to_dict() == {
+        "state": "failed",
+        "since": "2026-05-17T11:55:00Z",
+        "subtitle": "review (interrupted)",
+        "stuck_for": 300,
+    }
+
+
+@pytest.mark.asyncio
 async def test_canonical_status_detects_awaiting_review_trigger_from_review_state(
     tmp_path: Path,
 ) -> None:
