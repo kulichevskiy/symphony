@@ -164,3 +164,22 @@ CREATE TABLE IF NOT EXISTS state_transitions (
 
 CREATE INDEX IF NOT EXISTS idx_state_transitions_issue_ts
     ON state_transitions(issue_id, ts);
+
+-- Periodic and webhook-triggered observations of external truth. This is
+-- intentionally append-only in this slice: the reconciler records drift and
+-- dry-run intent, but does not clear or mutate local state yet.
+CREATE TABLE IF NOT EXISTS external_observations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id      TEXT NOT NULL REFERENCES issues(id),
+    source        TEXT NOT NULL,
+    observed_at   TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    drift_kind    TEXT,
+    action_taken  TEXT NOT NULL DEFAULT 'observed'
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_observations_issue_ts
+    ON external_observations(issue_id, observed_at);
+
+CREATE INDEX IF NOT EXISTS idx_external_observations_drift
+    ON external_observations(drift_kind) WHERE drift_kind IS NOT NULL;

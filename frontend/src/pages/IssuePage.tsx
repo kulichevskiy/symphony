@@ -15,9 +15,10 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-import { fetchIssueDetail, fetchIssueExternal } from "@/lib/api";
+import { fetchIssueDetail, fetchIssueExternal, fetchIssueObservations } from "@/lib/api";
 import type {
   DriftFlag,
+  ExternalObservation,
   ExternalComment,
   GithubPrSnapshot,
   IssueExternalSnapshot,
@@ -367,6 +368,76 @@ function ExternalTruthSection({
   );
 }
 
+function prettyPayload(raw: string): string {
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+function ObservationsPanel({
+  rows,
+  isLoading,
+  error,
+}: {
+  rows: ExternalObservation[];
+  isLoading: boolean;
+  error: unknown;
+}) {
+  return (
+    <section className="border-t py-5">
+      <h2 className="mb-3 text-base font-semibold tracking-normal">Recent observations</h2>
+      {isLoading ? <p className="text-sm text-muted-foreground">Loading</p> : null}
+      {error ? (
+        <p className="text-sm text-red-600">{(error as Error).message}</p>
+      ) : null}
+      {!isLoading && !error && rows.length === 0 ? (
+        <p className="text-sm text-muted-foreground">(none)</p>
+      ) : null}
+      {rows.length > 0 ? (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-52">observed_at</TableHead>
+              <TableHead className="w-24">source</TableHead>
+              <TableHead className="w-44">drift_kind</TableHead>
+              <TableHead className="w-36">action_taken</TableHead>
+              <TableHead>payload</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.id}>
+                <TableCell className="font-mono text-xs">{row.observed_at}</TableCell>
+                <TableCell className="font-mono text-xs">{row.source}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {row.drift_kind ? (
+                    <span className="text-red-700">{row.drift_kind}</span>
+                  ) : (
+                    <span className="text-muted-foreground">null</span>
+                  )}
+                </TableCell>
+                <TableCell className="font-mono text-xs">{row.action_taken}</TableCell>
+                <TableCell className="max-w-[520px] align-top font-mono text-xs">
+                  <details>
+                    <summary className="cursor-pointer text-primary underline-offset-4 hover:underline">
+                      payload
+                    </summary>
+                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-3 leading-relaxed">
+                      {prettyPayload(row.payload_json)}
+                    </pre>
+                  </details>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      ) : null}
+    </section>
+  );
+}
+
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
@@ -390,6 +461,14 @@ export function IssuePage() {
     refetchInterval: 60_000,
     refetchOnWindowFocus: true,
     staleTime: 60_000,
+  });
+  const observationsQuery = useQuery({
+    queryKey: ["issue-observations", issueId],
+    queryFn: () => fetchIssueObservations(issueId),
+    enabled: issueId.length > 0,
+    refetchInterval: 10_000,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
   });
 
   return (
@@ -437,6 +516,11 @@ export function IssuePage() {
                 {(externalQuery.error as Error).message}
               </p>
             ) : null}
+            <ObservationsPanel
+              rows={observationsQuery.data ?? []}
+              isLoading={observationsQuery.isLoading}
+              error={observationsQuery.error}
+            />
             <SectionTable
               title="Issue"
               rows={[data.issue]}

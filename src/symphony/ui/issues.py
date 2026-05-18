@@ -9,6 +9,7 @@ from typing import Annotated, Any
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Query
 
+from .. import db
 from .db import ReadOnlyDbPool
 from .external import ExternalSnapshotService
 from .status import DEFAULT_STUCK_THRESHOLDS, CanonicalState, compute_canonical_status
@@ -227,6 +228,34 @@ def create_issue_detail_router(
         if payload is None:
             raise HTTPException(status_code=404, detail="Issue not found")
         return payload
+
+    @router.get("/issues/{issue_id}/observations")
+    async def issue_observations(issue_id: str) -> list[dict[str, Any]]:
+        conn = await pool.connection()
+        issue = await _fetch_one(
+            conn,
+            "SELECT id FROM issues WHERE id = ?",
+            (issue_id,),
+        )
+        if issue is None:
+            raise HTTPException(status_code=404, detail="Issue not found")
+        observations = await db.external_observations.list_recent_for_issue(
+            conn,
+            issue_id,
+            limit=20,
+        )
+        return [
+            {
+                "id": observation.id,
+                "issue_id": observation.issue_id,
+                "source": observation.source,
+                "observed_at": observation.observed_at,
+                "payload_json": observation.payload_json,
+                "drift_kind": observation.drift_kind,
+                "action_taken": observation.action_taken,
+            }
+            for observation in observations
+        ]
 
     @router.get("/issues/{issue_id}/timeline")
     async def issue_timeline(issue_id: str) -> list[dict[str, Any]]:

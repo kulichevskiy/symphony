@@ -33,6 +33,8 @@ class IssueSummary(BaseModel):
     identifier: str
     title: str
     team_key: str
+    latest_activity_ts: str | None
+    latest_activity_age_secs: int | None
     canonical_status: CanonicalStatusPayload
 
 
@@ -87,6 +89,28 @@ latest_events(issue_id, ts) AS (
     UNION ALL
     SELECT issue_id, ts FROM state_transitions
 ),
+latest_activity_sources(issue_id, ts) AS (
+    SELECT issue_id, COALESCE(ended_at, started_at) FROM runs
+    UNION ALL
+    SELECT issue_id, ts FROM state_transitions
+    UNION ALL
+    SELECT issue_id, seen_at FROM comment_events
+    UNION ALL
+    SELECT r.issue_id, m.last_event_at
+    FROM activity_comment_marks m
+    JOIN runs r ON r.id = m.run_id
+    WHERE m.last_event_at IS NOT NULL
+    UNION ALL
+    SELECT issue_id, COALESCE(merged_at, created_at) FROM issue_prs
+    UNION ALL
+    SELECT issue_id, created_at FROM operator_waits
+),
+latest_activity(issue_id, latest_activity_ts) AS (
+    SELECT issue_id, MAX(ts)
+    FROM latest_activity_sources
+    WHERE ts IS NOT NULL
+    GROUP BY issue_id
+),
 recent_issue_ids(issue_id) AS (
     SELECT issue_id
     FROM latest_events
@@ -104,9 +128,20 @@ def _identifier_sort_key(identifier: str) -> tuple[str, int, str]:
     return (identifier, 2**31 - 1, identifier)
 
 
-def _list_issues_query(scope: IssueScope, q: str | None) -> tuple[str, tuple[str, ...]]:
+def _utc_iso(ts: datetime) -> str:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _list_issues_query(
+    scope: IssueScope,
+    q: str | None,
+    *,
+    now: datetime,
+) -> tuple[str, tuple[str, ...]]:
     where: list[str] = []
-    params: list[str] = []
+    params: list[str] = [_utc_iso(now)]
 
     if scope is IssueScope.ACTIVE:
         where.append("i.id IN (SELECT issue_id FROM active_issue_ids)")
@@ -129,8 +164,21 @@ def _list_issues_query(scope: IssueScope, q: str | None) -> tuple[str, tuple[str
     return (
         f"""
         {_ISSUE_SCOPE_CTES}
-        SELECT i.id, i.identifier, i.title, i.team_key
+        SELECT
+            i.id,
+            i.identifier,
+            i.title,
+            i.team_key,
+            la.latest_activity_ts,
+            CASE
+                WHEN la.latest_activity_ts IS NULL THEN NULL
+                ELSE CAST(
+                    MAX(0, strftime('%s', ?) - strftime('%s', la.latest_activity_ts))
+                    AS INTEGER
+                )
+            END AS latest_activity_age_secs
         FROM issues i
+        LEFT JOIN latest_activity la ON la.issue_id = i.id
         {where_sql}
         """,
         tuple(params),
@@ -159,10 +207,10 @@ def create_api_router(
 
         try:
             conn = await ui_db_pool.connection()
-            query, params = _list_issues_query(scope, q)
+            request_now = now()
+            query, params = _list_issues_query(scope, q, now=request_now)
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
-            request_now = now()
             issues = [dict(row) for row in rows]
             statuses = [
                 (

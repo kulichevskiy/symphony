@@ -14,6 +14,9 @@ webhook_host: 127.0.0.1
 webhook_port: 8787
 webhook_dedupe_ttl_secs: 600
 webhook_timestamp_tolerance_secs: 60
+reconcile_interval_secs: 300
+reconcile_max_per_tick: 50
+reconcile_backoff_secs: 600
 ui:
   enabled: true
 
@@ -30,6 +33,7 @@ repos:
     issue_label: symphony
     branch_prefix: symphony
     webhook_enabled: true
+    reconcile_enabled: true
     # webhook_secret: repo-specific-github-webhook-secret
     max_concurrent: 2
     runner: local

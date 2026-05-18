@@ -23,6 +23,8 @@ export interface IssueSummary {
   identifier: string;
   title: string;
   team_key: string;
+  latest_activity_ts: string | null;
+  latest_activity_age_secs: number | null;
   canonical_status: CanonicalStatus;
 }
 
@@ -143,6 +145,16 @@ export type IssueExternalSnapshot = {
   drift_flags: DriftFlag[];
 };
 
+export type ExternalObservation = {
+  id: number;
+  issue_id: string;
+  source: "linear" | "github" | string;
+  observed_at: string;
+  payload_json: string;
+  drift_kind: string | null;
+  action_taken: string;
+};
+
 async function fetchJson<T>(
   path: string,
   notFoundMessage: string,
@@ -196,5 +208,13 @@ export function fetchIssueExternal(
     `/api/issues/${encodeURIComponent(id)}/external?${params.toString()}`,
     "Issue not found",
     "Failed to load external issue state",
+  );
+}
+
+export function fetchIssueObservations(id: string): Promise<ExternalObservation[]> {
+  return fetchJson<ExternalObservation[]>(
+    `/api/issues/${encodeURIComponent(id)}/observations`,
+    "Issue not found",
+    "Failed to load observations",
   );
 }

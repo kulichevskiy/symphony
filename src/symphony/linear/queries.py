@@ -18,6 +18,7 @@ query LookupIssue($id: String!) {
     title
     description
     url
+    updatedAt
     state { id name type }
     team { id key }
     labels { nodes { name } }
@@ -56,7 +57,7 @@ query IssuesInState($team: String!, $stateName: String!, $label: String) {
     first: 50
   ) {
     nodes {
-      id identifier title description url
+      id identifier title description url updatedAt
       state { id name type }
       team { id key }
       labels { nodes { name } }
@@ -95,7 +96,7 @@ query IssuesInState($team: String!, $stateName: String!) {
     first: 50
   ) {
     nodes {
-      id identifier title description url
+      id identifier title description url updatedAt
       state { id name type }
       team { id key }
       labels { nodes { name } }
