@@ -179,6 +179,28 @@ query IssueComments($id: String!, $after: DateTimeOrDuration!, $cursor: String) 
 }
 """
 
+ISSUE_EXTERNAL_SNAPSHOT = """
+query IssueExternalSnapshot($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    url
+    updatedAt
+    state { name }
+    labels { nodes { name } }
+    comments(last: 5, orderBy: createdAt) {
+      pageInfo { hasPreviousPage startCursor }
+      nodes {
+        id
+        body
+        createdAt
+        user { name }
+      }
+    }
+  }
+}
+"""
+
 CREATE_COMMENT = """
 mutation CreateComment($input: CommentCreateInput!) {
   commentCreate(input: $input) {

@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import type { ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
 import { StatusCluster, StatusSinceLine } from "@/components/CanonicalStatus";
 import { IssueTimeline } from "@/components/IssueTimeline";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   Table,
   TableBody,
@@ -12,8 +14,16 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { fetchIssueDetail, fetchIssueObservations } from "@/lib/api";
-import type { ExternalObservation } from "@/lib/api";
+import { cn } from "@/lib/utils";
+import { fetchIssueDetail, fetchIssueExternal, fetchIssueObservations } from "@/lib/api";
+import type {
+  DriftFlag,
+  ExternalObservation,
+  ExternalComment,
+  GithubPrSnapshot,
+  IssueExternalSnapshot,
+  LinearSnapshot,
+} from "@/lib/api";
 
 type CellValue = string | number | null;
 
@@ -65,6 +75,304 @@ function SectionTable<T extends object>({
             ))}
           </TableBody>
         </Table>
+      )}
+    </section>
+  );
+}
+
+function formatUtc(ts?: string | null) {
+  if (!ts) {
+    return "null";
+  }
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) {
+    return ts;
+  }
+  return date.toISOString().replace(".000Z", "Z");
+}
+
+function formatRelative(ts?: string | null) {
+  if (!ts) {
+    return "unknown";
+  }
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) {
+    return ts;
+  }
+  const diffSeconds = Math.round((Date.now() - date.getTime()) / 1000);
+  const absSeconds = Math.abs(diffSeconds);
+  const units: Array<[number, string]> = [
+    [60 * 60 * 24, "d"],
+    [60 * 60, "h"],
+    [60, "m"],
+  ];
+  let value = absSeconds;
+  let unit = "s";
+  for (const [seconds, label] of units) {
+    if (absSeconds >= seconds) {
+      value = Math.floor(absSeconds / seconds);
+      unit = label;
+      break;
+    }
+  }
+  if (value < 10 && unit === "s") {
+    return "now";
+  }
+  return diffSeconds < 0 ? `in ${value}${unit}` : `${value}${unit} ago`;
+}
+
+function flagsByField(flags: DriftFlag[]) {
+  return new Map(flags.map((flag) => [flag.field, flag]));
+}
+
+function fieldTitle(flag?: DriftFlag) {
+  if (!flag) {
+    return undefined;
+  }
+  return `SQLite: ${flag.sqlite_value ?? "null"}; ${flag.source_name}: ${
+    flag.source_value ?? "null"
+  }`;
+}
+
+function FieldRow({
+  label,
+  value,
+  flag,
+}: {
+  label: string;
+  value: ReactNode;
+  flag?: DriftFlag;
+}) {
+  const isWarning = flag?.severity === "warning";
+  return (
+    <div
+      className={cn(
+        "grid min-h-9 grid-cols-[9rem_minmax(0,1fr)] items-center gap-3 border-t px-3 py-2 text-sm first:border-t-0",
+        flag && !isWarning ? "bg-red-50 text-red-950" : null,
+        isWarning ? "bg-amber-50 text-amber-950" : null,
+      )}
+      title={fieldTitle(flag)}
+    >
+      <span className="text-muted-foreground">{label}</span>
+      <span className="min-w-0 break-words font-mono text-xs">
+        {flag ? <span className="mr-2 font-sans text-sm">⚠</span> : null}
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function SourceAlert({
+  source,
+  snapshot,
+}: {
+  source: "Linear" | "GitHub";
+  snapshot: LinearSnapshot | GithubPrSnapshot;
+}) {
+  if (!snapshot.error) {
+    return null;
+  }
+  const stale = snapshot.stale_fetched_at
+    ? ` — showing data from ${formatRelative(snapshot.stale_fetched_at)}`
+    : "";
+  return (
+    <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
+      {source} returned {snapshot.error}
+      {stale}
+    </div>
+  );
+}
+
+function LinearCard({
+  snapshot,
+  flags,
+}: {
+  snapshot: LinearSnapshot;
+  flags: Map<string, DriftFlag>;
+}) {
+  return (
+    <section className="overflow-hidden rounded-md border border-border">
+      <div className="border-b bg-secondary px-3 py-2 text-sm font-semibold">Linear</div>
+      <SourceAlert source="Linear" snapshot={snapshot} />
+      <FieldRow label="state" value={snapshot.state ?? "null"} flag={flags.get("linear.state")} />
+      <FieldRow label="updatedAt" value={formatUtc(snapshot.updated_at)} />
+      <div className="grid min-h-9 grid-cols-[9rem_minmax(0,1fr)] items-center gap-3 border-t px-3 py-2 text-sm">
+        <span className="text-muted-foreground">labels</span>
+        <div className="flex min-w-0 flex-wrap gap-1">
+          {(snapshot.labels ?? []).length > 0 ? (
+            (snapshot.labels ?? []).map((label) => (
+              <Badge key={label} className="border-gray-300 bg-gray-50 text-gray-700">
+                {label}
+              </Badge>
+            ))
+          ) : (
+            <span className="font-mono text-xs text-muted-foreground">none</span>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export function GithubCard({
+  snapshot,
+  flags,
+}: {
+  snapshot: GithubPrSnapshot;
+  flags: Map<string, DriftFlag>;
+}) {
+  const checks = snapshot.check_summary;
+  const checksText = checks
+    ? `${checks.passing} passing / ${checks.failing} failing / ${checks.pending} pending`
+    : "null";
+  return (
+    <section className="overflow-hidden rounded-md border border-border">
+      <div className="border-b bg-secondary px-3 py-2 text-sm font-semibold">
+        GitHub PR {snapshot.pr_number ? `#${snapshot.pr_number}` : ""}
+      </div>
+      <SourceAlert source="GitHub" snapshot={snapshot} />
+      {snapshot.comments_error ? (
+        <div className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+          GitHub review comments unavailable: {snapshot.comments_error}
+        </div>
+      ) : null}
+      <FieldRow label="state" value={snapshot.state ?? "null"} flag={flags.get("github.state")} />
+      <FieldRow
+        label="mergedAt"
+        value={formatUtc(snapshot.merged_at)}
+        flag={flags.get("github.merged_at")}
+      />
+      <FieldRow label="mergedBy" value={snapshot.merged_by ?? "null"} />
+      <FieldRow label="mergeable" value={String(snapshot.mergeable ?? "null")} />
+      <FieldRow label="mergeState" value={snapshot.merge_state_status ?? "null"} />
+      <FieldRow label="checks" value={checksText} flag={flags.get("github.checks")} />
+    </section>
+  );
+}
+
+function CommentList({
+  title,
+  comments,
+}: {
+  title: string;
+  comments: ExternalComment[];
+}) {
+  const [expanded, setExpanded] = useState<Set<string | number>>(() => new Set());
+  return (
+    <section>
+      <h3 className="mb-2 text-sm font-semibold tracking-normal">{title}</h3>
+      {comments.length === 0 ? (
+        <p className="text-sm text-muted-foreground">(none)</p>
+      ) : (
+        <ul className="space-y-2">
+          {comments.map((comment) => {
+            const isExpanded = expanded.has(comment.comment_id);
+            const needsTrim = comment.body.length > 120;
+            const body = needsTrim && !isExpanded ? `${comment.body.slice(0, 120)} […]` : comment.body;
+            return (
+              <li key={comment.comment_id} className="rounded-md border border-border p-3">
+                <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <time className="italic" dateTime={comment.ts} title={formatUtc(comment.ts)}>
+                    {formatRelative(comment.ts)}
+                  </time>
+                  <span className="font-mono">{comment.author || "unknown"}</span>
+                  {comment.url ? (
+                    <a
+                      className="text-primary underline-offset-4 hover:underline"
+                      href={comment.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      anchor
+                    </a>
+                  ) : null}
+                </div>
+                <p className="whitespace-pre-wrap break-words text-sm">{body}</p>
+                {needsTrim ? (
+                  <button
+                    type="button"
+                    className="mt-1 text-xs font-medium text-primary underline-offset-4 hover:underline"
+                    onClick={() =>
+                      setExpanded((current) => {
+                        const next = new Set(current);
+                        if (next.has(comment.comment_id)) {
+                          next.delete(comment.comment_id);
+                        } else {
+                          next.add(comment.comment_id);
+                        }
+                        return next;
+                      })
+                    }
+                  >
+                    {isExpanded ? "collapse" : "expand"}
+                  </button>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+export function ExternalTruthSection({
+  snapshot,
+  isFetching,
+  onRefresh,
+}: {
+  snapshot?: IssueExternalSnapshot;
+  isFetching: boolean;
+  onRefresh: () => void;
+}) {
+  const flags = flagsByField(snapshot?.drift_flags ?? []);
+  const driftCount = snapshot?.drift_flags.filter((flag) => flag.severity !== "warning").length ?? 0;
+  const hasSourceError = Boolean(snapshot?.linear.error || snapshot?.github.error);
+  const statusClass =
+    driftCount > 0
+      ? "border-red-300 bg-red-50 text-red-900"
+      : hasSourceError
+        ? "border-amber-300 bg-amber-50 text-amber-900"
+        : "border-green-300 bg-green-50 text-green-900";
+  const statusLabel =
+    driftCount > 0
+      ? `Drift detected ⚠ (${driftCount})`
+      : hasSourceError
+        ? "Source unavailable"
+        : "In sync ✓";
+  return (
+    <section className="border-t py-5">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <h2 className="text-base font-semibold tracking-normal">
+            External truth
+            {snapshot ? (
+              <span className="ml-2 font-normal text-muted-foreground">
+                fetched {formatRelative(snapshot.fetched_at)}
+              </span>
+            ) : null}
+          </h2>
+          {snapshot ? (
+            <Badge className={statusClass}>{statusLabel}</Badge>
+          ) : null}
+        </div>
+        <Button type="button" variant="secondary" disabled={isFetching} onClick={onRefresh}>
+          Refresh now
+        </Button>
+      </div>
+      {snapshot ? (
+        <div className="space-y-5">
+          <div className="grid gap-4 md:grid-cols-2">
+            <LinearCard snapshot={snapshot.linear} flags={flags} />
+            <GithubCard snapshot={snapshot.github} flags={flags} />
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <CommentList title="Recent Linear comments" comments={snapshot.linear.comments ?? []} />
+            <CommentList title="Recent PR review comments" comments={snapshot.github.comments ?? []} />
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-muted-foreground">Loading external state</p>
       )}
     </section>
   );
@@ -143,6 +451,7 @@ function ObservationsPanel({
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
+  const forceExternalRefresh = useRef(false);
   const { data, error, isLoading, isFetching } = useQuery({
     queryKey: ["issue-detail", issueId],
     queryFn: () => fetchIssueDetail(issueId),
@@ -150,6 +459,18 @@ export function IssuePage() {
     refetchInterval: 5000,
     refetchOnWindowFocus: true,
     staleTime: 0,
+  });
+  const externalQuery = useQuery({
+    queryKey: ["external", issueId],
+    queryFn: () => {
+      const refresh = forceExternalRefresh.current;
+      forceExternalRefresh.current = false;
+      return fetchIssueExternal(issueId, { refresh });
+    },
+    enabled: issueId.length > 0,
+    refetchInterval: 60_000,
+    refetchOnWindowFocus: true,
+    staleTime: 60_000,
   });
   const observationsQuery = useQuery({
     queryKey: ["issue-observations", issueId],
@@ -192,6 +513,19 @@ export function IssuePage() {
         ) : null}
         {data ? (
           <>
+            <ExternalTruthSection
+              snapshot={externalQuery.data}
+              isFetching={externalQuery.isFetching}
+              onRefresh={() => {
+                forceExternalRefresh.current = true;
+                void externalQuery.refetch();
+              }}
+            />
+            {externalQuery.error ? (
+              <p className="border-t py-3 text-sm text-red-600">
+                {(externalQuery.error as Error).message}
+              </p>
+            ) : null}
             <ObservationsPanel
               rows={observationsQuery.data ?? []}
               isLoading={observationsQuery.isLoading}

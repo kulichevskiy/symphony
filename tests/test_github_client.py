@@ -140,6 +140,107 @@ async def test_pr_create_omits_base_when_not_provided(fake_gh) -> None:  # type:
     assert "--head" in argv and argv[argv.index("--head") + 1] == "x"
 
 
+async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    view = json.dumps(
+        {
+            "number": 42,
+            "state": "MERGED",
+            "url": "https://github.com/org/r/pull/42",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "mergedAt": "2026-05-17T11:00:00Z",
+            "mergedBy": {"login": "octo"},
+            "statusCheckRollup": [
+                {"state": "SUCCESS"},
+                {"state": "COMPLETED", "conclusion": "FAILURE"},
+                {"state": "PENDING"},
+            ],
+        }
+    )
+    comments = json.dumps(
+        [
+            {
+                "id": 1,
+                "body": "older",
+                "created_at": "2026-05-17T10:00:00Z",
+                "updated_at": "2026-05-17T10:00:00Z",
+                "html_url": "https://github.com/org/r/pull/42#discussion_r1",
+                "user": {"login": "reviewer-a"},
+            },
+            {
+                "id": 2,
+                "body": "newer",
+                "created_at": "2026-05-17T10:05:00Z",
+                "updated_at": "2026-05-17T10:06:00Z",
+                "html_url": "https://github.com/org/r/pull/42#discussion_r2",
+                "user": {"login": "reviewer-b"},
+            },
+        ]
+    )
+    log = fake_gh(
+        {
+            "pr view 42": [0, view],
+            "repos/org/r/pulls/42/comments": [0, comments],
+        }
+    )
+    gh = GitHub()
+
+    snapshot = await gh.pr_external_snapshot(42, repo="org/r")
+
+    assert snapshot["state"] == "MERGED"
+    assert snapshot["merged_by"] == "octo"
+    assert snapshot["check_summary"] == {
+        "passing": 1,
+        "failing": 1,
+        "pending": 1,
+        "total": 3,
+    }
+    assert [comment["comment_id"] for comment in snapshot["comments"]] == [2, 1]
+    calls = _calls(log)
+    assert calls[0]["argv"][:3] == ["pr", "view", "42"]
+    assert "statusCheckRollup" in calls[0]["argv"][-1]
+    assert calls[1]["argv"] == [
+        "api",
+        "repos/org/r/pulls/42/comments?per_page=5&sort=updated&direction=desc",
+    ]
+
+
+async def test_pr_external_snapshot_keeps_metadata_when_recent_comments_fail(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    view = json.dumps(
+        {
+            "number": 42,
+            "state": "OPEN",
+            "url": "https://github.com/org/r/pull/42",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "mergedAt": None,
+            "mergedBy": None,
+            "statusCheckRollup": [{"state": "SUCCESS"}],
+        }
+    )
+    log = fake_gh(
+        {
+            "pr view 42": [0, view],
+            "repos/org/r/pulls/42/comments": [1, "missing scope"],
+        }
+    )
+    gh = GitHub()
+
+    snapshot = await gh.pr_external_snapshot(42, repo="org/r")
+
+    assert snapshot["state"] == "OPEN"
+    assert snapshot["check_summary"] == {
+        "passing": 1,
+        "failing": 0,
+        "pending": 0,
+        "total": 1,
+    }
+    assert snapshot["comments"] == []
+    assert "missing scope" in snapshot["comments_error"]
+    calls = _calls(log)
+    assert len(calls) == 2
+
+
 # ---- pr_checks ------------------------------------------------------
 
 
