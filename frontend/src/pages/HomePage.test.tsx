@@ -53,7 +53,7 @@ describe("IssueListRow activity freshness", () => {
     expect(renderRow(issueWithAge(25 * 60 * 60))).toContain("bg-red-50/70");
   });
 
-  it("renders relative activity with an absolute UTC title and keeps stuck visible", () => {
+  it("renders absolute activity with a relative title and keeps stuck visible", () => {
     const issue = issueWithAge(25 * 60 * 60);
     issue.canonical_status = {
       state: "pr_open",
@@ -64,8 +64,8 @@ describe("IssueListRow activity freshness", () => {
 
     const markup = renderRow(issue);
 
-    expect(markup).toContain("1d ago");
-    expect(markup).toContain('title="2026-05-16T11:00:00Z"');
+    expect(markup).toContain("2026-05-16T11:00:00Z");
+    expect(markup).toContain('title="1d ago"');
     expect(markup).toContain("bg-red-50/70");
     expect(markup).toContain("stuck 1d");
   });

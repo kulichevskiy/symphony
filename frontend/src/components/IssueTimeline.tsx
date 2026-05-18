@@ -109,7 +109,7 @@ function formatUtc(ts: string) {
   if (Number.isNaN(date.getTime())) {
     return ts;
   }
-  return date.toISOString();
+  return `${date.toISOString().slice(0, 19)}Z`;
 }
 
 function formatRelative(ts: string, now: number) {
@@ -144,8 +144,8 @@ function formatRelative(ts: string, now: number) {
 
 function RelativeTime({ ts, now }: { ts: string; now: number }) {
   return (
-    <time dateTime={ts} title={formatUtc(ts)}>
-      {formatRelative(ts, now)}
+    <time className="font-mono" dateTime={ts} title={formatRelative(ts, now)}>
+      {formatUtc(ts)}
     </time>
   );
 }

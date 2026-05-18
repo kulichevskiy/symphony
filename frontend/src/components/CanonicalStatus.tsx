@@ -61,7 +61,7 @@ function formatUtc(ts: string) {
   if (Number.isNaN(date.getTime())) {
     return ts;
   }
-  return date.toISOString().replace(".000Z", "Z");
+  return `${date.toISOString().slice(0, 19)}Z`;
 }
 
 function formatRelative(ts: string, now: number) {
@@ -170,7 +170,7 @@ export function StatusSinceLine({ status }: { status: CanonicalStatus }) {
 
   return (
     <p className="text-sm text-muted-foreground">
-      since {formatUtc(status.since)} ({formatRelative(status.since, now)})
+      since <span className="font-mono" title={formatRelative(status.since, now)}>{formatUtc(status.since)}</span>
     </p>
   );
 }

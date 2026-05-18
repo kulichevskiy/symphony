@@ -40,7 +40,7 @@ export function formatUtcTimestamp(ts: string): string {
   if (Number.isNaN(date.getTime())) {
     return ts;
   }
-  return date.toISOString().replace(".000Z", "Z");
+  return `${date.toISOString().slice(0, 19)}Z`;
 }
 
 export function formatRelativeTimestamp(ts: string, nowMs: number): string {
