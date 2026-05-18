@@ -207,7 +207,9 @@ def create_api_router(
     router = APIRouter(prefix="/api")
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
     pr_no_progress_threshold = (
-        no_progress_threshold or DEFAULT_PR_NO_PROGRESS_THRESHOLD
+        DEFAULT_PR_NO_PROGRESS_THRESHOLD
+        if no_progress_threshold is None
+        else no_progress_threshold
     )
 
     def now() -> datetime:

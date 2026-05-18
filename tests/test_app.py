@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1235,6 +1235,59 @@ async def test_no_progress_warning_surfaces_on_list_and_detail(
     assert detail_payload["canonical_status"]["state"] == "pr_open"
     assert detail_payload["latest_activity_age_secs"] == 18000
     assert detail_payload["warnings"] == ["no_progress"]
+
+
+@pytest.mark.asyncio
+async def test_zero_no_progress_threshold_is_preserved(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-zero-threshold",
+            identifier="VIB-25",
+            title="Open PR just moved",
+            team_key="VIB",
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at,
+                merged_at
+            )
+            VALUES ('iss-zero-threshold', 'org/repo', 'VIB|org/repo', 25,
+                    'https://github.com/org/repo/pull/25',
+                    '2026-05-17T11:59:59Z', NULL)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_pr_no_progress_threshold=timedelta(0),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            list_response = await client.get("/api/issues?scope=all")
+            detail_response = await client.get("/api/issues/iss-zero-threshold")
+    finally:
+        await conn.close()
+
+    assert list_response.status_code == 200
+    assert list_response.json()[0]["latest_activity_age_secs"] == 1
+    assert list_response.json()[0]["warnings"] == ["no_progress"]
+    assert detail_response.status_code == 200
+    assert detail_response.json()["latest_activity_age_secs"] == 1
+    assert detail_response.json()["warnings"] == ["no_progress"]
 
 
 @pytest.mark.asyncio
