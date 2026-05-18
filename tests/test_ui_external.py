@@ -11,6 +11,7 @@ from symphony import db
 from symphony.app import create_app
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.ui.external import (
+    ExternalSnapshotCache,
     ExternalSnapshotService,
     compute_drift,
     sqlite_external_view,
@@ -153,6 +154,39 @@ def _github_payload(
             }
         ],
     }
+
+
+def test_external_snapshot_cache_prunes_expired_entries_globally() -> None:
+    cache = ExternalSnapshotCache()
+    cache.remember_payload(
+        "old",
+        fetched_at=NOW - timedelta(seconds=61),
+        payload={"linear": {"state": "Done"}, "github": {"state": "OPEN"}},
+    )
+    cache.remember_source(
+        "old",
+        "linear",
+        fetched_at="2026-05-17T11:00:00Z",
+        payload={"state": "Done"},
+    )
+    cache.remember_source_error(
+        "old",
+        "github",
+        failed_at=NOW - timedelta(seconds=31),
+        error="GitHub returned 500",
+    )
+    cache.remember_payload(
+        "fresh",
+        fetched_at=NOW - timedelta(seconds=10),
+        payload={"linear": {"state": "Done"}, "github": {"state": "OPEN"}},
+    )
+
+    cache.prune(now=NOW)
+
+    assert "old" not in cache.payloads
+    assert ("old", "linear") not in cache.last_known_good
+    assert ("old", "github") not in cache.source_errors
+    assert "fresh" in cache.payloads
 
 
 @pytest.mark.asyncio

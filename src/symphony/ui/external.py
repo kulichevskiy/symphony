@@ -79,9 +79,34 @@ class ExternalSnapshotCache:
         if cached is None:
             return None
         if now >= self._expires_at(issue_id, cached):
-            self.payloads.pop(issue_id, None)
+            self._drop_payload(issue_id)
             return None
         return cached.payload
+
+    def prune(self, *, now: datetime) -> None:
+        expired_payloads = [
+            issue_id
+            for issue_id, cached in self.payloads.items()
+            if now >= self._expires_at(issue_id, cached)
+        ]
+        expired_source_errors = [
+            key
+            for key, previous in self.source_errors.items()
+            if now - previous.failed_at >= self.source_error_backoff
+        ]
+        for key in expired_source_errors:
+            self.source_errors.pop(key, None)
+
+        for issue_id in expired_payloads:
+            self._drop_payload(issue_id)
+
+    def _drop_payload(self, issue_id: str) -> None:
+        self.payloads.pop(issue_id, None)
+        if any(error_issue_id == issue_id for error_issue_id, _ in self.source_errors):
+            return
+        for key in list(self.last_known_good):
+            if key[0] == issue_id:
+                self.last_known_good.pop(key, None)
 
     def _expires_at(self, issue_id: str, cached: _CachedPayload) -> datetime:
         expires_at = cached.fetched_at + self.ttl
@@ -436,6 +461,7 @@ class ExternalSnapshotService:
         refresh: bool = False,
     ) -> JsonDict | None:
         now = self._now()
+        self.cache.prune(now=now)
         if not refresh:
             cached = self.cache.get(issue_id, now=now)
             if cached is not None:

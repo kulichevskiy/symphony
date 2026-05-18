@@ -316,7 +316,7 @@ function CommentList({
   );
 }
 
-function ExternalTruthSection({
+export function ExternalTruthSection({
   snapshot,
   isFetching,
   onRefresh,
@@ -327,6 +327,19 @@ function ExternalTruthSection({
 }) {
   const flags = flagsByField(snapshot?.drift_flags ?? []);
   const driftCount = snapshot?.drift_flags.filter((flag) => flag.severity !== "warning").length ?? 0;
+  const hasSourceError = Boolean(snapshot?.linear.error || snapshot?.github.error);
+  const statusClass =
+    driftCount > 0
+      ? "border-red-300 bg-red-50 text-red-900"
+      : hasSourceError
+        ? "border-amber-300 bg-amber-50 text-amber-900"
+        : "border-green-300 bg-green-50 text-green-900";
+  const statusLabel =
+    driftCount > 0
+      ? `Drift detected ⚠ (${driftCount})`
+      : hasSourceError
+        ? "Source unavailable"
+        : "In sync ✓";
   return (
     <section className="border-t py-5">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -340,15 +353,7 @@ function ExternalTruthSection({
             ) : null}
           </h2>
           {snapshot ? (
-            <Badge
-              className={
-                driftCount > 0
-                  ? "border-red-300 bg-red-50 text-red-900"
-                  : "border-green-300 bg-green-50 text-green-900"
-              }
-            >
-              {driftCount > 0 ? `Drift detected ⚠ (${driftCount})` : "In sync ✓"}
-            </Badge>
+            <Badge className={statusClass}>{statusLabel}</Badge>
           ) : null}
         </div>
         <Button type="button" variant="secondary" disabled={isFetching} onClick={onRefresh}>
