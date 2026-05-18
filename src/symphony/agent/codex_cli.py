@@ -48,6 +48,19 @@ def _has_symphony_permissions_profile(config: dict[str, Any]) -> bool:
     return isinstance(profile, dict)
 
 
+def _has_top_level_permissions_assignment(config_text: str) -> bool:
+    for raw_line in config_text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("["):
+            return False
+        if line.startswith("permissions") and "=" in line:
+            key = line.split("=", 1)[0].strip()
+            return key == "permissions"
+    return False
+
+
 def ensure_symphony_permissions_profile(
     config_path: Path | None = None,
 ) -> tuple[Path, bool]:
@@ -75,6 +88,11 @@ def ensure_symphony_permissions_profile(
         if permissions is not None and not isinstance(permissions, dict):
             raise CodexPermissionsProfileError(
                 f"Codex config {path} defines 'permissions' as a non-table value; "
+                f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
+            )
+        if permissions is not None and _has_top_level_permissions_assignment(existing):
+            raise CodexPermissionsProfileError(
+                f"Codex config {path} defines 'permissions' as an inline table; "
                 f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
             )
         if (
