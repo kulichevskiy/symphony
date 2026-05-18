@@ -38,6 +38,16 @@ async def _fetch_one(
     return _dict(row) if row is not None else None
 
 
+def _external_fields_changed(drift_kind: str | None) -> list[str]:
+    if drift_kind == "merge_zombie":
+        return ["operator_waits", "issue_prs.merged_at"]
+    if drift_kind == "pr_locally_merged":
+        return ["issue_prs.merged_at"]
+    if drift_kind == "pr_closed_no_merge":
+        return ["operator_waits"]
+    return []
+
+
 def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
     kind = row["kind"]
     payload: dict[str, Any]
@@ -82,6 +92,23 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
         }
     elif kind in {"operator_wait_started", "operator_wait_ended"}:
         payload = {"kind": row["wait_kind"]}
+    elif kind == "external_observed":
+        payload = {
+            "source": row["external_source"],
+            "drift_kind": row["drift_kind"],
+        }
+    elif kind == "external_cleared":
+        payload = {
+            "source": row["external_source"],
+            "drift_kind": row["drift_kind"],
+            "fields_changed": _external_fields_changed(row["drift_kind"]),
+        }
+    elif kind == "external_state_change":
+        payload = {
+            "source": row["external_source"] or "linear",
+            "field": row["field"],
+            "new_value": row["new_value"],
+        }
     else:
         raise ValueError(f"unknown timeline kind: {kind}")
 
@@ -256,7 +283,8 @@ def create_issue_detail_router(
                        NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM runs
                 WHERE issue_id = ?
 
@@ -267,7 +295,8 @@ def create_issue_detail_router(
                        NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM runs
                 WHERE issue_id = ? AND ended_at IS NOT NULL
 
@@ -278,7 +307,8 @@ def create_issue_detail_router(
                        NULL AS cost_usd, github_repo, pr_number, pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM issue_prs
                 WHERE issue_id = ?
 
@@ -289,7 +319,8 @@ def create_issue_detail_router(
                        NULL AS cost_usd, github_repo, pr_number, NULL AS pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM issue_prs
                 WHERE issue_id = ? AND merged_at IS NOT NULL
 
@@ -300,7 +331,8 @@ def create_issue_detail_router(
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM comment_events
                 WHERE issue_id = ?
 
@@ -311,7 +343,8 @@ def create_issue_detail_router(
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, m.last_fingerprint AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM activity_comment_marks m
                 JOIN runs r ON r.id = m.run_id
                 WHERE r.issue_id = ? AND m.last_posted_at IS NOT NULL
@@ -323,7 +356,8 @@ def create_issue_detail_router(
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind
+                       NULL AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM issue_cost_marks
                 WHERE issue_id = ? AND warning_posted_at IS NOT NULL
 
@@ -333,7 +367,9 @@ def create_issue_detail_router(
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       field, old_value, new_value, NULL AS wait_kind
+                       field, old_value, new_value, NULL AS wait_kind,
+                       NULL AS external_source, NULL AS drift_kind,
+                       NULL AS action_taken
                 FROM state_transitions
                 WHERE issue_id = ? AND table_name = 'review_state'
 
@@ -344,7 +380,8 @@ def create_issue_detail_router(
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       old_value AS wait_kind
+                       old_value AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM state_transitions
                 WHERE issue_id = ?
                   AND table_name = 'operator_waits'
@@ -358,16 +395,49 @@ def create_issue_detail_router(
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
-                       new_value AS wait_kind
+                       new_value AS wait_kind, NULL AS external_source,
+                       NULL AS drift_kind, NULL AS action_taken
                 FROM state_transitions
                 WHERE issue_id = ?
                   AND table_name = 'operator_waits'
                   AND field = 'kind'
                   AND new_value IS NOT NULL
+
+                UNION ALL
+
+                SELECT observed_at AS ts,
+                       CASE
+                           WHEN action_taken = 'cleared' THEN 'external_cleared'
+                           ELSE 'external_observed'
+                       END AS kind,
+                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+                       NULL AS field, NULL AS old_value, NULL AS new_value,
+                       NULL AS wait_kind, source AS external_source,
+                       drift_kind, action_taken
+                FROM external_observations
+                WHERE issue_id = ? AND action_taken != 'noted'
+
+                UNION ALL
+
+                SELECT ts, 'external_state_change' AS kind,
+                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+                       field, old_value, new_value, NULL AS wait_kind,
+                       old_value AS external_source, NULL AS drift_kind,
+                       NULL AS action_taken
+                FROM state_transitions
+                WHERE issue_id = ?
+                  AND table_name = 'external_observations'
+                  AND field = 'external_state_change'
             )
             ORDER BY ts ASC, kind ASC
             """,
             (
+                issue_id,
+                issue_id,
                 issue_id,
                 issue_id,
                 issue_id,

@@ -16,6 +16,7 @@ webhook_dedupe_ttl_secs: 600
 webhook_timestamp_tolerance_secs: 60
 reconcile_interval_secs: 300
 reconcile_max_per_tick: 50
+reconcile_max_actions_per_tick: 10
 reconcile_backoff_secs: 600
 ui:
   enabled: true

@@ -32,6 +32,9 @@ const TIMELINE_KINDS = [
   "review_state_changed",
   "operator_wait_started",
   "operator_wait_ended",
+  "external_observed",
+  "external_cleared",
+  "external_state_change",
 ] as const;
 
 const KIND_LABELS: Record<string, string> = {
@@ -45,6 +48,9 @@ const KIND_LABELS: Record<string, string> = {
   review_state_changed: "review state",
   operator_wait_started: "operator wait started",
   operator_wait_ended: "operator wait ended",
+  external_observed: "external observed",
+  external_cleared: "external cleared",
+  external_state_change: "external state",
 };
 
 const KIND_COLORS: Record<string, string> = {
@@ -58,6 +64,9 @@ const KIND_COLORS: Record<string, string> = {
   review_state_changed: "bg-fuchsia-500",
   operator_wait_started: "bg-orange-500",
   operator_wait_ended: "bg-lime-600",
+  external_observed: "bg-sky-600",
+  external_cleared: "bg-teal-600",
+  external_state_change: "bg-indigo-600",
 };
 
 async function fetchIssueTimeline(id: string): Promise<TimelineEvent[]> {
@@ -85,6 +94,14 @@ function kindLabel(kind: string) {
 
 function kindDotClass(kind: string) {
   return KIND_COLORS[kind] ?? "bg-muted-foreground";
+}
+
+function isExternalKind(kind: string) {
+  return (
+    kind === "external_observed" ||
+    kind === "external_cleared" ||
+    kind === "external_state_change"
+  );
 }
 
 function formatUtc(ts: string) {
@@ -136,7 +153,29 @@ function RelativeTime({ ts, now }: { ts: string; now: number }) {
 function KindBadge({ kind }: { kind: string }) {
   return (
     <span className="inline-flex items-center gap-2 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-medium">
-      <span className={cn("h-2 w-2 rounded-full", kindDotClass(kind))} />
+      {isExternalKind(kind) ? (
+        <svg
+          aria-hidden="true"
+          className="h-3 w-3 text-sky-700"
+          fill="none"
+          viewBox="0 0 24 24"
+          stroke="currentColor"
+          strokeWidth="2"
+        >
+          <path
+            d="M10 13a5 5 0 0 0 7.07 0l2.12-2.12a5 5 0 0 0-7.07-7.07L11 4.93"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          <path
+            d="M14 11a5 5 0 0 0-7.07 0L4.81 13.12a5 5 0 0 0 7.07 7.07L13 19.07"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      ) : (
+        <span className={cn("h-2 w-2 rounded-full", kindDotClass(kind))} />
+      )}
       {kindLabel(kind)}
     </span>
   );

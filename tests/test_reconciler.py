@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,8 @@ from symphony.github.webhook import GitHubWebhookEvent
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import (
+    ACTION_CLEARED,
+    ACTION_NOTED,
     ACTION_OBSERVED,
     ACTION_WOULD_CLEAR,
     DRIFT_LINEAR_STATE_DONE,
@@ -177,6 +180,36 @@ async def _observation_rows(
     ]
 
 
+async def _merged_at(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+) -> str | None:
+    cur = await conn.execute(
+        "SELECT merged_at FROM issue_prs WHERE issue_id = ?",
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return str(row["merged_at"]) if row["merged_at"] is not None else None
+
+
+async def _transition_rows(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+) -> list[tuple[str, str, str | None, str | None]]:
+    transitions = await db.state_transitions.list_for_issue(conn, issue_id)
+    return [
+        (
+            transition.table_name,
+            transition.field,
+            transition.old_value,
+            transition.new_value,
+        )
+        for transition in transitions
+    ]
+
+
 def test_classifies_all_drift_kinds() -> None:
     merged_pr = GithubPrObservation(
         github_repo="org/repo",
@@ -318,6 +351,320 @@ async def test_drift_without_dry_run_keeps_observed_action(
 
     assert rows[1][1] == DRIFT_PR_LOCALLY_MERGED
     assert rows[1][2] == ACTION_OBSERVED
+
+
+@pytest.mark.asyncio
+async def test_active_merge_zombie_clears_wait_and_marks_pr_merged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        stored_merged_at = await _merged_at(conn)
+        transitions = await _transition_rows(conn)
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert stored_merged_at == merged_at
+    assert [(source, drift, action) for source, drift, action, _ in rows] == [
+        ("linear", None, ACTION_OBSERVED),
+        ("github", DRIFT_MERGE_ZOMBIE, ACTION_CLEARED),
+    ]
+    assert ("operator_waits", "kind", db.operator_waits.KIND_MERGE, None) in transitions
+    assert ("issue_prs", "merged_at", None, merged_at) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_pr_locally_merged_marks_pr_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        stored_merged_at = await _merged_at(conn)
+        transitions = await _transition_rows(conn)
+    finally:
+        await conn.close()
+
+    assert stored_merged_at == merged_at
+    assert rows[1][1] == DRIFT_PR_LOCALLY_MERGED
+    assert rows[1][2] == ACTION_CLEARED
+    assert ("issue_prs", "merged_at", None, merged_at) in transitions
+    assert not any(row[0] == "operator_waits" and row[2] is not None for row in transitions)
+
+
+@pytest.mark.asyncio
+async def test_active_pr_closed_no_merge_clears_wait_without_marking_merged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "CLOSED",
+                    "mergeable": None,
+                    "merged": False,
+                    "mergedAt": None,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        stored_merged_at = await _merged_at(conn)
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert stored_merged_at is None
+    assert rows[1][1] == DRIFT_PR_CLOSED_NO_MERGE
+    assert rows[1][2] == ACTION_CLEARED
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_notes_transition_without_clearing_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(state_name="Done"),  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert rows[0][1] == DRIFT_LINEAR_STATE_DONE
+    assert rows[0][2] == ACTION_NOTED
+    assert (
+        "external_observations",
+        "external_state_change",
+        "linear",
+        "linear:Done",
+    ) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_clear_rolls_back_observation_and_wait_delete_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+
+    async def fail_update_merged(*args: object, **kwargs: object) -> bool:
+        raise RuntimeError("injected update failure")
+
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await _seed_pr(conn)
+        monkeypatch.setattr(db.issue_prs, "update_merged", fail_update_merged)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        with pytest.raises(RuntimeError, match="injected update failure"):
+            await reconciler.reconcile_issue("iss-1", reason="test")
+        wait = await db.operator_waits.get(conn, "iss-1")
+        stored_merged_at = await _merged_at(conn)
+        cur = await conn.execute("SELECT COUNT(*) AS count FROM external_observations")
+        observation_count = (await cur.fetchone())["count"]
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert stored_merged_at is None
+    assert observation_count == 0
+
+
+@pytest.mark.asyncio
+async def test_autoclear_kill_switch_returns_to_observe_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    monkeypatch.setenv("SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED", "1")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": "2026-05-17T11:59:00Z",
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        stored_merged_at = await _merged_at(conn)
+    finally:
+        await conn.close()
+
+    assert rows[1][1] == DRIFT_PR_LOCALLY_MERGED
+    assert rows[1][2] == ACTION_OBSERVED
+    assert stored_merged_at is None
+
+
+@pytest.mark.asyncio
+async def test_active_tick_honors_action_cap_and_logs_overflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        for idx in range(15):
+            issue_id = f"iss-{idx:02d}"
+            await db.issues.upsert(
+                conn,
+                id=issue_id,
+                identifier=f"ENG-{idx}",
+                title=f"Issue {idx}",
+                team_key="ENG",
+            )
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo="org/repo",
+                binding_key='["ENG","org/repo","symphony"]',
+                pr_number=idx + 1,
+                pr_url=f"https://github.com/org/repo/pull/{idx + 1}",
+                created_at=f"2026-05-17T10:{idx:02d}:00Z",
+            )
+        reconciler = Reconciler(
+            Config(
+                repos=[_binding()],
+                reconcile_max_per_tick=15,
+                reconcile_max_actions_per_tick=10,
+            ),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": "2026-05-17T11:59:00Z",
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="symphony.orchestrator.reconciler"):
+            assert await reconciler.tick() == 30
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS count FROM issue_prs WHERE merged_at IS NOT NULL"
+        )
+        merged_count = (await cur.fetchone())["count"]
+        cur = await conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM external_observations
+            WHERE action_taken = ?
+            """,
+            (ACTION_CLEARED,),
+        )
+        cleared_count = (await cur.fetchone())["count"]
+    finally:
+        await conn.close()
+
+    assert merged_count == 10
+    assert cleared_count == 10
+    assert "external reconciler action cap reached" in caplog.text
+    assert "deferred_actions=5" in caplog.text
 
 
 @pytest.mark.asyncio

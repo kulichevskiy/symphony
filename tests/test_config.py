@@ -205,6 +205,7 @@ def test_reconcile_config_defaults_and_overrides(
     raw = f"""
 reconcile_interval_secs: 120
 reconcile_max_per_tick: 7
+reconcile_max_actions_per_tick: 3
 reconcile_backoff_secs: 900
 repos:
   - linear_team_key: ENG
@@ -217,12 +218,14 @@ repos:
     cfg = Config.load(p)
     assert cfg.reconcile_interval_secs == 120
     assert cfg.reconcile_max_per_tick == 7
+    assert cfg.reconcile_max_actions_per_tick == 3
     assert cfg.reconcile_backoff_secs == 900
     assert cfg.repos[0].reconcile_enabled is False
 
     default_cfg = Config()
     assert default_cfg.reconcile_interval_secs == 300
     assert default_cfg.reconcile_max_per_tick == 50
+    assert default_cfg.reconcile_max_actions_per_tick == 10
     assert default_cfg.reconcile_backoff_secs == 600
     assert (
         RepoBinding(

@@ -1,8 +1,9 @@
 """Background external-truth observation reconciler.
 
-This slice is deliberately audit-only: it records Linear/GitHub snapshots and
-classified drift into `external_observations`, but it never clears waits,
-marks PRs merged, moves Linear issues, or changes run state.
+The reconciler stays observe-only by default. When active auto-clear is
+explicitly enabled, it only applies monotonic local corrections: removing
+obsolete operator waits, marking locally unmerged PR rows merged, and noting
+external Linear completion in the timeline.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ DRIFT_PR_LOCALLY_MERGED = "pr_locally_merged"
 
 ACTION_OBSERVED = "observed"
 ACTION_WOULD_CLEAR = "would_clear"
+ACTION_CLEARED = "cleared"
+ACTION_NOTED = "noted"
 
 _TRANSIENT_STATUS_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response(?:\s+status)?|"
@@ -92,6 +95,13 @@ class GithubPrObservation:
         return payload
 
 
+@dataclass(frozen=True)
+class _ReconcileIssueResult:
+    observations: int
+    actions_taken: int
+    actions_deferred: int
+
+
 class _BackoffRequested(RuntimeError):
     def __init__(self, *, source: str, error: str) -> None:
         super().__init__(error)
@@ -102,6 +112,21 @@ class _BackoffRequested(RuntimeError):
 def reconcile_dry_run_enabled(env: Mapping[str, str] | None = None) -> bool:
     value = (env or os.environ).get("SYMPHONY_RECONCILE_DRYRUN", "")
     return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def reconcile_autoclear_disabled(env: Mapping[str, str] | None = None) -> bool:
+    value = (env or os.environ).get("SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED", "")
+    return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def reconcile_auto_clear_enabled(env: Mapping[str, str] | None = None) -> bool:
+    values = env or os.environ
+    if reconcile_autoclear_disabled(values):
+        return False
+    value = values.get("SYMPHONY_RECONCILE_DRYRUN")
+    if value is None:
+        return False
+    return value.strip().casefold() in {"0", "false", "no", "off"}
 
 
 def classify_linear_drift(
@@ -181,39 +206,89 @@ class Reconciler:
             return 0
 
         observed = 0
+        actions_taken = 0
+        actions_deferred = 0
         for candidate in await self._list_candidates():
             if observed // 2 >= self.config.reconcile_max_per_tick:
                 break
             if not await self._candidate_enabled(candidate.issue_id, candidate.team_key):
                 continue
             try:
-                observed += await self.reconcile_issue(
+                action_budget_remaining = None
+                if reconcile_auto_clear_enabled():
+                    action_budget_remaining = max(
+                        self.config.reconcile_max_actions_per_tick - actions_taken,
+                        0,
+                    )
+                result = await self._reconcile_issue(
                     candidate.issue_id,
                     reason="periodic",
+                    action_budget_remaining=action_budget_remaining,
                 )
+                observed += result.observations
+                actions_taken += result.actions_taken
+                actions_deferred += result.actions_deferred
             except _BackoffRequested as exc:
                 self._enter_backoff(source=exc.source, error=exc.error)
                 break
+        if actions_deferred:
+            log.warning(
+                "external reconciler action cap reached max_actions=%d "
+                "actions_taken=%d deferred_actions=%d",
+                self.config.reconcile_max_actions_per_tick,
+                actions_taken,
+                actions_deferred,
+            )
         return observed
 
     async def reconcile_issue(self, issue_id: str, *, reason: str) -> int:
+        result = await self._reconcile_issue(
+            issue_id,
+            reason=reason,
+            action_budget_remaining=None,
+        )
+        return result.observations
+
+    async def _reconcile_issue(
+        self,
+        issue_id: str,
+        *,
+        reason: str,
+        action_budget_remaining: int | None,
+    ) -> _ReconcileIssueResult:
         if self._backoff_active():
-            return 0
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
 
         issue_row = await self._issue_row(issue_id)
         if issue_row is None:
-            return 0
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
         wait = await db.operator_waits.get(self._conn, issue_id)
         prs = await self._open_prs(issue_id)
         if wait is None and not prs:
-            return 0
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
         matched_bindings = self._matched_bindings(
             team_key=str(issue_row["team_key"]),
             wait=wait,
             prs=prs,
         )
         if not any(binding.reconcile_enabled for binding in matched_bindings):
-            return 0
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
 
         observed_at = self._now().isoformat()
         done_state_names = self._done_state_names(matched_bindings)
@@ -232,38 +307,91 @@ class Reconciler:
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=github_prs,
         )
-        linear_action = _action_for(linear_drift)
-        github_action = _action_for(github_drift)
+        active = reconcile_auto_clear_enabled()
+        remaining = action_budget_remaining
+        actions_taken = 0
+        actions_deferred = 0
 
-        await db.external_observations.insert(
-            self._conn,
-            issue_id=issue_id,
-            source=SOURCE_LINEAR,
-            observed_at=observed_at,
-            payload_json=_json_payload(
-                {
-                    **linear_payload,
-                    "reason": reason,
-                }
-            ),
-            drift_kind=linear_drift,
-            action_taken=linear_action,
+        linear_action = _passive_action_for(linear_drift)
+        if active and linear_drift == DRIFT_LINEAR_STATE_DONE:
+            if remaining is None or remaining > 0:
+                linear_action = ACTION_NOTED
+                actions_taken += 1
+                if remaining is not None:
+                    remaining -= 1
+            else:
+                actions_deferred += 1
+
+        github_action = _passive_action_for(github_drift)
+        github_clearable = _github_clearable(
+            github_drift=github_drift,
+            wait=wait,
+            github_prs=github_prs,
         )
-        await db.external_observations.insert(
-            self._conn,
-            issue_id=issue_id,
-            source=SOURCE_GITHUB,
-            observed_at=observed_at,
-            payload_json=_json_payload(
-                {
-                    **github_payload,
-                    "reason": reason,
-                }
-            ),
-            drift_kind=github_drift,
-            action_taken=github_action,
+        if active and github_clearable:
+            if remaining is None or remaining > 0:
+                github_action = ACTION_CLEARED
+                actions_taken += 1
+                if remaining is not None:
+                    remaining -= 1
+            else:
+                actions_deferred += 1
+
+        try:
+            await db.external_observations.insert(
+                self._conn,
+                issue_id=issue_id,
+                source=SOURCE_LINEAR,
+                observed_at=observed_at,
+                payload_json=_json_payload(
+                    {
+                        **linear_payload,
+                        "reason": reason,
+                    }
+                ),
+                drift_kind=linear_drift,
+                action_taken=linear_action,
+                commit=False,
+            )
+            await db.external_observations.insert(
+                self._conn,
+                issue_id=issue_id,
+                source=SOURCE_GITHUB,
+                observed_at=observed_at,
+                payload_json=_json_payload(
+                    {
+                        **github_payload,
+                        "reason": reason,
+                    }
+                ),
+                drift_kind=github_drift,
+                action_taken=github_action,
+                commit=False,
+            )
+            if linear_action == ACTION_NOTED and linear_issue is not None:
+                await self._note_external_state_change(
+                    issue_id=issue_id,
+                    source=SOURCE_LINEAR,
+                    state_name=linear_issue.state_name,
+                    ts=observed_at,
+                )
+            if github_action == ACTION_CLEARED:
+                await self._apply_github_clear(
+                    issue_id=issue_id,
+                    wait=wait,
+                    drift_kind=github_drift,
+                    github_prs=github_prs,
+                )
+            await self._conn.commit()
+        except Exception:
+            await self._conn.rollback()
+            raise
+
+        return _ReconcileIssueResult(
+            observations=2,
+            actions_taken=actions_taken,
+            actions_deferred=actions_deferred,
         )
-        return 2
 
     async def reconcile_github_event(self, event: GitHubWebhookEvent) -> int:
         if event.event_type != "pull_request":
@@ -549,6 +677,76 @@ class Reconciler:
         }
         return names or {"Done"}
 
+    async def _note_external_state_change(
+        self,
+        *,
+        issue_id: str,
+        source: str,
+        state_name: str,
+        ts: str,
+    ) -> None:
+        await db.state_transitions.record_transition(
+            self._conn,
+            issue_id,
+            "external_observations",
+            "external_state_change",
+            source,
+            f"{source}:{state_name}",
+            ts=ts,
+        )
+
+    async def _apply_github_clear(
+        self,
+        *,
+        issue_id: str,
+        wait: db.operator_waits.OperatorWait | None,
+        drift_kind: str | None,
+        github_prs: list[GithubPrObservation],
+    ) -> None:
+        if drift_kind == DRIFT_PR_CLOSED_NO_MERGE:
+            if wait is None:
+                raise RuntimeError("cannot clear closed PR drift without an operator wait")
+            await db.operator_waits.delete(
+                self._conn,
+                issue_id,
+                wait.run_id,
+                commit=False,
+            )
+            return
+
+        merged_prs = _merged_prs_with_timestamps(github_prs)
+        if not merged_prs:
+            raise RuntimeError("cannot clear merged PR drift without github.mergedAt")
+
+        if drift_kind == DRIFT_MERGE_ZOMBIE:
+            if wait is None:
+                raise RuntimeError("cannot clear merge zombie without an operator wait")
+            await db.operator_waits.delete(
+                self._conn,
+                issue_id,
+                wait.run_id,
+                commit=False,
+            )
+        elif drift_kind != DRIFT_PR_LOCALLY_MERGED:
+            raise RuntimeError(f"unsupported github drift clear: {drift_kind}")
+
+        for pr in merged_prs:
+            if pr.merged_at is None:
+                continue
+            updated = await db.issue_prs.update_merged(
+                self._conn,
+                issue_id=issue_id,
+                github_repo=pr.github_repo,
+                pr_number=pr.pr_number,
+                merged_at=pr.merged_at,
+                commit=False,
+            )
+            if not updated:
+                raise RuntimeError(
+                    "could not update merged_at for "
+                    f"{pr.github_repo}#{pr.pr_number}"
+                )
+
 
 def _optional_str(value: object) -> str | None:
     if value is None:
@@ -578,10 +776,43 @@ def _binding_storage_key(binding: RepoBinding) -> str:
     )
 
 
-def _action_for(drift_kind: str | None) -> str:
-    if drift_kind is not None and reconcile_dry_run_enabled():
+def _passive_action_for(drift_kind: str | None) -> str:
+    if (
+        drift_kind is not None
+        and not reconcile_autoclear_disabled()
+        and reconcile_dry_run_enabled()
+    ):
         return ACTION_WOULD_CLEAR
     return ACTION_OBSERVED
+
+
+def _github_clearable(
+    *,
+    github_drift: str | None,
+    wait: db.operator_waits.OperatorWait | None,
+    github_prs: list[GithubPrObservation],
+) -> bool:
+    if github_drift == DRIFT_PR_CLOSED_NO_MERGE:
+        return wait is not None and wait.kind == db.operator_waits.KIND_MERGE
+    if github_drift == DRIFT_MERGE_ZOMBIE:
+        return (
+            wait is not None
+            and wait.kind == db.operator_waits.KIND_MERGE
+            and bool(_merged_prs_with_timestamps(github_prs))
+        )
+    if github_drift == DRIFT_PR_LOCALLY_MERGED:
+        return bool(_merged_prs_with_timestamps(github_prs))
+    return False
+
+
+def _merged_prs_with_timestamps(
+    github_prs: list[GithubPrObservation],
+) -> list[GithubPrObservation]:
+    return [
+        pr
+        for pr in github_prs
+        if pr.error is None and pr.merged and pr.merged_at is not None
+    ]
 
 
 def _json_payload(payload: Mapping[str, object]) -> str:
@@ -599,6 +830,8 @@ def _should_backoff(message: str) -> bool:
 
 
 __all__ = [
+    "ACTION_CLEARED",
+    "ACTION_NOTED",
     "ACTION_OBSERVED",
     "ACTION_WOULD_CLEAR",
     "DRIFT_LINEAR_STATE_DONE",
@@ -610,5 +843,7 @@ __all__ = [
     "Reconciler",
     "classify_github_drift",
     "classify_linear_drift",
+    "reconcile_auto_clear_enabled",
+    "reconcile_autoclear_disabled",
     "reconcile_dry_run_enabled",
 ]

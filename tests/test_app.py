@@ -162,6 +162,22 @@ async def _seed_issue_timeline(conn: aiosqlite.Connection) -> None:
     )
     await conn.execute(
         """
+        INSERT INTO external_observations (
+            issue_id, source, observed_at, payload_json, drift_kind, action_taken
+        )
+        VALUES
+            (
+                'iss-timeline', 'github', '2026-05-17T10:04:20Z',
+                '{}', 'merge_zombie', 'would_clear'
+            ),
+            (
+                'iss-timeline', 'github', '2026-05-17T10:05:45Z',
+                '{}', 'pr_locally_merged', 'cleared'
+            )
+        """
+    )
+    await conn.execute(
+        """
         INSERT INTO state_transitions (
             issue_id, table_name, field, old_value, new_value, ts
         )
@@ -173,6 +189,10 @@ async def _seed_issue_timeline(conn: aiosqlite.Connection) -> None:
             (
                 'iss-timeline', 'operator_waits', 'kind', NULL, 'review_stopped',
                 '2026-05-17T10:04:30Z'
+            ),
+            (
+                'iss-timeline', 'external_observations', 'external_state_change',
+                'linear', 'linear:Done', '2026-05-17T10:04:40Z'
             ),
             (
                 'iss-timeline', 'operator_waits', 'kind', 'review_stopped', 'merge',
@@ -1202,9 +1222,23 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
             "payload": {},
         },
         {
+            "ts": "2026-05-17T10:04:20Z",
+            "kind": "external_observed",
+            "payload": {"source": "github", "drift_kind": "merge_zombie"},
+        },
+        {
             "ts": "2026-05-17T10:04:30Z",
             "kind": "operator_wait_started",
             "payload": {"kind": "review_stopped"},
+        },
+        {
+            "ts": "2026-05-17T10:04:40Z",
+            "kind": "external_state_change",
+            "payload": {
+                "source": "linear",
+                "field": "external_state_change",
+                "new_value": "linear:Done",
+            },
         },
         {
             "ts": "2026-05-17T10:04:45Z",
@@ -1230,6 +1264,15 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
             "ts": "2026-05-17T10:05:30Z",
             "kind": "operator_wait_ended",
             "payload": {"kind": "merge"},
+        },
+        {
+            "ts": "2026-05-17T10:05:45Z",
+            "kind": "external_cleared",
+            "payload": {
+                "source": "github",
+                "drift_kind": "pr_locally_merged",
+                "fields_changed": ["issue_prs.merged_at"],
+            },
         },
         {
             "ts": "2026-05-17T10:06:00Z",

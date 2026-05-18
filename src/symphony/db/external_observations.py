@@ -41,6 +41,7 @@ async def insert(
     payload_json: str,
     drift_kind: str | None,
     action_taken: str,
+    commit: bool = True,
 ) -> None:
     await conn.execute(
         """
@@ -51,7 +52,8 @@ async def insert(
         """,
         (issue_id, source, observed_at, payload_json, drift_kind, action_taken),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def list_recent_for_issue(

@@ -108,9 +108,9 @@ Set:
 
 - `webhook_host: 127.0.0.1`
 - `webhook_port: 8787`
-- `reconcile_interval_secs: 300`, `reconcile_max_per_tick: 50`, and
-  `reconcile_backoff_secs: 600` unless you need a quieter or more aggressive
-  external-truth audit cadence.
+- `reconcile_interval_secs: 300`, `reconcile_max_per_tick: 50`,
+  `reconcile_max_actions_per_tick: 10`, and `reconcile_backoff_secs: 600`
+  unless you need a quieter or more aggressive external-truth audit cadence.
 - `workspace_root`, `log_root`, and `db_path` to directories writable by `symphony`.
 - Each `repos[].github_repo` to a watched GitHub repo.
 - Leave `repos[].webhook_enabled: true` for watched repos that should accept
@@ -122,10 +122,21 @@ Set:
   `repos[].webhook_enabled: true` must define `repos[].webhook_secret`.
 - Each `repos[].linear_team_key`, `issue_label`, and `linear_states` entry to match the Linear workspace.
 
-Set `SYMPHONY_RECONCILE_DRYRUN=1` in `/opt/symphonyd/.env` during the first
-observation window. Drift rows then use `action_taken='would_clear'`; unset it
-or set it to `0` to keep writing `action_taken='observed'`. This slice never
-clears SQLite state automatically either way.
+Keep `SYMPHONY_RECONCILE_DRYRUN` unset for observe-only rows with
+`action_taken='observed'`. Set `SYMPHONY_RECONCILE_DRYRUN=1` during a dry-run
+window when drift rows should use `action_taken='would_clear'` without mutating
+SQLite. Set `SYMPHONY_RECONCILE_DRYRUN=0` only after the dry-run audit is clean;
+that enables monotonic auto-clear for `merge_zombie`, `pr_locally_merged`, and
+`pr_closed_no_merge`. `linear_state_done` is noted in the timeline but leaves
+the operator wait intact.
+
+Auto-clear rollout:
+
+1. Verify dry-run history: `SELECT drift_kind, COUNT(*) FROM external_observations WHERE drift_kind IS NOT NULL GROUP BY drift_kind;`
+2. Spot-check at least 5 `would_clear` rows per drift kind and confirm each would have been correct.
+3. Set `SYMPHONY_RECONCILE_DRYRUN=0` and restart `symphonyd.service`.
+4. Watch `action_taken='cleared'` rows for 24 hours and confirm zero false positives.
+5. If anything looks wrong, set `SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED=1` and restart; this returns the reconciler to observe-only behavior.
 
 ## 3. Authenticate headless tools
 
