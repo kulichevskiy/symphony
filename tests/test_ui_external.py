@@ -65,7 +65,12 @@ async def _connect(tmp_path: Path):
     return await db.connect(tmp_path / "state.sqlite")
 
 
-async def _seed_external_issue(conn, *, merged_at: str | None = None) -> None:
+async def _seed_external_issue(
+    conn,
+    *,
+    merged_at: str | None = None,
+    with_pr: bool = True,
+) -> None:
     await db.issues.upsert(
         conn,
         id="iss-1",
@@ -79,18 +84,19 @@ async def _seed_external_issue(conn, *, merged_at: str | None = None) -> None:
         VALUES ('run-1', 'iss-1', 'merge', 'running', NULL, '2026-05-17T11:00:00Z', NULL, 0)
         """
     )
-    await conn.execute(
-        """
-        INSERT INTO issue_prs (
-            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+    if with_pr:
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES (
+                'iss-1', 'org/repo', 'ENG|org/repo', 42, 'https://github.com/org/repo/pull/42',
+                '2026-05-17T11:05:00Z', ?
+            )
+            """,
+            (merged_at,),
         )
-        VALUES (
-            'iss-1', 'org/repo', 'ENG|org/repo', 42, 'https://github.com/org/repo/pull/42',
-            '2026-05-17T11:05:00Z', ?
-        )
-        """,
-        (merged_at,),
-    )
     await conn.execute(
         """
         INSERT INTO operator_waits (
@@ -306,6 +312,36 @@ async def test_external_snapshot_cache_ttl_and_refresh(tmp_path: Path) -> None:
     assert forced["fetched_at"] == "2026-05-17T12:00:10Z"
     assert linear.calls == ["iss-1", "iss-1"]
     assert github.calls == [(42, "org/repo"), (42, "org/repo")]
+
+
+@pytest.mark.asyncio
+async def test_external_snapshot_caches_stable_missing_pr_error(tmp_path: Path) -> None:
+    current = NOW
+
+    def clock() -> datetime:
+        return current
+
+    conn = await _connect(tmp_path)
+    linear = _FakeLinear(_linear_payload())
+    github = _FakeGitHub()
+    service = ExternalSnapshotService(_config(), linear, github, clock=clock)
+    try:
+        await _seed_external_issue(conn, with_pr=False)
+
+        first = await service.get_issue_external(conn, "iss-1")
+        current = NOW + timedelta(seconds=10)
+        warm = await service.get_issue_external(conn, "iss-1")
+        current = NOW + timedelta(seconds=61)
+        expired = service.cache.get("iss-1", now=current)
+    finally:
+        await conn.close()
+
+    assert first is warm
+    assert first is not None
+    assert first["github"]["error"] == "No GitHub PR is recorded for this issue"
+    assert expired is None
+    assert linear.calls == ["iss-1"]
+    assert github.calls == []
 
 
 @pytest.mark.asyncio

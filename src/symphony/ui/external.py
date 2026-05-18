@@ -90,9 +90,8 @@ class ExternalSnapshotCache:
             if not (isinstance(source_payload, dict) and source_payload.get("error")):
                 continue
             source_error = self.source_errors.get((issue_id, source))
-            if source_error is None:
-                return cached.fetched_at
-            expires_at = min(expires_at, source_error.failed_at + self.source_error_backoff)
+            if source_error is not None:
+                expires_at = min(expires_at, source_error.failed_at + self.source_error_backoff)
         return expires_at
 
     def remember_payload(self, issue_id: str, *, fetched_at: datetime, payload: JsonDict) -> None:
