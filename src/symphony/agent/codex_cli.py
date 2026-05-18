@@ -70,20 +70,28 @@ def ensure_symphony_permissions_profile(
             )
         if isinstance(permissions, dict):
             profile = permissions.get(SYMPHONY_PERMISSIONS_PROFILE)
-            if profile is None:
+            if profile is None and permissions:
                 raise CodexPermissionsProfileError(
                     f"Codex config {path} already defines other permissions; "
                     f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
                 )
-            if not isinstance(profile, dict):
+            if profile is not None and not isinstance(profile, dict):
                 raise CodexPermissionsProfileError(
                     f"Codex config {path} defines {SYMPHONY_PERMISSIONS_PROFILE!r} "
                     "as a non-table value; add the permissions profile manually."
                 )
-            return path, False
+            if isinstance(profile, dict):
+                return path, False
 
     separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
     updated = f"{existing}{separator}{SYMPHONY_PERMISSIONS_PROFILE_TOML}\n"
+    try:
+        tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        raise CodexPermissionsProfileError(
+            f"Codex config {path} could not be safely updated; add the "
+            f"{SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
+        ) from exc
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(updated, encoding="utf-8")
