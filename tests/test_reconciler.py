@@ -541,14 +541,20 @@ async def test_active_pr_closed_no_merge_clears_wait_without_marking_merged(
         assert await reconciler.tick() == 2
         rows = await _observation_rows(conn)
         wait = await db.operator_waits.get(conn, "iss-1")
-        stored_merged_at = await _merged_at(conn)
+        pr = await db.issue_prs.get(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+        )
+        transitions = await _transition_rows(conn)
     finally:
         await conn.close()
 
     assert wait is None
-    assert stored_merged_at is None
+    assert pr is None
     assert rows[1][1] == DRIFT_PR_CLOSED_NO_MERGE
     assert rows[1][2] == ACTION_CLEARED
+    assert ("issue_prs", "__row__", "org/repo#42", None) in transitions
 
 
 @pytest.mark.asyncio

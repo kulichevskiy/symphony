@@ -153,6 +153,52 @@ async def update_merged(
     return updated
 
 
+async def delete(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int | None = None,
+    commit: bool = True,
+) -> bool:
+    cur = await conn.execute(
+        """
+        SELECT pr_number
+        FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (? IS NULL OR pr_number = ?)
+        """,
+        (issue_id, github_repo, pr_number, pr_number),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+
+    cur = await conn.execute(
+        """
+        DELETE FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (? IS NULL OR pr_number = ?)
+        """,
+        (issue_id, github_repo, pr_number, pr_number),
+    )
+    deleted = (cur.rowcount or 0) > 0
+    if deleted:
+        await state_transitions.record_transition(
+            conn,
+            issue_id,
+            "issue_prs",
+            "__row__",
+            f"{github_repo}#{row['pr_number']}",
+            None,
+        )
+    if commit:
+        await conn.commit()
+    return deleted
+
+
 async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
     """PRs whose review run died (last review run is failed, none running).
 
@@ -232,6 +278,7 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
 
 __all__ = [
     "IssuePR",
+    "delete",
     "get",
     "list_merge_candidates",
     "list_orphaned_review_prs",

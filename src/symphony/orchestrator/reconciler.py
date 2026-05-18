@@ -706,12 +706,28 @@ class Reconciler:
         if drift_kind == DRIFT_PR_CLOSED_NO_MERGE:
             if wait is None:
                 raise RuntimeError("cannot clear closed PR drift without an operator wait")
+            closed_prs = _closed_unmerged_prs(github_prs)
+            if not closed_prs:
+                raise RuntimeError("cannot clear closed PR drift without a closed PR")
             await db.operator_waits.delete(
                 self._conn,
                 issue_id,
                 wait.run_id,
                 commit=False,
             )
+            for pr in closed_prs:
+                deleted = await db.issue_prs.delete(
+                    self._conn,
+                    issue_id=issue_id,
+                    github_repo=pr.github_repo,
+                    pr_number=pr.pr_number,
+                    commit=False,
+                )
+                if not deleted:
+                    raise RuntimeError(
+                        "could not delete closed PR row for "
+                        f"{pr.github_repo}#{pr.pr_number}"
+                    )
             return
 
         merged_prs = _merged_prs_with_timestamps(github_prs)
@@ -793,7 +809,11 @@ def _github_clearable(
     github_prs: list[GithubPrObservation],
 ) -> bool:
     if github_drift == DRIFT_PR_CLOSED_NO_MERGE:
-        return wait is not None and wait.kind == db.operator_waits.KIND_MERGE
+        return (
+            wait is not None
+            and wait.kind == db.operator_waits.KIND_MERGE
+            and bool(_closed_unmerged_prs(github_prs))
+        )
     if github_drift == DRIFT_MERGE_ZOMBIE:
         return (
             wait is not None
@@ -826,6 +846,16 @@ def _merged_prs_with_timestamps(
         pr
         for pr in github_prs
         if pr.error is None and pr.merged and pr.merged_at is not None
+    ]
+
+
+def _closed_unmerged_prs(
+    github_prs: list[GithubPrObservation],
+) -> list[GithubPrObservation]:
+    return [
+        pr
+        for pr in github_prs
+        if pr.error is None and pr.state.upper() == "CLOSED" and not pr.merged
     ]
 
 

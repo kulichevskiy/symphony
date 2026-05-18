@@ -44,7 +44,7 @@ def _external_fields_changed(drift_kind: str | None) -> list[str]:
     if drift_kind == "pr_locally_merged":
         return ["issue_prs.merged_at"]
     if drift_kind == "pr_closed_no_merge":
-        return ["operator_waits"]
+        return ["operator_waits", "issue_prs"]
     return []
 
 
