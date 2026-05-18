@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import aiosqlite
 
+from . import state_transitions
+
 
 @dataclass(frozen=True)
 class IssuePR:
@@ -93,15 +95,108 @@ async def mark_merged(
     github_repo: str,
     merged_at: str,
 ) -> None:
-    await conn.execute(
+    await update_merged(
+        conn,
+        issue_id=issue_id,
+        github_repo=github_repo,
+        pr_number=None,
+        merged_at=merged_at,
+    )
+
+
+async def update_merged(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int | None,
+    merged_at: str,
+    commit: bool = True,
+) -> bool:
+    cur = await conn.execute(
+        """
+        SELECT merged_at
+        FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (? IS NULL OR pr_number = ?)
+        """,
+        (issue_id, github_repo, pr_number, pr_number),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+
+    old_merged_at = row["merged_at"]
+    cur = await conn.execute(
         """
         UPDATE issue_prs
         SET merged_at = ?
-        WHERE issue_id = ? AND github_repo = ?
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (? IS NULL OR pr_number = ?)
         """,
-        (merged_at, issue_id, github_repo),
+        (merged_at, issue_id, github_repo, pr_number, pr_number),
     )
-    await conn.commit()
+    updated = (cur.rowcount or 0) > 0
+    if updated and old_merged_at != merged_at:
+        await state_transitions.record_transition(
+            conn,
+            issue_id,
+            "issue_prs",
+            "merged_at",
+            old_merged_at,
+            merged_at,
+        )
+    if commit:
+        await conn.commit()
+    return updated
+
+
+async def delete(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int | None = None,
+    commit: bool = True,
+) -> bool:
+    cur = await conn.execute(
+        """
+        SELECT pr_number
+        FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (? IS NULL OR pr_number = ?)
+        """,
+        (issue_id, github_repo, pr_number, pr_number),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+
+    cur = await conn.execute(
+        """
+        DELETE FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (? IS NULL OR pr_number = ?)
+        """,
+        (issue_id, github_repo, pr_number, pr_number),
+    )
+    deleted = (cur.rowcount or 0) > 0
+    if deleted:
+        await state_transitions.record_transition(
+            conn,
+            issue_id,
+            "issue_prs",
+            "__row__",
+            f"{github_repo}#{row['pr_number']}",
+            None,
+        )
+    if commit:
+        await conn.commit()
+    return deleted
 
 
 async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
@@ -179,3 +274,15 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     )
     rows = await cur.fetchall()
     return [_row_to_issue_pr(r) for r in rows]
+
+
+__all__ = [
+    "IssuePR",
+    "delete",
+    "get",
+    "list_merge_candidates",
+    "list_orphaned_review_prs",
+    "mark_merged",
+    "update_merged",
+    "upsert",
+]

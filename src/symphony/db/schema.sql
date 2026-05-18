@@ -165,9 +165,9 @@ CREATE TABLE IF NOT EXISTS state_transitions (
 CREATE INDEX IF NOT EXISTS idx_state_transitions_issue_ts
     ON state_transitions(issue_id, ts);
 
--- Periodic and webhook-triggered observations of external truth. This is
--- intentionally append-only in this slice: the reconciler records drift and
--- dry-run intent, but does not clear or mutate local state yet.
+-- Periodic and webhook-triggered observations of external truth. Observation
+-- rows are append-only; when active auto-clear is enabled, the reconciler
+-- records the observation and monotonic local mutation in the same transaction.
 CREATE TABLE IF NOT EXISTS external_observations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     issue_id      TEXT NOT NULL REFERENCES issues(id),

@@ -233,6 +233,7 @@ class Config(BaseModel):
     webhook_timestamp_tolerance_secs: int = Field(default=60, ge=1)
     reconcile_interval_secs: int = Field(default=300, ge=1)
     reconcile_max_per_tick: int = Field(default=50, ge=1)
+    reconcile_max_actions_per_tick: int = Field(default=10, ge=1)
     reconcile_backoff_secs: int = Field(default=600, ge=1)
     ui: UIConfig = Field(default_factory=UIConfig)
 

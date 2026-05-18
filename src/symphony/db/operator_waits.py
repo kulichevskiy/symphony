@@ -148,7 +148,11 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
 
 
 async def delete(
-    conn: aiosqlite.Connection, issue_id: str, run_id: str | None = None
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    run_id: str | None = None,
+    *,
+    commit: bool = True,
 ) -> None:
     old = await get(conn, issue_id)
     if run_id is None:
@@ -167,7 +171,8 @@ async def delete(
         await state_transitions.record_transition(
             conn, issue_id, "operator_waits", "kind", old.kind, None
         )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 __all__ = [
