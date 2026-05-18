@@ -292,12 +292,16 @@ async def test_external_snapshot_cache_ttl_and_refresh(tmp_path: Path) -> None:
         current = NOW + timedelta(seconds=10)
         warm = await service.get_issue_external(conn, "iss-1")
         forced = await service.get_issue_external(conn, "iss-1", refresh=True)
+        current = NOW + timedelta(seconds=71)
+        expired = service.cache.get("iss-1", now=current)
     finally:
         await conn.close()
 
     assert first is warm
     assert first is not None
     assert forced is not None
+    assert expired is None
+    assert "iss-1" not in service.cache.payloads
     assert first["fetched_at"] == "2026-05-17T12:00:00Z"
     assert forced["fetched_at"] == "2026-05-17T12:00:10Z"
     assert linear.calls == ["iss-1", "iss-1"]
@@ -330,6 +334,8 @@ async def test_external_snapshot_serves_last_known_good_on_source_error(tmp_path
         payload = await service.get_issue_external(conn, "iss-1", refresh=True)
         current = NOW + timedelta(seconds=2)
         backoff_payload = await service.get_issue_external(conn, "iss-1", refresh=True)
+        current = NOW + timedelta(seconds=31)
+        expired_backoff = service.cache.source_backoff_error("iss-1", "linear", now=current)
     finally:
         await conn.close()
 
@@ -341,6 +347,8 @@ async def test_external_snapshot_serves_last_known_good_on_source_error(tmp_path
     assert payload["github"]["state"] == "OPEN"
     assert backoff_payload["linear"]["state"] == "Done"
     assert backoff_payload["linear"]["error"] == "Linear returned 500"
+    assert expired_backoff is None
+    assert ("iss-1", "linear") not in service.cache.source_errors
     assert linear.calls == ["iss-1", "iss-1"]
 
 

@@ -79,6 +79,7 @@ class ExternalSnapshotCache:
         if cached is None:
             return None
         if now - cached.fetched_at >= self.ttl:
+            self.payloads.pop(issue_id, None)
             return None
         return cached.payload
 
@@ -118,6 +119,7 @@ class ExternalSnapshotCache:
             return None
         if now - previous.failed_at < self.source_error_backoff:
             return previous.error
+        self.source_errors.pop((issue_id, source), None)
         return None
 
     def source_error(self, issue_id: str, source: str, error: str) -> JsonDict:
