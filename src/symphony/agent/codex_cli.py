@@ -42,7 +42,10 @@ def codex_config_path() -> Path:
 
 def _has_symphony_permissions_profile(config: dict[str, Any]) -> bool:
     permissions = config.get("permissions")
-    return isinstance(permissions, dict) and SYMPHONY_PERMISSIONS_PROFILE in permissions
+    if not isinstance(permissions, dict):
+        return False
+    profile = permissions.get(SYMPHONY_PERMISSIONS_PROFILE)
+    return isinstance(profile, dict)
 
 
 def ensure_symphony_permissions_profile(
@@ -73,6 +76,15 @@ def ensure_symphony_permissions_profile(
             raise CodexPermissionsProfileError(
                 f"Codex config {path} defines 'permissions' as a non-table value; "
                 f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
+            )
+        if (
+            isinstance(permissions, dict)
+            and SYMPHONY_PERMISSIONS_PROFILE in permissions
+            and not isinstance(permissions[SYMPHONY_PERMISSIONS_PROFILE], dict)
+        ):
+            raise CodexPermissionsProfileError(
+                f"Codex config {path} defines {SYMPHONY_PERMISSIONS_PROFILE!r} "
+                "as a non-table value; add the permissions profile manually."
             )
         if _has_symphony_permissions_profile(parsed):
             return path, False

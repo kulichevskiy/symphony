@@ -91,6 +91,19 @@ def test_ensure_symphony_permissions_profile_reports_scalar_permissions(
         ensure_symphony_permissions_profile(config_path)
 
 
+def test_ensure_symphony_permissions_profile_reports_scalar_profile(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[permissions]\n{SYMPHONY_PERMISSIONS_PROFILE} = "custom"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CodexPermissionsProfileError, match="non-table"):
+        ensure_symphony_permissions_profile(config_path)
+
+
 def test_profile_toml_constant_is_valid() -> None:
     parsed = tomllib.loads(SYMPHONY_PERMISSIONS_PROFILE_TOML)
     assert SYMPHONY_PERMISSIONS_PROFILE in parsed["permissions"]
