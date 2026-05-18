@@ -325,6 +325,7 @@ async def test_external_snapshot_serves_last_known_good_on_source_error(tmp_path
         _github_payload(),
         _github_payload(state="OPEN", merged_at=None),
         _github_payload(state="OPEN", merged_at=None),
+        _github_payload(state="OPEN", merged_at=None),
     )
     service = ExternalSnapshotService(_config(), linear, github, clock=clock)
     try:
@@ -335,21 +336,25 @@ async def test_external_snapshot_serves_last_known_good_on_source_error(tmp_path
         current = NOW + timedelta(seconds=2)
         backoff_payload = await service.get_issue_external(conn, "iss-1", refresh=True)
         current = NOW + timedelta(seconds=31)
-        expired_backoff = service.cache.source_backoff_error("iss-1", "linear", now=current)
+        expired_error_payload = service.cache.get("iss-1", now=current)
+        retry_payload = await service.get_issue_external(conn, "iss-1")
     finally:
         await conn.close()
 
     assert payload is not None
     assert backoff_payload is not None
+    assert retry_payload is not None
     assert payload["linear"]["state"] == "Done"
     assert payload["linear"]["stale"] is True
     assert payload["linear"]["error"] == "Linear returned 500"
     assert payload["github"]["state"] == "OPEN"
     assert backoff_payload["linear"]["state"] == "Done"
     assert backoff_payload["linear"]["error"] == "Linear returned 500"
-    assert expired_backoff is None
+    assert expired_error_payload is None
+    assert retry_payload["linear"]["state"] == "In Review"
+    assert "error" not in retry_payload["linear"]
     assert ("iss-1", "linear") not in service.cache.source_errors
-    assert linear.calls == ["iss-1", "iss-1"]
+    assert linear.calls == ["iss-1", "iss-1", "iss-1"]
 
 
 @pytest.mark.asyncio
