@@ -10,7 +10,7 @@ from typing import Annotated
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .db import ReadOnlyDbPool
 from .status import (
@@ -19,6 +19,7 @@ from .status import (
     canonical_status_sort_key,
     compute_canonical_status,
 )
+from .warnings import DEFAULT_PR_NO_PROGRESS_THRESHOLD, issue_warnings
 
 
 class CanonicalStatusPayload(BaseModel):
@@ -36,6 +37,7 @@ class IssueSummary(BaseModel):
     latest_activity_ts: str | None
     latest_activity_age_secs: int | None
     canonical_status: CanonicalStatusPayload
+    warnings: list[str] = Field(default_factory=list)
 
 
 class IssueScope(StrEnum):
@@ -134,6 +136,16 @@ def _utc_iso(ts: datetime) -> str:
     return ts.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value)
+    return int(str(value))
+
+
 def _list_issues_query(
     scope: IssueScope,
     q: str | None,
@@ -190,14 +202,22 @@ def create_api_router(
     *,
     clock: Callable[[], datetime] | None = None,
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
+    no_progress_threshold: timedelta | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
+    pr_no_progress_threshold = (
+        no_progress_threshold or DEFAULT_PR_NO_PROGRESS_THRESHOLD
+    )
 
     def now() -> datetime:
         return clock() if clock is not None else datetime.now(UTC)
 
-    @router.get("/issues", response_model=list[IssueSummary])
+    @router.get(
+        "/issues",
+        response_model=list[IssueSummary],
+        response_model_exclude_defaults=True,
+    )
     async def list_issues(
         q: Annotated[str | None, Query()] = None,
         scope: Annotated[IssueScope, Query()] = IssueScope.ACTIVE,
@@ -236,15 +256,23 @@ def create_api_router(
                 _identifier_sort_key(str(item[0]["identifier"])),
             )
         )
-        return [
-            IssueSummary.model_validate(
-                {
-                    **issue,
-                    "canonical_status": status.to_dict(),
-                }
+        payloads: list[IssueSummary] = []
+        for issue, status in statuses:
+            warnings = issue_warnings(
+                status,
+                latest_activity_age_secs=_optional_int(
+                    issue["latest_activity_age_secs"]
+                ),
+                pr_no_progress_threshold=pr_no_progress_threshold,
             )
-            for issue, status in statuses
-        ]
+            payload: dict[str, object] = {
+                **issue,
+                "canonical_status": status.to_dict(),
+            }
+            if warnings:
+                payload["warnings"] = warnings
+            payloads.append(IssueSummary.model_validate(payload))
+        return payloads
 
     @router.api_route(
         "/{path:path}",

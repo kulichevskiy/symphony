@@ -74,6 +74,7 @@ def test_ui_status_threshold_defaults_and_overrides(
     assert defaults[CanonicalState.RUNNING] == timedelta(minutes=30)
     assert defaults[CanonicalState.AWAITING_REVIEW_TRIGGER] == timedelta(minutes=10)
     assert defaults[CanonicalState.PR_OPEN] == timedelta(hours=24)
+    assert UIStatusThresholds().pr_no_progress_threshold() == timedelta(hours=2)
 
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = """
@@ -84,6 +85,7 @@ ui:
     running_secs: 1800
     awaiting_review_trigger_secs: 60
     pr_open_secs: 3600
+    pr_no_progress_threshold_secs: 1800
 repos: []
 """
     p = tmp_path / "cfg.yaml"
@@ -95,6 +97,9 @@ repos: []
     assert thresholds[CanonicalState.RUNNING] == timedelta(seconds=1800)
     assert thresholds[CanonicalState.AWAITING_REVIEW_TRIGGER] == timedelta(seconds=60)
     assert thresholds[CanonicalState.PR_OPEN] == timedelta(seconds=3600)
+    assert cfg.ui.status_stuck_thresholds.pr_no_progress_threshold() == timedelta(
+        seconds=1800
+    )
 
 
 def test_ui_status_thresholds_accept_legacy_awaiting_operator_key(

@@ -12,7 +12,14 @@ from fastapi import APIRouter, HTTPException, Query
 from .. import db
 from .db import ReadOnlyDbPool
 from .external import ExternalSnapshotService
-from .status import DEFAULT_STUCK_THRESHOLDS, CanonicalState, compute_canonical_status
+from .status import (
+    DEFAULT_STUCK_THRESHOLDS,
+    CanonicalState,
+    ExternalDriftFlag,
+    ExternalStatusSnapshot,
+    compute_canonical_status,
+)
+from .warnings import DEFAULT_PR_NO_PROGRESS_THRESHOLD, issue_warnings
 
 
 def _dict(row: aiosqlite.Row) -> dict[str, Any]:
@@ -47,6 +54,108 @@ def _external_fields_changed(drift_kind: str | None) -> list[str]:
     if drift_kind == "pr_closed_no_merge":
         return ["operator_waits", "issue_prs"]
     return []
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _normalize_now(now: datetime) -> datetime:
+    if now.tzinfo is None:
+        return now.replace(tzinfo=UTC)
+    return now.astimezone(UTC)
+
+
+def _age_seconds(ts: str | None, request_now: datetime) -> int | None:
+    parsed = _parse_timestamp(ts)
+    if parsed is None:
+        return None
+    return max(0, int((_normalize_now(request_now) - parsed).total_seconds()))
+
+
+async def _latest_activity(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    request_now: datetime,
+) -> tuple[str | None, int | None]:
+    row = await _fetch_one(
+        conn,
+        """
+        WITH latest_activity_sources(ts) AS (
+            SELECT COALESCE(ended_at, started_at)
+            FROM runs
+            WHERE issue_id = ?
+            UNION ALL
+            SELECT ts
+            FROM state_transitions
+            WHERE issue_id = ?
+            UNION ALL
+            SELECT seen_at
+            FROM comment_events
+            WHERE issue_id = ?
+            UNION ALL
+            SELECT m.last_event_at
+            FROM activity_comment_marks m
+            JOIN runs r ON r.id = m.run_id
+            WHERE r.issue_id = ? AND m.last_event_at IS NOT NULL
+            UNION ALL
+            SELECT COALESCE(merged_at, created_at)
+            FROM issue_prs
+            WHERE issue_id = ?
+            UNION ALL
+            SELECT created_at
+            FROM operator_waits
+            WHERE issue_id = ?
+        )
+        SELECT MAX(ts) AS latest_activity_ts
+        FROM latest_activity_sources
+        WHERE ts IS NOT NULL
+        """,
+        (issue_id, issue_id, issue_id, issue_id, issue_id, issue_id),
+    )
+    if row is None:
+        return None, None
+    latest_activity_ts = (
+        str(row["latest_activity_ts"])
+        if row["latest_activity_ts"] is not None
+        else None
+    )
+    return latest_activity_ts, _age_seconds(latest_activity_ts, request_now)
+
+
+def _external_status_snapshot(payload: dict[str, Any]) -> ExternalStatusSnapshot:
+    fetched_at = str(payload.get("fetched_at") or "")
+    flags: list[ExternalDriftFlag] = []
+    raw_flags = payload.get("drift_flags")
+    if not isinstance(raw_flags, list):
+        return ExternalStatusSnapshot(drift_flags=())
+    for raw_flag in raw_flags:
+        if not isinstance(raw_flag, dict):
+            continue
+        field = raw_flag.get("field")
+        if field is None:
+            continue
+        flags.append(
+            ExternalDriftFlag(
+                field=str(field),
+                source_name=str(raw_flag.get("source_name") or ""),
+                flagged_at=fetched_at,
+                drift_kind=str(raw_flag.get("field") or field),
+            )
+        )
+    return ExternalStatusSnapshot(drift_flags=tuple(flags))
 
 
 def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
@@ -122,16 +231,24 @@ def create_issue_detail_router(
     external_service: ExternalSnapshotService | None = None,
     clock: Callable[[], datetime] | None = None,
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
+    no_progress_threshold: timedelta | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
+    pr_no_progress_threshold = (
+        no_progress_threshold or DEFAULT_PR_NO_PROGRESS_THRESHOLD
+    )
 
     def now() -> datetime:
         return clock() if clock is not None else datetime.now(UTC)
 
     @router.get("/issues/{issue_id}")
-    async def issue_detail(issue_id: str) -> dict[str, Any]:
+    async def issue_detail(
+        issue_id: str,
+        include_external: Annotated[bool, Query()] = False,
+    ) -> dict[str, Any]:
         conn = await pool.connection()
+        request_now = now()
         issue = await _fetch_one(
             conn,
             """
@@ -143,11 +260,26 @@ def create_issue_detail_router(
         )
         if issue is None:
             raise HTTPException(status_code=404, detail="Issue not found")
+        external_snapshot: ExternalStatusSnapshot | None = None
+        external_payload: dict[str, Any] | None = None
+        if include_external and external_service is not None:
+            external_payload = await external_service.get_issue_external(
+                conn,
+                issue_id,
+            )
+            if external_payload is not None:
+                external_snapshot = _external_status_snapshot(external_payload)
         canonical_status = await compute_canonical_status(
             conn,
             issue_id,
-            now=now(),
+            now=request_now,
             thresholds=thresholds,
+            external_snapshot=external_snapshot,
+        )
+        latest_activity_ts, latest_activity_age_secs = await _latest_activity(
+            conn,
+            issue_id,
+            request_now=request_now,
         )
 
         runs = await _fetch_all(
@@ -224,7 +356,12 @@ def create_issue_detail_router(
             (issue_id,),
         )
 
-        return {
+        warnings = issue_warnings(
+            canonical_status,
+            latest_activity_age_secs=latest_activity_age_secs,
+            pr_no_progress_threshold=pr_no_progress_threshold,
+        )
+        payload: dict[str, Any] = {
             "issue": issue,
             "canonical_status": canonical_status.to_dict(),
             "runs": runs,
@@ -235,6 +372,13 @@ def create_issue_detail_router(
             "activity_comment_marks": activity_comment_marks,
             "issue_cost_marks": issue_cost_marks,
         }
+        if warnings:
+            payload["warnings"] = warnings
+            payload["latest_activity_ts"] = latest_activity_ts
+            payload["latest_activity_age_secs"] = latest_activity_age_secs
+        if external_payload is not None:
+            payload["external_snapshot"] = external_payload
+        return payload
 
     @router.get("/issues/{issue_id}/external")
     async def issue_external(

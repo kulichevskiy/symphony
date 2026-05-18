@@ -69,4 +69,37 @@ describe("IssueListRow activity freshness", () => {
     expect(markup).toContain("bg-red-50/70");
     expect(markup).toContain("stuck 1d");
   });
+
+  it("renders the no-progress chip next to the PR badge", () => {
+    const issue = issueWithAge(5 * 60 * 60);
+    issue.canonical_status = {
+      state: "pr_open",
+      since: "2026-05-17T07:00:00Z",
+      subtitle: "#23",
+      stuck_for: null,
+    };
+    issue.warnings = ["no_progress"];
+
+    const markup = renderRow(issue);
+
+    expect(markup).toContain("PR open");
+    expect(markup).toContain("no progress 5h");
+  });
+
+  it("renders drift-detected status as a warning badge", () => {
+    const issue = issueWithAge(90 * 60);
+    issue.canonical_status = {
+      state: "drift_detected",
+      since: "2026-05-17T10:30:00Z",
+      subtitle: "1 field(s) disagree",
+      stuck_for: 90 * 60,
+    };
+
+    const markup = renderRow(issue);
+
+    expect(markup).toContain("drift detected");
+    expect(markup).toContain("1 field(s) disagree");
+    expect(markup).toContain("stuck 1h");
+    expect(markup).toContain("bg-red-100");
+  });
 });
