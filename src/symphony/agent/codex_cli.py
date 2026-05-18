@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
 
 SYMPHONY_PERMISSIONS_PROFILE = "symphony-git"
 CODEX_DEFAULT_PERMISSIONS_CONFIG = (
@@ -40,27 +39,6 @@ def codex_config_path() -> Path:
     return Path.home() / ".codex" / "config.toml"
 
 
-def _has_symphony_permissions_profile(config: dict[str, Any]) -> bool:
-    permissions = config.get("permissions")
-    if not isinstance(permissions, dict):
-        return False
-    profile = permissions.get(SYMPHONY_PERMISSIONS_PROFILE)
-    return isinstance(profile, dict)
-
-
-def _has_top_level_permissions_assignment(config_text: str) -> bool:
-    for raw_line in config_text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("["):
-            return False
-        if line.startswith("permissions") and "=" in line:
-            key = line.split("=", 1)[0].strip()
-            return key == "permissions"
-    return False
-
-
 def ensure_symphony_permissions_profile(
     config_path: Path | None = None,
 ) -> tuple[Path, bool]:
@@ -90,21 +68,18 @@ def ensure_symphony_permissions_profile(
                 f"Codex config {path} defines 'permissions' as a non-table value; "
                 f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
             )
-        if permissions is not None and _has_top_level_permissions_assignment(existing):
-            raise CodexPermissionsProfileError(
-                f"Codex config {path} defines 'permissions' as an inline table; "
-                f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
-            )
-        if (
-            isinstance(permissions, dict)
-            and SYMPHONY_PERMISSIONS_PROFILE in permissions
-            and not isinstance(permissions[SYMPHONY_PERMISSIONS_PROFILE], dict)
-        ):
-            raise CodexPermissionsProfileError(
-                f"Codex config {path} defines {SYMPHONY_PERMISSIONS_PROFILE!r} "
-                "as a non-table value; add the permissions profile manually."
-            )
-        if _has_symphony_permissions_profile(parsed):
+        if isinstance(permissions, dict):
+            profile = permissions.get(SYMPHONY_PERMISSIONS_PROFILE)
+            if profile is None:
+                raise CodexPermissionsProfileError(
+                    f"Codex config {path} already defines other permissions; "
+                    f"add the {SYMPHONY_PERMISSIONS_PROFILE!r} permissions profile manually."
+                )
+            if not isinstance(profile, dict):
+                raise CodexPermissionsProfileError(
+                    f"Codex config {path} defines {SYMPHONY_PERMISSIONS_PROFILE!r} "
+                    "as a non-table value; add the permissions profile manually."
+                )
             return path, False
 
     separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")

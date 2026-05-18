@@ -153,8 +153,10 @@ exit
 
 Configure the Codex permissions profile that Symphony uses for unattended
 `implement` and `review_fix` runs. `symphony preflight` creates this block in
-`~/.codex/config.toml` if it is missing and leaves it untouched if an operator
-has already customized it:
+`~/.codex/config.toml` if no permissions profiles exist yet. If an operator has
+already customized Codex permissions without defining `symphony-git`, preflight
+fails and asks for the profile to be added manually instead of rewriting custom
+TOML:
 
 ```toml
 [permissions.symphony-git.filesystem]

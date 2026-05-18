@@ -763,7 +763,9 @@ Preflight checks:
 - configured teams are visible;
 - configured Linear state names exist.
 - Codex has a `symphony-git` permissions profile in `~/.codex/config.toml`
-  so unattended Codex runs can commit inside managed worktrees.
+  so unattended Codex runs can commit inside managed worktrees. If custom
+  permissions already exist without `symphony-git`, preflight asks for a manual
+  config edit instead of rewriting operator-owned TOML.
 
 If preflight fails, do not start the daemon. Fix `.env` or YAML first.
 

@@ -188,8 +188,11 @@ exit
 работать только в репозиториях, где app установлен.
 
 `symphony preflight` создаст профиль Codex `symphony-git` в
-`~/.codex/config.toml`, если его еще нет. После этого можно проверить тот же
-режим, который daemon использует для unattended `implement` и `review_fix`:
+`~/.codex/config.toml`, если других permissions-профилей еще нет. Если
+permissions уже настроены вручную без `symphony-git`, preflight попросит
+добавить профиль руками, не переписывая пользовательский TOML. После этого
+можно проверить тот же режим, который daemon использует для unattended
+`implement` и `review_fix`:
 
 ```bash
 codex exec --json \
