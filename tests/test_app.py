@@ -1134,6 +1134,7 @@ async def test_issue_detail_include_external_promotes_latest_drift(
                     "source_value": source_value,
                     "source_name": source_name,
                     "severity": "drift",
+                    "flagged_at": "2026-05-17T08:15:00Z",
                 }
             ],
         }
@@ -1163,9 +1164,9 @@ async def test_issue_detail_include_external_promotes_latest_drift(
     detail_payload = detail_response.json()
     assert detail_payload["canonical_status"] == {
         "state": "drift_detected",
-        "since": "2026-05-17T09:30:00Z",
+        "since": "2026-05-17T08:15:00Z",
         "subtitle": "1 field(s) disagree",
-        "stuck_for": 9000,
+        "stuck_for": 13500,
     }
     assert detail_payload["external_snapshot"]["drift_flags"] == [
         {
@@ -1174,10 +1175,79 @@ async def test_issue_detail_include_external_promotes_latest_drift(
             "source_value": source_value,
             "source_name": source_name,
             "severity": "drift",
+            "flagged_at": "2026-05-17T08:15:00Z",
         }
     ]
     assert plain_response.json()["canonical_status"]["state"] == "awaiting_merge"
     assert list_response.json()[0]["canonical_status"]["state"] == "awaiting_merge"
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_include_external_keeps_warning_flags_out_of_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-check-warning",
+            identifier="VIB-26",
+            title="Running with failing checks",
+            team_key="VIB",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES ('run-warning', 'iss-check-warning', 'review', 'running', NULL,
+                    '2026-05-17T11:40:00Z', NULL, 0)
+            """
+        )
+        await conn.commit()
+        external_payload = {
+            "fetched_at": "2026-05-17T11:45:00Z",
+            "linear": {"state": "In Review", "comments": [], "labels": []},
+            "github": {"state": "OPEN", "comments": []},
+            "drift_flags": [
+                {
+                    "field": "github.checks",
+                    "sqlite_value": "running",
+                    "source_value": "1 failing",
+                    "source_name": "GitHub",
+                    "severity": "warning",
+                    "flagged_at": "2026-05-17T11:40:00Z",
+                }
+            ],
+        }
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_external_service=_FakeExternalService(external_payload),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/api/issues/iss-check-warning?include_external=1"
+            )
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["canonical_status"] == {
+        "state": "running",
+        "since": "2026-05-17T11:40:00Z",
+        "subtitle": "review",
+        "stuck_for": None,
+    }
+    assert payload["external_snapshot"]["drift_flags"][0]["severity"] == "warning"
 
 
 @pytest.mark.asyncio

@@ -144,14 +144,17 @@ def _external_status_snapshot(payload: dict[str, Any]) -> ExternalStatusSnapshot
     for raw_flag in raw_flags:
         if not isinstance(raw_flag, dict):
             continue
+        if raw_flag.get("severity") == "warning":
+            continue
         field = raw_flag.get("field")
         if field is None:
             continue
+        flagged_at = raw_flag.get("flagged_at") or fetched_at
         flags.append(
             ExternalDriftFlag(
                 field=str(field),
                 source_name=str(raw_flag.get("source_name") or ""),
-                flagged_at=fetched_at,
+                flagged_at=str(flagged_at),
                 drift_kind=str(raw_flag.get("field") or field),
             )
         )

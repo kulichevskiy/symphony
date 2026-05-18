@@ -103,6 +103,7 @@ export type DriftFlag = {
   source_value: string | null;
   source_name: string;
   severity: DriftSeverity;
+  flagged_at?: string | null;
 };
 
 export type ExternalComment = {
