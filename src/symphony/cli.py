@@ -154,6 +154,9 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_external_config=cfg,
                     ui_external_linear=linear,
                     ui_external_github=orch._gh,  # pylint: disable=protected-access
+                    ui_pr_no_progress_threshold=(
+                        cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
+                    ),
                 )
                 server = uvicorn.Server(
                     build_server_config(

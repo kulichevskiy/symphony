@@ -66,6 +66,7 @@ def create_app(
     ui_external_linear: Linear | None = None,
     ui_external_github: GitHub | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
+    ui_pr_no_progress_threshold: timedelta | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     ui_pool = (
@@ -137,6 +138,7 @@ def create_app(
                     external_service=external_service,
                     clock=clock,
                     status_thresholds=ui_status_thresholds,
+                    no_progress_threshold=ui_pr_no_progress_threshold,
                 )
             )
 
@@ -145,6 +147,7 @@ def create_app(
                 ui_pool,
                 clock=clock,
                 status_thresholds=ui_status_thresholds,
+                no_progress_threshold=ui_pr_no_progress_threshold,
             )
         )
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST

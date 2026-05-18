@@ -37,6 +37,7 @@ class DriftFlag:
     source_value: str | None
     source_name: str
     severity: str = "drift"
+    flagged_at: str | None = None
 
     def to_dict(self) -> dict[str, str | None]:
         return {
@@ -45,6 +46,7 @@ class DriftFlag:
             "source_value": self.source_value,
             "source_name": self.source_name,
             "severity": self.severity,
+            "flagged_at": self.flagged_at,
         }
 
 
@@ -386,6 +388,7 @@ def compute_drift(
                     sqlite_value=str(operator_waits[0]["kind"]),
                     source_value=linear_state,
                     source_name="Linear",
+                    flagged_at=_as_str(operator_waits[0].get("created_at")),
                 )
             )
 
@@ -402,6 +405,12 @@ def compute_drift(
                     sqlite_value="merged_at=null",
                     source_value=state,
                     source_name="GitHub",
+                    flagged_at=merged_at
+                    or (
+                        _as_str(pr_row.get("created_at"))
+                        if pr_row is not None
+                        else None
+                    ),
                 )
             )
         if merged_at is not None and sqlite_merged_at is None:
@@ -411,6 +420,7 @@ def compute_drift(
                     sqlite_value=None,
                     source_value=merged_at,
                     source_name="GitHub",
+                    flagged_at=merged_at,
                 )
             )
 
@@ -426,6 +436,7 @@ def compute_drift(
                     source_value=f"{failing} failing",
                     source_name="GitHub",
                     severity="warning",
+                    flagged_at=_as_str(sqlite_view["running_runs"][0].get("started_at")),
                 )
             )
 

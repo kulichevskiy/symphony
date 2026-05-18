@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 import pytest
 
 from symphony import db
-from symphony.ui.status import compute_canonical_status
+from symphony.ui.status import (
+    ExternalDriftFlag,
+    ExternalStatusSnapshot,
+    compute_canonical_status,
+)
+from symphony.ui.warnings import issue_warnings
 
 NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 
@@ -184,6 +189,85 @@ async def test_canonical_status_applies_operator_wait_stuck_thresholds(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "drift_kind"),
+    [
+        ("linear.state", "linear_state_done"),
+        ("github.state", "merge_zombie"),
+        ("github.state", "pr_closed_no_merge"),
+        ("github.merged_at", "pr_locally_merged"),
+    ],
+)
+async def test_canonical_status_promotes_external_drift(
+    tmp_path: Path,
+    field: str,
+    drift_kind: str,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "drift")
+        await _operator_wait(
+            conn,
+            issue_id="drift",
+            run_id="run-drift",
+            kind=db.operator_waits.KIND_MERGE,
+            created_at="2026-05-17T11:00:00Z",
+        )
+
+        status = await compute_canonical_status(
+            conn,
+            "drift",
+            now=NOW,
+            external_snapshot=ExternalStatusSnapshot(
+                drift_flags=(
+                    ExternalDriftFlag(
+                        field=field,
+                        source_name=field.partition(".")[0],
+                        flagged_at="2026-05-17T09:30:00Z",
+                        drift_kind=drift_kind,
+                    ),
+                )
+            ),
+        )
+    finally:
+        await conn.close()
+
+    assert status.to_dict() == {
+        "state": "drift_detected",
+        "since": "2026-05-17T09:30:00Z",
+        "subtitle": "1 field(s) disagree",
+        "stuck_for": 9000,
+    }
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_falls_back_when_external_snapshot_has_no_drift(
+    tmp_path: Path,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "clean-snapshot")
+        await _operator_wait(
+            conn,
+            issue_id="clean-snapshot",
+            run_id="run-clean-snapshot",
+            kind=db.operator_waits.KIND_MERGE,
+            created_at="2026-05-17T11:00:00Z",
+        )
+
+        status = await compute_canonical_status(
+            conn,
+            "clean-snapshot",
+            now=NOW,
+            external_snapshot=ExternalStatusSnapshot(drift_flags=()),
+        )
+    finally:
+        await conn.close()
+
+    assert status.state == "awaiting_merge"
+
+
+@pytest.mark.asyncio
 async def test_canonical_status_detects_running_and_running_threshold(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +435,61 @@ async def test_canonical_status_prefers_open_pr_over_stale_review_state(
         "subtitle": "#42",
         "stuck_for": 90000,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("issue_id", "state_seed", "latest_activity_age_secs", "expected"),
+    [
+        ("fresh-pr", "pr_open", 2 * 60 * 60, []),
+        ("stale-pr", "pr_open", 2 * 60 * 60 + 1, ["no_progress"]),
+        ("running-issue", "running", 5 * 60 * 60, []),
+        ("unknown-age", "pr_open", None, []),
+    ],
+)
+async def test_no_progress_warning_respects_threshold_and_pr_open_state(
+    tmp_path: Path,
+    issue_id: str,
+    state_seed: str,
+    latest_activity_age_secs: int | None,
+    expected: list[str],
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, issue_id)
+        if state_seed == "pr_open":
+            await conn.execute(
+                """
+                INSERT INTO issue_prs (
+                    issue_id, github_repo, binding_key, pr_number, pr_url, created_at,
+                    merged_at
+                )
+                VALUES (?, 'org/repo', 'ENG|org/repo', 42,
+                        'https://github.com/org/repo/pull/42',
+                        '2026-05-17T11:00:00Z', NULL)
+                """,
+                (issue_id,),
+            )
+            await conn.commit()
+        else:
+            await _run(
+                conn,
+                run_id=f"run-{issue_id}",
+                issue_id=issue_id,
+                stage="implement",
+                status="running",
+                started_at="2026-05-17T11:00:00Z",
+            )
+
+        status = await compute_canonical_status(conn, issue_id, now=NOW)
+    finally:
+        await conn.close()
+
+    assert issue_warnings(
+        status,
+        latest_activity_age_secs=latest_activity_age_secs,
+        pr_no_progress_threshold=timedelta(hours=2),
+    ) == expected
 
 
 @pytest.mark.asyncio

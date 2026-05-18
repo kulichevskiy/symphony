@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 import httpx
@@ -15,6 +16,21 @@ from symphony.webhook import WebhookSettings
 from .test_webhook import NOW, SECRET, _body, _Handler, _headers, _payload
 
 UI_NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
+
+
+class _FakeExternalService:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.cache: dict[str, Any] = {}
+
+    async def get_issue_external(
+        self,
+        conn: aiosqlite.Connection,
+        issue_id: str,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any] | None:
+        return self.payload
 
 
 def _dist(tmp_path: Path) -> Path:
@@ -475,6 +491,7 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
                 "subtitle": "#44",
                 "stuck_for": 90000,
             },
+            "warnings": ["no_progress"],
         },
         {
             "id": "running",
@@ -1060,6 +1077,287 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
         ],
         "issue_cost_marks": {"warning_posted_at": "2026-05-17T10:40:00Z"},
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_name", "field", "source_value"),
+    [
+        ("Linear", "linear.state", "Done"),
+        ("GitHub", "github.state", "MERGED"),
+        ("GitHub", "github.state", "CLOSED"),
+        ("GitHub", "github.merged_at", "2026-05-17T09:30:00Z"),
+    ],
+)
+async def test_issue_detail_include_external_promotes_latest_drift(
+    tmp_path: Path,
+    source_name: str,
+    field: str,
+    source_value: str,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-drift",
+            identifier="VIB-16",
+            title="Stale merge wait",
+            team_key="VIB",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES ('run-drift', 'iss-drift', 'merge', 'completed', NULL,
+                    '2026-05-17T07:00:00Z', '2026-05-17T07:10:00Z', 0)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO operator_waits (
+                issue_id, run_id, kind, linear_team_key, github_repo, issue_label,
+                created_at
+            )
+            VALUES ('iss-drift', 'run-drift', 'merge', 'VIB', 'org/repo',
+                    'symphony', '2026-05-17T08:00:00Z')
+            """
+        )
+        await conn.commit()
+        external_payload = {
+            "fetched_at": "2026-05-17T09:30:00Z",
+            "linear": {"state": "Done", "comments": [], "labels": []},
+            "github": {"state": "MERGED", "comments": []},
+            "drift_flags": [
+                {
+                    "field": field,
+                    "sqlite_value": None,
+                    "source_value": source_value,
+                    "source_name": source_name,
+                    "severity": "drift",
+                    "flagged_at": "2026-05-17T08:15:00Z",
+                }
+            ],
+        }
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_external_service=_FakeExternalService(external_payload),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            detail_response = await client.get(
+                "/api/issues/iss-drift?include_external=1"
+            )
+            plain_response = await client.get("/api/issues/iss-drift")
+            list_response = await client.get("/api/issues?scope=all")
+    finally:
+        await conn.close()
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert detail_payload["canonical_status"] == {
+        "state": "drift_detected",
+        "since": "2026-05-17T08:15:00Z",
+        "subtitle": "1 field(s) disagree",
+        "stuck_for": 13500,
+    }
+    assert detail_payload["external_snapshot"]["drift_flags"] == [
+        {
+            "field": field,
+            "sqlite_value": None,
+            "source_value": source_value,
+            "source_name": source_name,
+            "severity": "drift",
+            "flagged_at": "2026-05-17T08:15:00Z",
+        }
+    ]
+    assert plain_response.json()["canonical_status"]["state"] == "awaiting_merge"
+    assert list_response.json()[0]["canonical_status"]["state"] == "awaiting_merge"
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_include_external_keeps_warning_flags_out_of_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-check-warning",
+            identifier="VIB-26",
+            title="Running with failing checks",
+            team_key="VIB",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES ('run-warning', 'iss-check-warning', 'review', 'running', NULL,
+                    '2026-05-17T11:40:00Z', NULL, 0)
+            """
+        )
+        await conn.commit()
+        external_payload = {
+            "fetched_at": "2026-05-17T11:45:00Z",
+            "linear": {"state": "In Review", "comments": [], "labels": []},
+            "github": {"state": "OPEN", "comments": []},
+            "drift_flags": [
+                {
+                    "field": "github.checks",
+                    "sqlite_value": "running",
+                    "source_value": "1 failing",
+                    "source_name": "GitHub",
+                    "severity": "warning",
+                    "flagged_at": "2026-05-17T11:40:00Z",
+                }
+            ],
+        }
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_external_service=_FakeExternalService(external_payload),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get(
+                "/api/issues/iss-check-warning?include_external=1"
+            )
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["canonical_status"] == {
+        "state": "running",
+        "since": "2026-05-17T11:40:00Z",
+        "subtitle": "review",
+        "stuck_for": None,
+    }
+    assert payload["external_snapshot"]["drift_flags"][0]["severity"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_no_progress_warning_surfaces_on_list_and_detail(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-no-progress",
+            identifier="VIB-23",
+            title="Open PR stalled",
+            team_key="VIB",
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at,
+                merged_at
+            )
+            VALUES ('iss-no-progress', 'org/repo', 'VIB|org/repo', 23,
+                    'https://github.com/org/repo/pull/23',
+                    '2026-05-17T07:00:00Z', NULL)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            list_response = await client.get("/api/issues?scope=all")
+            detail_response = await client.get("/api/issues/iss-no-progress")
+    finally:
+        await conn.close()
+
+    assert list_response.status_code == 200
+    list_payload = list_response.json()[0]
+    assert list_payload["canonical_status"]["state"] == "pr_open"
+    assert list_payload["latest_activity_age_secs"] == 18000
+    assert list_payload["warnings"] == ["no_progress"]
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert detail_payload["canonical_status"]["state"] == "pr_open"
+    assert detail_payload["latest_activity_age_secs"] == 18000
+    assert detail_payload["warnings"] == ["no_progress"]
+
+
+@pytest.mark.asyncio
+async def test_zero_no_progress_threshold_is_preserved(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-zero-threshold",
+            identifier="VIB-25",
+            title="Open PR just moved",
+            team_key="VIB",
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at,
+                merged_at
+            )
+            VALUES ('iss-zero-threshold', 'org/repo', 'VIB|org/repo', 25,
+                    'https://github.com/org/repo/pull/25',
+                    '2026-05-17T11:59:59Z', NULL)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_pr_no_progress_threshold=timedelta(0),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            list_response = await client.get("/api/issues?scope=all")
+            detail_response = await client.get("/api/issues/iss-zero-threshold")
+    finally:
+        await conn.close()
+
+    assert list_response.status_code == 200
+    assert list_response.json()[0]["latest_activity_age_secs"] == 1
+    assert list_response.json()[0]["warnings"] == ["no_progress"]
+    assert detail_response.status_code == 200
+    assert detail_response.json()["latest_activity_age_secs"] == 1
+    assert detail_response.json()["warnings"] == ["no_progress"]
 
 
 @pytest.mark.asyncio

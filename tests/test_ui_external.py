@@ -498,3 +498,9 @@ async def test_issue_external_endpoint_returns_snapshot_and_drift(tmp_path: Path
         "github.merged_at",
         "github.checks",
     ]
+    assert [flag["flagged_at"] for flag in payload["drift_flags"]] == [
+        "2026-05-17T11:10:00Z",
+        "2026-05-17T11:25:00Z",
+        "2026-05-17T11:25:00Z",
+        "2026-05-17T11:00:00Z",
+    ]

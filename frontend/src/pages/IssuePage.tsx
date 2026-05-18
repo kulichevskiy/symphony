@@ -454,7 +454,7 @@ export function IssuePage() {
   const forceExternalRefresh = useRef(false);
   const { data, error, isLoading, isFetching } = useQuery({
     queryKey: ["issue-detail", issueId],
-    queryFn: () => fetchIssueDetail(issueId),
+    queryFn: () => fetchIssueDetail(issueId, { includeExternal: true }),
     enabled: issueId.length > 0,
     refetchInterval: 5000,
     refetchOnWindowFocus: true,
@@ -493,7 +493,13 @@ export function IssuePage() {
               <h1 className="text-2xl font-semibold tracking-normal">
                 {data?.issue.identifier ?? `Issue ${issueId}`}
               </h1>
-              {data ? <StatusCluster status={data.canonical_status} /> : null}
+              {data ? (
+                <StatusCluster
+                  status={data.canonical_status}
+                  warnings={data.warnings}
+                  latestActivityAgeSecs={data.latest_activity_age_secs}
+                />
+              ) : null}
             </div>
             {data ? (
               <>

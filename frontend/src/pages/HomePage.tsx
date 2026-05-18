@@ -78,7 +78,11 @@ export function IssueListRow({
         </a>
       </TableCell>
       <TableCell>
-        <StatusCluster status={issue.canonical_status} />
+        <StatusCluster
+          status={issue.canonical_status}
+          warnings={issue.warnings}
+          latestActivityAgeSecs={issue.latest_activity_age_secs}
+        />
       </TableCell>
       <TableCell className="w-32 whitespace-nowrap text-muted-foreground">
         {issue.latest_activity_ts ? (

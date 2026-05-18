@@ -195,6 +195,7 @@ class UIStatusThresholds(BaseModel):
     running_secs: int = Field(default=30 * 60, ge=0)
     awaiting_review_trigger_secs: int = Field(default=10 * 60, ge=0)
     pr_open_secs: int = Field(default=24 * 60 * 60, ge=0)
+    pr_no_progress_threshold_secs: int = Field(default=2 * 60 * 60, ge=0)
 
     def to_timedeltas(self) -> dict[CanonicalState, timedelta]:
         return {
@@ -208,6 +209,9 @@ class UIStatusThresholds(BaseModel):
             ),
             CanonicalState.PR_OPEN: timedelta(seconds=self.pr_open_secs),
         }
+
+    def pr_no_progress_threshold(self) -> timedelta:
+        return timedelta(seconds=self.pr_no_progress_threshold_secs)
 
 
 class UIConfig(BaseModel):

@@ -1,4 +1,5 @@
 export type CanonicalStatusState =
+  | "drift_detected"
   | "halted"
   | "paused"
   | "awaiting_merge"
@@ -17,6 +18,7 @@ export type CanonicalStatus = {
 };
 
 export type IssueScope = "active" | "recent" | "all";
+export type IssueWarning = "no_progress";
 
 export interface IssueSummary {
   id: string;
@@ -26,6 +28,7 @@ export interface IssueSummary {
   latest_activity_ts: string | null;
   latest_activity_age_secs: number | null;
   canonical_status: CanonicalStatus;
+  warnings?: IssueWarning[];
 }
 
 export type IssueDetail = {
@@ -36,6 +39,10 @@ export type IssueDetail = {
     team_key: string;
   };
   canonical_status: CanonicalStatus;
+  latest_activity_ts?: string | null;
+  latest_activity_age_secs?: number | null;
+  warnings?: IssueWarning[];
+  external_snapshot?: IssueExternalSnapshot;
   runs: Array<{
     id: string;
     stage: string;
@@ -96,6 +103,7 @@ export type DriftFlag = {
   source_value: string | null;
   source_name: string;
   severity: DriftSeverity;
+  flagged_at?: string | null;
 };
 
 export type ExternalComment = {
@@ -192,9 +200,17 @@ export function fetchIssues({
   );
 }
 
-export function fetchIssueDetail(id: string): Promise<IssueDetail> {
+export function fetchIssueDetail(
+  id: string,
+  { includeExternal = false }: { includeExternal?: boolean } = {},
+): Promise<IssueDetail> {
+  const params = new URLSearchParams();
+  if (includeExternal) {
+    params.set("include_external", "1");
+  }
+  const query = params.toString();
   return fetchJson<IssueDetail>(
-    `/api/issues/${encodeURIComponent(id)}`,
+    `/api/issues/${encodeURIComponent(id)}${query ? `?${query}` : ""}`,
     "Issue not found",
     "Failed to load issue",
   );

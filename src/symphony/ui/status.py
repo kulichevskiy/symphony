@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -14,6 +14,7 @@ from ..db import operator_waits
 
 
 class CanonicalState(StrEnum):
+    DRIFT_DETECTED = "drift_detected"
     HALTED = "halted"
     PAUSED = "paused"
     AWAITING_MERGE = "awaiting_merge"
@@ -41,6 +42,19 @@ class CanonicalStatus:
         }
 
 
+@dataclass(frozen=True)
+class ExternalDriftFlag:
+    field: str
+    source_name: str
+    flagged_at: str
+    drift_kind: str
+
+
+@dataclass(frozen=True)
+class ExternalStatusSnapshot:
+    drift_flags: Sequence[ExternalDriftFlag]
+
+
 DEFAULT_STUCK_THRESHOLDS: Mapping[CanonicalState, timedelta] = {
     CanonicalState.PAUSED: timedelta(minutes=15),
     CanonicalState.AWAITING_MERGE: timedelta(hours=4),
@@ -50,19 +64,21 @@ DEFAULT_STUCK_THRESHOLDS: Mapping[CanonicalState, timedelta] = {
 }
 
 STATE_PRIORITY: Mapping[CanonicalState, int] = {
-    CanonicalState.HALTED: 0,
-    CanonicalState.FAILED: 1,
-    CanonicalState.PAUSED: 2,
-    CanonicalState.AWAITING_MERGE: 3,
-    CanonicalState.RUNNING: 4,
-    CanonicalState.AWAITING_REVIEW_TRIGGER: 5,
-    CanonicalState.PR_OPEN: 6,
-    CanonicalState.DONE: 7,
-    CanonicalState.IDLE: 8,
+    CanonicalState.DRIFT_DETECTED: 0,
+    CanonicalState.HALTED: 1,
+    CanonicalState.FAILED: 2,
+    CanonicalState.PAUSED: 3,
+    CanonicalState.AWAITING_MERGE: 4,
+    CanonicalState.RUNNING: 5,
+    CanonicalState.AWAITING_REVIEW_TRIGGER: 6,
+    CanonicalState.PR_OPEN: 7,
+    CanonicalState.DONE: 8,
+    CanonicalState.IDLE: 9,
 }
 
 ALWAYS_STUCK_STATES = frozenset(
     {
+        CanonicalState.DRIFT_DETECTED,
         CanonicalState.HALTED,
         CanonicalState.FAILED,
     }
@@ -160,16 +176,54 @@ def _status(
     )
 
 
+def _earliest_flagged_at(flags: Sequence[ExternalDriftFlag]) -> str | None:
+    earliest: tuple[datetime, str] | None = None
+    for flag in flags:
+        flagged_at = _parse_timestamp(flag.flagged_at)
+        if flagged_at is None:
+            continue
+        if earliest is None or flagged_at < earliest[0]:
+            earliest = (flagged_at, flag.flagged_at)
+    return earliest[1] if earliest is not None else None
+
+
+def _drift_status(
+    snapshot: ExternalStatusSnapshot,
+    *,
+    now: datetime,
+    thresholds: Mapping[CanonicalState, timedelta],
+) -> CanonicalStatus | None:
+    flags = tuple(snapshot.drift_flags)
+    if not flags:
+        return None
+    return _status(
+        CanonicalState.DRIFT_DETECTED,
+        since=_earliest_flagged_at(flags),
+        subtitle=f"{len(flags)} field(s) disagree",
+        now=now,
+        thresholds=thresholds,
+    )
+
+
 async def compute_canonical_status(
     conn: aiosqlite.Connection,
     issue_id: str,
     *,
     now: datetime | None = None,
     thresholds: Mapping[CanonicalState, timedelta] = DEFAULT_STUCK_THRESHOLDS,
+    external_snapshot: ExternalStatusSnapshot | None = None,
 ) -> CanonicalStatus:
     """Return the first matching canonical UI status for an issue."""
 
     effective_now = _normalize_now(now or datetime.now(UTC))
+    if external_snapshot is not None:
+        status = _drift_status(
+            external_snapshot,
+            now=effective_now,
+            thresholds=thresholds,
+        )
+        if status is not None:
+            return status
 
     operator_wait = await _fetch_one(
         conn,

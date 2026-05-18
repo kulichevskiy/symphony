@@ -2,9 +2,10 @@ import { useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import type { CanonicalStatus, CanonicalStatusState } from "@/lib/api";
+import type { CanonicalStatus, CanonicalStatusState, IssueWarning } from "@/lib/api";
 
 const STATE_LABELS: Record<CanonicalStatusState, string> = {
+  drift_detected: "drift detected",
   halted: "halted",
   paused: "paused",
   awaiting_merge: "awaiting merge",
@@ -17,6 +18,7 @@ const STATE_LABELS: Record<CanonicalStatusState, string> = {
 };
 
 const STATE_CLASSES: Record<CanonicalStatusState, string> = {
+  drift_detected: "border-red-500 bg-red-100 text-red-950",
   halted: "border-red-300 bg-red-50 text-red-900",
   paused: "border-amber-300 bg-amber-50 text-amber-900",
   awaiting_merge: "border-blue-300 bg-blue-50 text-blue-900",
@@ -94,7 +96,8 @@ function formatRelative(ts: string, now: number) {
 
 export function CanonicalStatusBadge({ status }: { status: CanonicalStatus }) {
   return (
-    <Badge className={cn("capitalize", STATE_CLASSES[status.state])}>
+    <Badge className={cn("gap-1 capitalize", STATE_CLASSES[status.state])}>
+      {status.state === "drift_detected" ? <span aria-hidden="true">⚠</span> : null}
       {STATE_LABELS[status.state]}
     </Badge>
   );
@@ -112,10 +115,44 @@ export function StuckOverlay({ status }: { status: CanonicalStatus }) {
   );
 }
 
-export function StatusCluster({ status }: { status: CanonicalStatus }) {
+function NoProgressChip({
+  warnings,
+  latestActivityAgeSecs,
+}: {
+  warnings?: IssueWarning[];
+  latestActivityAgeSecs?: number | null;
+}) {
+  if (!warnings?.includes("no_progress")) {
+    return null;
+  }
+
+  const duration =
+    latestActivityAgeSecs === null || latestActivityAgeSecs === undefined
+      ? null
+      : formatDuration(latestActivityAgeSecs);
+  return (
+    <span className="whitespace-nowrap rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-xs font-semibold text-amber-900">
+      ⏸ no progress{duration ? ` ${duration}` : ""}
+    </span>
+  );
+}
+
+export function StatusCluster({
+  status,
+  warnings,
+  latestActivityAgeSecs,
+}: {
+  status: CanonicalStatus;
+  warnings?: IssueWarning[];
+  latestActivityAgeSecs?: number | null;
+}) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       <CanonicalStatusBadge status={status} />
+      <NoProgressChip
+        warnings={warnings}
+        latestActivityAgeSecs={latestActivityAgeSecs}
+      />
       {status.subtitle ? (
         <span className="font-mono text-xs text-muted-foreground">{status.subtitle}</span>
       ) : null}
