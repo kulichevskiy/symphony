@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import signal
 import sys
 from collections.abc import Callable
@@ -28,11 +30,64 @@ from .orchestrator.reconcile import reconcile
 from .webhook import WebhookSettings
 
 
+_ANSI_RESET = "\x1b[0m"
+_ANSI_DIM = "\x1b[2m"
+_ANSI_YELLOW = "\x1b[33m"
+_ANSI_RED = "\x1b[31m"
+_ANSI_BOLD_RED = "\x1b[1;31m"
+
+# Matches `HTTP/1.1 500 ...` and similar inside log messages from httpx etc.
+_HTTP_STATUS_RE = re.compile(r'HTTP/\d(?:\.\d)?\s+(\d{3})\b')
+
+
+class _ColorFormatter(logging.Formatter):
+    """Format log records with ANSI color based on level + HTTP status in message.
+
+    Why HTTP status sniffing: httpx logs every response at INFO, so a 5xx
+    from Linear would otherwise look identical to a 200 in the stream.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        color = self._color_for(record, text)
+        if color is None:
+            return text
+        return f"{color}{text}{_ANSI_RESET}"
+
+    @staticmethod
+    def _color_for(record: logging.LogRecord, text: str) -> str | None:
+        if record.levelno >= logging.ERROR:
+            return _ANSI_BOLD_RED
+        if record.levelno >= logging.WARNING:
+            return _ANSI_YELLOW
+        match = _HTTP_STATUS_RE.search(text)
+        if match:
+            status = int(match.group(1))
+            if status >= 500:
+                return _ANSI_BOLD_RED
+            if status >= 400:
+                return _ANSI_YELLOW
+        if record.levelno <= logging.DEBUG:
+            return _ANSI_DIM
+        return None
+
+
 def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    )
+    handler = logging.StreamHandler()
+    fmt = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+    # NO_COLOR (https://no-color.org) wins; FORCE_COLOR overrides a non-TTY
+    # stream (handy when piping through tee or viewing via journalctl with
+    # SYSTEMD_COLORS=1) so colors aren't silently lost.
+    if os.environ.get("NO_COLOR") is not None:
+        use_color = False
+    elif os.environ.get("FORCE_COLOR") not in (None, "", "0"):
+        use_color = True
+    else:
+        use_color = handler.stream.isatty()
+    handler.setFormatter(_ColorFormatter(fmt) if use_color else logging.Formatter(fmt))
+    # force=True so we win over any earlier handler an import may have attached
+    # to the root logger (otherwise basicConfig is a silent no-op).
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
 
 
 def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
