@@ -84,10 +84,10 @@ export function IssueListRow({
           latestActivityAgeSecs={issue.latest_activity_age_secs}
         />
       </TableCell>
-      <TableCell className="w-32 whitespace-nowrap text-muted-foreground">
+      <TableCell className="w-44 whitespace-nowrap font-mono text-xs text-muted-foreground">
         {issue.latest_activity_ts ? (
-          <span title={formatUtcTimestamp(issue.latest_activity_ts)}>
-            {formatRelativeTimestamp(issue.latest_activity_ts, activityNowMs)}
+          <span title={formatRelativeTimestamp(issue.latest_activity_ts, activityNowMs)}>
+            {formatUtcTimestamp(issue.latest_activity_ts)}
           </span>
         ) : (
           <span>No activity</span>

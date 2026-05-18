@@ -84,6 +84,11 @@ ALWAYS_STUCK_STATES = frozenset(
     }
 )
 
+# A run row in one of these states means there is no live worker behind it.
+# `interrupted` is set by reconcile.py when the host PID has died (e.g. after
+# a symphony restart); resurrection paths must treat it the same as `failed`.
+DEAD_RUN_STATUSES: frozenset[str] = frozenset({"failed", "interrupted"})
+
 OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
     operator_waits.KIND_IMPLEMENT_FAILED: CanonicalState.HALTED,
     operator_waits.KIND_REVIEW_FAILED: CanonicalState.HALTED,
@@ -277,11 +282,17 @@ async def compute_canonical_status(
         """,
         (issue_id,),
     )
-    if latest_run is not None and latest_run["status"] == "failed":
+    if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
+        stage = _as_str(latest_run["stage"])
+        run_status = _as_str(latest_run["status"])
+        if run_status and run_status != "failed":
+            subtitle = f"{stage} ({run_status})" if stage else run_status
+        else:
+            subtitle = stage
         return _status(
             CanonicalState.FAILED,
             since=_as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"]),
-            subtitle=_as_str(latest_run["stage"]),
+            subtitle=subtitle,
             now=effective_now,
             thresholds=thresholds,
         )

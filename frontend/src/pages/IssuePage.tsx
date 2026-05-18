@@ -44,10 +44,12 @@ function SectionTable<T extends object>({
   title,
   rows,
   columns,
+  rowClassName,
 }: {
   title: string;
   rows: T[];
   columns: Column<T>[];
+  rowClassName?: (row: T) => string | undefined;
 }) {
   return (
     <section className="border-t py-5">
@@ -65,7 +67,10 @@ function SectionTable<T extends object>({
           </TableHeader>
           <TableBody>
             {rows.map((row, index) => (
-              <TableRow key={Object.values(row).join(":") || index}>
+              <TableRow
+                key={Object.values(row).join(":") || index}
+                className={rowClassName?.(row)}
+              >
                 {columns.map((column) => (
                   <TableCell key={column.key} className="max-w-[360px] break-words font-mono text-xs">
                     {column.render ? column.render(row) : formatCell(row[column.key] as CellValue)}
@@ -80,6 +85,38 @@ function SectionTable<T extends object>({
   );
 }
 
+const RUN_STATUS_ROW_CLASS: Record<string, string> = {
+  running: "bg-blue-50",
+  failed: "bg-red-50",
+  interrupted: "bg-red-50",
+  completed: "bg-green-50/50",
+  done: "bg-green-50/50",
+};
+
+const RUN_STATUS_BADGE_CLASS: Record<string, string> = {
+  running: "border-blue-300 bg-blue-100 text-blue-900",
+  failed: "border-red-300 bg-red-100 text-red-900",
+  interrupted: "border-red-400 bg-red-100 text-red-950",
+  completed: "border-green-300 bg-green-100 text-green-900",
+  done: "border-green-300 bg-green-100 text-green-900",
+  needs_approval: "border-amber-300 bg-amber-100 text-amber-900",
+};
+
+function runRowClassName(row: { status?: string | null }) {
+  if (!row.status) {
+    return undefined;
+  }
+  return RUN_STATUS_ROW_CLASS[row.status];
+}
+
+function RunStatusBadge({ status }: { status: string | null | undefined }) {
+  if (!status) {
+    return <span className="text-muted-foreground">null</span>;
+  }
+  const cls = RUN_STATUS_BADGE_CLASS[status] ?? "border-gray-300 bg-gray-50 text-gray-700";
+  return <Badge className={cn("font-mono", cls)}>{status}</Badge>;
+}
+
 function formatUtc(ts?: string | null) {
   if (!ts) {
     return "null";
@@ -88,7 +125,7 @@ function formatUtc(ts?: string | null) {
   if (Number.isNaN(date.getTime())) {
     return ts;
   }
-  return date.toISOString().replace(".000Z", "Z");
+  return `${date.toISOString().slice(0, 19)}Z`;
 }
 
 function formatRelative(ts?: string | null) {
@@ -173,7 +210,7 @@ function SourceAlert({
     return null;
   }
   const stale = snapshot.stale_fetched_at
-    ? ` — showing data from ${formatRelative(snapshot.stale_fetched_at)}`
+    ? ` — showing data from ${formatUtc(snapshot.stale_fetched_at)}`
     : "";
   return (
     <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
@@ -272,8 +309,8 @@ function CommentList({
             return (
               <li key={comment.comment_id} className="rounded-md border border-border p-3">
                 <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <time className="italic" dateTime={comment.ts} title={formatUtc(comment.ts)}>
-                    {formatRelative(comment.ts)}
+                  <time className="font-mono" dateTime={comment.ts} title={formatRelative(comment.ts)}>
+                    {formatUtc(comment.ts)}
                   </time>
                   <span className="font-mono">{comment.author || "unknown"}</span>
                   {comment.url ? (
@@ -347,8 +384,11 @@ export function ExternalTruthSection({
           <h2 className="text-base font-semibold tracking-normal">
             External truth
             {snapshot ? (
-              <span className="ml-2 font-normal text-muted-foreground">
-                fetched {formatRelative(snapshot.fetched_at)}
+              <span
+                className="ml-2 font-mono text-sm font-normal text-muted-foreground"
+                title={formatRelative(snapshot.fetched_at)}
+              >
+                fetched {formatUtc(snapshot.fetched_at)}
               </span>
             ) : null}
           </h2>
@@ -551,10 +591,15 @@ export function IssuePage() {
             <SectionTable
               title="Runs"
               rows={data.runs}
+              rowClassName={runRowClassName}
               columns={[
                 { key: "id", label: "id" },
                 { key: "stage", label: "stage" },
-                { key: "status", label: "status" },
+                {
+                  key: "status",
+                  label: "status",
+                  render: (row) => <RunStatusBadge status={row.status} />,
+                },
                 { key: "pid", label: "pid" },
                 { key: "started_at", label: "started_at" },
                 { key: "ended_at", label: "ended_at" },
