@@ -897,7 +897,6 @@ class Orchestrator:
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
-        self._merge_conflict_fixed_issue_ids: set[str] = set()
         self._runs_moved_to_in_progress: set[str] = set()
         # `$skip-local-review` toggles the issue's flag here. The
         # local-review loop reads it between iterations and exits with
@@ -2955,13 +2954,18 @@ class Orchestrator:
         pr_url: str,
         view: dict[str, object] | None,
         merge_run_id: str | None = None,
+        dispatch_capacity_held: bool = False,
     ) -> bool:
         base_ref = await self._resolve_pr_base_ref(
             binding=binding,
             issue=issue,
             view=view,
         )
-        async with self._review_fix_dispatch_slot(binding, issue):
+        async with self._review_fix_dispatch_slot(
+            binding,
+            issue,
+            dispatch_capacity_held=dispatch_capacity_held,
+        ):
             prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
             cap_usd = effective_cap(
                 global_cap_usd=self.config.cost_cap_per_issue_usd,
@@ -3126,7 +3130,19 @@ class Orchestrator:
                     "interrupted",
                     ended_at=datetime.now(UTC).isoformat(),
                 )
-            self._merge_conflict_fixed_issue_ids.add(issue.id)
+            marked = await db.issue_prs.mark_merge_conflict_fixed(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+                pr_number=pr_number,
+                marked_at=datetime.now(UTC).isoformat(),
+            )
+            if not marked:
+                log.warning(
+                    "could not persist merge-conflict fixed marker for %s#%d",
+                    binding.github_repo,
+                    pr_number,
+                )
             return True
 
     async def _dispatch_merge_conflict_fix_run(
@@ -4273,7 +4289,11 @@ class Orchestrator:
 
     @asynccontextmanager
     async def _review_fix_dispatch_slot(
-        self, binding: RepoBinding, issue: LinearIssue
+        self,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        *,
+        dispatch_capacity_held: bool = False,
     ) -> AsyncIterator[None]:
         """Reserve priority capacity for a review-fix job.
 
@@ -4290,6 +4310,11 @@ class Orchestrator:
             binding_key,
             asyncio.Semaphore(max(binding.max_concurrent, 1)),
         )
+        if dispatch_capacity_held:
+            async with self._review_fix_sem, review_binding_sem:
+                yield
+            return
+
         self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
         try:
             async with self._review_fix_sem, review_binding_sem:
@@ -4608,6 +4633,13 @@ class Orchestrator:
                 ):
                     continue
                 if _pr_view_has_merge_conflict(view):
+                    await db.issue_prs.clear_merge_conflict_fixed(
+                        self._conn,
+                        issue_id=candidate.issue_id,
+                        github_repo=binding.github_repo,
+                        pr_number=candidate.pr_number,
+                        pr_created_at=candidate.created_at,
+                    )
                     scheduled.append(
                         self._schedule_merge_conflict_rebase_fix(
                             binding=binding,
@@ -4641,13 +4673,21 @@ class Orchestrator:
                 )
                 continue
 
-            if verdict.kind is VerdictKind.APPROVED or (
-                candidate.issue_id in self._merge_conflict_fixed_issue_ids
-                and verdict.kind is VerdictKind.PENDING
+            conflict_fix_ready = False
+            if (
+                verdict.kind is VerdictKind.PENDING
                 and verdict.rule == "no_signal"
                 and str(view.get("mergeable") or "").upper() == "MERGEABLE"
             ):
-                self._merge_conflict_fixed_issue_ids.discard(candidate.issue_id)
+                conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
+                    self._conn,
+                    issue_id=candidate.issue_id,
+                    github_repo=binding.github_repo,
+                    pr_number=candidate.pr_number,
+                    pr_created_at=candidate.created_at,
+                )
+
+            if verdict.kind is VerdictKind.APPROVED or conflict_fix_ready:
                 if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
                     continue
                 binding_key = _binding_key(binding)
@@ -4666,7 +4706,22 @@ class Orchestrator:
                         skip_review=verdict.kind is not VerdictKind.APPROVED,
                     )
                 )
+                if conflict_fix_ready:
+                    await db.issue_prs.clear_merge_conflict_fixed(
+                        self._conn,
+                        issue_id=candidate.issue_id,
+                        github_repo=binding.github_repo,
+                        pr_number=candidate.pr_number,
+                        pr_created_at=candidate.created_at,
+                    )
             elif verdict.merge_conflict:
+                await db.issue_prs.clear_merge_conflict_fixed(
+                    self._conn,
+                    issue_id=candidate.issue_id,
+                    github_repo=binding.github_repo,
+                    pr_number=candidate.pr_number,
+                    pr_created_at=candidate.created_at,
+                )
                 scheduled.append(
                     self._schedule_merge_conflict_rebase_fix(
                         binding=binding,
@@ -4677,7 +4732,13 @@ class Orchestrator:
                     )
                 )
             elif verdict.kind is VerdictKind.CHANGES_REQUESTED:
-                self._merge_conflict_fixed_issue_ids.discard(candidate.issue_id)
+                await db.issue_prs.clear_merge_conflict_fixed(
+                    self._conn,
+                    issue_id=candidate.issue_id,
+                    github_repo=binding.github_repo,
+                    pr_number=candidate.pr_number,
+                    pr_created_at=candidate.created_at,
+                )
         return scheduled
 
     def _schedule_merge_conflict_rebase_fix(
@@ -5555,6 +5616,7 @@ class Orchestrator:
                         pr_url=pr_url,
                         view=premerge_view,
                         merge_run_id=run_id,
+                        dispatch_capacity_held=True,
                     )
                     return run_id
 
@@ -5589,6 +5651,7 @@ class Orchestrator:
                         pr_url=pr_url,
                         view=conflict_view,
                         merge_run_id=run_id,
+                        dispatch_capacity_held=True,
                     )
                     return run_id
                 await self._mark_merge_needs_approval(
