@@ -3003,7 +3003,36 @@ class Orchestrator:
                 issue=issue,
                 state=state,
             )
+            await self._interrupt_stale_merge_needs_approval_for_state(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
             return True
+
+    async def _interrupt_stale_merge_needs_approval_for_state(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+    ) -> int:
+        if state.pr_number is None:
+            return 0
+        interrupted = await db.runs.interrupt_stale_merge_needs_approval(
+            self._conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=state.pr_number,
+        )
+        if interrupted:
+            log.info(
+                "interrupted %d stale merge needs_approval runs for %s#%d",
+                interrupted,
+                binding.github_repo,
+                state.pr_number,
+            )
+        return interrupted
 
     async def _retrigger_codex_review_unless_approved(
         self,
@@ -3409,6 +3438,11 @@ class Orchestrator:
                 issue=issue,
                 state=state,
             )
+            await self._interrupt_stale_merge_needs_approval_for_state(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
             return True
 
     async def _resolve_pr_base_ref(
@@ -3661,13 +3695,31 @@ class Orchestrator:
                     binding.github_repo,
                     pr_number,
                 )
+            else:
+                interrupted = await db.runs.interrupt_stale_merge_needs_approval(
+                    self._conn,
+                    issue_id=issue.id,
+                    github_repo=binding.github_repo,
+                    pr_number=pr_number,
+                )
+                if interrupted:
+                    log.info(
+                        "interrupted %d stale merge needs_approval runs for %s#%d "
+                        "after merge-conflict fix-run",
+                        interrupted,
+                        binding.github_repo,
+                        pr_number,
+                    )
             if merge_run_id is not None:
-                await db.runs.update_status(
+                running_interrupted = await db.runs.interrupt_running_merge(
                     self._conn,
                     merge_run_id,
-                    "interrupted",
-                    ended_at=datetime.now(UTC).isoformat(),
                 )
+                if running_interrupted:
+                    log.info(
+                        "interrupted active merge run %s after merge-conflict fix-run",
+                        merge_run_id,
+                    )
             return True
 
     async def _dispatch_merge_conflict_fix_run(
@@ -4047,6 +4099,11 @@ class Orchestrator:
 
             state = await db.review_state.get(self._conn, issue.id)
             await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
+            await self._interrupt_stale_merge_needs_approval_for_state(
                 binding=binding,
                 issue=issue,
                 state=state,

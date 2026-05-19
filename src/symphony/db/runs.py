@@ -9,6 +9,7 @@ startup reconcile walks `running` rows and flips orphaned ones to
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -180,6 +181,62 @@ async def update_status(
         (status, ended_at, run_id),
     )
     await conn.commit()
+
+
+async def interrupt_stale_merge_needs_approval(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    before: str | None = None,
+) -> int:
+    """Interrupt stale merge operator waits for the current PR."""
+    before_filter = "" if before is None else " AND started_at < ?"
+    params: list[object] = [
+        datetime.now(UTC).isoformat(),
+        issue_id,
+        github_repo,
+        pr_number,
+    ]
+    if before is not None:
+        params.append(before)
+    cur = await conn.execute(
+        f"""
+        UPDATE runs
+        SET status = 'interrupted', ended_at = ?
+        WHERE issue_id = ?
+          AND stage = 'merge'
+          AND status = 'needs_approval'
+          AND EXISTS (
+              SELECT 1
+              FROM issue_prs p
+              WHERE p.issue_id = runs.issue_id
+                AND p.github_repo = ?
+                AND p.pr_number = ?
+                AND p.merged_at IS NULL
+          )
+          {before_filter}
+        """,
+        params,
+    )
+    await conn.commit()
+    return cur.rowcount or 0
+
+
+async def interrupt_running_merge(conn: aiosqlite.Connection, run_id: str) -> int:
+    cur = await conn.execute(
+        """
+        UPDATE runs
+        SET status = 'interrupted', ended_at = ?
+        WHERE id = ?
+          AND stage = 'merge'
+          AND status = 'running'
+        """,
+        (datetime.now(UTC).isoformat(), run_id),
+    )
+    await conn.commit()
+    return cur.rowcount or 0
 
 
 async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -> None:

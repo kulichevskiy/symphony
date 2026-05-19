@@ -583,6 +583,74 @@ async def test_latest_for_issue_stage_can_scope_to_current_cycle(
 
 
 @pytest.mark.asyncio
+async def test_interrupt_stale_merge_needs_approval_only_touches_stale_waits(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        for idx in range(3):
+            await db.runs.create(
+                conn,
+                id=f"stale-merge-{idx}",
+                issue_id="iss-1",
+                stage="merge",
+                status="needs_approval",
+                pid=None,
+                started_at=f"2026-05-10T00:0{idx + 1}:00+00:00",
+            )
+        await db.runs.create(
+            conn,
+            id="done-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="done",
+            pid=None,
+            started_at="2026-05-10T00:04:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="running-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:05:00+00:00",
+        )
+
+        count = await db.runs.interrupt_stale_merge_needs_approval(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+        )
+
+        assert count == 3
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        by_id = {run.id: run for run in history}
+        for idx in range(3):
+            run = by_id[f"stale-merge-{idx}"]
+            assert run.status == "interrupted"
+            assert run.ended_at is not None
+        assert by_id["done-merge"].status == "done"
+        assert by_id["done-merge"].ended_at is None
+        assert by_id["running-merge"].status == "running"
+        assert by_id["running-merge"].ended_at is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_comment_cursor_advance(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
