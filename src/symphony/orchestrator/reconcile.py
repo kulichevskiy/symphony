@@ -126,10 +126,16 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
             run.id,
             run.issue_id,
         )
+        has_issue_pr = await db.issue_prs.has_for_issue(conn, issue_id=run.issue_id)
+        # Linked PRs are resumed by _resurrect_review_runs() on the next poll.
+        # Leave ended_at NULL so startup reconcile does not trigger that
+        # path's recent-failure cooldown.
+        ended_at = None if has_issue_pr else now
         await db.runs.update_status(
-            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=ended_at
         )
-        await _preserve_pidless_review_retry_path(conn, run, created_at=now)
+        if not has_issue_pr:
+            await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
         except LinearError as e:

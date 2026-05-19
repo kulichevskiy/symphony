@@ -1921,6 +1921,7 @@ async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
         )
         assert original is not None
         assert original.status == db.runs.INTERRUPTED_STATUS
+        assert original.ended_at is None
 
         gh = MagicMock()
         gh.pr_checks = AsyncMock(return_value=PRChecks())
