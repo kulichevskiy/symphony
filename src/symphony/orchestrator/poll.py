@@ -4471,10 +4471,80 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
+            pr = await db.issue_prs.get(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+            )
+            if pr is not None:
+                await self._park_already_has_pr(binding, issue, pr)
+                return None
             if binding.linear_states.waiting is not None and is_blocked(issue):
                 await self._park_blocked_by_deps(binding, issue)
                 return None
             return self._schedule_dispatch(binding, issue)
+
+    async def _park_already_has_pr(
+        self,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr: db.issue_prs.IssuePR,
+    ) -> None:
+        if pr.merged_at is not None:
+            target_state = binding.linear_states.done
+            body = (
+                f"🛑 Cannot re-implement: PR #{pr.pr_number} was already merged at "
+                f"{pr.merged_at}. Moving issue back to {target_state}. To genuinely "
+                "redo this work, revert the merge and remove the `issue_prs` row. "
+                f"{pr.pr_url}"
+            )
+        else:
+            target_state = binding.linear_states.in_progress
+            body = (
+                f"🛑 Cannot re-implement: PR #{pr.pr_number} is still open. Moving "
+                f"issue back to {target_state}. Close the PR via `gh pr close` if "
+                f"you want to abandon it. {pr.pr_url}"
+            )
+
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states before parking %s with existing PR #%d: %s",
+                issue.identifier,
+                pr.pr_number,
+                e,
+            )
+        else:
+            target_id = states.get(target_state)
+            if target_id is None:
+                log.warning(
+                    "could not move %s after existing PR guard: missing Linear "
+                    "state %r for team %s",
+                    issue.identifier,
+                    target_state,
+                    binding.linear_team_key,
+                )
+            else:
+                try:
+                    await self.linear.move_issue(issue.id, target_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s after existing PR guard for PR #%d: %s",
+                        issue.identifier,
+                        pr.pr_number,
+                        e,
+                    )
+
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "could not comment after existing PR guard for %s PR #%d: %s",
+                issue.identifier,
+                pr.pr_number,
+                e,
+            )
 
     async def _park_blocked_by_deps(
         self, binding: RepoBinding, issue: LinearIssue

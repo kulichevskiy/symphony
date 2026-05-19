@@ -328,6 +328,114 @@ async def test_scan_skips_issues_with_running_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_schedule_ready_issue_parks_issue_when_pr_already_merged(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "Done": "state-done",
+            }
+        }
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=101,
+            pr_url="https://github.com/org/repo/pull/101",
+            created_at="2026-05-19T12:00:00+00:00",
+        )
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            merged_at="2026-05-19T13:15:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert await db.runs.history_for_issue(conn, issue.id) == []
+        linear.move_issue.assert_awaited_once_with(issue.id, "state-done")
+        linear.post_comment.assert_awaited_once()
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "PR #101" in comment_body
+        assert "already merged" in comment_body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_parks_issue_when_pr_still_open(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "Done": "state-done",
+            }
+        }
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=107,
+            pr_url="https://github.com/org/repo/pull/107",
+            created_at="2026-05-19T17:02:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert await db.runs.history_for_issue(conn, issue.id) == []
+        linear.move_issue.assert_awaited_once_with(issue.id, "state-progress")
+        linear.post_comment.assert_awaited_once()
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "PR #107" in comment_body
+        assert "still open" in comment_body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_run_row_is_persisted_before_post_comment(tmp_path: Path) -> None:
     """Dedupe correctness: the `runs` row must exist before the first
     Linear write so a crash after `post_comment` can't leave the issue
