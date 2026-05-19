@@ -969,6 +969,7 @@ class Orchestrator:
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
+        await self._restore_operator_waits()
         self._reconcile_task = asyncio.create_task(
             self._reconciler.run(self._shutdown)
         )
@@ -1292,6 +1293,40 @@ class Orchestrator:
         if run_id in self._merge_needs_approval_bindings:
             await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
             return
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if wait is not None:
+            if wait.kind == db.operator_waits.KIND_COST_CAP:
+                await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
+                return
+            if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+                await self._handle_implement_failed_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind in (
+                db.operator_waits.KIND_REVIEW_FAILED,
+                db.operator_waits.KIND_REVIEW_STOPPED,
+            ):
+                await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
+                return
+            if wait.kind == db.operator_waits.KIND_MERGE:
+                await self._handle_merge_needs_approval_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"unsupported operator wait kind: {wait.kind}",
+            )
+            return
+        if run_id in self._operator_wait_run_ids:
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "operator wait is no longer active",
+            )
+            return
         if intent.kind is SlashKind.RETRY:
             monitor_run_id = self._review_poll_issue_ids.get(issue_id)
             if monitor_run_id is not None and monitor_run_id in self._review_poll_run_ids:
@@ -1332,6 +1367,10 @@ class Orchestrator:
                 "$retry",
                 "no active retry handler for the current run state",
             )
+
+    @staticmethod
+    def _slash_text(intent: SlashIntent) -> str:
+        return f"${intent.kind.value}"
 
     async def _post_command_rejected(
         self, issue_id: str, slash_text: str, reason: str
@@ -1555,7 +1594,14 @@ class Orchestrator:
     ) -> None:
         binding = self._cost_cap_run_bindings.get(run_id)
         if binding is None:
-            return
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_COST_CAP,),
+            )
+            if binding is None:
+                return
 
         if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
             states = await self._states_for_binding(binding)
@@ -1622,7 +1668,14 @@ class Orchestrator:
     ) -> None:
         binding = self._implement_failed_run_bindings.get(run_id)
         if binding is None:
-            return
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_IMPLEMENT_FAILED,),
+            )
+            if binding is None:
+                return
 
         states = await self._states_for_binding(binding)
         if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
@@ -1722,19 +1775,69 @@ class Orchestrator:
                     wait.issue_label,
                 )
                 continue
-            self._dispatch_run_ids[wait.issue_id] = wait.run_id
-            self._operator_wait_run_ids.add(wait.run_id)
-            if wait.kind == db.operator_waits.KIND_COST_CAP:
-                self._cost_cap_run_bindings[wait.run_id] = binding
-            elif wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
-                self._implement_failed_run_bindings[wait.run_id] = binding
-            elif wait.kind in (
-                db.operator_waits.KIND_REVIEW_FAILED,
-                db.operator_waits.KIND_REVIEW_STOPPED,
-            ):
-                self._review_failed_run_bindings[wait.run_id] = binding
-            elif wait.kind == db.operator_waits.KIND_MERGE:
-                self._merge_needs_approval_bindings[wait.run_id] = binding
+            self._register_operator_wait_binding(wait, binding)
+
+    def _register_operator_wait_binding(
+        self, wait: db.operator_waits.OperatorWait, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[wait.issue_id] = wait.run_id
+        self._operator_wait_run_ids.add(wait.run_id)
+        if wait.kind == db.operator_waits.KIND_COST_CAP:
+            self._cost_cap_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            self._implement_failed_run_bindings[wait.run_id] = binding
+        elif wait.kind in (
+            db.operator_waits.KIND_REVIEW_FAILED,
+            db.operator_waits.KIND_REVIEW_STOPPED,
+        ):
+            self._review_failed_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_MERGE:
+            self._merge_needs_approval_bindings[wait.run_id] = binding
+
+    async def _restore_operator_wait_binding(
+        self,
+        issue_id: str,
+        run_id: str,
+        intent: SlashIntent,
+        *,
+        expected_kinds: tuple[str, ...],
+    ) -> RepoBinding | None:
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if wait is None or wait.issue_id != issue_id:
+            log.warning(
+                "operator wait binding missing for slash %s run %s issue %s",
+                intent.kind,
+                run_id,
+                issue_id,
+            )
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "operator wait is no longer active",
+            )
+            return None
+        if wait.kind not in expected_kinds:
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"operator wait is {wait.kind}, not one of {', '.join(expected_kinds)}",
+            )
+            return None
+        binding = self._binding_for_operator_wait(wait)
+        if binding is None:
+            log.warning(
+                "operator wait binding cannot be restored for issue %s run %s",
+                issue_id,
+                run_id,
+            )
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "no repository binding found for operator wait",
+            )
+            return None
+        self._register_operator_wait_binding(wait, binding)
+        return binding
 
     async def _binding_for_review_issue_id(
         self, issue_id: str, *, state: db.review_state.ReviewState
@@ -3364,7 +3467,17 @@ class Orchestrator:
     ) -> None:
         binding = self._review_failed_run_bindings.get(run_id)
         if binding is None:
-            return
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(
+                    db.operator_waits.KIND_REVIEW_FAILED,
+                    db.operator_waits.KIND_REVIEW_STOPPED,
+                ),
+            )
+            if binding is None:
+                return
         if intent.kind not in (SlashKind.RETRY, SlashKind.APPROVE):
             if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
                 states = await self._states_for_binding(binding)
@@ -3449,7 +3562,14 @@ class Orchestrator:
         """Handle `$approve`/`$reject`/`$stop` on a merge `needs_approval` run."""
         binding = self._merge_needs_approval_bindings.get(run_id)
         if binding is None:
-            return
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_MERGE,),
+            )
+            if binding is None:
+                return
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
