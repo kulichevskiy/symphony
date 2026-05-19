@@ -1807,7 +1807,7 @@ async def test_merge_conflict_fix_reenters_merge_on_next_poll(
         }
         gh = MagicMock()
         gh.pr_view = AsyncMock(
-            side_effect=[conflict_view, clean_view, clean_view, merged_view]
+            side_effect=[conflict_view, clean_view, clean_view, clean_view, merged_view]
         )
         gh.pr_checks = AsyncMock(
             return_value=PRChecks(
@@ -1849,6 +1849,7 @@ async def test_merge_conflict_fix_reenters_merge_on_next_poll(
             github_repo="org/repo",
             pr_number=42,
             pr_created_at="2026-05-10T00:01:00+00:00",
+            head_sha="def456",
         )
 
         orch = Orchestrator(
@@ -1878,6 +1879,7 @@ async def test_merge_conflict_fix_reenters_merge_on_next_poll(
             github_repo="org/repo",
             pr_number=42,
             pr_created_at="2026-05-10T00:01:00+00:00",
+            head_sha="def456",
         )
     finally:
         await conn.close()
@@ -1893,15 +1895,16 @@ async def test_stale_merge_conflict_fix_marker_does_not_bypass_new_pr_cycle(
         await conn.execute(
             """
             INSERT INTO merge_conflict_fix_marks (
-                issue_id, github_repo, pr_number, pr_created_at, marked_at
+                issue_id, github_repo, pr_number, pr_created_at, head_sha, marked_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 "iss-1",
                 "org/repo",
                 41,
                 "2026-05-09T00:01:00+00:00",
+                "abc123",
                 "2026-05-09T00:02:00+00:00",
             ),
         )
@@ -1949,6 +1952,72 @@ async def test_stale_merge_conflict_fix_marker_does_not_bypass_new_pr_cycle(
 
 
 @pytest.mark.asyncio
+async def test_stale_merge_conflict_fix_marker_does_not_bypass_new_head(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await conn.execute(
+            """
+            INSERT INTO merge_conflict_fix_marks (
+                issue_id, github_repo, pr_number, pr_created_at, head_sha, marked_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "iss-1",
+                "org/repo",
+                42,
+                "2026-05-10T00:01:00+00:00",
+                "old-head",
+                "2026-05-10T00:02:00+00:00",
+            ),
+        )
+        await conn.commit()
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "new-head",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "state": "OPEN",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:03:00Z")
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, linear, conn, runner=_FakeRunner([]), gh=gh)
+
+        assert await orch._poll_merge_candidates() == []  # noqa: SLF001
+        gh.pr_merge.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == ["implement", "review"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_conflict_fix_marker_survives_when_merge_capacity_full(
     tmp_path: Path,
 ) -> None:
@@ -1960,6 +2029,7 @@ async def test_merge_conflict_fix_marker_survives_when_merge_capacity_full(
             issue_id="iss-1",
             github_repo="org/repo",
             pr_number=42,
+            head_sha="abc123",
             marked_at="2026-05-10T00:02:00+00:00",
         )
 
@@ -2003,6 +2073,7 @@ async def test_merge_conflict_fix_marker_survives_when_merge_capacity_full(
             github_repo="org/repo",
             pr_number=42,
             pr_created_at="2026-05-10T00:01:00+00:00",
+            head_sha="abc123",
         )
     finally:
         await conn.close()
@@ -2076,7 +2147,11 @@ async def test_merge_conflict_exception_dispatches_rebase_fix_not_needs_approval
             push_fn=push_fn,
         )
 
-        await asyncio.wait_for(_poll_and_wait(orch), timeout=1)
+        await orch._review_fix_sem.acquire()  # noqa: SLF001
+        try:
+            await asyncio.wait_for(_poll_and_wait(orch), timeout=1)
+        finally:
+            orch._review_fix_sem.release()  # noqa: SLF001
 
         push_fn.assert_awaited_once()
         gh.pr_merge.assert_awaited_once()
@@ -2131,8 +2206,12 @@ async def test_merge_precheck_after_merge_agent_dispatches_rebase_fix(
             "baseRefName": "release/1.2",
             "mergedAt": None,
         }
+        fixed_view = {
+            **approved_view,
+            "headRefOid": "def456",
+        }
         gh = MagicMock()
-        gh.pr_view = AsyncMock(side_effect=[approved_view, conflict_view])
+        gh.pr_view = AsyncMock(side_effect=[approved_view, conflict_view, fixed_view])
         gh.pr_checks = AsyncMock(
             return_value=PRChecks(
                 runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]

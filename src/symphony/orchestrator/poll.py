@@ -3130,11 +3130,24 @@ class Orchestrator:
                     "interrupted",
                     ended_at=datetime.now(UTC).isoformat(),
                 )
+            fixed_head_sha = ""
+            try:
+                fixed_view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+                fixed_head_sha = str(fixed_view.get("headRefOid") or "")
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not refresh PR head after merge-conflict fix-run "
+                    "for %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
             marked = await db.issue_prs.mark_merge_conflict_fixed(
                 self._conn,
                 issue_id=issue.id,
                 github_repo=binding.github_repo,
                 pr_number=pr_number,
+                head_sha=fixed_head_sha,
                 marked_at=datetime.now(UTC).isoformat(),
             )
             if not marked:
@@ -4311,8 +4324,11 @@ class Orchestrator:
             asyncio.Semaphore(max(binding.max_concurrent, 1)),
         )
         if dispatch_capacity_held:
-            async with self._review_fix_sem, review_binding_sem:
-                yield
+            # The caller already holds normal dispatch capacity. Acquiring
+            # review-fix semaphores here would invert the order used below
+            # and can deadlock against an active review-fix waiting for the
+            # dispatch semaphores.
+            yield
             return
 
         self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
@@ -4679,12 +4695,14 @@ class Orchestrator:
                 and verdict.rule == "no_signal"
                 and str(view.get("mergeable") or "").upper() == "MERGEABLE"
             ):
+                head_sha = str(view.get("headRefOid") or "")
                 conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
                     self._conn,
                     issue_id=candidate.issue_id,
                     github_repo=binding.github_repo,
                     pr_number=candidate.pr_number,
                     pr_created_at=candidate.created_at,
+                    head_sha=head_sha,
                 )
 
             if verdict.kind is VerdictKind.APPROVED or conflict_fix_ready:

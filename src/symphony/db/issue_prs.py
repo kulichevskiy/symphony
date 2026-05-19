@@ -82,9 +82,12 @@ async def mark_merge_conflict_fixed(
     issue_id: str,
     github_repo: str,
     pr_number: int,
+    head_sha: str,
     marked_at: str,
 ) -> bool:
     """Persist that a conflict fix-run completed for the current PR cycle."""
+    if not head_sha:
+        return False
     cur = await conn.execute(
         """
         SELECT created_at
@@ -103,15 +106,16 @@ async def mark_merge_conflict_fixed(
     await conn.execute(
         """
         INSERT INTO merge_conflict_fix_marks (
-            issue_id, github_repo, pr_number, pr_created_at, marked_at
+            issue_id, github_repo, pr_number, pr_created_at, head_sha, marked_at
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id, github_repo) DO UPDATE SET
             pr_number = excluded.pr_number,
             pr_created_at = excluded.pr_created_at,
+            head_sha = excluded.head_sha,
             marked_at = excluded.marked_at
         """,
-        (issue_id, github_repo, pr_number, pr_created_at, marked_at),
+        (issue_id, github_repo, pr_number, pr_created_at, head_sha, marked_at),
     )
     await conn.commit()
     return True
@@ -124,7 +128,10 @@ async def has_merge_conflict_fixed(
     github_repo: str,
     pr_number: int,
     pr_created_at: str,
+    head_sha: str,
 ) -> bool:
+    if not head_sha:
+        return False
     cur = await conn.execute(
         """
         SELECT 1
@@ -133,9 +140,10 @@ async def has_merge_conflict_fixed(
           AND github_repo = ?
           AND pr_number = ?
           AND pr_created_at = ?
+          AND head_sha = ?
         LIMIT 1
         """,
-        (issue_id, github_repo, pr_number, pr_created_at),
+        (issue_id, github_repo, pr_number, pr_created_at, head_sha),
     )
     row = await cur.fetchone()
     return row is not None

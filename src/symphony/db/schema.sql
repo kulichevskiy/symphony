@@ -57,12 +57,14 @@ CREATE INDEX IF NOT EXISTS idx_issue_prs_unmerged
 
 -- A successful merge-conflict rebase fix-run may produce a clean PR head
 -- without a fresh review signal. This marker lets the next merge poll bypass
--- the no-signal verdict for the same PR cycle only, and survives restarts.
+-- the no-signal verdict for the same PR cycle and reviewed head only, and
+-- survives restarts.
 CREATE TABLE IF NOT EXISTS merge_conflict_fix_marks (
     issue_id      TEXT NOT NULL REFERENCES issues(id),
     github_repo   TEXT NOT NULL,
     pr_number     INTEGER NOT NULL,
     pr_created_at TEXT NOT NULL,
+    head_sha      TEXT NOT NULL,
     marked_at     TEXT NOT NULL,
     PRIMARY KEY (issue_id, github_repo)
 );
