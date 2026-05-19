@@ -68,9 +68,14 @@ CREATE TABLE IF NOT EXISTS comment_cursors (
 -- Comment IDs handled by either webhook or poll delivery. This lets webhook
 -- delivery order differ from comment creation order without dropping an older
 -- slash command merely because the cursor has already moved past it.
+--
+-- `issue_id` is bookkeeping for the UI; no FK to `issues(id)` because the
+-- in-memory dispatch maps can briefly hold an issue.id before its row has
+-- been committed, and a slash poll tick that lands in that window would
+-- otherwise crash with a FOREIGN KEY violation.
 CREATE TABLE IF NOT EXISTS comment_events (
     comment_id TEXT PRIMARY KEY,
-    issue_id   TEXT NOT NULL REFERENCES issues(id),
+    issue_id   TEXT NOT NULL,
     seen_at    TEXT NOT NULL
 );
 

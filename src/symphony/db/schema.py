@@ -83,3 +83,22 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE issue_prs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''"
         )
+
+    # Drop the legacy FK on comment_events.issue_id (see schema.sql comment).
+    cur = await conn.execute("PRAGMA foreign_key_list(comment_events)")
+    if await cur.fetchall():
+        await conn.executescript(
+            """
+            CREATE TABLE comment_events_new (
+                comment_id TEXT PRIMARY KEY,
+                issue_id   TEXT NOT NULL,
+                seen_at    TEXT NOT NULL
+            );
+            INSERT INTO comment_events_new (comment_id, issue_id, seen_at)
+                SELECT comment_id, issue_id, seen_at FROM comment_events;
+            DROP TABLE comment_events;
+            ALTER TABLE comment_events_new RENAME TO comment_events;
+            CREATE INDEX IF NOT EXISTS idx_comment_events_issue
+                ON comment_events(issue_id);
+            """
+        )
