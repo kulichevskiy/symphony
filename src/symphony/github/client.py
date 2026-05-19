@@ -191,6 +191,23 @@ class GitHub:
             raise GitHubError(f"repo view: missing default branch for {repo}")
         return str(default_ref["name"])
 
+    async def repo_view(self, repo: str) -> dict[str, Any]:
+        host_args, owner_repo = self._api_repo(repo)
+        result = await self._run_json(
+            ["api", *host_args, f"repos/{owner_repo}"]
+        )
+        if not isinstance(result, dict):
+            raise GitHubError(
+                f"repo view: expected object, got {type(result).__name__}"
+            )
+        payload = dict(result)
+        if "allow_auto_merge" in payload:
+            payload.setdefault(
+                "enablePullRequestAutoMerge",
+                payload.get("allow_auto_merge"),
+            )
+        return payload
+
     async def pr_create(
         self,
         *,

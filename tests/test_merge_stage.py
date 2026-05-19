@@ -158,6 +158,262 @@ async def _seed_review_candidate(
     )
 
 
+async def _seed_merge_operator_wait(conn) -> None:  # type: ignore[no-untyped-def]
+    await db.issues.upsert(
+        conn,
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        team_key="ENG",
+    )
+    await db.runs.create(
+        conn,
+        id="merge-run",
+        issue_id="iss-1",
+        stage="merge",
+        status="needs_approval",
+        pid=None,
+        started_at="2026-05-10T00:02:00+00:00",
+    )
+    await db.operator_waits.upsert(
+        conn,
+        issue_id="iss-1",
+        run_id="merge-run",
+        kind=db.operator_waits.KIND_MERGE,
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        issue_label="",
+        created_at="2026-05-10T00:03:00+00:00",
+    )
+    await db.issue_prs.upsert(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        created_at="2026-05-10T00:01:00+00:00",
+    )
+
+
+def _make_merge_wait_orchestrator(
+    conn,
+    *,
+    gh_view: dict[str, object],
+    linear: AsyncMock | None = None,
+) -> Orchestrator:  # type: ignore[no-untyped-def]
+    gh = MagicMock()
+    gh.pr_view = AsyncMock(return_value=gh_view)
+    if linear is None:
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+    return Orchestrator(
+        Config(repos=[_binding()]),
+        linear,
+        conn,
+        runner=MagicMock(),
+        gh=gh,
+        workspace=MagicMock(),
+        push_fn=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merge_wait_conflict_dispatches_rebase_fix(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        conflict_view = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "baseRefName": "main",
+            "mergedAt": None,
+        }
+        orch = _make_merge_wait_orchestrator(conn, gh_view=conflict_view)
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 1  # noqa: SLF001
+        await orch.drain_dispatch_tasks()
+
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._dispatch_merge_conflict_rebase_fix_run.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert kwargs["view"] == conflict_view
+        assert kwargs["merge_run_id"] == "merge-run"
+        comment = orch.linear.post_comment.await_args.args[1]
+        assert "merge-conflict rebase fix-run" in comment
+        assert "no `$approve` needed" in comment
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merge_wait_clean_dispatches_fresh_merge(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "mergedAt": None,
+            },
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 1  # noqa: SLF001
+        await scheduled
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert callable(kwargs["on_started"])
+        comment = orch.linear.post_comment.await_args.args[1]
+        assert "clean merge retry" in comment
+        assert "no `$approve` needed" in comment
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merge_wait_blocked_leaves_wait_untouched(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "headRefOid": "abc123",
+                "mergeable": "BLOCKED",
+                "mergeStateStatus": "BLOCKED",
+                "baseRefName": "main",
+                "mergedAt": None,
+            },
+        )
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 0  # noqa: SLF001
+
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch.linear.post_comment.assert_not_awaited()
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merge_wait_second_tick_blocked_by_live_run(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "headRefOid": "abc123",
+                "mergeable": "CONFLICTING",
+                "mergeStateStatus": "DIRTY",
+                "baseRefName": "main",
+                "mergedAt": None,
+            },
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def dispatch_once(**_kwargs: object) -> bool:
+            await db.runs.create(
+                conn,
+                id="review-fix-running",
+                issue_id="iss-1",
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at="2026-05-10T00:04:00+00:00",
+            )
+            started.set()
+            await release.wait()
+            await db.runs.update_status(
+                conn,
+                "review-fix-running",
+                "completed",
+                ended_at="2026-05-10T00:05:00+00:00",
+            )
+            return True
+
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=dispatch_once
+        )
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 1  # noqa: SLF001
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 0  # noqa: SLF001
+        release.set()
+        await orch.drain_dispatch_tasks()
+
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert orch.linear.post_comment.await_count == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_run_reconciles_merge_waits_once_after_startup_restore(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "mergeable": "BLOCKED",
+                "mergeStateStatus": "BLOCKED",
+            },
+        )
+        orch.warmup = AsyncMock()  # type: ignore[method-assign]
+        orch._restore_operator_waits = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._reconcile_auto_recoverable_merge_waits = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=0
+        )
+
+        async def wait_for_shutdown(shutdown: asyncio.Event) -> None:
+            await shutdown.wait()
+
+        orch._reconciler.run = AsyncMock(side_effect=wait_for_shutdown)  # type: ignore[method-assign]  # noqa: SLF001
+
+        async def stop_after_first_tick() -> list[asyncio.Task[None]]:
+            await orch.shutdown()
+            return []
+
+        orch._tick = AsyncMock(side_effect=stop_after_first_tick)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await asyncio.wait_for(orch.run(), timeout=1)
+
+        orch._restore_operator_waits.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._reconcile_auto_recoverable_merge_waits.assert_any_await(  # type: ignore[attr-defined]  # noqa: SLF001
+            reason="startup"
+        )
+    finally:
+        await conn.close()
+
+
 def _write_fake_gh(
     tmp_path: Path, *, auto_merge_disabled: bool = False
 ) -> tuple[Path, Path]:
