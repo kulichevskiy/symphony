@@ -36,8 +36,6 @@ async def _preserve_pidless_review_retry_path(
 ) -> None:
     if run.stage != "review":
         return
-    if await db.issue_prs.has_for_issue(conn, issue_id=run.issue_id):
-        return
 
     state = await db.review_state.get(conn, run.issue_id)
     if not state.github_repo:
@@ -126,15 +124,17 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
             run.id,
             run.issue_id,
         )
-        has_issue_pr = await db.issue_prs.has_for_issue(conn, issue_id=run.issue_id)
-        # Linked PRs are resumed by _resurrect_review_runs() on the next poll.
-        # Leave ended_at NULL so startup reconcile does not trigger that
-        # path's recent-failure cooldown.
-        ended_at = None if has_issue_pr else now
         await db.runs.update_status(
-            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=ended_at
+            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=None
         )
-        if not has_issue_pr:
+        # Linked, still-open PRs are resumed by _resurrect_review_runs() on the
+        # next poll. Leave ended_at NULL so startup reconcile does not trigger
+        # that path's recent-failure cooldown. Historical PR rows that the
+        # resurrection query ignores still need the operator-wait retry path.
+        if not await db.issue_prs.has_orphaned_review_pr(conn, issue_id=run.issue_id):
+            await db.runs.update_status(
+                conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+            )
             await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
