@@ -89,6 +89,15 @@ async def get(
     return _row_to_issue_pr(row)
 
 
+async def has_for_issue(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
+    cur = await conn.execute(
+        "SELECT 1 FROM issue_prs WHERE issue_id = ? LIMIT 1",
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
 async def mark_merged(
     conn: aiosqlite.Connection,
     *,
@@ -284,6 +293,7 @@ __all__ = [
     "IssuePR",
     "delete",
     "get",
+    "has_for_issue",
     "list_merge_candidates",
     "list_orphaned_review_prs",
     "mark_merged",

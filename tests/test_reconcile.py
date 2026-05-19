@@ -115,6 +115,58 @@ async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments
 
 
 @pytest.mark.asyncio
+async def test_reconcile_preserves_retry_for_pidless_review_without_issue_pr(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-review",
+            identifier="ENG-5",
+            title="t",
+            team_key="ENG",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-review",
+            pr_number=None,
+            pr_url="not-a-github-pr-url",
+            github_repo="org/repo",
+            issue_label="backend",
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-review",
+            issue_id="iss-review",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(conn, linear)
+        assert flipped == 1
+
+        wait = await db.operator_waits.get(conn, "iss-review")
+        assert wait is not None
+        assert wait.run_id == "pidless-review"
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.linear_team_key == "ENG"
+        assert wait.github_repo == "org/repo"
+        assert wait.issue_label == "backend"
+
+        linear.post_comment.assert_awaited_once()
+        body = linear.post_comment.await_args.args[1]
+        assert "$retry" in body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_treats_eperm_pid_as_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

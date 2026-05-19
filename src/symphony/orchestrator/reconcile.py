@@ -28,6 +28,53 @@ _RETRY_BODY = (
 )
 
 
+async def _preserve_pidless_review_retry_path(
+    conn: aiosqlite.Connection,
+    run: db.runs.Run,
+    *,
+    created_at: str,
+) -> None:
+    if run.stage != "review":
+        return
+    if await db.issue_prs.has_for_issue(conn, issue_id=run.issue_id):
+        return
+
+    state = await db.review_state.get(conn, run.issue_id)
+    if not state.github_repo:
+        log.warning(
+            "could not preserve retry path for pidless review run=%s issue=%s: "
+            "missing review_state.github_repo",
+            run.id,
+            run.issue_id,
+        )
+        return
+
+    cur = await conn.execute(
+        "SELECT team_key FROM issues WHERE id = ?",
+        (run.issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        log.warning(
+            "could not preserve retry path for pidless review run=%s issue=%s: "
+            "missing issue row",
+            run.id,
+            run.issue_id,
+        )
+        return
+
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=run.issue_id,
+        run_id=run.id,
+        kind=db.operator_waits.KIND_REVIEW_FAILED,
+        linear_team_key=str(row["team_key"]),
+        github_repo=state.github_repo,
+        issue_label=state.issue_label,
+        created_at=created_at,
+    )
+
+
 def _process_alive(pid: int) -> bool:
     """`os.kill(pid, 0)` is the standard liveness probe: it returns 0 if the
     PID is reachable, raises `ProcessLookupError` (ESRCH) if no such process
@@ -80,6 +127,7 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
             run.issue_id,
         )
         await db.runs.update_status(conn, run.id, db.runs.INTERRUPTED_STATUS)
+        await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
         except LinearError as e:
