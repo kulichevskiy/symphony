@@ -2074,6 +2074,13 @@ class Orchestrator:
                 return False
             if wait.issue_id in self._merge_wait_reconcile_issue_ids:
                 return False
+            if await db.runs.has_active(
+                self._conn,
+                wait.issue_id,
+                ignored_stage="review",
+            ):
+                return False
+            await self._complete_review_monitors_for_merge(issue)
             if await db.runs.has_running_or_completed(self._conn, wait.issue_id):
                 return False
 

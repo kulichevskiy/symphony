@@ -225,6 +225,15 @@ async def test_reconcile_merge_wait_conflict_dispatches_rebase_fix(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_merge_operator_wait(conn)
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:30+00:00",
+        )
         conflict_view = {
             "headRefOid": "abc123",
             "mergeable": "CONFLICTING",
@@ -249,6 +258,10 @@ async def test_reconcile_merge_wait_conflict_dispatches_rebase_fix(
         comment = orch.linear.post_comment.await_args.args[1]
         assert "merge-conflict rebase fix-run" in comment
         assert "no `$approve` needed" in comment
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [(run.id, run.status) for run in history if run.id == "review-run"] == [
+            ("review-run", "completed")
+        ]
     finally:
         await conn.close()
 
@@ -284,6 +297,47 @@ async def test_reconcile_merge_wait_clean_dispatches_fresh_merge(
         comment = orch.linear.post_comment.await_args.args[1]
         assert "clean merge retry" in comment
         assert "no `$approve` needed" in comment
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merge_wait_clean_retires_live_review_monitor(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:30+00:00",
+        )
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "mergedAt": None,
+            },
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 1  # noqa: SLF001
+        await scheduled
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [(run.id, run.status) for run in history if run.id == "review-run"] == [
+            ("review-run", "completed")
+        ]
     finally:
         await conn.close()
 
