@@ -2797,10 +2797,10 @@ async def test_merge_conflict_fix_marks_fixed_head_before_interrupting_merge(
         await _seed_review_candidate(conn)
         await db.runs.create(
             conn,
-            id="merge-running",
+            id="merge-wait",
             issue_id="iss-1",
             stage="merge",
-            status="running",
+            status="needs_approval",
             pid=None,
             started_at="2026-05-10T00:03:00+00:00",
         )
@@ -2839,7 +2839,7 @@ async def test_merge_conflict_fix_marks_fixed_head_before_interrupting_merge(
 
         events: list[tuple[str, bool]] = []
         original_mark = db.issue_prs.mark_merge_conflict_fixed
-        original_update_status = db.runs.update_status
+        original_interrupt = db.runs.interrupt_stale_merge_needs_approval
 
         async def recording_mark_merge_conflict_fixed(
             *args: object,
@@ -2849,28 +2849,29 @@ async def test_merge_conflict_fix_marks_fixed_head_before_interrupting_merge(
             events.append(("mark", result))
             return result
 
-        async def recording_update_status(
+        async def recording_interrupt_stale_merge_needs_approval(
             conn_arg,
-            run_id: str,
-            status: str,
             *,
-            ended_at: str | None = None,
-        ) -> None:  # type: ignore[no-untyped-def]
-            if run_id == "merge-running" and status == "interrupted":
-                marker_exists = await db.issue_prs.has_merge_conflict_fixed(
-                    conn_arg,
-                    issue_id="iss-1",
-                    github_repo="org/repo",
-                    pr_number=42,
-                    pr_created_at="2026-05-10T00:01:00+00:00",
-                    head_sha="fixedsha",
-                )
-                events.append(("interrupt", marker_exists))
-            await original_update_status(
+            issue_id: str,
+            github_repo: str,
+            pr_number: int,
+            before: str | None = None,
+        ) -> int:  # type: ignore[no-untyped-def]
+            marker_exists = await db.issue_prs.has_merge_conflict_fixed(
                 conn_arg,
-                run_id,
-                status,
-                ended_at=ended_at,
+                issue_id=issue_id,
+                github_repo=github_repo,
+                pr_number=pr_number,
+                pr_created_at="2026-05-10T00:01:00+00:00",
+                head_sha="fixedsha",
+            )
+            events.append(("interrupt", marker_exists))
+            return await original_interrupt(
+                conn_arg,
+                issue_id=issue_id,
+                github_repo=github_repo,
+                pr_number=pr_number,
+                before=before,
             )
 
         monkeypatch.setattr(
@@ -2878,7 +2879,11 @@ async def test_merge_conflict_fix_marks_fixed_head_before_interrupting_merge(
             "mark_merge_conflict_fixed",
             recording_mark_merge_conflict_fixed,
         )
-        monkeypatch.setattr(db.runs, "update_status", recording_update_status)
+        monkeypatch.setattr(
+            db.runs,
+            "interrupt_stale_merge_needs_approval",
+            recording_interrupt_stale_merge_needs_approval,
+        )
 
         result = await orch._dispatch_merge_conflict_rebase_fix_run(  # noqa: SLF001
             binding=_binding(agent="claude"),
@@ -2886,12 +2891,177 @@ async def test_merge_conflict_fix_marks_fixed_head_before_interrupting_merge(
             pr_number=42,
             pr_url="https://github.com/org/repo/pull/42",
             view={"baseRefName": "release/1.2"},
-            merge_run_id="merge-running",
+            merge_run_id="merge-wait",
             dispatch_capacity_held=True,
         )
 
         assert result is True
         assert events == [("mark", True), ("interrupt", True)]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_fix_interrupts_all_stale_merge_needs_approval(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        for idx in range(3):
+            await db.runs.create(
+                conn,
+                id=f"stale-merge-{idx}",
+                issue_id="iss-1",
+                stage="merge",
+                status="needs_approval",
+                pid=None,
+                started_at=f"2026-05-10T00:0{idx + 2}:00+00:00",
+            )
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "fixedsha",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "release/1.2",
+                "mergedAt": None,
+            }
+        )
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+        )
+
+        result = await orch._dispatch_merge_conflict_rebase_fix_run(  # noqa: SLF001
+            binding=_binding(agent="claude"),
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            view={"baseRefName": "release/1.2"},
+            merge_run_id="stale-merge-1",
+            dispatch_capacity_held=True,
+        )
+
+        assert result is True
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        stale_merges = [run for run in history if run.id.startswith("stale-merge-")]
+        assert {run.status for run in stale_merges} == {"interrupted"}
+        assert all(run.ended_at is not None for run in stale_merges)
+        assert await db.issue_prs.has_merge_conflict_fixed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_created_at="2026-05-10T00:01:00+00:00",
+            head_sha="fixedsha",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert [candidate.pr_number for candidate in candidates] == [42]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_fix_interrupts_stale_merge_when_marker_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        for idx in range(3):
+            await db.runs.create(
+                conn,
+                id=f"stale-merge-{idx}",
+                issue_id="iss-1",
+                stage="merge",
+                status="needs_approval",
+                pid=None,
+                started_at=f"2026-05-10T00:0{idx + 2}:00+00:00",
+            )
+
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "fixedsha",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "release/1.2",
+                "mergedAt": None,
+            }
+        )
+
+        monkeypatch.setattr(
+            db.issue_prs,
+            "mark_merge_conflict_fixed",
+            AsyncMock(return_value=False),
+        )
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+        )
+
+        result = await orch._dispatch_merge_conflict_rebase_fix_run(  # noqa: SLF001
+            binding=_binding(agent="claude"),
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            view={"baseRefName": "release/1.2"},
+            merge_run_id="stale-merge-1",
+            dispatch_capacity_held=True,
+        )
+
+        assert result is True
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        stale_merges = [run for run in history if run.id.startswith("stale-merge-")]
+        assert {run.status for run in stale_merges} == {"interrupted"}
+        assert all(run.ended_at is not None for run in stale_merges)
+        assert not await db.issue_prs.has_merge_conflict_fixed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_created_at="2026-05-10T00:01:00+00:00",
+            head_sha="fixedsha",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert [candidate.pr_number for candidate in candidates] == [42]
     finally:
         await conn.close()
 
