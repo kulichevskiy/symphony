@@ -1,8 +1,8 @@
 export const ACTIVITY_TINT_CLASSES = {
   fresh: "",
-  amber: "bg-amber-50/60 hover:bg-amber-50/80",
-  orange: "bg-orange-50/65 hover:bg-orange-50/85",
-  red: "bg-red-50/70 hover:bg-red-50/90",
+  amber: "bg-amber-50/60 hover:bg-amber-50/80 dark:bg-amber-900/20 dark:hover:bg-amber-900/30",
+  orange: "bg-orange-50/65 hover:bg-orange-50/85 dark:bg-orange-900/25 dark:hover:bg-orange-900/40",
+  red: "bg-red-50/70 hover:bg-red-50/90 dark:bg-red-900/30 dark:hover:bg-red-900/45",
 } as const;
 
 const HOUR_SECONDS = 60 * 60;

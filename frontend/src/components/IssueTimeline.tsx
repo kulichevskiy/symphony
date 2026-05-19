@@ -156,7 +156,7 @@ function KindBadge({ kind }: { kind: string }) {
       {isExternalKind(kind) ? (
         <svg
           aria-hidden="true"
-          className="h-3 w-3 text-sky-700"
+          className="h-3 w-3 text-sky-700 dark:text-sky-400"
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -362,7 +362,9 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
         <VariantToggle variant={variant} onVariantChange={setVariant} />
       </div>
       {isLoading ? <p className="text-sm text-muted-foreground">Loading</p> : null}
-      {error ? <p className="text-sm text-red-600">{(error as Error).message}</p> : null}
+      {error ? (
+        <p className="text-sm text-red-600 dark:text-red-400">{(error as Error).message}</p>
+      ) : null}
       {!isLoading && !error && events.length === 0 ? (
         <p className="text-sm text-muted-foreground">(none)</p>
       ) : null}
