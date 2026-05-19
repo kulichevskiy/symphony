@@ -32,6 +32,11 @@ _AUTO_MERGE_DISABLED_MARKERS = (
     "enablepullrequestautomerge=false",
     "auto merge is not allowed for this repository",
 )
+_MERGE_CONFLICT_MARKERS = (
+    "merge conflict",
+    "merge conflicts",
+    "conflict between",
+)
 
 
 class GitHubError(RuntimeError):
@@ -41,6 +46,11 @@ class GitHubError(RuntimeError):
 def _is_auto_merge_disabled_error(error: object) -> bool:
     message = str(error).casefold()
     return any(marker in message for marker in _AUTO_MERGE_DISABLED_MARKERS)
+
+
+def _is_merge_conflict_error(error: object) -> bool:
+    message = str(error).casefold()
+    return any(marker in message for marker in _MERGE_CONFLICT_MARKERS)
 
 
 @dataclass
@@ -226,7 +236,21 @@ class GitHub:
             str(pr),
             *self._repo_args(repo),
             "--json",
-            "number,title,state,url,headRefName,headRefOid,mergeable,isDraft,mergedAt",
+            ",".join(
+                [
+                    "number",
+                    "title",
+                    "state",
+                    "url",
+                    "headRefName",
+                    "headRefOid",
+                    "baseRefName",
+                    "mergeable",
+                    "mergeStateStatus",
+                    "isDraft",
+                    "mergedAt",
+                ]
+            ),
         ]
         result = await self._run_json(argv)
         if not isinstance(result, dict):

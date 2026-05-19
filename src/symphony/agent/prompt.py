@@ -142,6 +142,35 @@ def merge_conflict_fix_prompt(
     )
 
 
+def merge_conflict_rebase_fix_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    pr_number: int,
+    base_ref: str,
+) -> str:
+    """Build the prompt for a merge-stage conflict rebase fix-run."""
+    label_line = ", ".join(labels) if labels else "(no labels)"
+    body = issue_body.strip() if issue_body else "(no description)"
+    return (
+        "You are Symphony's merge-conflict fix-run agent.\n"
+        f"PR #{pr_number} has merge conflicts against `{base_ref}`. Rebase the "
+        f"branch onto `origin/{base_ref}`, resolve conflicts, run the test+lint "
+        "gates, and push.\n\n"
+        "# Issue\n\n"
+        f"## Title\n{issue_title}\n\n"
+        f"## Labels\n{label_line}\n\n"
+        f"## Description\n{body}\n\n"
+        "# Working agreement\n\n"
+        "- Fetch the latest remote refs before rebasing.\n"
+        "- Preserve the PR's intended behavior while integrating upstream changes.\n"
+        "- Commit the resolved rebase result if needed, run the repo's test+lint "
+        "gates, and push the updated branch.\n"
+        "- Do not merge the PR or edit unrelated files.\n"
+    )
+
+
 def merge_prompt(
     *,
     issue_title: str,

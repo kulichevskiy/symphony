@@ -49,6 +49,7 @@ from ..agent.process import parse_event_line
 from ..agent.prompt import (
     implement_prompt,
     merge_conflict_fix_prompt,
+    merge_conflict_rebase_fix_prompt,
     merge_prompt,
     review_comment_fix_prompt,
     review_fix_prompt,
@@ -57,7 +58,7 @@ from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import CheckRun as GitHubCheckRun
-from ..github.client import GitHub, GitHubError, PRChecks
+from ..github.client import GitHub, GitHubError, PRChecks, _is_merge_conflict_error
 from ..github.webhook import GitHubWebhookEvent
 from ..linear import slash
 from ..linear.blockers import is_blocked, open_blocker_ids
@@ -521,6 +522,22 @@ def _pr_view_is_closed(view: dict[str, object]) -> bool:
     return str(view.get("state") or "").upper() == "CLOSED"
 
 
+def _pr_view_has_merge_conflict(view: dict[str, object]) -> bool:
+    mergeable = str(view.get("mergeable") or "").upper()
+    merge_state = str(
+        view.get("mergeStateStatus") or view.get("merge_state_status") or ""
+    ).upper()
+    return mergeable == "CONFLICTING" or merge_state == "DIRTY"
+
+
+def _pr_base_ref_from_view(view: dict[str, object]) -> str | None:
+    raw = view.get("baseRefName") or view.get("base_ref_name") or view.get("baseRef")
+    if raw is None:
+        return None
+    base_ref = str(raw).strip()
+    return base_ref or None
+
+
 async def _default_push(workspace_path: Path, branch: str) -> None:
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -880,6 +897,7 @@ class Orchestrator:
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
+        self._merge_conflict_fixed_issue_ids: set[str] = set()
         self._runs_moved_to_in_progress: set[str] = set()
         # `$skip-local-review` toggles the issue's flag here. The
         # local-review loop reads it between iterations and exits with
@@ -2882,6 +2900,235 @@ class Orchestrator:
             )
             return True
 
+    async def _resolve_pr_base_ref(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        view: dict[str, object] | None,
+    ) -> str:
+        if view is not None:
+            base_ref = _pr_base_ref_from_view(view)
+            if base_ref is not None:
+                return base_ref
+        if binding.base_branch is not None:
+            return binding.base_branch
+        try:
+            result_obj: object = self._gh.repo_default_branch(binding.github_repo)
+            if inspect.isawaitable(result_obj):
+                result_obj = await result_obj
+            if isinstance(result_obj, str) and result_obj.strip():
+                return result_obj.strip()
+        except (GitHubError, AttributeError, TypeError) as e:
+            log.warning(
+                "repo_default_branch failed for merge-conflict fix-run %s; "
+                "falling back to 'main': %s",
+                issue.identifier,
+                e,
+            )
+        return "main"
+
+    async def _mark_merge_conflict_fix_needs_approval(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        reason: str,
+        merge_run_id: str | None,
+    ) -> None:
+        await self._mark_merge_needs_approval(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            run_id=merge_run_id or str(uuid.uuid4()),
+            reason=reason,
+            create_run=merge_run_id is None,
+        )
+
+    async def _dispatch_merge_conflict_rebase_fix_run(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        view: dict[str, object] | None,
+        merge_run_id: str | None = None,
+    ) -> bool:
+        base_ref = await self._resolve_pr_base_ref(
+            binding=binding,
+            issue=issue,
+            view=view,
+        )
+        async with self._review_fix_dispatch_slot(binding, issue):
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            cap_usd = effective_cap(
+                global_cap_usd=self.config.cost_cap_per_issue_usd,
+                binding_override=binding.cost_cap_usd,
+            )
+            if cap_usd > 0 and prior_total >= cap_usd:
+                await self._mark_merge_conflict_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "merge-conflict cost cap reached: "
+                        f"${prior_total:.4f}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "workspace acquire failed for merge-conflict rebase fix-run %s",
+                    issue.identifier,
+                )
+                await self._mark_merge_conflict_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"merge-conflict fix-run failed: workspace acquire failed: {e}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            fix_run_id = str(uuid.uuid4())
+            await db.runs.create(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            prompt = merge_conflict_rebase_fix_prompt(
+                issue_title=issue.title,
+                issue_body=issue.description,
+                labels=list(issue.labels),
+                pr_number=pr_number,
+                base_ref=base_ref,
+            )
+            command = build_codex_workspace_write_command(
+                prompt=prompt,
+                codex_model=binding.codex_model,
+            )
+            codex_binding = binding.model_copy(update={"agent": "codex"})
+            warning_pct = effective_warning_pct(
+                global_pct=self.config.cost_warning_pct,
+                binding_override=binding.cost_warning_pct,
+            )
+            warning_already_fired = (
+                await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+            )
+            try:
+                cost, final_kind, final_returncode, cap_breached = (
+                    await self._run_stage_command(
+                        binding=codex_binding,
+                        issue=issue,
+                        command=command,
+                        run_id=fix_run_id,
+                        workspace_path=workspace_path,
+                        stage="review_fix",
+                        prior_total=prior_total,
+                        cap_usd=cap_usd,
+                        warning_pct=warning_pct,
+                        warning_already_fired=warning_already_fired,
+                    )
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "merge-conflict rebase fix-run execution failed for %s",
+                    issue.identifier,
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_conflict_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"merge-conflict fix-run failed: {e}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+            finally:
+                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
+                self._workspace.release(binding, issue)
+
+            if cost > 0:
+                await db.runs.add_cost(self._conn, fix_run_id, cost)
+
+            total_cost = prior_total + cost
+            if cap_breached:
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_conflict_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "merge-conflict cost cap reached: "
+                        f"${total_cost:.4f}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            transition = on_runner_event(
+                stage="review",
+                event_kind=final_kind,
+                returncode=final_returncode,
+            )
+            if transition.next_run_status != "completed":
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    transition.next_run_status,
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_conflict_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "merge-conflict fix-run failed: "
+                        f"runner ended with {final_kind}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+            if merge_run_id is not None:
+                await db.runs.update_status(
+                    self._conn,
+                    merge_run_id,
+                    "interrupted",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+            self._merge_conflict_fixed_issue_ids.add(issue.id)
+            return True
+
     async def _dispatch_merge_conflict_fix_run(
         self,
         *,
@@ -4360,6 +4607,17 @@ class Orchestrator:
                     view=view,
                 ):
                     continue
+                if _pr_view_has_merge_conflict(view):
+                    scheduled.append(
+                        self._schedule_merge_conflict_rebase_fix(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=candidate.pr_number,
+                            pr_url=candidate.pr_url,
+                            view=view,
+                        )
+                    )
+                    continue
             except Exception as e:  # noqa: BLE001 — retry finalization next tick
                 log.warning(
                     "could not check finalized PR state for %s#%d: %s",
@@ -4383,7 +4641,13 @@ class Orchestrator:
                 )
                 continue
 
-            if verdict.kind is VerdictKind.APPROVED:
+            if verdict.kind is VerdictKind.APPROVED or (
+                candidate.issue_id in self._merge_conflict_fixed_issue_ids
+                and verdict.kind is VerdictKind.PENDING
+                and verdict.rule == "no_signal"
+                and str(view.get("mergeable") or "").upper() == "MERGEABLE"
+            ):
+                self._merge_conflict_fixed_issue_ids.discard(candidate.issue_id)
                 if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
                     continue
                 binding_key = _binding_key(binding)
@@ -4399,21 +4663,45 @@ class Orchestrator:
                         issue=issue,
                         pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
+                        skip_review=verdict.kind is not VerdictKind.APPROVED,
                     )
                 )
             elif verdict.merge_conflict:
-                if not await db.runs.has_live_stage(
-                    self._conn, candidate.issue_id, stage="review"
-                ):
-                    await self._mark_merge_needs_approval(
+                scheduled.append(
+                    self._schedule_merge_conflict_rebase_fix(
                         binding=binding,
                         issue=issue,
+                        pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
-                        run_id=str(uuid.uuid4()),
-                        reason="merge conflict against base",
-                        create_run=True,
+                        view=view,
                     )
+                )
+            elif verdict.kind is VerdictKind.CHANGES_REQUESTED:
+                self._merge_conflict_fixed_issue_ids.discard(candidate.issue_id)
         return scheduled
+
+    def _schedule_merge_conflict_rebase_fix(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        view: dict[str, object],
+    ) -> asyncio.Task[None]:
+        async def dispatch_conflict_fix() -> None:
+            await self._dispatch_merge_conflict_rebase_fix_run(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                view=view,
+            )
+
+        task = asyncio.create_task(dispatch_conflict_fix())
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._dispatch_tasks.discard)
+        return task
 
     def _schedule_merge(
         self,
@@ -5235,6 +5523,42 @@ class Orchestrator:
 
             try:
                 await self._push_fn(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning("merge push failed for %s#%d: %s", binding.github_repo, pr_number, e)
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=str(e),
+                )
+                return run_id
+
+            try:
+                premerge_view = await self._gh.pr_view(
+                    pr_number,
+                    repo=binding.github_repo,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not pre-check mergeability for %s#%d before merge: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+            else:
+                if _pr_view_has_merge_conflict(premerge_view):
+                    await self._dispatch_merge_conflict_rebase_fix_run(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        view=premerge_view,
+                        merge_run_id=run_id,
+                    )
+                    return run_id
+
+            try:
                 await self._gh.pr_merge(
                     pr_number,
                     strategy=binding.merge_strategy,
@@ -5243,6 +5567,30 @@ class Orchestrator:
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("merge failed for %s#%d: %s", binding.github_repo, pr_number, e)
+                if _is_merge_conflict_error(e):
+                    try:
+                        conflict_view = await self._gh.pr_view(
+                            pr_number,
+                            repo=binding.github_repo,
+                        )
+                    except Exception as view_error:  # noqa: BLE001
+                        log.warning(
+                            "could not refresh PR base after merge conflict for "
+                            "%s#%d: %s",
+                            binding.github_repo,
+                            pr_number,
+                            view_error,
+                        )
+                        conflict_view = None
+                    await self._dispatch_merge_conflict_rebase_fix_run(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        view=conflict_view,
+                        merge_run_id=run_id,
+                    )
+                    return run_id
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,

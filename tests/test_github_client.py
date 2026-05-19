@@ -29,6 +29,7 @@ from symphony.github.client import (
     GitHubError,
     PRChecks,
     _is_auto_merge_disabled_error,
+    _is_merge_conflict_error,
 )
 
 
@@ -388,6 +389,19 @@ async def test_check_log_tail_fetches_run_log_from_check_link(fake_gh) -> None: 
 )
 def test_auto_merge_disabled_error_classifier(message: str, expected: bool) -> None:
     assert _is_auto_merge_disabled_error(message) is expected
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("merge conflict between head and base", True),
+        ("GraphQL: merge conflicts must be resolved before merging", True),
+        ("Base branch was modified. Review and try the merge again.", False),
+        ("GraphQL: enablePullRequestAutoMerge must be true", False),
+    ],
+)
+def test_merge_conflict_error_classifier(message: str, expected: bool) -> None:
+    assert _is_merge_conflict_error(message) is expected
 
 
 async def test_pr_merge_squash_with_auto(fake_gh) -> None:  # type: ignore[no-untyped-def]
