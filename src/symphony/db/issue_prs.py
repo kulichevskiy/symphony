@@ -64,7 +64,116 @@ async def upsert(
         """,
         (issue_id, github_repo, binding_key, pr_number, pr_url, created_at),
     )
+    await conn.execute(
+        """
+        DELETE FROM merge_conflict_fix_marks
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND (pr_number != ? OR pr_created_at != ?)
+        """,
+        (issue_id, github_repo, pr_number, created_at),
+    )
     await conn.commit()
+
+
+async def mark_merge_conflict_fixed(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    head_sha: str,
+    marked_at: str,
+) -> bool:
+    """Persist that a conflict fix-run completed for the current PR cycle."""
+    if not head_sha:
+        return False
+    cur = await conn.execute(
+        """
+        SELECT created_at
+        FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND merged_at IS NULL
+        """,
+        (issue_id, github_repo, pr_number),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+    pr_created_at = str(row["created_at"])
+    await conn.execute(
+        """
+        INSERT INTO merge_conflict_fix_marks (
+            issue_id, github_repo, pr_number, pr_created_at, head_sha, marked_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(issue_id, github_repo) DO UPDATE SET
+            pr_number = excluded.pr_number,
+            pr_created_at = excluded.pr_created_at,
+            head_sha = excluded.head_sha,
+            marked_at = excluded.marked_at
+        """,
+        (issue_id, github_repo, pr_number, pr_created_at, head_sha, marked_at),
+    )
+    await conn.commit()
+    return True
+
+
+async def has_merge_conflict_fixed(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    pr_created_at: str,
+    head_sha: str,
+) -> bool:
+    if not head_sha:
+        return False
+    cur = await conn.execute(
+        """
+        SELECT 1
+        FROM merge_conflict_fix_marks
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND pr_created_at = ?
+          AND head_sha = ?
+        LIMIT 1
+        """,
+        (issue_id, github_repo, pr_number, pr_created_at, head_sha),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def clear_merge_conflict_fixed(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    pr_created_at: str | None = None,
+) -> bool:
+    pr_cycle_filter = "" if pr_created_at is None else " AND pr_created_at = ?"
+    params: tuple[object, ...] = (
+        (issue_id, github_repo, pr_number)
+        if pr_created_at is None
+        else (issue_id, github_repo, pr_number, pr_created_at)
+    )
+    cur = await conn.execute(
+        f"""
+        DELETE FROM merge_conflict_fix_marks
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?{pr_cycle_filter}
+        """,
+        params,
+    )
+    await conn.commit()
+    return (cur.rowcount or 0) > 0
 
 
 async def get(

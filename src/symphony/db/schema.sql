@@ -55,6 +55,20 @@ CREATE TABLE IF NOT EXISTS issue_prs (
 CREATE INDEX IF NOT EXISTS idx_issue_prs_unmerged
     ON issue_prs(merged_at, created_at);
 
+-- A successful merge-conflict rebase fix-run may produce a clean PR head
+-- without a fresh review signal. This marker lets the next merge poll bypass
+-- the no-signal verdict for the same PR cycle and reviewed head only, and
+-- survives restarts.
+CREATE TABLE IF NOT EXISTS merge_conflict_fix_marks (
+    issue_id      TEXT NOT NULL REFERENCES issues(id),
+    github_repo   TEXT NOT NULL,
+    pr_number     INTEGER NOT NULL,
+    pr_created_at TEXT NOT NULL,
+    head_sha      TEXT NOT NULL,
+    marked_at     TEXT NOT NULL,
+    PRIMARY KEY (issue_id, github_repo)
+);
+
 -- `last_seen_ids` is a JSON array of comment IDs that share `last_seen_at`.
 -- Combined with a `gte` filter on the next fetch, this prevents losing
 -- comments tied at the boundary timestamp (e.g. bursty creation, pagination
