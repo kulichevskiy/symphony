@@ -122,6 +122,7 @@ CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
+CODEX_REVIEW_REQUEST_SIGNATURE_PREFIX = "codex_review_request"
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
@@ -174,6 +175,10 @@ def _parse_optional_datetime(raw: str | None) -> datetime | None:
         return _parse_rfc3339(raw)
     except ValueError:
         return None
+
+
+def _codex_review_request_signature(head_sha: str) -> str:
+    return f"{CODEX_REVIEW_REQUEST_SIGNATURE_PREFIX}:{head_sha}"
 
 
 @dataclass(frozen=True)
@@ -2952,13 +2957,17 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         state: db.review_state.ReviewState,
+        require_no_signal: bool = False,
     ) -> None:
         if state.pr_number is None:
             return
+        head_sha = ""
+        request_signature = ""
         try:
-            verdict = await self._review_approval_verdict_for_pr(
+            verdict, head_sha = await self._review_verdict_and_head_for_pr(
                 binding=binding,
                 pr_number=state.pr_number,
+                include_comments=require_no_signal,
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
@@ -2968,6 +2977,8 @@ class Orchestrator:
                 state.pr_number,
                 e,
             )
+            if require_no_signal:
+                return
         else:
             if verdict.kind is VerdictKind.APPROVED:
                 log.info(
@@ -2978,24 +2989,65 @@ class Orchestrator:
                     issue.identifier,
                 )
                 return
-        await self._retrigger_codex_review(
+            if require_no_signal and verdict.kind is VerdictKind.CHANGES_REQUESTED:
+                log.info(
+                    "skipping @codex review re-trigger on %s#%d for %s: "
+                    "current head already has review feedback (%s)",
+                    binding.github_repo,
+                    state.pr_number,
+                    issue.identifier,
+                    verdict.rule,
+                )
+                return
+            if require_no_signal and verdict.rule != "no_signal":
+                log.info(
+                    "skipping @codex review re-trigger on %s#%d for %s: "
+                    "current review verdict is pending via %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    issue.identifier,
+                    verdict.rule,
+                )
+                return
+            if require_no_signal:
+                request_signature = _codex_review_request_signature(head_sha)
+                if state.last_trigger_signature == request_signature:
+                    log.info(
+                        "skipping duplicate @codex review re-trigger on %s#%d "
+                        "for %s at %s",
+                        binding.github_repo,
+                        state.pr_number,
+                        issue.identifier,
+                        head_sha,
+                    )
+                    return
+        posted = await self._retrigger_codex_review(
             binding=binding,
             state=state,
         )
+        if posted and request_signature:
+            await db.review_state.set_signature(
+                self._conn, issue.id, request_signature
+            )
 
-    async def _review_approval_verdict_for_pr(
+    async def _review_verdict_and_head_for_pr(
         self,
         *,
         binding: RepoBinding,
         pr_number: int,
-    ) -> Verdict:
+        include_comments: bool = False,
+    ) -> tuple[Verdict, str]:
         view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
             raise GitHubError(
                 f"pr view missing headRefOid for {binding.github_repo}#{pr_number}"
             )
-
+        comments = []
+        if include_comments:
+            comments = await self._gh.pr_review_comments(
+                pr_number, repo=binding.github_repo
+            )
         reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
         reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
         try:
@@ -3023,16 +3075,23 @@ class Orchestrator:
             reviews=_reviews_from_github(reviews),
             mergeable=str(view.get("mergeable") or ""),
         )
-        return review_classifier(comments=[], ci=[], snapshot=snapshot)
+        return (
+            review_classifier(
+                comments=_review_comments_from_github(comments),
+                ci=[],
+                snapshot=snapshot,
+            ),
+            head_sha,
+        )
 
     async def _retrigger_codex_review(
         self,
         *,
         binding: RepoBinding,
         state: db.review_state.ReviewState,
-    ) -> None:
+    ) -> bool:
         if state.pr_number is None:
-            return
+            return False
         try:
             await self._gh.pr_comment(
                 state.pr_number,
@@ -3046,6 +3105,8 @@ class Orchestrator:
                 state.pr_number,
                 e,
             )
+            return False
+        return True
 
     def _format_comment_trigger(self, verdict: Verdict, iteration: int) -> str:
         cap = self.config.review_iteration_cap
@@ -4426,6 +4487,12 @@ class Orchestrator:
             )
             await self._move_issue_to_review_state(binding=binding, issue=issue)
             scheduled.append(self._schedule_review_poll(run, binding, issue))
+            await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+                require_no_signal=True,
+            )
         return scheduled
 
     async def _fail_review_run(
