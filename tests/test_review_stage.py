@@ -770,6 +770,7 @@ async def test_pr_checks_success_resets_persisted_fetch_failure_counter(
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reactions = AsyncMock(return_value=[])
         gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
 
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
 
@@ -1861,6 +1862,7 @@ async def test_dead_review_monitor_is_resurrected_after_cooldown(
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reactions = AsyncMock(return_value=[])
         gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
 
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -1934,6 +1936,7 @@ async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reactions = AsyncMock(return_value=[])
         gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
 
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -1947,6 +1950,516 @@ async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("Host restarted" in body for body in bodies)
         assert any("Resumed" in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_resurrection_rearms_codex_review_for_unreviewed_head_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A monitor resurrected after the @codex ping was lost must re-arm review.
+
+    This matches the VIB-52 failure mode: a dead pid=NULL review monitor, then
+    a current PR HEAD with only stale Codex signals from older commits. The
+    prior CI dedupe signature must survive the re-arm.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, signature="ci:head-sha:lint")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        old_ended_at = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        await db.runs.update_status(
+            conn, "review-run", "interrupted", ended_at=old_ended_at
+        )
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.issues_in_state = AsyncMock(return_value=[])
+        linear.comments_since = AsyncMock(return_value=[])
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-19T12:00:00Z")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(commit_sha="stale-sha")]
+        )
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                _codex_inline_comment(
+                    commit_sha="stale-sha",
+                    created_at="2026-05-19T11:30:00Z",
+                )
+            ]
+        )
+        gh.pr_comment = AsyncMock()
+
+        def issue_comments_after_ping(*_args, **_kwargs) -> list[dict]:
+            if gh.pr_comment.await_count:
+                return [_codex_review_request_comment()]
+            return []
+
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(side_effect=issue_comments_after_ping)
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        monkeypatch.setattr(
+            orch,
+            "_schedule_review_poll",
+            lambda *_args, **_kwargs: asyncio.create_task(asyncio.sleep(0)),
+        )
+
+        tasks = await orch._tick()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        review_pings = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if c.args[:2] == (42, "@codex review")
+        ]
+        assert len(review_pings) == 1
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.last_trigger_signature == "ci:head-sha:lint"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        resurrected = next(
+            r
+            for r in history
+            if r.stage == "review" and r.status == "running" and r.id != "review-run"
+        )
+        await db.runs.update_status(
+            conn, resurrected.id, "interrupted", ended_at=old_ended_at
+        )
+
+        tasks = await orch._tick()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        review_pings = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if c.args[:2] == (42, "@codex review")
+        ]
+        assert len(review_pings) == 1
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.last_trigger_signature == "ci:head-sha:lint"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_resurrection_rearm_defers_when_request_comments_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not duplicate-ping when the request-comment dedupe read is down."""
+    from datetime import UTC, datetime, timedelta
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        old_ended_at = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        await db.runs.update_status(
+            conn, "review-run", "interrupted", ended_at=old_ended_at
+        )
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.issues_in_state = AsyncMock(return_value=[])
+        linear.comments_since = AsyncMock(return_value=[])
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-19T12:00:00Z")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(commit_sha="stale-sha")]
+        )
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                _codex_inline_comment(
+                    commit_sha="stale-sha",
+                    created_at="2026-05-19T11:30:00Z",
+                )
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        issue_comment_calls = 0
+
+        async def issue_comments_after_transient_failure(
+            *_args: object, **_kwargs: object
+        ) -> list[dict]:
+            nonlocal issue_comment_calls
+            issue_comment_calls += 1
+            if issue_comment_calls == 1:
+                raise GitHubError("temporary issue comment fetch failure")
+            return [_codex_review_request_comment()]
+
+        gh.pr_issue_comments = AsyncMock(
+            side_effect=issue_comments_after_transient_failure
+        )
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        captured_runs: list[db.runs.Run] = []
+
+        def capture_review_poll(
+            run: db.runs.Run,
+            _binding: RepoBinding,
+            _issue: LinearIssue,
+        ) -> asyncio.Task[None]:
+            captured_runs.append(run)
+            return asyncio.create_task(asyncio.sleep(0))
+
+        monkeypatch.setattr(orch, "_schedule_review_poll", capture_review_poll)
+
+        tasks = await orch._resurrect_review_runs()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        assert len(captured_runs) == 1
+        resurrected = captured_runs[0]
+        assert gh.pr_comment.await_count == 0
+        assert await db.runs.has_review_rearm_retry(conn, resurrected.id)
+
+        await orch._poll_review_run_with_limits(  # noqa: SLF001
+            resurrected,
+            _binding(),
+            _issue_in_review(),
+        )
+
+        assert gh.pr_comment.await_count == 0
+        assert not await db.runs.has_review_rearm_retry(conn, resurrected.id)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_resurrection_retries_rearm_after_classification_failure(
+    tmp_path: Path,
+) -> None:
+    """Transient GitHub read errors during resurrection do not drop the re-arm."""
+    from datetime import UTC, datetime, timedelta
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        old_ended_at = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        await db.runs.update_status(
+            conn, "review-run", "interrupted", ended_at=old_ended_at
+        )
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.issues_in_state = AsyncMock(return_value=[])
+        linear.comments_since = AsyncMock(return_value=[])
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-19T12:00:00Z")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(commit_sha="stale-sha")]
+        )
+        gh.pr_review_comments = AsyncMock(
+            side_effect=[GitHubError("temporary comments fetch failure"), [], []]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._tick()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        review_pings = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if c.args[:2] == (42, "@codex review")
+        ]
+        assert len(review_pings) == 1
+        assert gh.pr_review_comments.await_count >= 2
+        assert not orch._review_rearm_retry_run_ids  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_resurrection_rearm_retry_survives_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An inconclusive resurrection re-arm is retried after orchestrator restart."""
+    from datetime import UTC, datetime, timedelta
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        old_ended_at = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        await db.runs.update_status(
+            conn, "review-run", "interrupted", ended_at=old_ended_at
+        )
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.issues_in_state = AsyncMock(return_value=[])
+        linear.comments_since = AsyncMock(return_value=[])
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-19T12:00:00Z")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(commit_sha="stale-sha")]
+        )
+        gh.pr_review_comments = AsyncMock(
+            side_effect=[GitHubError("temporary comments fetch failure"), [], []]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        captured_runs: list[db.runs.Run] = []
+
+        def capture_review_poll(
+            run: db.runs.Run,
+            _binding: RepoBinding,
+            _issue: LinearIssue,
+        ) -> asyncio.Task[None]:
+            captured_runs.append(run)
+            return asyncio.create_task(asyncio.sleep(0))
+
+        monkeypatch.setattr(orch, "_schedule_review_poll", capture_review_poll)
+        tasks = await orch._resurrect_review_runs()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        assert len(captured_runs) == 1
+        resurrected = captured_runs[0]
+        assert await db.runs.has_review_rearm_retry(conn, resurrected.id)
+        assert gh.pr_comment.await_count == 0
+
+        restarted = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        restarted._states = {"ENG": _states()}  # noqa: SLF001
+        tasks = await restarted._poll_review_runs()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        review_pings = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if c.args[:2] == (42, "@codex review")
+        ]
+        assert len(review_pings) == 1
+        assert not await db.runs.has_review_rearm_retry(conn, resurrected.id)
+        assert not restarted._review_rearm_retry_run_ids  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_rearm_retry_clears_when_fallback_poll_dispatches_feedback(
+    tmp_path: Path,
+) -> None:
+    """A failed re-arm classifier must not leave a stale retry after fallback.
+
+    The re-arm path can fail on head commit lookup, while the normal poll path
+    treats that same lookup as optional and can still consume current inline
+    feedback. Once that happens, the retry marker is stale.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        await db.runs.mark_review_rearm_retry(conn, "review-run")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            side_effect=[
+                {"headRefOid": "head-sha", "mergeable": "MERGEABLE"},
+                {"headRefOid": "head-sha", "mergeable": "MERGEABLE"},
+                {"headRefOid": "after-fix-sha", "mergeable": "MERGEABLE"},
+                {"headRefOid": "after-fix-sha", "mergeable": "MERGEABLE"},
+            ]
+        )
+        gh.head_sha = AsyncMock(return_value="head-sha")
+        gh.commit_committed_at = AsyncMock(
+            side_effect=[
+                GitHubError("temporary commit lookup failure"),
+                GitHubError("temporary commit lookup failure"),
+                "2026-05-19T12:05:00Z",
+                "2026-05-19T12:05:00Z",
+            ]
+        )
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_review_comments = AsyncMock(
+            side_effect=[
+                [_codex_inline_comment(commit_sha="head-sha")],
+                [_codex_inline_comment(commit_sha="head-sha")],
+                [],
+                [],
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is not None
+        assert not await db.runs.has_review_rearm_retry(conn, "review-run")
+        assert not orch._review_rearm_retry_run_ids  # noqa: SLF001
+        assert gh.pr_comment.await_count == 1
+
+        await asyncio.sleep(0)
+        await _poll_review_and_wait(orch)
+
+        assert gh.pr_comment.await_count == 1
     finally:
         await conn.close()
 
@@ -2827,6 +3340,18 @@ def _codex_review_entry(*, commit_sha: str = "head-sha", state: str = "COMMENTED
     }
 
 
+def _codex_review_request_comment(
+    *,
+    created_at: str = "2026-05-19T12:01:00Z",
+) -> dict:
+    return {
+        "id": 1001,
+        "user": {"login": "review-operator"},
+        "body": "@codex review",
+        "created_at": created_at,
+    }
+
+
 @pytest.mark.asyncio
 async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity(
     tmp_path: Path,
@@ -3134,6 +3659,53 @@ async def test_review_fix_skips_retrigger_when_pr_is_already_approved(
             binding=binding,
             issue=_issue_in_progress(),
             state=state,
+        )
+
+        gh.pr_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_retrigger_skips_when_codex_inline_feedback_is_current(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        await _seed_active_review(conn)
+
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[_codex_inline_comment()])
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-11T17:50:00Z")
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+        )
+        state = await db.review_state.get(conn, "iss-1")
+
+        await orch._retrigger_codex_review_unless_approved(  # noqa: SLF001
+            binding=binding,
+            issue=_issue_in_progress(),
+            state=state,
+            require_no_signal=True,
         )
 
         gh.pr_comment.assert_not_awaited()

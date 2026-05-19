@@ -490,6 +490,26 @@ def _codex_lgtm_reactions_from_issue_comments(
     return tuple(reactions)
 
 
+def _has_codex_review_request_after_head(
+    entries: list[dict[str, object]],
+    *,
+    head_committed_at: str,
+) -> bool:
+    head_dt = _parse_optional_datetime(head_committed_at)
+    if head_dt is None:
+        return False
+    for entry in entries:
+        body = str(entry.get("body") or "").strip()
+        if body.casefold() != "@codex review":
+            continue
+        created_at = _parse_optional_datetime(
+            str(entry.get("created_at") or entry.get("createdAt") or "")
+        )
+        if created_at is not None and created_at >= head_dt:
+            return True
+    return False
+
+
 async def _commit_committed_at_or_empty(
     gh: GitHub,
     *,
@@ -926,6 +946,9 @@ class Orchestrator:
         # can cancel the task immediately, preventing mid-iteration fix-run dispatch.
         self._review_poll_run_tasks: dict[str, asyncio.Task[None]] = {}
         self._merge_wait_reconcile_issue_ids: set[str] = set()
+        # Resurrected review monitors whose no-signal @codex re-arm hit a
+        # transient GitHub read/write failure and should be retried while live.
+        self._review_rearm_retry_run_ids: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -1624,6 +1647,7 @@ class Orchestrator:
         self._review_poll_run_tasks.pop(run_id, None)
         if self._review_poll_issue_ids.get(issue_id) == run_id:
             self._review_poll_issue_ids.pop(issue_id, None)
+        await self._clear_review_rearm_retry(run_id)
         await db.runs.update_status(
             self._conn,
             run_id,
@@ -2319,6 +2343,22 @@ class Orchestrator:
         )
         return task
 
+    async def _mark_review_rearm_retry(self, run_id: str) -> None:
+        self._review_rearm_retry_run_ids.add(run_id)
+        await db.runs.mark_review_rearm_retry(self._conn, run_id)
+
+    async def _clear_review_rearm_retry(self, run_id: str) -> None:
+        self._review_rearm_retry_run_ids.discard(run_id)
+        await db.runs.clear_review_rearm_retry(self._conn, run_id)
+
+    async def _review_rearm_retry_pending(self, run_id: str) -> bool:
+        if run_id in self._review_rearm_retry_run_ids:
+            return True
+        if await db.runs.has_review_rearm_retry(self._conn, run_id):
+            self._review_rearm_retry_run_ids.add(run_id)
+            return True
+        return False
+
     async def _poll_review_run_with_limits(
         self,
         run: db.runs.Run,
@@ -2342,7 +2382,23 @@ class Orchestrator:
         if current is None:
             return
         current_binding, current_issue = current
-        await self._poll_review_run(run, current_binding, current_issue)
+        rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
+        rearm_done = True
+        if rearm_retry_pending:
+            state = await db.review_state.get(self._conn, current_issue.id)
+            rearm_done = await self._retrigger_codex_review_unless_approved(
+                binding=current_binding,
+                issue=current_issue,
+                state=state,
+                require_no_signal=True,
+            )
+            if rearm_done:
+                await self._clear_review_rearm_retry(run.id)
+        handled_feedback = await self._poll_review_run(
+            run, current_binding, current_issue
+        )
+        if rearm_retry_pending and not rearm_done and handled_feedback:
+            await self._clear_review_rearm_retry(run.id)
 
     async def _refresh_review_poll_candidate(
         self,
@@ -2425,6 +2481,7 @@ class Orchestrator:
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+        await self._clear_review_rearm_retry(run.id)
 
     async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None:
         """Retire review polling once a merge run owns the issue."""
@@ -2452,6 +2509,7 @@ class Orchestrator:
                 if not task.done():
                     task.cancel()
             self._review_poll_run_ids.discard(run.id)
+            await self._clear_review_rearm_retry(run.id)
 
         for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
             if mapped_issue_id == issue.id or mapped_run_id in closed_run_ids:
@@ -2468,7 +2526,7 @@ class Orchestrator:
         run: db.runs.Run,
         binding: RepoBinding,
         issue: LinearIssue,
-    ) -> None:
+    ) -> bool:
         state = await db.review_state.get(self._conn, issue.id)
         if state.pr_number is None:
             await self._fail_review_run(
@@ -2478,7 +2536,7 @@ class Orchestrator:
                 error="review run has no PR number",
                 last_log="",
             )
-            return
+            return False
 
         try:
             checks = await self._gh.pr_checks(state.pr_number, repo=binding.github_repo)
@@ -2505,7 +2563,7 @@ class Orchestrator:
                     ),
                     last_log=str(e),
                 )
-            return
+            return False
 
         await db.review_state.reset_ci_fetch_failures(self._conn, issue.id)
 
@@ -2693,13 +2751,13 @@ class Orchestrator:
         )
 
         if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
-            return
+            return False
         if verdict.merge_conflict:
             if not should_dispatch_fix_run(
                 prev_signature=state.last_trigger_signature,
                 new_signature=verdict.trigger_signature,
             ):
-                return
+                return False
             if has_hit_iteration_cap(
                 iteration=state.iteration, cap=self.config.review_iteration_cap
             ):
@@ -2709,7 +2767,7 @@ class Orchestrator:
                     issue=issue,
                     trigger=verdict.trigger_signature,
                 )
-                return
+                return True
             dispatched = await self._dispatch_merge_conflict_fix_run(
                 run=run,
                 binding=binding,
@@ -2722,12 +2780,12 @@ class Orchestrator:
                 # new commit (HEAD SHA unchanged), we still want the next poll to
                 # re-evaluate instead of being blocked by the dedup gate.
                 await db.review_state.set_signature(self._conn, issue.id, "")
-            return
+            return dispatched
         if not should_dispatch_fix_run(
             prev_signature=state.last_trigger_signature,
             new_signature=verdict.trigger_signature,
         ):
-            return
+            return False
         if has_hit_iteration_cap(
             iteration=state.iteration, cap=self.config.review_iteration_cap
         ):
@@ -2737,7 +2795,7 @@ class Orchestrator:
                 issue=issue,
                 trigger=verdict.trigger_signature,
             )
-            return
+            return True
 
         iteration = state.iteration + 1
         if verdict.rule == "failing_ci":
@@ -2762,6 +2820,7 @@ class Orchestrator:
             await db.review_state.set_signature(
                 self._conn, issue.id, verdict.trigger_signature
             )
+        return dispatched
 
     async def _dispatch_ci_fix_run(
         self,
@@ -2952,13 +3011,26 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         state: db.review_state.ReviewState,
-    ) -> None:
+        require_no_signal: bool = False,
+    ) -> bool:
+        """Post @codex review unless current PR state makes it unnecessary.
+
+        Returns False only when the attempt was inconclusive and should be
+        retried by a resurrection caller.
+        """
         if state.pr_number is None:
-            return
+            return True
+        head_sha = ""
         try:
-            verdict = await self._review_approval_verdict_for_pr(
+            (
+                verdict,
+                head_sha,
+                head_committed_at,
+                issue_comments,
+            ) = await self._review_verdict_and_head_for_pr(
                 binding=binding,
                 pr_number=state.pr_number,
+                include_comments=require_no_signal,
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
@@ -2968,6 +3040,8 @@ class Orchestrator:
                 state.pr_number,
                 e,
             )
+            if require_no_signal:
+                return False
         else:
             if verdict.kind is VerdictKind.APPROVED:
                 log.info(
@@ -2977,25 +3051,65 @@ class Orchestrator:
                     state.pr_number,
                     issue.identifier,
                 )
-                return
-        await self._retrigger_codex_review(
+                return True
+            if require_no_signal and verdict.kind is VerdictKind.CHANGES_REQUESTED:
+                log.info(
+                    "skipping @codex review re-trigger on %s#%d for %s: "
+                    "current head already has review feedback (%s)",
+                    binding.github_repo,
+                    state.pr_number,
+                    issue.identifier,
+                    verdict.rule,
+                )
+                return True
+            if require_no_signal and verdict.rule != "no_signal":
+                log.info(
+                    "skipping @codex review re-trigger on %s#%d for %s: "
+                    "current review verdict is pending via %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    issue.identifier,
+                    verdict.rule,
+                )
+                return True
+            if require_no_signal:
+                if _has_codex_review_request_after_head(
+                    issue_comments,
+                    head_committed_at=head_committed_at,
+                ):
+                    log.info(
+                        "skipping duplicate @codex review re-trigger on %s#%d "
+                        "for %s at %s: request comment already exists",
+                        binding.github_repo,
+                        state.pr_number,
+                        issue.identifier,
+                        head_sha,
+                    )
+                    return True
+        posted = await self._retrigger_codex_review(
             binding=binding,
             state=state,
         )
+        return posted
 
-    async def _review_approval_verdict_for_pr(
+    async def _review_verdict_and_head_for_pr(
         self,
         *,
         binding: RepoBinding,
         pr_number: int,
-    ) -> Verdict:
+        include_comments: bool = False,
+    ) -> tuple[Verdict, str, str, list[dict[str, object]]]:
         view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
             raise GitHubError(
                 f"pr view missing headRefOid for {binding.github_repo}#{pr_number}"
             )
-
+        comments = []
+        if include_comments:
+            comments = await self._gh.pr_review_comments(
+                pr_number, repo=binding.github_repo
+            )
         reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
         reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
         try:
@@ -3004,6 +3118,8 @@ class Orchestrator:
                 repo=binding.github_repo,
             )
         except GitHubError as e:
+            if include_comments:
+                raise
             log.warning(
                 "could not fetch PR issue comments for %s#%d: %s",
                 binding.github_repo,
@@ -3023,16 +3139,25 @@ class Orchestrator:
             reviews=_reviews_from_github(reviews),
             mergeable=str(view.get("mergeable") or ""),
         )
-        return review_classifier(comments=[], ci=[], snapshot=snapshot)
+        return (
+            review_classifier(
+                comments=_review_comments_from_github(comments),
+                ci=[],
+                snapshot=snapshot,
+            ),
+            head_sha,
+            committed_at,
+            issue_comments,
+        )
 
     async def _retrigger_codex_review(
         self,
         *,
         binding: RepoBinding,
         state: db.review_state.ReviewState,
-    ) -> None:
+    ) -> bool:
         if state.pr_number is None:
-            return
+            return False
         try:
             await self._gh.pr_comment(
                 state.pr_number,
@@ -3046,6 +3171,8 @@ class Orchestrator:
                 state.pr_number,
                 e,
             )
+            return False
+        return True
 
     def _format_comment_trigger(self, verdict: Verdict, iteration: int) -> str:
         cap = self.config.review_iteration_cap
@@ -4295,6 +4422,7 @@ class Orchestrator:
         if monitor_task is not None and not monitor_task.done():
             monitor_task.cancel()
         self._review_poll_run_ids.discard(monitor_run_id)
+        await self._clear_review_rearm_retry(monitor_run_id)
         if self._review_poll_issue_ids.get(issue_id) == monitor_run_id:
             self._review_poll_issue_ids.pop(issue_id, None)
 
@@ -4426,6 +4554,14 @@ class Orchestrator:
             )
             await self._move_issue_to_review_state(binding=binding, issue=issue)
             scheduled.append(self._schedule_review_poll(run, binding, issue))
+            rearm_done = await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+                require_no_signal=True,
+            )
+            if not rearm_done:
+                await self._mark_review_rearm_retry(review_run_id)
         return scheduled
 
     async def _fail_review_run(
@@ -4445,6 +4581,7 @@ class Orchestrator:
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+        await self._clear_review_rearm_retry(run.id)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
         state = await db.review_state.get(self._conn, issue.id)
@@ -4490,6 +4627,7 @@ class Orchestrator:
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+        await self._clear_review_rearm_retry(run.id)
         repo = state.github_repo or "(unknown repo)"
         cost = await db.runs.cost_for_issue(self._conn, issue.id)
         body = failed(
@@ -4561,6 +4699,7 @@ class Orchestrator:
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+        await self._clear_review_rearm_retry(run.id)
 
     async def _scan_binding(
         self, binding: RepoBinding

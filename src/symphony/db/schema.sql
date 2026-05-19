@@ -121,6 +121,12 @@ CREATE TABLE IF NOT EXISTS review_state (
     codex_lgtm_comment_id  TEXT NOT NULL DEFAULT ''
 );
 
+-- Resurrected Review monitor rows whose opportunistic `@codex review`
+-- re-arm was inconclusive and must be retried by the live monitor task.
+CREATE TABLE IF NOT EXISTS review_rearm_retries (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE
+);
+
 -- Per-issue cost-warning idempotency. The cost warning template fires
 -- exactly once per issue — when the cumulative cost first crosses the
 -- configured threshold. Persisting the post timestamp lets a restarted
