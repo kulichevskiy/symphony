@@ -223,13 +223,15 @@ async def test_runs_list_live_with_pid_filters_correctly(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_runs_list_live_without_pid_filters_correctly(tmp_path: Path) -> None:
+async def test_runs_list_live_review_without_pid_filters_correctly(
+    tmp_path: Path,
+) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await db.issues.upsert(
             conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
         )
-        # Live without pid — should be returned.
+        # Live review without pid: should be returned.
         await db.runs.create(
             conn,
             id="nopid",
@@ -238,6 +240,17 @@ async def test_runs_list_live_without_pid_filters_correctly(tmp_path: Path) -> N
             status="running",
             pid=None,
             started_at="2026-05-10T00:01:00+00:00",
+        )
+        # Live implement without pid: should NOT be returned; pidless
+        # reconciliation is only for in-process review monitors.
+        await db.runs.create(
+            conn,
+            id="nopid-implement",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
         )
         # Live with pid — should NOT be returned.
         await db.runs.create(
@@ -259,7 +272,7 @@ async def test_runs_list_live_without_pid_filters_correctly(tmp_path: Path) -> N
             pid=None,
             started_at="2026-05-09T00:00:00+00:00",
         )
-        rows = await db.runs.list_live_without_pid(conn)
+        rows = await db.runs.list_live_review_without_pid(conn)
         ids = sorted(r.id for r in rows)
         assert ids == ["nopid"]
         assert rows[0].pid is None

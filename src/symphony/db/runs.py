@@ -270,14 +270,14 @@ async def list_live_with_pid(conn: aiosqlite.Connection) -> list[Run]:
     return [_row_to_run(r) for r in rows]
 
 
-async def list_live_without_pid(conn: aiosqlite.Connection) -> list[Run]:
-    """Live runs with no PID, such as in-process review monitors."""
+async def list_live_review_without_pid(conn: aiosqlite.Connection) -> list[Run]:
+    """Live review runs with no PID, owned by in-process review monitors."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
         FROM runs
-        WHERE status IN ({placeholders}) AND pid IS NULL
+        WHERE stage = 'review' AND status IN ({placeholders}) AND pid IS NULL
         """,
         LIVE_STATUSES,
     )

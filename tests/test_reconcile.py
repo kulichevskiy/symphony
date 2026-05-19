@@ -91,6 +91,22 @@ async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments
             pid=None,
             started_at="2026-05-10T00:00:00+00:00",
         )
+        await db.issues.upsert(
+            conn,
+            id="iss-implement",
+            identifier="ENG-6",
+            title="t",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-implement",
+            issue_id="iss-implement",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
 
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
@@ -111,6 +127,14 @@ async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments
         assert row is not None
         assert row[0] == db.runs.INTERRUPTED_STATUS
         assert row[1] is not None
+
+        cur = await conn.execute(
+            "SELECT status, ended_at FROM runs WHERE id=?", ("pidless-implement",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.LIVE_STATUSES[0]
+        assert row[1] is None
     finally:
         await conn.close()
 

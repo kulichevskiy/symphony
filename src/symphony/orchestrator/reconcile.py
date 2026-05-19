@@ -1,7 +1,7 @@
 """Startup reconciliation.
 
 Runs that were live when the host died still show as `running` with the
-old PID, or with no PID for in-process tasks such as review monitors. We
+old PID, or with no PID for in-process review-monitor tasks. We
 can't resume that work in a fresh process, so we mark each orphaned row
 `interrupted` and post a Linear comment. Live PIDs are left alone — they
 belong to runs the orchestrator adopts on the next poll.
@@ -120,7 +120,7 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
             log.warning("could not post reconcile comment on %s: %s", run.issue_id, e)
         flipped += 1
 
-    for run in await db.runs.list_live_without_pid(conn):
+    for run in await db.runs.list_live_review_without_pid(conn):
         log.info(
             "reconcile: run=%s issue=%s has no pid — marking interrupted",
             run.id,
