@@ -37,6 +37,7 @@ from symphony.orchestrator.poll import (
     build_runner_command,
     pr_number_from_url,
 )
+from symphony.orchestrator.reconcile import reconcile
 
 
 class _FakeRunner:
@@ -1851,7 +1852,9 @@ async def test_dead_review_monitor_is_resurrected_after_cooldown(
 
         gh = MagicMock()
         gh.pr_checks = AsyncMock(return_value=PRChecks())
-        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha", "mergeable": "MERGEABLE"})
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "sha", "mergeable": "MERGEABLE"}
+        )
         gh.head_sha = AsyncMock(return_value="sha")
         gh.commit_committed_at = AsyncMock(return_value="2026-05-11T17:50:00Z")
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -1872,6 +1875,78 @@ async def test_dead_review_monitor_is_resurrected_after_cooldown(
         assert linear.post_comment.await_count >= 1
         posted = linear.post_comment.await_args.args[1]
         assert "Resumed" in posted
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
+    tmp_path: Path,
+) -> None:
+    """A host restart strands in-process review monitors with pid=NULL.
+
+    Startup reconciliation must make that row terminal, then the normal poll
+    tick should immediately resurrect the open PR monitor.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.issues_in_state = AsyncMock(return_value=[])
+        linear.comments_since = AsyncMock(return_value=[])
+
+        flipped = await reconcile(conn, linear)
+        assert flipped == 1
+        original = await db.runs.latest_for_issue_stage(
+            conn, issue_id="iss-1", stage="review"
+        )
+        assert original is not None
+        assert original.status == db.runs.INTERRUPTED_STATUS
+        assert original.ended_at is None
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(return_value=PRChecks())
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "sha", "mergeable": "MERGEABLE"}
+        )
+        gh.head_sha = AsyncMock(return_value="sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-11T17:50:00Z")
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        tasks = await orch._tick()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        live = [r for r in history if r.stage == "review" and r.status == "running"]
+        assert len(live) == 1
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Host restarted" in body for body in bodies)
+        assert any("Resumed" in body for body in bodies)
     finally:
         await conn.close()
 

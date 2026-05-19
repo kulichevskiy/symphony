@@ -89,6 +89,54 @@ async def get(
     return _row_to_issue_pr(row)
 
 
+async def has_for_issue(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
+    cur = await conn.execute(
+        "SELECT 1 FROM issue_prs WHERE issue_id = ? LIMIT 1",
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def has_orphaned_review_pr(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
+    """True when review resurrection can pick up an issue's PR."""
+    live_placeholders = ",".join("?" * len(LIVE_STATUSES))
+    resurrect_placeholders = ",".join("?" * len(REVIEW_RESURRECT_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT 1
+        FROM issue_prs p
+        WHERE p.issue_id = ?
+          AND p.merged_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'review'
+                AND r.status IN ({live_placeholders})
+          )
+          AND (
+              SELECT r.status FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'review'
+                AND r.started_at >= p.created_at
+              ORDER BY r.started_at DESC, r.rowid DESC
+              LIMIT 1
+          ) IN ({resurrect_placeholders})
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'merge'
+                AND r.status IN ('running', 'completed', 'done', 'needs_approval')
+                AND r.started_at >= p.created_at
+          )
+        LIMIT 1
+        """,
+        (issue_id, *LIVE_STATUSES, *REVIEW_RESURRECT_STATUSES),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
 async def mark_merged(
     conn: aiosqlite.Connection,
     *,
@@ -284,6 +332,8 @@ __all__ = [
     "IssuePR",
     "delete",
     "get",
+    "has_for_issue",
+    "has_orphaned_review_pr",
     "list_merge_candidates",
     "list_orphaned_review_prs",
     "mark_merged",

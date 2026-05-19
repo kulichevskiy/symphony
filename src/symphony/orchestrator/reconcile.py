@@ -1,10 +1,10 @@
 """Startup reconciliation.
 
 Runs that were live when the host died still show as `running` with the
-old PID. We can't resume the subprocess (it's gone), so we mark each
-dead-PID row `interrupted` and post a Linear comment telling the user to
-`$retry`. Live PIDs are left alone — they belong to runs the orchestrator
-adopts on the next poll.
+old PID, or with no PID for in-process review-monitor tasks. We
+can't resume that work in a fresh process, so we mark each orphaned row
+`interrupted` and post a Linear comment. Live PIDs are left alone — they
+belong to runs the orchestrator adopts on the next poll.
 """
 
 from __future__ import annotations
@@ -23,8 +23,54 @@ log = logging.getLogger(__name__)
 _RETRY_BODY = (
     "🔁 **Host restarted — run interrupted**\n\n"
     "The Symphony host was restarted while this run was in flight, so the "
-    "agent subprocess is gone. Reply `$retry` to dispatch again.\n"
+    "agent subprocess or review monitor is gone. Review monitors will resume "
+    "automatically when possible; otherwise reply `$retry` to dispatch again.\n"
 )
+
+
+async def _preserve_pidless_review_retry_path(
+    conn: aiosqlite.Connection,
+    run: db.runs.Run,
+    *,
+    created_at: str,
+) -> None:
+    if run.stage != "review":
+        return
+
+    state = await db.review_state.get(conn, run.issue_id)
+    if not state.github_repo:
+        log.warning(
+            "could not preserve retry path for pidless review run=%s issue=%s: "
+            "missing review_state.github_repo",
+            run.id,
+            run.issue_id,
+        )
+        return
+
+    cur = await conn.execute(
+        "SELECT team_key FROM issues WHERE id = ?",
+        (run.issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        log.warning(
+            "could not preserve retry path for pidless review run=%s issue=%s: "
+            "missing issue row",
+            run.id,
+            run.issue_id,
+        )
+        return
+
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=run.issue_id,
+        run_id=run.id,
+        kind=db.operator_waits.KIND_REVIEW_FAILED,
+        linear_team_key=str(row["team_key"]),
+        github_repo=state.github_repo,
+        issue_label=state.issue_label,
+        created_at=created_at,
+    )
 
 
 def _process_alive(pid: int) -> bool:
@@ -47,8 +93,10 @@ def _process_alive(pid: int) -> bool:
 
 
 async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
-    """Walk live-with-PID runs; flip dead ones to `interrupted`. Returns
-    the number of rows flipped."""
+    """Walk live runs; flip orphaned ones to `interrupted`.
+
+    Returns the number of rows flipped.
+    """
     rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
     now = datetime.now(UTC).isoformat()
@@ -64,6 +112,30 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
         await db.runs.update_status(
             conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
         )
+        try:
+            await linear.post_comment(run.issue_id, _RETRY_BODY)
+        except LinearError as e:
+            log.warning("could not post reconcile comment on %s: %s", run.issue_id, e)
+        flipped += 1
+
+    for run in await db.runs.list_live_review_without_pid(conn):
+        log.info(
+            "reconcile: run=%s issue=%s has no pid — marking interrupted",
+            run.id,
+            run.issue_id,
+        )
+        await db.runs.update_status(
+            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=None
+        )
+        # Linked, still-open PRs are resumed by _resurrect_review_runs() on the
+        # next poll. Leave ended_at NULL so startup reconcile does not trigger
+        # that path's recent-failure cooldown. Historical PR rows that the
+        # resurrection query ignores still need the operator-wait retry path.
+        if not await db.issue_prs.has_orphaned_review_pr(conn, issue_id=run.issue_id):
+            await db.runs.update_status(
+                conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+            )
+            await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
         except LinearError as e:
