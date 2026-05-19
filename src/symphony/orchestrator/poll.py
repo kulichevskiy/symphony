@@ -3118,6 +3118,8 @@ class Orchestrator:
                 repo=binding.github_repo,
             )
         except GitHubError as e:
+            if include_comments:
+                raise
             log.warning(
                 "could not fetch PR issue comments for %s#%d: %s",
                 binding.github_repo,
