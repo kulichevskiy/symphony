@@ -23,7 +23,13 @@ from pathlib import Path
 
 import pytest
 
-from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
+from symphony.github.client import (
+    CheckRun,
+    GitHub,
+    GitHubError,
+    PRChecks,
+    _is_auto_merge_disabled_error,
+)
 
 
 def _make_fake_gh(
@@ -366,6 +372,24 @@ async def test_check_log_tail_fetches_run_log_from_check_link(fake_gh) -> None: 
 # ---- pr_merge -------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("GraphQL: enablePullRequestAutoMerge must be true", True),
+        ("GraphQL: enablePullRequestAutoMerge=false", True),
+        ("Auto merge is not allowed for this repository", True),
+        (
+            "GraphQL: Resource not accessible by integration (enablePullRequestAutoMerge)",
+            False,
+        ),
+        ("GraphQL: Base branch was modified", False),
+        ("gh pr merge 99 exited 1: something else failed", False),
+    ],
+)
+def test_auto_merge_disabled_error_classifier(message: str, expected: bool) -> None:
+    assert _is_auto_merge_disabled_error(message) is expected
+
+
 async def test_pr_merge_squash_with_auto(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"pr merge": [0, ""]})
     gh = GitHub()
@@ -387,6 +411,65 @@ async def test_pr_merge_omits_auto_unless_requested(fake_gh) -> None:  # type: i
     assert isinstance(argv, list)
     assert "--auto" not in argv
     assert "--merge" in argv
+
+
+async def test_pr_merge_degrades_auto_merge_disabled_to_sync_retry(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh(
+        {
+            "pr merge 99 --squash --repo org/r --auto": [
+                1,
+                "GraphQL: enablePullRequestAutoMerge must be true\n",
+            ],
+            "pr merge 99 --squash --repo org/r": [0, ""],
+        }
+    )
+    gh = GitHub()
+
+    await gh.pr_merge(99, strategy="squash", auto=True, repo="org/r")
+
+    calls = _calls(log)
+    assert len(calls) == 2
+    first = calls[0]["argv"]
+    second = calls[1]["argv"]
+    assert isinstance(first, list)
+    assert isinstance(second, list)
+    assert "--auto" in first
+    assert "--auto" not in second
+
+
+async def test_pr_merge_sync_retry_error_wins_and_degraded_state_sticks(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh(
+        {
+            "pr merge 99 --merge --repo org/r --auto": [
+                1,
+                "GraphQL: Auto merge is not allowed for this repository\n",
+            ],
+            "pr merge 99 --merge --repo org/r": [
+                1,
+                "GraphQL: Base branch was modified\n",
+            ],
+        }
+    )
+    gh = GitHub()
+
+    with pytest.raises(GitHubError, match="Base branch was modified") as exc:
+        await gh.pr_merge(99, strategy="merge", auto=True, repo="org/r")
+    assert "Auto merge is not allowed" not in str(exc.value)
+
+    with pytest.raises(GitHubError, match="Base branch was modified"):
+        await gh.pr_merge(99, strategy="merge", auto=True, repo="org/r")
+
+    calls = _calls(log)
+    assert len(calls) == 3
+    first = calls[0]["argv"]
+    second = calls[1]["argv"]
+    third = calls[2]["argv"]
+    assert isinstance(first, list)
+    assert isinstance(second, list)
+    assert isinstance(third, list)
+    assert "--auto" in first
+    assert "--auto" not in second
+    assert "--auto" not in third
 
 
 # ---- non-zero exit + GH_TOKEN env -----------------------------------
