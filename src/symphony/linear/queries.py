@@ -214,6 +214,10 @@ UPDATE_ISSUE_STATE = """
 mutation MoveIssue($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) {
     success
+    issue {
+      identifier
+      state { id name }
+    }
   }
 }
 """

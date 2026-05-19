@@ -11,6 +11,7 @@ first-call failure.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -242,8 +243,27 @@ class Linear:
             queries.UPDATE_ISSUE_STATE,
             {"id": issue_id_or_identifier, "stateId": state_id},
         )
-        if not data["issueUpdate"].get("success"):
+        result = data["issueUpdate"]
+        if not result.get("success"):
             raise LinearError("issueUpdate returned success=false")
+        issue = result.get("issue") or {}
+        state = issue.get("state") or {}
+        issue_identifier = str(issue.get("identifier") or issue_id_or_identifier)
+        state_name = str(state.get("name") or state_id)
+        logged_state_id = str(state.get("id") or state_id)
+        frame = inspect.currentframe()
+        caller_frame = frame.f_back if frame is not None else None
+        caller = "unknown"
+        if caller_frame is not None:
+            caller = f"{caller_frame.f_code.co_filename}:{caller_frame.f_lineno}"
+        del frame
+        log.info(
+            "move_issue %s → %s (%s) caller=%s",
+            issue_identifier,
+            state_name,
+            logged_state_id,
+            caller,
+        )
 
     async def team_states(self, team_key: str) -> dict[str, str]:
         """Return name -> state UUID for a team.

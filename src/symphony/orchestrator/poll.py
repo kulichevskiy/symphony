@@ -28,7 +28,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -122,6 +122,8 @@ CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
+MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
+MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
@@ -949,6 +951,8 @@ class Orchestrator:
         # Resurrected review monitors whose no-signal @codex re-arm hit a
         # transient GitHub read/write failure and should be retried while live.
         self._review_rearm_retry_run_ids: set[str] = set()
+        self._merged_linear_state_reconcile_ticks = 0
+        self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -1127,6 +1131,21 @@ class Orchestrator:
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
         await self._restore_operator_waits()
+        self._merged_linear_state_reconcile_ticks += 1
+        if (
+            self._merged_linear_state_reconcile_ticks
+            % MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL
+            == 0
+        ):
+            try:
+                corrected = await self._reconcile_merged_issues_linear_state()
+                if corrected:
+                    log.info(
+                        "reconciled %d merged Linear issue(s) back to Done",
+                        corrected,
+                    )
+            except Exception:  # noqa: BLE001 — must not kill the loop
+                log.exception("merged issue Linear state reconcile failed")
         try:
             scheduled.extend(await self._poll_merge_candidates())
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -5250,6 +5269,84 @@ class Orchestrator:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    async def _reconcile_merged_issues_linear_state(self) -> int:
+        since = self._now() - timedelta(
+            hours=MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS
+        )
+        recent_merged = await db.issue_prs.list_recent_merged(self._conn, since=since)
+        corrected = 0
+        for pr in recent_merged:
+            binding = self._binding_for_pr(pr)
+            if binding is None:
+                log.warning(
+                    "no binding for merged Linear-state reconcile candidate %s in %s",
+                    pr.identifier,
+                    pr.github_repo,
+                )
+                continue
+            try:
+                states = await self._states_for_binding(binding)
+            except LinearError as e:
+                log.warning(
+                    "could not load states while reconciling merged issue %s: %s",
+                    pr.identifier,
+                    e,
+                )
+                continue
+            done_id = states.get(binding.linear_states.done)
+            if done_id is None:
+                log.warning(
+                    "missing Linear done state %r while reconciling merged issue %s",
+                    binding.linear_states.done,
+                    pr.identifier,
+                )
+                continue
+            try:
+                issue = await self.linear.lookup_issue(pr.issue_id)
+            except LinearError as e:
+                log.warning(
+                    "could not refresh merged issue %s for state reconcile: %s",
+                    pr.identifier,
+                    e,
+                )
+                continue
+            if issue.state_name == binding.linear_states.done or issue.state_id == done_id:
+                continue
+
+            observed_state = issue.state_name or issue.state_id or "unknown"
+            try:
+                await self.linear.move_issue(issue.id, done_id)
+            except LinearError as e:
+                log.warning(
+                    "could not re-move merged issue %s from %s to %s: %s",
+                    issue.identifier,
+                    observed_state,
+                    binding.linear_states.done,
+                    e,
+                )
+                continue
+            corrected += 1
+
+            comment_key = (issue.id, observed_state)
+            if comment_key in self._merged_linear_state_drift_comment_keys:
+                continue
+            body = (
+                f"♻️ Linear status drifted back to {observed_state} after merge — "
+                f"re-moving to {binding.linear_states.done}. PR #{pr.pr_number} "
+                f"was merged at {pr.merged_at}."
+            )
+            try:
+                await self.linear.post_comment(issue.id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "could not post merged issue drift correction comment for %s: %s",
+                    issue.identifier,
+                    e,
+                )
+                continue
+            self._merged_linear_state_drift_comment_keys.add(comment_key)
+        return corrected
 
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""

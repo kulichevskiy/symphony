@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -93,6 +94,14 @@ def _issue() -> LinearIssue:
     )
 
 
+def _done_issue() -> LinearIssue:
+    issue = _issue()
+    issue.state_id = "state-done"
+    issue.state_name = "Done"
+    issue.state_type = "completed"
+    return issue
+
+
 def _ready_issue(issue_id: str = "iss-2", identifier: str = "ENG-2") -> LinearIssue:
     return LinearIssue(
         id=issue_id,
@@ -155,6 +164,33 @@ async def _seed_review_candidate(
         pr_number=42,
         pr_url="https://github.com/org/repo/pull/42",
         created_at="2026-05-10T00:01:00+00:00",
+    )
+
+
+async def _seed_merged_pr(
+    conn, *, merged_at: str, binding_key: str = ""
+) -> None:  # type: ignore[no-untyped-def]
+    await db.issues.upsert(
+        conn,
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        team_key="ENG",
+    )
+    await db.issue_prs.upsert(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        binding_key=binding_key,
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        created_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.issue_prs.mark_merged(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        merged_at=merged_at,
     )
 
 
@@ -262,6 +298,193 @@ async def test_reconcile_merge_wait_conflict_dispatches_rebase_fix(
         assert [(run.id, run.status) for run in history if run.id == "review-run"] == [
             ("review-run", "completed")
         ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merged_issue_linear_drift_moves_back_to_done(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    now = datetime(2026, 5, 19, 20, tzinfo=UTC)
+    merged_at = (now - timedelta(minutes=6)).isoformat()
+    try:
+        await _seed_merged_pr(conn, merged_at=merged_at)
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        cfg = Config(repos=[_binding()], db_path=tmp_path / "s.sqlite")
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+            clock=lambda: now,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        assert await orch._reconcile_merged_issues_linear_state() == 1  # noqa: SLF001
+
+        linear.lookup_issue.assert_awaited_once_with("iss-1")
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        linear.post_comment.assert_awaited_once()
+        assert linear.post_comment.await_args.args[0] == "iss-1"
+        body = linear.post_comment.await_args.args[1]
+        assert (
+            f"♻️ Linear status drifted back to In Progress after merge — "
+            f"re-moving to Done. PR #42 was merged at {merged_at}."
+        ) in body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merged_issue_linear_drift_dedupes_comment(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    now = datetime(2026, 5, 19, 20, tzinfo=UTC)
+    try:
+        await _seed_merged_pr(
+            conn,
+            merged_at=(now - timedelta(minutes=6)).isoformat(),
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        cfg = Config(repos=[_binding()], db_path=tmp_path / "s.sqlite")
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+            clock=lambda: now,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        assert await orch._reconcile_merged_issues_linear_state() == 1  # noqa: SLF001
+        assert await orch._reconcile_merged_issues_linear_state() == 1  # noqa: SLF001
+
+        assert linear.move_issue.await_count == 2
+        linear.post_comment.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merged_issue_linear_done_state_noops(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    now = datetime(2026, 5, 19, 20, tzinfo=UTC)
+    try:
+        await _seed_merged_pr(
+            conn,
+            merged_at=(now - timedelta(minutes=6)).isoformat(),
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_done_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock()
+        cfg = Config(repos=[_binding()], db_path=tmp_path / "s.sqlite")
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+            clock=lambda: now,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        assert await orch._reconcile_merged_issues_linear_state() == 0  # noqa: SLF001
+
+        linear.lookup_issue.assert_awaited_once_with("iss-1")
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merged_issue_linear_state_ignores_old_merges(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    now = datetime(2026, 5, 19, 20, tzinfo=UTC)
+    try:
+        await _seed_merged_pr(
+            conn,
+            merged_at=(now - timedelta(hours=25)).isoformat(),
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock()
+        cfg = Config(repos=[_binding()], db_path=tmp_path / "s.sqlite")
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+            clock=lambda: now,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        assert await orch._reconcile_merged_issues_linear_state() == 0  # noqa: SLF001
+
+        linear.lookup_issue.assert_not_awaited()
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_tick_runs_merged_issue_reconciler_every_fifth_tick(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()], db_path=tmp_path / "s.sqlite")
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._restore_operator_waits = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._poll_merge_candidates = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._poll_review_runs = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._resurrect_review_runs = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._scan_binding = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._poll_slash_commands = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._reconcile_merged_issues_linear_state = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=0
+        )
+
+        for _ in range(4):
+            await orch._tick()  # noqa: SLF001
+        orch._reconcile_merged_issues_linear_state.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+
+        await orch._tick()  # noqa: SLF001
+
+        orch._reconcile_merged_issues_linear_state.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
 

@@ -7,6 +7,7 @@ so we also incidentally cover persistence-across-reconnect.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -372,6 +373,56 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
             merged_at="2026-05-10T00:02:00+00:00",
         )
         assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_issue_prs_lists_recent_merged_rows_since_cutoff(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    now = datetime(2026, 5, 19, 20, tzinfo=UTC)
+    try:
+        for issue_id, identifier in [
+            ("iss-recent", "ENG-1"),
+            ("iss-old", "ENG-2"),
+            ("iss-open", "ENG-3"),
+        ]:
+            await db.issues.upsert(
+                conn,
+                id=issue_id,
+                identifier=identifier,
+                title="t",
+                team_key="ENG",
+            )
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo="org/repo",
+                binding_key='["ENG","org/repo",""]',
+                pr_number=40 + int(identifier.rsplit("-", 1)[1]),
+                pr_url=f"https://github.com/org/repo/pull/{identifier}",
+                created_at=(now - timedelta(days=2)).isoformat(),
+            )
+
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id="iss-recent",
+            github_repo="org/repo",
+            merged_at=(now - timedelta(hours=1)).isoformat(),
+        )
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id="iss-old",
+            github_repo="org/repo",
+            merged_at=(now - timedelta(hours=25)).isoformat(),
+        )
+
+        rows = await db.issue_prs.list_recent_merged(
+            conn,
+            since=now - timedelta(hours=24),
+        )
+
+        assert [row.issue_id for row in rows] == ["iss-recent"]
     finally:
         await conn.close()
 
