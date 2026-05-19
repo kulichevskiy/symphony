@@ -198,6 +198,33 @@ async def get(
     return _row_to_issue_pr(row)
 
 
+async def get_for_issue(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+) -> IssuePR | None:
+    cur = await conn.execute(
+        """
+        SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+        FROM issue_prs p
+        JOIN issues i ON i.id = p.issue_id
+        WHERE p.issue_id = ?
+        ORDER BY
+          p.merged_at IS NOT NULL ASC,
+          COALESCE(p.merged_at, p.created_at) DESC,
+          p.created_at DESC,
+          p.github_repo ASC
+        LIMIT 1
+        """,
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_issue_pr(row)
+
+
 async def has_for_issue(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
     cur = await conn.execute(
         "SELECT 1 FROM issue_prs WHERE issue_id = ? LIMIT 1",
@@ -441,6 +468,7 @@ __all__ = [
     "IssuePR",
     "delete",
     "get",
+    "get_for_issue",
     "has_for_issue",
     "has_orphaned_review_pr",
     "list_merge_candidates",

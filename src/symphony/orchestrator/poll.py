@@ -27,7 +27,7 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -4753,10 +4753,141 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
+            pr = await db.issue_prs.get(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+            )
+            if pr is not None:
+                blocking_pr = await self._blocking_existing_pr(binding, issue, pr)
+                if blocking_pr is not None:
+                    await self._park_already_has_pr(binding, issue, blocking_pr)
+                    return None
             if binding.linear_states.waiting is not None and is_blocked(issue):
                 await self._park_blocked_by_deps(binding, issue)
                 return None
             return self._schedule_dispatch(binding, issue)
+
+    async def _blocking_existing_pr(
+        self,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr: db.issue_prs.IssuePR,
+    ) -> db.issue_prs.IssuePR | None:
+        if pr.merged_at is not None:
+            return pr
+
+        try:
+            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not verify existing PR before ready dispatch for %s#%d: %s",
+                binding.github_repo,
+                pr.pr_number,
+                e,
+            )
+            return pr
+
+        if _pr_view_is_merged(view):
+            merged_at = str(view.get("mergedAt") or self._now().isoformat())
+            updated = await db.issue_prs.update_merged(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+                pr_number=pr.pr_number,
+                merged_at=merged_at,
+            )
+            if not updated:
+                log.warning(
+                    "could not mark existing PR row merged before parking %s for %s#%d",
+                    issue.identifier,
+                    binding.github_repo,
+                    pr.pr_number,
+                )
+            return replace(pr, merged_at=merged_at)
+
+        if _pr_view_is_closed(view):
+            deleted = await db.issue_prs.delete(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+                pr_number=pr.pr_number,
+            )
+            if not deleted:
+                log.warning(
+                    "could not delete closed unmerged PR row before ready dispatch "
+                    "for %s#%d",
+                    binding.github_repo,
+                    pr.pr_number,
+                )
+            return None
+
+        return pr
+
+    async def _park_already_has_pr(
+        self,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr: db.issue_prs.IssuePR,
+    ) -> None:
+        if pr.merged_at is not None:
+            target_state = binding.linear_states.done
+            body = (
+                f"🛑 Cannot re-implement: PR #{pr.pr_number} was already merged at "
+                f"{pr.merged_at}. Moving issue back to {target_state}. To genuinely "
+                "redo this work, revert the merge and remove the `issue_prs` row. "
+                f"{pr.pr_url}"
+            )
+        else:
+            target_state = binding.linear_states.in_progress
+            body = (
+                f"🛑 Cannot re-implement: PR #{pr.pr_number} is still open. Moving "
+                f"issue back to {target_state}. Close the PR via `gh pr close` if "
+                f"you want to abandon it. {pr.pr_url}"
+            )
+
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states before parking %s with existing PR #%d: %s",
+                issue.identifier,
+                pr.pr_number,
+                e,
+            )
+            return
+        else:
+            target_id = states.get(target_state)
+            if target_id is None:
+                log.warning(
+                    "could not move %s after existing PR guard: missing Linear "
+                    "state %r for team %s",
+                    issue.identifier,
+                    target_state,
+                    binding.linear_team_key,
+                )
+                return
+            else:
+                try:
+                    await self.linear.move_issue(issue.id, target_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s after existing PR guard for PR #%d: %s",
+                        issue.identifier,
+                        pr.pr_number,
+                        e,
+                    )
+                    return
+
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "could not comment after existing PR guard for %s PR #%d: %s",
+                issue.identifier,
+                pr.pr_number,
+                e,
+            )
 
     async def _park_blocked_by_deps(
         self, binding: RepoBinding, issue: LinearIssue

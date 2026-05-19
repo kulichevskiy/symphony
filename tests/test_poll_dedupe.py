@@ -15,7 +15,7 @@ import pytest
 from symphony import db
 from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.linear.client import LinearIssue
+from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 
 
@@ -323,6 +323,302 @@ async def test_scan_skips_issues_with_running_run(tmp_path: Path) -> None:
 
         await _scan_and_wait(orch, cfg.repos[0])
         linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_parks_issue_when_pr_already_merged(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "Done": "state-done",
+            }
+        }
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=101,
+            pr_url="https://github.com/org/repo/pull/101",
+            created_at="2026-05-19T12:00:00+00:00",
+        )
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            merged_at="2026-05-19T13:15:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert await db.runs.history_for_issue(conn, issue.id) == []
+        linear.move_issue.assert_awaited_once_with(issue.id, "state-done")
+        linear.post_comment.assert_awaited_once()
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "PR #101" in comment_body
+        assert "already merged" in comment_body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_ignores_pr_exists_for_other_repo(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        pr_repo = "org/previous-repo"
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value=issue.id)  # type: ignore[method-assign]  # noqa: SLF001
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=pr_repo,
+            pr_number=108,
+            pr_url="https://github.com/org/previous-repo/pull/108",
+            created_at="2026-05-19T18:00:00+00:00",
+        )
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id=issue.id,
+            github_repo=pr_repo,
+            merged_at="2026-05-19T18:15:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert task is not None
+        orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+        assert (
+            await db.issue_prs.get(conn, issue_id=issue.id, github_repo=pr_repo)
+            is not None
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_ignores_closed_unmerged_pr_row(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_view = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value={"state": "CLOSED", "mergedAt": None, "merged": False}
+        )
+        orch._dispatch_one = AsyncMock(return_value=issue.id)  # type: ignore[method-assign]  # noqa: SLF001
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=107,
+            pr_url="https://github.com/org/repo/pull/107",
+            created_at="2026-05-19T17:02:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert task is not None
+        orch._gh.pr_view.assert_awaited_once_with(  # noqa: SLF001
+            107, repo=binding.github_repo
+        )
+        assert (
+            await db.issue_prs.get(
+                conn, issue_id=issue.id, github_repo=binding.github_repo
+            )
+            is None
+        )
+        orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
+        linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("failure", ["states", "missing_state", "move"])
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_does_not_comment_when_pr_guard_move_fails(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        if failure == "states":
+            orch._states_for_binding = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+                side_effect=LinearError("states down")
+            )
+        elif failure == "missing_state":
+            orch._states = {  # noqa: SLF001
+                "ENG": {
+                    "Todo": "state-todo",
+                    "In Progress": "state-progress",
+                }
+            }
+        else:
+            orch._states = {  # noqa: SLF001
+                "ENG": {
+                    "Todo": "state-todo",
+                    "In Progress": "state-progress",
+                    "Done": "state-done",
+                }
+            }
+            linear.move_issue = AsyncMock(side_effect=LinearError("move down"))
+
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=101,
+            pr_url="https://github.com/org/repo/pull/101",
+            created_at="2026-05-19T12:00:00+00:00",
+        )
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            merged_at="2026-05-19T13:15:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert await db.runs.history_for_issue(conn, issue.id) == []
+        if failure == "move":
+            linear.move_issue.assert_awaited_once_with(issue.id, "state-done")
+        else:
+            linear.move_issue.assert_not_awaited()
+        linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_parks_issue_when_pr_still_open(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "Done": "state-done",
+            }
+        }
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=107,
+            pr_url="https://github.com/org/repo/pull/107",
+            created_at="2026-05-19T17:02:00+00:00",
+        )
+
+        orch._gh.pr_view = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value={"state": "OPEN", "mergedAt": None, "merged": False}
+        )
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert await db.runs.history_for_issue(conn, issue.id) == []
+        orch._gh.pr_view.assert_awaited_once_with(  # noqa: SLF001
+            107, repo=binding.github_repo
+        )
+        linear.move_issue.assert_awaited_once_with(issue.id, "state-progress")
+        linear.post_comment.assert_awaited_once()
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "PR #107" in comment_body
+        assert "still open" in comment_body
     finally:
         await conn.close()
 
