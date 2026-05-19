@@ -158,7 +158,9 @@ async def _seed_review_candidate(
     )
 
 
-def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
+def _write_fake_gh(
+    tmp_path: Path, *, auto_merge_disabled: bool = False
+) -> tuple[Path, Path]:
     calls = tmp_path / "gh-calls.jsonl"
     merged_flag = tmp_path / "merged.flag"
     shim = tmp_path / "gh"
@@ -201,6 +203,7 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         f"checks = json.loads({json.dumps(json.dumps(checks))})\n"
         f"reviews = json.loads({json.dumps(json.dumps(reviews))})\n"
         f"commit = json.loads({json.dumps(json.dumps(commit))})\n"
+        f"auto_merge_disabled = {auto_merge_disabled!r}\n"
         "argv = sys.argv[1:]\n"
         "with open(calls, 'a') as f:\n"
         "    f.write(json.dumps({'argv': argv}) + '\\n')\n"
@@ -223,6 +226,9 @@ def _write_fake_gh(tmp_path: Path) -> tuple[Path, Path]:
         "if 'repos/org/repo/commits/abc123' in joined:\n"
         "    sys.stdout.write(json.dumps(commit)); sys.exit(0)\n"
         "if argv[:3] == ['pr', 'merge', '42']:\n"
+        "    if auto_merge_disabled and '--auto' in argv:\n"
+        "        sys.stderr.write('GraphQL: enablePullRequestAutoMerge must be true')\n"
+        "        sys.exit(1)\n"
         "    merged_flag.write_text('1')\n"
         "    sys.exit(0)\n"
         "sys.stderr.write('unexpected gh call: ' + joined)\n"
@@ -461,6 +467,63 @@ async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> N
         assert "--squash" in merge_call["argv"]
         assert "--auto" in merge_call["argv"]
         assert "--repo" in merge_call["argv"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_disabled_degrades_to_sync_merge_with_fake_gh(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        shim, calls_log = _write_fake_gh(tmp_path, auto_merge_disabled=True)
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock(return_value=None)
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        push_fn = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="codex")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=GitHub(gh_path=str(shim)),
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        push_fn.assert_awaited_once()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        workspace.cleanup.assert_awaited_once_with(_issue())
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "done"
+
+        calls = _read_calls(calls_log)
+        merge_calls = [c for c in calls if c["argv"][:3] == ["pr", "merge", "42"]]
+        assert len(merge_calls) == 2
+        first = merge_calls[0]["argv"]
+        second = merge_calls[1]["argv"]
+        assert "--auto" in first
+        assert "--auto" not in second
     finally:
         await conn.close()
 

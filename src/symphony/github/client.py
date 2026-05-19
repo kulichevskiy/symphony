@@ -27,10 +27,19 @@ MergeStrategy = Literal["squash", "merge", "rebase"]
 
 _ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 DEFAULT_LOG_TAIL_BYTES = 12_000
+_AUTO_MERGE_DISABLED_MARKERS = (
+    "enablepullrequestautomerge",
+    "auto merge is not allowed for this repository",
+)
 
 
 class GitHubError(RuntimeError):
     """Raised on non-zero exit, spawn failure, or unparseable JSON."""
+
+
+def _is_auto_merge_disabled_error(error: object) -> bool:
+    message = str(error).casefold()
+    return any(marker in message for marker in _AUTO_MERGE_DISABLED_MARKERS)
 
 
 @dataclass
@@ -74,6 +83,7 @@ class GitHub:
         self._gh = gh_path
         self._token = token
         self._extra_env = dict(env or {})
+        self._auto_merge_disabled_repos: set[str] = set()
 
     # ---- low-level ----
 
@@ -502,9 +512,26 @@ class GitHub:
         # `--auto` requires repo-level auto-merge to be enabled, so callers
         # opt in explicitly when they want merge-on-green.
         argv = ["pr", "merge", str(pr), f"--{strategy}", *self._repo_args(repo)]
-        if auto:
+        use_auto = auto and (
+            repo is None or repo not in self._auto_merge_disabled_repos
+        )
+        if use_auto:
             argv.append("--auto")
-        await self._run(argv)
+        try:
+            await self._run(argv)
+        except GitHubError as e:
+            if not use_auto or not _is_auto_merge_disabled_error(e):
+                raise
+            if repo is not None:
+                self._auto_merge_disabled_repos.add(repo)
+            retry_argv = [
+                "pr",
+                "merge",
+                str(pr),
+                f"--{strategy}",
+                *self._repo_args(repo),
+            ]
+            await self._run(retry_argv)
 
     async def pr_close(self, pr: int | str, *, repo: str | None = None) -> None:
         await self._run(["pr", "close", str(pr), *self._repo_args(repo)])
