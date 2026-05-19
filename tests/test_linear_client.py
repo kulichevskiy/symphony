@@ -123,6 +123,42 @@ async def test_issue_external_snapshot_returns_latest_comments_desc() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_move_issue_logs_issue_identifier_and_target_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    linear = Linear("test-key")
+
+    async def fake_query(gql: str, variables: dict[str, Any]) -> dict[str, Any]:
+        assert gql == queries.UPDATE_ISSUE_STATE
+        assert variables == {"id": "iss-1", "stateId": "state-done"}
+        return {
+            "issueUpdate": {
+                "success": True,
+                "issue": {
+                    "identifier": "ENG-1",
+                    "state": {"id": "state-done", "name": "Done"},
+                },
+            }
+        }
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    try:
+        with caplog.at_level("INFO", logger="symphony.linear.client"):
+            await linear.move_issue("iss-1", "state-done")
+    finally:
+        await linear.aclose()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "move_issue ENG-1" in message
+        and "Done" in message
+        and "state-done" in message
+        and "caller=" in message
+        for message in messages
+    )
+
+
 def test_comments_since_uses_linear_filter_timestamp_type() -> None:
     assert "$after: DateTimeOrDuration!" in queries.ISSUE_COMMENTS_SINCE
     assert "$after: DateTime!" not in queries.ISSUE_COMMENTS_SINCE

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import aiosqlite
 
@@ -464,6 +465,25 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     return [_row_to_issue_pr(r) for r in rows]
 
 
+async def list_recent_merged(
+    conn: aiosqlite.Connection, *, since: datetime
+) -> list[IssuePR]:
+    cur = await conn.execute(
+        """
+        SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+        FROM issue_prs p
+        JOIN issues i ON i.id = p.issue_id
+        WHERE p.merged_at IS NOT NULL
+          AND p.merged_at >= ?
+        ORDER BY p.merged_at ASC
+        """,
+        (since.isoformat(),),
+    )
+    rows = await cur.fetchall()
+    return [_row_to_issue_pr(r) for r in rows]
+
+
 __all__ = [
     "IssuePR",
     "delete",
@@ -473,6 +493,7 @@ __all__ = [
     "has_orphaned_review_pr",
     "list_merge_candidates",
     "list_orphaned_review_prs",
+    "list_recent_merged",
     "mark_merged",
     "update_merged",
     "upsert",
