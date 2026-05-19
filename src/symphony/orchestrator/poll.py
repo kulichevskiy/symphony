@@ -121,6 +121,7 @@ BindingKey = tuple[str, str, str]
 CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
+MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
@@ -530,6 +531,14 @@ def _pr_view_has_merge_conflict(view: dict[str, object]) -> bool:
     return mergeable == "CONFLICTING" or merge_state == "DIRTY"
 
 
+def _pr_view_is_clean_mergeable(view: dict[str, object]) -> bool:
+    mergeable = str(view.get("mergeable") or "").upper()
+    merge_state = str(
+        view.get("mergeStateStatus") or view.get("merge_state_status") or ""
+    ).upper()
+    return mergeable == "MERGEABLE" and merge_state == "CLEAN"
+
+
 def _pr_base_ref_from_view(view: dict[str, object]) -> str | None:
     raw = view.get("baseRefName") or view.get("base_ref_name") or view.get("baseRef")
     if raw is None:
@@ -916,6 +925,7 @@ class Orchestrator:
         # Maps review monitor run_id → its asyncio Task so _handle_skip_review_intent
         # can cancel the task immediately, preventing mid-iteration fix-run dispatch.
         self._review_poll_run_tasks: dict[str, asyncio.Task[None]] = {}
+        self._merge_wait_reconcile_issue_ids: set[str] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -935,6 +945,7 @@ class Orchestrator:
             clock=clock,
         )
         self._reconcile_task: asyncio.Task[None] | None = None
+        self._merge_wait_reconcile_task: asyncio.Task[None] | None = None
         self._reconcile_event_tasks: set[asyncio.Task[None]] = set()
 
     def _now(self) -> datetime:
@@ -987,6 +998,10 @@ class Orchestrator:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
         await self._restore_operator_waits()
+        await self._reconcile_auto_recoverable_merge_waits(reason="startup")
+        self._merge_wait_reconcile_task = asyncio.create_task(
+            self._run_auto_recoverable_merge_wait_reconciler(self._shutdown)
+        )
         self._reconcile_task = asyncio.create_task(
             self._reconciler.run(self._shutdown)
         )
@@ -1004,6 +1019,12 @@ class Orchestrator:
                 except TimeoutError:
                     pass
         finally:
+            if self._merge_wait_reconcile_task is not None:
+                self._merge_wait_reconcile_task.cancel()
+                try:
+                    await self._merge_wait_reconcile_task
+                except asyncio.CancelledError:
+                    pass
             if self._reconcile_task is not None:
                 self._reconcile_task.cancel()
                 try:
@@ -1012,6 +1033,34 @@ class Orchestrator:
                     pass
             await self.drain_reconcile_event_tasks(cancel=True)
             await self.drain_dispatch_tasks(cancel=True)
+
+    async def _run_auto_recoverable_merge_wait_reconciler(
+        self, shutdown: asyncio.Event
+    ) -> None:
+        log.info(
+            "auto-recoverable merge wait reconciler entering loop (interval=%ds)",
+            MERGE_WAIT_RECONCILE_INTERVAL_SECS,
+        )
+        while not shutdown.is_set():
+            try:
+                await asyncio.wait_for(
+                    shutdown.wait(), timeout=MERGE_WAIT_RECONCILE_INTERVAL_SECS
+                )
+                break
+            except TimeoutError:
+                pass
+            try:
+                recovered = await self._reconcile_auto_recoverable_merge_waits(
+                    reason="periodic"
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("auto-recoverable merge wait reconcile failed")
+                continue
+            if recovered:
+                log.info(
+                    "auto-recoverable merge wait reconcile dispatched %d recovery run(s)",
+                    recovered,
+                )
 
     def _schedule_reconcile_task(
         self, awaitable: Awaitable[int], *, source: str
@@ -1112,6 +1161,16 @@ class Orchestrator:
             self._reconciler.reconcile_github_event(event),
             source=f"github.{event.event_type}.{event.action or 'unknown'}",
         )
+        if event.event_type == "pull_request" and event.pr_number is not None:
+            self._schedule_reconcile_task(
+                self._reconcile_auto_recoverable_merge_waits(
+                    reason=f"github_webhook:{event.event_type}.{event.action or 'unknown'}"
+                ),
+                source=(
+                    "merge_wait.github."
+                    f"{event.event_type}.{event.action or 'unknown'}"
+                ),
+            )
         return WebhookDispatchResult(
             kind=f"github.{event.event_type}",
             handled=True,
@@ -1913,6 +1972,229 @@ class Orchestrator:
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
+
+    async def _reconcile_auto_recoverable_merge_waits(
+        self, *, reason: str = "manual"
+    ) -> int:
+        """Re-drive stale merge waits whose current PR state is now auto-recoverable."""
+        dispatched = 0
+        repo_view_cache: dict[str, dict[str, object] | None] = {}
+        waits = await db.operator_waits.list_all(self._conn)
+        for wait in waits:
+            if wait.kind != db.operator_waits.KIND_MERGE:
+                continue
+            try:
+                if await self._reconcile_auto_recoverable_merge_wait(
+                    wait,
+                    reason=reason,
+                    repo_view_cache=repo_view_cache,
+                ):
+                    dispatched += 1
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "auto-recoverable merge wait reconcile failed for issue %s",
+                    wait.issue_id,
+                )
+        return dispatched
+
+    async def _reconcile_auto_recoverable_merge_wait(
+        self,
+        wait: db.operator_waits.OperatorWait,
+        *,
+        reason: str,
+        repo_view_cache: dict[str, dict[str, object] | None],
+    ) -> bool:
+        binding = self._binding_for_operator_wait(wait)
+        if binding is None:
+            log.warning(
+                "cannot reconcile merge wait for issue %s: no binding for %s/%s label=%r",
+                wait.issue_id,
+                wait.linear_team_key,
+                wait.github_repo,
+                wait.issue_label,
+            )
+            return False
+
+        pr = await db.issue_prs.get(
+            self._conn,
+            issue_id=wait.issue_id,
+            github_repo=binding.github_repo,
+        )
+        if pr is None or pr.merged_at is not None:
+            return False
+
+        try:
+            issue = await self.linear.lookup_issue(wait.issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not look up %s before merge wait reconcile: %s",
+                wait.issue_id,
+                e,
+            )
+            return False
+        if not _merge_issue_matches_binding(issue, binding):
+            log.info(
+                "skipping merge wait reconcile for %s: issue is no longer active "
+                "for binding %s/%s",
+                issue.identifier,
+                binding.github_repo,
+                binding.issue_label or "",
+            )
+            return False
+
+        try:
+            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not view PR for merge wait reconcile %s#%d: %s",
+                binding.github_repo,
+                pr.pr_number,
+                e,
+            )
+            return False
+
+        await self._repo_view_for_merge_wait_reconcile(
+            binding.github_repo,
+            repo_view_cache,
+        )
+
+        classifier: str | None = None
+        if _pr_view_has_merge_conflict(view):
+            classifier = "merge-conflict rebase fix-run"
+        elif _pr_view_is_clean_mergeable(view):
+            classifier = "clean merge retry"
+        if classifier is None:
+            return False
+
+        async with self._schedule_lock:
+            current_wait = await db.operator_waits.get(self._conn, wait.issue_id)
+            if current_wait != wait:
+                return False
+            if wait.issue_id in self._scheduled_issue_ids:
+                return False
+            if wait.issue_id in self._merge_wait_reconcile_issue_ids:
+                return False
+            if await db.runs.has_active(
+                self._conn,
+                wait.issue_id,
+                ignored_stage="review",
+            ):
+                return False
+            await self._complete_review_monitors_for_merge(issue)
+            if await db.runs.has_running_or_completed(self._conn, wait.issue_id):
+                return False
+
+            body = (
+                "♻️ Reconciling stuck merge wait: applying "
+                f"{classifier} auto-recovery (no `$approve` needed)."
+            )
+            try:
+                await self.linear.post_comment(wait.issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "could not post merge wait reconcile comment for %s: %s",
+                    issue.identifier,
+                    e,
+                )
+
+            if classifier == "merge-conflict rebase fix-run":
+                self._schedule_reconciled_merge_conflict_rebase_fix(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr.pr_number,
+                    pr_url=pr.pr_url,
+                    view=view,
+                    wait_run_id=wait.run_id,
+                )
+            else:
+                async def clear_reconciled_merge_wait(_new_run_id: str) -> None:
+                    await self._clear_operator_wait(wait.issue_id, wait.run_id)
+
+                self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr.pr_number,
+                    pr_url=pr.pr_url,
+                    on_started=clear_reconciled_merge_wait,
+                )
+            log.info(
+                "reconciled merge wait for %s via %s (reason=%s)",
+                issue.identifier,
+                classifier,
+                reason,
+            )
+            return True
+
+    async def _repo_view_for_merge_wait_reconcile(
+        self,
+        repo: str,
+        cache: dict[str, dict[str, object] | None],
+    ) -> dict[str, object] | None:
+        if repo in cache:
+            return cache[repo]
+        repo_view = getattr(self._gh, "repo_view", None)
+        if repo_view is None:
+            cache[repo] = None
+            return None
+        try:
+            result = repo_view(repo)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as e:  # noqa: BLE001
+            log.debug("repo view failed during merge wait reconcile for %s: %s", repo, e)
+            cache[repo] = None
+            return None
+        if isinstance(result, dict):
+            cache[repo] = result
+            return result
+        cache[repo] = None
+        return None
+
+    def _schedule_reconciled_merge_conflict_rebase_fix(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        view: dict[str, object],
+        wait_run_id: str,
+    ) -> asyncio.Task[None]:
+        self._merge_wait_reconcile_issue_ids.add(issue.id)
+
+        async def dispatch_conflict_fix() -> None:
+            recovered = await self._dispatch_merge_conflict_rebase_fix_run(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                view=view,
+                merge_run_id=wait_run_id,
+            )
+            if recovered:
+                await self._clear_operator_wait(issue.id, wait_run_id)
+
+        task = asyncio.create_task(dispatch_conflict_fix())
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(
+            partial(
+                self._merge_wait_reconcile_task_done,
+                issue_id=issue.id,
+            )
+        )
+        return task
+
+    def _merge_wait_reconcile_task_done(
+        self, task: asyncio.Task[None], *, issue_id: str
+    ) -> None:
+        self._dispatch_tasks.discard(task)
+        self._merge_wait_reconcile_issue_ids.discard(issue_id)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("merge wait recovery task crashed for issue_id=%s", issue_id)
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
