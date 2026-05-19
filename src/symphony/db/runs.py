@@ -197,6 +197,28 @@ async def add_cost(
     await conn.commit()
 
 
+async def mark_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> None:
+    await conn.execute(
+        "INSERT OR IGNORE INTO review_rearm_retries (run_id) VALUES (?)",
+        (run_id,),
+    )
+    await conn.commit()
+
+
+async def clear_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> None:
+    await conn.execute("DELETE FROM review_rearm_retries WHERE run_id = ?", (run_id,))
+    await conn.commit()
+
+
+async def has_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> bool:
+    cur = await conn.execute(
+        "SELECT 1 FROM review_rearm_retries WHERE run_id = ? LIMIT 1",
+        (run_id,),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
 async def has_active(
     conn: aiosqlite.Connection,
     issue_id: str,

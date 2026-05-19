@@ -1632,7 +1632,7 @@ class Orchestrator:
         self._review_poll_run_tasks.pop(run_id, None)
         if self._review_poll_issue_ids.get(issue_id) == run_id:
             self._review_poll_issue_ids.pop(issue_id, None)
-        self._review_rearm_retry_run_ids.discard(run_id)
+        await self._clear_review_rearm_retry(run_id)
         await db.runs.update_status(
             self._conn,
             run_id,
@@ -2328,6 +2328,22 @@ class Orchestrator:
         )
         return task
 
+    async def _mark_review_rearm_retry(self, run_id: str) -> None:
+        self._review_rearm_retry_run_ids.add(run_id)
+        await db.runs.mark_review_rearm_retry(self._conn, run_id)
+
+    async def _clear_review_rearm_retry(self, run_id: str) -> None:
+        self._review_rearm_retry_run_ids.discard(run_id)
+        await db.runs.clear_review_rearm_retry(self._conn, run_id)
+
+    async def _review_rearm_retry_pending(self, run_id: str) -> bool:
+        if run_id in self._review_rearm_retry_run_ids:
+            return True
+        if await db.runs.has_review_rearm_retry(self._conn, run_id):
+            self._review_rearm_retry_run_ids.add(run_id)
+            return True
+        return False
+
     async def _poll_review_run_with_limits(
         self,
         run: db.runs.Run,
@@ -2351,7 +2367,7 @@ class Orchestrator:
         if current is None:
             return
         current_binding, current_issue = current
-        if run.id in self._review_rearm_retry_run_ids:
+        if await self._review_rearm_retry_pending(run.id):
             state = await db.review_state.get(self._conn, current_issue.id)
             rearm_done = await self._retrigger_codex_review_unless_approved(
                 binding=current_binding,
@@ -2360,7 +2376,7 @@ class Orchestrator:
                 require_no_signal=True,
             )
             if rearm_done:
-                self._review_rearm_retry_run_ids.discard(run.id)
+                await self._clear_review_rearm_retry(run.id)
         await self._poll_review_run(run, current_binding, current_issue)
 
     async def _refresh_review_poll_candidate(
@@ -2444,7 +2460,7 @@ class Orchestrator:
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
-        self._review_rearm_retry_run_ids.discard(run.id)
+        await self._clear_review_rearm_retry(run.id)
 
     async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None:
         """Retire review polling once a merge run owns the issue."""
@@ -2472,7 +2488,7 @@ class Orchestrator:
                 if not task.done():
                     task.cancel()
             self._review_poll_run_ids.discard(run.id)
-            self._review_rearm_retry_run_ids.discard(run.id)
+            await self._clear_review_rearm_retry(run.id)
 
         for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
             if mapped_issue_id == issue.id or mapped_run_id in closed_run_ids:
@@ -4378,7 +4394,7 @@ class Orchestrator:
         if monitor_task is not None and not monitor_task.done():
             monitor_task.cancel()
         self._review_poll_run_ids.discard(monitor_run_id)
-        self._review_rearm_retry_run_ids.discard(monitor_run_id)
+        await self._clear_review_rearm_retry(monitor_run_id)
         if self._review_poll_issue_ids.get(issue_id) == monitor_run_id:
             self._review_poll_issue_ids.pop(issue_id, None)
 
@@ -4517,7 +4533,7 @@ class Orchestrator:
                 require_no_signal=True,
             )
             if not rearm_done:
-                self._review_rearm_retry_run_ids.add(review_run_id)
+                await self._mark_review_rearm_retry(review_run_id)
         return scheduled
 
     async def _fail_review_run(
@@ -4537,7 +4553,7 @@ class Orchestrator:
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
         )
-        self._review_rearm_retry_run_ids.discard(run.id)
+        await self._clear_review_rearm_retry(run.id)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
         state = await db.review_state.get(self._conn, issue.id)
@@ -4583,7 +4599,7 @@ class Orchestrator:
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
         )
-        self._review_rearm_retry_run_ids.discard(run.id)
+        await self._clear_review_rearm_retry(run.id)
         repo = state.github_repo or "(unknown repo)"
         cost = await db.runs.cost_for_issue(self._conn, issue.id)
         body = failed(
@@ -4655,7 +4671,7 @@ class Orchestrator:
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
-        self._review_rearm_retry_run_ids.discard(run.id)
+        await self._clear_review_rearm_retry(run.id)
 
     async def _scan_binding(
         self, binding: RepoBinding
