@@ -223,6 +223,52 @@ async def test_runs_list_live_with_pid_filters_correctly(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_runs_list_live_without_pid_filters_correctly(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        # Live without pid — should be returned.
+        await db.runs.create(
+            conn,
+            id="nopid",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        # Live with pid — should NOT be returned.
+        await db.runs.create(
+            conn,
+            id="alive",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=42,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        # Completed — should NOT be returned even though pid is null.
+        await db.runs.create(
+            conn,
+            id="done",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T00:00:00+00:00",
+        )
+        rows = await db.runs.list_live_without_pid(conn)
+        ids = sorted(r.id for r in rows)
+        assert ids == ["nopid"]
+        assert rows[0].pid is None
+        assert rows[0].issue_id == "iss-1"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_runs_cost_aggregation_per_issue(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

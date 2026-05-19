@@ -74,6 +74,47 @@ async def test_reconcile_marks_dead_pids_interrupted_and_comments(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-review", identifier="ENG-5", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-review",
+            issue_id="iss-review",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(conn, linear)
+        assert flipped == 1
+
+        linear.post_comment.assert_awaited_once()
+        call = linear.post_comment.await_args
+        assert call is not None
+        assert call.args[0] == "iss-review"
+        assert "Host restarted" in call.args[1]
+
+        cur = await conn.execute(
+            "SELECT status FROM runs WHERE id=?", ("pidless-review",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.INTERRUPTED_STATUS
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_treats_eperm_pid_as_alive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

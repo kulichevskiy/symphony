@@ -1,10 +1,10 @@
 """Startup reconciliation.
 
 Runs that were live when the host died still show as `running` with the
-old PID. We can't resume the subprocess (it's gone), so we mark each
-dead-PID row `interrupted` and post a Linear comment telling the user to
-`$retry`. Live PIDs are left alone — they belong to runs the orchestrator
-adopts on the next poll.
+old PID, or with no PID for in-process tasks such as review monitors. We
+can't resume that work in a fresh process, so we mark each orphaned row
+`interrupted` and post a Linear comment. Live PIDs are left alone — they
+belong to runs the orchestrator adopts on the next poll.
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ log = logging.getLogger(__name__)
 _RETRY_BODY = (
     "🔁 **Host restarted — run interrupted**\n\n"
     "The Symphony host was restarted while this run was in flight, so the "
-    "agent subprocess is gone. Reply `$retry` to dispatch again.\n"
+    "agent subprocess or review monitor is gone. Review monitors will resume "
+    "automatically when possible; otherwise reply `$retry` to dispatch again.\n"
 )
 
 
@@ -47,8 +48,10 @@ def _process_alive(pid: int) -> bool:
 
 
 async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
-    """Walk live-with-PID runs; flip dead ones to `interrupted`. Returns
-    the number of rows flipped."""
+    """Walk live runs; flip orphaned ones to `interrupted`.
+
+    Returns the number of rows flipped.
+    """
     rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
     now = datetime.now(UTC).isoformat()
@@ -64,6 +67,19 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
         await db.runs.update_status(
             conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
         )
+        try:
+            await linear.post_comment(run.issue_id, _RETRY_BODY)
+        except LinearError as e:
+            log.warning("could not post reconcile comment on %s: %s", run.issue_id, e)
+        flipped += 1
+
+    for run in await db.runs.list_live_without_pid(conn):
+        log.info(
+            "reconcile: run=%s issue=%s has no pid — marking interrupted",
+            run.id,
+            run.issue_id,
+        )
+        await db.runs.update_status(conn, run.id, db.runs.INTERRUPTED_STATUS)
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
         except LinearError as e:

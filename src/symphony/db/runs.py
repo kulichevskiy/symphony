@@ -2,8 +2,8 @@
 
 A run row is created when the orchestrator hands an issue to a runner. It
 moves through `running` → `completed` | `failed` | `interrupted`. The
-startup reconcile walks `running` rows with non-null PIDs and flips dead
-ones to `interrupted`.
+startup reconcile walks `running` rows and flips orphaned ones to
+`interrupted`.
 """
 
 from __future__ import annotations
@@ -263,6 +263,21 @@ async def list_live_with_pid(conn: aiosqlite.Connection) -> list[Run]:
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
         FROM runs
         WHERE status IN ({placeholders}) AND pid IS NOT NULL
+        """,
+        LIVE_STATUSES,
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run(r) for r in rows]
+
+
+async def list_live_without_pid(conn: aiosqlite.Connection) -> list[Run]:
+    """Live runs with no PID, such as in-process review monitors."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        FROM runs
+        WHERE status IN ({placeholders}) AND pid IS NULL
         """,
         LIVE_STATUSES,
     )
