@@ -376,7 +376,12 @@ async def test_check_log_tail_fetches_run_log_from_check_link(fake_gh) -> None: 
     ("message", "expected"),
     [
         ("GraphQL: enablePullRequestAutoMerge must be true", True),
+        ("GraphQL: enablePullRequestAutoMerge=false", True),
         ("Auto merge is not allowed for this repository", True),
+        (
+            "GraphQL: Resource not accessible by integration (enablePullRequestAutoMerge)",
+            False,
+        ),
         ("GraphQL: Base branch was modified", False),
         ("gh pr merge 99 exited 1: something else failed", False),
     ],

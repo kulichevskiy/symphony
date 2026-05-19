@@ -28,7 +28,8 @@ MergeStrategy = Literal["squash", "merge", "rebase"]
 _ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 DEFAULT_LOG_TAIL_BYTES = 12_000
 _AUTO_MERGE_DISABLED_MARKERS = (
-    "enablepullrequestautomerge",
+    "enablepullrequestautomerge must be true",
+    "enablepullrequestautomerge=false",
     "auto merge is not allowed for this repository",
 )
 
