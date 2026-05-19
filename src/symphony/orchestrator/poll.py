@@ -4471,10 +4471,9 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
-            pr = await db.issue_prs.get(
+            pr = await db.issue_prs.get_for_issue(
                 self._conn,
                 issue_id=issue.id,
-                github_repo=binding.github_repo,
             )
             if pr is not None:
                 await self._park_already_has_pr(binding, issue, pr)

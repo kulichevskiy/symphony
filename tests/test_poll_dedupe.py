@@ -384,6 +384,64 @@ async def test_schedule_ready_issue_parks_issue_when_pr_already_merged(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_schedule_ready_issue_parks_issue_when_pr_exists_for_other_repo(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(repos=[binding])
+        issue = _issue()
+        pr_repo = "org/previous-repo"
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "Done": "state-done",
+            }
+        }
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=pr_repo,
+            pr_number=108,
+            pr_url="https://github.com/org/previous-repo/pull/108",
+            created_at="2026-05-19T18:00:00+00:00",
+        )
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id=issue.id,
+            github_repo=pr_repo,
+            merged_at="2026-05-19T18:15:00+00:00",
+        )
+
+        task = await orch._schedule_ready_issue(binding, issue)  # noqa: SLF001
+        if task is not None:
+            await task
+
+        assert await db.runs.history_for_issue(conn, issue.id) == []
+        linear.move_issue.assert_awaited_once_with(issue.id, "state-done")
+        linear.post_comment.assert_awaited_once()
+        comment_body = linear.post_comment.await_args.args[1]
+        assert "PR #108" in comment_body
+        assert "previous-repo" in comment_body
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize("failure", ["states", "missing_state", "move"])
 @pytest.mark.asyncio
 async def test_schedule_ready_issue_does_not_comment_when_pr_guard_move_fails(
