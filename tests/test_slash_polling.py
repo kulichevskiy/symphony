@@ -20,6 +20,7 @@ import pytest
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 
 
@@ -85,6 +86,7 @@ def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
         "ENG": {
             "Todo": "state-todo",
             "In Progress": "state-progress",
+            "Needs Approval": "state-na",
             "Blocked": "state-blocked",
         }
     }
@@ -107,6 +109,67 @@ async def _seed_active_run(conn: object, *, issue_id: str, run_id: str) -> None:
         status="running",
         pid=None,
         started_at="2026-05-10T00:00:00+00:00",
+    )
+
+
+def _intent(kind: SlashKind = SlashKind.APPROVE) -> SlashIntent:
+    return SlashIntent(
+        kind=kind,
+        comment_id="c-command",
+        created_at="2026-05-10T01:00:00+00:00",
+    )
+
+
+async def _seed_operator_wait(
+    conn: object,
+    *,
+    issue_id: str = "iss-1",
+    run_id: str = "run-1",
+    kind: str,
+    stage: str = "implement",
+    status: str = "failed",
+) -> None:
+    await db.issues.upsert(
+        conn,  # type: ignore[arg-type]
+        id=issue_id,
+        identifier="ENG-1",
+        title="t",
+        team_key="ENG",
+    )
+    await db.runs.create(
+        conn,  # type: ignore[arg-type]
+        id=run_id,
+        issue_id=issue_id,
+        stage=stage,
+        status=status,
+        pid=None,
+        started_at="2026-05-10T00:00:00+00:00",
+    )
+    await db.operator_waits.upsert(
+        conn,  # type: ignore[arg-type]
+        issue_id=issue_id,
+        run_id=run_id,
+        kind=kind,
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        issue_label="",
+        created_at="2026-05-10T00:00:00+00:00",
+    )
+
+
+async def _seed_review_state(
+    conn: object,
+    *,
+    issue_id: str = "iss-1",
+    pr_number: int = 42,
+) -> None:
+    await db.review_state.begin_review(
+        conn,  # type: ignore[arg-type]
+        issue_id,
+        pr_number=pr_number,
+        pr_url=f"https://github.com/org/repo/pull/{pr_number}",
+        github_repo="org/repo",
+        issue_label=None,
     )
 
 
@@ -239,6 +302,151 @@ async def test_approve_resumes_cost_cap_wait_after_restart(tmp_path: Path) -> No
         assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
         assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
         assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize(
+    ("wait_kind", "handler_name", "intent_kind"),
+    [
+        (db.operator_waits.KIND_COST_CAP, "_handle_cost_cap_slash_intent", SlashKind.APPROVE),
+        (
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+            "_handle_implement_failed_slash_intent",
+            SlashKind.APPROVE,
+        ),
+        (
+            db.operator_waits.KIND_REVIEW_FAILED,
+            "_handle_review_failed_slash_intent",
+            SlashKind.RETRY,
+        ),
+        (
+            db.operator_waits.KIND_MERGE,
+            "_handle_merge_needs_approval_slash_intent",
+            SlashKind.APPROVE,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_operator_wait_handlers_lazy_restore_binding_and_dispatch(
+    tmp_path: Path,
+    wait_kind: str,
+    handler_name: str,
+    intent_kind: SlashKind,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_comment = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        stage = "merge" if wait_kind == db.operator_waits.KIND_MERGE else "implement"
+        status = (
+            "needs_approval"
+            if wait_kind == db.operator_waits.KIND_MERGE
+            else "failed"
+        )
+        await _seed_operator_wait(
+            conn,
+            kind=wait_kind,
+            stage=stage,
+            status=status,
+        )
+        if wait_kind in (
+            db.operator_waits.KIND_REVIEW_FAILED,
+            db.operator_waits.KIND_MERGE,
+        ):
+            await _seed_review_state(conn)
+
+        await getattr(orch, handler_name)("iss-1", "run-1", _intent(intent_kind))
+
+        if wait_kind in (
+            db.operator_waits.KIND_COST_CAP,
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+        ):
+            linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+            assert await db.operator_waits.get(conn, "iss-1") is None
+        elif wait_kind == db.operator_waits.KIND_REVIEW_FAILED:
+            orch._gh.pr_comment.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+                42, "@codex review", repo="org/repo"
+            )
+            orch._schedule_review_poll.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+            assert await db.operator_waits.get(conn, "iss-1") is None
+        else:
+            orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+            assert orch._merge_needs_approval_bindings["run-1"] is cfg.repos[0]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize(
+    "handler_name",
+    [
+        "_handle_cost_cap_slash_intent",
+        "_handle_implement_failed_slash_intent",
+        "_handle_review_failed_slash_intent",
+        "_handle_merge_needs_approval_slash_intent",
+    ],
+)
+@pytest.mark.asyncio
+async def test_operator_wait_handlers_reject_when_binding_and_wait_missing(
+    tmp_path: Path,
+    handler_name: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+
+        await getattr(orch, handler_name)("iss-1", "run-1", _intent())
+
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("$approve" in body and "ignored" in body for body in posted)
+        assert any("operator wait" in body for body in posted)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_approve_after_restart_dispatches_from_unread_comment(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            stage="merge",
+            status="needs_approval",
+        )
+        await _seed_review_state(conn, pr_number=166)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.comments_since.assert_awaited_once()
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        _, seen_ids = await db.comment_cursors.get(conn, "iss-1") or ("", [])
+        assert seen_ids == ["c1"]
     finally:
         await conn.close()
 

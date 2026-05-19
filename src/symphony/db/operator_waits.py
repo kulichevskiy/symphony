@@ -147,6 +147,38 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
     )
 
 
+async def get_by_run_id(
+    conn: aiosqlite.Connection, run_id: str
+) -> OperatorWait | None:
+    cur = await conn.execute(
+        """
+        SELECT
+            issue_id,
+            run_id,
+            kind,
+            linear_team_key,
+            github_repo,
+            issue_label,
+            created_at
+        FROM operator_waits
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return OperatorWait(
+        issue_id=str(row["issue_id"]),
+        run_id=str(row["run_id"]),
+        kind=str(row["kind"]),
+        linear_team_key=str(row["linear_team_key"]),
+        github_repo=str(row["github_repo"]),
+        issue_label=str(row["issue_label"] or ""),
+        created_at=str(row["created_at"]),
+    )
+
+
 async def delete(
     conn: aiosqlite.Connection,
     issue_id: str,
@@ -184,6 +216,7 @@ __all__ = [
     "OperatorWait",
     "delete",
     "get",
+    "get_by_run_id",
     "list_all",
     "upsert",
 ]
