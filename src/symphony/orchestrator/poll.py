@@ -3695,21 +3695,20 @@ class Orchestrator:
                     binding.github_repo,
                     pr_number,
                 )
-            else:
-                interrupted = await db.runs.interrupt_stale_merge_needs_approval(
-                    self._conn,
-                    issue_id=issue.id,
-                    github_repo=binding.github_repo,
-                    pr_number=pr_number,
+            interrupted = await db.runs.interrupt_stale_merge_needs_approval(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+                pr_number=pr_number,
+            )
+            if interrupted:
+                log.info(
+                    "interrupted %d stale merge needs_approval runs for %s#%d "
+                    "after merge-conflict fix-run",
+                    interrupted,
+                    binding.github_repo,
+                    pr_number,
                 )
-                if interrupted:
-                    log.info(
-                        "interrupted %d stale merge needs_approval runs for %s#%d "
-                        "after merge-conflict fix-run",
-                        interrupted,
-                        binding.github_repo,
-                        pr_number,
-                    )
             if merge_run_id is not None:
                 running_interrupted = await db.runs.interrupt_running_merge(
                     self._conn,
