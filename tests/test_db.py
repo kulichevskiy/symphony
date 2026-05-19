@@ -627,6 +627,15 @@ async def test_interrupt_stale_merge_needs_approval_only_touches_stale_waits(
             pid=None,
             started_at="2026-05-10T00:05:00+00:00",
         )
+        await db.runs.create(
+            conn,
+            id="previous-pr-wait",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-09T23:59:00+00:00",
+        )
 
         count = await db.runs.interrupt_stale_merge_needs_approval(
             conn,
@@ -646,6 +655,8 @@ async def test_interrupt_stale_merge_needs_approval_only_touches_stale_waits(
         assert by_id["done-merge"].ended_at is None
         assert by_id["running-merge"].status == "running"
         assert by_id["running-merge"].ended_at is None
+        assert by_id["previous-pr-wait"].status == "needs_approval"
+        assert by_id["previous-pr-wait"].ended_at is None
     finally:
         await conn.close()
 

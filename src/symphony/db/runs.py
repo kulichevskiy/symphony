@@ -215,6 +215,7 @@ async def interrupt_stale_merge_needs_approval(
                 AND p.github_repo = ?
                 AND p.pr_number = ?
                 AND p.merged_at IS NULL
+                AND runs.started_at >= p.created_at
           )
           {before_filter}
         """,
