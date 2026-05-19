@@ -4515,6 +4515,7 @@ class Orchestrator:
                 pr.pr_number,
                 e,
             )
+            return
         else:
             target_id = states.get(target_state)
             if target_id is None:
@@ -4525,6 +4526,7 @@ class Orchestrator:
                     target_state,
                     binding.linear_team_key,
                 )
+                return
             else:
                 try:
                     await self.linear.move_issue(issue.id, target_id)
@@ -4535,6 +4537,7 @@ class Orchestrator:
                         pr.pr_number,
                         e,
                     )
+                    return
 
         try:
             await self.linear.post_comment(issue.id, truncate_body(body))
