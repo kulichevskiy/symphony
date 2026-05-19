@@ -2367,7 +2367,9 @@ class Orchestrator:
         if current is None:
             return
         current_binding, current_issue = current
-        if await self._review_rearm_retry_pending(run.id):
+        rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
+        rearm_done = True
+        if rearm_retry_pending:
             state = await db.review_state.get(self._conn, current_issue.id)
             rearm_done = await self._retrigger_codex_review_unless_approved(
                 binding=current_binding,
@@ -2377,7 +2379,11 @@ class Orchestrator:
             )
             if rearm_done:
                 await self._clear_review_rearm_retry(run.id)
-        await self._poll_review_run(run, current_binding, current_issue)
+        handled_feedback = await self._poll_review_run(
+            run, current_binding, current_issue
+        )
+        if rearm_retry_pending and not rearm_done and handled_feedback:
+            await self._clear_review_rearm_retry(run.id)
 
     async def _refresh_review_poll_candidate(
         self,
@@ -2505,7 +2511,7 @@ class Orchestrator:
         run: db.runs.Run,
         binding: RepoBinding,
         issue: LinearIssue,
-    ) -> None:
+    ) -> bool:
         state = await db.review_state.get(self._conn, issue.id)
         if state.pr_number is None:
             await self._fail_review_run(
@@ -2515,7 +2521,7 @@ class Orchestrator:
                 error="review run has no PR number",
                 last_log="",
             )
-            return
+            return False
 
         try:
             checks = await self._gh.pr_checks(state.pr_number, repo=binding.github_repo)
@@ -2542,7 +2548,7 @@ class Orchestrator:
                     ),
                     last_log=str(e),
                 )
-            return
+            return False
 
         await db.review_state.reset_ci_fetch_failures(self._conn, issue.id)
 
@@ -2730,13 +2736,13 @@ class Orchestrator:
         )
 
         if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
-            return
+            return False
         if verdict.merge_conflict:
             if not should_dispatch_fix_run(
                 prev_signature=state.last_trigger_signature,
                 new_signature=verdict.trigger_signature,
             ):
-                return
+                return False
             if has_hit_iteration_cap(
                 iteration=state.iteration, cap=self.config.review_iteration_cap
             ):
@@ -2746,7 +2752,7 @@ class Orchestrator:
                     issue=issue,
                     trigger=verdict.trigger_signature,
                 )
-                return
+                return True
             dispatched = await self._dispatch_merge_conflict_fix_run(
                 run=run,
                 binding=binding,
@@ -2759,12 +2765,12 @@ class Orchestrator:
                 # new commit (HEAD SHA unchanged), we still want the next poll to
                 # re-evaluate instead of being blocked by the dedup gate.
                 await db.review_state.set_signature(self._conn, issue.id, "")
-            return
+            return dispatched
         if not should_dispatch_fix_run(
             prev_signature=state.last_trigger_signature,
             new_signature=verdict.trigger_signature,
         ):
-            return
+            return False
         if has_hit_iteration_cap(
             iteration=state.iteration, cap=self.config.review_iteration_cap
         ):
@@ -2774,7 +2780,7 @@ class Orchestrator:
                 issue=issue,
                 trigger=verdict.trigger_signature,
             )
-            return
+            return True
 
         iteration = state.iteration + 1
         if verdict.rule == "failing_ci":
@@ -2799,6 +2805,7 @@ class Orchestrator:
             await db.review_state.set_signature(
                 self._conn, issue.id, verdict.trigger_signature
             )
+        return dispatched
 
     async def _dispatch_ci_fix_run(
         self,
