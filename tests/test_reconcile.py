@@ -105,11 +105,12 @@ async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments
         assert "Host restarted" in call.args[1]
 
         cur = await conn.execute(
-            "SELECT status FROM runs WHERE id=?", ("pidless-review",)
+            "SELECT status, ended_at FROM runs WHERE id=?", ("pidless-review",)
         )
         row = await cur.fetchone()
         assert row is not None
         assert row[0] == db.runs.INTERRUPTED_STATUS
+        assert row[1] is not None
     finally:
         await conn.close()
 

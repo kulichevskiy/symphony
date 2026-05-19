@@ -126,7 +126,9 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
             run.id,
             run.issue_id,
         )
-        await db.runs.update_status(conn, run.id, db.runs.INTERRUPTED_STATUS)
+        await db.runs.update_status(
+            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+        )
         await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         try:
             await linear.post_comment(run.issue_id, _RETRY_BODY)
