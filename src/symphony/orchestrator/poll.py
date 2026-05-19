@@ -122,7 +122,6 @@ CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
-CODEX_REVIEW_REQUEST_SIGNATURE_PREFIX = "codex_review_request"
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
@@ -175,10 +174,6 @@ def _parse_optional_datetime(raw: str | None) -> datetime | None:
         return _parse_rfc3339(raw)
     except ValueError:
         return None
-
-
-def _codex_review_request_signature(head_sha: str) -> str:
-    return f"{CODEX_REVIEW_REQUEST_SIGNATURE_PREFIX}:{head_sha}"
 
 
 @dataclass(frozen=True)
@@ -493,6 +488,26 @@ def _codex_lgtm_reactions_from_issue_comments(
                 )
             )
     return tuple(reactions)
+
+
+def _has_codex_review_request_after_head(
+    entries: list[dict[str, object]],
+    *,
+    head_committed_at: str,
+) -> bool:
+    head_dt = _parse_optional_datetime(head_committed_at)
+    if head_dt is None:
+        return False
+    for entry in entries:
+        body = str(entry.get("body") or "").strip()
+        if body.casefold() != "@codex review":
+            continue
+        created_at = _parse_optional_datetime(
+            str(entry.get("created_at") or entry.get("createdAt") or "")
+        )
+        if created_at is not None and created_at >= head_dt:
+            return True
+    return False
 
 
 async def _commit_committed_at_or_empty(
@@ -3006,9 +3021,13 @@ class Orchestrator:
         if state.pr_number is None:
             return True
         head_sha = ""
-        request_signature = ""
         try:
-            verdict, head_sha = await self._review_verdict_and_head_for_pr(
+            (
+                verdict,
+                head_sha,
+                head_committed_at,
+                issue_comments,
+            ) = await self._review_verdict_and_head_for_pr(
                 binding=binding,
                 pr_number=state.pr_number,
                 include_comments=require_no_signal,
@@ -3054,11 +3073,13 @@ class Orchestrator:
                 )
                 return True
             if require_no_signal:
-                request_signature = _codex_review_request_signature(head_sha)
-                if state.last_trigger_signature == request_signature:
+                if _has_codex_review_request_after_head(
+                    issue_comments,
+                    head_committed_at=head_committed_at,
+                ):
                     log.info(
                         "skipping duplicate @codex review re-trigger on %s#%d "
-                        "for %s at %s",
+                        "for %s at %s: request comment already exists",
                         binding.github_repo,
                         state.pr_number,
                         issue.identifier,
@@ -3069,10 +3090,6 @@ class Orchestrator:
             binding=binding,
             state=state,
         )
-        if posted and request_signature:
-            await db.review_state.set_signature(
-                self._conn, issue.id, request_signature
-            )
         return posted
 
     async def _review_verdict_and_head_for_pr(
@@ -3081,7 +3098,7 @@ class Orchestrator:
         binding: RepoBinding,
         pr_number: int,
         include_comments: bool = False,
-    ) -> tuple[Verdict, str]:
+    ) -> tuple[Verdict, str, str, list[dict[str, object]]]:
         view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
@@ -3127,6 +3144,8 @@ class Orchestrator:
                 snapshot=snapshot,
             ),
             head_sha,
+            committed_at,
+            issue_comments,
         )
 
     async def _retrigger_codex_review(

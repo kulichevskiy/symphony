@@ -1957,17 +1957,19 @@ async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
 @pytest.mark.asyncio
 async def test_review_resurrection_rearms_codex_review_for_unreviewed_head_once(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A monitor resurrected after the @codex ping was lost must re-arm review.
 
     This matches the VIB-52 failure mode: a dead pid=NULL review monitor, then
-    a current PR HEAD with only stale Codex signals from older commits.
+    a current PR HEAD with only stale Codex signals from older commits. The
+    prior CI dedupe signature must survive the re-arm.
     """
     from datetime import UTC, datetime, timedelta
 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await _seed_active_review(conn)
+        await _seed_active_review(conn, signature="ci:head-sha:lint")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -2017,12 +2019,24 @@ async def test_review_resurrection_rearms_codex_review_for_unreviewed_head_once(
                 )
             ]
         )
-        gh.pr_reactions = AsyncMock(return_value=[])
-        gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.pr_comment = AsyncMock()
+
+        def issue_comments_after_ping(*_args, **_kwargs) -> list[dict]:
+            if gh.pr_comment.await_count:
+                return [_codex_review_request_comment()]
+            return []
+
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(side_effect=issue_comments_after_ping)
 
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
         orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        monkeypatch.setattr(
+            orch,
+            "_schedule_review_poll",
+            lambda *_args, **_kwargs: asyncio.create_task(asyncio.sleep(0)),
+        )
 
         tasks = await orch._tick()  # noqa: SLF001
         if tasks:
@@ -2034,6 +2048,8 @@ async def test_review_resurrection_rearms_codex_review_for_unreviewed_head_once(
             if c.args[:2] == (42, "@codex review")
         ]
         assert len(review_pings) == 1
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.last_trigger_signature == "ci:head-sha:lint"
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         resurrected = next(
@@ -2055,6 +2071,8 @@ async def test_review_resurrection_rearms_codex_review_for_unreviewed_head_once(
             if c.args[:2] == (42, "@codex review")
         ]
         assert len(review_pings) == 1
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.last_trigger_signature == "ci:head-sha:lint"
     finally:
         await conn.close()
 
@@ -3207,6 +3225,18 @@ def _codex_review_entry(*, commit_sha: str = "head-sha", state: str = "COMMENTED
         "commit_id": commit_sha,
         "submitted_at": "2026-05-11T17:52:34Z",
         "body": "review body",
+    }
+
+
+def _codex_review_request_comment(
+    *,
+    created_at: str = "2026-05-19T12:01:00Z",
+) -> dict:
+    return {
+        "id": 1001,
+        "user": {"login": "review-operator"},
+        "body": "@codex review",
+        "created_at": created_at,
     }
 
 
