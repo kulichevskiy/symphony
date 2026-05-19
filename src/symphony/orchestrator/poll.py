@@ -3123,13 +3123,6 @@ class Orchestrator:
                 "completed",
                 ended_at=datetime.now(UTC).isoformat(),
             )
-            if merge_run_id is not None:
-                await db.runs.update_status(
-                    self._conn,
-                    merge_run_id,
-                    "interrupted",
-                    ended_at=datetime.now(UTC).isoformat(),
-                )
             fixed_head_sha = ""
             try:
                 fixed_view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
@@ -3155,6 +3148,13 @@ class Orchestrator:
                     "could not persist merge-conflict fixed marker for %s#%d",
                     binding.github_repo,
                     pr_number,
+                )
+            if merge_run_id is not None:
+                await db.runs.update_status(
+                    self._conn,
+                    merge_run_id,
+                    "interrupted",
+                    ended_at=datetime.now(UTC).isoformat(),
                 )
             return True
 
@@ -4715,6 +4715,26 @@ class Orchestrator:
                     >= binding.max_concurrent
                 ):
                     continue
+                on_started: Callable[[str], Awaitable[None]] | None = None
+                if conflict_fix_ready:
+                    async def clear_conflict_fix_marker(
+                        _run_id: str,
+                        *,
+                        issue_id: str = candidate.issue_id,
+                        github_repo: str = binding.github_repo,
+                        pr_number: int = candidate.pr_number,
+                        pr_created_at: str = candidate.created_at,
+                    ) -> None:
+                        await db.issue_prs.clear_merge_conflict_fixed(
+                            self._conn,
+                            issue_id=issue_id,
+                            github_repo=github_repo,
+                            pr_number=pr_number,
+                            pr_created_at=pr_created_at,
+                        )
+
+                    on_started = clear_conflict_fix_marker
+
                 scheduled.append(
                     self._schedule_merge(
                         binding=binding,
@@ -4722,16 +4742,9 @@ class Orchestrator:
                         pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
                         skip_review=verdict.kind is not VerdictKind.APPROVED,
+                        on_started=on_started,
                     )
                 )
-                if conflict_fix_ready:
-                    await db.issue_prs.clear_merge_conflict_fixed(
-                        self._conn,
-                        issue_id=candidate.issue_id,
-                        github_repo=binding.github_repo,
-                        pr_number=candidate.pr_number,
-                        pr_created_at=candidate.created_at,
-                    )
             elif verdict.merge_conflict:
                 await db.issue_prs.clear_merge_conflict_fixed(
                     self._conn,
