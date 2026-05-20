@@ -5490,12 +5490,18 @@ class Orchestrator:
         return corrected
 
     async def _acceptance_passed_for_candidate(
-        self, candidate: db.issue_prs.IssuePR, binding: RepoBinding
+        self,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        pr_head_sha: str,
     ) -> bool:
+        if not pr_head_sha:
+            return False
         state = await db.acceptance_state.get(self._conn, candidate.issue_id)
         return (
             state.pr_number == candidate.pr_number
             and state.pr_url == candidate.pr_url
+            and state.pr_head_sha == pr_head_sha
             and state.mode == binding.acceptance.mode
             and state.last_verdict == "pass"
         )
@@ -5610,13 +5616,13 @@ class Orchestrator:
                 )
                 continue
 
+            head_sha = str(view.get("headRefOid") or "")
             conflict_fix_ready = False
             if (
                 verdict.kind is VerdictKind.PENDING
                 and verdict.rule == "no_signal"
                 and str(view.get("mergeable") or "").upper() == "MERGEABLE"
             ):
-                head_sha = str(view.get("headRefOid") or "")
                 conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
                     self._conn,
                     issue_id=candidate.issue_id,
@@ -5637,10 +5643,9 @@ class Orchestrator:
                 ):
                     continue
                 if (
-                    verdict.kind is VerdictKind.APPROVED
-                    and binding.acceptance.mode != "off"
+                    binding.acceptance.mode != "off"
                     and not await self._acceptance_passed_for_candidate(
-                        candidate, binding
+                        candidate, binding, head_sha
                     )
                 ):
                     scheduled.append(
@@ -5649,6 +5654,7 @@ class Orchestrator:
                             issue=issue,
                             pr_number=candidate.pr_number,
                             pr_url=candidate.pr_url,
+                            pr_head_sha=head_sha,
                         )
                     )
                     continue
@@ -5716,6 +5722,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        pr_head_sha: str,
     ) -> asyncio.Task[None]:
         binding_key = _binding_key(binding)
         self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
@@ -5725,6 +5732,7 @@ class Orchestrator:
                 issue=issue,
                 pr_number=pr_number,
                 pr_url=pr_url,
+                pr_head_sha=pr_head_sha,
             )
         )
         self._dispatch_tasks.add(task)
@@ -5744,6 +5752,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        pr_head_sha: str,
     ) -> None:
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
@@ -5761,6 +5770,7 @@ class Orchestrator:
                         issue=current,
                         pr_number=pr_number,
                         pr_url=pr_url,
+                        pr_head_sha=pr_head_sha,
                     )
         except asyncio.CancelledError:
             run_id = self._dispatch_run_ids.get(issue.id)
@@ -5802,6 +5812,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        pr_head_sha: str,
     ) -> str | None:
         run_id = str(uuid.uuid4())
         inserted = await db.runs.create_if_no_active(
@@ -5832,6 +5843,7 @@ class Orchestrator:
                 issue.id,
                 pr_number=pr_number,
                 pr_url=pr_url,
+                pr_head_sha=pr_head_sha,
                 mode=binding.acceptance.mode,
                 preview_url=preview_url,
                 extracted_criteria=json.dumps(criteria),

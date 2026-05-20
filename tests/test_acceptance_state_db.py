@@ -23,6 +23,7 @@ async def test_acceptance_state_starts_at_zero(tmp_path: Path) -> None:
         assert state.iteration == 0
         assert state.pr_number is None
         assert state.pr_url == ""
+        assert state.pr_head_sha == ""
         assert state.mode == "off"
         assert state.preview_url == ""
         assert state.extracted_criteria == ""
@@ -46,6 +47,7 @@ async def test_acceptance_state_begin_and_verdict_persist(tmp_path: Path) -> Non
             "iss-1",
             pr_number=42,
             pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
             mode="code_only",
             preview_url="",
             extracted_criteria="[]",
@@ -65,6 +67,7 @@ async def test_acceptance_state_begin_and_verdict_persist(tmp_path: Path) -> Non
         assert state.iteration == 0
         assert state.pr_number == 42
         assert state.pr_url == "https://github.com/org/repo/pull/42"
+        assert state.pr_head_sha == "abc123"
         assert state.mode == "code_only"
         assert state.preview_url == ""
         assert state.extracted_criteria == "[]"

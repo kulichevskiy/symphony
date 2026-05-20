@@ -23,6 +23,7 @@ class AcceptanceState:
     iteration: int
     pr_number: int | None
     pr_url: str
+    pr_head_sha: str
     mode: AcceptanceMode | str
     preview_url: str
     extracted_criteria: str
@@ -35,6 +36,7 @@ _TRACKED_FIELDS = (
     "iteration",
     "pr_number",
     "pr_url",
+    "pr_head_sha",
     "mode",
     "preview_url",
     "extracted_criteria",
@@ -53,6 +55,7 @@ async def _get_existing(
             iteration,
             pr_number,
             pr_url,
+            pr_head_sha,
             mode,
             preview_url,
             extracted_criteria,
@@ -71,6 +74,7 @@ async def _get_existing(
         iteration=int(row["iteration"]),
         pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
         pr_url=str(row["pr_url"]),
+        pr_head_sha=str(row["pr_head_sha"]),
         mode=str(row["mode"]),
         preview_url=str(row["preview_url"]),
         extracted_criteria=str(row["extracted_criteria"]),
@@ -109,6 +113,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> AcceptanceState:
         iteration=0,
         pr_number=None,
         pr_url="",
+        pr_head_sha="",
         mode="off",
         preview_url="",
         extracted_criteria="",
@@ -124,6 +129,7 @@ async def begin_acceptance(
     *,
     pr_number: int | None,
     pr_url: str,
+    pr_head_sha: str,
     mode: AcceptanceMode,
     preview_url: str,
     extracted_criteria: str,
@@ -133,14 +139,15 @@ async def begin_acceptance(
     await conn.execute(
         """
         INSERT INTO acceptance_state (
-            issue_id, iteration, pr_number, pr_url, mode, preview_url,
+            issue_id, iteration, pr_number, pr_url, pr_head_sha, mode, preview_url,
             extracted_criteria, last_verdict, last_artifacts_url, infra_retries
         )
-        VALUES (?, 0, ?, ?, ?, ?, ?, '', '', 0)
+        VALUES (?, 0, ?, ?, ?, ?, ?, ?, '', '', 0)
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             pr_number = excluded.pr_number,
             pr_url = excluded.pr_url,
+            pr_head_sha = excluded.pr_head_sha,
             mode = excluded.mode,
             preview_url = excluded.preview_url,
             extracted_criteria = excluded.extracted_criteria,
@@ -148,7 +155,15 @@ async def begin_acceptance(
             last_artifacts_url = '',
             infra_retries = 0
         """,
-        (issue_id, pr_number, pr_url, mode, preview_url, extracted_criteria),
+        (
+            issue_id,
+            pr_number,
+            pr_url,
+            pr_head_sha,
+            mode,
+            preview_url,
+            extracted_criteria,
+        ),
     )
     new = await _get_existing(conn, issue_id)
     assert new is not None
@@ -233,14 +248,15 @@ async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
     await conn.execute(
         """
         INSERT INTO acceptance_state (
-            issue_id, iteration, pr_number, pr_url, mode, preview_url,
+            issue_id, iteration, pr_number, pr_url, pr_head_sha, mode, preview_url,
             extracted_criteria, last_verdict, last_artifacts_url, infra_retries
         )
-        VALUES (?, 0, NULL, '', 'off', '', '', '', '', 0)
+        VALUES (?, 0, NULL, '', '', 'off', '', '', '', '', 0)
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             pr_number = NULL,
             pr_url = '',
+            pr_head_sha = '',
             mode = 'off',
             preview_url = '',
             extracted_criteria = '',

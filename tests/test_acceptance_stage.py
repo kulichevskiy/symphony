@@ -198,6 +198,7 @@ async def test_acceptance_mode_runs_stub_between_review_and_merge(
         acceptance = await db.acceptance_state.get(conn, "iss-1")
         assert acceptance.pr_number == 42
         assert acceptance.pr_url == "https://github.com/org/repo/pull/42"
+        assert acceptance.pr_head_sha == "abc123"
         assert acceptance.mode == "code_only"
         assert acceptance.last_verdict == "pass"
 
@@ -216,6 +217,148 @@ async def test_acceptance_mode_runs_stub_between_review_and_merge(
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-acceptance"),
             call("iss-1", "state-done"),
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_pass_must_match_current_pr_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="old123",
+            mode="code_only",
+            preview_url="",
+            extracted_criteria="[]",
+        )
+        await db.acceptance_state.record_verdict(
+            conn,
+            "iss-1",
+            verdict="pass",
+            artifacts_url="",
+        )
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=_github(),
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.pr_head_sha == "abc123"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+            "merge",
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runs_before_conflict_fix_ready_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        marked = await db.issue_prs.mark_merge_conflict_fixed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            head_sha="abc123",
+            marked_at="2026-05-10T00:03:00+00:00",
+        )
+        assert marked is True
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+        gh.pr_reviews = AsyncMock(return_value=[])
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.pr_head_sha == "abc123"
+        assert acceptance.last_verdict == "pass"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+            "merge",
         ]
     finally:
         await conn.close()

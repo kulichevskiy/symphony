@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS acceptance_state (
     iteration           INTEGER NOT NULL DEFAULT 0,
     pr_number           INTEGER,
     pr_url              TEXT NOT NULL DEFAULT '',
+    pr_head_sha         TEXT NOT NULL DEFAULT '',
     mode                TEXT NOT NULL DEFAULT 'off',
     preview_url         TEXT NOT NULL DEFAULT '',
     extracted_criteria  TEXT NOT NULL DEFAULT '',
