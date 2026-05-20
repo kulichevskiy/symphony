@@ -283,6 +283,8 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
             call("iss-1", "state-acceptance"),
             call("iss-1", "state-done"),
         ]
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert not any("degraded to code-only" in body for body in bodies)
     finally:
         await conn.close()
 

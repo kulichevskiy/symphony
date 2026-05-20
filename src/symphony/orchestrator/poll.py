@@ -5918,7 +5918,11 @@ class Orchestrator:
         self._dispatch_run_ids[issue.id] = run_id
         try:
             await self._complete_review_monitors_for_merge(issue)
-            degrade_note = _acceptance_degrade_note(issue.description)
+            degrade_note = (
+                _acceptance_degrade_note(issue.description)
+                if binding.acceptance.mode != _CODE_ONLY_ACCEPTANCE_MODE
+                else None
+            )
             effective_mode = (
                 _CODE_ONLY_ACCEPTANCE_MODE if degrade_note else binding.acceptance.mode
             )
