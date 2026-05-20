@@ -35,7 +35,11 @@ _CHECKBOX_RE = re.compile(
 )
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*#*\s*$")
-_CRITERIA_HEADING_RE = re.compile(r"\b(acceptance criteria|criteria|checklist)\b", re.I)
+_CRITERIA_HEADING_RE = re.compile(
+    r"^(?:acceptance\s+criteria|acceptance\s+checklist|criteria|checklist)"
+    r"(?:\s*(?::|-)\s*.*)?$",
+    re.I,
+)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_STRONG_RE = re.compile(r"(\*\*|__)(?P<text>.+?)\1")
 _MARKDOWN_CODE_RE = re.compile(r"`(?P<text>[^`]+)`")

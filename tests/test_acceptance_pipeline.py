@@ -323,6 +323,23 @@ def test_acceptance_criteria_extraction_keeps_nested_heading_items() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_ignores_negated_criteria_heading() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] OAuth login is implemented.\n\n"
+        "## Non-criteria follow-up\n\n"
+        "- [ ] Coordinate release timing."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+    ]
+
+
 def test_acceptance_verdict_comment_uses_neutral_per_criterion_breakdown() -> None:
     body = format_acceptance_verdict_comment(
         verdict=AcceptanceVerdict(
