@@ -455,6 +455,7 @@ async def test_retry_acceptance_clears_blocked_wait_and_infra_retries(
         assert await db.operator_waits.get(conn, "iss-1") is None
         assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
         assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
     finally:
         await conn.close()
 

@@ -2172,6 +2172,44 @@ class Orchestrator:
                 if state.pr_number is not None
                 else "(no PR yet)"
             )
+            states = await self._states_for_binding(binding)
+            active_state_names = (
+                binding.linear_states.needs_approval,
+                binding.linear_states.in_acceptance,
+                binding.linear_states.in_progress,
+            )
+            target_state_name = next(
+                (name for name in dict.fromkeys(active_state_names) if states.get(name)),
+                None,
+            )
+            if target_state_name is None:
+                log.warning(
+                    "could not retry blocked acceptance run %s: missing active state",
+                    run_id,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "missing active Linear state; keeping acceptance blocked",
+                )
+                return
+            target_state_id = states[target_state_name]
+            try:
+                await self.linear.move_issue(issue_id, target_state_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to %s for acceptance retry: %s",
+                    issue_id,
+                    target_state_name,
+                    e,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "could not move issue to an active Linear state; "
+                    "keeping acceptance blocked",
+                )
+                return
             await db.acceptance_state.reset(self._conn, issue_id)
             await self._clear_operator_wait(issue_id, run_id)
             body = acceptance_retry_requested(
