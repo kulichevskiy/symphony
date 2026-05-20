@@ -37,6 +37,7 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
 _HEADING_RE = re.compile(
     r"^\s{0,3}(?P<marker>#{1,6})\s+(?P<title>.+?)\s*#*\s*$"
 )
+_SETEXT_HEADING_UNDERLINE_RE = re.compile(r"^\s{0,3}(?P<marker>=+|-+)\s*$")
 _CRITERIA_HEADING_RE = re.compile(
     r"^(?:acceptance\s+criteria|acceptance\s+checklist|criteria|checklist)"
     r"(?:$|\W.*)",
@@ -181,12 +182,21 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
         current_criterion_name = ""
         current_criterion_parts.clear()
 
-    for raw_line in linear_description.splitlines():
+    lines = linear_description.splitlines()
+    line_index = 0
+    while line_index < len(lines):
+        raw_line = lines[line_index]
+        line_index += 1
         stripped = raw_line.strip()
         if not stripped:
             continue
 
         heading = _heading(raw_line.rstrip())
+        if heading is None and line_index < len(lines):
+            setext_heading = _setext_heading(raw_line.rstrip(), lines[line_index])
+            if setext_heading is not None:
+                heading = setext_heading
+                line_index += 1
         if heading is not None:
             flush_current_criterion()
             list_item_indent = None
@@ -487,6 +497,18 @@ def _heading(line: str) -> tuple[int, str] | None:
     return level, _clean_markdown(match.group("title")).casefold()
 
 
+def _setext_heading(line: str, underline: str) -> tuple[int, str] | None:
+    if _leading_indent_width(line) > 3 or _leading_indent_width(underline) > 3:
+        return None
+    if _CHECKBOX_RE.match(line) or _LIST_ITEM_RE.match(line):
+        return None
+    match = _SETEXT_HEADING_UNDERLINE_RE.match(underline)
+    if not match:
+        return None
+    level = 1 if match.group("marker").startswith("=") else 2
+    return level, _clean_markdown(line).casefold()
+
+
 def _is_criteria_heading(heading: str) -> bool:
     return bool(_CRITERIA_HEADING_RE.search(heading))
 
@@ -535,7 +557,7 @@ def _clean_markdown(text: str) -> str:
     cleaned = _MARKDOWN_STRONG_RE.sub(r"\g<text>", cleaned)
     cleaned = _MARKDOWN_CODE_RE.sub(r"\g<text>", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip(" \t-")
+    return cleaned.strip(" \t")
 
 
 def _criterion_name(predicate: str) -> str:

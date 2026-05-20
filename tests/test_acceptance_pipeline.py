@@ -354,6 +354,40 @@ def test_acceptance_criteria_extraction_folds_nested_list_items() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_preserves_leading_hyphen_text() -> None:
+    description = (
+        "Ship validation.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] `-1` remains a valid input.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "-1 remains a valid input",
+            "predicate": "-1 remains a valid input.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_accepts_setext_headings() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "Acceptance criteria\n"
+        "---\n\n"
+        "- [ ] Criteria are published first.\n\n"
+        "Out of scope\n"
+        "---\n\n"
+        "- [ ] Per-criterion screenshots are included.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria are published first",
+            "predicate": "Criteria are published first.",
+        },
+    ]
+
+
 def test_acceptance_criteria_extraction_accepts_heading_suffix_text() -> None:
     description = (
         "Ship acceptance checks.\n\n"
