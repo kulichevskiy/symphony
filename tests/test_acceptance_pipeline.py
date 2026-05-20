@@ -654,6 +654,32 @@ def test_acceptance_verdict_comment_embeds_dev_mode_screenshots() -> None:
     assert "- ✅ **Existing sessions still load**" in body
 
 
+def test_acceptance_verdict_comment_marks_missing_criterion_results_unreported() -> None:
+    body = format_acceptance_verdict_comment(
+        verdict=AcceptanceVerdict(
+            kind="pass",
+            criteria=["OAuth login is implemented", "Existing sessions still load"],
+            cost=0.12,
+            hero_screenshot_url="",
+            details="OAuth button works.",
+            criterion_results=(
+                AcceptanceCriterionResult(
+                    criterion="OAuth login is implemented",
+                    passed=True,
+                ),
+            ),
+        ),
+        pr_url="https://github.example/pr/1",
+    )
+
+    assert "- ✅ **OAuth login is implemented**: verified." in body
+    assert (
+        "- **Existing sessions still load**: not reported by the acceptance agent."
+        in body
+    )
+    assert "- ✅ **Existing sessions still load**" not in body
+
+
 @pytest.mark.asyncio
 async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     tmp_path: Path,
@@ -789,6 +815,74 @@ async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
     assert preview_url in prompt
     assert "Capture exactly one hero screenshot" in prompt
     assert "symphony-acceptance-artifacts" in prompt
+    assert len(stopped_servers) == 1
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_uses_fallback_port_when_configured_port_is_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    occupied_port = _free_port()
+    fallback_port = _free_port()
+    while fallback_port == occupied_port:
+        fallback_port = _free_port()
+    occupied_url = f"http://127.0.0.1:{occupied_port}"
+    fallback_url = f"http://127.0.0.1:{fallback_port}"
+    screenshot = ".symphony/acceptance/acceptance-1/hero.png"
+    start_kwargs: dict[str, object] = {}
+    stopped_servers: list[object] = []
+
+    async def fake_port_reachable(_host: str, checked_port: int) -> bool:
+        return checked_port == occupied_port
+
+    async def fake_start_dev_server(**kwargs: object) -> object:
+        start_kwargs.update(kwargs)
+        return acceptance_module._DevServer()  # noqa: SLF001
+
+    async def fake_stop_dev_server(server: object) -> None:
+        stopped_servers.append(server)
+
+    monkeypatch.setattr(acceptance_module, "_port_reachable", fake_port_reachable)
+    monkeypatch.setattr(acceptance_module, "_unused_dev_port", lambda: fallback_port)
+    monkeypatch.setattr(acceptance_module, "_start_dev_server", fake_start_dev_server)
+    monkeypatch.setattr(acceptance_module, "_stop_dev_server", fake_stop_dev_server)
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=_dev_artifact_result(
+                    preview_url=fallback_url,
+                    hero_path=screenshot,
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="dev",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=5,
+        preview_url=occupied_url,
+        dev_command="npm run dev",
+        dev_port=occupied_port,
+        dev_startup_timeout_secs=5,
+    )
+
+    assert verdict.kind == "pass"
+    assert verdict.preview_url == fallback_url
+    assert start_kwargs["port"] == fallback_port
+    assert start_kwargs["preview_url"] == fallback_url
+    assert runner.captured_spec is not None
+    assert fallback_url in runner.captured_spec.command[-1]
+    assert occupied_url not in runner.captured_spec.command[-1]
+    assert runner.captured_spec.env["SYMPHONY_ACCEPTANCE_PREVIEW_URL"] == fallback_url
     assert len(stopped_servers) == 1
 
 

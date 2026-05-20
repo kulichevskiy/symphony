@@ -704,7 +704,7 @@ def _criteria_breakdown(verdict: AcceptanceVerdict) -> str:
         for criterion in criteria:
             result = by_criterion.get(criterion.casefold())
             if result is None:
-                body += f"- ✅ **{criterion}**: verified.\n"
+                body += f"- **{criterion}**: not reported by the acceptance agent.\n"
                 continue
             if result.passed:
                 body += f"- ✅ **{criterion}**: verified.\n"

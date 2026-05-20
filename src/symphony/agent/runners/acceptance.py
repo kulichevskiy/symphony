@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import socket
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -303,24 +304,18 @@ async def _run_dev_acceptance(
             details="dev acceptance requires acceptance.dev_command and acceptance.dev_port.",
             preview_url=preview_url,
         )
-    resolved_preview_url = preview_url or _localhost_url(dev_port)
-    if await _port_reachable("127.0.0.1", dev_port):
-        return AcceptanceVerdict(
-            kind="infra_error",
-            criteria=list(criteria or []),
-            cost=0.0,
-            hero_screenshot_url="",
-            details=(
-                "dev server port "
-                f"{dev_port} was already reachable before launching dev_command."
-            ),
-            preview_url=resolved_preview_url,
-        )
+    resolved_dev_port = await _resolve_dev_port(dev_port)
+    resolved_preview_url = (
+        preview_url
+        if preview_url and resolved_dev_port == dev_port
+        else _localhost_url(resolved_dev_port)
+    )
 
     dev_server = await _start_dev_server(
         command=dev_command,
         workspace_path=workspace_path,
-        port=dev_port,
+        port=resolved_dev_port,
+        preview_url=resolved_preview_url,
         startup_timeout_secs=dev_startup_timeout_secs,
     )
     if dev_server.error_details:
@@ -563,6 +558,7 @@ async def _start_dev_server(
     workspace_path: Path,
     port: int,
     startup_timeout_secs: float,
+    preview_url: str | None = None,
 ) -> _DevServer:
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -570,7 +566,7 @@ async def _start_dev_server(
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=workspace_path,
-            env=os.environ.copy(),
+            env=_dev_server_env(port=port, preview_url=preview_url or _localhost_url(port)),
             start_new_session=True,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -652,8 +648,33 @@ async def _port_reachable(host: str, port: int) -> bool:
     return True
 
 
+async def _resolve_dev_port(preferred_port: int) -> int:
+    if not await _port_reachable("127.0.0.1", preferred_port):
+        return preferred_port
+    return _unused_dev_port()
+
+
+def _unused_dev_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _localhost_url(port: int) -> str:
     return f"http://127.0.0.1:{port}"
+
+
+def _dev_server_env(*, port: int, preview_url: str) -> dict[str, str]:
+    env = os.environ.copy()
+    port_text = str(port)
+    env.update(
+        {
+            "PORT": port_text,
+            "SYMPHONY_ACCEPTANCE_DEV_PORT": port_text,
+            "SYMPHONY_ACCEPTANCE_PREVIEW_URL": preview_url,
+        }
+    )
+    return env
 
 
 def _dev_server_exit_details(
