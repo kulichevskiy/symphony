@@ -5501,7 +5501,7 @@ class Orchestrator:
         )
 
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
-        """Advance approved Review PRs into the next post-review step."""
+        """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
         candidates = await db.issue_prs.list_merge_candidates(self._conn)
         for candidate in candidates:
@@ -5627,13 +5627,6 @@ class Orchestrator:
                 )
 
             if verdict.kind is VerdictKind.APPROVED or conflict_fix_ready:
-                if verdict.kind is VerdictKind.APPROVED and binding.acceptance.mode == "off":
-                    await self._start_merge_approval_wait(
-                        binding=binding,
-                        issue=issue,
-                        pr_url=candidate.pr_url,
-                    )
-                    continue
                 if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
                     continue
                 binding_key = _binding_key(binding)
@@ -5715,23 +5708,6 @@ class Orchestrator:
                     pr_created_at=candidate.created_at,
                 )
         return scheduled
-
-    async def _start_merge_approval_wait(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_url: str,
-    ) -> None:
-        await self._complete_review_monitors_for_merge(issue)
-        await self._mark_merge_needs_approval(
-            binding=binding,
-            issue=issue,
-            pr_url=pr_url,
-            run_id=str(uuid.uuid4()),
-            reason="",
-            create_run=True,
-        )
 
     def _schedule_acceptance(
         self,
