@@ -2560,6 +2560,13 @@ class Orchestrator:
         state: db.review_state.ReviewState,
         head_sha: str,
     ) -> None:
+        if binding.review_strategy == "local":
+            log.debug(
+                "skipping no-signal @codex review re-arm for %s: "
+                "binding uses local review strategy",
+                issue.identifier,
+            )
+            return
         if not head_sha:
             return
         rearm_key = (run.id, head_sha)
