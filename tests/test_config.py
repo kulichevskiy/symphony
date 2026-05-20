@@ -167,7 +167,7 @@ repos:
       dev_port: 3000
       taste_guide: docs/taste.md
       cost_cap_usd: 3.5
-      time_cap_minutes: 7
+      time_cap_minutes: 0.1
     linear_states:
       ready: Todo
       in_acceptance: QA Acceptance
@@ -182,7 +182,7 @@ repos:
     assert cfg.repos[0].acceptance.dev_port == 3000
     assert cfg.repos[0].acceptance.taste_guide == "docs/taste.md"
     assert cfg.repos[0].acceptance.cost_cap_usd == 3.5
-    assert cfg.repos[0].acceptance.time_cap_minutes == 7
+    assert cfg.repos[0].acceptance.time_cap_minutes == pytest.approx(0.1)
     assert cfg.repos[0].linear_states.in_acceptance == "QA Acceptance"
 
 

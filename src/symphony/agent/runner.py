@@ -27,7 +27,7 @@ class RunnerSpec:
     )
     command: list[str]  # ["claude", "--print", "--output-format", "stream-json", ...]
     env: dict[str, str] = field(default_factory=dict)
-    stall_secs: int = 300
+    stall_secs: float = 300
     stage: str = ""  # implement|review|merge — telemetry only
 
 
