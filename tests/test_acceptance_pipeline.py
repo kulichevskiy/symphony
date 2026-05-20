@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -29,6 +30,7 @@ class _ScriptedRunner:
     def __init__(self, events: list[RunnerEvent]) -> None:
         self.events = events
         self.captured_spec: RunnerSpec | None = None
+        self.killed_run_ids: list[str] = []
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         self.captured_spec = spec
@@ -38,8 +40,20 @@ class _ScriptedRunner:
         for ev in self.events:
             yield ev
 
-    async def kill(self, _run_id: str) -> None:
-        return None
+    async def kill(self, run_id: str) -> None:
+        self.killed_run_ids.append(run_id)
+
+
+class _SlowRunner(_ScriptedRunner):
+    def __init__(self, *, delay_secs: float, events: list[RunnerEvent]) -> None:
+        super().__init__(events)
+        self.delay_secs = delay_secs
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        yield RunnerEvent(kind="started", pid=1234)
+        await asyncio.sleep(self.delay_secs)
+        for ev in self.events:
+            yield ev
 
 
 def _claude_result(text: str, *, cost: float = 0.0) -> str:
@@ -430,6 +444,83 @@ def test_acceptance_prompt_includes_first_phase_quick_skip_contract() -> None:
     assert "If in doubt, classify as non-trivial" in prompt
 
 
+@pytest.mark.asyncio
+async def test_acceptance_runner_aborts_with_infra_error_when_budget_reached(
+    tmp_path: Path,
+) -> None:
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result("Still evaluating.", cost=0.02),
+            ),
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result(
+                    f"Looks good.\n\n{ACCEPTANCE_FOOTER_PASS}",
+                    cost=0.03,
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=15,
+        max_budget_usd=0.01,
+    )
+
+    assert verdict.kind == "infra_error"
+    assert verdict.criteria == ["toolbar has settings icon"]
+    assert verdict.cost == pytest.approx(0.02)
+    assert "cost_cap_exceeded" in verdict.details
+    assert runner.killed_run_ids == ["acceptance-1"]
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runner_aborts_with_infra_error_when_time_cap_reached(
+    tmp_path: Path,
+) -> None:
+    runner = _SlowRunner(
+        delay_secs=0.05,
+        events=[
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result(
+                    f"Looks good.\n\n{ACCEPTANCE_FOOTER_PASS}",
+                    cost=0.02,
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ],
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=0.01,
+        max_budget_usd=10.0,
+    )
+
+    assert verdict.kind == "infra_error"
+    assert verdict.criteria == ["toolbar has settings icon"]
+    assert verdict.cost == 0.0
+    assert "time_cap_exceeded" in verdict.details
+    assert runner.killed_run_ids == ["acceptance-1"]
+
+
 def test_acceptance_command_disallows_claude_tools_without_budget() -> None:
     command = build_acceptance_command(prompt="judge this")
 
@@ -523,10 +614,10 @@ def test_acceptance_prompt_works_without_taste_guide_section() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("terminal", "expected_details"),
-    [
-        (RunnerEvent(kind="exit", returncode=2), "exited rc=2"),
-        (RunnerEvent(kind="stall_timeout"), "stalled"),
+        ("terminal", "expected_details"),
+        [
+            (RunnerEvent(kind="exit", returncode=2), "exited rc=2"),
+            (RunnerEvent(kind="stall_timeout"), "time_cap_exceeded"),
         (
             RunnerEvent(kind="spawn_failed", error="FileNotFoundError: claude"),
             "spawn_failed: FileNotFoundError: claude",

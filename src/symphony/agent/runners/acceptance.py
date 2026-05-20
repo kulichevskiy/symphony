@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
+from collections.abc import AsyncIterator
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
-from symphony.agent.runner import Runner, RunnerSpec
+from symphony.agent.process import parse_event_line
+from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_PASS,
     ACCEPTANCE_FOOTER_REJECT,
@@ -13,7 +19,7 @@ from symphony.pipeline.acceptance_classifier import (
     AcceptanceVerdict,
     acceptance_classifier,
 )
-from symphony.pipeline.local_review_io import CollectedRunnerOutput, collect_runner_output
+from symphony.pipeline.local_review_io import CollectedRunnerOutput
 
 _DIFF_LIMIT_CHARS = 60_000
 _CODE_ONLY_MODE = "code_only"
@@ -152,7 +158,7 @@ async def run_acceptance(
     pr_diff_summary: str,
     taste_guide: str = "",
     criteria: list[str] | None = None,
-    stall_secs: int = 300,
+    stall_secs: float = 300,
     max_budget_usd: float | None = None,
 ) -> AcceptanceVerdict:
     if mode != _CODE_ONLY_MODE:
@@ -188,7 +194,21 @@ async def run_acceptance(
         stall_secs=stall_secs,
         stage="acceptance",
     )
-    collected = await collect_runner_output(runner, spec)
+    acceptance_run = await _collect_acceptance_output(
+        runner,
+        spec,
+        max_budget_usd=max_budget_usd,
+        wall_clock_secs=stall_secs,
+    )
+    collected = acceptance_run.output
+    if acceptance_run.abort_details:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=acceptance_run.cost,
+            hero_screenshot_url="",
+            details=acceptance_run.abort_details,
+        )
     if not collected.ok_exit:
         parsed = acceptance_classifier(
             transcript=collected.stdout,
@@ -197,13 +217,151 @@ async def run_acceptance(
         return AcceptanceVerdict(
             kind="infra_error",
             criteria=list(criteria or []),
-            cost=parsed.cost,
+            cost=max(parsed.cost, acceptance_run.cost),
             hero_screenshot_url="",
-            details=_failed_run_details(collected),
+            details=_failed_run_details(
+                collected,
+                parsed_details=(
+                    parsed.details if parsed.kind == "infra_error" else ""
+                ),
+                time_cap_secs=stall_secs,
+            ),
         )
     return acceptance_classifier(
         transcript=collected.stdout,
         criteria=criteria,
+    )
+
+
+@dataclass(frozen=True)
+class _AcceptanceRunOutput:
+    output: CollectedRunnerOutput
+    abort_details: str = ""
+    cost: float = 0.0
+
+
+async def _collect_acceptance_output(
+    runner: Runner,
+    spec: RunnerSpec,
+    *,
+    max_budget_usd: float | None,
+    wall_clock_secs: float,
+) -> _AcceptanceRunOutput:
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    terminal_kind = "exit"
+    returncode: int | None = None
+    spawn_error: str | None = None
+    stall_timeout = False
+    tracked_cost = 0.0
+    started_at = time.monotonic()
+    iterator: AsyncIterator[RunnerEvent] = runner.run(spec).__aiter__()
+
+    async def abort(details: str) -> _AcceptanceRunOutput:
+        await runner.kill(spec.run_id)
+        await _close_iterator(iterator)
+        return _AcceptanceRunOutput(
+            output=CollectedRunnerOutput(
+                stdout="\n".join(stdout_parts),
+                stderr="\n".join(stderr_parts),
+                terminal_kind="abort",
+                returncode=None,
+                spawn_error=None,
+                stall_timeout=False,
+            ),
+            abort_details=details,
+            cost=tracked_cost,
+        )
+
+    while True:
+        remaining = wall_clock_secs - (time.monotonic() - started_at)
+        if remaining <= 0:
+            return await abort(_time_cap_exceeded_details(wall_clock_secs))
+
+        next_event: asyncio.Task[RunnerEvent] = asyncio.create_task(
+            _next_runner_event(iterator)
+        )
+        done, _pending = await asyncio.wait({next_event}, timeout=remaining)
+        if not done:
+            await runner.kill(spec.run_id)
+            next_event.cancel()
+            with suppress(asyncio.CancelledError):
+                await next_event
+            await _close_iterator(iterator)
+            return _AcceptanceRunOutput(
+                output=CollectedRunnerOutput(
+                    stdout="\n".join(stdout_parts),
+                    stderr="\n".join(stderr_parts),
+                    terminal_kind="abort",
+                    returncode=None,
+                    spawn_error=None,
+                    stall_timeout=False,
+                ),
+                abort_details=_time_cap_exceeded_details(wall_clock_secs),
+                cost=tracked_cost,
+            )
+
+        try:
+            event = next_event.result()
+        except StopAsyncIteration:
+            break
+
+        if event.kind == "stdout" and event.line is not None:
+            stdout_parts.append(event.line)
+            usage = parse_event_line(event.line)
+            if usage is not None:
+                tracked_cost = max(tracked_cost, usage.cost_usd)
+                if _cost_cap_reached(max_budget_usd, tracked_cost):
+                    return await abort(
+                        _cost_cap_exceeded_details(max_budget_usd, tracked_cost)
+                    )
+        elif event.kind == "stderr" and event.line is not None:
+            stderr_parts.append(event.line)
+        elif event.kind == "exit":
+            terminal_kind = "exit"
+            returncode = event.returncode
+            break
+        elif event.kind == "stall_timeout":
+            terminal_kind = "stall_timeout"
+            stall_timeout = True
+            break
+        elif event.kind == "spawn_failed":
+            terminal_kind = "spawn_failed"
+            spawn_error = event.error
+            break
+
+    return _AcceptanceRunOutput(
+        output=CollectedRunnerOutput(
+            stdout="\n".join(stdout_parts),
+            stderr="\n".join(stderr_parts),
+            terminal_kind=terminal_kind,
+            returncode=returncode,
+            spawn_error=spawn_error,
+            stall_timeout=stall_timeout,
+        ),
+        cost=tracked_cost,
+    )
+
+
+async def _close_iterator(iterator: object) -> None:
+    aclose = getattr(iterator, "aclose", None)
+    if aclose is None:
+        return
+    with suppress(Exception):  # noqa: BLE001
+        await aclose()
+
+
+async def _next_runner_event(
+    iterator: AsyncIterator[RunnerEvent],
+) -> RunnerEvent:
+    return await iterator.__anext__()
+
+
+def _cost_cap_reached(max_budget_usd: float | None, cost_usd: float) -> bool:
+    return (
+        max_budget_usd is not None
+        and max_budget_usd > 0
+        and cost_usd >= max_budget_usd
     )
 
 
@@ -451,12 +609,46 @@ def _unsupported_mode_details(mode: str) -> str:
     )
 
 
-def _failed_run_details(collected: CollectedRunnerOutput) -> str:
+def _failed_run_details(
+    collected: CollectedRunnerOutput,
+    *,
+    parsed_details: str = "",
+    time_cap_secs: float = 0.0,
+) -> str:
+    if parsed_details:
+        return _prefix_cap_details(parsed_details)
     if collected.terminal_kind == "spawn_failed":
         return f"Acceptance runner spawn_failed: {collected.spawn_error or 'unknown'}"
     if collected.stall_timeout:
-        return "Acceptance runner stalled before completing successfully."
+        return _time_cap_exceeded_details(time_cap_secs)
     return f"Acceptance runner exited rc={collected.returncode}."
+
+
+def _cost_cap_exceeded_details(max_budget_usd: float | None, cost_usd: float) -> str:
+    cap = 0.0 if max_budget_usd is None else max_budget_usd
+    return (
+        "cost_cap_exceeded: acceptance cost "
+        f"${cost_usd:.4f} reached cap ${cap:.4f}."
+    )
+
+
+def _time_cap_exceeded_details(time_cap_secs: float) -> str:
+    minutes = time_cap_secs / 60.0
+    return (
+        "time_cap_exceeded: acceptance exceeded wall-clock cap "
+        f"of {minutes:.2f} minutes ({time_cap_secs:.1f}s)."
+    )
+
+
+def _prefix_cap_details(details: str) -> str:
+    lower = details.lower()
+    if "cost_cap_exceeded" in lower or "time_cap_exceeded" in lower:
+        return details
+    if "cost" in lower and ("cap" in lower or "budget" in lower):
+        return f"cost_cap_exceeded: {details}"
+    if "timeout" in lower or "timed out" in lower or "time cap" in lower:
+        return f"time_cap_exceeded: {details}"
+    return details
 
 
 __all__ = [

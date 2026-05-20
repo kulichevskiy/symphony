@@ -47,7 +47,7 @@ class AcceptanceConfig(BaseModel):
     dev_port: int | None = Field(default=None, ge=1, le=65535)
     taste_guide: str | None = None
     cost_cap_usd: float = Field(default=10.0, ge=0)
-    time_cap_minutes: int = Field(default=15, ge=1)
+    time_cap_minutes: float = Field(default=15.0, gt=0)
 
 
 class LinearStates(BaseModel):
