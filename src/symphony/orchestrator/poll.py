@@ -67,6 +67,9 @@ from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
 from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import (
     CommentVars,
+    acceptance_blocked,
+    acceptance_retry_requested,
+    acceptance_skipped,
     awaiting_approval,
     codex_lgtm,
     command_rejected,
@@ -134,6 +137,9 @@ _CODE_ONLY_ACCEPTANCE_MODE = "code_only"
 _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
+ACCEPTANCE_INFRA_RETRY_LIMIT = 2
+ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
+ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
 
 
 class _AcceptancePrDiffUnavailable(RuntimeError):
@@ -1490,6 +1496,11 @@ class Orchestrator:
                     issue_id, run_id, intent
                 )
                 return
+            if wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED:
+                await self._handle_acceptance_blocked_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
             await self._post_command_rejected(
                 issue_id,
                 self._slash_text(intent),
@@ -1531,6 +1542,16 @@ class Orchestrator:
             return
         if intent.kind is SlashKind.SKIP_LOCAL_REVIEW:
             await self._handle_skip_local_review_intent(issue_id)
+            return
+        if intent.kind in (
+            SlashKind.RETRY_ACCEPTANCE,
+            SlashKind.SKIP_ACCEPTANCE,
+        ):
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "no blocked acceptance wait is active",
+            )
             return
         log.info(
             "slash %s received for run %s (handler not implemented in this slice)",
@@ -1935,6 +1956,7 @@ class Orchestrator:
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
+                db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
             ):
                 log.warning(
                     "ignoring unsupported operator wait kind %r for issue %s",
@@ -2062,6 +2084,196 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def _track_acceptance_blocked_wait(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        run_id: str,
+        verdict: AcceptanceVerdict,
+    ) -> None:
+        states: dict[str, str] = {}
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking acceptance-blocked %s: %s",
+                issue.identifier,
+                e,
+            )
+        target_id = states.get(binding.linear_states.needs_approval) or states.get(
+            binding.linear_states.blocked
+        )
+        if target_id is not None:
+            try:
+                await self.linear.move_issue(issue.id, target_id)
+            except LinearError as e:
+                log.warning(
+                    "could not park acceptance-blocked %s: %s",
+                    issue.identifier,
+                    e,
+                )
+
+        body = acceptance_blocked(
+            CommentVars(
+                stage="acceptance",
+                repo=binding.github_repo,
+                issue=pr_number,
+                pr_url=await self._acceptance_pr_url(issue.id),
+                run_id=run_id,
+                error=verdict.details,
+            )
+        )
+        try:
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("acceptance blocked comment failed on %s: %s", issue.identifier, e)
+
+        self._dispatch_run_ids[issue.id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue.id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
+    async def _acceptance_pr_url(self, issue_id: str) -> str:
+        state = await db.acceptance_state.get(self._conn, issue_id)
+        if state.pr_url:
+            return state.pr_url
+        if state.pr_number is not None:
+            return f"#{state.pr_number}"
+        return "(no PR yet)"
+
+    async def _handle_acceptance_blocked_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = await self._restore_operator_wait_binding(
+            issue_id,
+            run_id,
+            intent,
+            expected_kinds=(db.operator_waits.KIND_ACCEPTANCE_BLOCKED,),
+        )
+        if binding is None:
+            return
+
+        state = await db.acceptance_state.get(self._conn, issue_id)
+        if intent.kind is SlashKind.RETRY_ACCEPTANCE:
+            pr_url = state.pr_url or (
+                f"https://github.com/{binding.github_repo}/pull/{state.pr_number}"
+                if state.pr_number is not None
+                else "(no PR yet)"
+            )
+            states = await self._states_for_binding(binding)
+            active_state_names = (
+                binding.linear_states.needs_approval,
+                binding.linear_states.in_acceptance,
+                binding.linear_states.in_progress,
+            )
+            target_state_name = next(
+                (name for name in dict.fromkeys(active_state_names) if states.get(name)),
+                None,
+            )
+            if target_state_name is None:
+                log.warning(
+                    "could not retry blocked acceptance run %s: missing active state",
+                    run_id,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "missing active Linear state; keeping acceptance blocked",
+                )
+                return
+            target_state_id = states[target_state_name]
+            try:
+                await self.linear.move_issue(issue_id, target_state_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to %s for acceptance retry: %s",
+                    issue_id,
+                    target_state_name,
+                    e,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "could not move issue to an active Linear state; "
+                    "keeping acceptance blocked",
+                )
+                return
+            await db.acceptance_state.reset(self._conn, issue_id)
+            await self._clear_operator_wait(issue_id, run_id)
+            body = acceptance_retry_requested(
+                CommentVars(
+                    stage="acceptance",
+                    repo=binding.github_repo,
+                    issue=state.pr_number or 0,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                )
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning("acceptance retry comment failed for %s: %s", issue_id, e)
+            return
+
+        if intent.kind is SlashKind.SKIP_ACCEPTANCE:
+            if state.pr_number is None:
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "no PR found for blocked acceptance",
+                )
+                return
+            try:
+                issue = await self.linear.lookup_issue(issue_id)
+            except LinearError as e:
+                log.warning("could not look up %s for skip-acceptance: %s", issue_id, e)
+                return
+
+            await db.acceptance_state.record_verdict(
+                self._conn,
+                issue_id,
+                verdict="pass",
+                artifacts_url=state.last_artifacts_url,
+            )
+            await self._clear_operator_wait(issue_id, run_id)
+            self._schedule_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=state.pr_number,
+                pr_url=state.pr_url,
+            )
+            body = acceptance_skipped(
+                CommentVars(
+                    stage="acceptance",
+                    repo=binding.github_repo,
+                    issue=state.pr_number,
+                    pr_url=state.pr_url,
+                    run_id=run_id,
+                    next_stage="merge",
+                )
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning("acceptance skip comment failed for %s: %s", issue_id, e)
+            return
+
+        await self._post_command_rejected(
+            issue_id,
+            self._slash_text(intent),
+            "acceptance is blocked; use $retry-acceptance or $skip-acceptance",
         )
 
     async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
@@ -5568,6 +5780,8 @@ class Orchestrator:
                 continue
             if candidate.issue_id in self._scheduled_issue_ids:
                 continue
+            if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
+                continue
             if await db.runs.has_active(
                 self._conn,
                 candidate.issue_id,
@@ -5695,6 +5909,10 @@ class Orchestrator:
                         candidate, binding, head_sha
                     )
                 ):
+                    if await self._acceptance_infra_retry_backoff_active(
+                        candidate.issue_id
+                    ):
+                        continue
                     scheduled.append(
                         self._schedule_acceptance(
                             binding=binding,
@@ -5761,6 +5979,28 @@ class Orchestrator:
                     pr_created_at=candidate.created_at,
                 )
         return scheduled
+
+    async def _acceptance_infra_retry_backoff_active(self, issue_id: str) -> bool:
+        state = await db.acceptance_state.get(self._conn, issue_id)
+        if state.last_verdict != "infra_error" or state.infra_retries <= 0:
+            return False
+        latest = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="acceptance",
+        )
+        if latest is None or latest.ended_at is None:
+            return False
+        try:
+            ended_at = _parse_rfc3339(latest.ended_at)
+        except ValueError:
+            return False
+        retry_count = min(state.infra_retries, ACCEPTANCE_INFRA_RETRY_LIMIT)
+        backoff_secs = min(
+            ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS * (2 ** (retry_count - 1)),
+            ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS,
+        )
+        return self._now() < ended_at + timedelta(seconds=backoff_secs)
 
     def _schedule_acceptance(
         self,
@@ -6096,6 +6336,22 @@ class Orchestrator:
                 return run_id
 
             if verdict.kind == "infra_error":
+                state = await db.acceptance_state.get(self._conn, issue.id)
+                if state.infra_retries >= ACCEPTANCE_INFRA_RETRY_LIMIT:
+                    await db.runs.update_status(
+                        self._conn,
+                        run_id,
+                        "failed",
+                        ended_at=ended_at,
+                    )
+                    await self._track_acceptance_blocked_wait(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        run_id=run_id,
+                        verdict=verdict,
+                    )
+                    return run_id
                 await db.acceptance_state.bump_infra_retries(self._conn, issue.id)
             await db.runs.update_status(
                 self._conn,
@@ -6114,7 +6370,10 @@ class Orchestrator:
             )
             return run_id
         finally:
-            if self._dispatch_run_ids.get(issue.id) == run_id:
+            if (
+                self._dispatch_run_ids.get(issue.id) == run_id
+                and run_id not in self._operator_wait_run_ids
+            ):
                 self._dispatch_run_ids.pop(issue.id, None)
 
     def _schedule_merge_conflict_rebase_fix(

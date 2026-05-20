@@ -418,6 +418,93 @@ async def test_operator_wait_handlers_reject_when_binding_and_wait_missing(
 
 
 @pytest.mark.asyncio
+async def test_retry_acceptance_clears_blocked_wait_and_infra_retries(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$retry-acceptance")])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
+            stage="acceptance",
+        )
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
+            mode="code_only",
+            preview_url="",
+            extracted_criteria="[]",
+        )
+        await db.acceptance_state.bump_infra_retries(conn, "iss-1")
+        await db.acceptance_state.bump_infra_retries(conn, "iss-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.infra_retries == 0
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
+        assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_acceptance_on_blocked_wait_dispatches_merge(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$skip-acceptance")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
+            stage="acceptance",
+        )
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
+            mode="code_only",
+            preview_url="",
+            extracted_criteria="[]",
+        )
+        await db.acceptance_state.bump_infra_retries(conn, "iss-1")
+        await db.acceptance_state.bump_infra_retries(conn, "iss-1")
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        _, kwargs = orch._schedule_merge.call_args  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_approve_after_restart_dispatches_from_unread_comment(
     tmp_path: Path,
 ) -> None:

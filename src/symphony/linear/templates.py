@@ -133,6 +133,41 @@ def cost_cap_reached(v: CommentVars) -> str:
     )
 
 
+def acceptance_blocked(v: CommentVars) -> str:
+    detail = f"\n\nLast infra error: {v.error}\n" if v.error else "\n"
+    return (
+        f"🟠 **Acceptance blocked — infrastructure error**\n\n"
+        f"Symphony paused `{v.repo}#{v.issue}` after acceptance infra retries "
+        f"were exhausted.\n\n"
+        f"- Run ID: `{v.run_id}`\n"
+        f"- PR: {v.pr_url}\n"
+        f"{detail}\n"
+        "Reply with `$retry-acceptance` to run Acceptance again. "
+        "Reply with `$skip-acceptance` to merge despite the blocked "
+        "Acceptance stage.\n"
+    )
+
+
+def acceptance_retry_requested(v: CommentVars) -> str:
+    return (
+        f"↻ **Acceptance retry requested**\n\n"
+        f"`$retry-acceptance` received for `{v.repo}#{v.issue}`.\n\n"
+        f"- Run ID: `{v.run_id}`\n"
+        f"- PR: {v.pr_url}\n\n"
+        "Cleared Acceptance state; the next poll will run Acceptance again.\n"
+    )
+
+
+def acceptance_skipped(v: CommentVars) -> str:
+    return (
+        f"⏭️ **Acceptance skipped — advancing to merge**\n\n"
+        f"`$skip-acceptance` received on `{v.repo}#{v.issue}`.\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n\n"
+        "Dispatching merge now.\n"
+    )
+
+
 def review_stopped(v: CommentVars) -> str:
     return (
         f"⏸️ **Review monitor stopped — pipeline paused**\n\n"
