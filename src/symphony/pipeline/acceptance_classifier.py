@@ -40,6 +40,14 @@ _CRITERIA_HEADING_RE = re.compile(
     r"(?:\s*(?::|-)\s*.*)?$",
     re.I,
 )
+_NON_CRITERIA_HEADING_RE = re.compile(
+    r"^(?:"
+    r"non[-\s]+criteria\b.*|"
+    r"what\s+to\s+build|where\s+to\s+verify|out\s+of\s+scope|"
+    r"description|summary|notes?|implementation|context|tasks?|todo"
+    r")(?:\s*(?::|-)\s*.*)?$",
+    re.I,
+)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _MARKDOWN_STRONG_RE = re.compile(r"(\*\*|__)(?P<text>.+?)\1")
 _MARKDOWN_CODE_RE = re.compile(r"`(?P<text>[^`]+)`")
@@ -153,6 +161,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
     seen: set[str] = set()
     in_criteria_section = False
     criteria_heading_level: int | None = None
+    blocked_nested_heading_level: int | None = None
 
     for raw_line in linear_description.splitlines():
         line = raw_line.strip()
@@ -167,7 +176,15 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
                 and criteria_heading_level is not None
                 and heading_level > criteria_heading_level
             ):
+                if (
+                    blocked_nested_heading_level is not None
+                    and heading_level <= blocked_nested_heading_level
+                ):
+                    blocked_nested_heading_level = None
+                if _is_non_criteria_heading(heading_title):
+                    blocked_nested_heading_level = heading_level
                 continue
+            blocked_nested_heading_level = None
             if _is_criteria_heading(heading_title):
                 in_criteria_section = True
                 criteria_heading_level = heading_level
@@ -176,7 +193,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
                 criteria_heading_level = None
             continue
 
-        if not in_criteria_section:
+        if not in_criteria_section or blocked_nested_heading_level is not None:
             continue
         checkbox_match = _CHECKBOX_RE.match(line)
         if checkbox_match:
@@ -437,6 +454,10 @@ def _heading(line: str) -> tuple[int, str] | None:
 
 def _is_criteria_heading(heading: str) -> bool:
     return bool(_CRITERIA_HEADING_RE.search(heading))
+
+
+def _is_non_criteria_heading(heading: str) -> bool:
+    return bool(_NON_CRITERIA_HEADING_RE.search(heading))
 
 
 def _append_criterion(

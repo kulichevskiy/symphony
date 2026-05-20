@@ -328,6 +328,34 @@ def test_acceptance_criteria_extraction_keeps_nested_heading_items() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_skips_nested_noncriteria_sections() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Acceptance criteria\n\n"
+        "### Backend criteria\n\n"
+        "- [ ] OAuth login is implemented.\n\n"
+        "### Out of scope\n\n"
+        "- [ ] Password reset changes.\n\n"
+        "#### Notes\n\n"
+        "- [ ] Release timing is tracked elsewhere.\n\n"
+        "### Regression coverage\n\n"
+        "- Existing sessions still load.\n\n"
+        "## Where to verify\n\n"
+        "- [ ] Staging login flow."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+        {
+            "name": "Existing sessions still load",
+            "predicate": "Existing sessions still load.",
+        },
+    ]
+
+
 def test_acceptance_criteria_extraction_ignores_negated_criteria_heading() -> None:
     description = (
         "Ship OAuth.\n\n"
