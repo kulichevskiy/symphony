@@ -65,6 +65,7 @@ def build_acceptance_command(
 ) -> list[str]:
     command = [
         "claude",
+        "--bare",
         "--print",
         "--output-format",
         "stream-json",

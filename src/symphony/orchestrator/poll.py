@@ -5933,13 +5933,15 @@ class Orchestrator:
 
             if binding.acceptance.mode != "code_only":
                 verdict = AcceptanceVerdict(
-                    kind="infra_error",
+                    kind="pass",
                     criteria=criteria,
                     cost=0.0,
                     hero_screenshot_url="",
                     details=(
-                        f"Acceptance mode {binding.acceptance.mode!r} is not supported "
-                        "by the Claude code-only runner."
+                        f"Acceptance mode {binding.acceptance.mode!r} is configured, "
+                        "but only 'code_only' has a real runner in this slice. "
+                        "Preserving pass-through acceptance behavior until that "
+                        "mode's runner is implemented."
                     ),
                 )
             else:

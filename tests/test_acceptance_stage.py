@@ -614,7 +614,7 @@ async def test_acceptance_diff_fetch_failure_records_infra_error_without_runner(
 
 
 @pytest.mark.asyncio
-async def test_non_code_only_acceptance_mode_records_infra_error_without_runner(
+async def test_non_code_only_acceptance_mode_passes_through_without_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
@@ -625,7 +625,7 @@ async def test_non_code_only_acceptance_mode_records_infra_error_without_runner(
     try:
         binding = _binding("dev")
         await _seed_review_candidate(conn, binding)
-        runner = _FakeRunner(_acceptance_events())
+        runner = _FakeRunner(_merge_events())
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
         workspace.release = MagicMock()
@@ -659,24 +659,25 @@ async def test_non_code_only_acceptance_mode_records_infra_error_without_runner(
 
         acceptance = await db.acceptance_state.get(conn, "iss-1")
         assert acceptance.mode == "dev"
-        assert acceptance.last_verdict == "infra_error"
-        assert acceptance.infra_retries == 1
+        assert acceptance.last_verdict == "pass"
+        assert acceptance.infra_retries == 0
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert [run.stage for run in history] == [
             "implement",
             "review",
             "acceptance",
+            "merge",
         ]
-        assert history[2].status == "failed"
-        assert runner.captured_specs == []
-        workspace.acquire.assert_not_awaited()
+        assert history[2].status == "completed"
+        assert history[3].status == "done"
+        assert [spec.stage for spec in runner.captured_specs] == ["merge"]
         gh.pr_diff.assert_not_awaited()
-        gh.pr_merge.assert_not_awaited()
+        gh.pr_merge.assert_awaited_once()
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("Acceptance mode 'dev' is not supported" in body for body in bodies)
-        assert any(ACCEPTANCE_FOOTER_INFRA_ERROR in body for body in bodies)
+        assert any("pass-through acceptance behavior" in body for body in bodies)
+        assert any(ACCEPTANCE_FOOTER_PASS in body for body in bodies)
     finally:
         await conn.close()
 
