@@ -129,6 +129,10 @@ CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
 MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
+_CODE_ONLY_ACCEPTANCE_MODE = "code_only"
+_ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
+    "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
+)
 
 
 class _AcceptancePrDiffUnavailable(RuntimeError):
@@ -136,6 +140,39 @@ class _AcceptancePrDiffUnavailable(RuntimeError):
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
+
+
+def _acceptance_has_where_to_verify(description: str) -> bool:
+    for raw_line in description.splitlines():
+        heading = _normalize_acceptance_section_heading(raw_line)
+        if heading == "where to verify" or heading.startswith("where to verify:"):
+            return True
+    return False
+
+
+def _normalize_acceptance_section_heading(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^#{1,6}\s*", "", line)
+    line = line.strip(" *_`")
+    return re.sub(r"\s+", " ", line).casefold()
+
+
+def _acceptance_degrade_note(description: str) -> str | None:
+    if _acceptance_has_where_to_verify(description):
+        return None
+    return _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE
+
+
+def _with_acceptance_degrade_note(
+    verdict: AcceptanceVerdict, degrade_note: str | None
+) -> AcceptanceVerdict:
+    if not degrade_note:
+        return verdict
+    details = verdict.details.strip()
+    if details.startswith(degrade_note):
+        return verdict
+    combined = degrade_note if not details else f"{degrade_note}\n\n{details}"
+    return replace(verdict, details=combined)
 
 
 def _activity_settings_for(config: Config, binding: RepoBinding) -> ActivitySettings:
@@ -5880,11 +5917,21 @@ class Orchestrator:
         self._dispatch_run_ids[issue.id] = run_id
         try:
             await self._complete_review_monitors_for_merge(issue)
-            preview_url = self._acceptance_preview_url(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
+            degrade_note = _acceptance_degrade_note(issue.description)
+            effective_mode = (
+                _CODE_ONLY_ACCEPTANCE_MODE if degrade_note else binding.acceptance.mode
+            )
+            if degrade_note:
+                log.info("%s for %s", degrade_note, issue.identifier)
+            preview_url = (
+                ""
+                if degrade_note
+                else self._acceptance_preview_url(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                )
             )
             criteria: list[str] = []
             await db.acceptance_state.begin_acceptance(
@@ -5931,7 +5978,7 @@ class Orchestrator:
             if budget_limits:
                 max_budget_usd = min(budget_limits)
 
-            if binding.acceptance.mode != "code_only":
+            if effective_mode != _CODE_ONLY_ACCEPTANCE_MODE:
                 verdict = AcceptanceVerdict(
                     kind="pass",
                     criteria=criteria,
@@ -5966,7 +6013,7 @@ class Orchestrator:
                             runner=self._runner,
                             run_id=run_id,
                             workspace_path=workspace_path,
-                            mode=binding.acceptance.mode,
+                            mode=effective_mode,
                             linear_description=issue.description,
                             pr_diff_summary=pr_diff_summary,
                             criteria=criteria,
@@ -5975,6 +6022,8 @@ class Orchestrator:
                         )
                     finally:
                         self._workspace.release(binding, issue)
+
+            verdict = _with_acceptance_degrade_note(verdict, degrade_note)
 
             cap_breached = False
             if verdict.cost > 0:

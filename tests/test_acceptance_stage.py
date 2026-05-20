@@ -105,12 +105,16 @@ def _binding(
     )
 
 
-def _issue(state_name: str = "Needs Approval", state_id: str = "state-na") -> LinearIssue:
+def _issue(
+    state_name: str = "Needs Approval",
+    state_id: str = "state-na",
+    description: str = "Need OAuth.",
+) -> LinearIssue:
     return LinearIssue(
         id="iss-1",
         identifier="ENG-1",
         title="Add auth",
-        description="Need OAuth.",
+        description=description,
         url="https://linear.app/team/issue/ENG-1",
         state_id=state_id,
         state_name=state_name,
@@ -279,6 +283,84 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
             call("iss-1", "state-acceptance"),
             call("iss-1", "state-done"),
         ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["dev", "preview"])
+async def test_acceptance_degrades_missing_where_to_verify_to_code_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    caplog.set_level("INFO", logger="symphony.orchestrator.poll")
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(mode)
+        binding.acceptance.preview_url_pattern = "https://preview.example/{issue}"
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner([_acceptance_events(), _merge_events()])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue(description="Need OAuth."))
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.mode == mode
+        assert acceptance.preview_url == ""
+        assert acceptance.last_verdict == "pass"
+
+        assert [spec.stage for spec in runner.captured_specs] == [
+            "acceptance",
+            "merge",
+        ]
+        acceptance_prompt = runner.captured_specs[0].command[-1]
+        assert "mode: code_only" in acceptance_prompt
+        assert "mode: dev" not in acceptance_prompt
+        assert "mode: preview" not in acceptance_prompt
+        gh.pr_diff.assert_awaited_once()
+        assert runner.captured_specs[0].workspace_path == tmp_path / "ws" / "org" / "eng-1"
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        degrade_note = (
+            "Acceptance: degraded to code-only — no `Where to verify` "
+            "in ticket description"
+        )
+        assert any(degrade_note in body for body in bodies)
+        assert degrade_note in caplog.text
+        gh.pr_merge.assert_awaited_once()
     finally:
         await conn.close()
 
@@ -631,7 +713,15 @@ async def test_non_code_only_acceptance_mode_passes_through_without_runner(
         workspace.release = MagicMock()
         workspace.cleanup = AsyncMock()
         linear = AsyncMock()
-        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.lookup_issue = AsyncMock(
+            return_value=_issue(
+                description=(
+                    "Need OAuth.\n\n"
+                    "## Where to verify\n\n"
+                    "* Open the login screen and complete OAuth."
+                )
+            )
+        )
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
         gh = _github()
@@ -677,6 +767,7 @@ async def test_non_code_only_acceptance_mode_passes_through_without_runner(
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("pass-through acceptance behavior" in body for body in bodies)
+        assert not any("degraded to code-only" in body for body in bodies)
         assert any(ACCEPTANCE_FOOTER_PASS in body for body in bodies)
     finally:
         await conn.close()
