@@ -774,6 +774,12 @@ async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
                 line=_dev_artifact_result(
                     preview_url=preview_url,
                     hero_path=screenshot,
+                    criteria=[
+                        {
+                            "criterion": "toolbar has settings icon",
+                            "passed": True,
+                        }
+                    ],
                 ),
             ),
             RunnerEvent(kind="exit", returncode=0),
@@ -815,6 +821,114 @@ async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
     assert preview_url in prompt
     assert "Capture exactly one hero screenshot" in prompt
     assert "symphony-acceptance-artifacts" in prompt
+    assert len(stopped_servers) == 1
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_stops_dev_server_when_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port = _free_port()
+    preview_url = f"http://127.0.0.1:{port}"
+    stopped_servers: list[object] = []
+
+    async def fake_port_reachable(_host: str, _port: int) -> bool:
+        return False
+
+    async def fake_start_dev_server(**_kwargs: object) -> object:
+        return acceptance_module._DevServer()  # noqa: SLF001
+
+    async def fake_stop_dev_server(server: object) -> None:
+        stopped_servers.append(server)
+
+    def fail_write_mcp_config(**_kwargs: object) -> Path:
+        raise RuntimeError("mcp config boom")
+
+    monkeypatch.setattr(acceptance_module, "_port_reachable", fake_port_reachable)
+    monkeypatch.setattr(acceptance_module, "_start_dev_server", fake_start_dev_server)
+    monkeypatch.setattr(acceptance_module, "_stop_dev_server", fake_stop_dev_server)
+    monkeypatch.setattr(
+        acceptance_module,
+        "_write_playwright_mcp_config",
+        fail_write_mcp_config,
+    )
+    runner = _ScriptedRunner([])
+
+    with pytest.raises(RuntimeError, match="mcp config boom"):
+        await run_acceptance(
+            runner=runner,
+            run_id="acceptance-1",
+            workspace_path=tmp_path,
+            mode="dev",
+            linear_description="Add a settings icon to the toolbar.",
+            pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+            criteria=["toolbar has settings icon"],
+            stall_secs=5,
+            max_budget_usd=3.25,
+            preview_url=preview_url,
+            dev_command="npm run dev",
+            dev_port=port,
+            dev_startup_timeout_secs=5,
+        )
+
+    assert len(stopped_servers) == 1
+    assert runner.captured_spec is None
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_pass_requires_reported_criteria(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port = _free_port()
+    preview_url = f"http://127.0.0.1:{port}"
+    screenshot = ".symphony/acceptance/acceptance-1/hero.png"
+    stopped_servers: list[object] = []
+
+    async def fake_port_reachable(_host: str, _port: int) -> bool:
+        return False
+
+    async def fake_start_dev_server(**_kwargs: object) -> object:
+        return acceptance_module._DevServer()  # noqa: SLF001
+
+    async def fake_stop_dev_server(server: object) -> None:
+        stopped_servers.append(server)
+
+    monkeypatch.setattr(acceptance_module, "_port_reachable", fake_port_reachable)
+    monkeypatch.setattr(acceptance_module, "_start_dev_server", fake_start_dev_server)
+    monkeypatch.setattr(acceptance_module, "_stop_dev_server", fake_stop_dev_server)
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=_dev_artifact_result(
+                    preview_url=preview_url,
+                    hero_path=screenshot,
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="dev",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=5,
+        max_budget_usd=3.25,
+        preview_url=preview_url,
+        dev_command="npm run dev",
+        dev_port=port,
+        dev_startup_timeout_secs=5,
+    )
+
+    assert verdict.kind == "infra_error"
+    assert verdict.criteria == ["toolbar has settings icon"]
+    assert "dev acceptance pass must include per-criterion results" in verdict.details
     assert len(stopped_servers) == 1
 
 
@@ -920,6 +1034,12 @@ async def test_dev_acceptance_uses_fallback_port_when_configured_port_is_busy(
                 line=_dev_artifact_result(
                     preview_url=fallback_url,
                     hero_path=screenshot,
+                    criteria=[
+                        {
+                            "criterion": "toolbar has settings icon",
+                            "passed": True,
+                        }
+                    ],
                 ),
             ),
             RunnerEvent(kind="exit", returncode=0),

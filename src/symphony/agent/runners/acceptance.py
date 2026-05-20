@@ -329,39 +329,39 @@ async def _run_dev_acceptance(
             preview_url=resolved_preview_url,
         )
 
-    artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    mcp_config_path = _write_playwright_mcp_config(
-        workspace_path=workspace_path,
-        run_id=run_id,
-        output_dir=artifacts_dir,
-    )
-    prompt = build_acceptance_prompt(
-        mode=_DEV_MODE,
-        linear_description=linear_description,
-        pr_diff_summary=pr_diff_summary,
-        taste_guide=taste_guide,
-        criteria=criteria,
-        preview_url=resolved_preview_url,
-        artifacts_dir=artifacts_dir,
-    )
-    spec = RunnerSpec(
-        run_id=run_id,
-        workspace_path=workspace_path,
-        command=build_acceptance_command(
-            prompt=prompt,
-            max_budget_usd=max_budget_usd,
-            mode=_DEV_MODE,
-            mcp_config_path=mcp_config_path,
-        ),
-        env={
-            "SYMPHONY_ACCEPTANCE_PREVIEW_URL": resolved_preview_url,
-            "SYMPHONY_ACCEPTANCE_ARTIFACT_DIR": str(artifacts_dir),
-        },
-        stall_secs=stall_secs,
-        stage="acceptance",
-    )
     try:
+        artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        mcp_config_path = _write_playwright_mcp_config(
+            workspace_path=workspace_path,
+            run_id=run_id,
+            output_dir=artifacts_dir,
+        )
+        prompt = build_acceptance_prompt(
+            mode=_DEV_MODE,
+            linear_description=linear_description,
+            pr_diff_summary=pr_diff_summary,
+            taste_guide=taste_guide,
+            criteria=criteria,
+            preview_url=resolved_preview_url,
+            artifacts_dir=artifacts_dir,
+        )
+        spec = RunnerSpec(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=build_acceptance_command(
+                prompt=prompt,
+                max_budget_usd=max_budget_usd,
+                mode=_DEV_MODE,
+                mcp_config_path=mcp_config_path,
+            ),
+            env={
+                "SYMPHONY_ACCEPTANCE_PREVIEW_URL": resolved_preview_url,
+                "SYMPHONY_ACCEPTANCE_ARTIFACT_DIR": str(artifacts_dir),
+            },
+            stall_secs=stall_secs,
+            stage="acceptance",
+        )
         acceptance_run = await _collect_acceptance_output(
             runner,
             spec,
@@ -738,6 +738,7 @@ def _validate_dev_artifacts(
     *,
     criteria: list[str] | None,
 ) -> AcceptanceVerdict:
+    expected_criteria = list(criteria or [])
     if verdict.kind == "pass":
         hero = [item for item in verdict.screenshots if item.kind == "hero"]
         if len(hero) != 1:
@@ -747,6 +748,33 @@ def _validate_dev_artifacts(
                 cost=verdict.cost,
                 hero_screenshot_url="",
                 details="dev acceptance pass must include exactly one hero screenshot.",
+                preview_url=verdict.preview_url,
+            )
+        if expected_criteria and not verdict.criterion_results:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=expected_criteria,
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details="dev acceptance pass must include per-criterion results.",
+                preview_url=verdict.preview_url,
+            )
+        reported = {item.criterion.casefold() for item in verdict.criterion_results}
+        missing = [
+            criterion
+            for criterion in expected_criteria
+            if criterion.casefold() not in reported
+        ]
+        if missing:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=expected_criteria,
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details=(
+                    "dev acceptance pass did not report criteria: "
+                    f"{', '.join(missing)}"
+                ),
                 preview_url=verdict.preview_url,
             )
         failed = [item.criterion for item in verdict.criterion_results if not item.passed]
