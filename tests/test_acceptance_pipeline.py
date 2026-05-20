@@ -12,6 +12,7 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.acceptance import (
     build_acceptance_command,
     build_acceptance_prompt,
+    quick_skip_trivial_acceptance,
     run_acceptance,
 )
 from symphony.pipeline.acceptance_classifier import (
@@ -20,6 +21,7 @@ from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_REJECT,
     AcceptanceVerdict,
     acceptance_classifier,
+    format_acceptance_verdict_comment,
 )
 
 
@@ -194,6 +196,46 @@ def test_acceptance_classifier_parses_pass_footer_and_cost() -> None:
     )
 
 
+def test_acceptance_classifier_parses_quick_skip_reason() -> None:
+    transcript = _claude_result(
+        "Acceptance skipped - no user-visible behavior described.\n\n"
+        "<!-- symphony-acceptance-verdict: pass reason=quick_skip_trivial -->",
+        cost=0.02,
+    )
+
+    verdict = acceptance_classifier(transcript=transcript)
+
+    assert verdict == AcceptanceVerdict(
+        kind="pass",
+        criteria=[],
+        cost=0.02,
+        hero_screenshot_url="",
+        details="Acceptance skipped - no user-visible behavior described.",
+        reason="quick_skip_trivial",
+    )
+
+
+def test_quick_skip_comment_has_distinct_prefix() -> None:
+    verdict = AcceptanceVerdict(
+        kind="pass",
+        criteria=[],
+        cost=0.0,
+        hero_screenshot_url="",
+        details="No user-visible behavior described.",
+        reason="quick_skip_trivial",
+    )
+
+    body = format_acceptance_verdict_comment(
+        verdict=verdict,
+        pr_url="https://github.com/org/repo/pull/42",
+    )
+
+    assert body.startswith("**Acceptance: skipped - trivial change.**")
+    assert "**Acceptance verdict:** `pass`" in body
+    assert "Reason: `quick_skip_trivial`" in body
+    assert "symphony-acceptance-verdict: pass reason=quick_skip_trivial" in body
+
+
 def test_acceptance_classifier_ignores_raw_prompt_footer_examples() -> None:
     transcript = "\n".join(
         [
@@ -289,6 +331,103 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     assert "mode: code_only" in prompt
     assert "Do not run Playwright" in prompt
     assert "Do not inspect screenshots" in prompt
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runner_quick_skips_trivial_readme_typo_without_claude(
+    tmp_path: Path,
+) -> None:
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result(
+                    "Should not run.\n\n"
+                    f"{ACCEPTANCE_FOOTER_REJECT}",
+                    cost=0.12,
+                ),
+            ),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Fix a typo in README.md.",
+        pr_diff_summary=(
+            "diff --git a/README.md b/README.md\n"
+            "-This pacakge runs Symphony.\n"
+            "+This package runs Symphony.\n"
+        ),
+        criteria=[],
+        stall_secs=15,
+        max_budget_usd=3.25,
+    )
+
+    assert verdict == AcceptanceVerdict(
+        kind="pass",
+        criteria=[],
+        cost=0.0,
+        hero_screenshot_url="",
+        details="No user-visible behavior described in the ticket or PR diff.",
+        reason="quick_skip_trivial",
+    )
+    assert runner.captured_spec is None
+
+
+def test_acceptance_quick_skip_requires_only_trivial_ticket_text() -> None:
+    verdict = quick_skip_trivial_acceptance(
+        linear_description="Fix a README typo and add the OAuth settings screen.",
+        pr_diff_summary=(
+            "diff --git a/README.md b/README.md\n"
+            "-This pacakge runs Symphony.\n"
+            "+This package runs Symphony.\n"
+        ),
+    )
+
+    assert verdict is None
+
+
+def test_acceptance_quick_skip_preserves_diff_paths_with_spaces() -> None:
+    verdict = quick_skip_trivial_acceptance(
+        linear_description="Internal refactor only.",
+        pr_diff_summary=(
+            "diff --git a/ui/login page.tsx b/ui/login page.tsx\n"
+            "-const label = 'Sign in';\n"
+            "+const label = 'Sign in';\n"
+        ),
+    )
+
+    assert verdict is None
+
+
+def test_acceptance_quick_skip_preserves_diff_paths_with_b_directory() -> None:
+    verdict = quick_skip_trivial_acceptance(
+        linear_description="Internal refactor only.",
+        pr_diff_summary=(
+            "diff --git a/app/foo b/bar.py b/app/foo b/bar.py\n"
+            "-old_helper()\n"
+            "+new_helper()\n"
+        ),
+    )
+
+    assert verdict is None
+
+
+def test_acceptance_prompt_includes_first_phase_quick_skip_contract() -> None:
+    prompt = build_acceptance_prompt(
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+    )
+
+    assert "First phase: quick-skip decision" in prompt
+    assert "trivial / non-trivial" in prompt
+    assert "quick_skip_trivial" in prompt
+    assert "If in doubt, classify as non-trivial" in prompt
 
 
 def test_acceptance_command_disallows_claude_tools_without_budget() -> None:
