@@ -384,12 +384,39 @@ def _changed_paths(diff: str) -> list[str]:
     for line in diff.splitlines():
         if not line.startswith("diff --git "):
             continue
-        _, separator, path = line[len("diff --git ") :].rpartition(" b/")
-        if not separator:
+        path = _diff_git_new_path(line[len("diff --git ") :])
+        if path is None:
             continue
         if path and path != "/dev/null":
             paths.append(path)
     return paths
+
+
+def _diff_git_new_path(header: str) -> str | None:
+    prefix = "a/"
+    separator = " b/"
+    if not header.startswith(prefix):
+        return None
+
+    rest = header[len(prefix) :]
+    offset = 0
+    while True:
+        index = rest.find(separator, offset)
+        if index == -1:
+            break
+        old_path = rest[:index]
+        new_path = rest[index + len(separator) :]
+        if old_path == new_path:
+            return new_path
+        offset = index + 1
+
+    index = rest.find(separator)
+    if index == -1:
+        return None
+    new_path = rest[index + len(separator) :]
+    if separator in new_path:
+        return None
+    return new_path
 
 
 def _is_doc_path(path: str) -> bool:

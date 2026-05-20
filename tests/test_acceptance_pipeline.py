@@ -404,6 +404,19 @@ def test_acceptance_quick_skip_preserves_diff_paths_with_spaces() -> None:
     assert verdict is None
 
 
+def test_acceptance_quick_skip_preserves_diff_paths_with_b_directory() -> None:
+    verdict = quick_skip_trivial_acceptance(
+        linear_description="Internal refactor only.",
+        pr_diff_summary=(
+            "diff --git a/app/foo b/bar.py b/app/foo b/bar.py\n"
+            "-old_helper()\n"
+            "+new_helper()\n"
+        ),
+    )
+
+    assert verdict is None
+
+
 def test_acceptance_prompt_includes_first_phase_quick_skip_contract() -> None:
     prompt = build_acceptance_prompt(
         mode="code_only",
