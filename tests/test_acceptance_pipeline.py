@@ -219,7 +219,7 @@ def test_acceptance_classifier_parses_quick_skip_reason() -> None:
 def test_quick_skip_comment_has_distinct_prefix() -> None:
     verdict = AcceptanceVerdict(
         kind="pass",
-        criteria=[],
+        criteria=["README typo is fixed"],
         cost=0.0,
         hero_screenshot_url="",
         details="No user-visible behavior described.",
@@ -234,6 +234,11 @@ def test_quick_skip_comment_has_distinct_prefix() -> None:
     assert body.startswith("**Acceptance: skipped - trivial change.**")
     assert "**Acceptance verdict:** `pass`" in body
     assert "Reason: `quick_skip_trivial`" in body
+    assert (
+        "- **README typo is fixed**: not checked because acceptance was skipped as trivial."
+        in body
+    )
+    assert "included in the overall acceptance review" not in body
     assert "symphony-acceptance-verdict: pass reason=quick_skip_trivial" in body
 
 
@@ -363,6 +368,26 @@ def test_acceptance_verdict_comment_uses_neutral_per_criterion_breakdown() -> No
     )
     assert "- **OAuth login is implemented**: `reject`" not in body
     assert "- **Existing sessions still load**: `reject`" not in body
+
+
+def test_acceptance_verdict_comment_marks_infra_error_criteria_unchecked() -> None:
+    body = format_acceptance_verdict_comment(
+        verdict=AcceptanceVerdict(
+            kind="infra_error",
+            criteria=["OAuth login is implemented"],
+            cost=0.12,
+            hero_screenshot_url="",
+            details="Acceptance agent did not emit a verdict footer.",
+        ),
+        pr_url="https://github.example/pr/1",
+    )
+
+    assert "**Acceptance verdict:** `infra_error`" in body
+    assert (
+        "- **OAuth login is implemented**: not checked because the acceptance run "
+        "failed before review completed."
+    ) in body
+    assert "included in the overall acceptance review" not in body
 
 
 @pytest.mark.asyncio

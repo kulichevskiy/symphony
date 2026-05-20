@@ -221,7 +221,7 @@ def format_acceptance_verdict_comment(
     )
     if verdict.reason:
         body += f"- Reason: `{verdict.reason}`\n"
-    body += _criteria_breakdown(verdict.criteria)
+    body += _criteria_breakdown(verdict)
     if details:
         body += f"\n{details}\n"
     return f"{prefix}{body}\n{acceptance_footer(verdict.kind, reason=verdict.reason)}"
@@ -470,10 +470,25 @@ def _criterion_name(predicate: str) -> str:
     return name or predicate
 
 
-def _criteria_breakdown(criteria: list[str]) -> str:
+def _criteria_breakdown(verdict: AcceptanceVerdict) -> str:
     body = "\n**Criteria breakdown:**\n"
+    criteria = verdict.criteria
     if not criteria:
         return body + "- No verifiable criteria - falling back to description match.\n"
+    if (
+        verdict.kind == "pass"
+        and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL
+    ):
+        for criterion in criteria:
+            body += f"- **{criterion}**: not checked because acceptance was skipped as trivial.\n"
+        return body
+    if verdict.kind == "infra_error":
+        for criterion in criteria:
+            body += (
+                f"- **{criterion}**: not checked because the acceptance run "
+                "failed before review completed.\n"
+            )
+        return body
     for criterion in criteria:
         body += f"- **{criterion}**: included in the overall acceptance review.\n"
     return body
