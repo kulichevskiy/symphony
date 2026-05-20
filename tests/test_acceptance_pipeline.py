@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.agent.runners.acceptance import build_acceptance_prompt, run_acceptance
+from symphony.agent.runners.acceptance import (
+    build_acceptance_command,
+    build_acceptance_prompt,
+    run_acceptance,
+)
 from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_INFRA_ERROR,
     ACCEPTANCE_FOOTER_PASS,
@@ -116,6 +120,13 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
         "stream-json",
         "--verbose",
     ]
+    assert "--permission-mode" in runner.captured_spec.command
+    permission_mode_idx = runner.captured_spec.command.index("--permission-mode") + 1
+    assert runner.captured_spec.command[permission_mode_idx] == "default"
+    assert "--disallowedTools" in runner.captured_spec.command
+    disallowed_tools_idx = runner.captured_spec.command.index("--disallowedTools") + 1
+    disallowed_tools = runner.captured_spec.command[disallowed_tools_idx].split(",")
+    assert {"Bash", "Read", "Edit"}.issubset(disallowed_tools)
     assert "--max-budget-usd" in runner.captured_spec.command
     budget_idx = runner.captured_spec.command.index("--max-budget-usd") + 1
     assert runner.captured_spec.command[budget_idx] == "3.2500"
@@ -125,6 +136,20 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     assert "mode: code_only" in prompt
     assert "Do not run Playwright" in prompt
     assert "Do not inspect screenshots" in prompt
+
+
+def test_acceptance_command_disallows_claude_tools_without_budget() -> None:
+    command = build_acceptance_command(prompt="judge this")
+
+    assert "--permission-mode" in command
+    assert command[command.index("--permission-mode") + 1] == "default"
+    assert "--disallowedTools" in command
+    disallowed_tools = command[command.index("--disallowedTools") + 1].split(",")
+    assert {"Bash", "Read", "Edit", "Write", "MultiEdit"}.issubset(
+        disallowed_tools
+    )
+    assert "--max-budget-usd" not in command
+    assert command[-1] == "judge this"
 
 
 @pytest.mark.asyncio
@@ -170,6 +195,54 @@ def test_acceptance_prompt_rejects_non_code_only_mode() -> None:
             linear_description="Open the preview.",
             pr_diff_summary="diff --git a/app.py b/app.py",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal", "expected_details"),
+    [
+        (RunnerEvent(kind="exit", returncode=2), "exited rc=2"),
+        (RunnerEvent(kind="stall_timeout"), "stalled"),
+        (
+            RunnerEvent(kind="spawn_failed", error="FileNotFoundError: claude"),
+            "spawn_failed: FileNotFoundError: claude",
+        ),
+    ],
+)
+async def test_acceptance_runner_fails_when_claude_does_not_complete_successfully(
+    tmp_path: Path,
+    terminal: RunnerEvent,
+    expected_details: str,
+) -> None:
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result(
+                    f"Looks good.\n\n{ACCEPTANCE_FOOTER_PASS}",
+                    cost=0.33,
+                ),
+            ),
+            terminal,
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=15,
+        max_budget_usd=3.25,
+    )
+
+    assert verdict.kind == "infra_error"
+    assert verdict.criteria == ["toolbar has settings icon"]
+    assert verdict.cost == pytest.approx(0.33)
+    assert expected_details in verdict.details
 
 
 def test_acceptance_classifier_parses_reject_footer() -> None:

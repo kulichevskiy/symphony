@@ -11,10 +11,29 @@ from symphony.pipeline.acceptance_classifier import (
     AcceptanceVerdict,
     acceptance_classifier,
 )
-from symphony.pipeline.local_review_io import collect_runner_output
+from symphony.pipeline.local_review_io import CollectedRunnerOutput, collect_runner_output
 
 _DIFF_LIMIT_CHARS = 60_000
 _CODE_ONLY_MODE = "code_only"
+_CLAUDE_ACCEPTANCE_PERMISSION_MODE = "default"
+_CLAUDE_ACCEPTANCE_DISALLOWED_TOOLS = ",".join(
+    (
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "Glob",
+        "Grep",
+        "LS",
+        "NotebookRead",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "TodoWrite",
+        "Task",
+    )
+)
 
 
 async def run_acceptance(
@@ -54,6 +73,18 @@ async def run_acceptance(
         stage="acceptance",
     )
     collected = await collect_runner_output(runner, spec)
+    if not collected.ok_exit:
+        parsed = acceptance_classifier(
+            transcript=collected.stdout,
+            criteria=criteria,
+        )
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=parsed.cost,
+            hero_screenshot_url="",
+            details=_failed_run_details(collected),
+        )
     return acceptance_classifier(
         transcript=collected.stdout,
         criteria=criteria,
@@ -70,6 +101,10 @@ def build_acceptance_command(
         "--output-format",
         "stream-json",
         "--verbose",
+        "--permission-mode",
+        _CLAUDE_ACCEPTANCE_PERMISSION_MODE,
+        "--disallowedTools",
+        _CLAUDE_ACCEPTANCE_DISALLOWED_TOOLS,
     ]
     if max_budget_usd is not None:
         command.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
@@ -126,6 +161,14 @@ def _unsupported_mode_details(mode: str) -> str:
         f"Acceptance mode {mode!r} is not supported by the Claude code-only "
         "runner; only 'code_only' can run without dev or preview artifacts."
     )
+
+
+def _failed_run_details(collected: CollectedRunnerOutput) -> str:
+    if collected.terminal_kind == "spawn_failed":
+        return f"Acceptance runner spawn_failed: {collected.spawn_error or 'unknown'}"
+    if collected.stall_timeout:
+        return "Acceptance runner stalled before completing successfully."
+    return f"Acceptance runner exited rc={collected.returncode}."
 
 
 __all__ = [
