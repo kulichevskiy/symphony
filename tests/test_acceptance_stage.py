@@ -78,13 +78,22 @@ def _merge_events() -> list[RunnerEvent]:
     return [RunnerEvent(kind="exit", returncode=0)]
 
 
-def _binding(mode: str = "off") -> RepoBinding:
+def _binding(
+    mode: str = "off",
+    *,
+    acceptance_cost_cap_usd: float = 10.0,
+    acceptance_time_cap_minutes: int = 15,
+) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
         agent="claude",
         branch_prefix="symphony",
-        acceptance=AcceptanceConfig(mode=mode),  # type: ignore[arg-type]
+        acceptance=AcceptanceConfig(  # type: ignore[arg-type]
+            mode=mode,
+            cost_cap_usd=acceptance_cost_cap_usd,
+            time_cap_minutes=acceptance_time_cap_minutes,
+        ),
         linear_states=LinearStates(
             ready="Todo",
             in_progress="In Progress",
@@ -270,6 +279,63 @@ async def test_acceptance_mode_runs_stub_between_review_and_merge(
             call("iss-1", "state-acceptance"),
             call("iss-1", "state-done"),
         ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runner_uses_acceptance_budget_and_time_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(
+            "code_only",
+            acceptance_cost_cap_usd=3.5,
+            acceptance_time_cap_minutes=7,
+        )
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner([_acceptance_events(), _merge_events()])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+                cost_cap_per_issue_usd=100.0,
+                stall_timeout_secs=30,
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=_github(),
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance_spec = runner.captured_specs[0]
+        assert acceptance_spec.stall_secs == 7 * 60
+        budget_idx = acceptance_spec.command.index("--max-budget-usd") + 1
+        assert acceptance_spec.command[budget_idx] == "3.5000"
     finally:
         await conn.close()
 

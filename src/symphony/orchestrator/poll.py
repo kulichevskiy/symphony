@@ -5913,9 +5913,10 @@ class Orchestrator:
             )
 
             max_budget_usd: float | None = None
+            budget_limits: list[float] = []
             if cap_usd > 0:
-                max_budget_usd = cap_usd - prior_total
-                if max_budget_usd <= 0:
+                issue_remaining_budget_usd = cap_usd - prior_total
+                if issue_remaining_budget_usd <= 0:
                     await self._handle_cap_breach(
                         binding=binding,
                         issue=issue,
@@ -5924,6 +5925,11 @@ class Orchestrator:
                         stage="acceptance",
                     )
                     return run_id
+                budget_limits.append(issue_remaining_budget_usd)
+            if binding.acceptance.cost_cap_usd > 0:
+                budget_limits.append(binding.acceptance.cost_cap_usd)
+            if budget_limits:
+                max_budget_usd = min(budget_limits)
 
             if binding.acceptance.mode != "code_only":
                 verdict = AcceptanceVerdict(
@@ -5962,7 +5968,7 @@ class Orchestrator:
                             linear_description=issue.description,
                             pr_diff_summary=pr_diff_summary,
                             criteria=criteria,
-                            stall_secs=self.config.stall_timeout_secs,
+                            stall_secs=binding.acceptance.time_cap_minutes * 60,
                             max_budget_usd=max_budget_usd,
                         )
                     finally:
