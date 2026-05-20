@@ -84,6 +84,38 @@ def test_acceptance_classifier_treats_tool_failures_as_infra_error() -> None:
     assert "Playwright timeout" in verdict.details
 
 
+def test_acceptance_classifier_allows_recovered_tool_failure_pass() -> None:
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "is_error": True,
+                                "content": "Playwright timeout opening preview",
+                            }
+                        ]
+                    },
+                }
+            ),
+            _claude_result(
+                "Retried the preview and the implementation is correct.\n\n"
+                f"{ACCEPTANCE_FOOTER_PASS}",
+                cost=0.09,
+            ),
+        ]
+    )
+
+    verdict = acceptance_classifier(transcript=transcript)
+
+    assert verdict.kind == "pass"
+    assert verdict.cost == pytest.approx(0.09)
+    assert "Retried the preview" in verdict.details
+
+
 def test_acceptance_classifier_preserves_product_reject_after_noninfra_tool_error() -> None:
     transcript = "\n".join(
         [

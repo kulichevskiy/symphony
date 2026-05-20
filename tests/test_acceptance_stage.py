@@ -841,6 +841,9 @@ async def test_acceptance_infra_error_retries_with_backoff_then_blocks(
             "acceptance",
         ]
         assert all(run.status == "failed" for run in history[2:])
+        blocked_comment = linear.post_comment.await_args_list[-1].args[1]
+        assert "`org/repo#42`" in blocked_comment
+        assert "`org/repo#0`" not in blocked_comment
         gh.pr_merge.assert_not_awaited()
     finally:
         await conn.close()

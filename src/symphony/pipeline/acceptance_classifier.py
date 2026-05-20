@@ -42,6 +42,7 @@ class _ParsedTranscript:
     message: str
     cost: float
     infra_error_details: str = ""
+    terminal_infra_error_details: str = ""
 
 
 def acceptance_footer(kind: AcceptanceVerdictKind) -> str:
@@ -60,13 +61,13 @@ def acceptance_classifier(
 ) -> AcceptanceVerdict:
     parsed = _parse_claude_transcript(transcript)
     verdict_cost = parsed.cost if cost is None else cost
-    if parsed.infra_error_details:
+    if parsed.terminal_infra_error_details:
         return AcceptanceVerdict(
             kind="infra_error",
             criteria=list(criteria or []),
             cost=verdict_cost,
             hero_screenshot_url="",
-            details=parsed.infra_error_details,
+            details=parsed.terminal_infra_error_details,
         )
     if not parsed.message:
         return AcceptanceVerdict(
@@ -74,7 +75,10 @@ def acceptance_classifier(
             criteria=list(criteria or []),
             cost=verdict_cost,
             hero_screenshot_url="",
-            details="Acceptance agent did not emit a final message.",
+            details=(
+                parsed.infra_error_details
+                or "Acceptance agent did not emit a final message."
+            ),
         )
     verdict_text = parsed.message
     match = list(_FOOTER_RE.finditer(verdict_text))
@@ -84,10 +88,21 @@ def acceptance_classifier(
             criteria=list(criteria or []),
             cost=verdict_cost,
             hero_screenshot_url="",
-            details="Acceptance agent did not emit a verdict footer.",
+            details=(
+                parsed.infra_error_details
+                or "Acceptance agent did not emit a verdict footer."
+            ),
         )
     kind = match[-1].group("kind").lower()
     details = _strip_footer(verdict_text).strip()
+    if kind != "pass" and parsed.infra_error_details:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=verdict_cost,
+            hero_screenshot_url="",
+            details=parsed.infra_error_details,
+        )
     return AcceptanceVerdict(
         kind=kind,  # type: ignore[arg-type]
         criteria=list(criteria or []),
@@ -117,6 +132,7 @@ def _parse_claude_transcript(transcript: str) -> _ParsedTranscript:
     message = ""
     cost = 0.0
     infra_error_details = ""
+    terminal_infra_error_details = ""
     for raw in transcript.splitlines():
         line = raw.strip()
         if not line or not line.startswith("{"):
@@ -129,6 +145,8 @@ def _parse_claude_transcript(transcript: str) -> _ParsedTranscript:
             continue
         if not infra_error_details:
             infra_error_details = _infra_error_details(event)
+        if not terminal_infra_error_details:
+            terminal_infra_error_details = _terminal_infra_error_details(event)
         if event.get("type") == "result":
             result = event.get("result")
             if isinstance(result, str):
@@ -143,6 +161,7 @@ def _parse_claude_transcript(transcript: str) -> _ParsedTranscript:
         message=message,
         cost=cost,
         infra_error_details=infra_error_details,
+        terminal_infra_error_details=terminal_infra_error_details,
     )
 
 
@@ -159,6 +178,19 @@ def _infra_error_details(event: dict[str, object]) -> str:
     if subtype and subtype != "success" and _is_cap_or_timeout_signal(signal):
         return text or f"Acceptance runner reported {subtype}."
     if _is_agent_infra_text(signal):
+        return text or f"Acceptance runner reported {subtype}."
+    return ""
+
+
+def _terminal_infra_error_details(event: dict[str, object]) -> str:
+    if event.get("type") != "result":
+        return ""
+    subtype = str(event.get("subtype") or "").lower()
+    if not subtype or subtype == "success":
+        return ""
+    text = _event_text(event)
+    signal = " ".join((subtype, text)).lower()
+    if _is_cap_or_timeout_signal(signal):
         return text or f"Acceptance runner reported {subtype}."
     return ""
 

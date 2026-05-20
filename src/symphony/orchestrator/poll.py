@@ -2091,6 +2091,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        pr_number: int,
         run_id: str,
         verdict: AcceptanceVerdict,
     ) -> None:
@@ -2120,7 +2121,7 @@ class Orchestrator:
             CommentVars(
                 stage="acceptance",
                 repo=binding.github_repo,
-                issue=0,
+                issue=pr_number,
                 pr_url=await self._acceptance_pr_url(issue.id),
                 run_id=run_id,
                 error=verdict.details,
@@ -6308,6 +6309,7 @@ class Orchestrator:
                     await self._track_acceptance_blocked_wait(
                         binding=binding,
                         issue=issue,
+                        pr_number=pr_number,
                         run_id=run_id,
                         verdict=verdict,
                     )
