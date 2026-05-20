@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
+AcceptanceScreenshotKind = Literal["hero", "criterion"]
 
 ACCEPTANCE_FOOTER_PASS = "<!-- symphony-acceptance-verdict: pass -->"
 ACCEPTANCE_FOOTER_REJECT = "<!-- symphony-acceptance-verdict: reject -->"
@@ -26,6 +27,10 @@ _FOOTER_RE = re.compile(
     r"(?P<kind>pass|reject|infra_error)"
     r"(?:\s+reason\s*=\s*(?P<reason>[a-z0-9_:-]+))?\s*-->",
     re.IGNORECASE,
+)
+_ARTIFACTS_RE = re.compile(
+    r"<!--\s*symphony-acceptance-artifacts\s*(?P<payload>.*?)\s*-->",
+    re.IGNORECASE | re.DOTALL,
 )
 _COMMENT_DETAILS_LIMIT = 2500
 ACCEPTANCE_CRITERIA_COMMENT_HEADER = "### Symphony extracted acceptance criteria"
@@ -62,6 +67,22 @@ class ExtractedCriterion(TypedDict):
 
 
 @dataclass(frozen=True)
+class AcceptanceScreenshot:
+    kind: AcceptanceScreenshotKind
+    label: str
+    path: str
+    url: str = ""
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterionResult:
+    criterion: str
+    passed: bool
+    screenshot_path: str = ""
+    screenshot_url: str = ""
+
+
+@dataclass(frozen=True)
 class AcceptanceVerdict:
     kind: AcceptanceVerdictKind
     criteria: list[str]
@@ -69,6 +90,9 @@ class AcceptanceVerdict:
     hero_screenshot_url: str
     details: str = ""
     reason: str = ""
+    preview_url: str = ""
+    screenshots: tuple[AcceptanceScreenshot, ...] = ()
+    criterion_results: tuple[AcceptanceCriterionResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +150,7 @@ def acceptance_classifier(
             ),
         )
     verdict_text = parsed.message
+    artifacts = _acceptance_artifacts(verdict_text)
     match = list(_FOOTER_RE.finditer(verdict_text))
     if not match:
         return AcceptanceVerdict(
@@ -153,10 +178,21 @@ def acceptance_classifier(
         kind=kind,  # type: ignore[arg-type]
         criteria=list(criteria or []),
         cost=verdict_cost,
-        hero_screenshot_url="",
+        hero_screenshot_url=artifacts.hero_screenshot_url,
         details=details,
         reason=reason,
+        preview_url=artifacts.preview_url,
+        screenshots=artifacts.screenshots,
+        criterion_results=artifacts.criterion_results,
     )
+
+
+@dataclass(frozen=True)
+class _AcceptanceArtifacts:
+    preview_url: str = ""
+    hero_screenshot_url: str = ""
+    screenshots: tuple[AcceptanceScreenshot, ...] = ()
+    criterion_results: tuple[AcceptanceCriterionResult, ...] = ()
 
 
 def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriterion]:
@@ -292,8 +328,11 @@ def format_acceptance_verdict_comment(
         f"- PR: {pr_url}\n"
         f"- Cost: ${verdict.cost:.4f}\n"
     )
+    if verdict.preview_url:
+        body += f"- Dev URL: {verdict.preview_url}\n"
     if verdict.reason:
         body += f"- Reason: `{verdict.reason}`\n"
+    body += _screenshot_summary(verdict)
     body += _criteria_breakdown(verdict)
     if details:
         body += f"\n{details}\n"
@@ -496,8 +535,71 @@ def _float_or_none(value: object) -> float | None:
         return None
 
 
+def _acceptance_artifacts(text: str) -> _AcceptanceArtifacts:
+    matches = list(_ARTIFACTS_RE.finditer(text))
+    if not matches:
+        return _AcceptanceArtifacts()
+    payload = matches[-1].group("payload").strip()
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError:
+        return _AcceptanceArtifacts()
+    if not isinstance(raw, dict):
+        return _AcceptanceArtifacts()
+
+    preview_url = _string_value(raw.get("preview_url"))
+    screenshots: list[AcceptanceScreenshot] = []
+    hero = _string_value(raw.get("hero_screenshot"))
+    if hero:
+        screenshots.append(
+            AcceptanceScreenshot(
+                kind="hero",
+                label=_string_value(raw.get("hero_label")) or "Primary verified view",
+                path=hero,
+            )
+        )
+
+    criterion_results: list[AcceptanceCriterionResult] = []
+    criteria = raw.get("criteria")
+    if isinstance(criteria, list):
+        for item in criteria:
+            if not isinstance(item, dict):
+                continue
+            criterion = _string_value(item.get("criterion"))
+            if not criterion:
+                continue
+            passed = bool(item.get("passed"))
+            screenshot_path = _string_value(item.get("screenshot"))
+            criterion_results.append(
+                AcceptanceCriterionResult(
+                    criterion=criterion,
+                    passed=passed,
+                    screenshot_path=screenshot_path,
+                )
+            )
+            if not passed and screenshot_path:
+                screenshots.append(
+                    AcceptanceScreenshot(
+                        kind="criterion",
+                        label=criterion,
+                        path=screenshot_path,
+                    )
+                )
+    return _AcceptanceArtifacts(
+        preview_url=preview_url,
+        hero_screenshot_url=hero,
+        screenshots=tuple(screenshots),
+        criterion_results=tuple(criterion_results),
+    )
+
+
+def _string_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
 def _strip_footer(text: str) -> str:
-    return _FOOTER_RE.sub("", text).strip()
+    without_artifacts = _ARTIFACTS_RE.sub("", text)
+    return _FOOTER_RE.sub("", without_artifacts).strip()
 
 
 def _heading(line: str) -> tuple[int, str] | None:
@@ -595,9 +697,35 @@ def _criteria_breakdown(verdict: AcceptanceVerdict) -> str:
                 "failed before review completed.\n"
             )
         return body
+    if verdict.criterion_results:
+        by_criterion = {
+            item.criterion.casefold(): item for item in verdict.criterion_results
+        }
+        for criterion in criteria:
+            result = by_criterion.get(criterion.casefold())
+            if result is None:
+                body += f"- ✅ **{criterion}**: verified.\n"
+                continue
+            if result.passed:
+                body += f"- ✅ **{criterion}**: verified.\n"
+            else:
+                body += f"- ❌ **{criterion}**: failed.\n"
+                if result.screenshot_url:
+                    body += f"  ![{criterion}]({result.screenshot_url})\n"
+        return body
     for criterion in criteria:
         body += f"- **{criterion}**: included in the overall acceptance review.\n"
     return body
+
+
+def _screenshot_summary(verdict: AcceptanceVerdict) -> str:
+    if not verdict.screenshots:
+        return ""
+    hero = [item for item in verdict.screenshots if item.kind == "hero" and item.url]
+    if verdict.kind == "pass" and hero:
+        screenshot = hero[0]
+        return f"- Screenshot: ![{screenshot.label}]({screenshot.url})\n"
+    return ""
 
 
 __all__ = [
@@ -607,6 +735,8 @@ __all__ = [
     "ACCEPTANCE_FOOTER_PASS",
     "ACCEPTANCE_FOOTER_REJECT",
     "ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL",
+    "AcceptanceCriterionResult",
+    "AcceptanceScreenshot",
     "AcceptanceVerdict",
     "AcceptanceVerdictKind",
     "ExtractedCriterion",

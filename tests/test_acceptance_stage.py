@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
@@ -21,6 +22,9 @@ from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_INFRA_ERROR,
     ACCEPTANCE_FOOTER_PASS,
     ACCEPTANCE_FOOTER_REJECT,
+    AcceptanceCriterionResult,
+    AcceptanceScreenshot,
+    AcceptanceVerdict,
 )
 
 
@@ -72,6 +76,12 @@ def _acceptance_events(
         ),
         RunnerEvent(kind="exit", returncode=0),
     ]
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _malformed_acceptance_events() -> list[RunnerEvent]:
@@ -1099,7 +1109,7 @@ async def test_acceptance_infra_error_retries_with_backoff_then_blocks(
 
 
 @pytest.mark.asyncio
-async def test_non_code_only_acceptance_mode_passes_through_without_runner(
+async def test_preview_acceptance_mode_passes_through_without_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
@@ -1108,7 +1118,7 @@ async def test_non_code_only_acceptance_mode_passes_through_without_runner(
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding("dev")
+        binding = _binding("preview")
         await _seed_review_candidate(conn, binding)
         runner = _FakeRunner(_merge_events())
         workspace = MagicMock()
@@ -1151,7 +1161,7 @@ async def test_non_code_only_acceptance_mode_passes_through_without_runner(
         await orch.drain_dispatch_tasks()
 
         acceptance = await db.acceptance_state.get(conn, "iss-1")
-        assert acceptance.mode == "dev"
+        assert acceptance.mode == "preview"
         assert acceptance.last_verdict == "pass"
         assert acceptance.infra_retries == 0
 
@@ -1172,6 +1182,124 @@ async def test_non_code_only_acceptance_mode_passes_through_without_runner(
         assert any("pass-through acceptance behavior" in body for body in bodies)
         assert not any("degraded to code-only" in body for body in bodies)
         assert any(ACCEPTANCE_FOOTER_PASS in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_sets_preview_url_uploads_screenshot_and_records_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def fake_run_acceptance(**kwargs: object) -> AcceptanceVerdict:
+        assert kwargs["mode"] == "dev"
+        assert kwargs["preview_url"] == preview_url
+        assert kwargs["dev_command"] == "npm run dev"
+        assert kwargs["dev_port"] == port
+        return AcceptanceVerdict(
+            kind="pass",
+            criteria=[
+                "OAuth login is implemented: GitHub OAuth is supported.",
+            ],
+            cost=0.13,
+            hero_screenshot_url="",
+            details="Visual acceptance passed.",
+            preview_url=preview_url,
+            screenshots=(
+                AcceptanceScreenshot(
+                    kind="hero",
+                    label="Primary verified view",
+                    path=".symphony/acceptance/run/hero.png",
+                ),
+            ),
+            criterion_results=(
+                AcceptanceCriterionResult(
+                    criterion="OAuth login is implemented: GitHub OAuth is supported.",
+                    passed=True,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    port = _free_port()
+    preview_url = f"http://127.0.0.1:{port}"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("dev")
+        binding.acceptance.dev_port = port
+        binding.acceptance.dev_command = "npm run dev"
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(_merge_events())
+        workspace_path = tmp_path / "ws" / "org" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=_issue(
+                description=(
+                    "Need OAuth.\n\n"
+                    "## Where to verify\n\n"
+                    "- Open the login screen.\n\n"
+                    "## Acceptance criteria\n\n"
+                    "- [ ] OAuth login is implemented:\n"
+                    "  - GitHub OAuth is supported.\n"
+                )
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(side_effect=["criteria-cmt", "verdict-cmt"])
+        linear.upload_issue_attachment = AsyncMock(
+            return_value="https://uploads.linear.app/hero.png"
+        )
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.mode == "dev"
+        assert acceptance.preview_url == preview_url
+        assert acceptance.last_verdict == "pass"
+        assert acceptance.last_artifacts_url == (
+            "https://linear.app/team/issue/ENG-1#comment-verdict-cmt"
+        )
+        linear.upload_issue_attachment.assert_awaited_once()
+        upload_call = linear.upload_issue_attachment.await_args
+        assert upload_call.kwargs["issue_uuid"] == "iss-1"
+        assert upload_call.kwargs["title"] == "Acceptance screenshot: Primary verified view"
+        assert upload_call.kwargs["path"] == workspace_path / ".symphony/acceptance/run/hero.png"
+
+        verdict_comment = linear.post_comment.await_args_list[1].args[1]
+        assert preview_url in verdict_comment
+        assert "![Primary verified view](https://uploads.linear.app/hero.png)" in verdict_comment
+        assert "pass-through acceptance behavior" not in verdict_comment
+        assert runner.captured_specs[0].stage == "merge"
+        gh.pr_diff.assert_awaited_once()
+        gh.pr_merge.assert_awaited_once()
     finally:
         await conn.close()
 
