@@ -91,6 +91,9 @@ from ..linear.templates import (
 )
 from ..pipeline.acceptance_classifier import (
     AcceptanceVerdict,
+    ExtractedCriterion,
+    extract_acceptance_criteria,
+    format_acceptance_criteria_comment,
     format_acceptance_verdict_comment,
 )
 from ..pipeline.cost_guard import (
@@ -6133,6 +6136,22 @@ class Orchestrator:
                 e,
             )
 
+    async def _post_acceptance_criteria_comment(
+        self,
+        *,
+        issue: LinearIssue,
+        criteria: list[ExtractedCriterion],
+    ) -> None:
+        try:
+            body = format_acceptance_criteria_comment(criteria)
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "acceptance criteria comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
     async def _run_acceptance_stage(
         self,
         *,
@@ -6179,7 +6198,8 @@ class Orchestrator:
                     pr_url=pr_url,
                 )
             )
-            criteria: list[str] = []
+            extracted_criteria = extract_acceptance_criteria(issue.description)
+            criteria = [item["name"] for item in extracted_criteria]
             await db.acceptance_state.begin_acceptance(
                 self._conn,
                 issue.id,
@@ -6188,7 +6208,11 @@ class Orchestrator:
                 pr_head_sha=pr_head_sha,
                 mode=binding.acceptance.mode,
                 preview_url=preview_url,
-                extracted_criteria=json.dumps(criteria),
+                extracted_criteria=json.dumps(extracted_criteria),
+            )
+            await self._post_acceptance_criteria_comment(
+                issue=issue,
+                criteria=extracted_criteria,
             )
             await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
 

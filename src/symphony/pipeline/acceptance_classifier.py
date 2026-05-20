@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
 
@@ -28,6 +28,22 @@ _FOOTER_RE = re.compile(
     re.IGNORECASE,
 )
 _COMMENT_DETAILS_LIMIT = 2500
+ACCEPTANCE_CRITERIA_COMMENT_HEADER = "### Symphony extracted acceptance criteria"
+ACCEPTANCE_CRITERIA_COMMENT_MARKER = "<!-- symphony-acceptance-criteria -->"
+_CHECKBOX_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s+(?P<text>.+?)\s*$"
+)
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*#*\s*$")
+_CRITERIA_HEADING_RE = re.compile(r"\b(acceptance criteria|criteria|checklist)\b", re.I)
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MARKDOWN_STRONG_RE = re.compile(r"(\*\*|__)(?P<text>.+?)\1")
+_MARKDOWN_CODE_RE = re.compile(r"`(?P<text>[^`]+)`")
+
+
+class ExtractedCriterion(TypedDict):
+    name: str
+    predicate: str
 
 
 @dataclass(frozen=True)
@@ -128,6 +144,48 @@ def acceptance_classifier(
     )
 
 
+def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriterion]:
+    criteria: list[ExtractedCriterion] = []
+    seen: set[str] = set()
+    in_criteria_section = False
+
+    for raw_line in linear_description.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        heading = _heading_title(line)
+        if heading is not None:
+            in_criteria_section = _is_criteria_heading(heading)
+            continue
+
+        checkbox_match = _CHECKBOX_RE.match(line)
+        if checkbox_match:
+            _append_criterion(criteria, seen, checkbox_match.group("text"))
+            continue
+
+        if not in_criteria_section:
+            continue
+        item_match = _LIST_ITEM_RE.match(line)
+        if item_match:
+            _append_criterion(criteria, seen, item_match.group("text"))
+
+    return criteria
+
+
+def format_acceptance_criteria_comment(
+    criteria: list[ExtractedCriterion],
+) -> str:
+    body = f"{ACCEPTANCE_CRITERIA_COMMENT_HEADER}\n\n"
+    if criteria:
+        body += "Symphony will check these criteria before posting the verdict:\n\n"
+        for item in criteria:
+            body += f"- **{item['name']}**: {item['predicate']}\n"
+    else:
+        body += "No verifiable criteria - falling back to description match.\n"
+    return f"{body}\n{ACCEPTANCE_CRITERIA_COMMENT_MARKER}"
+
+
 def format_acceptance_verdict_comment(
     *, verdict: AcceptanceVerdict, pr_url: str
 ) -> str:
@@ -147,6 +205,7 @@ def format_acceptance_verdict_comment(
     )
     if verdict.reason:
         body += f"- Reason: `{verdict.reason}`\n"
+    body += _criteria_breakdown(verdict.criteria, verdict.kind)
     if details:
         body += f"\n{details}\n"
     return f"{prefix}{body}\n{acceptance_footer(verdict.kind, reason=verdict.reason)}"
@@ -352,14 +411,72 @@ def _strip_footer(text: str) -> str:
     return _FOOTER_RE.sub("", text).strip()
 
 
+def _heading_title(line: str) -> str | None:
+    match = _HEADING_RE.match(line)
+    if not match:
+        return None
+    return _clean_markdown(match.group("title")).casefold()
+
+
+def _is_criteria_heading(heading: str) -> bool:
+    return bool(_CRITERIA_HEADING_RE.search(heading))
+
+
+def _append_criterion(
+    criteria: list[ExtractedCriterion], seen: set[str], raw_text: str
+) -> None:
+    predicate = _clean_markdown(raw_text)
+    if not predicate:
+        return
+    key = predicate.casefold()
+    if key in seen:
+        return
+    seen.add(key)
+    criteria.append(
+        {
+            "name": _criterion_name(predicate),
+            "predicate": predicate,
+        }
+    )
+
+
+def _clean_markdown(text: str) -> str:
+    cleaned = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    cleaned = _MARKDOWN_STRONG_RE.sub(r"\g<text>", cleaned)
+    cleaned = _MARKDOWN_CODE_RE.sub(r"\g<text>", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" \t-")
+
+
+def _criterion_name(predicate: str) -> str:
+    name = predicate.rstrip(".:;!?").strip()
+    return name or predicate
+
+
+def _criteria_breakdown(
+    criteria: list[str], kind: AcceptanceVerdictKind
+) -> str:
+    body = "\n**Criteria breakdown:**\n"
+    if not criteria:
+        return body + "- No verifiable criteria - falling back to description match.\n"
+    for criterion in criteria:
+        body += f"- **{criterion}**: `{kind}`\n"
+    return body
+
+
 __all__ = [
+    "ACCEPTANCE_CRITERIA_COMMENT_HEADER",
+    "ACCEPTANCE_CRITERIA_COMMENT_MARKER",
     "ACCEPTANCE_FOOTER_INFRA_ERROR",
     "ACCEPTANCE_FOOTER_PASS",
     "ACCEPTANCE_FOOTER_REJECT",
     "ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL",
     "AcceptanceVerdict",
     "AcceptanceVerdictKind",
+    "ExtractedCriterion",
     "acceptance_classifier",
     "acceptance_footer",
+    "extract_acceptance_criteria",
+    "format_acceptance_criteria_comment",
     "format_acceptance_verdict_comment",
 ]
