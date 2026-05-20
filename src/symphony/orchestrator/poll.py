@@ -86,6 +86,10 @@ from ..linear.templates import (
     stuck_loop_escape,
     truncate_body,
 )
+from ..pipeline.acceptance_classifier import (
+    AcceptanceVerdict,
+    format_acceptance_verdict_comment,
+)
 from ..pipeline.cost_guard import (
     UsageCostEstimator,
     effective_cap,
@@ -125,6 +129,10 @@ CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
 MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
+
+
+class _AcceptancePrDiffUnavailable(RuntimeError):
+    pass
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
@@ -5805,6 +5813,47 @@ class Orchestrator:
             )
             return ""
 
+    async def _acceptance_pr_diff(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+    ) -> str:
+        try:
+            return await self._gh.pr_diff(pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not fetch acceptance PR diff for %s#%d on %s: %s",
+                binding.github_repo,
+                pr_number,
+                issue.identifier,
+                e,
+            )
+            raise _AcceptancePrDiffUnavailable(
+                f"Could not fetch PR diff for {binding.github_repo}#{pr_number}: {e}"
+            ) from e
+
+    async def _post_acceptance_verdict_comment(
+        self,
+        *,
+        issue: LinearIssue,
+        pr_url: str,
+        verdict: AcceptanceVerdict,
+    ) -> None:
+        try:
+            body = format_acceptance_verdict_comment(
+                verdict=verdict,
+                pr_url=pr_url,
+            )
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "acceptance verdict comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
     async def _run_acceptance_stage(
         self,
         *,
@@ -5850,15 +5899,125 @@ class Orchestrator:
             )
             await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
 
-            verdict = await run_acceptance(criteria=criteria)
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            cap_usd = effective_cap(
+                global_cap_usd=self.config.cost_cap_per_issue_usd,
+                binding_override=binding.cost_cap_usd,
+            )
+            warning_pct = effective_warning_pct(
+                global_pct=self.config.cost_warning_pct,
+                binding_override=binding.cost_warning_pct,
+            )
+            warning_already_fired = (
+                await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+            )
+
+            max_budget_usd: float | None = None
+            budget_limits: list[float] = []
+            if cap_usd > 0:
+                issue_remaining_budget_usd = cap_usd - prior_total
+                if issue_remaining_budget_usd <= 0:
+                    await self._handle_cap_breach(
+                        binding=binding,
+                        issue=issue,
+                        run_id=run_id,
+                        cumulative_total=prior_total,
+                        stage="acceptance",
+                    )
+                    return run_id
+                budget_limits.append(issue_remaining_budget_usd)
+            if binding.acceptance.cost_cap_usd > 0:
+                budget_limits.append(binding.acceptance.cost_cap_usd)
+            if budget_limits:
+                max_budget_usd = min(budget_limits)
+
+            if binding.acceptance.mode != "code_only":
+                verdict = AcceptanceVerdict(
+                    kind="pass",
+                    criteria=criteria,
+                    cost=0.0,
+                    hero_screenshot_url="",
+                    details=(
+                        f"Acceptance mode {binding.acceptance.mode!r} is configured, "
+                        "but only 'code_only' has a real runner in this slice. "
+                        "Preserving pass-through acceptance behavior until that "
+                        "mode's runner is implemented."
+                    ),
+                )
+            else:
+                try:
+                    pr_diff_summary = await self._acceptance_pr_diff(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                    )
+                except _AcceptancePrDiffUnavailable as e:
+                    verdict = AcceptanceVerdict(
+                        kind="infra_error",
+                        criteria=criteria,
+                        cost=0.0,
+                        hero_screenshot_url="",
+                        details=str(e),
+                    )
+                else:
+                    workspace_path = await self._workspace.acquire(binding, issue)
+                    try:
+                        verdict = await run_acceptance(
+                            runner=self._runner,
+                            run_id=run_id,
+                            workspace_path=workspace_path,
+                            mode=binding.acceptance.mode,
+                            linear_description=issue.description,
+                            pr_diff_summary=pr_diff_summary,
+                            criteria=criteria,
+                            stall_secs=binding.acceptance.time_cap_minutes * 60,
+                            max_budget_usd=max_budget_usd,
+                        )
+                    finally:
+                        self._workspace.release(binding, issue)
+
+            cap_breached = False
             if verdict.cost > 0:
                 await db.runs.add_cost(self._conn, run_id, verdict.cost)
+                new_total = prior_total + verdict.cost
+                decision = evaluate_cost(
+                    previous_total=prior_total,
+                    new_total=new_total,
+                    cap_usd=cap_usd,
+                    warning_pct=warning_pct,
+                    warning_already_fired=warning_already_fired,
+                )
+                if decision.fire_warning:
+                    await self._post_cost_warning(
+                        binding=binding,
+                        issue=issue,
+                        run_id=run_id,
+                        stage="acceptance",
+                        cumulative_total=new_total,
+                        cap_usd=cap_usd,
+                    )
+                cap_breached = decision.cap_breached
             await db.acceptance_state.record_verdict(
                 self._conn,
                 issue.id,
                 verdict=verdict.kind,
                 artifacts_url=verdict.hero_screenshot_url,
             )
+            await self._post_acceptance_verdict_comment(
+                issue=issue,
+                pr_url=pr_url,
+                verdict=verdict,
+            )
+
+            if cap_breached:
+                await self._handle_cap_breach(
+                    binding=binding,
+                    issue=issue,
+                    run_id=run_id,
+                    cumulative_total=prior_total + verdict.cost,
+                    stage="acceptance",
+                )
+                return run_id
 
             ended_at = datetime.now(UTC).isoformat()
             if verdict.kind == "pass":
@@ -8025,6 +8184,7 @@ class Orchestrator:
         issue: LinearIssue,
         run_id: str,
         cumulative_total: float,
+        stage: str = "implement",
     ) -> None:
         """Park a cost-capped issue and post a cost-cap escalation."""
         try:
@@ -8078,7 +8238,7 @@ class Orchestrator:
                 )
             body = cost_cap_reached(
                 CommentVars(
-                    stage="implement",
+                    stage=stage,
                     repo=binding.github_repo,
                     issue=0,
                     run_id=run_id,

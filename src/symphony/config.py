@@ -37,7 +37,8 @@ class AcceptanceConfig(BaseModel):
     """Per-binding Acceptance-stage knobs.
 
     `off` preserves the current Review → Merge behavior. The other modes all
-    enter the Acceptance stage; this slice only wires the stub pass verdict.
+    enter the Acceptance stage; this slice runs `code_only` with a real
+    Claude diff-vs-description verdict and keeps future modes pass-through.
     """
 
     mode: Literal["off", "code_only", "dev", "preview"] = "off"

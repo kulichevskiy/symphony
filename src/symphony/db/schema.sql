@@ -121,9 +121,9 @@ CREATE TABLE IF NOT EXISTS review_state (
     codex_lgtm_comment_id  TEXT NOT NULL DEFAULT ''
 );
 
--- Acceptance-stage state per issue. This slice only records the stub pass
--- verdict; later slices can replace the runner/classifier without changing
--- schema or poll-loop ownership.
+-- Acceptance-stage state per issue. The current code_only runner records
+-- Claude verdicts here; later dev/preview slices can add artifact-backed
+-- criteria without changing schema or poll-loop ownership.
 CREATE TABLE IF NOT EXISTS acceptance_state (
     issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
     iteration           INTEGER NOT NULL DEFAULT 0,

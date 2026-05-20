@@ -345,6 +345,9 @@ class GitHub:
         argv = ["pr", "comment", str(pr), "--body", body, *self._repo_args(repo)]
         await self._run(argv)
 
+    async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str:
+        return await self._run(["pr", "diff", str(pr), *self._repo_args(repo)])
+
     async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks:
         # `--required` mirrors GitHub's mergeability rule: optional checks
         # should not block merge gating even if they fail.
