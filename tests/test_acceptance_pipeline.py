@@ -131,6 +131,26 @@ def _dev_artifact_result(
     )
 
 
+def test_acceptance_classifier_requires_boolean_artifact_passed() -> None:
+    failed_screenshot = ".symphony/acceptance/acceptance-1/failed.png"
+    transcript = _dev_artifact_result(
+        preview_url="http://127.0.0.1:3000",
+        hero_path=".symphony/acceptance/acceptance-1/hero.png",
+        criteria=[
+            {
+                "criterion": "toolbar has settings icon",
+                "passed": "false",
+                "screenshot": failed_screenshot,
+            }
+        ],
+    )
+
+    verdict = acceptance_classifier(transcript=transcript)
+
+    assert verdict.criterion_results == ()
+    assert not any(item.path == failed_screenshot for item in verdict.screenshots)
+
+
 def test_acceptance_classifier_treats_tool_failures_as_infra_error() -> None:
     transcript = "\n".join(
         [

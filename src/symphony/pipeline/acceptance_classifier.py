@@ -568,16 +568,18 @@ def _acceptance_artifacts(text: str) -> _AcceptanceArtifacts:
             criterion = _string_value(item.get("criterion"))
             if not criterion:
                 continue
-            passed = bool(item.get("passed"))
+            passed_value = item.get("passed")
+            if not isinstance(passed_value, bool):
+                continue
             screenshot_path = _string_value(item.get("screenshot"))
             criterion_results.append(
                 AcceptanceCriterionResult(
                     criterion=criterion,
-                    passed=passed,
+                    passed=passed_value,
                     screenshot_path=screenshot_path,
                 )
             )
-            if not passed and screenshot_path:
+            if not passed_value and screenshot_path:
                 screenshots.append(
                     AcceptanceScreenshot(
                         kind="criterion",
