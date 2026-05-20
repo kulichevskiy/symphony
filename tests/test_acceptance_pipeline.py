@@ -375,6 +375,23 @@ def test_acceptance_criteria_extraction_accepts_heading_suffix_text() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_ignores_indented_code_headings() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "    ## Acceptance criteria\n\n"
+        "    - [ ] This checklist is a code sample.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] OAuth login is implemented.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+    ]
+
+
 def test_acceptance_criteria_extraction_skips_nested_noncriteria_sections() -> None:
     description = (
         "Ship OAuth.\n\n"

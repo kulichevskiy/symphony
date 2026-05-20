@@ -34,7 +34,9 @@ _CHECKBOX_RE = re.compile(
     r"^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s+(?P<text>.+?)\s*$"
 )
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*#*\s*$")
+_HEADING_RE = re.compile(
+    r"^\s{0,3}(?P<marker>#{1,6})\s+(?P<title>.+?)\s*#*\s*$"
+)
 _CRITERIA_HEADING_RE = re.compile(
     r"^(?:acceptance\s+criteria|acceptance\s+checklist|criteria|checklist)"
     r"(?:$|\W.*)",
@@ -184,7 +186,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
         if not stripped:
             continue
 
-        heading = _heading(stripped)
+        heading = _heading(raw_line.rstrip())
         if heading is not None:
             flush_current_criterion()
             list_item_indent = None
@@ -481,7 +483,7 @@ def _heading(line: str) -> tuple[int, str] | None:
     match = _HEADING_RE.match(line)
     if not match:
         return None
-    level = len(line) - len(line.lstrip("#"))
+    level = len(match.group("marker"))
     return level, _clean_markdown(match.group("title")).casefold()
 
 
