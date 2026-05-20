@@ -55,6 +55,7 @@ from ..agent.prompt import (
     review_fix_prompt,
 )
 from ..agent.runner import Runner, RunnerSpec
+from ..agent.runners.acceptance import run_acceptance
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import CheckRun as GitHubCheckRun
@@ -360,9 +361,15 @@ def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
 
 
 def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bool:
+    active_states = {
+        binding.linear_states.in_progress,
+        binding.linear_states.needs_approval,
+    }
+    if binding.acceptance.mode != "off":
+        active_states.add(binding.linear_states.in_acceptance)
     return (
         issue.team_key == binding.linear_team_key
-        and _review_issue_is_active(issue, binding)
+        and issue.state_name in active_states
         and (binding.issue_label is None or binding.issue_label in issue.labels)
     )
 
@@ -5482,6 +5489,17 @@ class Orchestrator:
             self._merged_linear_state_drift_comment_keys.add(comment_key)
         return corrected
 
+    async def _acceptance_passed_for_candidate(
+        self, candidate: db.issue_prs.IssuePR, binding: RepoBinding
+    ) -> bool:
+        state = await db.acceptance_state.get(self._conn, candidate.issue_id)
+        return (
+            state.pr_number == candidate.pr_number
+            and state.pr_url == candidate.pr_url
+            and state.mode == binding.acceptance.mode
+            and state.last_verdict == "pass"
+        )
+
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
@@ -5618,6 +5636,22 @@ class Orchestrator:
                     >= binding.max_concurrent
                 ):
                     continue
+                if (
+                    verdict.kind is VerdictKind.APPROVED
+                    and binding.acceptance.mode != "off"
+                    and not await self._acceptance_passed_for_candidate(
+                        candidate, binding
+                    )
+                ):
+                    scheduled.append(
+                        self._schedule_acceptance(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=candidate.pr_number,
+                            pr_url=candidate.pr_url,
+                        )
+                    )
+                    continue
                 on_started: Callable[[str], Awaitable[None]] | None = None
                 if conflict_fix_ready:
                     async def clear_conflict_fix_marker(
@@ -5674,6 +5708,185 @@ class Orchestrator:
                     pr_created_at=candidate.created_at,
                 )
         return scheduled
+
+    def _schedule_acceptance(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> asyncio.Task[None]:
+        binding_key = _binding_key(binding)
+        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        task = asyncio.create_task(
+            self._acceptance_with_limits(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
+        )
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(
+            partial(
+                self._dispatch_task_done,
+                issue_id=issue.id,
+                binding_key=binding_key,
+            )
+        )
+        return task
+
+    async def _acceptance_with_limits(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> None:
+        key = _binding_key(binding)
+        binding_sem = self._binding_dispatch_sems.setdefault(
+            key,
+            asyncio.Semaphore(max(binding.max_concurrent, 1)),
+        )
+        try:
+            async with self._global_dispatch_sem:
+                async with binding_sem:
+                    current = await self._refresh_merge_candidate(binding, issue)
+                    if current is None:
+                        return
+                    await self._run_acceptance_stage(
+                        binding=binding,
+                        issue=current,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
+        except asyncio.CancelledError:
+            run_id = self._dispatch_run_ids.get(issue.id)
+            if run_id is not None:
+                await self._fail_run(run_id, "acceptance cancelled")
+            raise
+
+    def _acceptance_preview_url(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> str:
+        pattern = binding.acceptance.preview_url_pattern
+        if not pattern:
+            return ""
+        try:
+            return pattern.format(
+                issue=issue.identifier,
+                issue_id=issue.id,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not render acceptance preview URL for %s from %r: %s",
+                issue.identifier,
+                pattern,
+                e,
+            )
+            return ""
+
+    async def _run_acceptance_stage(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> str | None:
+        run_id = str(uuid.uuid4())
+        inserted = await db.runs.create_if_no_active(
+            self._conn,
+            id=run_id,
+            issue_id=issue.id,
+            stage="acceptance",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+            ignored_stage="review",
+        )
+        if not inserted:
+            return None
+
+        self._dispatch_run_ids[issue.id] = run_id
+        try:
+            await self._complete_review_monitors_for_merge(issue)
+            preview_url = self._acceptance_preview_url(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
+            criteria: list[str] = []
+            await db.acceptance_state.begin_acceptance(
+                self._conn,
+                issue.id,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                mode=binding.acceptance.mode,
+                preview_url=preview_url,
+                extracted_criteria=json.dumps(criteria),
+            )
+            await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
+
+            verdict = await run_acceptance(criteria=criteria)
+            if verdict.cost > 0:
+                await db.runs.add_cost(self._conn, run_id, verdict.cost)
+            await db.acceptance_state.record_verdict(
+                self._conn,
+                issue.id,
+                verdict=verdict.kind,
+                artifacts_url=verdict.hero_screenshot_url,
+            )
+
+            ended_at = datetime.now(UTC).isoformat()
+            if verdict.kind == "pass":
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "completed",
+                    ended_at=ended_at,
+                )
+                if self._dispatch_run_ids.get(issue.id) == run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
+                await self._merge_approved_pr(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                )
+                return run_id
+
+            if verdict.kind == "infra_error":
+                await db.acceptance_state.bump_infra_retries(self._conn, issue.id)
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "failed",
+                ended_at=ended_at,
+            )
+            return run_id
+        except Exception:
+            log.exception("acceptance stage failed for %s", issue.identifier)
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "failed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+            return run_id
+        finally:
+            if self._dispatch_run_ids.get(issue.id) == run_id:
+                self._dispatch_run_ids.pop(issue.id, None)
 
     def _schedule_merge_conflict_rebase_fix(
         self,
@@ -7235,6 +7448,36 @@ class Orchestrator:
                 "could not move %s to review state %r: %s",
                 issue.identifier,
                 binding.linear_states.needs_approval,
+                e,
+            )
+
+    async def _move_issue_to_acceptance_state(
+        self, *, binding: RepoBinding, issue: LinearIssue
+    ) -> None:
+        try:
+            states = await self._states_for_binding(binding)
+            acceptance_state_id = states.get(binding.linear_states.in_acceptance)
+        except LinearError as e:
+            log.warning(
+                "could not load states while moving %s to acceptance: %s",
+                issue.identifier,
+                e,
+            )
+            return
+        if acceptance_state_id is None:
+            log.warning(
+                "missing Linear acceptance state %r for %s",
+                binding.linear_states.in_acceptance,
+                issue.identifier,
+            )
+            return
+        try:
+            await self.linear.move_issue(issue.id, acceptance_state_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s to acceptance state %r: %s",
+                issue.identifier,
+                binding.linear_states.in_acceptance,
                 e,
             )
 
