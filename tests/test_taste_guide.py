@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from symphony.pipeline.taste_guide import load_taste_guide
 
 
@@ -31,6 +33,22 @@ def test_load_taste_guide_concatenates_global_then_binding(tmp_path: Path) -> No
     assert "Binding hard rule." in guide
     assert guide.index("Global principles.") < guide.index("Binding hard rule.")
     assert guide.count("## Hard rules (acceptance must reject if violated)") == 2
+
+
+def test_load_taste_guide_defaults_to_deploy_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deploy_root = tmp_path / "deploy"
+    deploy_root.mkdir()
+    (deploy_root / "taste-guide.md").write_text("deploy global\n", encoding="utf-8")
+    binding_guide = deploy_root / "docs" / "sample-ux.md"
+    binding_guide.parent.mkdir()
+    binding_guide.write_text("binding guide\n", encoding="utf-8")
+    monkeypatch.chdir(deploy_root)
+
+    guide = load_taste_guide(binding_taste_guide="./docs/sample-ux.md")
+
+    assert guide == "deploy global\n\nbinding guide"
 
 
 def test_load_taste_guide_returns_empty_string_when_no_files(tmp_path: Path) -> None:

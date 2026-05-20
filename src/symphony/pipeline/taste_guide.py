@@ -14,7 +14,7 @@ def load_taste_guide(
     repo_root: Path | None = None,
 ) -> str:
     """Load global guide first, then optional per-binding guide."""
-    root = repo_root or Path(__file__).resolve().parents[3]
+    root = (repo_root or Path.cwd()).resolve()
     paths = [root / _GLOBAL_TASTE_GUIDE]
     if binding_taste_guide:
         paths.append(_resolve_binding_path(binding_taste_guide, repo_root=root))
