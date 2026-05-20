@@ -12,6 +12,7 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.acceptance import (
     build_acceptance_command,
     build_acceptance_prompt,
+    quick_skip_trivial_acceptance,
     run_acceptance,
 )
 from symphony.pipeline.acceptance_classifier import (
@@ -375,6 +376,19 @@ async def test_acceptance_runner_quick_skips_trivial_readme_typo_without_claude(
         reason="quick_skip_trivial",
     )
     assert runner.captured_spec is None
+
+
+def test_acceptance_quick_skip_requires_only_trivial_ticket_text() -> None:
+    verdict = quick_skip_trivial_acceptance(
+        linear_description="Fix a README typo and add the OAuth settings screen.",
+        pr_diff_summary=(
+            "diff --git a/README.md b/README.md\n"
+            "-This pacakge runs Symphony.\n"
+            "+This package runs Symphony.\n"
+        ),
+    )
+
+    assert verdict is None
 
 
 def test_acceptance_prompt_includes_first_phase_quick_skip_contract() -> None:

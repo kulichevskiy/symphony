@@ -46,14 +46,58 @@ _DEP_FILENAMES = {
     "uv.lock",
     "yarn.lock",
 }
-_TRIVIAL_DESCRIPTION_RE = re.compile(
+_DESCRIPTION_TEMPLATE_HEADING_RE = re.compile(
+    r"^#+\s*("
+    r"what to build|where to verify|acceptance criteria|out of scope|"
+    r"description|summary|notes?|implementation|context"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_HEADING_RE = re.compile(r"^#+\s*")
+_MARKDOWN_LIST_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+_MARKDOWN_CHECKBOX_RE = re.compile(r"^\[[ xX]\]\s+")
+_EXPLICIT_TRIVIAL_DESCRIPTION_LINE_RE = re.compile(
+    r"(?:"
+    r"no\s+(?:user[- ]visible\s+)?behaviou?r(?:\s+change)?|"
+    r"(?:internal\s+)?refactor(?:\s+[\w./`'\" -]+)?\s+"
+    r"(?:only|with\s+no\s+behaviou?r\s+change|no\s+behaviou?r\s+change)"
+    r")\.?",
+    re.IGNORECASE,
+)
+_NON_TRIVIAL_DESCRIPTION_RE = re.compile(
     r"\b("
-    r"typo|readme|docs?|documentation|comment|copyedit|copy edit|"
-    r"dependency|dependencies|dep bump|bump|lockfile|rename|"
-    r"internal refactor|refactor only|no behavior change|no behaviour change|"
-    r"no user-visible behavior|no user visible behavior"
+    r"api|endpoint|ui|ux|screen|page|button|form|modal|dialog|"
+    r"workflow|flow|user|customer|operator|admin|login|auth|oauth|"
+    r"payment|checkout|feature|behaviou?r|visual|visible|browser|"
+    r"playwright|preview|server|database|db|persist|state|render|"
+    r"click|submit"
     r")\b",
     re.IGNORECASE,
+)
+_TRIVIAL_DESCRIPTION_LINE_RES = (
+    re.compile(
+        r"[\w./`'\" -]*(?:typo|spelling|grammar|copyedit|copy edit)"
+        r"[\w./`'\" -]*\.?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:update|fix|edit|improve|refresh)?\s*"
+        r"(?:docs?|documentation|readme|changelog|license|notice|comments?)"
+        r"(?:\s+(?:only|typo|spelling|grammar|copy|copyedit|copy edit|"
+        r"links?|wording|text|reference|examples?))*\.?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:bump|update|upgrade)\s+"
+        r"(?:[\w./`'\"-]+\s+)?"
+        r"(?:dependencies|dependency|deps?|packages?|lockfile|version)"
+        r"(?:\s+[\w./`'\" -]+)?\.?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:rename|move)\s+[\w./`'\" -]+\s+(?:to|as)\s+[\w./`'\" -]+\.?",
+        re.IGNORECASE,
+    ),
 )
 _DEPENDENCY_DESCRIPTION_RE = re.compile(
     r"\b(dependency|dependencies|dep bump|bump|upgrade|update|lockfile|version)\b",
@@ -269,7 +313,7 @@ def quick_skip_trivial_acceptance(
     if not description or not diff:
         return None
     paths = _changed_paths(diff)
-    if not paths or not _TRIVIAL_DESCRIPTION_RE.search(description):
+    if not paths or not _is_exclusively_trivial_description(description):
         return None
 
     lower_description = description.casefold()
@@ -286,6 +330,42 @@ def quick_skip_trivial_acceptance(
     ):
         return _quick_skip_verdict(criteria)
     return None
+
+
+def _is_exclusively_trivial_description(description: str) -> bool:
+    lines = _meaningful_description_lines(description)
+    return bool(lines) and all(_is_trivial_description_line(line) for line in lines)
+
+
+def _meaningful_description_lines(description: str) -> list[str]:
+    lines: list[str] = []
+    in_fence = False
+    for raw_line in description.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            lines.append(line)
+            continue
+        if _DESCRIPTION_TEMPLATE_HEADING_RE.fullmatch(line):
+            continue
+        line = _MARKDOWN_HEADING_RE.sub("", line).strip()
+        line = _MARKDOWN_LIST_RE.sub("", line).strip()
+        line = _MARKDOWN_CHECKBOX_RE.sub("", line).strip()
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _is_trivial_description_line(line: str) -> bool:
+    if _EXPLICIT_TRIVIAL_DESCRIPTION_LINE_RE.fullmatch(line):
+        return True
+    if _NON_TRIVIAL_DESCRIPTION_RE.search(line):
+        return False
+    return any(pattern.fullmatch(line) for pattern in _TRIVIAL_DESCRIPTION_LINE_RES)
 
 
 def _quick_skip_verdict(criteria: list[str] | None) -> AcceptanceVerdict:
