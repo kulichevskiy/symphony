@@ -15,7 +15,7 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import AcceptanceConfig, Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHubError, PRChecks
-from symphony.linear.client import LinearIssue
+from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
 from symphony.pipeline.acceptance_classifier import (
@@ -1299,6 +1299,161 @@ async def test_dev_acceptance_sets_preview_url_uploads_screenshot_and_records_co
         assert "pass-through acceptance behavior" not in verdict_comment
         assert runner.captured_specs[0].stage == "merge"
         gh.pr_diff.assert_awaited_once()
+        gh.pr_merge.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_invalid_screenshot_path_records_infra_error(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        workspace_path = tmp_path / "ws" / "org" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        linear = AsyncMock()
+        linear.upload_issue_attachment = AsyncMock()
+        orch = Orchestrator(
+            Config(
+                repos=[],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=_FakeRunner([]),
+            gh=_github(),
+            push_fn=AsyncMock(),
+        )
+
+        verdict = AcceptanceVerdict(
+            kind="pass",
+            criteria=[],
+            cost=0.0,
+            hero_screenshot_url="",
+            screenshots=(
+                AcceptanceScreenshot(
+                    kind="hero",
+                    label="Primary verified view",
+                    path="../outside.png",
+                ),
+            ),
+        )
+
+        result = await orch._upload_acceptance_screenshots(  # noqa: SLF001
+            issue=_issue(),
+            workspace_path=workspace_path,
+            verdict=verdict,
+        )
+
+        assert result.kind == "infra_error"
+        assert "acceptance screenshot upload failed" in result.details
+        assert "escapes workspace" in result.details
+        assert result.screenshots == ()
+        linear.upload_issue_attachment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_records_hero_upload_when_verdict_comment_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def fake_run_acceptance(**kwargs: object) -> AcceptanceVerdict:
+        assert kwargs["mode"] == "dev"
+        return AcceptanceVerdict(
+            kind="pass",
+            criteria=[
+                "OAuth login is implemented: GitHub OAuth is supported.",
+            ],
+            cost=0.13,
+            hero_screenshot_url="",
+            details="Visual acceptance passed.",
+            preview_url=preview_url,
+            screenshots=(
+                AcceptanceScreenshot(
+                    kind="hero",
+                    label="Primary verified view",
+                    path=".symphony/acceptance/run/hero.png",
+                ),
+            ),
+            criterion_results=(
+                AcceptanceCriterionResult(
+                    criterion="OAuth login is implemented: GitHub OAuth is supported.",
+                    passed=True,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    port = _free_port()
+    preview_url = f"http://127.0.0.1:{port}"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("dev")
+        binding.acceptance.dev_port = port
+        binding.acceptance.dev_command = "npm run dev"
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(_merge_events())
+        workspace_path = tmp_path / "ws" / "org" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=_issue(
+                description=(
+                    "Need OAuth.\n\n"
+                    "## Where to verify\n\n"
+                    "- Open the login screen.\n\n"
+                    "## Acceptance criteria\n\n"
+                    "- [ ] OAuth login is implemented:\n"
+                    "  - GitHub OAuth is supported.\n"
+                )
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(
+            side_effect=["criteria-cmt", LinearError("comment failed")]
+        )
+        linear.upload_issue_attachment = AsyncMock(
+            return_value="https://uploads.linear.app/hero.png"
+        )
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.last_verdict == "pass"
+        assert acceptance.last_artifacts_url == "https://uploads.linear.app/hero.png"
+        linear.upload_issue_attachment.assert_awaited_once()
         gh.pr_merge.assert_awaited_once()
     finally:
         await conn.close()

@@ -6221,8 +6221,8 @@ class Orchestrator:
         uploaded_by_path: dict[str, str] = {}
         uploaded_screenshots: list[AcceptanceScreenshot] = []
         for screenshot in verdict.screenshots:
-            path = _acceptance_artifact_path(workspace_path, screenshot.path)
             try:
+                path = _acceptance_artifact_path(workspace_path, screenshot.path)
                 url = await self.linear.upload_issue_attachment(
                     issue_uuid=issue.id,
                     path=path,
@@ -6468,7 +6468,7 @@ class Orchestrator:
                 self._conn,
                 issue.id,
                 verdict=verdict.kind,
-                artifacts_url=comment_url if verdict.screenshots else verdict.hero_screenshot_url,
+                artifacts_url=comment_url or verdict.hero_screenshot_url,
             )
 
             if cap_breached:
