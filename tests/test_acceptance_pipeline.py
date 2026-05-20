@@ -299,6 +299,30 @@ def test_acceptance_criteria_extraction_ignores_offsection_checkboxes() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_keeps_nested_heading_items() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Acceptance criteria\n\n"
+        "### Happy path\n\n"
+        "- [ ] OAuth login is implemented.\n\n"
+        "### Regression coverage\n\n"
+        "- Existing sessions still load.\n\n"
+        "## Out of scope\n\n"
+        "- [ ] Password reset changes."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+        {
+            "name": "Existing sessions still load",
+            "predicate": "Existing sessions still load.",
+        },
+    ]
+
+
 def test_acceptance_verdict_comment_uses_neutral_per_criterion_breakdown() -> None:
     body = format_acceptance_verdict_comment(
         verdict=AcceptanceVerdict(

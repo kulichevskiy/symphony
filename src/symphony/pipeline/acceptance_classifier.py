@@ -148,15 +148,28 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
     criteria: list[ExtractedCriterion] = []
     seen: set[str] = set()
     in_criteria_section = False
+    criteria_heading_level: int | None = None
 
     for raw_line in linear_description.splitlines():
         line = raw_line.strip()
         if not line:
             continue
 
-        heading = _heading_title(line)
+        heading = _heading(line)
         if heading is not None:
-            in_criteria_section = _is_criteria_heading(heading)
+            heading_level, heading_title = heading
+            if _is_criteria_heading(heading_title):
+                in_criteria_section = True
+                criteria_heading_level = heading_level
+            elif (
+                in_criteria_section
+                and criteria_heading_level is not None
+                and heading_level > criteria_heading_level
+            ):
+                continue
+            else:
+                in_criteria_section = False
+                criteria_heading_level = None
             continue
 
         if not in_criteria_section:
@@ -410,11 +423,12 @@ def _strip_footer(text: str) -> str:
     return _FOOTER_RE.sub("", text).strip()
 
 
-def _heading_title(line: str) -> str | None:
+def _heading(line: str) -> tuple[int, str] | None:
     match = _HEADING_RE.match(line)
     if not match:
         return None
-    return _clean_markdown(match.group("title")).casefold()
+    level = len(line) - len(line.lstrip("#"))
+    return level, _clean_markdown(match.group("title")).casefold()
 
 
 def _is_criteria_heading(heading: str) -> bool:
