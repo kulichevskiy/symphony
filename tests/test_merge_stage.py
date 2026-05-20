@@ -13,7 +13,7 @@ import pytest
 
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import AcceptanceConfig, Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
@@ -75,6 +75,7 @@ def _binding(
         agent=agent,  # type: ignore[arg-type]
         issue_label=issue_label,
         branch_prefix=branch_prefix,
+        acceptance=AcceptanceConfig(mode="code_only"),
         linear_states=LinearStates(ready="Todo"),
     )
 
@@ -164,6 +165,21 @@ async def _seed_review_candidate(
         pr_number=42,
         pr_url="https://github.com/org/repo/pull/42",
         created_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.acceptance_state.begin_acceptance(
+        conn,
+        "iss-1",
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        mode="code_only",
+        preview_url="",
+        extracted_criteria="[]",
+    )
+    await db.acceptance_state.record_verdict(
+        conn,
+        "iss-1",
+        verdict="pass",
+        artifacts_url="",
     )
 
 

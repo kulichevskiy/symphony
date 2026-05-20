@@ -14,6 +14,7 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import AcceptanceConfig, Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, PRChecks
 from symphony.linear.client import LinearIssue
+from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
 
@@ -113,6 +114,14 @@ async def _seed_review_candidate(conn, binding: RepoBinding) -> None:  # type: i
         pr_number=42,
         pr_url="https://github.com/org/repo/pull/42",
         created_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.review_state.begin_review(
+        conn,
+        "iss-1",
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        github_repo="org/repo",
+        issue_label=binding.issue_label,
     )
 
 
@@ -222,7 +231,7 @@ async def test_acceptance_mode_runs_stub_between_review_and_merge(
 
 
 @pytest.mark.asyncio
-async def test_acceptance_off_preserves_current_review_to_merge_flow(
+async def test_acceptance_off_preserves_current_review_approval_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
@@ -265,9 +274,40 @@ async def test_acceptance_off_preserves_current_review_to_merge_flow(
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert [run.stage for run in history] == ["implement", "review", "merge"]
-        assert await db.operator_waits.get(conn, "iss-1") is None
-        assert linear.move_issue.await_args_list == [call("iss-1", "state-done")]
+        merge_wait_run = history[2]
+        assert merge_wait_run.status == "needs_approval"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        assert wait.run_id == merge_wait_run.id
+        assert runner.captured_spec is None
+        assert linear.move_issue.await_args_list == [call("iss-1", "state-na")]
         cur = await conn.execute("SELECT COUNT(*) FROM acceptance_state")
         assert (await cur.fetchone())[0] == 0
+
+        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+            "iss-1",
+            wait.run_id,
+            SlashIntent(
+                kind=SlashKind.APPROVE,
+                comment_id="c-approve",
+                created_at="2026-05-10T00:04:00+00:00",
+            ),
+        )
+        await orch.drain_dispatch_tasks()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "merge",
+            "merge",
+        ]
+        assert history[-1].status == "done"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-na"),
+            call("iss-1", "state-done"),
+        ]
     finally:
         await conn.close()
