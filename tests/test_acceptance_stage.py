@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
+import httpx
 import pytest
 
 from symphony import db
@@ -1353,6 +1354,63 @@ async def test_dev_acceptance_invalid_screenshot_path_records_infra_error(
         assert "escapes workspace" in result.details
         assert result.screenshots == ()
         linear.upload_issue_attachment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dev_acceptance_http_upload_failure_records_infra_error(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        workspace_path = tmp_path / "ws" / "org" / "eng-1"
+        screenshot_path = workspace_path / ".symphony/acceptance/run/hero.png"
+        screenshot_path.parent.mkdir(parents=True)
+        screenshot_path.write_bytes(b"fake png")
+        linear = AsyncMock()
+        linear.upload_issue_attachment = AsyncMock(
+            side_effect=httpx.ConnectError("signed upload failed")
+        )
+        orch = Orchestrator(
+            Config(
+                repos=[],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=_FakeRunner([]),
+            gh=_github(),
+            push_fn=AsyncMock(),
+        )
+
+        verdict = AcceptanceVerdict(
+            kind="pass",
+            criteria=[],
+            cost=0.0,
+            hero_screenshot_url="",
+            screenshots=(
+                AcceptanceScreenshot(
+                    kind="hero",
+                    label="Primary verified view",
+                    path=".symphony/acceptance/run/hero.png",
+                ),
+            ),
+        )
+
+        result = await orch._upload_acceptance_screenshots(  # noqa: SLF001
+            issue=_issue(),
+            workspace_path=workspace_path,
+            verdict=verdict,
+        )
+
+        assert result.kind == "infra_error"
+        assert "acceptance screenshot upload failed" in result.details
+        assert "signed upload failed" in result.details
+        assert result.screenshots == ()
+        linear.upload_issue_attachment.assert_awaited_once()
     finally:
         await conn.close()
 

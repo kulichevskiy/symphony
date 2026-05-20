@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import aiosqlite
+import httpx
 
 from .. import db
 from ..agent.activity import (
@@ -6228,7 +6229,7 @@ class Orchestrator:
                     path=path,
                     title=f"Acceptance screenshot: {screenshot.label}",
                 )
-            except (LinearError, OSError) as e:
+            except (LinearError, OSError, httpx.HTTPError) as e:
                 return replace(
                     verdict,
                     kind="infra_error",

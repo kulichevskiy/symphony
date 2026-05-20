@@ -749,6 +749,19 @@ def _validate_dev_artifacts(
                 details="dev acceptance pass must include exactly one hero screenshot.",
                 preview_url=verdict.preview_url,
             )
+        failed = [item.criterion for item in verdict.criterion_results if not item.passed]
+        if failed:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=list(criteria or []),
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details=(
+                    "dev acceptance pass reported failed criteria: "
+                    f"{', '.join(failed)}"
+                ),
+                preview_url=verdict.preview_url,
+            )
     if verdict.kind == "reject":
         if criteria and not verdict.criterion_results:
             return AcceptanceVerdict(

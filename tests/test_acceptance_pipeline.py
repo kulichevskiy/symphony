@@ -819,6 +819,72 @@ async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
 
 
 @pytest.mark.asyncio
+async def test_dev_acceptance_pass_with_failed_criterion_is_infra_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    port = _free_port()
+    preview_url = f"http://127.0.0.1:{port}"
+    hero = ".symphony/acceptance/acceptance-1/hero.png"
+    failed = ".symphony/acceptance/acceptance-1/settings-missing.png"
+    stopped_servers: list[object] = []
+
+    async def fake_port_reachable(_host: str, _port: int) -> bool:
+        return True
+
+    async def fake_start_dev_server(**_kwargs: object) -> object:
+        return acceptance_module._DevServer()  # noqa: SLF001
+
+    async def fake_stop_dev_server(server: object) -> None:
+        stopped_servers.append(server)
+
+    monkeypatch.setattr(acceptance_module, "_port_reachable", fake_port_reachable)
+    monkeypatch.setattr(acceptance_module, "_start_dev_server", fake_start_dev_server)
+    monkeypatch.setattr(acceptance_module, "_stop_dev_server", fake_stop_dev_server)
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=_dev_artifact_result(
+                    preview_url=preview_url,
+                    hero_path=hero,
+                    criteria=[
+                        {
+                            "criterion": "toolbar has settings icon",
+                            "passed": False,
+                            "screenshot": failed,
+                        }
+                    ],
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="dev",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=5,
+        preview_url=preview_url,
+        dev_command="npm run dev",
+        dev_port=port,
+        dev_startup_timeout_secs=5,
+    )
+
+    assert verdict.kind == "infra_error"
+    assert verdict.criteria == ["toolbar has settings icon"]
+    assert "dev acceptance pass reported failed criteria" in verdict.details
+    assert "toolbar has settings icon" in verdict.details
+    assert verdict.preview_url == preview_url
+    assert len(stopped_servers) == 1
+
+
+@pytest.mark.asyncio
 async def test_dev_acceptance_uses_fallback_port_when_configured_port_is_busy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
