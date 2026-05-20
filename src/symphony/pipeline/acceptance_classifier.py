@@ -19,10 +19,12 @@ ACCEPTANCE_FOOTER_REJECT = "<!-- symphony-acceptance-verdict: reject -->"
 ACCEPTANCE_FOOTER_INFRA_ERROR = (
     "<!-- symphony-acceptance-verdict: infra_error -->"
 )
+ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL = "quick_skip_trivial"
 
 _FOOTER_RE = re.compile(
     r"<!--\s*symphony-acceptance-verdict:\s*"
-    r"(?P<kind>pass|reject|infra_error)\s*-->",
+    r"(?P<kind>pass|reject|infra_error)"
+    r"(?:\s+reason\s*=\s*(?P<reason>[a-z0-9_:-]+))?\s*-->",
     re.IGNORECASE,
 )
 _COMMENT_DETAILS_LIMIT = 2500
@@ -35,6 +37,7 @@ class AcceptanceVerdict:
     cost: float
     hero_screenshot_url: str
     details: str = ""
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -45,11 +48,22 @@ class _ParsedTranscript:
     terminal_infra_error_details: str = ""
 
 
-def acceptance_footer(kind: AcceptanceVerdictKind) -> str:
+def acceptance_footer(
+    kind: AcceptanceVerdictKind,
+    *,
+    reason: str | None = None,
+) -> str:
+    reason_suffix = f" reason={reason}" if reason else ""
     if kind == "pass":
+        if reason_suffix:
+            return f"<!-- symphony-acceptance-verdict: pass{reason_suffix} -->"
         return ACCEPTANCE_FOOTER_PASS
     if kind == "reject":
+        if reason_suffix:
+            return f"<!-- symphony-acceptance-verdict: reject{reason_suffix} -->"
         return ACCEPTANCE_FOOTER_REJECT
+    if reason_suffix:
+        return f"<!-- symphony-acceptance-verdict: infra_error{reason_suffix} -->"
     return ACCEPTANCE_FOOTER_INFRA_ERROR
 
 
@@ -94,6 +108,7 @@ def acceptance_classifier(
             ),
         )
     kind = match[-1].group("kind").lower()
+    reason = match[-1].group("reason") or ""
     details = _strip_footer(verdict_text).strip()
     if kind != "pass" and parsed.infra_error_details:
         return AcceptanceVerdict(
@@ -109,6 +124,7 @@ def acceptance_classifier(
         cost=verdict_cost,
         hero_screenshot_url="",
         details=details,
+        reason=reason,
     )
 
 
@@ -118,14 +134,22 @@ def format_acceptance_verdict_comment(
     details = verdict.details.strip()
     if len(details) > _COMMENT_DETAILS_LIMIT:
         details = details[:_COMMENT_DETAILS_LIMIT] + "\n...[truncated]"
+    prefix = ""
+    if (
+        verdict.kind == "pass"
+        and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL
+    ):
+        prefix = "**Acceptance: skipped - trivial change.**\n\n"
     body = (
         f"**Acceptance verdict:** `{verdict.kind}`\n\n"
         f"- PR: {pr_url}\n"
         f"- Cost: ${verdict.cost:.4f}\n"
     )
+    if verdict.reason:
+        body += f"- Reason: `{verdict.reason}`\n"
     if details:
         body += f"\n{details}\n"
-    return f"{body}\n{acceptance_footer(verdict.kind)}"
+    return f"{prefix}{body}\n{acceptance_footer(verdict.kind, reason=verdict.reason)}"
 
 
 def _parse_claude_transcript(transcript: str) -> _ParsedTranscript:
@@ -332,6 +356,7 @@ __all__ = [
     "ACCEPTANCE_FOOTER_INFRA_ERROR",
     "ACCEPTANCE_FOOTER_PASS",
     "ACCEPTANCE_FOOTER_REJECT",
+    "ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL",
     "AcceptanceVerdict",
     "AcceptanceVerdictKind",
     "acceptance_classifier",

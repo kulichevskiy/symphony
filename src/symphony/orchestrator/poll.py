@@ -55,7 +55,7 @@ from ..agent.prompt import (
     review_fix_prompt,
 )
 from ..agent.runner import Runner, RunnerSpec
-from ..agent.runners.acceptance import run_acceptance
+from ..agent.runners.acceptance import quick_skip_trivial_acceptance, run_acceptance
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.client import CheckRun as GitHubCheckRun
@@ -6253,24 +6253,32 @@ class Orchestrator:
                         details=str(e),
                     )
                 else:
-                    workspace_path = await self._workspace.acquire(binding, issue)
-                    try:
-                        verdict = await run_acceptance(
-                            runner=self._runner,
-                            run_id=run_id,
-                            workspace_path=workspace_path,
-                            mode=effective_mode,
-                            linear_description=issue.description,
-                            pr_diff_summary=pr_diff_summary,
-                            taste_guide=load_taste_guide(
-                                binding_taste_guide=binding.acceptance.taste_guide,
-                            ),
-                            criteria=criteria,
-                            stall_secs=binding.acceptance.time_cap_minutes * 60,
-                            max_budget_usd=max_budget_usd,
-                        )
-                    finally:
-                        self._workspace.release(binding, issue)
+                    quick_skip = quick_skip_trivial_acceptance(
+                        linear_description=issue.description,
+                        pr_diff_summary=pr_diff_summary,
+                        criteria=criteria,
+                    )
+                    if quick_skip is not None:
+                        verdict = quick_skip
+                    else:
+                        workspace_path = await self._workspace.acquire(binding, issue)
+                        try:
+                            verdict = await run_acceptance(
+                                runner=self._runner,
+                                run_id=run_id,
+                                workspace_path=workspace_path,
+                                mode=effective_mode,
+                                linear_description=issue.description,
+                                pr_diff_summary=pr_diff_summary,
+                                taste_guide=load_taste_guide(
+                                    binding_taste_guide=binding.acceptance.taste_guide,
+                                ),
+                                criteria=criteria,
+                                stall_secs=binding.acceptance.time_cap_minutes * 60,
+                                max_budget_usd=max_budget_usd,
+                            )
+                        finally:
+                            self._workspace.release(binding, issue)
 
             verdict = _with_acceptance_degrade_note(verdict, degrade_note)
 

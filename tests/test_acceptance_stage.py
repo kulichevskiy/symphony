@@ -116,12 +116,14 @@ def _binding(
 def _issue(
     state_name: str = "Needs Approval",
     state_id: str = "state-na",
+    *,
+    title: str = "Add auth",
     description: str = "Need OAuth.",
 ) -> LinearIssue:
     return LinearIssue(
         id="iss-1",
         identifier="ENG-1",
-        title="Add auth",
+        title=title,
         description=description,
         url="https://linear.app/team/issue/ENG-1",
         state_id=state_id,
@@ -452,6 +454,84 @@ async def test_acceptance_runner_uses_acceptance_budget_and_time_caps(
         assert acceptance_spec.stall_secs == 7 * 60
         budget_idx = acceptance_spec.command.index("--max-budget-usd") + 1
         assert acceptance_spec.command[budget_idx] == "3.5000"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_quick_skip_posts_distinct_pass_and_still_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(_merge_events())
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=_issue(
+                title="Fix README typo",
+                description="Fix a typo in README.md.",
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+        gh.pr_diff = AsyncMock(
+            return_value=(
+                "diff --git a/README.md b/README.md\n"
+                "-This pacakge runs Symphony.\n"
+                "+This package runs Symphony.\n"
+            )
+        )
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.last_verdict == "pass"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+            "merge",
+        ]
+        assert history[2].status == "completed"
+        assert history[2].cost_usd == 0.0
+        assert [spec.stage for spec in runner.captured_specs] == ["merge"]
+        gh.pr_merge.assert_awaited_once()
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any(body.startswith("**Acceptance: skipped - trivial change.**") for body in bodies)
+        assert any("Reason: `quick_skip_trivial`" in body for body in bodies)
     finally:
         await conn.close()
 
