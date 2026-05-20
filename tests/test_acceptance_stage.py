@@ -324,6 +324,105 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
 
 
 @pytest.mark.asyncio
+async def test_acceptance_publishes_extracted_criteria_before_checking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner([_acceptance_events(), _merge_events()])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=_issue(
+                description=(
+                    "Ship OAuth.\n\n"
+                    "## Acceptance criteria\n\n"
+                    "- [ ] OAuth login is implemented:\n"
+                    "  - GitHub OAuth is supported.\n"
+                    "- [ ] Existing sessions still load.\n\n"
+                    "## Out of scope\n\n"
+                    "- Password reset changes."
+                )
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        expected_criteria = [
+            {
+                "name": "OAuth login is implemented",
+                "predicate": "OAuth login is implemented: GitHub OAuth is supported.",
+            },
+            {
+                "name": "Existing sessions still load",
+                "predicate": "Existing sessions still load.",
+            },
+        ]
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert json.loads(acceptance.extracted_criteria) == expected_criteria
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        criteria_index = next(
+            i
+            for i, body in enumerate(bodies)
+            if "### Symphony extracted acceptance criteria" in body
+        )
+        verdict_index = next(
+            i for i, body in enumerate(bodies) if "**Acceptance verdict:**" in body
+        )
+        assert criteria_index < verdict_index
+        assert "OAuth login is implemented" in bodies[criteria_index]
+        assert "GitHub OAuth is supported" in bodies[criteria_index]
+        assert "Existing sessions still load" in bodies[criteria_index]
+        assert gh.pr_diff.await_count == 1
+        assert runner.captured_specs[0].stage == "acceptance"
+        acceptance_prompt = runner.captured_specs[0].command[-1]
+        assert (
+            "- OAuth login is implemented: GitHub OAuth is supported."
+            in acceptance_prompt
+        )
+        assert "OAuth login is implemented" in bodies[verdict_index]
+        assert (
+            "- **OAuth login is implemented: GitHub OAuth is supported.**"
+            not in bodies[verdict_index]
+        )
+        assert "Existing sessions still load" in bodies[verdict_index]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["dev", "preview"])
 async def test_acceptance_degrades_missing_where_to_verify_to_code_only(
     tmp_path: Path,

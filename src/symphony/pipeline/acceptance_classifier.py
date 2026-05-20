@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
 
@@ -28,6 +28,37 @@ _FOOTER_RE = re.compile(
     re.IGNORECASE,
 )
 _COMMENT_DETAILS_LIMIT = 2500
+ACCEPTANCE_CRITERIA_COMMENT_HEADER = "### Symphony extracted acceptance criteria"
+ACCEPTANCE_CRITERIA_COMMENT_MARKER = "<!-- symphony-acceptance-criteria -->"
+_CHECKBOX_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s+(?P<text>.+?)\s*$"
+)
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
+_HEADING_RE = re.compile(
+    r"^\s{0,3}(?P<marker>#{1,6})\s+(?P<title>.+?)\s*#*\s*$"
+)
+_SETEXT_HEADING_UNDERLINE_RE = re.compile(r"^\s{0,3}(?P<marker>=+|-+)\s*$")
+_CRITERIA_HEADING_RE = re.compile(
+    r"^(?:acceptance\s+criteria|acceptance\s+checklist|criteria|checklist)"
+    r"(?:$|\W.*)",
+    re.I,
+)
+_NON_CRITERIA_HEADING_RE = re.compile(
+    r"^(?:"
+    r"non[-\s]+criteria\b.*|"
+    r"what\s+to\s+build|where\s+to\s+verify|out\s+of\s+scope|"
+    r"description|summary|notes?|implementation|context|tasks?|todo"
+    r")(?:\s*(?::|-)\s*.*)?$",
+    re.I,
+)
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MARKDOWN_STRONG_RE = re.compile(r"(\*\*|__)(?P<text>.+?)\1")
+_MARKDOWN_CODE_RE = re.compile(r"`(?P<text>[^`]+)`")
+
+
+class ExtractedCriterion(TypedDict):
+    name: str
+    predicate: str
 
 
 @dataclass(frozen=True)
@@ -128,6 +159,122 @@ def acceptance_classifier(
     )
 
 
+def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriterion]:
+    criteria: list[ExtractedCriterion] = []
+    seen: set[str] = set()
+    in_criteria_section = False
+    criteria_heading_level: int | None = None
+    blocked_nested_heading_level: int | None = None
+    list_item_indent: int | None = None
+    previous_line_can_lazy_continue = False
+    current_criterion_name = ""
+    current_criterion_parts: list[str] = []
+
+    def flush_current_criterion() -> None:
+        nonlocal current_criterion_name
+        if not current_criterion_parts:
+            return
+        _append_criterion(
+            criteria,
+            seen,
+            " ".join(current_criterion_parts),
+            name_text=current_criterion_name,
+        )
+        current_criterion_name = ""
+        current_criterion_parts.clear()
+
+    lines = linear_description.splitlines()
+    line_index = 0
+    while line_index < len(lines):
+        raw_line = lines[line_index]
+        line_index += 1
+        stripped = raw_line.strip()
+        if not stripped:
+            previous_line_can_lazy_continue = False
+            continue
+
+        heading = _heading(raw_line.rstrip())
+        if heading is None and line_index < len(lines):
+            setext_heading = _setext_heading(raw_line.rstrip(), lines[line_index])
+            if setext_heading is not None:
+                heading = setext_heading
+                line_index += 1
+        if heading is not None:
+            flush_current_criterion()
+            list_item_indent = None
+            previous_line_can_lazy_continue = False
+            heading_level, heading_title = heading
+            if (
+                in_criteria_section
+                and criteria_heading_level is not None
+                and heading_level > criteria_heading_level
+            ):
+                if (
+                    blocked_nested_heading_level is not None
+                    and heading_level <= blocked_nested_heading_level
+                ):
+                    blocked_nested_heading_level = None
+                if _is_non_criteria_heading(heading_title):
+                    blocked_nested_heading_level = heading_level
+                continue
+            blocked_nested_heading_level = None
+            if _is_criteria_heading(heading_title):
+                in_criteria_section = True
+                criteria_heading_level = heading_level
+                list_item_indent = None
+            else:
+                in_criteria_section = False
+                criteria_heading_level = None
+                list_item_indent = None
+            continue
+
+        if not in_criteria_section or blocked_nested_heading_level is not None:
+            previous_line_can_lazy_continue = False
+            continue
+        line = raw_line.rstrip()
+        checkbox_match = _CHECKBOX_RE.match(line)
+        item_match = checkbox_match or _LIST_ITEM_RE.match(line)
+        if item_match:
+            item_indent = _leading_indent_width(line)
+            item_text = item_match.group("text")
+            if list_item_indent is None or item_indent <= list_item_indent:
+                flush_current_criterion()
+                list_item_indent = item_indent
+                current_criterion_name = item_text
+            current_criterion_parts.append(item_text)
+            previous_line_can_lazy_continue = True
+            continue
+
+        if (
+            current_criterion_parts
+            and list_item_indent is not None
+            and (
+                _leading_indent_width(raw_line) > list_item_indent
+                or previous_line_can_lazy_continue
+            )
+        ):
+            current_criterion_parts.append(stripped)
+            previous_line_can_lazy_continue = True
+        else:
+            previous_line_can_lazy_continue = False
+
+    flush_current_criterion()
+    return criteria
+
+
+def format_acceptance_criteria_comment(
+    criteria: list[ExtractedCriterion],
+) -> str:
+    body = f"{ACCEPTANCE_CRITERIA_COMMENT_HEADER}\n\n"
+    if criteria:
+        body += "Symphony will check these criteria before posting the verdict:\n\n"
+        for item in criteria:
+            body += f"- **{item['name']}**: {item['predicate']}\n"
+    else:
+        body += "No verifiable criteria - falling back to description match.\n"
+    return f"{body}\n{ACCEPTANCE_CRITERIA_COMMENT_MARKER}"
+
+
 def format_acceptance_verdict_comment(
     *, verdict: AcceptanceVerdict, pr_url: str
 ) -> str:
@@ -147,6 +294,7 @@ def format_acceptance_verdict_comment(
     )
     if verdict.reason:
         body += f"- Reason: `{verdict.reason}`\n"
+    body += _criteria_breakdown(verdict)
     if details:
         body += f"\n{details}\n"
     return f"{prefix}{body}\n{acceptance_footer(verdict.kind, reason=verdict.reason)}"
@@ -352,14 +500,119 @@ def _strip_footer(text: str) -> str:
     return _FOOTER_RE.sub("", text).strip()
 
 
+def _heading(line: str) -> tuple[int, str] | None:
+    match = _HEADING_RE.match(line)
+    if not match:
+        return None
+    level = len(match.group("marker"))
+    return level, _clean_markdown(match.group("title")).casefold()
+
+
+def _setext_heading(line: str, underline: str) -> tuple[int, str] | None:
+    if _leading_indent_width(line) > 3 or _leading_indent_width(underline) > 3:
+        return None
+    if _CHECKBOX_RE.match(line) or _LIST_ITEM_RE.match(line):
+        return None
+    match = _SETEXT_HEADING_UNDERLINE_RE.match(underline)
+    if not match:
+        return None
+    level = 1 if match.group("marker").startswith("=") else 2
+    return level, _clean_markdown(line).casefold()
+
+
+def _is_criteria_heading(heading: str) -> bool:
+    return bool(_CRITERIA_HEADING_RE.search(heading))
+
+
+def _is_non_criteria_heading(heading: str) -> bool:
+    return bool(_NON_CRITERIA_HEADING_RE.search(heading))
+
+
+def _leading_indent_width(text: str) -> int:
+    width = 0
+    for char in text:
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += 4
+        else:
+            break
+    return width
+
+
+def _append_criterion(
+    criteria: list[ExtractedCriterion],
+    seen: set[str],
+    raw_text: str,
+    *,
+    name_text: str | None = None,
+) -> None:
+    predicate = _clean_markdown(raw_text)
+    if not predicate:
+        return
+    key = predicate.casefold()
+    if key in seen:
+        return
+    seen.add(key)
+    name_source = _clean_markdown(name_text) if name_text else predicate
+    criteria.append(
+        {
+            "name": _criterion_name(name_source) or _criterion_name(predicate),
+            "predicate": predicate,
+        }
+    )
+
+
+def _clean_markdown(text: str) -> str:
+    cleaned = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    cleaned = _MARKDOWN_STRONG_RE.sub(r"\g<text>", cleaned)
+    cleaned = _MARKDOWN_CODE_RE.sub(r"\g<text>", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" \t")
+
+
+def _criterion_name(predicate: str) -> str:
+    name = predicate.rstrip(".:;!?").strip()
+    return name or predicate
+
+
+def _criteria_breakdown(verdict: AcceptanceVerdict) -> str:
+    body = "\n**Criteria breakdown:**\n"
+    criteria = verdict.criteria
+    if not criteria:
+        return body + "- No verifiable criteria - falling back to description match.\n"
+    if (
+        verdict.kind == "pass"
+        and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL
+    ):
+        for criterion in criteria:
+            body += f"- **{criterion}**: not checked because acceptance was skipped as trivial.\n"
+        return body
+    if verdict.kind == "infra_error":
+        for criterion in criteria:
+            body += (
+                f"- **{criterion}**: not checked because the acceptance run "
+                "failed before review completed.\n"
+            )
+        return body
+    for criterion in criteria:
+        body += f"- **{criterion}**: included in the overall acceptance review.\n"
+    return body
+
+
 __all__ = [
+    "ACCEPTANCE_CRITERIA_COMMENT_HEADER",
+    "ACCEPTANCE_CRITERIA_COMMENT_MARKER",
     "ACCEPTANCE_FOOTER_INFRA_ERROR",
     "ACCEPTANCE_FOOTER_PASS",
     "ACCEPTANCE_FOOTER_REJECT",
     "ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL",
     "AcceptanceVerdict",
     "AcceptanceVerdictKind",
+    "ExtractedCriterion",
     "acceptance_classifier",
     "acceptance_footer",
+    "extract_acceptance_criteria",
+    "format_acceptance_criteria_comment",
     "format_acceptance_verdict_comment",
 ]

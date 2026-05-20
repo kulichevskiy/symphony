@@ -91,6 +91,9 @@ from ..linear.templates import (
 )
 from ..pipeline.acceptance_classifier import (
     AcceptanceVerdict,
+    ExtractedCriterion,
+    extract_acceptance_criteria,
+    format_acceptance_criteria_comment,
     format_acceptance_verdict_comment,
 )
 from ..pipeline.cost_guard import (
@@ -181,6 +184,14 @@ def _with_acceptance_degrade_note(
         return verdict
     combined = degrade_note if not details else f"{degrade_note}\n\n{details}"
     return replace(verdict, details=combined)
+
+
+def _acceptance_criterion_names(criteria: list[ExtractedCriterion]) -> list[str]:
+    return [item["name"] for item in criteria if item["name"].strip()]
+
+
+def _acceptance_criterion_predicates(criteria: list[ExtractedCriterion]) -> list[str]:
+    return [item["predicate"] for item in criteria if item["predicate"].strip()]
 
 
 def _activity_settings_for(config: Config, binding: RepoBinding) -> ActivitySettings:
@@ -6133,6 +6144,22 @@ class Orchestrator:
                 e,
             )
 
+    async def _post_acceptance_criteria_comment(
+        self,
+        *,
+        issue: LinearIssue,
+        criteria: list[ExtractedCriterion],
+    ) -> None:
+        try:
+            body = format_acceptance_criteria_comment(criteria)
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "acceptance criteria comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
     async def _run_acceptance_stage(
         self,
         *,
@@ -6179,7 +6206,9 @@ class Orchestrator:
                     pr_url=pr_url,
                 )
             )
-            criteria: list[str] = []
+            extracted_criteria = extract_acceptance_criteria(issue.description)
+            criteria_names = _acceptance_criterion_names(extracted_criteria)
+            criteria_predicates = _acceptance_criterion_predicates(extracted_criteria)
             await db.acceptance_state.begin_acceptance(
                 self._conn,
                 issue.id,
@@ -6188,7 +6217,11 @@ class Orchestrator:
                 pr_head_sha=pr_head_sha,
                 mode=binding.acceptance.mode,
                 preview_url=preview_url,
-                extracted_criteria=json.dumps(criteria),
+                extracted_criteria=json.dumps(extracted_criteria),
+            )
+            await self._post_acceptance_criteria_comment(
+                issue=issue,
+                criteria=extracted_criteria,
             )
             await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
 
@@ -6227,7 +6260,7 @@ class Orchestrator:
             if effective_mode != _CODE_ONLY_ACCEPTANCE_MODE:
                 verdict = AcceptanceVerdict(
                     kind="pass",
-                    criteria=criteria,
+                    criteria=criteria_names,
                     cost=0.0,
                     hero_screenshot_url="",
                     details=(
@@ -6247,7 +6280,7 @@ class Orchestrator:
                 except _AcceptancePrDiffUnavailable as e:
                     verdict = AcceptanceVerdict(
                         kind="infra_error",
-                        criteria=criteria,
+                        criteria=criteria_names,
                         cost=0.0,
                         hero_screenshot_url="",
                         details=str(e),
@@ -6256,7 +6289,7 @@ class Orchestrator:
                     quick_skip = quick_skip_trivial_acceptance(
                         linear_description=issue.description,
                         pr_diff_summary=pr_diff_summary,
-                        criteria=criteria,
+                        criteria=criteria_names,
                     )
                     if quick_skip is not None:
                         verdict = quick_skip
@@ -6273,10 +6306,11 @@ class Orchestrator:
                                 taste_guide=load_taste_guide(
                                     binding_taste_guide=binding.acceptance.taste_guide,
                                 ),
-                                criteria=criteria,
+                                criteria=criteria_predicates,
                                 stall_secs=binding.acceptance.time_cap_minutes * 60,
                                 max_budget_usd=max_budget_usd,
                             )
+                            verdict = replace(verdict, criteria=criteria_names)
                         finally:
                             self._workspace.release(binding, issue)
 

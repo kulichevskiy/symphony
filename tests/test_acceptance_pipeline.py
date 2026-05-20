@@ -22,6 +22,7 @@ from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_REJECT,
     AcceptanceVerdict,
     acceptance_classifier,
+    extract_acceptance_criteria,
     format_acceptance_verdict_comment,
 )
 
@@ -262,7 +263,7 @@ def test_acceptance_classifier_parses_quick_skip_reason() -> None:
 def test_quick_skip_comment_has_distinct_prefix() -> None:
     verdict = AcceptanceVerdict(
         kind="pass",
-        criteria=[],
+        criteria=["README typo is fixed"],
         cost=0.0,
         hero_screenshot_url="",
         details="No user-visible behavior described.",
@@ -277,6 +278,11 @@ def test_quick_skip_comment_has_distinct_prefix() -> None:
     assert body.startswith("**Acceptance: skipped - trivial change.**")
     assert "**Acceptance verdict:** `pass`" in body
     assert "Reason: `quick_skip_trivial`" in body
+    assert (
+        "- **README typo is fixed**: not checked because acceptance was skipped as trivial."
+        in body
+    )
+    assert "included in the overall acceptance review" not in body
     assert "symphony-acceptance-verdict: pass reason=quick_skip_trivial" in body
 
 
@@ -310,6 +316,273 @@ def test_acceptance_classifier_ignores_raw_prompt_footer_examples() -> None:
         hero_screenshot_url="",
         details="Acceptance agent did not emit a final message.",
     )
+
+
+def test_acceptance_criteria_extraction_ignores_offsection_checkboxes() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Tasks\n\n"
+        "- [ ] Coordinate release timing.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] OAuth login is implemented.\n"
+        "- Existing sessions still load.\n\n"
+        "## Out of scope\n\n"
+        "- [ ] Password reset changes.\n\n"
+        "## Checklist\n\n"
+        "- [ ] Migration is idempotent."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+        {
+            "name": "Existing sessions still load",
+            "predicate": "Existing sessions still load.",
+        },
+        {
+            "name": "Migration is idempotent",
+            "predicate": "Migration is idempotent.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_keeps_nested_heading_items() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Acceptance criteria\n\n"
+        "### Backend criteria\n\n"
+        "- [ ] OAuth login is implemented.\n\n"
+        "### Regression coverage\n\n"
+        "- Existing sessions still load.\n\n"
+        "## Out of scope\n\n"
+        "- [ ] Password reset changes."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+        {
+            "name": "Existing sessions still load",
+            "predicate": "Existing sessions still load.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_folds_nested_list_items() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] Criteria extraction is published before checking:\n"
+        "  - [ ] Comment is posted before the verdict.\n"
+        "  - Extracted JSON is stored in acceptance_state.\n"
+        "- [ ] Verdict references criteria by name.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria extraction is published before checking",
+            "predicate": (
+                "Criteria extraction is published before checking: Comment is "
+                "posted before the verdict. Extracted JSON is stored in "
+                "acceptance_state."
+            ),
+        },
+        {
+            "name": "Verdict references criteria by name",
+            "predicate": "Verdict references criteria by name.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_folds_lazy_continuation_lines() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] Criteria extraction is published before checking\n"
+        "before the verdict comment is posted.\n\n"
+        "Operator notes stay out of the criterion.\n"
+        "- [ ] Verdict references criteria by name.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria extraction is published before checking",
+            "predicate": (
+                "Criteria extraction is published before checking before the "
+                "verdict comment is posted."
+            ),
+        },
+        {
+            "name": "Verdict references criteria by name",
+            "predicate": "Verdict references criteria by name.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_preserves_leading_hyphen_text() -> None:
+    description = (
+        "Ship validation.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] `-1` remains a valid input.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "-1 remains a valid input",
+            "predicate": "-1 remains a valid input.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_accepts_setext_headings() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "Acceptance criteria\n"
+        "---\n\n"
+        "- [ ] Criteria are published first.\n\n"
+        "Out of scope\n"
+        "---\n\n"
+        "- [ ] Per-criterion screenshots are included.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria are published first",
+            "predicate": "Criteria are published first.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_accepts_heading_suffix_text() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "## Acceptance criteria (must pass)\n\n"
+        "- [ ] Criteria are published first.\n\n"
+        "## Checklist for release\n\n"
+        "- [ ] Verdict references criteria by name.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria are published first",
+            "predicate": "Criteria are published first.",
+        },
+        {
+            "name": "Verdict references criteria by name",
+            "predicate": "Verdict references criteria by name.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_ignores_indented_code_headings() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "    ## Acceptance criteria\n\n"
+        "    - [ ] This checklist is a code sample.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] OAuth login is implemented.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_skips_nested_noncriteria_sections() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Acceptance criteria\n\n"
+        "### Backend criteria\n\n"
+        "- [ ] OAuth login is implemented.\n\n"
+        "### Out of scope\n\n"
+        "- [ ] Password reset changes.\n\n"
+        "#### Notes\n\n"
+        "- [ ] Release timing is tracked elsewhere.\n\n"
+        "### Regression coverage\n\n"
+        "- Existing sessions still load.\n\n"
+        "## Where to verify\n\n"
+        "- [ ] Staging login flow."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+        {
+            "name": "Existing sessions still load",
+            "predicate": "Existing sessions still load.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_ignores_negated_criteria_heading() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] OAuth login is implemented.\n\n"
+        "## Non-criteria follow-up\n\n"
+        "- [ ] Coordinate release timing."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+    ]
+
+
+def test_acceptance_verdict_comment_uses_neutral_per_criterion_breakdown() -> None:
+    body = format_acceptance_verdict_comment(
+        verdict=AcceptanceVerdict(
+            kind="reject",
+            criteria=["OAuth login is implemented", "Existing sessions still load"],
+            cost=0.12,
+            hero_screenshot_url="",
+            details="Diff only adds docs.",
+        ),
+        pr_url="https://github.example/pr/1",
+    )
+
+    assert "**Acceptance verdict:** `reject`" in body
+    assert (
+        "- **OAuth login is implemented**: included in the overall acceptance review."
+        in body
+    )
+    assert (
+        "- **Existing sessions still load**: included in the overall acceptance review."
+        in body
+    )
+    assert "- **OAuth login is implemented**: `reject`" not in body
+    assert "- **Existing sessions still load**: `reject`" not in body
+
+
+def test_acceptance_verdict_comment_marks_infra_error_criteria_unchecked() -> None:
+    body = format_acceptance_verdict_comment(
+        verdict=AcceptanceVerdict(
+            kind="infra_error",
+            criteria=["OAuth login is implemented"],
+            cost=0.12,
+            hero_screenshot_url="",
+            details="Acceptance agent did not emit a verdict footer.",
+        ),
+        pr_url="https://github.example/pr/1",
+    )
+
+    assert "**Acceptance verdict:** `infra_error`" in body
+    assert (
+        "- **OAuth login is implemented**: not checked because the acceptance run "
+        "failed before review completed."
+    ) in body
+    assert "included in the overall acceptance review" not in body
 
 
 @pytest.mark.asyncio

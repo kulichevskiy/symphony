@@ -183,6 +183,7 @@ async def run_acceptance(
         linear_description=linear_description,
         pr_diff_summary=pr_diff_summary,
         taste_guide=taste_guide,
+        criteria=criteria,
     )
     spec = RunnerSpec(
         run_id=run_id,
@@ -392,6 +393,7 @@ def build_acceptance_prompt(
     linear_description: str,
     pr_diff_summary: str,
     taste_guide: str = "",
+    criteria: list[str] | None = None,
 ) -> str:
     if mode != _CODE_ONLY_MODE:
         raise ValueError(_unsupported_mode_details(mode))
@@ -399,6 +401,7 @@ def build_acceptance_prompt(
     description = linear_description.strip() or "(no Linear description)"
     diff = _truncate_diff(pr_diff_summary.strip() or "(no PR diff available)")
     taste_guide_section = _taste_guide_section(taste_guide)
+    criteria_section = _criteria_section(criteria)
     return (
         "You are Symphony's Acceptance-stage agent. Your only job is to "
         "decide whether the PR diff satisfies the Linear ticket description.\n\n"
@@ -429,6 +432,7 @@ def build_acceptance_prompt(
         "- Do not inspect screenshots or preview URLs.\n"
         "- Do not modify files, commit, push, or merge anything.\n\n"
         f"{taste_guide_section}"
+        f"{criteria_section}"
         "# Linear description\n\n"
         f"{description}\n\n"
         "# PR diff summary\n\n"
@@ -454,6 +458,20 @@ def _taste_guide_section(taste_guide: str) -> str:
         "global hard rules.\n\n"
         f"{content}\n\n"
     )
+
+
+def _criteria_section(criteria: list[str] | None) -> str:
+    items = [item.strip() for item in criteria or [] if item.strip()]
+    if not items:
+        return (
+            "# Extracted acceptance criteria\n\n"
+            "No verifiable criteria were extracted; fall back to matching the "
+            "overall Linear description against the PR diff.\n\n"
+        )
+    body = "# Extracted acceptance criteria\n\n"
+    for item in items:
+        body += f"- {item}\n"
+    return f"{body}\n"
 
 
 def quick_skip_trivial_acceptance(
