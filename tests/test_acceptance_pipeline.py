@@ -21,6 +21,7 @@ from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_REJECT,
     AcceptanceVerdict,
     acceptance_classifier,
+    extract_acceptance_criteria,
     format_acceptance_verdict_comment,
 )
 
@@ -266,6 +267,61 @@ def test_acceptance_classifier_ignores_raw_prompt_footer_examples() -> None:
         hero_screenshot_url="",
         details="Acceptance agent did not emit a final message.",
     )
+
+
+def test_acceptance_criteria_extraction_ignores_offsection_checkboxes() -> None:
+    description = (
+        "Ship OAuth.\n\n"
+        "## Tasks\n\n"
+        "- [ ] Coordinate release timing.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] OAuth login is implemented.\n"
+        "- Existing sessions still load.\n\n"
+        "## Out of scope\n\n"
+        "- [ ] Password reset changes.\n\n"
+        "## Checklist\n\n"
+        "- [ ] Migration is idempotent."
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "OAuth login is implemented",
+            "predicate": "OAuth login is implemented.",
+        },
+        {
+            "name": "Existing sessions still load",
+            "predicate": "Existing sessions still load.",
+        },
+        {
+            "name": "Migration is idempotent",
+            "predicate": "Migration is idempotent.",
+        },
+    ]
+
+
+def test_acceptance_verdict_comment_uses_neutral_per_criterion_breakdown() -> None:
+    body = format_acceptance_verdict_comment(
+        verdict=AcceptanceVerdict(
+            kind="reject",
+            criteria=["OAuth login is implemented", "Existing sessions still load"],
+            cost=0.12,
+            hero_screenshot_url="",
+            details="Diff only adds docs.",
+        ),
+        pr_url="https://github.example/pr/1",
+    )
+
+    assert "**Acceptance verdict:** `reject`" in body
+    assert (
+        "- **OAuth login is implemented**: included in the overall acceptance review."
+        in body
+    )
+    assert (
+        "- **Existing sessions still load**: included in the overall acceptance review."
+        in body
+    )
+    assert "- **OAuth login is implemented**: `reject`" not in body
+    assert "- **Existing sessions still load**: `reject`" not in body
 
 
 @pytest.mark.asyncio

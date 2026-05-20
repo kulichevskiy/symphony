@@ -159,12 +159,11 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
             in_criteria_section = _is_criteria_heading(heading)
             continue
 
+        if not in_criteria_section:
+            continue
         checkbox_match = _CHECKBOX_RE.match(line)
         if checkbox_match:
             _append_criterion(criteria, seen, checkbox_match.group("text"))
-            continue
-
-        if not in_criteria_section:
             continue
         item_match = _LIST_ITEM_RE.match(line)
         if item_match:
@@ -205,7 +204,7 @@ def format_acceptance_verdict_comment(
     )
     if verdict.reason:
         body += f"- Reason: `{verdict.reason}`\n"
-    body += _criteria_breakdown(verdict.criteria, verdict.kind)
+    body += _criteria_breakdown(verdict.criteria)
     if details:
         body += f"\n{details}\n"
     return f"{prefix}{body}\n{acceptance_footer(verdict.kind, reason=verdict.reason)}"
@@ -453,14 +452,12 @@ def _criterion_name(predicate: str) -> str:
     return name or predicate
 
 
-def _criteria_breakdown(
-    criteria: list[str], kind: AcceptanceVerdictKind
-) -> str:
+def _criteria_breakdown(criteria: list[str]) -> str:
     body = "\n**Criteria breakdown:**\n"
     if not criteria:
         return body + "- No verifiable criteria - falling back to description match.\n"
     for criterion in criteria:
-        body += f"- **{criterion}**: `{kind}`\n"
+        body += f"- **{criterion}**: included in the overall acceptance review.\n"
     return body
 
 
