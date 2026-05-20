@@ -2387,6 +2387,28 @@ class Orchestrator:
             key for key in self._review_no_signal_rearm_heads if key[0] != run_id
         }
 
+    async def _local_review_approved_for_current_review(
+        self, run: db.runs.Run
+    ) -> bool:
+        latest_implement = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=run.issue_id,
+            stage="implement",
+        )
+        if latest_implement is None:
+            return False
+        latest_local_review = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=run.issue_id,
+            stage="local_review",
+            started_at_gte=latest_implement.started_at,
+        )
+        if latest_local_review is None or latest_local_review.status != "completed":
+            return False
+        return _parse_rfc3339(latest_local_review.started_at) <= _parse_rfc3339(
+            run.started_at
+        )
+
     async def _poll_review_run_with_limits(
         self,
         run: db.runs.Run,
@@ -2560,10 +2582,13 @@ class Orchestrator:
         state: db.review_state.ReviewState,
         head_sha: str,
     ) -> None:
-        if binding.review_strategy == "local":
+        if (
+            binding.review_strategy == "local"
+            and await self._local_review_approved_for_current_review(run)
+        ):
             log.debug(
                 "skipping no-signal @codex review re-arm for %s: "
-                "binding uses local review strategy",
+                "local reviewer approved current review cycle",
                 issue.identifier,
             )
             return

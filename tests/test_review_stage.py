@@ -361,6 +361,27 @@ async def _seed_active_review(
     )
 
 
+async def _seed_local_review_cycle(conn, *, local_review_status: str) -> None:
+    await db.runs.create(
+        conn,
+        id=f"implement-for-{local_review_status}-local-review",
+        issue_id="iss-1",
+        stage="implement",
+        status="completed",
+        pid=1234,
+        started_at="2026-05-09T23:58:00+00:00",
+    )
+    await db.runs.create(
+        conn,
+        id=f"{local_review_status}-local-review",
+        issue_id="iss-1",
+        stage="local_review",
+        status=local_review_status,
+        pid=None,
+        started_at="2026-05-09T23:59:00+00:00",
+    )
+
+
 async def _poll_review_and_wait(orch: Orchestrator) -> list[asyncio.Task[None]]:
     tasks = await orch._poll_review_runs()  # noqa: SLF001
     if tasks:
@@ -2524,12 +2545,66 @@ async def test_review_poll_rearms_missing_codex_signal_once_per_head(
 
 
 @pytest.mark.asyncio
-async def test_review_poll_does_not_rearm_no_signal_for_local_strategy(
+async def test_review_poll_rearms_no_signal_for_local_fallback_strategy(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_active_review(conn)
+        await _seed_local_review_cycle(conn, local_review_status="failed")
+        cfg = Config(
+            repos=[_binding(review_strategy="local")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-20T12:00:00Z")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(commit_sha="stale-sha")]
+        )
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                _codex_inline_comment(
+                    commit_sha="stale-sha",
+                    created_at="2026-05-20T11:30:00Z",
+                )
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+
+        await _poll_review_and_wait(orch)
+
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        assert ("review-run", "head-sha") in orch._review_no_signal_rearm_heads  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_poll_does_not_rearm_no_signal_for_local_approval(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        await _seed_local_review_cycle(conn, local_review_status="completed")
         cfg = Config(
             repos=[_binding(review_strategy="local")],
             log_root=tmp_path / "logs",
