@@ -166,6 +166,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
     criteria_heading_level: int | None = None
     blocked_nested_heading_level: int | None = None
     list_item_indent: int | None = None
+    previous_line_can_lazy_continue = False
     current_criterion_name = ""
     current_criterion_parts: list[str] = []
 
@@ -189,6 +190,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
         line_index += 1
         stripped = raw_line.strip()
         if not stripped:
+            previous_line_can_lazy_continue = False
             continue
 
         heading = _heading(raw_line.rstrip())
@@ -200,6 +202,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
         if heading is not None:
             flush_current_criterion()
             list_item_indent = None
+            previous_line_can_lazy_continue = False
             heading_level, heading_title = heading
             if (
                 in_criteria_section
@@ -226,6 +229,7 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
             continue
 
         if not in_criteria_section or blocked_nested_heading_level is not None:
+            previous_line_can_lazy_continue = False
             continue
         line = raw_line.rstrip()
         checkbox_match = _CHECKBOX_RE.match(line)
@@ -238,14 +242,21 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
                 list_item_indent = item_indent
                 current_criterion_name = item_text
             current_criterion_parts.append(item_text)
+            previous_line_can_lazy_continue = True
             continue
 
         if (
             current_criterion_parts
             and list_item_indent is not None
-            and _leading_indent_width(raw_line) > list_item_indent
+            and (
+                _leading_indent_width(raw_line) > list_item_indent
+                or previous_line_can_lazy_continue
+            )
         ):
             current_criterion_parts.append(stripped)
+            previous_line_can_lazy_continue = True
+        else:
+            previous_line_can_lazy_continue = False
 
     flush_current_criterion()
     return criteria

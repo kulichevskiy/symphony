@@ -354,6 +354,31 @@ def test_acceptance_criteria_extraction_folds_nested_list_items() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_folds_lazy_continuation_lines() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] Criteria extraction is published before checking\n"
+        "before the verdict comment is posted.\n\n"
+        "Operator notes stay out of the criterion.\n"
+        "- [ ] Verdict references criteria by name.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria extraction is published before checking",
+            "predicate": (
+                "Criteria extraction is published before checking before the "
+                "verdict comment is posted."
+            ),
+        },
+        {
+            "name": "Verdict references criteria by name",
+            "predicate": "Verdict references criteria by name.",
+        },
+    ]
+
+
 def test_acceptance_criteria_extraction_preserves_leading_hyphen_text() -> None:
     description = (
         "Ship validation.\n\n"
