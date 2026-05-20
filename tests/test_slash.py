@@ -34,6 +34,8 @@ def test_parses_known_commands() -> None:
             _c("$REJECT"),
             _c("$retry now"),
             _c("$stop"),
+            _c("$retry-acceptance"),
+            _c("$skip-acceptance"),
             _c("$skip-review"),
             _c("$skip-local-review"),
         ]
@@ -43,6 +45,8 @@ def test_parses_known_commands() -> None:
         SlashKind.REJECT,
         SlashKind.RETRY,
         SlashKind.STOP,
+        SlashKind.RETRY_ACCEPTANCE,
+        SlashKind.SKIP_ACCEPTANCE,
         SlashKind.SKIP_REVIEW,
         SlashKind.SKIP_LOCAL_REVIEW,
     ]

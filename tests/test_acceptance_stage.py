@@ -74,6 +74,14 @@ def _acceptance_events(
     ]
 
 
+def _malformed_acceptance_events() -> list[RunnerEvent]:
+    return [
+        RunnerEvent(kind="started", pid=2222),
+        RunnerEvent(kind="stdout", line="not-json"),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
 def _merge_events() -> list[RunnerEvent]:
     return [RunnerEvent(kind="exit", returncode=0)]
 
@@ -717,6 +725,123 @@ async def test_acceptance_diff_fetch_failure_records_infra_error_without_runner(
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("Could not fetch PR diff" in body for body in bodies)
         assert any(ACCEPTANCE_FOOTER_INFRA_ERROR in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_infra_error_retries_with_backoff_then_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def expire_latest_acceptance_backoff() -> None:
+        latest = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="acceptance",
+        )
+        assert latest is not None
+        await db.runs.update_status(
+            conn,
+            latest.id,
+            latest.status,
+            ended_at="2026-05-10T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(
+            [
+                _malformed_acceptance_events(),
+                _malformed_acceptance_events(),
+                _malformed_acceptance_events(),
+            ]
+        )
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergedAt": None,
+            }
+        )
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.last_verdict == "infra_error"
+        assert acceptance.infra_retries == 1
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+        assert len(runner.captured_specs) == 1
+
+        await expire_latest_acceptance_backoff()
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.infra_retries == 2
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        await expire_latest_acceptance_backoff()
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.infra_retries == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+            "acceptance",
+            "acceptance",
+        ]
+        assert all(run.status == "failed" for run in history[2:])
+        gh.pr_merge.assert_not_awaited()
     finally:
         await conn.close()
 

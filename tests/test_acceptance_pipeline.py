@@ -52,6 +52,96 @@ def _claude_result(text: str, *, cost: float = 0.0) -> str:
     )
 
 
+def test_acceptance_classifier_treats_tool_failures_as_infra_error() -> None:
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "is_error": True,
+                                "content": "Playwright timeout opening preview",
+                            }
+                        ]
+                    },
+                }
+            ),
+            _claude_result(
+                "Could not inspect the app.\n\n"
+                f"{ACCEPTANCE_FOOTER_REJECT}",
+                cost=0.09,
+            ),
+        ]
+    )
+
+    verdict = acceptance_classifier(transcript=transcript)
+
+    assert verdict.kind == "infra_error"
+    assert verdict.cost == pytest.approx(0.09)
+    assert "Playwright timeout" in verdict.details
+
+
+def test_acceptance_classifier_preserves_product_reject_after_noninfra_tool_error() -> None:
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "is_error": True,
+                                "content": "pytest failed: expected 200 got 500",
+                            }
+                        ]
+                    },
+                }
+            ),
+            _claude_result(
+                "The implementation still returns 500.\n\n"
+                f"{ACCEPTANCE_FOOTER_REJECT}",
+                cost=0.09,
+            ),
+        ]
+    )
+
+    verdict = acceptance_classifier(transcript=transcript)
+
+    assert verdict.kind == "reject"
+    assert "returns 500" in verdict.details
+
+
+@pytest.mark.parametrize(
+    ("subtype", "message"),
+    [
+        ("error_max_budget", "cost cap exceeded"),
+        ("error_timeout", "time cap exceeded"),
+    ],
+)
+def test_acceptance_classifier_treats_runner_cap_signals_as_infra_error(
+    subtype: str,
+    message: str,
+) -> None:
+    transcript = json.dumps(
+        {
+            "type": "result",
+            "subtype": subtype,
+            "result": message,
+            "total_cost_usd": 0.12,
+        }
+    )
+
+    verdict = acceptance_classifier(transcript=transcript)
+
+    assert verdict.kind == "infra_error"
+    assert verdict.cost == pytest.approx(0.12)
+    assert message in verdict.details
+
+
 def test_acceptance_classifier_parses_pass_footer_and_cost() -> None:
     transcript = _claude_result(
         f"Diff satisfies the Linear issue.\n\n{ACCEPTANCE_FOOTER_PASS}",

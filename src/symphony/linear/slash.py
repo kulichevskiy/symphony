@@ -2,9 +2,9 @@
 
 Per `docs/python-port-research.md` §13.2 and the prior doc's §35 Strategy 1
 (slash-command-only), v1 acts on `$approve|$approved|$reject|$retry|$stop|
-$skip-review`, plus a standalone thumbs-up as `$approve`. Free-form steering
-is *not* dispatched in v1 because we don't have a safe authorship allowlist on
-the GitHub side; defer to v1.1.
+$retry-acceptance|$skip-acceptance|$skip-review`, plus a standalone thumbs-up
+as `$approve`. Free-form steering is *not* dispatched in v1 because we don't
+have a safe authorship allowlist on the GitHub side; defer to v1.1.
 
 Filter rules:
 - `external_thread_type is None` → comment was authored natively in Linear
@@ -24,7 +24,10 @@ if TYPE_CHECKING:
     from .client import LinearComment
 
 _PATTERN = re.compile(
-    r"^\s*\$(approve|approved|reject|retry|stop|skip-local-review|skip-review)\b",
+    r"^\s*\$("
+    r"approve|approved|reject|retry-acceptance|skip-acceptance|retry|stop|"
+    r"skip-local-review|skip-review"
+    r")\b",
     re.IGNORECASE,
 )
 _THUMBS_UP = {"👍", ":+1:", ":+1"}
@@ -37,6 +40,8 @@ class SlashKind(StrEnum):
     REJECT = "reject"
     RETRY = "retry"
     STOP = "stop"
+    RETRY_ACCEPTANCE = "retry-acceptance"
+    SKIP_ACCEPTANCE = "skip-acceptance"
     SKIP_REVIEW = "skip-review"
     SKIP_LOCAL_REVIEW = "skip-local-review"
 

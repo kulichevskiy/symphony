@@ -76,3 +76,20 @@ async def test_acceptance_state_begin_and_verdict_persist(tmp_path: Path) -> Non
         assert state.infra_retries == 0
     finally:
         await conn2.close()
+
+
+async def test_acceptance_state_infra_retries_cap_at_two(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+
+        assert await acceptance_state.bump_infra_retries(conn, "iss-1") == 1
+        assert await acceptance_state.bump_infra_retries(conn, "iss-1") == 2
+        assert await acceptance_state.bump_infra_retries(conn, "iss-1") == 2
+
+        state = await acceptance_state.get(conn, "iss-1")
+        assert state.infra_retries == 2
+    finally:
+        await conn.close()

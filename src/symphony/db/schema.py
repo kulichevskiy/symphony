@@ -91,6 +91,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
             "ALTER TABLE acceptance_state "
             "ADD COLUMN pr_head_sha TEXT NOT NULL DEFAULT ''"
         )
+    if "infra_retries" not in cols:
+        await conn.execute(
+            "ALTER TABLE acceptance_state "
+            "ADD COLUMN infra_retries INTEGER NOT NULL DEFAULT 0"
+        )
 
     cur = await conn.execute("PRAGMA table_info(merge_conflict_fix_marks)")
     cols = {row[1] for row in await cur.fetchall()}

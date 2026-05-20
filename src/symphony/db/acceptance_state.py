@@ -16,6 +16,7 @@ from . import state_transitions
 
 AcceptanceMode = Literal["off", "code_only", "dev", "preview"]
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
+_INFRA_RETRY_LIMIT = 2
 
 
 @dataclass(frozen=True)
@@ -153,7 +154,14 @@ async def begin_acceptance(
             extracted_criteria = excluded.extracted_criteria,
             last_verdict = '',
             last_artifacts_url = '',
-            infra_retries = 0
+            infra_retries = CASE
+                WHEN COALESCE(pr_number, -1) = COALESCE(excluded.pr_number, -1)
+                 AND pr_url = excluded.pr_url
+                 AND pr_head_sha = excluded.pr_head_sha
+                 AND mode = excluded.mode
+                THEN infra_retries
+                ELSE 0
+            END
         """,
         (
             issue_id,
@@ -226,9 +234,12 @@ async def bump_infra_retries(conn: aiosqlite.Connection, issue_id: str) -> int:
         """
         INSERT INTO acceptance_state (issue_id, infra_retries)
         VALUES (?, 1)
-        ON CONFLICT(issue_id) DO UPDATE SET infra_retries = infra_retries + 1
+        ON CONFLICT(issue_id) DO UPDATE SET infra_retries = CASE
+            WHEN infra_retries >= ? THEN ?
+            ELSE infra_retries + 1
+        END
         """,
-        (issue_id,),
+        (issue_id, _INFRA_RETRY_LIMIT, _INFRA_RETRY_LIMIT),
     )
     cur = await conn.execute(
         "SELECT infra_retries FROM acceptance_state WHERE issue_id = ?",
