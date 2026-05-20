@@ -44,6 +44,7 @@ async def run_acceptance(
     mode: str,
     linear_description: str,
     pr_diff_summary: str,
+    taste_guide: str = "",
     criteria: list[str] | None = None,
     stall_secs: int = 300,
     max_budget_usd: float | None = None,
@@ -61,6 +62,7 @@ async def run_acceptance(
         mode=mode,
         linear_description=linear_description,
         pr_diff_summary=pr_diff_summary,
+        taste_guide=taste_guide,
     )
     spec = RunnerSpec(
         run_id=run_id,
@@ -116,12 +118,14 @@ def build_acceptance_prompt(
     mode: str,
     linear_description: str,
     pr_diff_summary: str,
+    taste_guide: str = "",
 ) -> str:
     if mode != _CODE_ONLY_MODE:
         raise ValueError(_unsupported_mode_details(mode))
 
     description = linear_description.strip() or "(no Linear description)"
     diff = _truncate_diff(pr_diff_summary.strip() or "(no PR diff available)")
+    taste_guide_section = _taste_guide_section(taste_guide)
     return (
         "You are Symphony's Acceptance-stage agent. Your only job is to "
         "decide whether the PR diff satisfies the Linear ticket description.\n\n"
@@ -132,9 +136,12 @@ def build_acceptance_prompt(
         "- Reject when the diff obviously implements something different from "
         "the requested behavior.\n"
         "- Pass when the diff and description agree at the code level.\n"
+        "- If the taste guide below contains hard rules and the PR diff violates "
+        "one, reject and cite the specific taste-guide rule.\n"
         "- Do not run Playwright, browser automation, a dev server, or tests.\n"
-        "- Do not inspect screenshots, preview URLs, or a taste guide.\n"
+        "- Do not inspect screenshots or preview URLs.\n"
         "- Do not modify files, commit, push, or merge anything.\n\n"
+        f"{taste_guide_section}"
         "# Linear description\n\n"
         f"{description}\n\n"
         "# PR diff summary\n\n"
@@ -146,6 +153,19 @@ def build_acceptance_prompt(
         "these footers on its own line:\n\n"
         f"{ACCEPTANCE_FOOTER_PASS}\n"
         f"{ACCEPTANCE_FOOTER_REJECT}\n"
+    )
+
+
+def _taste_guide_section(taste_guide: str) -> str:
+    content = taste_guide.strip()
+    if not content:
+        return ""
+    return (
+        "# Taste guide\n\n"
+        "Global guide content appears first. Per-binding guide content appears "
+        "after it and may add stricter rules, but it cannot override or silence "
+        "global hard rules.\n\n"
+        f"{content}\n\n"
     )
 
 

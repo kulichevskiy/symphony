@@ -213,10 +213,30 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
         return None
 
+    loaded_taste_guide_path: dict[str, str | None] = {}
+
+    def fake_load_taste_guide(*, binding_taste_guide: str | None) -> str:
+        loaded_taste_guide_path["path"] = binding_taste_guide
+        return (
+            "## Principles\n\nGlobal taste.\n\n"
+            "## Hard rules (acceptance must reject if violated)\n\n"
+            "- Reject icon names rendered as text.\n\n"
+            "## Hard rules (acceptance must reject if violated)\n\n"
+            "- Per-binding hard rule.\n"
+        )
+
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "load_taste_guide", fake_load_taste_guide)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("code_only")
+        binding = binding.model_copy(
+            update={
+                "acceptance": binding.acceptance.model_copy(
+                    update={"taste_guide": "./docs/sample-ux.md"}
+                )
+            }
+        )
         await _seed_review_candidate(conn, binding)
         runner = _FakeRunner([_acceptance_events(), _merge_events()])
         workspace = MagicMock()
@@ -275,6 +295,10 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
         assert "Need OAuth." in acceptance_prompt
         assert "diff --git a/auth.py b/auth.py" in acceptance_prompt
         assert "mode: code_only" in acceptance_prompt
+        assert loaded_taste_guide_path["path"] == "./docs/sample-ux.md"
+        assert acceptance_prompt.index("Global taste.") < acceptance_prompt.index(
+            "Per-binding hard rule."
+        )
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-acceptance"),
             call("iss-1", "state-done"),
