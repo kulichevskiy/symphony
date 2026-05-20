@@ -717,7 +717,7 @@ async def test_non_code_only_acceptance_mode_passes_through_without_runner(
             return_value=_issue(
                 description=(
                     "Need OAuth.\n\n"
-                    "## Where to verify\n\n"
+                    "## Where to verify ##\n\n"
                     "* Open the login screen and complete OAuth."
                 )
             )

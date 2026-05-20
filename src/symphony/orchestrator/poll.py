@@ -153,6 +153,7 @@ def _acceptance_has_where_to_verify(description: str) -> bool:
 def _normalize_acceptance_section_heading(line: str) -> str:
     line = line.strip()
     line = re.sub(r"^#{1,6}\s*", "", line)
+    line = re.sub(r"\s+#{1,6}\s*$", "", line)
     line = line.strip(" *_`")
     return re.sub(r"\s+", " ", line).casefold()
 
