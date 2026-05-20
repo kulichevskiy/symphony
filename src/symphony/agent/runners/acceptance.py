@@ -384,12 +384,9 @@ def _changed_paths(diff: str) -> list[str]:
     for line in diff.splitlines():
         if not line.startswith("diff --git "):
             continue
-        parts = line.split()
-        if len(parts) < 4:
+        _, separator, path = line[len("diff --git ") :].rpartition(" b/")
+        if not separator:
             continue
-        path = parts[3]
-        if path.startswith("b/"):
-            path = path[2:]
         if path and path != "/dev/null":
             paths.append(path)
     return paths

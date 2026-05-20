@@ -391,6 +391,19 @@ def test_acceptance_quick_skip_requires_only_trivial_ticket_text() -> None:
     assert verdict is None
 
 
+def test_acceptance_quick_skip_preserves_diff_paths_with_spaces() -> None:
+    verdict = quick_skip_trivial_acceptance(
+        linear_description="Internal refactor only.",
+        pr_diff_summary=(
+            "diff --git a/ui/login page.tsx b/ui/login page.tsx\n"
+            "-const label = 'Sign in';\n"
+            "+const label = 'Sign in';\n"
+        ),
+    )
+
+    assert verdict is None
+
+
 def test_acceptance_prompt_includes_first_phase_quick_skip_contract() -> None:
     prompt = build_acceptance_prompt(
         mode="code_only",
