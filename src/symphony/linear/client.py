@@ -273,7 +273,10 @@ class Linear:
             if isinstance(item, dict) and item.get("key") is not None
         }
         response = await self._put_file(upload_url, content=content, headers=headers)
-        response.raise_for_status()
+        if not 200 <= response.status_code < 300:
+            raise LinearError(
+                f"file upload returned HTTP {response.status_code}: {response.text[:200]}"
+            )
         data = await self._query(
             queries.CREATE_ATTACHMENT,
             {

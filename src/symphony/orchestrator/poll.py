@@ -229,8 +229,11 @@ def _acceptance_artifact_path(workspace_path: Path, raw_path: str) -> Path:
     path = Path(raw_path)
     if not path.is_absolute():
         path = workspace_path / path
-    resolved = path.resolve(strict=False)
-    workspace = workspace_path.resolve(strict=False)
+    try:
+        resolved = path.resolve(strict=False)
+        workspace = workspace_path.resolve(strict=False)
+    except RuntimeError as e:
+        raise OSError(f"acceptance artifact path cannot be resolved: {raw_path}") from e
     try:
         resolved.relative_to(workspace)
     except ValueError as e:

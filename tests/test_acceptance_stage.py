@@ -1358,6 +1358,26 @@ async def test_dev_acceptance_invalid_screenshot_path_records_infra_error(
         await conn.close()
 
 
+def test_acceptance_artifact_path_reports_symlink_loop_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace_path = tmp_path / "ws" / "org" / "eng-1"
+    workspace_path.mkdir(parents=True)
+    raw_path = ".symphony/acceptance/run/loop/hero.png"
+    loop_path = workspace_path / raw_path
+    original_resolve = Path.resolve
+
+    def fake_resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if self == loop_path:
+            raise RuntimeError("Symlink loop from test")
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+    with pytest.raises(OSError, match="cannot be resolved"):
+        poll_module._acceptance_artifact_path(workspace_path, raw_path)  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_dev_acceptance_http_upload_failure_records_infra_error(
     tmp_path: Path,

@@ -4,10 +4,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from symphony.linear import queries
-from symphony.linear.client import Linear, LinearIssue
+from symphony.linear.client import Linear, LinearError, LinearIssue
 
 
 def _comment(cid: str, created_at: str = "2026-05-10T12:00:00+00:00") -> dict[str, Any]:
@@ -206,6 +207,9 @@ async def test_upload_issue_attachment_uses_linear_file_upload_and_attachment_cr
         put_calls.append((url, headers, content))
 
         class _Response:
+            status_code = 200
+            text = ""
+
             def raise_for_status(self) -> None:
                 return None
 
@@ -253,6 +257,53 @@ async def test_upload_issue_attachment_uses_linear_file_upload_and_attachment_cr
             b"png-bytes",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_upload_issue_attachment_rejects_redirect_upload_response(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "hero.png"
+    screenshot.write_bytes(b"png-bytes")
+    linear = Linear("test-key")
+
+    async def fake_query(gql: str, _variables: dict[str, Any]) -> dict[str, Any]:
+        if gql == queries.FILE_UPLOAD:
+            return {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {
+                        "uploadUrl": "https://upload.linear.app/signed",
+                        "assetUrl": "https://uploads.linear.app/hero.png",
+                    },
+                }
+            }
+        if gql == queries.CREATE_ATTACHMENT:
+            raise AssertionError("attachmentCreate must not run after failed upload")
+        raise AssertionError(f"unexpected query: {gql}")
+
+    async def fake_put(
+        url: str, *, content: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        assert content == b"png-bytes"
+        assert headers == {}
+        return httpx.Response(
+            302,
+            headers={"Location": "https://upload.linear.app/redirected"},
+            request=httpx.Request("PUT", url),
+        )
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    linear._put_file = fake_put  # type: ignore[method-assign]
+    try:
+        with pytest.raises(LinearError, match="file upload returned HTTP 302"):
+            await linear.upload_issue_attachment(
+                issue_uuid="iss-1",
+                path=screenshot,
+                title="Acceptance screenshot: Primary verified view",
+            )
+    finally:
+        await linear.aclose()
 
 
 def _issue_node() -> dict[str, Any]:
