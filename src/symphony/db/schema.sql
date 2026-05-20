@@ -121,6 +121,23 @@ CREATE TABLE IF NOT EXISTS review_state (
     codex_lgtm_comment_id  TEXT NOT NULL DEFAULT ''
 );
 
+-- Acceptance-stage state per issue. This slice only records the stub pass
+-- verdict; later slices can replace the runner/classifier without changing
+-- schema or poll-loop ownership.
+CREATE TABLE IF NOT EXISTS acceptance_state (
+    issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
+    iteration           INTEGER NOT NULL DEFAULT 0,
+    pr_number           INTEGER,
+    pr_url              TEXT NOT NULL DEFAULT '',
+    pr_head_sha         TEXT NOT NULL DEFAULT '',
+    mode                TEXT NOT NULL DEFAULT 'off',
+    preview_url         TEXT NOT NULL DEFAULT '',
+    extracted_criteria  TEXT NOT NULL DEFAULT '',
+    last_verdict        TEXT NOT NULL DEFAULT '',
+    last_artifacts_url  TEXT NOT NULL DEFAULT '',
+    infra_retries       INTEGER NOT NULL DEFAULT 0
+);
+
 -- Resurrected Review monitor rows whose opportunistic `@codex review`
 -- re-arm was inconclusive and must be retried by the live monitor task.
 CREATE TABLE IF NOT EXISTS review_rearm_retries (

@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from symphony.config import Config, LinearStates, RepoBinding, UIStatusThresholds
+from symphony.config import (
+    AcceptanceConfig,
+    Config,
+    LinearStates,
+    RepoBinding,
+    UIStatusThresholds,
+)
 from symphony.ui.status import CanonicalState
 
 _BINDING_STATES = """
@@ -128,6 +134,56 @@ def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # 
     cfg = Config.load(p)
     assert cfg.repos[0].runner == "local"
     assert cfg.repos[0].codex_model == "gpt-5.1-codex"
+
+
+def test_acceptance_config_defaults() -> None:
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo"),
+    )
+
+    assert binding.acceptance == AcceptanceConfig()
+    assert binding.acceptance.mode == "off"
+    assert binding.acceptance.preview_url_pattern is None
+    assert binding.acceptance.dev_command is None
+    assert binding.acceptance.dev_port is None
+    assert binding.acceptance.taste_guide is None
+    assert binding.acceptance.cost_cap_usd == 10
+    assert binding.acceptance.time_cap_minutes == 15
+    assert binding.linear_states.in_acceptance == "In Acceptance"
+
+
+def test_acceptance_config_can_be_configured(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    acceptance:
+      mode: code_only
+      preview_url_pattern: https://preview.example/{issue}
+      dev_command: npm run dev
+      dev_port: 3000
+      taste_guide: docs/taste.md
+      cost_cap_usd: 3.5
+      time_cap_minutes: 7
+    linear_states:
+      ready: Todo
+      in_acceptance: QA Acceptance
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+
+    assert cfg.repos[0].acceptance.mode == "code_only"
+    assert cfg.repos[0].acceptance.preview_url_pattern == "https://preview.example/{issue}"
+    assert cfg.repos[0].acceptance.dev_command == "npm run dev"
+    assert cfg.repos[0].acceptance.dev_port == 3000
+    assert cfg.repos[0].acceptance.taste_guide == "docs/taste.md"
+    assert cfg.repos[0].acceptance.cost_cap_usd == 3.5
+    assert cfg.repos[0].acceptance.time_cap_minutes == 7
+    assert cfg.repos[0].linear_states.in_acceptance == "QA Acceptance"
 
 
 def test_codex_model_can_be_configured(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

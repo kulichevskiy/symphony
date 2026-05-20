@@ -33,6 +33,22 @@ def _expand(path: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(path)))).resolve()
 
 
+class AcceptanceConfig(BaseModel):
+    """Per-binding Acceptance-stage knobs.
+
+    `off` preserves the current Review → Merge behavior. The other modes all
+    enter the Acceptance stage; this slice only wires the stub pass verdict.
+    """
+
+    mode: Literal["off", "code_only", "dev", "preview"] = "off"
+    preview_url_pattern: str | None = None
+    dev_command: str | None = None
+    dev_port: int | None = Field(default=None, ge=1, le=65535)
+    taste_guide: str | None = None
+    cost_cap_usd: float = Field(default=10.0, ge=0)
+    time_cap_minutes: int = Field(default=15, ge=1)
+
+
 class LinearStates(BaseModel):
     """Workflow state names per role.
 
@@ -50,6 +66,7 @@ class LinearStates(BaseModel):
     ready: str = Field(min_length=1)
     in_progress: str = "In Progress"
     needs_approval: str = "Needs Approval"
+    in_acceptance: str = "In Acceptance"
     blocked: str = "Blocked"
     waiting: str | None = None
     done: str = "Done"
@@ -100,6 +117,7 @@ class RepoBinding(BaseModel):
     # PR threads (already wired into a GitHub-side dashboard); others
     # want every verdict surfaced for human reviewers.
     post_local_review_pr_summary: bool | None = None
+    acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
     # Per-binding cost knobs. `None` falls back to the global default; an
     # explicit `0` disables the cap (useful when one team is exempt).
     cost_cap_usd: float | None = None
