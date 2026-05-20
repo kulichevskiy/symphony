@@ -185,19 +185,24 @@ async def record_verdict(
     *,
     verdict: AcceptanceVerdictKind,
     artifacts_url: str,
+    preview_url: str | None = None,
 ) -> None:
     old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO acceptance_state (
-            issue_id, iteration, last_verdict, last_artifacts_url
+            issue_id, iteration, preview_url, last_verdict, last_artifacts_url
         )
-        VALUES (?, 0, ?, ?)
+        VALUES (?, 0, ?, ?, ?)
         ON CONFLICT(issue_id) DO UPDATE SET
+            preview_url = CASE
+                WHEN excluded.preview_url != '' THEN excluded.preview_url
+                ELSE preview_url
+            END,
             last_verdict = excluded.last_verdict,
             last_artifacts_url = excluded.last_artifacts_url
         """,
-        (issue_id, verdict, artifacts_url),
+        (issue_id, preview_url or "", verdict, artifacts_url),
     )
     new = await _get_existing(conn, issue_id)
     assert new is not None

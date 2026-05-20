@@ -6473,6 +6473,7 @@ class Orchestrator:
                 issue.id,
                 verdict=verdict.kind,
                 artifacts_url=comment_url or verdict.hero_screenshot_url,
+                preview_url=verdict.preview_url,
             )
 
             if cap_breached:
