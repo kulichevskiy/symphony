@@ -56,6 +56,36 @@ class _SlowRunner(_ScriptedRunner):
             yield ev
 
 
+class _CloseTrackingIterator:
+    def __init__(self, events: list[RunnerEvent]) -> None:
+        self.events = events
+        self.index = 0
+        self.closed = False
+
+    def __aiter__(self) -> _CloseTrackingIterator:
+        return self
+
+    async def __anext__(self) -> RunnerEvent:
+        if self.index >= len(self.events):
+            raise StopAsyncIteration
+        event = self.events[self.index]
+        self.index += 1
+        return event
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _CloseTrackingRunner(_ScriptedRunner):
+    def __init__(self, events: list[RunnerEvent]) -> None:
+        super().__init__(events)
+        self.iterator = _CloseTrackingIterator(events)
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.captured_spec = spec
+        return self.iterator
+
+
 def _claude_result(text: str, *, cost: float = 0.0) -> str:
     return json.dumps(
         {
@@ -345,6 +375,40 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     assert "mode: code_only" in prompt
     assert "Do not run Playwright" in prompt
     assert "Do not inspect screenshots" in prompt
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runner_closes_event_stream_after_terminal_event(
+    tmp_path: Path,
+) -> None:
+    runner = _CloseTrackingRunner(
+        [
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result(
+                    "The patch implements the requested icon.\n\n"
+                    f"{ACCEPTANCE_FOOTER_PASS}",
+                    cost=0.12,
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=15,
+        max_budget_usd=3.25,
+    )
+
+    assert verdict.kind == "pass"
+    assert runner.iterator.closed is True
 
 
 @pytest.mark.asyncio

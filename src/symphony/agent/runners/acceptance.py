@@ -330,6 +330,7 @@ async def _collect_acceptance_output(
             spawn_error = event.error
             break
 
+    await _close_iterator(iterator)
     return _AcceptanceRunOutput(
         output=CollectedRunnerOutput(
             stdout="\n".join(stdout_parts),
