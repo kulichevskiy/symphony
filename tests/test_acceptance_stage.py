@@ -346,7 +346,8 @@ async def test_acceptance_publishes_extracted_criteria_before_checking(
                 description=(
                     "Ship OAuth.\n\n"
                     "## Acceptance criteria\n\n"
-                    "- [ ] OAuth login is implemented.\n"
+                    "- [ ] OAuth login is implemented:\n"
+                    "  - GitHub OAuth is supported.\n"
                     "- [ ] Existing sessions still load.\n\n"
                     "## Out of scope\n\n"
                     "- Password reset changes."
@@ -381,7 +382,7 @@ async def test_acceptance_publishes_extracted_criteria_before_checking(
         expected_criteria = [
             {
                 "name": "OAuth login is implemented",
-                "predicate": "OAuth login is implemented.",
+                "predicate": "OAuth login is implemented: GitHub OAuth is supported.",
             },
             {
                 "name": "Existing sessions still load",
@@ -402,10 +403,20 @@ async def test_acceptance_publishes_extracted_criteria_before_checking(
         )
         assert criteria_index < verdict_index
         assert "OAuth login is implemented" in bodies[criteria_index]
+        assert "GitHub OAuth is supported" in bodies[criteria_index]
         assert "Existing sessions still load" in bodies[criteria_index]
         assert gh.pr_diff.await_count == 1
         assert runner.captured_specs[0].stage == "acceptance"
+        acceptance_prompt = runner.captured_specs[0].command[-1]
+        assert (
+            "- OAuth login is implemented: GitHub OAuth is supported."
+            in acceptance_prompt
+        )
         assert "OAuth login is implemented" in bodies[verdict_index]
+        assert (
+            "- **OAuth login is implemented: GitHub OAuth is supported.**"
+            not in bodies[verdict_index]
+        )
         assert "Existing sessions still load" in bodies[verdict_index]
     finally:
         await conn.close()
