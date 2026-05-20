@@ -210,6 +210,28 @@ mutation CreateComment($input: CommentCreateInput!) {
 }
 """
 
+FILE_UPLOAD = """
+mutation FileUpload($contentType: String!, $filename: String!, $size: Int!) {
+  fileUpload(contentType: $contentType, filename: $filename, size: $size) {
+    success
+    uploadFile {
+      uploadUrl
+      assetUrl
+      headers { key value }
+    }
+  }
+}
+"""
+
+CREATE_ATTACHMENT = """
+mutation CreateAttachment($input: AttachmentCreateInput!) {
+  attachmentCreate(input: $input) {
+    success
+    attachment { id }
+  }
+}
+"""
+
 UPDATE_ISSUE_STATE = """
 mutation MoveIssue($id: String!, $stateId: String!) {
   issueUpdate(id: $id, input: { stateId: $stateId }) {

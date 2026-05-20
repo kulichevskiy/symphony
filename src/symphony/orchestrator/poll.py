@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import aiosqlite
+import httpx
 
 from .. import db
 from ..agent.activity import (
@@ -90,6 +91,7 @@ from ..linear.templates import (
     truncate_body,
 )
 from ..pipeline.acceptance_classifier import (
+    AcceptanceScreenshot,
     AcceptanceVerdict,
     ExtractedCriterion,
     extract_acceptance_criteria,
@@ -192,6 +194,51 @@ def _acceptance_criterion_names(criteria: list[ExtractedCriterion]) -> list[str]
 
 def _acceptance_criterion_predicates(criteria: list[ExtractedCriterion]) -> list[str]:
     return [item["predicate"] for item in criteria if item["predicate"].strip()]
+
+
+def _replace_acceptance_criteria_labels(
+    *,
+    verdict: AcceptanceVerdict,
+    criteria_names: list[str],
+    criteria_predicates: list[str],
+) -> AcceptanceVerdict:
+    labels = dict(zip(criteria_predicates, criteria_names, strict=False))
+    criterion_results = tuple(
+        replace(
+            item,
+            criterion=labels.get(item.criterion, item.criterion),
+        )
+        for item in verdict.criterion_results
+    )
+    screenshots = tuple(
+        replace(
+            item,
+            label=labels.get(item.label, item.label),
+        )
+        for item in verdict.screenshots
+    )
+    return replace(
+        verdict,
+        criteria=criteria_names,
+        criterion_results=criterion_results,
+        screenshots=screenshots,
+    )
+
+
+def _acceptance_artifact_path(workspace_path: Path, raw_path: str) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = workspace_path / path
+    try:
+        resolved = path.resolve(strict=False)
+        workspace = workspace_path.resolve(strict=False)
+    except RuntimeError as e:
+        raise OSError(f"acceptance artifact path cannot be resolved: {raw_path}") from e
+    try:
+        resolved.relative_to(workspace)
+    except ValueError as e:
+        raise OSError(f"acceptance artifact path escapes workspace: {raw_path}") from e
+    return resolved
 
 
 def _activity_settings_for(config: Config, binding: RepoBinding) -> ActivitySettings:
@@ -6084,6 +6131,8 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
     ) -> str:
+        if binding.acceptance.mode == "dev" and binding.acceptance.dev_port:
+            return f"http://127.0.0.1:{binding.acceptance.dev_port}"
         pattern = binding.acceptance.preview_url_pattern
         if not pattern:
             return ""
@@ -6130,19 +6179,22 @@ class Orchestrator:
         issue: LinearIssue,
         pr_url: str,
         verdict: AcceptanceVerdict,
-    ) -> None:
+    ) -> str:
         try:
             body = format_acceptance_verdict_comment(
                 verdict=verdict,
                 pr_url=pr_url,
             )
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            comment_id = await self.linear.post_comment(issue.id, truncate_body(body))
+            if comment_id:
+                return f"{issue.url}#comment-{comment_id}"
         except LinearError as e:
             log.warning(
                 "acceptance verdict comment failed on %s: %s",
                 issue.identifier,
                 e,
             )
+        return ""
 
     async def _post_acceptance_criteria_comment(
         self,
@@ -6159,6 +6211,63 @@ class Orchestrator:
                 issue.identifier,
                 e,
             )
+
+    async def _upload_acceptance_screenshots(
+        self,
+        *,
+        issue: LinearIssue,
+        workspace_path: Path,
+        verdict: AcceptanceVerdict,
+    ) -> AcceptanceVerdict:
+        if verdict.kind not in {"pass", "reject"} or not verdict.screenshots:
+            return verdict
+
+        uploaded_by_path: dict[str, str] = {}
+        uploaded_screenshots: list[AcceptanceScreenshot] = []
+        for screenshot in verdict.screenshots:
+            try:
+                path = _acceptance_artifact_path(workspace_path, screenshot.path)
+                url = await self.linear.upload_issue_attachment(
+                    issue_uuid=issue.id,
+                    path=path,
+                    title=f"Acceptance screenshot: {screenshot.label}",
+                )
+            except (LinearError, OSError, httpx.HTTPError) as e:
+                return replace(
+                    verdict,
+                    kind="infra_error",
+                    hero_screenshot_url="",
+                    screenshots=(),
+                    criterion_results=(),
+                    details=f"acceptance screenshot upload failed: {e}",
+                )
+            uploaded_by_path[screenshot.path] = url
+            uploaded_screenshots.append(replace(screenshot, url=url))
+
+        criterion_results = tuple(
+            replace(
+                result,
+                screenshot_url=uploaded_by_path.get(
+                    result.screenshot_path,
+                    result.screenshot_url,
+                ),
+            )
+            for result in verdict.criterion_results
+        )
+        hero_url = next(
+            (
+                item.url
+                for item in uploaded_screenshots
+                if item.kind == "hero" and item.url
+            ),
+            verdict.hero_screenshot_url,
+        )
+        return replace(
+            verdict,
+            hero_screenshot_url=hero_url,
+            screenshots=tuple(uploaded_screenshots),
+            criterion_results=criterion_results,
+        )
 
     async def _run_acceptance_stage(
         self,
@@ -6257,7 +6366,7 @@ class Orchestrator:
             if budget_limits:
                 max_budget_usd = min(budget_limits)
 
-            if effective_mode != _CODE_ONLY_ACCEPTANCE_MODE:
+            if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev"}:
                 verdict = AcceptanceVerdict(
                     kind="pass",
                     criteria=criteria_names,
@@ -6286,10 +6395,14 @@ class Orchestrator:
                         details=str(e),
                     )
                 else:
-                    quick_skip = quick_skip_trivial_acceptance(
-                        linear_description=issue.description,
-                        pr_diff_summary=pr_diff_summary,
-                        criteria=criteria_names,
+                    quick_skip = (
+                        quick_skip_trivial_acceptance(
+                            linear_description=issue.description,
+                            pr_diff_summary=pr_diff_summary,
+                            criteria=criteria_names,
+                        )
+                        if effective_mode == _CODE_ONLY_ACCEPTANCE_MODE
+                        else None
                     )
                     if quick_skip is not None:
                         verdict = quick_skip
@@ -6309,8 +6422,21 @@ class Orchestrator:
                                 criteria=criteria_predicates,
                                 stall_secs=binding.acceptance.time_cap_minutes * 60,
                                 max_budget_usd=max_budget_usd,
+                                preview_url=preview_url,
+                                dev_command=binding.acceptance.dev_command,
+                                dev_port=binding.acceptance.dev_port,
                             )
-                            verdict = replace(verdict, criteria=criteria_names)
+                            verdict = _replace_acceptance_criteria_labels(
+                                verdict=verdict,
+                                criteria_names=criteria_names,
+                                criteria_predicates=criteria_predicates,
+                            )
+                            if effective_mode == "dev":
+                                verdict = await self._upload_acceptance_screenshots(
+                                    issue=issue,
+                                    workspace_path=workspace_path,
+                                    verdict=verdict,
+                                )
                         finally:
                             self._workspace.release(binding, issue)
 
@@ -6337,16 +6463,17 @@ class Orchestrator:
                         cap_usd=cap_usd,
                     )
                 cap_breached = decision.cap_breached
+            comment_url = await self._post_acceptance_verdict_comment(
+                issue=issue,
+                pr_url=pr_url,
+                verdict=verdict,
+            )
             await db.acceptance_state.record_verdict(
                 self._conn,
                 issue.id,
                 verdict=verdict.kind,
-                artifacts_url=verdict.hero_screenshot_url,
-            )
-            await self._post_acceptance_verdict_comment(
-                issue=issue,
-                pr_url=pr_url,
-                verdict=verdict,
+                artifacts_url=comment_url or verdict.hero_screenshot_url,
+                preview_url=verdict.preview_url,
             )
 
             if cap_breached:

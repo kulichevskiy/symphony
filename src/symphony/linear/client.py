@@ -11,10 +11,13 @@ first-call failure.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
+import mimetypes
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -237,6 +240,67 @@ class Linear:
             raise LinearError(f"commentCreate returned success=false: {result}")
         comment_id: str = result["comment"]["id"]
         return comment_id
+
+    async def upload_issue_attachment(
+        self,
+        *,
+        issue_uuid: str,
+        path: Path,
+        title: str,
+    ) -> str:
+        """Upload a file into Linear storage and link it as an issue attachment."""
+        content = await asyncio.to_thread(path.read_bytes)
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        data = await self._query(
+            queries.FILE_UPLOAD,
+            {
+                "contentType": content_type,
+                "filename": path.name,
+                "size": len(content),
+            },
+        )
+        result = data["fileUpload"]
+        if not result.get("success"):
+            raise LinearError(f"fileUpload returned success=false: {result}")
+        upload_file = result.get("uploadFile") or {}
+        upload_url = str(upload_file.get("uploadUrl") or "")
+        asset_url = str(upload_file.get("assetUrl") or "")
+        if not upload_url or not asset_url:
+            raise LinearError("fileUpload did not return uploadUrl and assetUrl")
+        headers = {
+            str(item["key"]): str(item["value"])
+            for item in upload_file.get("headers") or []
+            if isinstance(item, dict) and item.get("key") is not None
+        }
+        response = await self._put_file(upload_url, content=content, headers=headers)
+        if not 200 <= response.status_code < 300:
+            raise LinearError(
+                f"file upload returned HTTP {response.status_code}: {response.text[:200]}"
+            )
+        data = await self._query(
+            queries.CREATE_ATTACHMENT,
+            {
+                "input": {
+                    "issueId": issue_uuid,
+                    "title": title,
+                    "url": asset_url,
+                }
+            },
+        )
+        result = data["attachmentCreate"]
+        if not result.get("success"):
+            raise LinearError(f"attachmentCreate returned success=false: {result}")
+        return asset_url
+
+    async def _put_file(
+        self,
+        url: str,
+        *,
+        content: bytes,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=self._client.timeout) as client:
+            return await client.put(url, content=content, headers=headers)
 
     async def move_issue(self, issue_id_or_identifier: str, state_id: str) -> None:
         data = await self._query(

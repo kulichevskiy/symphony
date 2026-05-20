@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from symphony.linear import queries
-from symphony.linear.client import Linear, LinearIssue
+from symphony.linear.client import Linear, LinearError, LinearIssue
 
 
 def _comment(cid: str, created_at: str = "2026-05-10T12:00:00+00:00") -> dict[str, Any]:
@@ -162,6 +164,146 @@ async def test_move_issue_logs_issue_identifier_and_target_state(
 def test_comments_since_uses_linear_filter_timestamp_type() -> None:
     assert "$after: DateTimeOrDuration!" in queries.ISSUE_COMMENTS_SINCE
     assert "$after: DateTime!" not in queries.ISSUE_COMMENTS_SINCE
+
+
+@pytest.mark.asyncio
+async def test_upload_issue_attachment_uses_linear_file_upload_and_attachment_create(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "hero.png"
+    screenshot.write_bytes(b"png-bytes")
+    linear = Linear("test-key")
+    calls: list[tuple[str, dict[str, Any]]] = []
+    put_calls: list[tuple[str, dict[str, str], bytes]] = []
+
+    async def fake_query(gql: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append((gql, variables))
+        if gql == queries.FILE_UPLOAD:
+            return {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {
+                        "uploadUrl": "https://upload.linear.app/signed",
+                        "assetUrl": "https://uploads.linear.app/hero.png",
+                        "headers": [
+                            {"key": "Content-Type", "value": "image/png"},
+                            {"key": "Cache-Control", "value": "public, max-age=31536000"},
+                        ],
+                    },
+                }
+            }
+        if gql == queries.CREATE_ATTACHMENT:
+            return {
+                "attachmentCreate": {
+                    "success": True,
+                    "attachment": {"id": "att-1"},
+                }
+            }
+        raise AssertionError(f"unexpected query: {gql}")
+
+    async def fake_put(
+        url: str, *, content: bytes, headers: dict[str, str]
+    ) -> Any:
+        put_calls.append((url, headers, content))
+
+        class _Response:
+            status_code = 200
+            text = ""
+
+            def raise_for_status(self) -> None:
+                return None
+
+        return _Response()
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    linear._put_file = fake_put  # type: ignore[method-assign]
+    try:
+        url = await linear.upload_issue_attachment(
+            issue_uuid="iss-1",
+            path=screenshot,
+            title="Acceptance screenshot: Primary verified view",
+        )
+    finally:
+        await linear.aclose()
+
+    assert url == "https://uploads.linear.app/hero.png"
+    assert calls == [
+        (
+            queries.FILE_UPLOAD,
+            {
+                "contentType": "image/png",
+                "filename": "hero.png",
+                "size": len(b"png-bytes"),
+            },
+        ),
+        (
+            queries.CREATE_ATTACHMENT,
+            {
+                "input": {
+                    "issueId": "iss-1",
+                    "title": "Acceptance screenshot: Primary verified view",
+                    "url": "https://uploads.linear.app/hero.png",
+                }
+            },
+        ),
+    ]
+    assert put_calls == [
+        (
+            "https://upload.linear.app/signed",
+            {
+                "Content-Type": "image/png",
+                "Cache-Control": "public, max-age=31536000",
+            },
+            b"png-bytes",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upload_issue_attachment_rejects_redirect_upload_response(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "hero.png"
+    screenshot.write_bytes(b"png-bytes")
+    linear = Linear("test-key")
+
+    async def fake_query(gql: str, _variables: dict[str, Any]) -> dict[str, Any]:
+        if gql == queries.FILE_UPLOAD:
+            return {
+                "fileUpload": {
+                    "success": True,
+                    "uploadFile": {
+                        "uploadUrl": "https://upload.linear.app/signed",
+                        "assetUrl": "https://uploads.linear.app/hero.png",
+                    },
+                }
+            }
+        if gql == queries.CREATE_ATTACHMENT:
+            raise AssertionError("attachmentCreate must not run after failed upload")
+        raise AssertionError(f"unexpected query: {gql}")
+
+    async def fake_put(
+        url: str, *, content: bytes, headers: dict[str, str]
+    ) -> httpx.Response:
+        assert content == b"png-bytes"
+        assert headers == {}
+        return httpx.Response(
+            302,
+            headers={"Location": "https://upload.linear.app/redirected"},
+            request=httpx.Request("PUT", url),
+        )
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    linear._put_file = fake_put  # type: ignore[method-assign]
+    try:
+        with pytest.raises(LinearError, match="file upload returned HTTP 302"):
+            await linear.upload_issue_attachment(
+                issue_uuid="iss-1",
+                path=screenshot,
+                title="Acceptance screenshot: Primary verified view",
+            )
+    finally:
+        await linear.aclose()
 
 
 def _issue_node() -> dict[str, Any]:

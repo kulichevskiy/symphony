@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
+import signal
+import socket
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -23,6 +27,9 @@ from symphony.pipeline.local_review_io import CollectedRunnerOutput
 
 _DIFF_LIMIT_CHARS = 60_000
 _CODE_ONLY_MODE = "code_only"
+_DEV_MODE = "dev"
+_DEV_SERVER_STARTUP_TIMEOUT_SECS = 60.0
+_DEV_SERVER_STOP_TIMEOUT_SECS = 5.0
 _QUICK_SKIP_DETAILS = "No user-visible behavior described in the ticket or PR diff."
 _DOC_EXTENSIONS = {".adoc", ".md", ".mdx", ".rst", ".txt"}
 _DOC_FILENAMES = {
@@ -146,6 +153,24 @@ _CLAUDE_ACCEPTANCE_DISALLOWED_TOOLS = ",".join(
         "Task",
     )
 )
+_CLAUDE_DEV_ACCEPTANCE_DISALLOWED_TOOLS = ",".join(
+    (
+        "Bash",
+        "Read",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "Glob",
+        "Grep",
+        "LS",
+        "NotebookRead",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "TodoWrite",
+        "Task",
+    )
+)
 
 
 async def run_acceptance(
@@ -160,7 +185,27 @@ async def run_acceptance(
     criteria: list[str] | None = None,
     stall_secs: float = 300,
     max_budget_usd: float | None = None,
+    preview_url: str = "",
+    dev_command: str | None = None,
+    dev_port: int | None = None,
+    dev_startup_timeout_secs: float = _DEV_SERVER_STARTUP_TIMEOUT_SECS,
 ) -> AcceptanceVerdict:
+    if mode == _DEV_MODE:
+        return await _run_dev_acceptance(
+            runner=runner,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            linear_description=linear_description,
+            pr_diff_summary=pr_diff_summary,
+            taste_guide=taste_guide,
+            criteria=criteria,
+            stall_secs=stall_secs,
+            max_budget_usd=max_budget_usd,
+            preview_url=preview_url,
+            dev_command=dev_command,
+            dev_port=dev_port,
+            dev_startup_timeout_secs=dev_startup_timeout_secs,
+        )
     if mode != _CODE_ONLY_MODE:
         return AcceptanceVerdict(
             kind="infra_error",
@@ -234,11 +279,151 @@ async def run_acceptance(
     )
 
 
+async def _run_dev_acceptance(
+    *,
+    runner: Runner,
+    run_id: str,
+    workspace_path: Path,
+    linear_description: str,
+    pr_diff_summary: str,
+    taste_guide: str,
+    criteria: list[str] | None,
+    stall_secs: float,
+    max_budget_usd: float | None,
+    preview_url: str,
+    dev_command: str | None,
+    dev_port: int | None,
+    dev_startup_timeout_secs: float,
+) -> AcceptanceVerdict:
+    if not dev_command or dev_port is None:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=0.0,
+            hero_screenshot_url="",
+            details="dev acceptance requires acceptance.dev_command and acceptance.dev_port.",
+            preview_url=preview_url,
+        )
+    resolved_dev_port = await _resolve_dev_port(dev_port)
+    resolved_preview_url = (
+        preview_url
+        if preview_url and resolved_dev_port == dev_port
+        else _localhost_url(resolved_dev_port)
+    )
+
+    dev_server = await _start_dev_server(
+        command=dev_command,
+        workspace_path=workspace_path,
+        port=resolved_dev_port,
+        preview_url=resolved_preview_url,
+        startup_timeout_secs=dev_startup_timeout_secs,
+    )
+    if dev_server.error_details:
+        await _stop_dev_server(dev_server)
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=0.0,
+            hero_screenshot_url="",
+            details=dev_server.error_details,
+            preview_url=resolved_preview_url,
+        )
+
+    try:
+        artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        mcp_config_path = _write_playwright_mcp_config(
+            workspace_path=workspace_path,
+            run_id=run_id,
+            output_dir=artifacts_dir,
+        )
+        prompt = build_acceptance_prompt(
+            mode=_DEV_MODE,
+            linear_description=linear_description,
+            pr_diff_summary=pr_diff_summary,
+            taste_guide=taste_guide,
+            criteria=criteria,
+            preview_url=resolved_preview_url,
+            artifacts_dir=artifacts_dir,
+        )
+        spec = RunnerSpec(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=build_acceptance_command(
+                prompt=prompt,
+                max_budget_usd=max_budget_usd,
+                mode=_DEV_MODE,
+                mcp_config_path=mcp_config_path,
+            ),
+            env={
+                "SYMPHONY_ACCEPTANCE_PREVIEW_URL": resolved_preview_url,
+                "SYMPHONY_ACCEPTANCE_ARTIFACT_DIR": str(artifacts_dir),
+            },
+            stall_secs=stall_secs,
+            stage="acceptance",
+        )
+        acceptance_run = await _collect_acceptance_output(
+            runner,
+            spec,
+            max_budget_usd=max_budget_usd,
+            wall_clock_secs=stall_secs,
+        )
+    finally:
+        await _stop_dev_server(dev_server)
+
+    collected = acceptance_run.output
+    if acceptance_run.abort_details:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=acceptance_run.cost,
+            hero_screenshot_url="",
+            details=acceptance_run.abort_details,
+            preview_url=resolved_preview_url,
+        )
+    if not collected.ok_exit:
+        parsed = acceptance_classifier(
+            transcript=collected.stdout,
+            criteria=criteria,
+        )
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=max(parsed.cost, acceptance_run.cost),
+            hero_screenshot_url="",
+            details=_failed_run_details(
+                collected,
+                parsed_details=(
+                    parsed.details if parsed.kind == "infra_error" else ""
+                ),
+                time_cap_secs=stall_secs,
+            ),
+            preview_url=resolved_preview_url,
+        )
+    verdict = acceptance_classifier(
+        transcript=collected.stdout,
+        criteria=criteria,
+    )
+    return _validate_dev_artifacts(
+        verdict if verdict.preview_url else _with_preview_url(verdict, resolved_preview_url),
+        criteria=criteria,
+    )
+
+
 @dataclass(frozen=True)
 class _AcceptanceRunOutput:
     output: CollectedRunnerOutput
     abort_details: str = ""
     cost: float = 0.0
+
+
+@dataclass
+class _DevServer:
+    process: asyncio.subprocess.Process | None = None
+    stdout_lines: list[str] | None = None
+    stderr_lines: list[str] | None = None
+    pump_tasks: tuple[asyncio.Task[None], ...] = ()
+    error_details: str = ""
 
 
 async def _collect_acceptance_output(
@@ -367,8 +552,289 @@ def _cost_cap_reached(max_budget_usd: float | None, cost_usd: float) -> bool:
     )
 
 
+async def _start_dev_server(
+    *,
+    command: str,
+    workspace_path: Path,
+    port: int,
+    startup_timeout_secs: float,
+    preview_url: str | None = None,
+) -> _DevServer:
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=workspace_path,
+            env=_dev_server_env(port=port, preview_url=preview_url or _localhost_url(port)),
+            start_new_session=True,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+    except (OSError, FileNotFoundError) as e:
+        return _DevServer(error_details=f"dev server spawn_failed: {type(e).__name__}: {e}")
+
+    tasks = (
+        asyncio.create_task(_pump_dev_stream(proc.stdout, stdout_lines)),
+        asyncio.create_task(_pump_dev_stream(proc.stderr, stderr_lines)),
+    )
+    server = _DevServer(
+        process=proc,
+        stdout_lines=stdout_lines,
+        stderr_lines=stderr_lines,
+        pump_tasks=tasks,
+    )
+    deadline = time.monotonic() + startup_timeout_secs
+    while time.monotonic() < deadline:
+        if proc.returncode is not None:
+            server.error_details = _dev_server_exit_details(proc, stdout_lines, stderr_lines)
+            return server
+        if await _port_reachable("127.0.0.1", port):
+            return server
+        await asyncio.sleep(0.1)
+    server.error_details = (
+        "dev server did not become reachable on "
+        f"127.0.0.1:{port} within {startup_timeout_secs:.1f}s."
+    )
+    return server
+
+
+async def _pump_dev_stream(
+    stream: asyncio.StreamReader | None,
+    lines: list[str],
+    *,
+    limit: int = 40,
+) -> None:
+    if stream is None:
+        return
+    while True:
+        raw = await stream.readline()
+        if not raw:
+            break
+        if len(lines) < limit:
+            lines.append(raw.decode(errors="replace").rstrip("\n"))
+
+
+async def _stop_dev_server(server: _DevServer) -> None:
+    proc = server.process
+    if proc is None:
+        return
+    if proc.returncode is None:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_DEV_SERVER_STOP_TIMEOUT_SECS)
+        except TimeoutError:
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with suppress(Exception):
+                await proc.wait()
+    for task in server.pump_tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*server.pump_tasks, return_exceptions=True)
+
+
+async def _port_reachable(host: str, port: int) -> bool:
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+    except OSError:
+        return False
+    writer.close()
+    with suppress(Exception):
+        await writer.wait_closed()
+    del reader
+    return True
+
+
+async def _resolve_dev_port(preferred_port: int) -> int:
+    if not await _port_reachable("127.0.0.1", preferred_port):
+        return preferred_port
+    return _unused_dev_port()
+
+
+def _unused_dev_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _localhost_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def _dev_server_env(*, port: int, preview_url: str) -> dict[str, str]:
+    env = os.environ.copy()
+    port_text = str(port)
+    env.update(
+        {
+            "PORT": port_text,
+            "SYMPHONY_ACCEPTANCE_DEV_PORT": port_text,
+            "SYMPHONY_ACCEPTANCE_PREVIEW_URL": preview_url,
+        }
+    )
+    return env
+
+
+def _dev_server_exit_details(
+    proc: asyncio.subprocess.Process,
+    stdout_lines: list[str],
+    stderr_lines: list[str],
+) -> str:
+    lines = stderr_lines or stdout_lines
+    tail = "\n".join(lines[-5:]).strip()
+    suffix = f"\n{tail}" if tail else ""
+    return f"dev server exited before binding rc={proc.returncode}.{suffix}"
+
+
+def _write_playwright_mcp_config(
+    *,
+    workspace_path: Path,
+    run_id: str,
+    output_dir: Path,
+) -> Path:
+    config_dir = workspace_path / ".symphony" / "acceptance" / run_id
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "playwright-mcp.json"
+    config = {
+        "mcpServers": {
+            "playwright": {
+                "command": "npx",
+                "args": [
+                    "@playwright/mcp@latest",
+                    "--headless",
+                    "--isolated",
+                    "--viewport-size=1280x720",
+                    "--output-dir",
+                    str(output_dir),
+                ],
+            }
+        }
+    }
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return config_path
+
+
+def _with_preview_url(
+    verdict: AcceptanceVerdict,
+    preview_url: str,
+) -> AcceptanceVerdict:
+    return AcceptanceVerdict(
+        kind=verdict.kind,
+        criteria=verdict.criteria,
+        cost=verdict.cost,
+        hero_screenshot_url=verdict.hero_screenshot_url,
+        details=verdict.details,
+        reason=verdict.reason,
+        preview_url=preview_url,
+        screenshots=verdict.screenshots,
+        criterion_results=verdict.criterion_results,
+    )
+
+
+def _validate_dev_artifacts(
+    verdict: AcceptanceVerdict,
+    *,
+    criteria: list[str] | None,
+) -> AcceptanceVerdict:
+    expected_criteria = list(criteria or [])
+    if verdict.kind == "pass":
+        hero = [item for item in verdict.screenshots if item.kind == "hero"]
+        if len(hero) != 1:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=list(criteria or []),
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details="dev acceptance pass must include exactly one hero screenshot.",
+                preview_url=verdict.preview_url,
+            )
+        if expected_criteria and not verdict.criterion_results:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=expected_criteria,
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details="dev acceptance pass must include per-criterion results.",
+                preview_url=verdict.preview_url,
+            )
+        reported = {item.criterion.casefold() for item in verdict.criterion_results}
+        missing = [
+            criterion
+            for criterion in expected_criteria
+            if criterion.casefold() not in reported
+        ]
+        if missing:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=expected_criteria,
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details=(
+                    "dev acceptance pass did not report criteria: "
+                    f"{', '.join(missing)}"
+                ),
+                preview_url=verdict.preview_url,
+            )
+        failed = [item.criterion for item in verdict.criterion_results if not item.passed]
+        if failed:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=list(criteria or []),
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details=(
+                    "dev acceptance pass reported failed criteria: "
+                    f"{', '.join(failed)}"
+                ),
+                preview_url=verdict.preview_url,
+            )
+    if verdict.kind == "reject":
+        if criteria and not verdict.criterion_results:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=list(criteria),
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details="dev acceptance reject must include per-criterion results.",
+                preview_url=verdict.preview_url,
+            )
+        if criteria and not any(not item.passed for item in verdict.criterion_results):
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=list(criteria),
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details="dev acceptance reject must identify at least one failed criterion.",
+                preview_url=verdict.preview_url,
+            )
+        missing = [
+            item.criterion
+            for item in verdict.criterion_results
+            if not item.passed and not item.screenshot_path
+        ]
+        if missing:
+            return AcceptanceVerdict(
+                kind="infra_error",
+                criteria=list(criteria or []),
+                cost=verdict.cost,
+                hero_screenshot_url="",
+                details=(
+                    "dev acceptance reject is missing screenshots for failed "
+                    f"criteria: {', '.join(missing)}"
+                ),
+                preview_url=verdict.preview_url,
+            )
+    return verdict
+
+
 def build_acceptance_command(
-    *, prompt: str, max_budget_usd: float | None = None
+    *,
+    prompt: str,
+    max_budget_usd: float | None = None,
+    mode: str = _CODE_ONLY_MODE,
+    mcp_config_path: Path | None = None,
 ) -> list[str]:
     command = [
         "claude",
@@ -379,8 +845,24 @@ def build_acceptance_command(
         "--permission-mode",
         _CLAUDE_ACCEPTANCE_PERMISSION_MODE,
         "--disallowedTools",
-        _CLAUDE_ACCEPTANCE_DISALLOWED_TOOLS,
+        (
+            _CLAUDE_DEV_ACCEPTANCE_DISALLOWED_TOOLS
+            if mode == _DEV_MODE
+            else _CLAUDE_ACCEPTANCE_DISALLOWED_TOOLS
+        ),
     ]
+    if mode == _DEV_MODE:
+        if mcp_config_path is None:
+            raise ValueError("dev acceptance requires a Playwright MCP config path")
+        command.extend(
+            [
+                "--mcp-config",
+                str(mcp_config_path),
+                "--strict-mcp-config",
+                "--allowedTools",
+                "mcp__playwright__*",
+            ]
+        )
     if max_budget_usd is not None:
         command.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
     command.append(prompt)
@@ -394,7 +876,20 @@ def build_acceptance_prompt(
     pr_diff_summary: str,
     taste_guide: str = "",
     criteria: list[str] | None = None,
+    preview_url: str = "",
+    artifacts_dir: Path | None = None,
 ) -> str:
+    if mode == _DEV_MODE:
+        if not preview_url or artifacts_dir is None:
+            raise ValueError("dev acceptance requires preview_url and artifacts_dir")
+        return _build_dev_acceptance_prompt(
+            linear_description=linear_description,
+            pr_diff_summary=pr_diff_summary,
+            taste_guide=taste_guide,
+            criteria=criteria,
+            preview_url=preview_url,
+            artifacts_dir=artifacts_dir,
+        )
     if mode != _CODE_ONLY_MODE:
         raise ValueError(_unsupported_mode_details(mode))
 
@@ -431,6 +926,65 @@ def build_acceptance_prompt(
         "- Do not run Playwright, browser automation, a dev server, or tests.\n"
         "- Do not inspect screenshots or preview URLs.\n"
         "- Do not modify files, commit, push, or merge anything.\n\n"
+        f"{taste_guide_section}"
+        f"{criteria_section}"
+        "# Linear description\n\n"
+        f"{description}\n\n"
+        "# PR diff summary\n\n"
+        "```diff\n"
+        f"{diff}\n"
+        "```\n\n"
+        "# Response format\n\n"
+        "Write a short rationale. End your final message with EXACTLY ONE of "
+        "these footers on its own line:\n\n"
+        f"{ACCEPTANCE_FOOTER_PASS}\n"
+        f"{ACCEPTANCE_FOOTER_REJECT}\n"
+    )
+
+
+def _build_dev_acceptance_prompt(
+    *,
+    linear_description: str,
+    pr_diff_summary: str,
+    taste_guide: str,
+    criteria: list[str] | None,
+    preview_url: str,
+    artifacts_dir: Path,
+) -> str:
+    description = linear_description.strip() or "(no Linear description)"
+    diff = _truncate_diff(pr_diff_summary.strip() or "(no PR diff available)")
+    taste_guide_section = _taste_guide_section(taste_guide)
+    criteria_section = _criteria_section(criteria)
+    artifact_dir_text = str(artifacts_dir)
+    return (
+        "You are Symphony's Acceptance-stage agent. Your only job is to "
+        "visually decide whether the live UI satisfies the Linear ticket.\n\n"
+        "# Mode\n\n"
+        "mode: dev\n\n"
+        "# Mode-specific instructions for dev\n\n"
+        f"- Open the live app at {preview_url} using the Playwright MCP tools.\n"
+        "- Use a single desktop viewport. Do not perform multi-viewport checks.\n"
+        "- Verify each extracted acceptance criterion visually against the "
+        "live UI.\n"
+        "- Capture exactly one hero screenshot when all criteria pass. It must "
+        "show the primary view you verified.\n"
+        "- If any criterion fails, capture one screenshot for each failed "
+        "criterion, showing the failing state.\n"
+        f"- Save screenshots as PNG files under `{artifact_dir_text}`.\n"
+        "- Do not edit files, commit, push, or merge anything.\n"
+        "- End your final response with exactly one verdict footer and include "
+        "one JSON artifact block immediately before the footer:\n\n"
+        "<!-- symphony-acceptance-artifacts\n"
+        "{\n"
+        f'  "preview_url": "{preview_url}",\n'
+        '  "hero_screenshot": "relative/or/absolute/path.png",\n'
+        '  "criteria": [\n'
+        '    {"criterion": "criterion text", "passed": true},\n'
+        '    {"criterion": "failed criterion text", "passed": false, '
+        '"screenshot": "relative/or/absolute/path.png"}\n'
+        "  ]\n"
+        "}\n"
+        "-->\n\n"
         f"{taste_guide_section}"
         f"{criteria_section}"
         "# Linear description\n\n"
