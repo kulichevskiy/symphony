@@ -951,6 +951,10 @@ class Orchestrator:
         # Resurrected review monitors whose no-signal @codex re-arm hit a
         # transient GitHub read/write failure and should be retried while live.
         self._review_rearm_retry_run_ids: set[str] = set()
+        # Live review monitors that already attempted a no-signal @codex
+        # re-arm for the current PR head. Keyed by (run_id, head_sha) so a new
+        # commit naturally allows one fresh ping.
+        self._review_no_signal_rearm_heads: set[tuple[str, str]] = set()
         self._merged_linear_state_reconcile_ticks = 0
         self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
@@ -2378,6 +2382,11 @@ class Orchestrator:
             return True
         return False
 
+    def _clear_review_no_signal_rearm_heads(self, run_id: str) -> None:
+        self._review_no_signal_rearm_heads = {
+            key for key in self._review_no_signal_rearm_heads if key[0] != run_id
+        }
+
     async def _poll_review_run_with_limits(
         self,
         run: db.runs.Run,
@@ -2501,6 +2510,7 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
+        self._clear_review_no_signal_rearm_heads(run.id)
 
     async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None:
         """Retire review polling once a merge run owns the issue."""
@@ -2522,6 +2532,7 @@ class Orchestrator:
                 ended_at=now,
             )
             closed_run_ids.add(run.id)
+            self._clear_review_no_signal_rearm_heads(run.id)
             task = self._review_poll_run_tasks.pop(run.id, None)
             if task is not None:
                 self._review_poll_tasks.discard(task)
@@ -2539,6 +2550,30 @@ class Orchestrator:
             ", ".join(sorted(closed_run_ids)),
             issue.identifier,
         )
+
+    async def _maybe_rearm_codex_review_for_no_signal(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+        head_sha: str,
+    ) -> None:
+        if not head_sha:
+            return
+        rearm_key = (run.id, head_sha)
+        if rearm_key in self._review_no_signal_rearm_heads:
+            return
+
+        rearm_done = await self._retrigger_codex_review_unless_approved(
+            binding=binding,
+            issue=issue,
+            state=state,
+            require_no_signal=True,
+        )
+        if rearm_done:
+            self._review_no_signal_rearm_heads.add(rearm_key)
 
     async def _poll_review_run(
         self,
@@ -2768,6 +2803,15 @@ class Orchestrator:
             head_committed_at=head_committed_at,
             issue_comments=issue_comments,
         )
+
+        if verdict.kind is VerdictKind.PENDING and verdict.rule == "no_signal":
+            await self._maybe_rearm_codex_review_for_no_signal(
+                run=run,
+                binding=binding,
+                issue=issue,
+                state=state,
+                head_sha=head_sha,
+            )
 
         if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
             return False
@@ -4657,6 +4701,7 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
+        self._clear_review_no_signal_rearm_heads(run.id)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
         state = await db.review_state.get(self._conn, issue.id)
@@ -4703,6 +4748,7 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
+        self._clear_review_no_signal_rearm_heads(run.id)
         repo = state.github_repo or "(unknown repo)"
         cost = await db.runs.cost_for_issue(self._conn, issue.id)
         body = failed(
