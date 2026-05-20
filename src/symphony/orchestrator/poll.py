@@ -116,6 +116,7 @@ from ..pipeline.review_classifier import (
     CheckRun as ReviewCheckRun,
 )
 from ..pipeline.state_machine import on_runner_event
+from ..pipeline.taste_guide import load_taste_guide
 from ..workspace import Workspace
 from .reconciler import Reconciler
 
@@ -5969,6 +5970,9 @@ class Orchestrator:
                             mode=binding.acceptance.mode,
                             linear_description=issue.description,
                             pr_diff_summary=pr_diff_summary,
+                            taste_guide=load_taste_guide(
+                                binding_taste_guide=binding.acceptance.taste_guide,
+                            ),
                             criteria=criteria,
                             stall_secs=binding.acceptance.time_cap_minutes * 60,
                             max_budget_usd=max_budget_usd,

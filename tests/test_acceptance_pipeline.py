@@ -228,6 +228,38 @@ def test_acceptance_prompt_rejects_non_code_only_mode() -> None:
         )
 
 
+def test_acceptance_prompt_includes_taste_guide_when_configured() -> None:
+    prompt = build_acceptance_prompt(
+        mode="code_only",
+        linear_description="Add a polished VIB icon.",
+        pr_diff_summary="diff --git a/ui.tsx b/ui.tsx\n+<span>Icon</span>",
+        taste_guide=(
+            "## Principles\n\nGlobal taste.\n\n"
+            "## Hard rules (acceptance must reject if violated)\n\n"
+            "- Do not render icon names as text.\n\n"
+            "## Hard rules (acceptance must reject if violated)\n\n"
+            "- Binding-specific icon rule.\n"
+        ),
+    )
+
+    assert "# Taste guide" in prompt
+    assert prompt.index("Global taste.") < prompt.index("Binding-specific icon rule.")
+    assert "- Do not render icon names as text." in prompt
+    assert "reject and cite the specific taste-guide rule" in prompt
+    assert "cannot override or silence global hard rules" in prompt
+
+
+def test_acceptance_prompt_works_without_taste_guide_section() -> None:
+    prompt = build_acceptance_prompt(
+        mode="code_only",
+        linear_description="Add a settings icon.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+add_icon()",
+    )
+
+    assert "# Linear description" in prompt
+    assert "# Taste guide" not in prompt
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("terminal", "expected_details"),
