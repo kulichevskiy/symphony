@@ -86,6 +86,10 @@ from ..linear.templates import (
     stuck_loop_escape,
     truncate_body,
 )
+from ..pipeline.acceptance_classifier import (
+    AcceptanceVerdict,
+    format_acceptance_verdict_comment,
+)
 from ..pipeline.cost_guard import (
     UsageCostEstimator,
     effective_cap,
@@ -5805,6 +5809,45 @@ class Orchestrator:
             )
             return ""
 
+    async def _acceptance_pr_diff(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+    ) -> str:
+        try:
+            return await self._gh.pr_diff(pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not fetch acceptance PR diff for %s#%d on %s: %s",
+                binding.github_repo,
+                pr_number,
+                issue.identifier,
+                e,
+            )
+            return f"(PR diff unavailable: {e})"
+
+    async def _post_acceptance_verdict_comment(
+        self,
+        *,
+        issue: LinearIssue,
+        pr_url: str,
+        verdict: AcceptanceVerdict,
+    ) -> None:
+        try:
+            body = format_acceptance_verdict_comment(
+                verdict=verdict,
+                pr_url=pr_url,
+            )
+            await self.linear.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "acceptance verdict comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
     async def _run_acceptance_stage(
         self,
         *,
@@ -5850,15 +5893,95 @@ class Orchestrator:
             )
             await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
 
-            verdict = await run_acceptance(criteria=criteria)
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            cap_usd = effective_cap(
+                global_cap_usd=self.config.cost_cap_per_issue_usd,
+                binding_override=binding.cost_cap_usd,
+            )
+            warning_pct = effective_warning_pct(
+                global_pct=self.config.cost_warning_pct,
+                binding_override=binding.cost_warning_pct,
+            )
+            warning_already_fired = (
+                await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+            )
+
+            max_budget_usd: float | None = None
+            if cap_usd > 0:
+                max_budget_usd = cap_usd - prior_total
+                if max_budget_usd <= 0:
+                    await self._handle_cap_breach(
+                        binding=binding,
+                        issue=issue,
+                        run_id=run_id,
+                        cumulative_total=prior_total,
+                        stage="acceptance",
+                    )
+                    return run_id
+
+            pr_diff_summary = await self._acceptance_pr_diff(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+            )
+            workspace_path = await self._workspace.acquire(binding, issue)
+            try:
+                verdict = await run_acceptance(
+                    runner=self._runner,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                    mode=binding.acceptance.mode,
+                    linear_description=issue.description,
+                    pr_diff_summary=pr_diff_summary,
+                    criteria=criteria,
+                    stall_secs=self.config.stall_timeout_secs,
+                    max_budget_usd=max_budget_usd,
+                )
+            finally:
+                self._workspace.release(binding, issue)
+
+            cap_breached = False
             if verdict.cost > 0:
                 await db.runs.add_cost(self._conn, run_id, verdict.cost)
+                new_total = prior_total + verdict.cost
+                decision = evaluate_cost(
+                    previous_total=prior_total,
+                    new_total=new_total,
+                    cap_usd=cap_usd,
+                    warning_pct=warning_pct,
+                    warning_already_fired=warning_already_fired,
+                )
+                if decision.fire_warning:
+                    await self._post_cost_warning(
+                        binding=binding,
+                        issue=issue,
+                        run_id=run_id,
+                        stage="acceptance",
+                        cumulative_total=new_total,
+                        cap_usd=cap_usd,
+                    )
+                cap_breached = decision.cap_breached
             await db.acceptance_state.record_verdict(
                 self._conn,
                 issue.id,
                 verdict=verdict.kind,
                 artifacts_url=verdict.hero_screenshot_url,
             )
+            await self._post_acceptance_verdict_comment(
+                issue=issue,
+                pr_url=pr_url,
+                verdict=verdict,
+            )
+
+            if cap_breached:
+                await self._handle_cap_breach(
+                    binding=binding,
+                    issue=issue,
+                    run_id=run_id,
+                    cumulative_total=prior_total + verdict.cost,
+                    stage="acceptance",
+                )
+                return run_id
 
             ended_at = datetime.now(UTC).isoformat()
             if verdict.kind == "pass":
@@ -8025,6 +8148,7 @@ class Orchestrator:
         issue: LinearIssue,
         run_id: str,
         cumulative_total: float,
+        stage: str = "implement",
     ) -> None:
         """Park a cost-capped issue and post a cost-cap escalation."""
         try:
@@ -8078,7 +8202,7 @@ class Orchestrator:
                 )
             body = cost_cap_reached(
                 CommentVars(
-                    stage="implement",
+                    stage=stage,
                     repo=binding.github_repo,
                     issue=0,
                     run_id=run_id,
