@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.agent.runners.acceptance import run_acceptance
+from symphony.agent.runners.acceptance import build_acceptance_prompt, run_acceptance
 from symphony.pipeline.acceptance_classifier import (
+    ACCEPTANCE_FOOTER_INFRA_ERROR,
     ACCEPTANCE_FOOTER_PASS,
     ACCEPTANCE_FOOTER_REJECT,
     AcceptanceVerdict,
@@ -123,6 +124,51 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     assert "mode: code_only" in prompt
     assert "Do not run Playwright" in prompt
     assert "Do not inspect screenshots" in prompt
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runner_rejects_non_code_only_mode_without_prompt_runner(
+    tmp_path: Path,
+) -> None:
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=_claude_result(
+                    f"Should not run.\n\n{ACCEPTANCE_FOOTER_INFRA_ERROR}",
+                    cost=0.12,
+                ),
+            ),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="dev",
+        linear_description="Run the dev acceptance flow.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+run_dev_check()",
+        criteria=["dev acceptance works"],
+        stall_secs=15,
+        max_budget_usd=3.25,
+    )
+
+    assert verdict.kind == "infra_error"
+    assert verdict.criteria == ["dev acceptance works"]
+    assert verdict.cost == 0.0
+    assert "Acceptance mode 'dev' is not supported" in verdict.details
+    assert runner.captured_spec is None
+
+
+def test_acceptance_prompt_rejects_non_code_only_mode() -> None:
+    with pytest.raises(ValueError, match="Acceptance mode 'preview' is not supported"):
+        build_acceptance_prompt(
+            mode="preview",
+            linear_description="Open the preview.",
+            pr_diff_summary="diff --git a/app.py b/app.py",
+        )
 
 
 def test_acceptance_classifier_parses_reject_footer() -> None:

@@ -13,11 +13,12 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import AcceptanceConfig, Config, LinearStates, RepoBinding
-from symphony.github.client import CheckRun, PRChecks
+from symphony.github.client import CheckRun, GitHubError, PRChecks
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
 from symphony.pipeline.acceptance_classifier import (
+    ACCEPTANCE_FOOTER_INFRA_ERROR,
     ACCEPTANCE_FOOTER_PASS,
     ACCEPTANCE_FOOTER_REJECT,
 )
@@ -475,6 +476,141 @@ async def test_acceptance_reject_posts_parseable_comment_and_does_not_merge(
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("Acceptance verdict" in body for body in bodies)
         assert any(ACCEPTANCE_FOOTER_REJECT in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_diff_fetch_failure_records_infra_error_without_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(_acceptance_events())
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+        gh.pr_diff = AsyncMock(side_effect=GitHubError("rate limited"))
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.last_verdict == "infra_error"
+        assert acceptance.infra_retries == 1
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+        ]
+        assert history[2].status == "failed"
+        assert runner.captured_specs == []
+        workspace.acquire.assert_not_awaited()
+        gh.pr_merge.assert_not_awaited()
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Could not fetch PR diff" in body for body in bodies)
+        assert any(ACCEPTANCE_FOOTER_INFRA_ERROR in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_non_code_only_acceptance_mode_records_infra_error_without_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("dev")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(_acceptance_events())
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.mode == "dev"
+        assert acceptance.last_verdict == "infra_error"
+        assert acceptance.infra_retries == 1
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+        ]
+        assert history[2].status == "failed"
+        assert runner.captured_specs == []
+        workspace.acquire.assert_not_awaited()
+        gh.pr_diff.assert_not_awaited()
+        gh.pr_merge.assert_not_awaited()
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Acceptance mode 'dev' is not supported" in body for body in bodies)
+        assert any(ACCEPTANCE_FOOTER_INFRA_ERROR in body for body in bodies)
     finally:
         await conn.close()
 

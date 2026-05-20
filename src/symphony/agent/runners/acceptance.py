@@ -14,6 +14,7 @@ from symphony.pipeline.acceptance_classifier import (
 from symphony.pipeline.local_review_io import collect_runner_output
 
 _DIFF_LIMIT_CHARS = 60_000
+_CODE_ONLY_MODE = "code_only"
 
 
 async def run_acceptance(
@@ -28,6 +29,15 @@ async def run_acceptance(
     stall_secs: int = 300,
     max_budget_usd: float | None = None,
 ) -> AcceptanceVerdict:
+    if mode != _CODE_ONLY_MODE:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=0.0,
+            hero_screenshot_url="",
+            details=_unsupported_mode_details(mode),
+        )
+
     prompt = build_acceptance_prompt(
         mode=mode,
         linear_description=linear_description,
@@ -72,6 +82,9 @@ def build_acceptance_prompt(
     linear_description: str,
     pr_diff_summary: str,
 ) -> str:
+    if mode != _CODE_ONLY_MODE:
+        raise ValueError(_unsupported_mode_details(mode))
+
     description = linear_description.strip() or "(no Linear description)"
     diff = _truncate_diff(pr_diff_summary.strip() or "(no PR diff available)")
     return (
@@ -105,6 +118,13 @@ def _truncate_diff(diff: str) -> str:
     if len(diff) <= _DIFF_LIMIT_CHARS:
         return diff
     return diff[:_DIFF_LIMIT_CHARS] + "\n...[truncated]"
+
+
+def _unsupported_mode_details(mode: str) -> str:
+    return (
+        f"Acceptance mode {mode!r} is not supported by the Claude code-only "
+        "runner; only 'code_only' can run without dev or preview artifacts."
+    )
 
 
 __all__ = [

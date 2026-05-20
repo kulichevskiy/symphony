@@ -131,6 +131,10 @@ MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
 
 
+class _AcceptancePrDiffUnavailable(RuntimeError):
+    pass
+
+
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
 
 
@@ -5826,7 +5830,9 @@ class Orchestrator:
                 issue.identifier,
                 e,
             )
-            return f"(PR diff unavailable: {e})"
+            raise _AcceptancePrDiffUnavailable(
+                f"Could not fetch PR diff for {binding.github_repo}#{pr_number}: {e}"
+            ) from e
 
     async def _post_acceptance_verdict_comment(
         self,
@@ -5919,26 +5925,48 @@ class Orchestrator:
                     )
                     return run_id
 
-            pr_diff_summary = await self._acceptance_pr_diff(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-            )
-            workspace_path = await self._workspace.acquire(binding, issue)
-            try:
-                verdict = await run_acceptance(
-                    runner=self._runner,
-                    run_id=run_id,
-                    workspace_path=workspace_path,
-                    mode=binding.acceptance.mode,
-                    linear_description=issue.description,
-                    pr_diff_summary=pr_diff_summary,
+            if binding.acceptance.mode != "code_only":
+                verdict = AcceptanceVerdict(
+                    kind="infra_error",
                     criteria=criteria,
-                    stall_secs=self.config.stall_timeout_secs,
-                    max_budget_usd=max_budget_usd,
+                    cost=0.0,
+                    hero_screenshot_url="",
+                    details=(
+                        f"Acceptance mode {binding.acceptance.mode!r} is not supported "
+                        "by the Claude code-only runner."
+                    ),
                 )
-            finally:
-                self._workspace.release(binding, issue)
+            else:
+                try:
+                    pr_diff_summary = await self._acceptance_pr_diff(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                    )
+                except _AcceptancePrDiffUnavailable as e:
+                    verdict = AcceptanceVerdict(
+                        kind="infra_error",
+                        criteria=criteria,
+                        cost=0.0,
+                        hero_screenshot_url="",
+                        details=str(e),
+                    )
+                else:
+                    workspace_path = await self._workspace.acquire(binding, issue)
+                    try:
+                        verdict = await run_acceptance(
+                            runner=self._runner,
+                            run_id=run_id,
+                            workspace_path=workspace_path,
+                            mode=binding.acceptance.mode,
+                            linear_description=issue.description,
+                            pr_diff_summary=pr_diff_summary,
+                            criteria=criteria,
+                            stall_secs=self.config.stall_timeout_secs,
+                            max_budget_usd=max_budget_usd,
+                        )
+                    finally:
+                        self._workspace.release(binding, issue)
 
             cap_breached = False
             if verdict.cost > 0:
