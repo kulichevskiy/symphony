@@ -144,9 +144,8 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     assert runner.captured_spec.stage == "acceptance"
     assert runner.captured_spec.run_id == "acceptance-1"
     assert runner.captured_spec.workspace_path == tmp_path
-    assert runner.captured_spec.command[:6] == [
+    assert runner.captured_spec.command[:5] == [
         "claude",
-        "--bare",
         "--print",
         "--output-format",
         "stream-json",

@@ -207,7 +207,7 @@ def _github() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_acceptance_mode_runs_stub_between_review_and_merge(
+async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:

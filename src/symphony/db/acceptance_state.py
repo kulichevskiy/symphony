@@ -1,8 +1,8 @@
 """DAO for the `acceptance_state` table.
 
-Acceptance rows are created lazily, like `review_state`. The initial runner is
-an always-pass stub, but the durable row is already shaped for later verdict
-logic, criteria extraction, artifacts, and retry accounting.
+Acceptance rows are created lazily, like `review_state`. The durable row stores
+the current code-only verdict and is already shaped for later criteria
+extraction, artifacts, and retry accounting.
 """
 
 from __future__ import annotations
