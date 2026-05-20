@@ -303,7 +303,7 @@ def test_acceptance_criteria_extraction_keeps_nested_heading_items() -> None:
     description = (
         "Ship OAuth.\n\n"
         "## Acceptance criteria\n\n"
-        "### Happy path\n\n"
+        "### Backend criteria\n\n"
         "- [ ] OAuth login is implemented.\n\n"
         "### Regression coverage\n\n"
         "- Existing sessions still load.\n\n"

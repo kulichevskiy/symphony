@@ -158,15 +158,15 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
         heading = _heading(line)
         if heading is not None:
             heading_level, heading_title = heading
-            if _is_criteria_heading(heading_title):
-                in_criteria_section = True
-                criteria_heading_level = heading_level
-            elif (
+            if (
                 in_criteria_section
                 and criteria_heading_level is not None
                 and heading_level > criteria_heading_level
             ):
                 continue
+            if _is_criteria_heading(heading_title):
+                in_criteria_section = True
+                criteria_heading_level = heading_level
             else:
                 in_criteria_section = False
                 criteria_heading_level = None
