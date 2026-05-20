@@ -328,6 +328,53 @@ def test_acceptance_criteria_extraction_keeps_nested_heading_items() -> None:
     ]
 
 
+def test_acceptance_criteria_extraction_folds_nested_list_items() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "## Acceptance criteria\n\n"
+        "- [ ] Criteria extraction is published before checking:\n"
+        "  - [ ] Comment is posted before the verdict.\n"
+        "  - Extracted JSON is stored in acceptance_state.\n"
+        "- [ ] Verdict references criteria by name.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria extraction is published before checking",
+            "predicate": (
+                "Criteria extraction is published before checking: Comment is "
+                "posted before the verdict. Extracted JSON is stored in "
+                "acceptance_state."
+            ),
+        },
+        {
+            "name": "Verdict references criteria by name",
+            "predicate": "Verdict references criteria by name.",
+        },
+    ]
+
+
+def test_acceptance_criteria_extraction_accepts_heading_suffix_text() -> None:
+    description = (
+        "Ship acceptance checks.\n\n"
+        "## Acceptance criteria (must pass)\n\n"
+        "- [ ] Criteria are published first.\n\n"
+        "## Checklist for release\n\n"
+        "- [ ] Verdict references criteria by name.\n"
+    )
+
+    assert extract_acceptance_criteria(description) == [
+        {
+            "name": "Criteria are published first",
+            "predicate": "Criteria are published first.",
+        },
+        {
+            "name": "Verdict references criteria by name",
+            "predicate": "Verdict references criteria by name.",
+        },
+    ]
+
+
 def test_acceptance_criteria_extraction_skips_nested_noncriteria_sections() -> None:
     description = (
         "Ship OAuth.\n\n"

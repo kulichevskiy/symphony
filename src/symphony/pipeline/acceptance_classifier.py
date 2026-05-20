@@ -37,7 +37,7 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.+?)\s*#*\s*$")
 _CRITERIA_HEADING_RE = re.compile(
     r"^(?:acceptance\s+criteria|acceptance\s+checklist|criteria|checklist)"
-    r"(?:\s*(?::|-)\s*.*)?$",
+    r"(?:$|\W.*)",
     re.I,
 )
 _NON_CRITERIA_HEADING_RE = re.compile(
@@ -162,14 +162,32 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
     in_criteria_section = False
     criteria_heading_level: int | None = None
     blocked_nested_heading_level: int | None = None
+    list_item_indent: int | None = None
+    current_criterion_name = ""
+    current_criterion_parts: list[str] = []
+
+    def flush_current_criterion() -> None:
+        nonlocal current_criterion_name
+        if not current_criterion_parts:
+            return
+        _append_criterion(
+            criteria,
+            seen,
+            " ".join(current_criterion_parts),
+            name_text=current_criterion_name,
+        )
+        current_criterion_name = ""
+        current_criterion_parts.clear()
 
     for raw_line in linear_description.splitlines():
-        line = raw_line.strip()
-        if not line:
+        stripped = raw_line.strip()
+        if not stripped:
             continue
 
-        heading = _heading(line)
+        heading = _heading(stripped)
         if heading is not None:
+            flush_current_criterion()
+            list_item_indent = None
             heading_level, heading_title = heading
             if (
                 in_criteria_section
@@ -188,21 +206,36 @@ def extract_acceptance_criteria(linear_description: str) -> list[ExtractedCriter
             if _is_criteria_heading(heading_title):
                 in_criteria_section = True
                 criteria_heading_level = heading_level
+                list_item_indent = None
             else:
                 in_criteria_section = False
                 criteria_heading_level = None
+                list_item_indent = None
             continue
 
         if not in_criteria_section or blocked_nested_heading_level is not None:
             continue
+        line = raw_line.rstrip()
         checkbox_match = _CHECKBOX_RE.match(line)
-        if checkbox_match:
-            _append_criterion(criteria, seen, checkbox_match.group("text"))
-            continue
-        item_match = _LIST_ITEM_RE.match(line)
+        item_match = checkbox_match or _LIST_ITEM_RE.match(line)
         if item_match:
-            _append_criterion(criteria, seen, item_match.group("text"))
+            item_indent = _leading_indent_width(line)
+            item_text = item_match.group("text")
+            if list_item_indent is None or item_indent <= list_item_indent:
+                flush_current_criterion()
+                list_item_indent = item_indent
+                current_criterion_name = item_text
+            current_criterion_parts.append(item_text)
+            continue
 
+        if (
+            current_criterion_parts
+            and list_item_indent is not None
+            and _leading_indent_width(raw_line) > list_item_indent
+        ):
+            current_criterion_parts.append(stripped)
+
+    flush_current_criterion()
     return criteria
 
 
@@ -460,8 +493,24 @@ def _is_non_criteria_heading(heading: str) -> bool:
     return bool(_NON_CRITERIA_HEADING_RE.search(heading))
 
 
+def _leading_indent_width(text: str) -> int:
+    width = 0
+    for char in text:
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += 4
+        else:
+            break
+    return width
+
+
 def _append_criterion(
-    criteria: list[ExtractedCriterion], seen: set[str], raw_text: str
+    criteria: list[ExtractedCriterion],
+    seen: set[str],
+    raw_text: str,
+    *,
+    name_text: str | None = None,
 ) -> None:
     predicate = _clean_markdown(raw_text)
     if not predicate:
@@ -470,9 +519,10 @@ def _append_criterion(
     if key in seen:
         return
     seen.add(key)
+    name_source = _clean_markdown(name_text) if name_text else predicate
     criteria.append(
         {
-            "name": _criterion_name(predicate),
+            "name": _criterion_name(name_source) or _criterion_name(predicate),
             "predicate": predicate,
         }
     )
