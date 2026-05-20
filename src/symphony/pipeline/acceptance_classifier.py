@@ -52,7 +52,15 @@ def acceptance_classifier(
     cost: float | None = None,
 ) -> AcceptanceVerdict:
     message, parsed_cost = _last_claude_result(transcript)
-    verdict_text = message or transcript
+    if not message:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=parsed_cost if cost is None else cost,
+            hero_screenshot_url="",
+            details="Acceptance agent did not emit a final message.",
+        )
+    verdict_text = message
     match = list(_FOOTER_RE.finditer(verdict_text))
     if not match:
         return AcceptanceVerdict(

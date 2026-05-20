@@ -72,6 +72,38 @@ def test_acceptance_classifier_parses_pass_footer_and_cost() -> None:
     )
 
 
+def test_acceptance_classifier_ignores_raw_prompt_footer_examples() -> None:
+    transcript = "\n".join(
+        [
+            json.dumps({"type": "system", "subtype": "init"}),
+            "Write a short rationale. End your final message with EXACTLY ONE "
+            "of these footers:",
+            ACCEPTANCE_FOOTER_PASS,
+            ACCEPTANCE_FOOTER_REJECT,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "total_cost_usd": 0.17,
+                }
+            ),
+        ]
+    )
+
+    verdict = acceptance_classifier(
+        transcript=transcript,
+        criteria=["description matches diff"],
+    )
+
+    assert verdict == AcceptanceVerdict(
+        kind="infra_error",
+        criteria=["description matches diff"],
+        cost=0.17,
+        hero_screenshot_url="",
+        details="Acceptance agent did not emit a final message.",
+    )
+
+
 @pytest.mark.asyncio
 async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     tmp_path: Path,
