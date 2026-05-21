@@ -107,6 +107,11 @@ from ..pipeline.cost_guard import (
 from ..pipeline.local_review import LocalVerdict
 from ..pipeline.local_review_loop import LoopOutcome, LoopResult
 from ..pipeline.local_review_session import run_local_review_session
+from ..pipeline.preview_resolver import (
+    PreviewResolutionError,
+    render_preview_url,
+    resolve_preview_url,
+)
 from ..pipeline.review_classifier import (
     BLOCKING_CHECK_CONCLUSIONS,
     Reaction,
@@ -6137,13 +6142,14 @@ class Orchestrator:
         if not pattern:
             return ""
         try:
-            return pattern.format(
-                issue=issue.identifier,
+            return render_preview_url(
+                acceptance=binding.acceptance,
+                issue_identifier=issue.identifier,
                 issue_id=issue.id,
                 pr_number=pr_number,
                 pr_url=pr_url,
             )
-        except Exception as e:  # noqa: BLE001
+        except PreviewResolutionError as e:
             log.warning(
                 "could not render acceptance preview URL for %s from %r: %s",
                 issue.identifier,
@@ -6305,16 +6311,31 @@ class Orchestrator:
             )
             if degrade_note:
                 log.info("%s for %s", degrade_note, issue.identifier)
-            preview_url = (
-                ""
-                if degrade_note
-                else self._acceptance_preview_url(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                )
-            )
+            preview_url = ""
+            preview_resolution_error = ""
+            if not degrade_note:
+                if (
+                    effective_mode == "preview"
+                    and binding.acceptance.preview_url_pattern
+                ):
+                    try:
+                        preview_url = render_preview_url(
+                            acceptance=binding.acceptance,
+                            issue_identifier=issue.identifier,
+                            issue_id=issue.id,
+                            pr_number=pr_number,
+                            pr_url=pr_url,
+                        )
+                    except PreviewResolutionError as e:
+                        preview_resolution_error = str(e)
+                        preview_url = e.url
+                else:
+                    preview_url = self._acceptance_preview_url(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
             extracted_criteria = extract_acceptance_criteria(issue.description)
             criteria_names = _acceptance_criterion_names(extracted_criteria)
             criteria_predicates = _acceptance_criterion_predicates(extracted_criteria)
@@ -6366,7 +6387,8 @@ class Orchestrator:
             if budget_limits:
                 max_budget_usd = min(budget_limits)
 
-            if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev"}:
+            verdict: AcceptanceVerdict | None = None
+            if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev", "preview"}:
                 verdict = AcceptanceVerdict(
                     kind="pass",
                     criteria=criteria_names,
@@ -6374,12 +6396,40 @@ class Orchestrator:
                     hero_screenshot_url="",
                     details=(
                         f"Acceptance mode {binding.acceptance.mode!r} is configured, "
-                        "but only 'code_only' has a real runner in this slice. "
+                        "but this mode does not have a real runner in this slice. "
                         "Preserving pass-through acceptance behavior until that "
                         "mode's runner is implemented."
                     ),
                 )
-            else:
+            elif preview_resolution_error:
+                verdict = AcceptanceVerdict(
+                    kind="infra_error",
+                    criteria=criteria_names,
+                    cost=0.0,
+                    hero_screenshot_url="",
+                    details=preview_resolution_error,
+                    preview_url=preview_url,
+                )
+            elif effective_mode == "preview":
+                try:
+                    preview_url = await resolve_preview_url(
+                        acceptance=binding.acceptance,
+                        pr_number=pr_number,
+                        issue_identifier=issue.identifier,
+                        issue_id=issue.id,
+                        pr_url=pr_url,
+                    )
+                except PreviewResolutionError as e:
+                    verdict = AcceptanceVerdict(
+                        kind="infra_error",
+                        criteria=criteria_names,
+                        cost=0.0,
+                        hero_screenshot_url="",
+                        details=str(e),
+                        preview_url=e.url,
+                    )
+
+            if verdict is None:
                 try:
                     pr_diff_summary = await self._acceptance_pr_diff(
                         binding=binding,
@@ -6431,7 +6481,7 @@ class Orchestrator:
                                 criteria_names=criteria_names,
                                 criteria_predicates=criteria_predicates,
                             )
-                            if effective_mode == "dev":
+                            if effective_mode in {"dev", "preview"}:
                                 verdict = await self._upload_acceptance_screenshots(
                                     issue=issue,
                                     workspace_path=workspace_path,

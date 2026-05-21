@@ -43,6 +43,7 @@ class AcceptanceConfig(BaseModel):
 
     mode: Literal["off", "code_only", "dev", "preview"] = "off"
     preview_url_pattern: str | None = None
+    preview_wait_timeout_secs: float = Field(default=300.0, ge=0)
     dev_command: str | None = None
     dev_port: int | None = Field(default=None, ge=1, le=65535)
     taste_guide: str | None = None
