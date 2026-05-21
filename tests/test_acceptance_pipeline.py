@@ -1145,6 +1145,67 @@ async def test_dev_acceptance_startup_timeout_returns_infra_error_without_claude
 
 
 @pytest.mark.asyncio
+async def test_preview_acceptance_uses_playwright_without_dev_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preview_url = "https://vib-42.vercel.app"
+    screenshot = ".symphony/acceptance/acceptance-1/hero.png"
+
+    async def fail_start_dev_server(**_kwargs: object) -> object:
+        raise AssertionError("preview acceptance must not start a dev server")
+
+    monkeypatch.setattr(acceptance_module, "_start_dev_server", fail_start_dev_server)
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=_dev_artifact_result(
+                    preview_url=preview_url,
+                    hero_path=screenshot,
+                    criteria=[
+                        {
+                            "criterion": "toolbar has settings icon",
+                            "passed": True,
+                        }
+                    ],
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="preview",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=5,
+        max_budget_usd=3.25,
+        preview_url=preview_url,
+        dev_command="npm run dev",
+        dev_port=3000,
+        dev_startup_timeout_secs=5,
+    )
+
+    assert verdict.kind == "pass"
+    assert verdict.preview_url == preview_url
+    assert verdict.screenshots == (
+        AcceptanceScreenshot(kind="hero", label="Primary verified view", path=screenshot),
+    )
+    assert runner.captured_spec is not None
+    assert runner.captured_spec.env["SYMPHONY_ACCEPTANCE_PREVIEW_URL"] == preview_url
+    command = runner.captured_spec.command
+    assert "--mcp-config" in command
+    assert "--strict-mcp-config" in command
+    assert "mode: preview" in command[-1]
+    assert preview_url in command[-1]
+
+
+@pytest.mark.asyncio
 async def test_acceptance_runner_closes_event_stream_after_terminal_event(
     tmp_path: Path,
 ) -> None:
@@ -1402,8 +1463,8 @@ async def test_dev_acceptance_requires_dev_command_and_port_without_prompt_runne
     assert runner.captured_spec is None
 
 
-def test_acceptance_prompt_rejects_non_code_only_mode() -> None:
-    with pytest.raises(ValueError, match="Acceptance mode 'preview' is not supported"):
+def test_preview_acceptance_prompt_requires_visual_inputs() -> None:
+    with pytest.raises(ValueError, match="requires preview_url and artifacts_dir"):
         build_acceptance_prompt(
             mode="preview",
             linear_description="Open the preview.",

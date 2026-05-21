@@ -1110,20 +1110,62 @@ async def test_acceptance_infra_error_retries_with_backoff_then_blocks(
 
 
 @pytest.mark.asyncio
-async def test_preview_acceptance_mode_passes_through_without_runner(
+async def test_preview_acceptance_resolves_url_runs_visual_flow_and_skips_dev_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
         return None
 
+    async def fake_resolve_preview_url(**kwargs: object) -> str:
+        assert kwargs["acceptance"].preview_url_pattern == (
+            "https://vib-{pr_number}.vercel.app"
+        )
+        assert kwargs["pr_number"] == 42
+        return preview_url
+
+    async def fake_run_acceptance(**kwargs: object) -> AcceptanceVerdict:
+        assert kwargs["mode"] == "preview"
+        assert kwargs["preview_url"] == preview_url
+        return AcceptanceVerdict(
+            kind="pass",
+            criteria=[
+                "OAuth login is implemented: GitHub OAuth is supported.",
+            ],
+            cost=0.13,
+            hero_screenshot_url="",
+            details="Preview acceptance passed.",
+            preview_url=preview_url,
+            screenshots=(
+                AcceptanceScreenshot(
+                    kind="hero",
+                    label="Primary verified view",
+                    path=".symphony/acceptance/run/hero.png",
+                ),
+            ),
+            criterion_results=(
+                AcceptanceCriterionResult(
+                    criterion="OAuth login is implemented: GitHub OAuth is supported.",
+                    passed=True,
+                ),
+            ),
+        )
+
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "resolve_preview_url", fake_resolve_preview_url)
+    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    preview_url = "https://vib-42.vercel.app"
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("preview")
+        binding.acceptance.preview_url_pattern = "https://vib-{pr_number}.vercel.app"
+        binding.acceptance.dev_command = "npm run dev"
+        binding.acceptance.dev_port = _free_port()
         await _seed_review_candidate(conn, binding)
         runner = _FakeRunner(_merge_events())
+        workspace_path = tmp_path / "ws" / "org" / "eng-1"
+        workspace_path.mkdir(parents=True)
         workspace = MagicMock()
-        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.acquire = AsyncMock(return_value=workspace_path)
         workspace.release = MagicMock()
         workspace.cleanup = AsyncMock()
         linear = AsyncMock()
@@ -1131,13 +1173,21 @@ async def test_preview_acceptance_mode_passes_through_without_runner(
             return_value=_issue(
                 description=(
                     "Need OAuth.\n\n"
-                    "## Where to verify ##\n\n"
-                    "* Open the login screen and complete OAuth."
+                    "## Where to verify\n\n"
+                    "- Open the login screen.\n\n"
+                    "## Acceptance criteria\n\n"
+                    "- [ ] OAuth login is implemented:\n"
+                    "  - GitHub OAuth is supported.\n"
                 )
             )
         )
         linear.move_issue = AsyncMock()
-        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.post_comment = AsyncMock(
+            side_effect=["criteria-cmt", "verdict-cmt", "merge-cmt"]
+        )
+        linear.upload_issue_attachment = AsyncMock(
+            return_value="https://uploads.linear.app/hero.png"
+        )
         gh = _github()
 
         orch = Orchestrator(
@@ -1163,6 +1213,7 @@ async def test_preview_acceptance_mode_passes_through_without_runner(
 
         acceptance = await db.acceptance_state.get(conn, "iss-1")
         assert acceptance.mode == "preview"
+        assert acceptance.preview_url == preview_url
         assert acceptance.last_verdict == "pass"
         assert acceptance.infra_retries == 0
 
@@ -1176,13 +1227,17 @@ async def test_preview_acceptance_mode_passes_through_without_runner(
         assert history[2].status == "completed"
         assert history[3].status == "done"
         assert [spec.stage for spec in runner.captured_specs] == ["merge"]
-        gh.pr_diff.assert_not_awaited()
+        gh.pr_diff.assert_awaited_once()
+        linear.upload_issue_attachment.assert_awaited_once()
         gh.pr_merge.assert_awaited_once()
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("pass-through acceptance behavior" in body for body in bodies)
-        assert not any("degraded to code-only" in body for body in bodies)
-        assert any(ACCEPTANCE_FOOTER_PASS in body for body in bodies)
+        assert any(preview_url in body for body in bodies)
+        assert any(
+            "![Primary verified view](https://uploads.linear.app/hero.png)" in body
+            for body in bodies
+        )
+        assert not any("pass-through acceptance behavior" in body for body in bodies)
     finally:
         await conn.close()
 

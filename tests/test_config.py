@@ -146,6 +146,7 @@ def test_acceptance_config_defaults() -> None:
     assert binding.acceptance == AcceptanceConfig()
     assert binding.acceptance.mode == "off"
     assert binding.acceptance.preview_url_pattern is None
+    assert binding.acceptance.preview_wait_timeout_secs == 300
     assert binding.acceptance.dev_command is None
     assert binding.acceptance.dev_port is None
     assert binding.acceptance.taste_guide is None
@@ -163,6 +164,7 @@ repos:
     acceptance:
       mode: code_only
       preview_url_pattern: https://preview.example/{issue}
+      preview_wait_timeout_secs: 12.5
       dev_command: npm run dev
       dev_port: 3000
       taste_guide: docs/taste.md
@@ -178,6 +180,7 @@ repos:
 
     assert cfg.repos[0].acceptance.mode == "code_only"
     assert cfg.repos[0].acceptance.preview_url_pattern == "https://preview.example/{issue}"
+    assert cfg.repos[0].acceptance.preview_wait_timeout_secs == pytest.approx(12.5)
     assert cfg.repos[0].acceptance.dev_command == "npm run dev"
     assert cfg.repos[0].acceptance.dev_port == 3000
     assert cfg.repos[0].acceptance.taste_guide == "docs/taste.md"

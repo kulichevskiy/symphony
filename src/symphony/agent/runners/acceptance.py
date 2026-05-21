@@ -28,6 +28,8 @@ from symphony.pipeline.local_review_io import CollectedRunnerOutput
 _DIFF_LIMIT_CHARS = 60_000
 _CODE_ONLY_MODE = "code_only"
 _DEV_MODE = "dev"
+_PREVIEW_MODE = "preview"
+_PLAYWRIGHT_MODES = {_DEV_MODE, _PREVIEW_MODE}
 _DEV_SERVER_STARTUP_TIMEOUT_SECS = 60.0
 _DEV_SERVER_STOP_TIMEOUT_SECS = 5.0
 _QUICK_SKIP_DETAILS = "No user-visible behavior described in the ticket or PR diff."
@@ -206,6 +208,19 @@ async def run_acceptance(
             dev_port=dev_port,
             dev_startup_timeout_secs=dev_startup_timeout_secs,
         )
+    if mode == _PREVIEW_MODE:
+        return await _run_preview_acceptance(
+            runner=runner,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            linear_description=linear_description,
+            pr_diff_summary=pr_diff_summary,
+            taste_guide=taste_guide,
+            criteria=criteria,
+            stall_secs=stall_secs,
+            max_budget_usd=max_budget_usd,
+            preview_url=preview_url,
+        )
     if mode != _CODE_ONLY_MODE:
         return AcceptanceVerdict(
             kind="infra_error",
@@ -330,47 +345,111 @@ async def _run_dev_acceptance(
         )
 
     try:
-        artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        mcp_config_path = _write_playwright_mcp_config(
-            workspace_path=workspace_path,
+        return await _run_playwright_acceptance(
+            runner=runner,
             run_id=run_id,
-            output_dir=artifacts_dir,
-        )
-        prompt = build_acceptance_prompt(
+            workspace_path=workspace_path,
             mode=_DEV_MODE,
             linear_description=linear_description,
             pr_diff_summary=pr_diff_summary,
             taste_guide=taste_guide,
             criteria=criteria,
-            preview_url=resolved_preview_url,
-            artifacts_dir=artifacts_dir,
-        )
-        spec = RunnerSpec(
-            run_id=run_id,
-            workspace_path=workspace_path,
-            command=build_acceptance_command(
-                prompt=prompt,
-                max_budget_usd=max_budget_usd,
-                mode=_DEV_MODE,
-                mcp_config_path=mcp_config_path,
-            ),
-            env={
-                "SYMPHONY_ACCEPTANCE_PREVIEW_URL": resolved_preview_url,
-                "SYMPHONY_ACCEPTANCE_ARTIFACT_DIR": str(artifacts_dir),
-            },
             stall_secs=stall_secs,
-            stage="acceptance",
-        )
-        acceptance_run = await _collect_acceptance_output(
-            runner,
-            spec,
             max_budget_usd=max_budget_usd,
-            wall_clock_secs=stall_secs,
+            preview_url=resolved_preview_url,
         )
     finally:
         await _stop_dev_server(dev_server)
 
+
+async def _run_preview_acceptance(
+    *,
+    runner: Runner,
+    run_id: str,
+    workspace_path: Path,
+    linear_description: str,
+    pr_diff_summary: str,
+    taste_guide: str,
+    criteria: list[str] | None,
+    stall_secs: float,
+    max_budget_usd: float | None,
+    preview_url: str,
+) -> AcceptanceVerdict:
+    if not preview_url:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=0.0,
+            hero_screenshot_url="",
+            details="preview acceptance requires a resolved preview URL.",
+        )
+    return await _run_playwright_acceptance(
+        runner=runner,
+        run_id=run_id,
+        workspace_path=workspace_path,
+        mode=_PREVIEW_MODE,
+        linear_description=linear_description,
+        pr_diff_summary=pr_diff_summary,
+        taste_guide=taste_guide,
+        criteria=criteria,
+        stall_secs=stall_secs,
+        max_budget_usd=max_budget_usd,
+        preview_url=preview_url,
+    )
+
+
+async def _run_playwright_acceptance(
+    *,
+    runner: Runner,
+    run_id: str,
+    workspace_path: Path,
+    mode: str,
+    linear_description: str,
+    pr_diff_summary: str,
+    taste_guide: str,
+    criteria: list[str] | None,
+    stall_secs: float,
+    max_budget_usd: float | None,
+    preview_url: str,
+) -> AcceptanceVerdict:
+    artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    mcp_config_path = _write_playwright_mcp_config(
+        workspace_path=workspace_path,
+        run_id=run_id,
+        output_dir=artifacts_dir,
+    )
+    prompt = build_acceptance_prompt(
+        mode=mode,
+        linear_description=linear_description,
+        pr_diff_summary=pr_diff_summary,
+        taste_guide=taste_guide,
+        criteria=criteria,
+        preview_url=preview_url,
+        artifacts_dir=artifacts_dir,
+    )
+    spec = RunnerSpec(
+        run_id=run_id,
+        workspace_path=workspace_path,
+        command=build_acceptance_command(
+            prompt=prompt,
+            max_budget_usd=max_budget_usd,
+            mode=mode,
+            mcp_config_path=mcp_config_path,
+        ),
+        env={
+            "SYMPHONY_ACCEPTANCE_PREVIEW_URL": preview_url,
+            "SYMPHONY_ACCEPTANCE_ARTIFACT_DIR": str(artifacts_dir),
+        },
+        stall_secs=stall_secs,
+        stage="acceptance",
+    )
+    acceptance_run = await _collect_acceptance_output(
+        runner,
+        spec,
+        max_budget_usd=max_budget_usd,
+        wall_clock_secs=stall_secs,
+    )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
         return AcceptanceVerdict(
@@ -379,7 +458,7 @@ async def _run_dev_acceptance(
             cost=acceptance_run.cost,
             hero_screenshot_url="",
             details=acceptance_run.abort_details,
-            preview_url=resolved_preview_url,
+            preview_url=preview_url,
         )
     if not collected.ok_exit:
         parsed = acceptance_classifier(
@@ -398,14 +477,14 @@ async def _run_dev_acceptance(
                 ),
                 time_cap_secs=stall_secs,
             ),
-            preview_url=resolved_preview_url,
+            preview_url=preview_url,
         )
     verdict = acceptance_classifier(
         transcript=collected.stdout,
         criteria=criteria,
     )
     return _validate_dev_artifacts(
-        verdict if verdict.preview_url else _with_preview_url(verdict, resolved_preview_url),
+        verdict if verdict.preview_url else _with_preview_url(verdict, preview_url),
         criteria=criteria,
     )
 
@@ -847,13 +926,13 @@ def build_acceptance_command(
         "--disallowedTools",
         (
             _CLAUDE_DEV_ACCEPTANCE_DISALLOWED_TOOLS
-            if mode == _DEV_MODE
+            if mode in _PLAYWRIGHT_MODES
             else _CLAUDE_ACCEPTANCE_DISALLOWED_TOOLS
         ),
     ]
-    if mode == _DEV_MODE:
+    if mode in _PLAYWRIGHT_MODES:
         if mcp_config_path is None:
-            raise ValueError("dev acceptance requires a Playwright MCP config path")
+            raise ValueError("visual acceptance requires a Playwright MCP config path")
         command.extend(
             [
                 "--mcp-config",
@@ -879,10 +958,11 @@ def build_acceptance_prompt(
     preview_url: str = "",
     artifacts_dir: Path | None = None,
 ) -> str:
-    if mode == _DEV_MODE:
+    if mode in _PLAYWRIGHT_MODES:
         if not preview_url or artifacts_dir is None:
-            raise ValueError("dev acceptance requires preview_url and artifacts_dir")
+            raise ValueError("visual acceptance requires preview_url and artifacts_dir")
         return _build_dev_acceptance_prompt(
+            mode=mode,
             linear_description=linear_description,
             pr_diff_summary=pr_diff_summary,
             taste_guide=taste_guide,
@@ -944,6 +1024,7 @@ def build_acceptance_prompt(
 
 def _build_dev_acceptance_prompt(
     *,
+    mode: str,
     linear_description: str,
     pr_diff_summary: str,
     taste_guide: str,
@@ -960,8 +1041,8 @@ def _build_dev_acceptance_prompt(
         "You are Symphony's Acceptance-stage agent. Your only job is to "
         "visually decide whether the live UI satisfies the Linear ticket.\n\n"
         "# Mode\n\n"
-        "mode: dev\n\n"
-        "# Mode-specific instructions for dev\n\n"
+        f"mode: {mode}\n\n"
+        f"# Mode-specific instructions for {mode}\n\n"
         f"- Open the live app at {preview_url} using the Playwright MCP tools.\n"
         "- Use a single desktop viewport. Do not perform multi-viewport checks.\n"
         "- Verify each extracted acceptance criterion visually against the "
