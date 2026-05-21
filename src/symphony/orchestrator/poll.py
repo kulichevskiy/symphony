@@ -148,6 +148,7 @@ MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
 MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
 _CODE_ONLY_ACCEPTANCE_MODE = "code_only"
+NEEDS_HUMAN_APPROVAL_LABEL = "needs-human-approval"
 _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
@@ -493,6 +494,10 @@ def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bo
         and issue.state_name in active_states
         and (binding.issue_label is None or binding.issue_label in issue.labels)
     )
+
+
+def _needs_human_approval_label_present(issue: LinearIssue) -> bool:
+    return NEEDS_HUMAN_APPROVAL_LABEL in issue.labels
 
 
 def _parse_rfc3339(s: str) -> datetime:
@@ -2345,12 +2350,19 @@ class Orchestrator:
                 artifacts_url=state.last_artifacts_url,
             )
             await self._clear_operator_wait(issue_id, run_id)
-            self._schedule_merge(
-                binding=binding,
-                issue=issue,
-                pr_number=state.pr_number,
-                pr_url=state.pr_url,
-            )
+            if _needs_human_approval_label_present(issue):
+                await self._open_merge_wait_for_human_approval_label(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=state.pr_url,
+                )
+            else:
+                self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=state.pr_number,
+                    pr_url=state.pr_url,
+                )
             body = acceptance_skipped(
                 CommentVars(
                     stage="acceptance",
@@ -4901,12 +4913,19 @@ class Orchestrator:
                 artifacts_url=state.last_artifacts_url,
             )
             await self._clear_operator_wait(issue_id, run_id)
-            self._schedule_merge(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
-            )
+            if _needs_human_approval_label_present(issue):
+                await self._open_merge_wait_for_human_approval_label(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                )
+            else:
+                self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                )
             body = skip_acceptance_forced(
                 CommentVars(
                     stage="acceptance",
@@ -5964,6 +5983,36 @@ class Orchestrator:
             and state.last_verdict == "pass"
         )
 
+    async def _refresh_issue_for_acceptance_merge_handoff(
+        self, issue: LinearIssue
+    ) -> LinearIssue:
+        try:
+            return await self.linear.lookup_issue(issue.id)
+        except LinearError as e:
+            log.warning(
+                "could not refresh %s labels before acceptance merge handoff: %s",
+                issue.identifier,
+                e,
+            )
+            return issue
+
+    async def _open_merge_wait_for_human_approval_label(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+    ) -> None:
+        await self._complete_review_monitors_for_merge(issue)
+        await self._mark_merge_needs_approval(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            run_id=str(uuid.uuid4()),
+            reason=f"{NEEDS_HUMAN_APPROVAL_LABEL} label present",
+            create_run=True,
+        )
+
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
@@ -6122,6 +6171,16 @@ class Orchestrator:
                             pr_url=candidate.pr_url,
                             pr_head_sha=head_sha,
                         )
+                    )
+                    continue
+                if (
+                    binding.acceptance.mode != "off"
+                    and _needs_human_approval_label_present(issue)
+                ):
+                    await self._open_merge_wait_for_human_approval_label(
+                        binding=binding,
+                        issue=issue,
+                        pr_url=candidate.pr_url,
                     )
                     continue
                 on_started: Callable[[str], Awaitable[None]] | None = None
@@ -6686,12 +6745,22 @@ class Orchestrator:
                 )
                 if self._dispatch_run_ids.get(issue.id) == run_id:
                     self._dispatch_run_ids.pop(issue.id, None)
-                await self._merge_approved_pr(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
+                merge_issue = await self._refresh_issue_for_acceptance_merge_handoff(
+                    issue
                 )
+                if _needs_human_approval_label_present(merge_issue):
+                    await self._open_merge_wait_for_human_approval_label(
+                        binding=binding,
+                        issue=merge_issue,
+                        pr_url=pr_url,
+                    )
+                else:
+                    await self._merge_approved_pr(
+                        binding=binding,
+                        issue=merge_issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
                 return run_id
 
             if verdict.kind == "infra_error":
