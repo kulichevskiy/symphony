@@ -4894,6 +4894,12 @@ class Orchestrator:
         )
 
         if intent.kind is SlashKind.SKIP_ACCEPTANCE:
+            await db.acceptance_state.record_verdict(
+                self._conn,
+                issue_id,
+                verdict="pass",
+                artifacts_url=state.last_artifacts_url,
+            )
             await self._clear_operator_wait(issue_id, run_id)
             self._schedule_merge(
                 binding=binding,
@@ -6722,7 +6728,7 @@ class Orchestrator:
                 ended_at=ended_at,
             )
             if state.iteration < ACCEPTANCE_FIX_ITERATION_CAP:
-                await self._dispatch_acceptance_fix_run(
+                dispatched = await self._dispatch_acceptance_fix_run(
                     binding=binding,
                     issue=issue,
                     pr_number=pr_number,
@@ -6730,7 +6736,12 @@ class Orchestrator:
                     pr_head_sha=pr_head_sha,
                     verdict=verdict,
                 )
-                return run_id
+                if dispatched:
+                    return run_id
+                log.warning(
+                    "acceptance fix-run did not advance %s; opening operator wait",
+                    issue.identifier,
+                )
 
             await self._track_acceptance_rejected_wait(issue.id, run_id, binding)
             body = acceptance_rejected(

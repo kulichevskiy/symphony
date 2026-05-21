@@ -583,6 +583,8 @@ async def test_skip_acceptance_after_restart_dispatches_merge(
         linear.comments_since.assert_awaited_once()
         orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
         assert await db.operator_waits.get(conn, "iss-1") is None
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.last_verdict == "pass"
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("$skip-acceptance" in body and "merge" in body for body in bodies)
     finally:
