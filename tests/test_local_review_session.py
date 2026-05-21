@@ -16,6 +16,7 @@ import pytest
 from symphony.agent.codex_cli import (
     CODEX_APPROVAL_POLICY_CONFIG,
     CODEX_DEFAULT_PERMISSIONS_CONFIG,
+    codex_project_root_write_config,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.pipeline.local_review import (
@@ -226,6 +227,7 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
     assert configs == [
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         CODEX_APPROVAL_POLICY_CONFIG,
+        codex_project_root_write_config(workspace),
     ]
 
 

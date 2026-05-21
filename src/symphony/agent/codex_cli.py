@@ -36,6 +36,28 @@ class CodexPermissionsProfileError(RuntimeError):
     """Raised when the Codex permissions profile cannot be ensured."""
 
 
+def _toml_basic_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\b", "\\b")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\f", "\\f")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+def codex_project_root_write_config(workspace_path: Path) -> str:
+    """Return a per-invocation Codex config that pins the writable worktree."""
+    workspace_root = str(workspace_path.expanduser().resolve())
+    return (
+        f"permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem."
+        f'":project_roots".{_toml_basic_string(workspace_root)}="write"'
+    )
+
+
 def codex_config_path() -> Path:
     """Return the Codex config path used for the permissions profile."""
     if codex_home := os.environ.get("CODEX_HOME"):
@@ -127,7 +149,7 @@ def ensure_symphony_permissions_profile(
 
 
 def build_codex_workspace_write_command(
-    *, prompt: str, codex_model: str
+    *, prompt: str, codex_model: str, workspace_path: Path
 ) -> list[str]:
     """Build `codex exec` argv for agents that must modify and commit."""
     return [
@@ -138,6 +160,8 @@ def build_codex_workspace_write_command(
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         "--config",
         CODEX_APPROVAL_POLICY_CONFIG,
+        "--config",
+        codex_project_root_write_config(workspace_path),
         "--model",
         codex_model,
         prompt,
@@ -151,6 +175,7 @@ __all__ = [
     "SYMPHONY_PERMISSIONS_PROFILE_TOML",
     "CodexPermissionsProfileError",
     "build_codex_workspace_write_command",
+    "codex_project_root_write_config",
     "codex_config_path",
     "ensure_symphony_permissions_profile",
 ]

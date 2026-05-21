@@ -20,6 +20,7 @@ from symphony import db
 from symphony.agent.codex_cli import (
     CODEX_APPROVAL_POLICY_CONFIG,
     CODEX_DEFAULT_PERMISSIONS_CONFIG,
+    codex_project_root_write_config,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
@@ -526,6 +527,7 @@ async def test_codex_token_usage_estimates_cost_for_cap(tmp_path: Path) -> None:
         assert configs == [
             CODEX_DEFAULT_PERMISSIONS_CONFIG,
             CODEX_APPROVAL_POLICY_CONFIG,
+            codex_project_root_write_config(ws),
         ]
         assert command[command.index("--model") + 1] == "gpt-5.1-codex"
         history = await db.runs.history_for_issue(conn, "iss-1")

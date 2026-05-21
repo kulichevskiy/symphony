@@ -373,6 +373,7 @@ def build_runner_command(
     *,
     max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    workspace_path: Path | None = None,
 ) -> list[str]:
     """Per-runner argv for the Implement stage prompt."""
     if agent == "claude":
@@ -388,9 +389,12 @@ def build_runner_command(
         command.append(prompt)
         return command
     if agent == "codex":
+        if workspace_path is None:
+            raise ValueError("workspace_path is required for codex write runs")
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
+            workspace_path=workspace_path,
         )
     raise ValueError(f"unknown agent {agent!r}")
 
@@ -400,6 +404,7 @@ def build_fix_runner_command(
     prompt: str,
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    workspace_path: Path | None = None,
 ) -> list[str]:
     """argv for a Review-stage fix-run.
 
@@ -408,7 +413,12 @@ def build_fix_runner_command(
     comments; the binding's `agent` field is what drives code changes
     in response to its feedback.
     """
-    return build_runner_command(agent, prompt, codex_model=codex_model)
+    return build_runner_command(
+        agent,
+        prompt,
+        codex_model=codex_model,
+        workspace_path=workspace_path,
+    )
 
 
 def build_merge_runner_command(
@@ -417,6 +427,7 @@ def build_merge_runner_command(
     *,
     max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    workspace_path: Path | None = None,
 ) -> list[str]:
     """argv for the Merge-stage final local pass."""
     return build_runner_command(
@@ -424,6 +435,7 @@ def build_merge_runner_command(
         prompt,
         max_budget_usd=max_budget_usd,
         codex_model=codex_model,
+        workspace_path=workspace_path,
     )
 
 
@@ -4039,6 +4051,7 @@ class Orchestrator:
             command = build_codex_workspace_write_command(
                 prompt=prompt,
                 codex_model=binding.codex_model,
+                workspace_path=workspace_path,
             )
             codex_binding = binding.model_copy(update={"agent": "codex"})
             warning_pct = effective_warning_pct(
@@ -8802,6 +8815,7 @@ class Orchestrator:
             prompt,
             max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
+            workspace_path=workspace_path,
         )
         return await self._run_stage_command(
             binding=binding,
@@ -8855,6 +8869,7 @@ class Orchestrator:
             prompt,
             max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
+            workspace_path=workspace_path,
         )
         return await self._run_stage_command(
             binding=binding,
@@ -8987,6 +9002,7 @@ class Orchestrator:
             binding.agent,
             prompt,
             codex_model=binding.codex_model,
+            workspace_path=workspace_path,
         )
         return await self._run_runner(
             run_id=run_id,
@@ -9015,6 +9031,7 @@ class Orchestrator:
             binding.agent,
             prompt,
             codex_model=binding.codex_model,
+            workspace_path=workspace_path,
         )
         return await self._run_runner(
             run_id=run_id,
