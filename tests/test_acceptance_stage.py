@@ -2111,3 +2111,62 @@ async def test_acceptance_off_preserves_current_review_to_merge_flow(
         assert (await cur.fetchone())[0] == 0
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_off_honors_needs_human_approval_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("off")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(_merge_events())
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        issue_with_override = _issue()
+        issue_with_override.labels = ["feature", "needs-human-approval"]
+        linear.lookup_issue = AsyncMock(return_value=issue_with_override)
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == ["implement", "review", "merge"]
+        assert history[2].status == "needs_approval"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        assert wait.run_id == history[2].id
+        assert runner.captured_specs == []
+        assert linear.move_issue.await_args_list == [call("iss-1", "state-na")]
+        gh.pr_merge.assert_not_awaited()
+    finally:
+        await conn.close()

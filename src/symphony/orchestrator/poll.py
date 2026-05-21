@@ -6173,10 +6173,7 @@ class Orchestrator:
                         )
                     )
                     continue
-                if (
-                    binding.acceptance.mode != "off"
-                    and _needs_human_approval_label_present(issue)
-                ):
+                if _needs_human_approval_label_present(issue):
                     await self._open_merge_wait_for_human_approval_label(
                         binding=binding,
                         issue=issue,
