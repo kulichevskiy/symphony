@@ -77,3 +77,21 @@ async def test_preview_resolver_timeout_raises_infra_error() -> None:
     assert excinfo.value.url == "https://vib-42.vercel.app"
     assert "did not become live" in str(excinfo.value)
     assert attempts == ["https://vib-42.vercel.app"]
+
+
+@pytest.mark.asyncio
+async def test_preview_resolver_invalid_url_still_raises_resolution_error() -> None:
+    acceptance = AcceptanceConfig(
+        mode="preview",
+        preview_url_pattern="https://vib-{pr_number}:bad.vercel.app",
+    )
+
+    with pytest.raises(PreviewResolutionError) as excinfo:
+        await resolve_preview_url(
+            acceptance,
+            pr_number=42,
+            timeout_secs=0.0,
+        )
+
+    assert excinfo.value.url == "https://vib-42:bad.vercel.app"
+    assert "did not become live" in str(excinfo.value)

@@ -121,7 +121,7 @@ async def _preview_returns_200(url: str) -> bool:
             timeout=_PROBE_TIMEOUT_SECS,
         ) as client:
             response = await client.get(url)
-    except httpx.HTTPError:
+    except (httpx.HTTPError, httpx.InvalidURL):
         return False
     return response.status_code == 200
 
