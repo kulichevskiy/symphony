@@ -25,6 +25,7 @@ from symphony import db
 from symphony.agent.codex_cli import (
     CODEX_APPROVAL_POLICY_CONFIG,
     CODEX_DEFAULT_PERMISSIONS_CONFIG,
+    codex_project_root_write_config,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
@@ -497,6 +498,7 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert configs == [
             CODEX_DEFAULT_PERMISSIONS_CONFIG,
             CODEX_APPROVAL_POLICY_CONFIG,
+            codex_project_root_write_config(workspace_path),
         ]
         assert command[command.index("--model") + 1] == "gpt-5.1-codex-max"
         prompt = command[-1]
@@ -1723,11 +1725,14 @@ def test_build_fix_runner_command_uses_claude_when_binding_is_claude() -> None:
     assert "fix this" in argv
 
 
-def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
+def test_build_fix_runner_command_uses_codex_when_binding_is_codex(
+    tmp_path: Path,
+) -> None:
     argv = build_fix_runner_command(
         "codex",
         "fix this",
         codex_model="gpt-5.1-codex-max",
+        workspace_path=tmp_path,
     )
     assert argv[:3] == [
         "codex",
@@ -1740,29 +1745,40 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex() -> None:
     assert configs == [
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         CODEX_APPROVAL_POLICY_CONFIG,
+        codex_project_root_write_config(tmp_path),
     ]
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert "fix this" in argv
 
 
-def test_build_fix_runner_command_passes_configured_codex_model() -> None:
+def test_build_fix_runner_command_passes_configured_codex_model(
+    tmp_path: Path,
+) -> None:
     argv = build_fix_runner_command(
         "codex",
         "fix this",
         codex_model="gpt-5.1-codex-max",
+        workspace_path=tmp_path,
     )
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert argv[-1] == "fix this"
 
 
-def test_build_runner_command_allows_git_writes_for_codex_implement() -> None:
-    argv = build_runner_command("codex", "implement this")
+def test_build_runner_command_allows_git_writes_for_codex_implement(
+    tmp_path: Path,
+) -> None:
+    argv = build_runner_command(
+        "codex",
+        "implement this",
+        workspace_path=tmp_path,
+    )
     assert "--sandbox" not in argv
     assert "workspace-write" not in argv
     configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
     assert configs == [
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         CODEX_APPROVAL_POLICY_CONFIG,
+        codex_project_root_write_config(tmp_path),
     ]
     assert argv[-1] == "implement this"
 
