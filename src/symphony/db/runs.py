@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 
 import aiosqlite
 
+from . import operator_waits
+
 # Statuses that mean "this run is supposed to be alive". Kept as a tuple so
 # callers (poll dedupe, reconcile) share a single source of truth.
 LIVE_STATUSES: tuple[str, ...] = ("running",)
@@ -22,6 +24,12 @@ INTERRUPTED_STATUS: str = "interrupted"
 # Terminal review-monitor statuses that indicate the monitor died or was
 # stopped before it could keep polling the linked PR.
 REVIEW_RESURRECT_STATUSES: tuple[str, ...] = (FAILED_STATUS, INTERRUPTED_STATUS)
+
+STALE_WAIT_KINDS_CLEARED_BY_COMPLETED_STAGE: dict[str, tuple[str, ...]] = {
+    "implement": (operator_waits.KIND_IMPLEMENT_FAILED,),
+    "review_fix": (operator_waits.KIND_REVIEW_FAILED,),
+    "acceptance_fix": (operator_waits.KIND_ACCEPTANCE_REJECTED,),
+}
 
 
 @dataclass
@@ -176,11 +184,63 @@ async def update_status(
     *,
     ended_at: str | None = None,
 ) -> None:
+    cur = await conn.execute(
+        """
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        FROM runs
+        WHERE id = ?
+        """,
+        (run_id,),
+    )
+    run = await cur.fetchone()
     await conn.execute(
         "UPDATE runs SET status = ?, ended_at = COALESCE(?, ended_at) WHERE id = ?",
         (status, ended_at, run_id),
     )
+    if run is not None and status == "completed":
+        completed_at = ended_at or run["ended_at"] or run["started_at"]
+        await _clear_stale_wait_for_completed_run(conn, run, completed_at)
     await conn.commit()
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _timestamp_after(left: str | None, right: str | None) -> bool:
+    left_dt = _parse_timestamp(left)
+    right_dt = _parse_timestamp(right)
+    if left_dt is None or right_dt is None:
+        return False
+    return left_dt > right_dt
+
+
+async def _clear_stale_wait_for_completed_run(
+    conn: aiosqlite.Connection,
+    run: aiosqlite.Row,
+    completed_at: str,
+) -> None:
+    wait_kinds = STALE_WAIT_KINDS_CLEARED_BY_COMPLETED_STAGE.get(str(run["stage"]))
+    if wait_kinds is None:
+        return
+
+    wait = await operator_waits.get(conn, str(run["issue_id"]))
+    if wait is None or wait.run_id == run["id"] or wait.kind not in wait_kinds:
+        return
+    if not _timestamp_after(completed_at, wait.created_at):
+        return
+    await operator_waits.delete(conn, wait.issue_id, wait.run_id, commit=False)
 
 
 async def interrupt_stale_merge_needs_approval(

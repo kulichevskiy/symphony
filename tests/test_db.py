@@ -787,6 +787,79 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("completed_stage", "wait_kind", "wait_run_stage"),
+    [
+        ("implement", db.operator_waits.KIND_IMPLEMENT_FAILED, "implement"),
+        ("review_fix", db.operator_waits.KIND_REVIEW_FAILED, "review"),
+        ("acceptance_fix", db.operator_waits.KIND_ACCEPTANCE_REJECTED, "acceptance"),
+    ],
+)
+async def test_completed_remediation_run_clears_older_matching_wait(
+    tmp_path: Path,
+    completed_stage: str,
+    wait_kind: str,
+    wait_run_stage: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="wait-run",
+            issue_id="iss-1",
+            stage=wait_run_stage,
+            status="failed",
+            pid=None,
+            started_at="2026-05-17T09:05:22+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="wait-run",
+            kind=wait_kind,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-17T09:16:55+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="remediation-run",
+            issue_id="iss-1",
+            stage=completed_stage,
+            status="running",
+            pid=5087,
+            started_at="2026-05-17T09:09:55+00:00",
+        )
+
+        await db.runs.update_status(
+            conn,
+            "remediation-run",
+            "completed",
+            ended_at="2026-05-17T09:18:18+00:00",
+        )
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert (
+        "operator_waits",
+        "kind",
+        wait_kind,
+        None,
+    ) in [
+        (t.table_name, t.field, t.old_value, t.new_value)
+        for t in transitions
+    ]
+
+
+@pytest.mark.asyncio
 async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
     """`create_if_no_active` must skip the insert when a live (`running`) row
     already exists for the same issue, and must succeed when the previous run

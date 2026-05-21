@@ -153,6 +153,109 @@ async def test_canonical_status_splits_operator_wait_kind(
 
 
 @pytest.mark.asyncio
+async def test_canonical_status_ignores_review_failed_wait_after_completed_fix(
+    tmp_path: Path,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "stale-review-wait")
+        await _run(
+            conn,
+            run_id="review-monitor",
+            issue_id="stale-review-wait",
+            stage="review",
+            status="failed",
+            started_at="2026-05-17T09:05:22Z",
+            ended_at="2026-05-17T09:16:55Z",
+        )
+        await _run(
+            conn,
+            run_id="review-fix",
+            issue_id="stale-review-wait",
+            stage="review_fix",
+            status="completed",
+            started_at="2026-05-17T09:09:55Z",
+            ended_at="2026-05-17T09:18:18Z",
+        )
+        await _operator_wait(
+            conn,
+            issue_id="stale-review-wait",
+            run_id="review-monitor",
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            created_at="2026-05-17T09:16:55Z",
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at,
+                merged_at
+            )
+            VALUES (
+                'stale-review-wait', 'org/repo', 'ENG|org/repo', 200,
+                'https://github.com/org/repo/pull/200', '2026-05-17T09:00:00Z',
+                NULL
+            )
+            """
+        )
+        await conn.commit()
+
+        status = await compute_canonical_status(conn, "stale-review-wait", now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.to_dict() == {
+        "state": "pr_open",
+        "since": "2026-05-17T09:00:00Z",
+        "subtitle": "#200",
+        "stuck_for": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_prefers_running_review_fix_over_review_failed_wait(
+    tmp_path: Path,
+) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "running-review-fix")
+        await _run(
+            conn,
+            run_id="review-monitor",
+            issue_id="running-review-fix",
+            stage="review",
+            status="failed",
+            started_at="2026-05-17T09:05:22Z",
+            ended_at="2026-05-17T09:16:55Z",
+        )
+        await _run(
+            conn,
+            run_id="review-fix",
+            issue_id="running-review-fix",
+            stage="review_fix",
+            status="running",
+            started_at="2026-05-17T09:09:55Z",
+        )
+        await _operator_wait(
+            conn,
+            issue_id="running-review-fix",
+            run_id="review-monitor",
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            created_at="2026-05-17T09:16:55Z",
+        )
+
+        status = await compute_canonical_status(conn, "running-review-fix", now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.to_dict() == {
+        "state": "running",
+        "since": "2026-05-17T09:09:55Z",
+        "subtitle": "review_fix",
+        "stuck_for": 10205,
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("issue_id", "kind", "created_at", "expected_stuck_for"),
     [

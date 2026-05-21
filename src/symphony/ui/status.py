@@ -98,6 +98,12 @@ OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
     operator_waits.KIND_MERGE: CanonicalState.AWAITING_MERGE,
 }
 
+OPERATOR_WAIT_SUPERSEDED_BY_STAGES: Mapping[str, tuple[str, ...]] = {
+    operator_waits.KIND_ACCEPTANCE_REJECTED: ("acceptance_fix",),
+    operator_waits.KIND_IMPLEMENT_FAILED: ("implement",),
+    operator_waits.KIND_REVIEW_FAILED: ("review_fix",),
+}
+
 
 async def _fetch_one(
     conn: aiosqlite.Connection,
@@ -107,6 +113,16 @@ async def _fetch_one(
     cur = await conn.execute(query, params)
     row = await cur.fetchone()
     return dict(row) if row is not None else None
+
+
+async def _fetch_all(
+    conn: aiosqlite.Connection,
+    query: str,
+    params: tuple[object, ...],
+) -> list[dict[str, Any]]:
+    cur = await conn.execute(query, params)
+    rows = await cur.fetchall()
+    return [dict(row) for row in rows]
 
 
 def _as_str(value: object) -> str | None:
@@ -129,6 +145,58 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _run_supersedes_operator_wait(
+    run: Mapping[str, Any],
+    wait_created_at: str | None,
+) -> bool:
+    status = _as_str(run.get("status"))
+    if status == "running":
+        return True
+    if status != "completed":
+        return False
+
+    wait_created = _parse_timestamp(wait_created_at)
+    run_progressed = _parse_timestamp(_as_str(run.get("ended_at"))) or _parse_timestamp(
+        _as_str(run.get("started_at"))
+    )
+    return (
+        wait_created is not None
+        and run_progressed is not None
+        and run_progressed > wait_created
+    )
+
+
+async def _operator_wait_superseding_run(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    wait_kind: str | None,
+    wait_created_at: str | None,
+) -> dict[str, Any] | None:
+    stages = OPERATOR_WAIT_SUPERSEDED_BY_STAGES.get(wait_kind or "")
+    if not stages:
+        return None
+
+    placeholders = ",".join("?" * len(stages))
+    rows = await _fetch_all(
+        conn,
+        f"""
+        SELECT stage, status, started_at, ended_at
+        FROM runs
+        WHERE issue_id = ?
+          AND stage IN ({placeholders})
+          AND status IN ('running', 'completed')
+        ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, id DESC
+        LIMIT 10
+        """,
+        (issue_id, *stages),
+    )
+    for run in rows:
+        if _run_supersedes_operator_wait(run, wait_created_at):
+            return run
+    return None
 
 
 def _normalize_now(now: datetime) -> datetime:
@@ -244,13 +312,28 @@ async def compute_canonical_status(
     )
     if operator_wait is not None:
         wait_kind = _as_str(operator_wait["kind"])
-        return _status(
-            OPERATOR_WAIT_STATES.get(wait_kind or "", CanonicalState.PAUSED),
-            since=_as_str(operator_wait["created_at"]),
-            subtitle=wait_kind,
-            now=effective_now,
-            thresholds=thresholds,
+        superseding_run = await _operator_wait_superseding_run(
+            conn,
+            issue_id=issue_id,
+            wait_kind=wait_kind,
+            wait_created_at=_as_str(operator_wait["created_at"]),
         )
+        if superseding_run is not None and superseding_run["status"] == "running":
+            return _status(
+                CanonicalState.RUNNING,
+                since=_as_str(superseding_run["started_at"]),
+                subtitle=_as_str(superseding_run["stage"]),
+                now=effective_now,
+                thresholds=thresholds,
+            )
+        if superseding_run is None:
+            return _status(
+                OPERATOR_WAIT_STATES.get(wait_kind or "", CanonicalState.PAUSED),
+                since=_as_str(operator_wait["created_at"]),
+                subtitle=wait_kind,
+                now=effective_now,
+                thresholds=thresholds,
+            )
 
     running_run = await _fetch_one(
         conn,
