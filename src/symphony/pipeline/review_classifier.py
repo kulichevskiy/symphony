@@ -255,6 +255,7 @@ def review_classifier(
         return (
             r.state == "COMMENTED"
             and is_codex_author(r.user_login)
+            and len(r.body) < CODEX_BOILERPLATE_THRESHOLD
             and "👍" in r.body
             and after_head_or_unknown(r.submitted_at)
         )

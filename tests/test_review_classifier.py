@@ -573,6 +573,50 @@ def test_codex_emoji_approval_marks_approved() -> None:
     assert v.rule == "codex_approved"
 
 
+@pytest.mark.parametrize(
+    ("body", "expected_kind", "expected_rule"),
+    [
+        pytest.param(
+            (
+                "P1 Preserve admin auto-provisioning in Supabase login flow.\n\n"
+                "The new path skips the existing admin provisioning branch and will "
+                "prevent first-time admins from getting their expected role. "
+            )
+            * 8
+            + "\n\n<details>\n<summary>About Codex in GitHub</summary>\n\n"
+            "If Codex has suggestions, it will comment; otherwise it will react with 👍."
+            "\n</details>",
+            VerdictKind.CHANGES_REQUESTED,
+            "codex_review",
+            id="substantive-codex-review-with-boilerplate-thumbs-up",
+        ),
+        pytest.param(
+            "👍",
+            VerdictKind.APPROVED,
+            "codex_approved",
+            id="short-bare-thumbs-up",
+        ),
+    ],
+)
+def test_codex_emoji_approval_requires_short_review_body(
+    body: str,
+    expected_kind: VerdictKind,
+    expected_rule: str,
+) -> None:
+    reviews = (
+        Review(
+            user_login=CODEX_BOT_LOGIN,
+            state="COMMENTED",
+            commit_sha=HEAD_SHA,
+            submitted_at=LATER,
+            body=body,
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reviews=reviews))
+    assert v.kind == expected_kind
+    assert v.rule == expected_rule
+
+
 def test_codex_no_issues_still_requires_mergeable() -> None:
     """Codex "no issues" approval still requires mergeable to be MERGEABLE."""
     reviews = (
