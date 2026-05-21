@@ -97,6 +97,13 @@ def _merge_events() -> list[RunnerEvent]:
     return [RunnerEvent(kind="exit", returncode=0)]
 
 
+def _fix_events() -> list[RunnerEvent]:
+    return [
+        RunnerEvent(kind="started", pid=3333),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
 def _binding(
     mode: str = "off",
     *,
@@ -859,18 +866,37 @@ async def test_acceptance_runs_before_conflict_fix_ready_merge(
 
 
 @pytest.mark.asyncio
-async def test_acceptance_reject_posts_parseable_comment_and_does_not_merge(
+async def test_acceptance_reject_dispatches_fix_then_rechecks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
         return None
 
+    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def remote_sha(_workspace_path: Path, _ref: str) -> str:
+        return "abc123"
+
+    async def fixed_head_sha(_workspace_path: Path) -> str:
+        return "def456"
+
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_sha)
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", fixed_head_sha)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("code_only")
         await _seed_review_candidate(conn, binding)
-        runner = _FakeRunner(_acceptance_events(ACCEPTANCE_FOOTER_REJECT, cost=0.11))
+        runner = _FakeRunner(
+            [
+                _acceptance_events(ACCEPTANCE_FOOTER_REJECT, cost=0.11),
+                _fix_events(),
+                _acceptance_events(ACCEPTANCE_FOOTER_PASS, cost=0.13),
+                _merge_events(),
+            ]
+        )
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
         workspace.release = MagicMock()
@@ -879,6 +905,109 @@ async def test_acceptance_reject_posts_parseable_comment_and_does_not_merge(
         linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = _github()
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.iteration == 1
+        assert acceptance.pr_head_sha == "def456"
+        assert acceptance.last_verdict == "pass"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+            "acceptance_fix",
+            "acceptance",
+            "merge",
+        ]
+        assert history[2].status == "failed"
+        assert history[2].cost_usd == pytest.approx(0.11)
+        assert history[3].status == "completed"
+        assert history[4].status == "completed"
+        assert history[5].status == "done"
+        assert push_fn.await_count >= 1
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert [spec.stage for spec in runner.captured_specs] == [
+            "acceptance",
+            "acceptance_fix",
+            "acceptance",
+            "merge",
+        ]
+        fix_prompt = runner.captured_specs[1].command[-1]
+        assert "product/UX mismatch" in fix_prompt
+        assert "Acceptance verdict." in fix_prompt
+        gh.pr_merge.assert_awaited_once()
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Acceptance verdict" in body for body in bodies)
+        assert any(ACCEPTANCE_FOOTER_REJECT in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_reject_after_fix_opens_operator_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def remote_sha(_workspace_path: Path, _ref: str) -> str:
+        return "abc123"
+
+    async def fixed_head_sha(_workspace_path: Path) -> str:
+        return "def456"
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_sha)
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", fixed_head_sha)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(
+            [
+                _acceptance_events(ACCEPTANCE_FOOTER_REJECT, cost=0.11),
+                _fix_events(),
+                _acceptance_events(ACCEPTANCE_FOOTER_REJECT, cost=0.07),
+            ]
+        )
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        push_fn = AsyncMock()
         gh = _github()
 
         orch = Orchestrator(
@@ -893,7 +1022,7 @@ async def test_acceptance_reject_posts_parseable_comment_and_does_not_merge(
             runner=runner,
             gh=gh,
             workspace=workspace,
-            push_fn=AsyncMock(),
+            push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
@@ -903,6 +1032,7 @@ async def test_acceptance_reject_posts_parseable_comment_and_does_not_merge(
         await orch.drain_dispatch_tasks()
 
         acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.iteration == 1
         assert acceptance.last_verdict == "reject"
 
         history = await db.runs.history_for_issue(conn, "iss-1")
@@ -910,14 +1040,115 @@ async def test_acceptance_reject_posts_parseable_comment_and_does_not_merge(
             "implement",
             "review",
             "acceptance",
+            "acceptance_fix",
+            "acceptance",
         ]
-        assert history[2].status == "failed"
-        assert history[2].cost_usd == pytest.approx(0.11)
+        assert history[3].status == "completed"
+        assert history[4].status == "failed"
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED
+        assert wait.run_id == history[4].id
         gh.pr_merge.assert_not_awaited()
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("Acceptance verdict" in body for body in bodies)
-        assert any(ACCEPTANCE_FOOTER_REJECT in body for body in bodies)
+        assert any("$skip-acceptance" in body for body in bodies)
+        assert any("$retry-acceptance" in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_fix_without_new_commit_opens_operator_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def remote_sha(_workspace_path: Path, _ref: str) -> str:
+        return "abc123"
+
+    async def unchanged_head_sha(_workspace_path: Path) -> str:
+        return "abc123"
+
+    async def clean_status(_workspace_path: Path) -> str:
+        return ""
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    monkeypatch.setattr(poll_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_sha)
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", unchanged_head_sha)
+    monkeypatch.setattr(poll_module, "_git_status_short", clean_status)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only")
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner(
+            [
+                _acceptance_events(ACCEPTANCE_FOOTER_REJECT, cost=0.11),
+                _fix_events(),
+            ]
+        )
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        push_fn = AsyncMock()
+        gh = _github()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        acceptance = await db.acceptance_state.get(conn, "iss-1")
+        assert acceptance.iteration == 1
+        assert acceptance.last_verdict == "reject"
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == [
+            "implement",
+            "review",
+            "acceptance",
+            "acceptance_fix",
+        ]
+        assert history[2].status == "failed"
+        assert history[3].status == "failed"
+        assert push_fn.await_count == 0
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED
+        assert wait.run_id == history[2].id
+        assert await orch._poll_merge_candidates() == []  # noqa: SLF001
+
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("$skip-acceptance" in body for body in bodies)
+        assert any("$retry-acceptance" in body for body in bodies)
     finally:
         await conn.close()
 

@@ -48,6 +48,7 @@ from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.process import parse_event_line
 from ..agent.prompt import (
+    acceptance_fix_prompt,
     implement_prompt,
     merge_conflict_fix_prompt,
     merge_conflict_rebase_fix_prompt,
@@ -69,6 +70,7 @@ from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import (
     CommentVars,
     acceptance_blocked,
+    acceptance_rejected,
     acceptance_retry_requested,
     acceptance_skipped,
     awaiting_approval,
@@ -81,10 +83,12 @@ from ..linear.templates import (
     fixing_merge_conflict,
     moved_to_waiting,
     resumed,
+    retry_acceptance_requested,
     review_retry_requested,
     review_stopped,
     reviewing_feedback,
     run_started,
+    skip_acceptance_forced,
     skip_review_forced,
     stage_done,
     stuck_loop_escape,
@@ -150,6 +154,7 @@ _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
 ACCEPTANCE_INFRA_RETRY_LIMIT = 2
 ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
+ACCEPTANCE_FIX_ITERATION_CAP = 1
 
 
 class _AcceptancePrDiffUnavailable(RuntimeError):
@@ -1051,6 +1056,7 @@ class Orchestrator:
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
+        self._acceptance_rejected_run_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
         # `$skip-local-review` toggles the issue's flag here. The
         # local-review loop reads it between iterations and exits with
@@ -1538,6 +1544,9 @@ class Orchestrator:
         if run_id in self._merge_needs_approval_bindings:
             await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._acceptance_rejected_run_bindings:
+            await self._handle_acceptance_rejected_slash_intent(issue_id, run_id, intent)
+            return
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if wait is not None:
             if wait.kind == db.operator_waits.KIND_COST_CAP:
@@ -1561,6 +1570,11 @@ class Orchestrator:
                 return
             if wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED:
                 await self._handle_acceptance_blocked_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
+                await self._handle_acceptance_rejected_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
@@ -2020,6 +2034,7 @@ class Orchestrator:
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
                 db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
+                db.operator_waits.KIND_ACCEPTANCE_REJECTED,
             ):
                 log.warning(
                     "ignoring unsupported operator wait kind %r for issue %s",
@@ -2055,6 +2070,8 @@ class Orchestrator:
             self._review_failed_run_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_MERGE:
             self._merge_needs_approval_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
+            self._acceptance_rejected_run_bindings[wait.run_id] = binding
 
     async def _restore_operator_wait_binding(
         self,
@@ -2208,6 +2225,23 @@ class Orchestrator:
             created_at=datetime.now(UTC).isoformat(),
         )
 
+    async def _track_acceptance_rejected_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._acceptance_rejected_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_ACCEPTANCE_REJECTED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
     async def _acceptance_pr_url(self, issue_id: str) -> str:
         state = await db.acceptance_state.get(self._conn, issue_id)
         if state.pr_url:
@@ -2347,6 +2381,7 @@ class Orchestrator:
         self._implement_failed_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
+        self._acceptance_rejected_run_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
 
     async def _reconcile_auto_recoverable_merge_waits(
@@ -4811,6 +4846,107 @@ class Orchestrator:
             on_started=on_merge_started,
         )
 
+    async def _handle_acceptance_rejected_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._acceptance_rejected_run_bindings.get(run_id)
+        if binding is None:
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_ACCEPTANCE_REJECTED,),
+            )
+            if binding is None:
+                return
+
+        if intent.kind not in (
+            SlashKind.SKIP_ACCEPTANCE,
+            SlashKind.RETRY_ACCEPTANCE,
+        ):
+            log.info(
+                "slash %s for acceptance-rejected run %s ignored",
+                intent.kind,
+                run_id,
+            )
+            return
+
+        state = await db.acceptance_state.get(self._conn, issue_id)
+        if state.pr_number is None:
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "no PR found for acceptance state",
+            )
+            return
+
+        try:
+            issue = await self.linear.lookup_issue(issue_id)
+        except LinearError as e:
+            log.warning("could not look up %s for acceptance slash: %s", issue_id, e)
+            return
+
+        pr_number = state.pr_number
+        pr_url = _pr_url_for_state(
+            repo=binding.github_repo,
+            pr_number=pr_number,
+            pr_url=state.pr_url,
+        )
+
+        if intent.kind is SlashKind.SKIP_ACCEPTANCE:
+            await db.acceptance_state.record_verdict(
+                self._conn,
+                issue_id,
+                verdict="pass",
+                artifacts_url=state.last_artifacts_url,
+            )
+            await self._clear_operator_wait(issue_id, run_id)
+            self._schedule_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+            )
+            body = skip_acceptance_forced(
+                CommentVars(
+                    stage="acceptance",
+                    repo=binding.github_repo,
+                    issue=pr_number,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    next_stage="merge",
+                )
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning("skip-acceptance comment failed for %s: %s", issue_id, e)
+            return
+
+        await self._clear_operator_wait(issue_id, run_id)
+        await db.acceptance_state.reset(self._conn, issue_id)
+        self._schedule_acceptance(
+            binding=binding,
+            issue=issue,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            pr_head_sha=state.pr_head_sha,
+        )
+        body = retry_acceptance_requested(
+            CommentVars(
+                stage="acceptance",
+                repo=binding.github_repo,
+                issue=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+                next_stage="acceptance",
+            )
+        )
+        try:
+            await self.linear.post_comment(issue_id, truncate_body(body))
+        except LinearError as e:
+            log.warning("retry-acceptance comment failed for %s: %s", issue_id, e)
+
     async def _handle_skip_review_intent(self, issue_id: str, run_id: str) -> None:
         """Handle `$skip-review`: stop the review monitor and dispatch merge directly.
 
@@ -5851,6 +5987,8 @@ class Orchestrator:
                 ignored_stage="review",
             ):
                 continue
+            if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
+                continue
             try:
                 issue = await self.linear.lookup_issue(candidate.issue_id)
             except LinearError as e:
@@ -6283,6 +6421,7 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
         pr_head_sha: str,
+        reset_iteration: bool = True,
     ) -> str | None:
         run_id = str(uuid.uuid4())
         inserted = await db.runs.create_if_no_active(
@@ -6348,6 +6487,7 @@ class Orchestrator:
                 mode=binding.acceptance.mode,
                 preview_url=preview_url,
                 extracted_criteria=json.dumps(extracted_criteria),
+                reset_iteration=reset_iteration,
             )
             await self._post_acceptance_criteria_comment(
                 issue=issue,
@@ -6572,12 +6712,55 @@ class Orchestrator:
                     )
                     return run_id
                 await db.acceptance_state.bump_infra_retries(self._conn, issue.id)
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "failed",
+                    ended_at=ended_at,
+                )
+                return run_id
+
+            state = await db.acceptance_state.get(self._conn, issue.id)
             await db.runs.update_status(
                 self._conn,
                 run_id,
                 "failed",
                 ended_at=ended_at,
             )
+            if state.iteration < ACCEPTANCE_FIX_ITERATION_CAP:
+                dispatched = await self._dispatch_acceptance_fix_run(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    pr_head_sha=pr_head_sha,
+                    verdict=verdict,
+                )
+                if dispatched:
+                    return run_id
+                log.warning(
+                    "acceptance fix-run did not advance %s; opening operator wait",
+                    issue.identifier,
+                )
+
+            await self._track_acceptance_rejected_wait(issue.id, run_id, binding)
+            body = acceptance_rejected(
+                CommentVars(
+                    stage="acceptance",
+                    repo=binding.github_repo,
+                    issue=pr_number,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                )
+            )
+            try:
+                await self.linear.post_comment(issue.id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "acceptance rejected wait comment failed on %s: %s",
+                    issue.identifier,
+                    e,
+                )
             return run_id
         except Exception:
             log.exception("acceptance stage failed for %s", issue.identifier)
@@ -6594,6 +6777,159 @@ class Orchestrator:
                 and run_id not in self._operator_wait_run_ids
             ):
                 self._dispatch_run_ids.pop(issue.id, None)
+
+    async def _dispatch_acceptance_fix_run(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        pr_head_sha: str,
+        verdict: AcceptanceVerdict,
+    ) -> bool:
+        await db.acceptance_state.bump_iteration(self._conn, issue.id)
+        prompt = acceptance_fix_prompt(
+            issue_title=issue.title,
+            issue_body=issue.description,
+            labels=list(issue.labels),
+            acceptance_verdict=format_acceptance_verdict_comment(
+                verdict=verdict,
+                pr_url=pr_url,
+            ),
+        )
+
+        try:
+            workspace_path = await self._workspace.acquire(binding, issue)
+        except Exception:  # noqa: BLE001
+            log.exception("workspace acquire failed for acceptance fix-run %s", issue.identifier)
+            return False
+
+        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        try:
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not fetch acceptance fix-run remote HEAD for %s: %s",
+                    branch,
+                    e,
+                )
+                return False
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                start_sha = pr_head_sha
+            if not start_sha:
+                log.warning(
+                    "could not read acceptance fix-run remote HEAD for %s",
+                    branch,
+                )
+                return False
+
+            fix_run_id = str(uuid.uuid4())
+            await db.runs.create(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="acceptance_fix",
+                status="running",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            try:
+                prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+                cost, final_kind, final_returncode = await self._run_acceptance_fix_agent(
+                    binding=binding,
+                    issue=issue,
+                    run_id=fix_run_id,
+                    workspace_path=workspace_path,
+                    prompt=prompt,
+                    prior_total=prior_total,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("acceptance fix-run execution failed for %s", issue.identifier)
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                return False
+            finally:
+                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
+
+            if cost > 0:
+                await db.runs.add_cost(self._conn, fix_run_id, cost)
+
+            transition = on_runner_event(
+                stage="acceptance_fix",
+                event_kind=final_kind,
+                returncode=final_returncode,
+            )
+            if transition.next_run_status != "completed":
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    transition.next_run_status,
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                return False
+
+            pushed_sha = await _workspace_head_sha(workspace_path)
+            if not pushed_sha or pushed_sha == start_sha:
+                short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
+                status_short = await _git_status_short(workspace_path)
+                log.warning(
+                    "acceptance fix-run completed without advancing %s; "
+                    "HEAD stayed at %s; status=%s",
+                    branch,
+                    short_sha,
+                    status_short,
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                return False
+
+            try:
+                await self._push_fn(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "git push failed for acceptance fix-run %s: %s",
+                    issue.identifier,
+                    e,
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                return False
+
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+            await self._run_acceptance_stage(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_head_sha=pushed_sha,
+                reset_iteration=False,
+            )
+            return True
+        finally:
+            self._workspace.release(binding, issue)
 
     def _schedule_merge_conflict_rebase_fix(
         self,
@@ -8596,6 +8932,34 @@ class Orchestrator:
             binding=binding,
             issue=issue,
             activity_stage="review_fix",
+            prior_total=prior_total,
+        )
+
+    async def _run_acceptance_fix_agent(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        workspace_path: Path,
+        prompt: str,
+        prior_total: float,
+    ) -> tuple[float, str, int | None]:
+        command = build_fix_runner_command(
+            binding.agent,
+            prompt,
+            codex_model=binding.codex_model,
+        )
+        return await self._run_runner(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            stage="acceptance_fix",
+            agent=binding.agent,
+            codex_model=binding.codex_model,
+            binding=binding,
+            issue=issue,
+            activity_stage="acceptance_fix",
             prior_total=prior_total,
         )
 

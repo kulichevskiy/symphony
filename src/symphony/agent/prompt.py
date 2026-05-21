@@ -98,6 +98,38 @@ def review_comment_fix_prompt(
     )
 
 
+def acceptance_fix_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    acceptance_verdict: str,
+) -> str:
+    """Build the prompt for an Acceptance-stage fix-run."""
+    label_line = ", ".join(labels) if labels else "(no labels)"
+    body = issue_body.strip() if issue_body else "(no description)"
+    verdict = acceptance_verdict.strip() or "(no acceptance verdict details available)"
+    return (
+        "You are Symphony's Acceptance-stage fix-run agent.\n"
+        "The acceptance agent rejected the current PR because of a product/UX "
+        "mismatch, not a code-review defect. Treat this as a fresh "
+        "implement-style attempt to make the product behavior match the "
+        "Linear issue.\n\n"
+        "# Acceptance verdict\n\n"
+        f"{verdict}\n\n"
+        "# Issue\n\n"
+        f"## Title\n{issue_title}\n\n"
+        f"## Labels\n{label_line}\n\n"
+        f"## Description\n{body}\n\n"
+        "# Working agreement\n\n"
+        "- Make the smallest change that resolves the product/UX mismatch.\n"
+        "- Commit your changes on the current branch (do not push).\n"
+        "- Follow strict TDD where practical: reproduce the mismatch first, "
+        "then fix it.\n"
+        "- Do not edit unrelated files.\n"
+    )
+
+
 def merge_conflict_fix_prompt(
     *,
     issue_title: str,
