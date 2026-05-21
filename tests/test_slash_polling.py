@@ -539,6 +539,112 @@ async def test_merge_approve_after_restart_dispatches_from_unread_comment(
 
 
 @pytest.mark.asyncio
+async def test_skip_acceptance_after_restart_dispatches_merge(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$skip-acceptance")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="acceptance-run",
+            kind=db.operator_waits.KIND_ACCEPTANCE_REJECTED,
+            stage="acceptance",
+            status="failed",
+        )
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
+            mode="code_only",
+            preview_url="",
+            extracted_criteria="[]",
+        )
+        await db.acceptance_state.bump_iteration(conn, "iss-1")
+        await db.acceptance_state.record_verdict(
+            conn,
+            "iss-1",
+            verdict="reject",
+            artifacts_url="",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.comments_since.assert_awaited_once()
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("$skip-acceptance" in body and "merge" in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_acceptance_after_restart_resets_state_and_dispatches_acceptance(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$retry-acceptance")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="acceptance-run",
+            kind=db.operator_waits.KIND_ACCEPTANCE_REJECTED,
+            stage="acceptance",
+            status="failed",
+        )
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
+            mode="code_only",
+            preview_url="",
+            extracted_criteria="[]",
+        )
+        await db.acceptance_state.bump_iteration(conn, "iss-1")
+        await db.acceptance_state.record_verdict(
+            conn,
+            "iss-1",
+            verdict="reject",
+            artifacts_url="",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_acceptance = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.comments_since.assert_awaited_once()
+        orch._schedule_acceptance.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        state = await db.acceptance_state.get(conn, "iss-1")
+        assert state.iteration == 0
+        assert state.pr_number is None
+        assert state.last_verdict == ""
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("$retry-acceptance" in body and "acceptance" in body for body in bodies)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_cursor_persisted_after_fetch(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

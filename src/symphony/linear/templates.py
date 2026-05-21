@@ -270,3 +270,35 @@ def skip_review_forced(v: CommentVars) -> str:
         f"- Run ID: `{v.run_id}`\n\n"
         f"Review stage cancelled. Dispatching merge now.\n"
     )
+
+
+def acceptance_rejected(v: CommentVars) -> str:
+    return (
+        f"🟠 **Acceptance rejected — pipeline paused**\n\n"
+        f"Acceptance still rejected `{v.repo}#{v.issue}` after the "
+        "acceptance fix attempt.\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n\n"
+        "Reply with `$skip-acceptance` to dispatch merge anyway, or "
+        "`$retry-acceptance` to reset acceptance state and run acceptance again.\n"
+    )
+
+
+def skip_acceptance_forced(v: CommentVars) -> str:
+    return (
+        f"⏭️ **Acceptance skipped — advancing to merge**\n\n"
+        f"`$skip-acceptance` received on `{v.repo}#{v.issue}`.\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n\n"
+        "Acceptance gate cleared. Dispatching merge now.\n"
+    )
+
+
+def retry_acceptance_requested(v: CommentVars) -> str:
+    return (
+        f"✅ **Acceptance retry requested** on `{v.repo}#{v.issue}`\n\n"
+        f"- PR: {v.pr_url}\n"
+        f"- Run ID: `{v.run_id}`\n\n"
+        "`$retry-acceptance` cleared the acceptance state. Dispatching a fresh "
+        "acceptance run now.\n"
+    )

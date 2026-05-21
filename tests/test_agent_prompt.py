@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from symphony.agent.prompt import implement_prompt
+from symphony.agent.prompt import acceptance_fix_prompt, implement_prompt
 
 
 def test_implement_prompt_includes_title_body_and_labels() -> None:
@@ -32,3 +32,20 @@ def test_implement_prompt_is_deterministic() -> None:
     a = implement_prompt(issue_title="t", issue_body="b", labels=["x"])
     b = implement_prompt(issue_title="t", issue_body="b", labels=["x"])
     assert a == b
+
+
+def test_acceptance_fix_prompt_frames_product_mismatch_not_code_review() -> None:
+    prompt = acceptance_fix_prompt(
+        issue_title="Improve onboarding",
+        issue_body="The signup flow should explain the workspace step.",
+        labels=["product", "ux"],
+        acceptance_verdict=(
+            "The PR adds validation but still does not explain the workspace step."
+        ),
+    )
+
+    assert "Acceptance-stage fix-run agent" in prompt
+    assert "product/UX mismatch" in prompt
+    assert "not a code-review defect" in prompt
+    assert "The PR adds validation" in prompt
+    assert "Review-stage fix-run agent" not in prompt

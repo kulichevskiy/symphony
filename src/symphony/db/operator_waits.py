@@ -19,6 +19,7 @@ KIND_REVIEW_FAILED = "review_failed"
 KIND_REVIEW_STOPPED = "review_stopped"
 KIND_MERGE = "merge"
 KIND_ACCEPTANCE_BLOCKED = "acceptance_blocked"
+KIND_ACCEPTANCE_REJECTED = "acceptance_rejected"
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ async def delete(
 
 __all__ = [
     "KIND_ACCEPTANCE_BLOCKED",
+    "KIND_ACCEPTANCE_REJECTED",
     "KIND_COST_CAP",
     "KIND_IMPLEMENT_FAILED",
     "KIND_MERGE",

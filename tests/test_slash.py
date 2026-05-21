@@ -38,6 +38,8 @@ def test_parses_known_commands() -> None:
             _c("$skip-acceptance"),
             _c("$skip-review"),
             _c("$skip-local-review"),
+            _c("$skip-acceptance"),
+            _c("$retry-acceptance"),
         ]
     )
     assert [i.kind for i in intents] == [
@@ -49,6 +51,8 @@ def test_parses_known_commands() -> None:
         SlashKind.SKIP_ACCEPTANCE,
         SlashKind.SKIP_REVIEW,
         SlashKind.SKIP_LOCAL_REVIEW,
+        SlashKind.SKIP_ACCEPTANCE,
+        SlashKind.RETRY_ACCEPTANCE,
     ]
 
 

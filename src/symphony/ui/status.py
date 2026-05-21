@@ -90,6 +90,7 @@ ALWAYS_STUCK_STATES = frozenset(
 DEAD_RUN_STATUSES: frozenset[str] = frozenset({"failed", "interrupted"})
 
 OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
+    operator_waits.KIND_ACCEPTANCE_REJECTED: CanonicalState.PAUSED,
     operator_waits.KIND_IMPLEMENT_FAILED: CanonicalState.HALTED,
     operator_waits.KIND_REVIEW_FAILED: CanonicalState.HALTED,
     operator_waits.KIND_REVIEW_STOPPED: CanonicalState.PAUSED,

@@ -134,18 +134,20 @@ async def begin_acceptance(
     mode: AcceptanceMode,
     preview_url: str,
     extracted_criteria: str,
+    reset_iteration: bool = True,
 ) -> None:
     """Initialize durable state for a fresh Acceptance stage."""
     old = await _get_existing(conn, issue_id)
+    iteration = 0 if reset_iteration or old is None else old.iteration
     await conn.execute(
         """
         INSERT INTO acceptance_state (
             issue_id, iteration, pr_number, pr_url, pr_head_sha, mode, preview_url,
             extracted_criteria, last_verdict, last_artifacts_url, infra_retries
         )
-        VALUES (?, 0, ?, ?, ?, ?, ?, ?, '', '', 0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0)
         ON CONFLICT(issue_id) DO UPDATE SET
-            iteration = 0,
+            iteration = excluded.iteration,
             pr_number = excluded.pr_number,
             pr_url = excluded.pr_url,
             pr_head_sha = excluded.pr_head_sha,
@@ -165,6 +167,7 @@ async def begin_acceptance(
         """,
         (
             issue_id,
+            iteration,
             pr_number,
             pr_url,
             pr_head_sha,
