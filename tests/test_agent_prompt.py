@@ -63,4 +63,5 @@ def test_merge_prompt_limits_final_edits_to_housekeeping_files() -> None:
     assert "generated build manifests" in prompt
     assert ".changeset/CHANGELOG-style housekeeping" in prompt
     assert "Do not edit any source files, tests, configs, schemas, or migrations" in prompt
-    assert "exit successfully without committing" in prompt
+    assert "exit with a non-zero status" in prompt
+    assert "merge will pause" not in prompt
