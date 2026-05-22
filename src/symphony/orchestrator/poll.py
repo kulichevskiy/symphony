@@ -394,7 +394,6 @@ def build_runner_command(
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
-            workspace_path=workspace_path,
         )
     raise ValueError(f"unknown agent {agent!r}")
 
@@ -4051,7 +4050,6 @@ class Orchestrator:
             command = build_codex_workspace_write_command(
                 prompt=prompt,
                 codex_model=binding.codex_model,
-                workspace_path=workspace_path,
             )
             codex_binding = binding.model_copy(update={"agent": "codex"})
             warning_pct = effective_warning_pct(

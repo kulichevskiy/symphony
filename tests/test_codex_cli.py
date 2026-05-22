@@ -14,18 +14,14 @@ from symphony.agent.codex_cli import (
     SYMPHONY_PERMISSIONS_PROFILE_TOML,
     CodexPermissionsProfileError,
     build_codex_workspace_write_command,
-    codex_project_root_write_config,
     ensure_symphony_permissions_profile,
 )
 
 
-def test_build_codex_workspace_write_command_uses_named_permissions_profile(
-    tmp_path: Path,
-) -> None:
+def test_build_codex_workspace_write_command_uses_named_permissions_profile() -> None:
     argv = build_codex_workspace_write_command(
         prompt="fix this",
         codex_model="gpt-5.1-codex",
-        workspace_path=tmp_path,
     )
 
     assert argv[:3] == ["codex", "exec", "--json"]
@@ -35,36 +31,9 @@ def test_build_codex_workspace_write_command_uses_named_permissions_profile(
     assert configs == [
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         CODEX_APPROVAL_POLICY_CONFIG,
-        codex_project_root_write_config(tmp_path),
     ]
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
     assert argv[-1] == "fix this"
-
-
-def test_build_codex_workspace_write_command_pins_worktree_project_root(
-    tmp_path: Path,
-) -> None:
-    workspace_path = tmp_path / "workspaces" / "vib-94"
-    workspace_path.mkdir(parents=True)
-
-    argv = build_codex_workspace_write_command(
-        prompt="fix this",
-        codex_model="gpt-5.1-codex",
-        workspace_path=workspace_path,
-    )
-
-    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
-    project_root_configs = [
-        config
-        for config in configs
-        if 'filesystem.":project_roots"' in config
-    ]
-    assert len(project_root_configs) == 1
-    parsed = tomllib.loads(project_root_configs[0])
-    roots = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]["filesystem"][
-        ":project_roots"
-    ]
-    assert roots[str(workspace_path.resolve())] == "write"
 
 
 def test_ensure_symphony_permissions_profile_creates_missing_config(

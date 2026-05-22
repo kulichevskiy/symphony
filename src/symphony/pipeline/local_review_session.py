@@ -85,7 +85,6 @@ def _build_fix_command(
     agent: ImplementerAgent,
     codex_model: str,
     prompt: str,
-    workspace_path: Path,
 ) -> list[str]:
     """Mirror `build_fix_runner_command` without importing from orchestrator.
 
@@ -106,7 +105,6 @@ def _build_fix_command(
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
-            workspace_path=workspace_path,
         )
     raise ValueError(f"unknown implementer agent {agent!r}")
 
@@ -253,7 +251,6 @@ async def run_local_review_session(
             agent=implementer_agent,
             codex_model=implementer_codex_model,
             prompt=prompt,
-            workspace_path=workspace_path,
         )
         spec = RunnerSpec(
             run_id=_safe_run_id(parent_run_id, f"fix-{iteration}"),

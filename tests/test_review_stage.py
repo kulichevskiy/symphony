@@ -25,7 +25,6 @@ from symphony import db
 from symphony.agent.codex_cli import (
     CODEX_APPROVAL_POLICY_CONFIG,
     CODEX_DEFAULT_PERMISSIONS_CONFIG,
-    codex_project_root_write_config,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
@@ -498,7 +497,6 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert configs == [
             CODEX_DEFAULT_PERMISSIONS_CONFIG,
             CODEX_APPROVAL_POLICY_CONFIG,
-            codex_project_root_write_config(workspace_path),
         ]
         assert command[command.index("--model") + 1] == "gpt-5.1-codex-max"
         prompt = command[-1]
@@ -1745,7 +1743,6 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex(
     assert configs == [
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         CODEX_APPROVAL_POLICY_CONFIG,
-        codex_project_root_write_config(tmp_path),
     ]
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert "fix this" in argv
@@ -1778,7 +1775,6 @@ def test_build_runner_command_allows_git_writes_for_codex_implement(
     assert configs == [
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         CODEX_APPROVAL_POLICY_CONFIG,
-        codex_project_root_write_config(tmp_path),
     ]
     assert argv[-1] == "implement this"
 
