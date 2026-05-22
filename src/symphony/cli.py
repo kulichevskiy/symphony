@@ -34,7 +34,6 @@ from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
 from .webhook import WebhookSettings
 
-
 _ANSI_RESET = "\x1b[0m"
 _ANSI_DIM = "\x1b[2m"
 _ANSI_YELLOW = "\x1b[33m"

@@ -17,6 +17,7 @@ from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
+from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
 
 class _FakeRunner:
@@ -55,6 +56,44 @@ class _BlockingRunner:
 
     async def kill(self, run_id: str) -> None:
         self.release.set()
+
+
+class _CommittingRunner:
+    def __init__(self) -> None:
+        self.captured_spec: RunnerSpec | None = None
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.captured_spec = spec
+        return self._aiter(spec)
+
+    async def _aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        yield RunnerEvent(kind="started", pid=123)
+        (spec.workspace_path / "merge-agent.txt").write_text(
+            "merge agent final fix\n",
+            encoding="utf-8",
+        )
+        await _git(spec.workspace_path, "add", "merge-agent.txt")
+        await _git(spec.workspace_path, "commit", "-m", "merge agent final fix")
+        yield RunnerEvent(kind="exit", returncode=0)
+
+    async def kill(self, _run_id: str) -> None:
+        return None
+
+
+async def _git(workspace_path: Path, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=workspace_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    assert proc.returncode == 0, (
+        f"git {' '.join(args)} failed with {proc.returncode}: "
+        f"{stderr.decode().strip()}"
+    )
+    return stdout.decode().strip()
 
 
 async def _poll_and_wait(orch: Orchestrator) -> None:
@@ -235,6 +274,7 @@ def _make_merge_wait_orchestrator(
     conn,
     *,
     gh_view: dict[str, object],
+    review_verdict: Verdict | None = None,
     linear: AsyncMock | None = None,
 ) -> Orchestrator:  # type: ignore[no-untyped-def]
     gh = MagicMock()
@@ -243,7 +283,7 @@ def _make_merge_wait_orchestrator(
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.post_comment = AsyncMock(return_value="cmt-1")
-    return Orchestrator(
+    orch = Orchestrator(
         Config(repos=[_binding()]),
         linear,
         conn,
@@ -252,6 +292,10 @@ def _make_merge_wait_orchestrator(
         workspace=MagicMock(),
         push_fn=AsyncMock(),
     )
+    if review_verdict is None:
+        review_verdict = Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+    orch._review_verdict_for_pr = AsyncMock(return_value=review_verdict)  # type: ignore[method-assign]  # noqa: SLF001
+    return orch
 
 
 @pytest.mark.asyncio
@@ -513,6 +557,7 @@ async def test_reconcile_merge_wait_clean_dispatches_fresh_merge(
         await scheduled
 
         orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._review_verdict_for_pr.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
         kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
         assert kwargs["pr_number"] == 42
         assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
@@ -520,6 +565,39 @@ async def test_reconcile_merge_wait_clean_dispatches_fresh_merge(
         comment = orch.linear.post_comment.await_args.args[1]
         assert "clean merge retry" in comment
         assert "no `$approve` needed" in comment
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_merge_wait_clean_no_signal_does_not_schedule_merge(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "mergedAt": None,
+            },
+            review_verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        dispatched = await orch._reconcile_auto_recoverable_merge_waits()  # noqa: SLF001
+        await scheduled
+
+        assert dispatched == 0
+        orch._review_verdict_for_pr.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch.linear.post_comment.assert_not_awaited()
+        assert await db.operator_waits.get(conn, "iss-1") is not None
     finally:
         await conn.close()
 
@@ -1465,6 +1543,123 @@ async def test_tick_schedules_merge_before_new_implementation_when_capacity_is_f
             runner.release.set()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_agent_new_commit_requires_fresh_review_before_merge(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+
+        workspace_path = tmp_path / "ws" / "org" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        await _git(workspace_path, "init")
+        await _git(workspace_path, "config", "user.email", "test@example.com")
+        await _git(workspace_path, "config", "user.name", "Test User")
+        (workspace_path / "README.md").write_text("base\n", encoding="utf-8")
+        await _git(workspace_path, "add", "README.md")
+        await _git(workspace_path, "commit", "-m", "base")
+        await _git(workspace_path, "checkout", "-b", "symphony/eng-1")
+        approved_head_sha = await _git(workspace_path, "rev-parse", "HEAD")
+
+        runner = _CommittingRunner()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        pr_view_calls = 0
+
+        async def pr_view(_pr_number: int, *, repo: str) -> dict[str, object]:
+            nonlocal pr_view_calls
+            assert repo == "org/repo"
+            pr_view_calls += 1
+            head_sha = approved_head_sha
+            if pr_view_calls > 1:
+                head_sha = await _git(workspace_path, "rev-parse", "HEAD")
+            return {
+                "headRefOid": head_sha,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "mergedAt": None,
+            }
+
+        gh.pr_view = AsyncMock(side_effect=pr_view)
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": approved_head_sha,
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_comment = AsyncMock()
+        gh.pr_merge = AsyncMock()
+        push_fn = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        new_head_sha = await _git(workspace_path, "rev-parse", "HEAD")
+        assert new_head_sha != approved_head_sha
+        push_fn.assert_awaited_once()
+        gh.pr_merge.assert_not_awaited()
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "needs_approval"
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any(
+            f"merge-agent pushed unreviewed HEAD {new_head_sha}" in body
+            for body in bodies
+        )
     finally:
         await conn.close()
 

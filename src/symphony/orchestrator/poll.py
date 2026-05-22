@@ -2500,6 +2500,34 @@ class Orchestrator:
         if classifier is None:
             return False
 
+        approved_head_sha = str(view.get("headRefOid") or "")
+        if classifier == "clean merge retry":
+            try:
+                verdict = await self._review_verdict_for_pr(
+                    binding=binding,
+                    pr_number=pr.pr_number,
+                    view=view,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not classify review before clean merge wait reconcile "
+                    "%s#%d: %s",
+                    binding.github_repo,
+                    pr.pr_number,
+                    e,
+                )
+                return False
+            if verdict.kind is not VerdictKind.APPROVED:
+                log.info(
+                    "skipping clean merge wait reconcile for %s#%d: current HEAD "
+                    "%s is not approved (%s)",
+                    binding.github_repo,
+                    pr.pr_number,
+                    approved_head_sha[:12] or "(unknown)",
+                    verdict.rule or verdict.kind.value,
+                )
+                return False
+
         async with self._schedule_lock:
             current_wait = await db.operator_waits.get(self._conn, wait.issue_id)
             if current_wait != wait:
@@ -2549,6 +2577,7 @@ class Orchestrator:
                     issue=issue,
                     pr_number=pr.pr_number,
                     pr_url=pr.pr_url,
+                    approved_head_sha=approved_head_sha,
                     on_started=clear_reconciled_merge_wait,
                 )
             log.info(
@@ -6217,6 +6246,7 @@ class Orchestrator:
                         issue=issue,
                         pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
+                        approved_head_sha=head_sha,
                         skip_review=verdict.kind is not VerdictKind.APPROVED,
                         on_started=on_started,
                     )
@@ -6768,6 +6798,7 @@ class Orchestrator:
                         issue=merge_issue,
                         pr_number=pr_number,
                         pr_url=pr_url,
+                        approved_head_sha=pr_head_sha,
                     )
                 return run_id
 
@@ -7038,6 +7069,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> asyncio.Task[None]:
@@ -7049,6 +7081,7 @@ class Orchestrator:
                 issue=issue,
                 pr_number=pr_number,
                 pr_url=pr_url,
+                approved_head_sha=approved_head_sha,
                 skip_review=skip_review,
                 on_started=on_started,
             )
@@ -7070,6 +7103,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
@@ -7089,6 +7123,7 @@ class Orchestrator:
                         issue=current,
                         pr_number=pr_number,
                         pr_url=pr_url,
+                        approved_head_sha=approved_head_sha,
                         skip_review=skip_review,
                         on_started=on_started,
                     )
@@ -7729,6 +7764,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
@@ -7874,7 +7910,54 @@ class Orchestrator:
                     pr_number,
                     e,
                 )
+                if approved_head_sha:
+                    await self._mark_merge_needs_approval(
+                        binding=binding,
+                        issue=issue,
+                        pr_url=pr_url,
+                        run_id=run_id,
+                        reason=f"post-push HEAD verification failed: {e}",
+                    )
+                    return run_id
             else:
+                premerge_head_sha = str(premerge_view.get("headRefOid") or "")
+                if approved_head_sha and premerge_head_sha != approved_head_sha:
+                    try:
+                        verdict = await self._review_verdict_for_pr(
+                            binding=binding,
+                            pr_number=pr_number,
+                            view=premerge_view,
+                        )
+                    except GitHubError as e:
+                        log.warning(
+                            "could not classify review for post-merge-agent HEAD "
+                            "%s#%d at %s: %s",
+                            binding.github_repo,
+                            pr_number,
+                            premerge_head_sha[:12] or "(unknown)",
+                            e,
+                        )
+                        verdict = None
+                    if verdict is None or verdict.kind is not VerdictKind.APPROVED:
+                        reason = (
+                            "merge-agent pushed unreviewed HEAD "
+                            f"{premerge_head_sha or '(unknown)'}"
+                        )
+                        await self._mark_merge_needs_approval(
+                            binding=binding,
+                            issue=issue,
+                            pr_url=pr_url,
+                            run_id=run_id,
+                            reason=reason,
+                        )
+                        state = await db.review_state.get(self._conn, issue.id)
+                        await self._retrigger_codex_review_unless_approved(
+                            binding=binding,
+                            issue=issue,
+                            state=state,
+                        )
+                        return run_id
+
                 if _pr_view_has_merge_conflict(premerge_view):
                     await self._dispatch_merge_conflict_rebase_fix_run(
                         binding=binding,
