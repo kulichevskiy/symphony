@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from symphony.agent.prompt import acceptance_fix_prompt, implement_prompt
+from symphony.agent.prompt import acceptance_fix_prompt, implement_prompt, merge_prompt
 
 
 def test_implement_prompt_includes_title_body_and_labels() -> None:
@@ -49,3 +49,20 @@ def test_acceptance_fix_prompt_frames_product_mismatch_not_code_review() -> None
     assert "not a code-review defect" in prompt
     assert "The PR adds validation" in prompt
     assert "Review-stage fix-run agent" not in prompt
+
+
+def test_merge_prompt_limits_final_edits_to_housekeeping_files() -> None:
+    prompt = merge_prompt(
+        issue_title="Update generated artifacts",
+        issue_body="The PR is ready to merge.",
+        labels=["improvement"],
+        pr_url="https://github.com/example/repo/pull/123",
+    )
+
+    assert "lockfiles" in prompt
+    assert "generated build manifests" in prompt
+    assert ".changeset/CHANGELOG-style housekeeping" in prompt
+    assert "Do not edit any source files, tests, configs, schemas, or migrations" in prompt
+    assert "source or test change is needed" in prompt
+    assert "exit successfully without creating a commit" in prompt
+    assert "merge will pause" in prompt
