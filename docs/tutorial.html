@@ -2,8 +2,11 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
 <title>symphonyd — интерактивный учебник</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=Instrument+Serif:ital@0;1&family=Geist:wght@300..700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
 <style>
   :root {
     /* Warm dark palette — editorial */
@@ -27,10 +30,10 @@
     --bad:        #d97070;
     --code-bg:    #15120e;
 
-    --font-sans:    ui-sans-serif, -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
+    --font-sans:    "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     --font-mono:    "JetBrains Mono", "SF Mono", "Menlo", "Consolas", ui-monospace, monospace;
-    --font-serif:   "Iowan Old Style", "Charter", "Cambria", "Georgia", ui-serif, serif;
-    --font-display: var(--font-sans);
+    --font-serif:   "Newsreader", "Iowan Old Style", "Charter", "Cambria", "Georgia", ui-serif, serif;
+    --font-display: "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 
     --r-sm: 4px;
     --r-md: 6px;
@@ -51,13 +54,18 @@
     font-family: var(--font-serif);
     font-size: 19px;
     line-height: 1.65;
+    font-variation-settings: "opsz" 16;
+    font-feature-settings: "kern", "liga", "calt", "onum";
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
     -webkit-text-size-adjust: 100%;
     overflow-wrap: break-word;
   }
-  body { min-height: 100dvh; }
+  body {
+    min-height: 100dvh;
+    background: var(--bg);
+  }
 
   /* UI chrome stays sans */
   aside, header.scn-header, .controls, button, .pill, .legend, .step-counter,
@@ -116,101 +124,184 @@
 
   aside h1 {
     font-family: var(--font-display);
-    font-size: 24px;
+    font-size: 18px;
     font-weight: 600;
-    letter-spacing: -0.015em;
-    margin: 0 0 6px 0;
+    letter-spacing: -0.005em;
+    margin: 0 0 4px 0;
     color: var(--text);
   }
+  aside h1 .accent { color: var(--accent); font-weight: 500; }
   aside .tagline {
     color: var(--muted);
-    font-size: 13.5px;
-    line-height: 1.5;
-    margin-bottom: 28px;
+    font-size: 13px;
+    line-height: 1.55;
+    margin-bottom: 32px;
+    font-family: var(--font-sans);
+    font-weight: 300;
+    letter-spacing: 0.005em;
   }
   aside h2 {
-    font-size: 11px;
+    font-size: 10.5px;
     text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--muted);
-    margin: 28px 0 8px 0;
-    font-weight: 600;
+    letter-spacing: 0.18em;
+    color: var(--muted-2);
+    margin: 32px 0 10px 0;
+    font-weight: 500;
+    font-family: var(--font-sans);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  aside h2::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border-3);
   }
   aside h2:first-of-type { margin-top: 0; }
-  aside ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 2px; }
+  aside h2:first-of-type::after { display: none; }
+  aside ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 1px; }
   aside li {
-    padding: 10px 12px;
+    padding: 11px 12px 11px 14px;
     border-radius: var(--r-sm);
     cursor: pointer;
-    font-size: 14.5px;
+    font-size: 14px;
     color: var(--text-dim);
     line-height: 1.4;
-    transition: background 0.12s, color 0.12s;
+    font-family: var(--font-sans);
+    font-weight: 400;
+    letter-spacing: 0.002em;
+    transition: background 0.18s, color 0.18s, padding-left 0.18s;
     -webkit-tap-highlight-color: transparent;
+    position: relative;
   }
-  aside li:hover { background: rgba(217,119,87,0.06); color: var(--text); }
+  aside li:hover { background: rgba(217,119,87,0.05); color: var(--text); padding-left: 18px; }
   aside li.active {
     background: var(--accent-soft);
     color: var(--accent);
     font-weight: 500;
+    padding-left: 18px;
   }
-  aside li.active .scn-num { color: var(--accent); }
+  aside li.active::before {
+    content: "";
+    position: absolute;
+    left: 4px; top: 12px; bottom: 12px;
+    width: 2px;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+  aside li.active .scn-num { color: var(--accent); font-weight: 500; }
   .scn-num {
-    color: var(--muted);
-    margin-right: 10px;
+    color: var(--muted-2);
+    margin-right: 12px;
     font-variant-numeric: tabular-nums;
-    font-size: 12.5px;
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+    font-weight: 400;
   }
+
+  aside .colophon {
+    margin-top: 40px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border-3);
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    color: var(--muted-2);
+    line-height: 1.6;
+    letter-spacing: 0.01em;
+  }
+  aside .colophon b { color: var(--text-dim); font-weight: 500; }
 
   main {
     padding: 56px var(--pad-main) 96px;
-    min-width: 0;     /* allow inner overflow to scroll */
+    min-width: 0;
     max-width: 100%;
+    animation: fadeUp 0.42s cubic-bezier(0.16, 1, 0.3, 1);
   }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+  }
+  #content { animation: fadeUp 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
 
-  /* ============================================ */
-  /* Scenario header                              */
-  /* ============================================ */
+  /* Scenario header */
   header.scn-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 28px;
-    padding-bottom: 22px;
-    margin-bottom: 32px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: start;
+    column-gap: 28px;
+    padding-bottom: 24px;
+    margin-bottom: 36px;
     border-bottom: 1px solid var(--border-3);
+    position: relative;
   }
-  .scn-title { min-width: 0; flex: 1; }
+  .scn-numeral {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+    padding-top: 10px;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .scn-title { min-width: 0; padding-top: 2px; }
+  .scn-kicker {
+    display: block;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+  .scn-kicker .dot-sep {
+    display: inline-block;
+    width: 3px; height: 3px;
+    border-radius: 50%;
+    background: var(--muted-2);
+    margin: 0 10px;
+    transform: translateY(-2px);
+  }
   .scn-title h2 {
-    margin: 0 0 10px 0;
+    margin: 0 0 12px 0;
     font-family: var(--font-display);
-    font-size: clamp(28px, 3.4vw, 40px);
+    font-size: clamp(28px, 3.2vw, 38px);
     font-weight: 600;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.018em;
     line-height: 1.15;
     text-wrap: balance;
+    color: var(--text);
   }
+  .scn-title h2 em { font-style: normal; color: inherit; }
   .scn-title p {
     margin: 0;
-    color: var(--muted);
+    color: var(--text-dim);
     font-size: 17px;
     line-height: 1.55;
-    max-width: 70ch;
+    max-width: 68ch;
     font-family: var(--font-serif);
     text-wrap: pretty;
+    font-weight: 400;
   }
   .controls {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-shrink: 0;
+    padding-top: 2px;
   }
   .step-counter {
     color: var(--muted);
     font-variant-numeric: tabular-nums;
-    min-width: 64px;
+    min-width: 60px;
     text-align: center;
-    font-size: 13.5px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.04em;
   }
 
   /* ============================================ */
@@ -289,12 +380,11 @@
     padding: 12px;
   }
   .diagram-modal-inner svg.statemachine {
-    width: 100%;
-    max-width: 1400px;
-    min-width: 900px;
+    width: auto;
     height: auto;
-    max-height: none;
-    aspect-ratio: 900 / 600;
+    max-width: min(100%, 1400px);
+    max-height: 100%;
+    aspect-ratio: 900 / 700;
   }
   .diagram-modal-close {
     position: absolute;
@@ -318,38 +408,86 @@
   svg.statemachine {
     width: 100%;
     height: auto;
-    aspect-ratio: 900 / 600;
-    max-height: 520px;
+    aspect-ratio: 900 / 700;
+    max-height: 600px;
     display: block;
   }
   svg .node rect {
     fill: var(--bg-elev);
     stroke: var(--border);
     stroke-width: 1;
-    rx: 6; ry: 6;
     transition: fill 0.25s, stroke 0.25s;
   }
   svg .node text {
     fill: var(--text-dim);
-    font: 12.5px var(--font-sans);
+    font: 500 13px var(--font-sans);
+    letter-spacing: 0.005em;
     text-anchor: middle;
     dominant-baseline: middle;
     pointer-events: none;
   }
-  svg .node.sub rect { fill: var(--bg-softer); }
-  svg .node.side rect { stroke-dasharray: 3 3; }
+  svg .node.sub rect {
+    fill: var(--bg-softer);
+    stroke: var(--border-2);
+  }
+  svg .node.sub text {
+    font-size: 11.5px;
+    fill: var(--muted);
+  }
+  svg .node.side rect {
+    stroke-dasharray: 4 3;
+    stroke: var(--muted-2);
+  }
+  svg .node.side text { fill: var(--muted); }
   svg .node:hover rect { stroke: var(--accent); cursor: pointer; }
+  svg .node:hover text { fill: var(--text); }
   svg .node.active rect { fill: var(--accent); stroke: var(--accent); }
   svg .node.active text { fill: #110f0c; font-weight: 600; }
   svg .node.warn rect { fill: var(--warn); stroke: var(--warn); }
   svg .node.warn text { fill: #110f0c; font-weight: 600; }
   svg .node.bad rect { fill: var(--bad); stroke: var(--bad); }
   svg .node.bad text { fill: #fff; font-weight: 600; }
-  svg .edge { fill: none; stroke: var(--border); stroke-width: 1.25; marker-end: url(#arrow); }
-  svg .edge.active { stroke: var(--accent); stroke-width: 2; }
-  svg .edge.dashed { stroke-dasharray: 4 3; }
-  svg .edge-label { fill: var(--muted); font: 11px var(--font-mono); pointer-events: none; }
-  svg .edge.active + .edge-label { fill: var(--accent); }
+
+  svg .edge {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 1.3;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    marker-end: url(#arrow);
+    transition: stroke 0.2s, stroke-width 0.2s;
+  }
+  svg .edge.dashed {
+    stroke: var(--muted-2);
+    stroke-dasharray: 5 3;
+    marker-end: url(#arrow-dashed);
+  }
+  svg .edge.active {
+    stroke: var(--accent);
+    stroke-width: 2.2;
+    marker-end: url(#arrow-active);
+  }
+
+  svg #arrow path { fill: var(--border); }
+  svg #arrow-dashed path { fill: var(--muted-2); }
+  svg #arrow-active path { fill: var(--accent); }
+
+  svg .edge-label-g rect {
+    fill: var(--bg-soft);
+    stroke: none;
+  }
+  svg .edge-label {
+    fill: var(--muted);
+    font: 500 11px var(--font-mono);
+    letter-spacing: 0.02em;
+    dominant-baseline: middle;
+    pointer-events: none;
+  }
+  svg .edge-label-g[data-for="e-impl-needs"] rect,
+  svg .edge-label-g[data-for="e-review-needs"] rect,
+  svg .edge-label-g[data-for="e-merge-needs"] rect,
+  svg .edge-label-g[data-for="e-accept-needs"] rect,
+  svg .edge-label-g[data-for="e-needs-back"] rect { fill: var(--bg-soft); }
 
   /* ============================================ */
   /* Cards & narrative                            */
@@ -381,41 +519,68 @@
   }
 
   .narrative {
-    font-size: 19px;
-    line-height: 1.72;
+    font-size: 17px;
+    line-height: 1.65;
     color: var(--text);
     max-width: 68ch;
+    font-variation-settings: "opsz" 16;
   }
   .narrative > :first-child { margin-top: 0; }
   .narrative > :last-child { margin-bottom: 0; }
   .narrative h4 {
-    margin: 36px 0 16px 0;
+    margin: 32px 0 14px 0;
     font-family: var(--font-display);
-    font-size: 28px;
+    font-size: 21px;
     font-weight: 600;
-    letter-spacing: -0.015em;
+    letter-spacing: -0.005em;
     color: var(--text);
     line-height: 1.25;
     text-wrap: balance;
+    font-style: normal;
   }
   .narrative h4:first-child { margin-top: 0; }
-  .narrative p { margin: 0 0 18px 0; text-wrap: pretty; }
+  .narrative p { margin: 0 0 16px 0; text-wrap: pretty; }
   .narrative ul { margin: 0 0 18px 0; padding-left: 24px; }
-  .narrative li { margin-bottom: 8px; text-wrap: pretty; }
+  .narrative ul li::marker { color: var(--muted-2); }
+  .narrative li { margin-bottom: 8px; text-wrap: pretty; padding-left: 2px; }
   .narrative strong { color: var(--text); font-weight: 600; }
   .narrative em { font-style: italic; color: var(--text-dim); }
   .narrative .hl { background: var(--accent-soft); padding: 1px 6px; border-radius: 3px; color: var(--accent); }
   .narrative code {
     background: var(--bg-soft);
-    padding: 2px 6px;
+    padding: 1px 6px;
     border-radius: 3px;
     color: var(--accent-2);
-    font-size: 0.85em;
+    font-size: 0.86em;
     border: 1px solid var(--border-3);
     font-family: var(--font-mono);
     overflow-wrap: anywhere;
+    font-weight: 500;
   }
   .narrative a code { color: var(--accent); }
+
+  /* Step title for narrative card */
+  .step-headline {
+    font-family: var(--font-sans);
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin: 0 0 16px 0;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border-3);
+  }
+  .step-headline .num {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    text-transform: none;
+  }
 
   /* "Технически" disclosure */
   .narrative details {
@@ -671,34 +836,69 @@
 
   /* Intro */
   .intro { max-width: 70ch; margin: 0; }
+  .intro-eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 24px;
+  }
+  .intro-eyebrow .line {
+    flex: 0 0 28px;
+    height: 1px;
+    background: var(--accent);
+  }
   .intro h2 {
     font-family: var(--font-display);
-    font-size: clamp(32px, 5vw, 52px);
+    font-size: clamp(32px, 4.4vw, 52px);
     font-weight: 600;
-    letter-spacing: -0.025em;
+    letter-spacing: -0.022em;
     line-height: 1.08;
-    margin: 0 0 36px 0;
+    margin: 0 0 28px 0;
     color: var(--text);
     text-wrap: balance;
   }
-  .intro p {
+  .intro h2 em { font-style: normal; color: inherit; }
+  .intro .lede {
+    font-family: var(--font-serif);
     font-size: 19px;
-    line-height: 1.72;
+    line-height: 1.55;
+    color: var(--text-dim);
+    margin-bottom: 36px;
+    font-style: normal;
+    font-weight: 400;
+    max-width: 60ch;
+    text-wrap: pretty;
+    padding-left: 14px;
+    border-left: 2px solid var(--accent);
+  }
+  .intro p {
+    font-size: 18px;
+    line-height: 1.68;
     color: var(--text);
     margin-bottom: 18px;
     text-wrap: pretty;
   }
+  .intro .has-dropcap { /* drop-cap disabled — too editorial */ }
+  .intro .has-dropcap::first-letter { all: unset; }
   .intro .start-hint {
     color: var(--text);
     margin-top: 36px;
-    padding: 20px 24px;
+    padding: 18px 22px;
     background: var(--bg-soft);
     border: 1px solid var(--border-3);
     border-left: 2px solid var(--accent);
     border-radius: 0 var(--r-sm) var(--r-sm) 0;
-    font-size: 17.5px;
+    font-size: 16px;
     line-height: 1.55;
+    font-family: var(--font-sans);
   }
+  .intro .start-hint strong { color: var(--accent); font-weight: 600; }
 
   /* ============================================ */
   /* Mobile menu toggle & sidebar overlay         */
@@ -707,7 +907,7 @@
     display: none;
     position: fixed;
     top: 12px; left: 12px;
-    z-index: 50;
+    z-index: 70;
     width: 44px; height: 44px;
     align-items: center; justify-content: center;
     background: var(--bg-elev);
@@ -723,31 +923,29 @@
   .menu-toggle:hover { border-color: var(--accent); color: var(--text); }
   .sidebar-bg {
     position: fixed; inset: 0;
-    z-index: 44;
-    background: rgba(10, 8, 6, 0.55);
-    backdrop-filter: blur(2px);
+    z-index: 50;
+    background: rgba(10, 8, 6, 0.6);
     display: none;
   }
   .sidebar-bg.open { display: block; }
 
-  /* ============================================ */
-  /* Mobile sticky bottom nav (scenario mode)     */
-  /* ============================================ */
+  /* Step nav — sticky at bottom in scenario mode, all viewport widths */
   .mobile-nav {
     display: none;
     position: fixed;
     left: 0; right: 0; bottom: 0;
     z-index: 30;
-    background: rgba(24, 21, 17, 0.92);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    background: var(--bg-elev);
     border-top: 1px solid var(--border-3);
     padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
     gap: 10px;
     align-items: center;
   }
+  body.scenario-mode .mobile-nav { display: flex; }
+  body.scenario-mode main { padding-bottom: 96px; }
   .mobile-nav button {
     flex: 1;
+    max-width: 200px;
     min-height: 44px;
     font-size: 14px;
     padding: 10px 12px;
@@ -758,9 +956,10 @@
   .mobile-nav button:hover { border-color: var(--accent); }
   .mobile-nav .step-counter {
     flex-shrink: 0;
-    min-width: 56px;
+    min-width: 80px;
     font-size: 13px;
     color: var(--muted);
+    text-align: center;
   }
   .mobile-nav .progress-bar {
     position: absolute;
@@ -771,6 +970,11 @@
     transition: width 0.2s ease;
   }
 
+  /* On desktop, hide the redundant in-header controls (sticky bar handles it) */
+  @media (min-width: 761px) {
+    header.scn-header .controls { display: none; }
+  }
+
   /* ============================================ */
   /* Tablet — ≤ 1000px                            */
   /* ============================================ */
@@ -778,6 +982,20 @@
     .grid { grid-template-columns: 1fr; gap: 4px; }
     .narrative { max-width: none; }
     .drawer { width: min(520px, 100vw); padding: 32px 28px; }
+    header.scn-header {
+      grid-template-columns: auto 1fr;
+      column-gap: 20px;
+    }
+    header.scn-header .controls {
+      grid-column: 1 / -1;
+      justify-content: flex-end;
+      padding-top: 12px;
+      margin-top: 12px;
+      border-top: 1px solid var(--border-3);
+    }
+    .scn-numeral { font-size: 12px; padding-top: 8px; }
+    .scn-title h2 { font-size: clamp(24px, 3.8vw, 32px); }
+    .scn-title p { font-size: 16px; }
   }
 
   /* ============================================ */
@@ -796,11 +1014,14 @@
       top: 0; left: 0; bottom: 0;
       width: min(86vw, 320px);
       height: 100dvh;
-      z-index: 45;
+      z-index: 60;
+      isolation: isolate;
+      will-change: transform;
       transform: translateX(-100%);
       transition: transform 0.24s cubic-bezier(0.4, 0, 0.2, 1);
       padding: 72px 22px 28px;
       box-shadow: var(--shadow-lg);
+      background: var(--bg-elev);
     }
     aside#sidebar.open { transform: translateX(0); }
     aside li { padding: 12px 12px; font-size: 15px; }
@@ -812,20 +1033,23 @@
     }
 
     header.scn-header {
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 14px;
-      padding-bottom: 18px;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      padding-bottom: 20px;
       margin-bottom: 22px;
     }
+    .scn-numeral { font-size: 11.5px; padding-top: 0; }
+    .scn-title { padding-top: 0; }
+    .scn-kicker { font-size: 10.5px; letter-spacing: 0.16em; margin-bottom: 8px; }
     /* Hide desktop controls — bottom mobile-nav takes over */
     header.scn-header .controls { display: none; }
 
-    .scn-title h2 { font-size: 26px; line-height: 1.2; }
+    .scn-title h2 { font-size: 24px; line-height: 1.2; }
     .scn-title p { font-size: 15.5px; }
 
-    .intro h2 { font-size: 32px; margin-bottom: 24px; }
-    .intro p { font-size: 17px; margin-bottom: 16px; }
+    .intro h2 { font-size: 32px; margin-bottom: 22px; line-height: 1.1; }
+    .intro .lede { font-size: 17px; padding-left: 12px; }
+    .intro p { font-size: 16.5px; margin-bottom: 16px; }
     .intro ul { padding-left: 22px; }
     .intro .start-hint { font-size: 15.5px; padding: 16px 18px; }
 
@@ -856,7 +1080,7 @@
       max-width: none;
       max-height: none;
       height: auto;
-      aspect-ratio: 900 / 600;
+      aspect-ratio: 900 / 700;
       display: block;
       padding: 14px;
     }
@@ -886,7 +1110,6 @@
     .drawer .close-btn { width: 44px; height: 44px; font-size: 30px; }
 
     /* show bottom nav only when scenario is active (toggled by JS body class) */
-    body.scenario-mode .mobile-nav { display: flex; }
     body.scenario-mode main { padding-bottom: 96px; }
   }
 
@@ -895,7 +1118,7 @@
   /* ============================================ */
   @media (max-width: 380px) {
     main { padding: 68px 14px 96px; }
-    .scn-title h2 { font-size: 23px; }
+    .scn-title h2 { font-size: 22px; }
     .intro h2 { font-size: 28px; }
     .narrative h4 { font-size: 20px; }
     .mobile-nav button { font-size: 13.5px; padding: 10px 10px; }
@@ -930,7 +1153,7 @@
 
 <div id="app">
   <aside id="sidebar">
-    <h1>symphonyd</h1>
+    <h1>symphony<span class="accent">d</span></h1>
     <div class="tagline">интерактивный учебник по жизненному циклу issue</div>
 
     <h2>Сценарии</h2>
@@ -944,6 +1167,11 @@
       <li data-ref="slash">Slash-команды</li>
       <li data-ref="verdicts">Verdicts (Review + Acceptance)</li>
     </ul>
+
+    <div class="colophon">
+      Один Python-демон. Три источника правды: <b>Linear</b>, <b>GitHub</b>, <b>SQLite</b>.<br />
+      <span style="opacity:0.7">Учебник — 10 сценариев и 5 справочных разделов.</span>
+    </div>
   </aside>
 
   <main id="content"></main>
@@ -1180,35 +1408,40 @@ const SLASH = [
 //  STATE MACHINE NODES (SVG positions)
 // ============================================================
 const NODES = [
-  { id: "ready",          x: 360, y: 30,  w: 160, h: 38, label: "Ready (Linear)",      kind: "main" },
-  { id: "implement",      x: 360, y: 100, w: 160, h: 38, label: "Implement",            kind: "main" },
-  { id: "local_review",   x: 360, y: 160, w: 160, h: 30, label: "Local review",         kind: "sub"  },
-  { id: "pr_open",        x: 360, y: 220, w: 160, h: 30, label: "PR opened",            kind: "sub"  },
-  { id: "review",         x: 360, y: 290, w: 160, h: 38, label: "Review (monitor)",     kind: "main" },
-  { id: "review_fix",     x: 580, y: 290, w: 160, h: 38, label: "Review fix",           kind: "main" },
-  { id: "merge",          x: 360, y: 380, w: 160, h: 38, label: "Merge",                kind: "main" },
-  { id: "acceptance",     x: 360, y: 460, w: 160, h: 38, label: "Acceptance",           kind: "main" },
-  { id: "acceptance_fix", x: 580, y: 460, w: 160, h: 38, label: "Acceptance fix",       kind: "main" },
-  { id: "done",           x: 360, y: 540, w: 160, h: 38, label: "Done",                 kind: "main" },
-  { id: "needs_approval", x: 110, y: 380, w: 180, h: 38, label: "Needs approval",       kind: "side" },
+  { id: "ready",          x: 370, y: 24,  w: 160, h: 44, label: "Ready (Linear)",      kind: "main" },
+  { id: "implement",      x: 370, y: 102, w: 160, h: 44, label: "Implement",            kind: "main" },
+  { id: "local_review",   x: 370, y: 178, w: 160, h: 36, label: "Local review",         kind: "sub"  },
+  { id: "pr_open",        x: 370, y: 232, w: 160, h: 36, label: "PR opened",            kind: "sub"  },
+  { id: "review",         x: 370, y: 308, w: 160, h: 44, label: "Review (monitor)",     kind: "main" },
+  { id: "review_fix",     x: 680, y: 308, w: 170, h: 44, label: "Review fix",           kind: "main" },
+  { id: "merge",          x: 370, y: 410, w: 160, h: 44, label: "Merge",                kind: "main" },
+  { id: "acceptance",     x: 370, y: 498, w: 160, h: 44, label: "Acceptance",           kind: "main" },
+  { id: "acceptance_fix", x: 680, y: 498, w: 170, h: 44, label: "Acceptance fix",       kind: "main" },
+  { id: "done",           x: 370, y: 600, w: 160, h: 44, label: "Done",                 kind: "main" },
+  { id: "needs_approval", x: 110, y: 410, w: 190, h: 44, label: "Needs approval",       kind: "side" },
 ];
 const EDGES = [
-  { id: "e-ready-impl",         from: "ready",          to: "implement",       label: "" },
-  { id: "e-impl-local",         from: "implement",      to: "local_review",    label: "" },
-  { id: "e-local-pr",           from: "local_review",   to: "pr_open",         label: "" },
-  { id: "e-pr-review",          from: "pr_open",        to: "review",          label: "" },
-  { id: "e-review-fix",         from: "review",         to: "review_fix",      label: "CHANGES_REQUESTED" },
-  { id: "e-fix-review",         from: "review_fix",     to: "review",          label: "fix pushed", curve: "back" },
-  { id: "e-review-merge",       from: "review",         to: "merge",           label: "APPROVED" },
-  { id: "e-merge-accept",       from: "merge",          to: "acceptance",      label: "" },
-  { id: "e-accept-fix",         from: "acceptance",     to: "acceptance_fix",  label: "reject" },
-  { id: "e-fix-accept",         from: "acceptance_fix", to: "acceptance",      label: "rerun", curve: "back" },
-  { id: "e-accept-done",        from: "acceptance",     to: "done",            label: "pass" },
-  { id: "e-impl-needs",         from: "implement",      to: "needs_approval",  label: "fail / cost cap", dashed: true },
-  { id: "e-review-needs",       from: "review",         to: "needs_approval",  label: "iter cap 12 / fail", dashed: true },
-  { id: "e-merge-needs",        from: "merge",          to: "needs_approval",  label: "fail / conflict", dashed: true },
-  { id: "e-accept-needs",       from: "acceptance",     to: "needs_approval",  label: "infra retries exhausted", dashed: true },
-  { id: "e-needs-back",         from: "needs_approval", to: "implement",       label: "$retry / $approve", dashed: true, curve: "back" },
+  // happy path (center column, straight verticals)
+  { id: "e-ready-impl",         from: "ready",          to: "implement",       route: "v",   label: "" },
+  { id: "e-impl-local",         from: "implement",      to: "local_review",    route: "v",   label: "" },
+  { id: "e-local-pr",           from: "local_review",   to: "pr_open",         route: "v",   label: "" },
+  { id: "e-pr-review",          from: "pr_open",        to: "review",          route: "v",   label: "" },
+  { id: "e-review-merge",       from: "review",         to: "merge",           route: "v",   label: "APPROVED" },
+  { id: "e-merge-accept",       from: "merge",          to: "acceptance",      route: "v",   label: "" },
+  { id: "e-accept-done",        from: "acceptance",     to: "done",            route: "v",   label: "pass" },
+  // review fix loop
+  { id: "e-review-fix",         from: "review",         to: "review_fix",      route: "h",   label: "CHANGES_REQUESTED" },
+  { id: "e-fix-review",         from: "review_fix",     to: "review",          route: "arc-top", label: "fix pushed" },
+  // acceptance fix loop
+  { id: "e-accept-fix",         from: "acceptance",     to: "acceptance_fix",  route: "h",   label: "reject" },
+  { id: "e-fix-accept",         from: "acceptance_fix", to: "acceptance",      route: "arc-top", label: "rerun" },
+  // failure paths (dashed → needs_approval, left column)
+  { id: "e-impl-needs",         from: "implement",      to: "needs_approval",  route: "L-down", label: "fail / cost cap", dashed: true },
+  { id: "e-review-needs",       from: "review",         to: "needs_approval",  route: "L-down", label: "iter cap / fail", dashed: true },
+  { id: "e-merge-needs",        from: "merge",          to: "needs_approval",  route: "h",   label: "conflict / fail", dashed: true },
+  { id: "e-accept-needs",       from: "acceptance",     to: "needs_approval",  route: "L-up", label: "infra exhausted", dashed: true },
+  // recovery path (curves around the left)
+  { id: "e-needs-back",         from: "needs_approval", to: "implement",       route: "arc-left", label: "$retry / $approve", dashed: true },
 ];
 
 // ============================================================
@@ -2382,74 +2615,123 @@ function closeDiagramModal() {
 }
 
 function buildSVG() {
-  const W = 900, H = 600;
+  const W = 900, H = 700;
   const lines = [];
-  lines.push(`<svg class="statemachine" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`);
+  lines.push(`<svg class="statemachine" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">`);
   lines.push(`<defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2a313d"/>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z"/>
     </marker>
-    <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6aa6ff"/>
+    <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+    <marker id="arrow-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z"/>
     </marker>
   </defs>`);
 
-  // Edges first
+  // helper: anchors on rect sides
+  const N = (id) => NODES.find(n => n.id === id);
+  const top    = (n) => ({ x: n.x + n.w/2,        y: n.y });
+  const bottom = (n) => ({ x: n.x + n.w/2,        y: n.y + n.h });
+  const left   = (n) => ({ x: n.x,                y: n.y + n.h/2 });
+  const right  = (n) => ({ x: n.x + n.w,          y: n.y + n.h/2 });
+  const fmt    = (p) => `${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
+
+  // Edges (before nodes so nodes paint on top)
+  const labelMarkup = []; // labels rendered after edges, so they're on top
   for (const e of EDGES) {
-    const a = NODES.find(n => n.id === e.from);
-    const b = NODES.find(n => n.id === e.to);
+    const a = N(e.from), b = N(e.to);
     if (!a || !b) continue;
-    const ax = a.x + a.w/2;
-    const ay = a.y + a.h/2;
-    const bx = b.x + b.w/2;
-    const by = b.y + b.h/2;
-    // Anchor on edge of rect facing the other node
-    const [sx, sy] = anchorOnRect(a, bx, by);
-    const [tx, ty] = anchorOnRect(b, ax, ay);
-    let d;
-    if (e.curve === "back") {
-      // Use a curve for back-edges (e.g. fix → review)
-      const mx = (sx + tx) / 2 + 40;
-      const my = (sy + ty) / 2;
-      d = `M ${sx} ${sy} Q ${mx} ${my} ${tx} ${ty}`;
+
+    let d = "", lp = null;          // path data, label position
+    const route = e.route || "v";
+
+    if (route === "v") {
+      // vertical, same column
+      const downward = a.y < b.y;
+      const s = downward ? bottom(a) : top(a);
+      const t = downward ? top(b)    : bottom(b);
+      d = `M ${fmt(s)} L ${fmt(t)}`;
+      lp = { x: s.x + 10, y: (s.y + t.y)/2 + 4, anchor: "start" };
+
+    } else if (route === "h") {
+      // horizontal, same row (or near-same)
+      const rightward = a.x < b.x;
+      const s = rightward ? right(a) : left(a);
+      const t = rightward ? left(b)  : right(b);
+      d = `M ${fmt(s)} L ${fmt(t)}`;
+      lp = { x: (s.x + t.x)/2, y: s.y - 10, anchor: "middle" };
+
+    } else if (route === "arc-top") {
+      // U-arc above two same-row nodes (return path)
+      const s = top(a);
+      const t = top(b);
+      const peakY = Math.min(s.y, t.y) - 44;
+      d = `M ${fmt(s)} C ${s.x} ${peakY} ${t.x} ${peakY} ${t.x} ${t.y}`;
+      lp = { x: (s.x + t.x)/2, y: peakY + 4, anchor: "middle" };
+
+    } else if (route === "L-down" || route === "L-up") {
+      // L-shape: exit horizontally toward target column, then vertical to target top/bottom
+      const isDown = route === "L-down";
+      const s = left(a);                                  // exit source's left edge
+      const cornerX = b.x + b.w/2;                        // target's column
+      const cornerY = s.y;
+      const t = isDown ? top(b) : bottom(b);
+      d = `M ${fmt(s)} L ${cornerX.toFixed(1)} ${cornerY.toFixed(1)} L ${fmt(t)}`;
+      // place label midpoint of horizontal leg
+      lp = { x: (s.x + cornerX)/2, y: s.y - 10, anchor: "middle" };
+
+    } else if (route === "arc-left") {
+      // wide bezier curving on the left margin: needs_approval → implement
+      const s = left(a);                                  // exit source's left
+      const t = left(b);                                  // enter target's left
+      const cx1 = 24, cy1 = s.y;
+      const cx2 = 24, cy2 = t.y;
+      d = `M ${fmt(s)} C ${cx1} ${cy1} ${cx2} ${cy2} ${fmt(t)}`;
+      lp = { x: 36, y: (s.y + t.y)/2 + 4, anchor: "start" };
+
     } else {
-      d = `M ${sx} ${sy} L ${tx} ${ty}`;
+      // fallback: straight center-to-center
+      const ax = a.x + a.w/2, ay = a.y + a.h/2;
+      const bx = b.x + b.w/2, by = b.y + b.h/2;
+      d = `M ${ax} ${ay} L ${bx} ${by}`;
+      lp = { x: (ax+bx)/2, y: (ay+by)/2 - 8, anchor: "middle" };
     }
+
     const dashed = e.dashed ? " dashed" : "";
     lines.push(`<path id="${e.id}" class="edge${dashed}" d="${d}"/>`);
-    if (e.label) {
-      const lx = (sx + tx)/2 + (e.curve === "back" ? 30 : 6);
-      const ly = (sy + ty)/2 - 4;
-      lines.push(`<text class="edge-label" x="${lx}" y="${ly}">${e.label}</text>`);
+
+    if (e.label && lp) {
+      // measure-ish: each char ~5.5px at 11px font
+      const padX = 7, padY = 3;
+      const textW = e.label.length * 5.7 + padX * 2;
+      const textH = 11 + padY * 2;
+      let bx = lp.x, by = lp.y - textH/2 + 2;
+      if (lp.anchor === "middle") bx = lp.x - textW/2;
+      else if (lp.anchor === "start") bx = lp.x - padX;
+      labelMarkup.push(`<g class="edge-label-g" data-for="${e.id}">
+        <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${textW.toFixed(1)}" height="${textH}" rx="3"/>
+        <text class="edge-label" x="${lp.x.toFixed(1)}" y="${(lp.y + 3).toFixed(1)}" text-anchor="${lp.anchor}">${e.label}</text>
+      </g>`);
     }
   }
 
   // Nodes
   for (const n of NODES) {
     const kindClass = n.kind === "sub" ? " sub" : n.kind === "side" ? " side" : "";
+    const rx = n.kind === "sub" ? 6 : 10;
     lines.push(`<g class="node${kindClass}" id="node-${n.id}" data-node="${n.id}" transform="translate(${n.x} ${n.y})">
-      <rect width="${n.w}" height="${n.h}" rx="8"/>
-      <text x="${n.w/2}" y="${n.h/2}">${n.label}</text>
+      <rect width="${n.w}" height="${n.h}" rx="${rx}" ry="${rx}"/>
+      <text x="${n.w/2}" y="${n.h/2 + 1}">${n.label}</text>
     </g>`);
   }
 
+  // Labels last → always on top of edges AND nodes
+  lines.push(labelMarkup.join("\n"));
+
   lines.push(`</svg>`);
   return lines.join("\n");
-}
-
-function anchorOnRect(node, tx, ty) {
-  const cx = node.x + node.w/2;
-  const cy = node.y + node.h/2;
-  const dx = tx - cx;
-  const dy = ty - cy;
-  if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) return [cx, cy];
-  const halfW = node.w/2;
-  const halfH = node.h/2;
-  const scale = Math.min(
-    Math.abs(dx) > 0 ? halfW / Math.abs(dx) : Infinity,
-    Math.abs(dy) > 0 ? halfH / Math.abs(dy) : Infinity,
-  );
-  return [cx + dx * scale, cy + dy * scale];
 }
 
 function applyStepHighlights(step) {
@@ -2473,16 +2755,26 @@ function renderScenario() {
   const step = scenario.steps[activeStepIdx];
   const total = scenario.steps.length;
 
+  // Extract leading "N." for an editorial numeral
+  const m = scenario.title.match(/^\s*(\d+)\s*\.\s*(.+)$/);
+  const numeral = m ? m[1] : String(activeScenarioIdx + 1);
+  const cleanTitle = m ? m[2] : scenario.title;
+  const isFailure = activeScenarioIdx >= 3 && activeScenarioIdx <= 7;
+  const isOperator = activeScenarioIdx >= 8;
+  const kind = isFailure ? "Failure path" : isOperator ? "Operator action" : "Happy path";
+
   const content = $("#content");
   content.innerHTML = `
     <header class="scn-header">
+      <div class="scn-numeral">SCEN. ${String(activeScenarioIdx + 1).padStart(2, "0")}</div>
       <div class="scn-title">
-        <h2>${scenario.title}</h2>
+        <span class="scn-kicker">${kind}<span class="dot-sep"></span>${String(activeScenarioIdx + 1).padStart(2, "0")} / ${String(SCENARIOS.length).padStart(2, "0")}</span>
+        <h2>${cleanTitle}</h2>
         <p>${scenario.desc}</p>
       </div>
       <div class="controls">
         <button id="prevStep">‹ Назад</button>
-        <span class="step-counter">${activeStepIdx + 1} / ${total}</span>
+        <span class="step-counter">${String(activeStepIdx + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}</span>
         <button id="nextStep">Вперёд ›</button>
       </div>
     </header>
@@ -2501,7 +2793,7 @@ function renderScenario() {
     </div>
 
     <div class="card">
-      <h3>Шаг ${activeStepIdx + 1}: ${step.title}</h3>
+      <div class="step-headline"><span class="num">${String(activeStepIdx + 1).padStart(2, "0")}</span><span>${step.title}</span></div>
       <div class="narrative">${step.narrative}</div>
     </div>
 
@@ -2539,7 +2831,7 @@ function renderScenario() {
   if (mPrev && mNext && mCounter) {
     mPrev.disabled = activeStepIdx === 0;
     mNext.disabled = activeStepIdx === total - 1;
-    mCounter.textContent = (activeStepIdx + 1) + " / " + total;
+    mCounter.textContent = String(activeStepIdx + 1).padStart(2, "0") + " / " + String(total).padStart(2, "0");
     if (mProgress) mProgress.style.width = ((activeStepIdx + 1) / total * 100) + "%";
   }
   document.body.classList.add("scenario-mode");
@@ -2556,6 +2848,12 @@ function renderScenario() {
   });
 
   applyStepHighlights(step);
+
+  // Re-trigger fade-in on each step change
+  const c = $("#content");
+  c.style.animation = "none";
+  void c.offsetWidth;
+  c.style.animation = "";
 }
 
 function renderDbStep(db) {
@@ -2879,7 +3177,9 @@ function renderIntro() {
   setActiveSidebar();
   $("#content").innerHTML = `
     <div class="intro narrative">
-      <h2>symphonyd — жизненный цикл issue</h2>
+      <div class="intro-eyebrow"><span class="line"></span>symphonyd / docs / lifecycle.book</div>
+      <h2>Жизненный цикл issue</h2>
+      <p class="lede">Один Python-демон ведёт тикет из Linear через Codex, GitHub-ревью и acceptance-проверку. Учебник разбирает каждый шаг — happy path, отклонения и операторские вмешательства.</p>
 
       <h4>Что делает symphony</h4>
       <p>Мы создаём тикет в Linear, вешаем лейбл <code>symphony</code> и переносим в колонку Todo. Через минуту symphony это замечает, поднимает локально Codex в отдельном worktree, тот пишет код и открывает PR в связанном GitHub-репозитории. Дальше symphony ведёт PR через ревью (второй Codex-проход + GitHub CI), мержит, и наконец прогоняет acceptance-проверку — отдельный Codex/Claude-проход, который читает уже смерженный код и решает, реально ли он закрывает то, что просили в тикете.</p>
