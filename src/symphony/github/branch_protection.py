@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import MutableMapping
+from collections.abc import Iterable, MutableMapping
 from urllib.parse import quote
 
 from .client import GitHub
 
 RequiredContextCache = MutableMapping[tuple[str, str], tuple[str, ...]]
+_REQUIRED_CONTEXTS_JQ = (
+    "[.required_status_checks.contexts[]?, "
+    ".required_status_checks.checks[]?.context?] "
+    '| map(select(type == "string" and length > 0))'
+)
 
 
 async def get_required_contexts(
@@ -36,7 +41,7 @@ async def get_required_contexts(
             *host_args,
             f"repos/{owner_repo}/branches/{branch}/protection",
             "--jq",
-            ".required_status_checks.contexts // []",
+            _REQUIRED_CONTEXTS_JQ,
         ]
     )
     contexts = _parse_required_contexts(out)
@@ -52,9 +57,23 @@ def _parse_required_contexts(raw: str) -> tuple[str, ...]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return tuple(line.strip() for line in text.splitlines() if line.strip())
+        return _normalize_required_contexts(text.splitlines())
     if isinstance(parsed, list):
-        return tuple(str(item) for item in parsed if str(item).strip())
+        return _normalize_required_contexts(parsed)
     if isinstance(parsed, str) and parsed.strip():
         return (parsed.strip(),)
     return ()
+
+
+def _normalize_required_contexts(items: Iterable[object]) -> tuple[str, ...]:
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        contexts.append(text)
+        seen.add(text)
+    return tuple(contexts)
