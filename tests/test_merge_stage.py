@@ -16,7 +16,11 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearError, LinearIssue
-from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
+from symphony.orchestrator.poll import (
+    Orchestrator,
+    _binding_storage_key,
+    _status_check_failed,
+)
 from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
 
@@ -36,6 +40,13 @@ class _FakeRunner:
 
     async def kill(self, run_id: str) -> None:
         self.kill_calls.append(run_id)
+
+
+@pytest.mark.parametrize("conclusion", ["STARTUP_FAILURE", "STALE"])
+def test_status_check_failed_includes_terminal_failure_conclusions(
+    conclusion: str,
+) -> None:
+    assert _status_check_failed({"state": "COMPLETED", "conclusion": conclusion})
 
 
 class _BlockingRunner:

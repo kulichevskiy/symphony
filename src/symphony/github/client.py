@@ -660,6 +660,8 @@ def _status_check_summary(raw: object) -> dict[str, object]:
             "CANCELED",
             "TIMED_OUT",
             "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "STALE",
         }:
             failing += 1
         elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
@@ -674,6 +676,8 @@ def _status_check_summary(raw: object) -> dict[str, object]:
             "CANCELED",
             "TIMED_OUT",
             "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "STALE",
         }:
             failing += 1
         else:

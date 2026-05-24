@@ -180,6 +180,7 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
             "statusCheckRollup": [
                 {"state": "SUCCESS"},
                 {"state": "COMPLETED", "conclusion": "FAILURE"},
+                {"state": "COMPLETED", "conclusion": "STARTUP_FAILURE"},
                 {"state": "PENDING"},
             ],
         }
@@ -218,12 +219,13 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
     assert snapshot["merged_by"] == "octo"
     assert snapshot["check_summary"] == {
         "passing": 1,
-        "failing": 1,
+        "failing": 2,
         "pending": 1,
-        "total": 3,
+        "total": 4,
         "checks": [
             {"state": "SUCCESS"},
             {"state": "COMPLETED", "conclusion": "FAILURE"},
+            {"state": "COMPLETED", "conclusion": "STARTUP_FAILURE"},
             {"state": "PENDING"},
         ],
     }
