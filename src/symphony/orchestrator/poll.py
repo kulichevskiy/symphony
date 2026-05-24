@@ -826,7 +826,7 @@ def _required_check_detail(check: Mapping[str, object]) -> dict[str, object]:
 
 
 def _status_check_run_id(check: Mapping[str, object]) -> str:
-    for key in ("runId", "run_id", "databaseId", "database_id"):
+    for key in ("runId", "run_id"):
         value = str(check.get(key) or "").strip()
         if value:
             return value
@@ -841,6 +841,10 @@ def _status_check_run_id(check: Mapping[str, object]) -> str:
         match = re.search(r"/actions/runs/([^/?#]+)", url)
         if match is not None:
             return match.group(1)
+    for key in ("databaseId", "database_id"):
+        value = str(check.get(key) or "").strip()
+        if value:
+            return value
     return ""
 
 

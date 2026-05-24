@@ -21,6 +21,7 @@ from symphony.orchestrator.poll import (
     _binding_storage_key,
     _required_check_trigger_signature,
     _status_check_failed,
+    _status_check_run_id,
 )
 from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
@@ -48,6 +49,27 @@ def test_status_check_failed_includes_terminal_failure_conclusions(
     conclusion: str,
 ) -> None:
     assert _status_check_failed({"state": "COMPLETED", "conclusion": conclusion})
+
+
+def test_status_check_run_id_prefers_workflow_run_over_check_run_database_id() -> None:
+    check = {
+        "__typename": "CheckRun",
+        "databaseId": 456,
+        "workflowRun": {"databaseId": 123},
+        "detailsUrl": "https://github.com/org/repo/actions/runs/789/job/101112",
+    }
+
+    assert _status_check_run_id(check) == "123"
+
+
+def test_status_check_run_id_prefers_actions_url_over_check_run_database_id() -> None:
+    check = {
+        "__typename": "CheckRun",
+        "databaseId": 456,
+        "detailsUrl": "https://github.com/org/repo/actions/runs/789/job/101112",
+    }
+
+    assert _status_check_run_id(check) == "789"
 
 
 class _BlockingRunner:
