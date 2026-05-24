@@ -100,22 +100,31 @@ async def test_repo_default_branch_reads_repo_view(fake_gh) -> None:  # type: ig
     assert argv == ["repo", "view", "org/r", "--json", "defaultBranchRef"]
 
 
-async def test_get_required_contexts_reads_app_scoped_checks(fake_gh) -> None:  # type: ignore[no-untyped-def]
-    payload = json.dumps(["ci", "Vercel", "ci", "", None])
-    log = fake_gh({"branches/main/protection": [0, payload]})
+async def test_get_required_contexts_reads_required_pr_checks(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps(
+        [
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass", "link": ""},
+            {"name": "Vercel", "state": "FAILURE", "bucket": "fail", "link": ""},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass", "link": ""},
+            {"name": "", "state": "SUCCESS", "bucket": "pass", "link": ""},
+        ]
+    )
+    log = fake_gh({"pr checks": [0, payload]})
     gh = GitHub()
 
-    assert await get_required_contexts("org/r", "main", gh=gh) == ("ci", "Vercel")
+    assert await get_required_contexts("org/r", 42, gh=gh) == ("ci", "Vercel")
 
     argv = _calls(log)[0]["argv"]
     assert isinstance(argv, list)
     assert argv == [
-        "api",
-        "repos/org/r/branches/main/protection",
-        "--jq",
-        "[.required_status_checks.contexts[]?, "
-        ".required_status_checks.checks[]?.context?] "
-        '| map(select(type == "string" and length > 0))',
+        "pr",
+        "checks",
+        "42",
+        "--required",
+        "--repo",
+        "org/r",
+        "--json",
+        "name,state,bucket,link",
     ]
 
 

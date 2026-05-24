@@ -1,68 +1,37 @@
-"""Branch protection helpers built on the local gh CLI."""
+"""Required-check helpers built on the local gh CLI."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable, MutableMapping
-from urllib.parse import quote
 
 from .client import GitHub
 
 RequiredContextCache = MutableMapping[tuple[str, str], tuple[str, ...]]
-_REQUIRED_CONTEXTS_JQ = (
-    "[.required_status_checks.contexts[]?, "
-    ".required_status_checks.checks[]?.context?] "
-    '| map(select(type == "string" and length > 0))'
-)
 
 
 async def get_required_contexts(
     repo: str,
-    base: str,
+    pr: int | str,
     *,
     gh: GitHub | None = None,
     cache: RequiredContextCache | None = None,
 ) -> tuple[str, ...]:
-    """Return required status-check contexts for repo/base.
+    """Return required status-check contexts for repo/pr.
 
-    The caller can pass a per-poll cache so multiple PRs in the same binding do
-    not re-fetch identical branch protection data.
+    `gh pr checks --required` exposes the merge-gating checks without requiring
+    branch-protection admin access. The caller can pass a per-poll cache so
+    repeated checks for the same PR do not shell out twice.
     """
-    key = (repo, base)
+    key = (repo, str(pr))
     if cache is not None and key in cache:
         return cache[key]
 
     client = gh or GitHub()
-    host_args, owner_repo = client._api_repo(repo)  # noqa: SLF001
-    branch = quote(base, safe="")
-    out = await client._run(  # noqa: SLF001
-        [
-            "api",
-            *host_args,
-            f"repos/{owner_repo}/branches/{branch}/protection",
-            "--jq",
-            _REQUIRED_CONTEXTS_JQ,
-        ]
-    )
-    contexts = _parse_required_contexts(out)
+    checks = await client.pr_checks(pr, repo=repo)
+    contexts = _normalize_required_contexts(run.name for run in checks.runs)
     if cache is not None:
         cache[key] = contexts
     return contexts
-
-
-def _parse_required_contexts(raw: str) -> tuple[str, ...]:
-    text = raw.strip()
-    if not text:
-        return ()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return _normalize_required_contexts(text.splitlines())
-    if isinstance(parsed, list):
-        return _normalize_required_contexts(parsed)
-    if isinstance(parsed, str) and parsed.strip():
-        return (parsed.strip(),)
-    return ()
 
 
 def _normalize_required_contexts(items: Iterable[object]) -> tuple[str, ...]:

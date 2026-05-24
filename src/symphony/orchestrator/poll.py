@@ -4129,7 +4129,7 @@ class Orchestrator:
         self,
         *,
         binding: RepoBinding,
-        issue: LinearIssue,
+        pr_number: int,
         view: dict[str, object],
         required_context_cache: dict[tuple[str, str], tuple[str, ...]],
     ) -> list[dict[str, object]]:
@@ -4146,23 +4146,18 @@ class Orchestrator:
         if not failing_rollup_checks:
             return []
 
-        base_ref = await self._resolve_pr_base_ref(
-            binding=binding,
-            issue=issue,
-            view=view,
-        )
         try:
             required_contexts = await get_required_contexts(
                 binding.github_repo,
-                base_ref,
+                pr_number,
                 gh=self._gh,
                 cache=required_context_cache,
             )
         except GitHubError as e:
             log.warning(
-                "could not fetch required status contexts for %s@%s: %s",
+                "could not fetch required status contexts for %s#%d: %s",
                 binding.github_repo,
-                base_ref,
+                pr_number,
                 e,
             )
             return []
@@ -4174,6 +4169,23 @@ class Orchestrator:
             for check in failing_rollup_checks
             if _status_check_names(check) & required
         ]
+
+    async def _merge_required_check_fix_should_dispatch(
+        self,
+        *,
+        issue_id: str,
+        head_sha: str,
+        failing_checks: list[dict[str, object]],
+    ) -> bool:
+        signature = _required_check_trigger_signature(
+            head_sha=head_sha,
+            failing_checks=failing_checks,
+        )
+        state = await db.review_state.get(self._conn, issue_id)
+        return should_dispatch_fix_run(
+            prev_signature=state.last_trigger_signature,
+            new_signature=signature,
+        )
 
     async def _merge_required_check_action_log_tail(
         self,
@@ -6763,11 +6775,18 @@ class Orchestrator:
                     continue
                 required_check_failures = await self._required_check_failures_for_view(
                     binding=binding,
-                    issue=issue,
+                    pr_number=candidate.pr_number,
                     view=view,
                     required_context_cache=required_context_cache,
                 )
-                if required_check_failures:
+                if (
+                    required_check_failures
+                    and await self._merge_required_check_fix_should_dispatch(
+                        issue_id=issue.id,
+                        head_sha=str(view.get("headRefOid") or ""),
+                        failing_checks=required_check_failures,
+                    )
+                ):
                     scheduled.append(
                         self._schedule_merge_required_check_fix(
                             binding=binding,
@@ -8692,7 +8711,7 @@ class Orchestrator:
                 if required_view is not None:
                     required_failures = await self._required_check_failures_for_view(
                         binding=binding,
-                        issue=issue,
+                        pr_number=pr_number,
                         view=required_view,
                         required_context_cache={},
                     )
