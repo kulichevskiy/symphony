@@ -6731,6 +6731,7 @@ class Orchestrator:
                 view = await self._gh.pr_view(
                     candidate.pr_number,
                     repo=binding.github_repo,
+                    include_status_checks=True,
                 )
                 if await self._finalize_pr_if_closed(
                     binding=binding,
@@ -8667,13 +8668,18 @@ class Orchestrator:
                     )
                     return run_id
                 required_view: dict[str, object] | None = None
-                if "premerge_view" in locals() and isinstance(premerge_view, dict):
+                if (
+                    "premerge_view" in locals()
+                    and isinstance(premerge_view, dict)
+                    and "statusCheckRollup" in premerge_view
+                ):
                     required_view = premerge_view
                 else:
                     try:
                         required_view = await self._gh.pr_view(
                             pr_number,
                             repo=binding.github_repo,
+                            include_status_checks=True,
                         )
                     except Exception as view_error:  # noqa: BLE001
                         log.warning(

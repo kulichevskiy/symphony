@@ -246,29 +246,35 @@ class GitHub:
         out = await self._run(argv)
         return out.strip()
 
-    async def pr_view(self, pr: int | str, *, repo: str | None = None) -> dict[str, Any]:
+    async def pr_view(
+        self,
+        pr: int | str,
+        *,
+        repo: str | None = None,
+        include_status_checks: bool = False,
+    ) -> dict[str, Any]:
+        fields = [
+            "number",
+            "title",
+            "state",
+            "url",
+            "headRefName",
+            "headRefOid",
+            "baseRefName",
+            "mergeable",
+            "mergeStateStatus",
+            "isDraft",
+            "mergedAt",
+        ]
+        if include_status_checks:
+            fields.append("statusCheckRollup")
         argv = [
             "pr",
             "view",
             str(pr),
             *self._repo_args(repo),
             "--json",
-            ",".join(
-                [
-                    "number",
-                    "title",
-                    "state",
-                    "url",
-                    "headRefName",
-                    "headRefOid",
-                    "baseRefName",
-                    "mergeable",
-                    "mergeStateStatus",
-                    "isDraft",
-                    "mergedAt",
-                    "statusCheckRollup",
-                ]
-            ),
+            ",".join(fields),
         ]
         result = await self._run_json(argv)
         if not isinstance(result, dict):

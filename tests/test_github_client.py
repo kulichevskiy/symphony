@@ -538,6 +538,21 @@ async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  
     fields = str(argv[argv.index("--json") + 1])
     assert "mergedAt" in fields
     assert "merged," not in fields
+    assert "statusCheckRollup" not in fields
+
+
+async def test_pr_view_status_rollup_is_opt_in(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr view": [0, '{"number": 5}']})
+    gh = GitHub()
+
+    await gh.pr_view(5, repo="org/r")
+    await gh.pr_view(5, repo="org/r", include_status_checks=True)
+
+    calls = _calls(log)
+    default_fields = str(calls[0]["argv"][calls[0]["argv"].index("--json") + 1])
+    opt_in_fields = str(calls[1]["argv"][calls[1]["argv"].index("--json") + 1])
+    assert "statusCheckRollup" not in default_fields
+    assert "statusCheckRollup" in opt_in_fields
 
 
 # ---- head_sha + branch_list + repo_clone + pr_comment + pr_close ----

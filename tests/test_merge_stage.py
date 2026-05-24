@@ -3642,6 +3642,11 @@ async def test_required_status_failure_precheck_dispatches_fix_run(
         await _poll_and_wait(orch)
         await scheduled_merge
 
+        gh.pr_view.assert_awaited_once_with(  # type: ignore[attr-defined]
+            42,
+            repo="org/repo",
+            include_status_checks=True,
+        )
         required_contexts.assert_awaited_once()
         assert required_contexts.await_args.args == ("org/repo", "main")
         assert required_contexts.await_args.kwargs["gh"] is gh
@@ -3729,6 +3734,11 @@ async def test_optional_status_failure_precheck_preserves_merge_path(
         await asyncio.gather(*scheduled)
         await scheduled_merge
 
+        gh.pr_view.assert_awaited_once_with(  # type: ignore[attr-defined]
+            42,
+            repo="org/repo",
+            include_status_checks=True,
+        )
         required_contexts.assert_awaited_once()
         orch._dispatch_merge_required_check_fix_run.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
