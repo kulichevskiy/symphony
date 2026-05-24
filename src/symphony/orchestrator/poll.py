@@ -53,6 +53,7 @@ from ..agent.prompt import (
     merge_conflict_fix_prompt,
     merge_conflict_rebase_fix_prompt,
     merge_prompt,
+    merge_required_check_fix_prompt,
     review_comment_fix_prompt,
     review_fix_prompt,
 )
@@ -60,6 +61,7 @@ from ..agent.runner import Runner, RunnerSpec
 from ..agent.runners.acceptance import quick_skip_trivial_acceptance, run_acceptance
 from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
+from ..github.branch_protection import get_required_contexts
 from ..github.client import CheckRun as GitHubCheckRun
 from ..github.client import GitHub, GitHubError, PRChecks, _is_merge_conflict_error
 from ..github.webhook import GitHubWebhookEvent
@@ -402,6 +404,7 @@ def build_fix_runner_command(
     agent: str,
     prompt: str,
     *,
+    max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
 ) -> list[str]:
@@ -415,6 +418,7 @@ def build_fix_runner_command(
     return build_runner_command(
         agent,
         prompt,
+        max_budget_usd=max_budget_usd,
         codex_model=codex_model,
         workspace_path=workspace_path,
     )
@@ -697,6 +701,17 @@ def _pr_view_has_merge_conflict(view: dict[str, object]) -> bool:
     return mergeable == "CONFLICTING" or merge_state == "DIRTY"
 
 
+def _pr_view_skips_required_check_fix(view: dict[str, object]) -> bool:
+    mergeable = str(view.get("mergeable") or "").upper()
+    merge_state = str(
+        view.get("mergeStateStatus") or view.get("merge_state_status") or ""
+    ).upper()
+    return (
+        mergeable == "CONFLICTING"
+        or merge_state in {"BEHIND", "CONFLICTING", "DIRTY"}
+    )
+
+
 def _pr_view_is_clean_mergeable(view: dict[str, object]) -> bool:
     mergeable = str(view.get("mergeable") or "").upper()
     merge_state = str(
@@ -711,6 +726,136 @@ def _pr_base_ref_from_view(view: dict[str, object]) -> str | None:
         return None
     base_ref = str(raw).strip()
     return base_ref or None
+
+
+_REQUIRED_CHECK_FAILURE_STATES = {
+    "FAILURE",
+    "FAILED",
+    "ERROR",
+    "CANCELLED",
+    "CANCELED",
+    "TIMED_OUT",
+    "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
+    "STALE",
+}
+
+
+def _status_rollup_nodes(raw: object) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [entry for entry in raw if isinstance(entry, dict)]
+    if not isinstance(raw, dict):
+        return []
+    nodes = raw.get("nodes")
+    if isinstance(nodes, list):
+        return [entry for entry in nodes if isinstance(entry, dict)]
+    edges = raw.get("edges")
+    if isinstance(edges, list):
+        return [
+            edge["node"]
+            for edge in edges
+            if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+        ]
+    contexts = raw.get("contexts")
+    if isinstance(contexts, list):
+        return [entry for entry in contexts if isinstance(entry, dict)]
+    return []
+
+
+def _status_check_identity(check: Mapping[str, object]) -> str:
+    return (
+        str(check.get("context") or "").strip()
+        or str(check.get("name") or "").strip()
+        or str(check.get("workflowName") or "").strip()
+        or "(unnamed)"
+    )
+
+
+def _status_check_names(check: Mapping[str, object]) -> set[str]:
+    names: set[str] = set()
+    for key in ("context", "name", "workflowName"):
+        value = str(check.get(key) or "").strip()
+        if value:
+            names.add(value)
+    return names
+
+
+def _status_check_sha(check: Mapping[str, object]) -> str:
+    for key in ("sha", "commitOid", "commit_oid"):
+        value = str(check.get(key) or "").strip()
+        if value:
+            return value
+    commit = check.get("commit")
+    if isinstance(commit, Mapping):
+        return str(commit.get("oid") or commit.get("sha") or "").strip()
+    return ""
+
+
+def _status_check_failed(check: Mapping[str, object]) -> bool:
+    state = str(
+        check.get("state") or check.get("status") or check.get("__typename") or ""
+    ).upper()
+    conclusion = str(check.get("conclusion") or "").upper()
+    return (
+        state in _REQUIRED_CHECK_FAILURE_STATES
+        or conclusion in _REQUIRED_CHECK_FAILURE_STATES
+    )
+
+
+def _required_check_detail(check: Mapping[str, object]) -> dict[str, object]:
+    detail: dict[str, object] = {}
+    for key in (
+        "__typename",
+        "name",
+        "context",
+        "workflowName",
+        "state",
+        "status",
+        "conclusion",
+        "targetUrl",
+        "detailsUrl",
+        "description",
+    ):
+        value = check.get(key)
+        if value is not None:
+            detail[key] = value
+    run_id = _status_check_run_id(check)
+    if run_id:
+        detail["runId"] = run_id
+    return detail
+
+
+def _status_check_run_id(check: Mapping[str, object]) -> str:
+    for key in ("runId", "run_id"):
+        value = str(check.get(key) or "").strip()
+        if value:
+            return value
+    workflow_run = check.get("workflowRun")
+    if isinstance(workflow_run, Mapping):
+        for key in ("databaseId", "database_id", "id"):
+            value = str(workflow_run.get(key) or "").strip()
+            if value:
+                return value
+    for key in ("detailsUrl", "targetUrl"):
+        url = str(check.get(key) or "")
+        match = re.search(r"/actions/runs/([^/?#]+)", url)
+        if match is not None:
+            return match.group(1)
+    for key in ("databaseId", "database_id"):
+        value = str(check.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _required_check_trigger_signature(
+    *,
+    head_sha: str,
+    failing_checks: list[dict[str, object]],
+) -> str:
+    contexts = sorted(_status_check_identity(check) for check in failing_checks)
+    contexts_hash = hashlib.sha256("\n".join(contexts).encode("utf-8")).hexdigest()[:12]
+    return f"required_check_failure:{head_sha}:{contexts_hash}"
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -3984,6 +4129,492 @@ class Orchestrator:
             )
         return "main"
 
+    async def _required_check_failures_for_view(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_number: int,
+        view: dict[str, object],
+        required_context_cache: dict[tuple[str, str], tuple[str, ...]],
+    ) -> list[dict[str, object]]:
+        if _pr_view_skips_required_check_fix(view):
+            return []
+        head_sha = str(view.get("headRefOid") or "")
+        failing_rollup_checks: list[dict[str, object]] = []
+        for check in _status_rollup_nodes(view.get("statusCheckRollup")):
+            check_sha = _status_check_sha(check)
+            if check_sha and head_sha and check_sha != head_sha:
+                continue
+            if _status_check_failed(check):
+                failing_rollup_checks.append(_required_check_detail(check))
+        if not failing_rollup_checks:
+            return []
+
+        try:
+            required_contexts = await get_required_contexts(
+                binding.github_repo,
+                pr_number,
+                gh=self._gh,
+                cache=required_context_cache,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch required status contexts for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return []
+        required = {context.strip() for context in required_contexts if context.strip()}
+        if not required:
+            return []
+        return [
+            check
+            for check in failing_rollup_checks
+            if _status_check_names(check) & required
+        ]
+
+    async def _merge_required_check_fix_should_dispatch(
+        self,
+        *,
+        issue_id: str,
+        head_sha: str,
+        failing_checks: list[dict[str, object]],
+    ) -> bool:
+        signature = _required_check_trigger_signature(
+            head_sha=head_sha,
+            failing_checks=failing_checks,
+        )
+        state = await db.review_state.get(self._conn, issue_id)
+        return should_dispatch_fix_run(
+            prev_signature=state.last_trigger_signature,
+            new_signature=signature,
+        )
+
+    async def _merge_required_check_action_log_tail(
+        self,
+        *,
+        repo: str,
+        failing_checks: list[dict[str, object]],
+    ) -> str:
+        sections: list[str] = []
+        for check in failing_checks:
+            if str(check.get("__typename") or "") != "CheckRun":
+                continue
+            run_id = str(check.get("runId") or "").strip()
+            name = _status_check_identity(check)
+            try:
+                if run_id:
+                    tail = await self._gh.run_failed_log_tail(run_id, repo=repo)
+                else:
+                    link = str(check.get("detailsUrl") or check.get("targetUrl") or "")
+                    tail = await self._gh.check_log_tail(
+                        GitHubCheckRun(
+                            name=name,
+                            state=str(check.get("state") or check.get("conclusion") or ""),
+                            bucket="fail",
+                            link=link or None,
+                        ),
+                        repo=repo,
+                    )
+            except GitHubError as e:
+                log.warning(
+                    "could not fetch failed log for required check %s in %s: %s",
+                    name,
+                    repo,
+                    e,
+                )
+                continue
+            if tail.strip():
+                sections.append(f"## {name}\n{tail.strip()}")
+        return "\n\n".join(sections)
+
+    async def _mark_merge_required_check_fix_needs_approval(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        reason: str,
+        merge_run_id: str | None,
+    ) -> None:
+        await self._mark_merge_needs_approval(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            run_id=merge_run_id or str(uuid.uuid4()),
+            reason=reason,
+            create_run=merge_run_id is None,
+        )
+
+    async def _dispatch_merge_required_check_fix_if_allowed(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str,
+        failing_checks: list[dict[str, object]],
+        merge_error: str,
+        merge_run_id: str | None = None,
+        dispatch_capacity_held: bool = False,
+    ) -> bool:
+        signature = _required_check_trigger_signature(
+            head_sha=head_sha,
+            failing_checks=failing_checks,
+        )
+        state = await db.review_state.get(self._conn, issue.id)
+        if not should_dispatch_fix_run(
+            prev_signature=state.last_trigger_signature,
+            new_signature=signature,
+        ):
+            return False
+        if has_hit_iteration_cap(
+            iteration=state.iteration,
+            cap=self.config.review_iteration_cap,
+        ):
+            await self._mark_merge_required_check_fix_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                reason=f"required-check iteration cap reached: {signature}",
+                merge_run_id=merge_run_id,
+            )
+            return False
+
+        iteration = state.iteration + 1
+        dispatched = await self._dispatch_merge_required_check_fix_run(
+            binding=binding,
+            issue=issue,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            head_sha=head_sha,
+            failing_checks=failing_checks,
+            merge_error=merge_error,
+            trigger_signature=signature,
+            iteration=iteration,
+            merge_run_id=merge_run_id,
+            dispatch_capacity_held=dispatch_capacity_held,
+        )
+        if dispatched:
+            await db.review_state.bump_iteration(self._conn, issue.id)
+            await db.review_state.set_signature(self._conn, issue.id, signature)
+        return dispatched
+
+    async def _dispatch_merge_required_check_fix_run(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str,
+        failing_checks: list[dict[str, object]],
+        merge_error: str,
+        trigger_signature: str,
+        iteration: int,
+        merge_run_id: str | None = None,
+        dispatch_capacity_held: bool = False,
+    ) -> bool:
+        action_log_tail = await self._merge_required_check_action_log_tail(
+            repo=binding.github_repo,
+            failing_checks=failing_checks,
+        )
+        prompt = merge_required_check_fix_prompt(
+            issue_title=issue.title,
+            issue_body=issue.description,
+            labels=list(issue.labels),
+            pr_number=pr_number,
+            head_sha=head_sha,
+            merge_error=merge_error,
+            failing_checks=failing_checks,
+            action_log_tail=action_log_tail,
+            trigger_signature=trigger_signature,
+            iteration=f"{iteration}/{self.config.review_iteration_cap}",
+        )
+
+        async with self._review_fix_dispatch_slot(
+            binding,
+            issue,
+            dispatch_capacity_held=dispatch_capacity_held,
+        ):
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            cap_usd = effective_cap(
+                global_cap_usd=self.config.cost_cap_per_issue_usd,
+                binding_override=binding.cost_cap_usd,
+            )
+            if cap_usd > 0 and prior_total >= cap_usd:
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"required-check cost cap reached: ${prior_total:.4f}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "workspace acquire failed for required-check fix-run %s",
+                    issue.identifier,
+                )
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"required-check fix-run failed: workspace acquire failed: {e}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                self._workspace.release(binding, issue)
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "required-check fix-run failed: could not fetch "
+                        f"remote HEAD for {branch}: {e}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "required-check fix-run failed: could not read remote "
+                        f"HEAD for {branch}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            fix_run_id = str(uuid.uuid4())
+            await db.runs.create(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            try:
+                (
+                    cost,
+                    final_kind,
+                    final_returncode,
+                    cap_breached,
+                ) = await self._run_required_check_fix_agent(
+                    binding=binding,
+                    issue=issue,
+                    run_id=fix_run_id,
+                    workspace_path=workspace_path,
+                    prompt=prompt,
+                    prior_total=prior_total,
+                    cap_usd=cap_usd,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "required-check fix-run execution failed for %s",
+                    issue.identifier,
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"required-check fix-run failed: {e}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+            finally:
+                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
+                self._workspace.release(binding, issue)
+
+            if cost > 0:
+                await db.runs.add_cost(self._conn, fix_run_id, cost)
+
+            if cap_breached:
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "required-check cost cap reached: "
+                        f"${prior_total + cost:.4f}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            transition = on_runner_event(
+                stage="review",
+                event_kind=final_kind,
+                returncode=final_returncode,
+            )
+            if transition.next_run_status != "completed":
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    transition.next_run_status,
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"required-check fix-run ended with {final_kind}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            pushed_sha = await _workspace_head_sha(workspace_path)
+            if not pushed_sha or pushed_sha == start_sha:
+                short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=(
+                        "required-check fix-run completed without advancing "
+                        f"{branch}; HEAD stayed at {short_sha}"
+                    ),
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+
+            try:
+                await self._push_fn(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "git push failed for required-check fix-run %s: %s",
+                    issue.identifier,
+                    e,
+                )
+                await self._mark_merge_required_check_fix_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    reason=f"required-check fix-run push failed: {e}",
+                    merge_run_id=merge_run_id,
+                )
+                return False
+
+            state = await db.review_state.get(self._conn, issue.id)
+            if state.pr_number is None:
+                state = replace(
+                    state,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                )
+            await self._retrigger_codex_review_unless_approved(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
+            await self._interrupt_stale_merge_needs_approval_for_state(
+                binding=binding,
+                issue=issue,
+                state=state,
+            )
+            if merge_run_id is not None:
+                running_interrupted = await db.runs.interrupt_running_merge(
+                    self._conn,
+                    merge_run_id,
+                )
+                if running_interrupted:
+                    log.info(
+                        "interrupted active merge run %s after required-check fix-run",
+                        merge_run_id,
+                    )
+            return True
+
+    async def _run_required_check_fix_agent(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        workspace_path: Path,
+        prompt: str,
+        prior_total: float,
+        cap_usd: float,
+    ) -> tuple[float, str, int | None, bool]:
+        warning_pct = effective_warning_pct(
+            global_pct=self.config.cost_warning_pct,
+            binding_override=binding.cost_warning_pct,
+        )
+        warning_already_fired = (
+            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+        )
+        max_budget_usd: float | None = None
+        if cap_usd > 0:
+            max_budget_usd = cap_usd - prior_total
+            if max_budget_usd <= 0:
+                return 0.0, "cost_cap", None, True
+        command = build_fix_runner_command(
+            binding.agent,
+            prompt,
+            max_budget_usd=max_budget_usd,
+            codex_model=binding.codex_model,
+            workspace_path=workspace_path,
+        )
+        return await self._run_stage_command(
+            binding=binding,
+            issue=issue,
+            command=command,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            stage="review_fix",
+            prior_total=prior_total,
+            cap_usd=cap_usd,
+            warning_pct=warning_pct,
+            warning_already_fired=warning_already_fired,
+        )
+
     async def _mark_merge_conflict_fix_needs_approval(
         self,
         *,
@@ -6056,6 +6687,7 @@ class Orchestrator:
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
+        required_context_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         candidates = await db.issue_prs.list_merge_candidates(self._conn)
         for candidate in candidates:
             binding = self._binding_for_pr(candidate)
@@ -6115,6 +6747,7 @@ class Orchestrator:
                 view = await self._gh.pr_view(
                     candidate.pr_number,
                     repo=binding.github_repo,
+                    include_status_checks=True,
                 )
                 if await self._finalize_pr_if_closed(
                     binding=binding,
@@ -6141,6 +6774,32 @@ class Orchestrator:
                             pr_number=candidate.pr_number,
                             pr_url=candidate.pr_url,
                             view=view,
+                        )
+                    )
+                    continue
+                required_check_failures = await self._required_check_failures_for_view(
+                    binding=binding,
+                    pr_number=candidate.pr_number,
+                    view=view,
+                    required_context_cache=required_context_cache,
+                )
+                if (
+                    required_check_failures
+                    and await self._merge_required_check_fix_should_dispatch(
+                        issue_id=issue.id,
+                        head_sha=str(view.get("headRefOid") or ""),
+                        failing_checks=required_check_failures,
+                    )
+                ):
+                    scheduled.append(
+                        self._schedule_merge_required_check_fix(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=candidate.pr_number,
+                            pr_url=candidate.pr_url,
+                            head_sha=str(view.get("headRefOid") or ""),
+                            failing_checks=required_check_failures,
+                            merge_error="required status check failed before merge",
                         )
                     )
                     continue
@@ -7058,6 +7717,33 @@ class Orchestrator:
             )
 
         task = asyncio.create_task(dispatch_conflict_fix())
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(self._dispatch_tasks.discard)
+        return task
+
+    def _schedule_merge_required_check_fix(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        head_sha: str,
+        failing_checks: list[dict[str, object]],
+        merge_error: str,
+    ) -> asyncio.Task[None]:
+        async def dispatch_required_check_fix() -> None:
+            await self._dispatch_merge_required_check_fix_if_allowed(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                head_sha=head_sha,
+                failing_checks=failing_checks,
+                merge_error=merge_error,
+            )
+
+        task = asyncio.create_task(dispatch_required_check_fix())
         self._dispatch_tasks.add(task)
         task.add_done_callback(self._dispatch_tasks.discard)
         return task
@@ -8004,6 +8690,53 @@ class Orchestrator:
                         dispatch_capacity_held=True,
                     )
                     return run_id
+                required_view: dict[str, object] | None = None
+                if (
+                    "premerge_view" in locals()
+                    and isinstance(premerge_view, dict)
+                    and "statusCheckRollup" in premerge_view
+                ):
+                    required_view = premerge_view
+                else:
+                    try:
+                        required_view = await self._gh.pr_view(
+                            pr_number,
+                            repo=binding.github_repo,
+                            include_status_checks=True,
+                        )
+                    except Exception as view_error:  # noqa: BLE001
+                        log.warning(
+                            "could not refresh PR checks after merge failure for "
+                            "%s#%d: %s",
+                            binding.github_repo,
+                            pr_number,
+                            view_error,
+                        )
+                if required_view is not None:
+                    required_failures = await self._required_check_failures_for_view(
+                        binding=binding,
+                        pr_number=pr_number,
+                        view=required_view,
+                        required_context_cache={},
+                    )
+                    if required_failures:
+                        dispatched = await self._dispatch_merge_required_check_fix_if_allowed(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=pr_number,
+                            pr_url=pr_url,
+                            head_sha=str(required_view.get("headRefOid") or ""),
+                            failing_checks=required_failures,
+                            merge_error=str(e),
+                            merge_run_id=run_id,
+                            dispatch_capacity_held=True,
+                        )
+                        if (
+                            dispatched
+                            or await db.operator_waits.get(self._conn, issue.id)
+                            is not None
+                        ):
+                            return run_id
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,

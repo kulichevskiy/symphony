@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from symphony.github.branch_protection import get_required_contexts
 from symphony.github.client import (
     CheckRun,
     GitHub,
@@ -99,6 +100,34 @@ async def test_repo_default_branch_reads_repo_view(fake_gh) -> None:  # type: ig
     assert argv == ["repo", "view", "org/r", "--json", "defaultBranchRef"]
 
 
+async def test_get_required_contexts_reads_required_pr_checks(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps(
+        [
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass", "link": ""},
+            {"name": "Vercel", "state": "FAILURE", "bucket": "fail", "link": ""},
+            {"name": "ci", "state": "SUCCESS", "bucket": "pass", "link": ""},
+            {"name": "", "state": "SUCCESS", "bucket": "pass", "link": ""},
+        ]
+    )
+    log = fake_gh({"pr checks": [0, payload]})
+    gh = GitHub()
+
+    assert await get_required_contexts("org/r", 42, gh=gh) == ("ci", "Vercel")
+
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv == [
+        "pr",
+        "checks",
+        "42",
+        "--required",
+        "--repo",
+        "org/r",
+        "--json",
+        "name,state,bucket,link",
+    ]
+
+
 async def test_pr_create_appends_linear_url_when_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/42\n"]})
     gh = GitHub()
@@ -160,6 +189,7 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
             "statusCheckRollup": [
                 {"state": "SUCCESS"},
                 {"state": "COMPLETED", "conclusion": "FAILURE"},
+                {"state": "COMPLETED", "conclusion": "STARTUP_FAILURE"},
                 {"state": "PENDING"},
             ],
         }
@@ -198,9 +228,15 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
     assert snapshot["merged_by"] == "octo"
     assert snapshot["check_summary"] == {
         "passing": 1,
-        "failing": 1,
+        "failing": 2,
         "pending": 1,
-        "total": 3,
+        "total": 4,
+        "checks": [
+            {"state": "SUCCESS"},
+            {"state": "COMPLETED", "conclusion": "FAILURE"},
+            {"state": "COMPLETED", "conclusion": "STARTUP_FAILURE"},
+            {"state": "PENDING"},
+        ],
     }
     assert [comment["comment_id"] for comment in snapshot["comments"]] == [2, 1]
     calls = _calls(log)
@@ -241,6 +277,7 @@ async def test_pr_external_snapshot_keeps_metadata_when_recent_comments_fail(fak
         "failing": 0,
         "pending": 0,
         "total": 1,
+        "checks": [{"state": "SUCCESS"}],
     }
     assert snapshot["comments"] == []
     assert "missing scope" in snapshot["comments_error"]
@@ -510,6 +547,21 @@ async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  
     fields = str(argv[argv.index("--json") + 1])
     assert "mergedAt" in fields
     assert "merged," not in fields
+    assert "statusCheckRollup" not in fields
+
+
+async def test_pr_view_status_rollup_is_opt_in(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr view": [0, '{"number": 5}']})
+    gh = GitHub()
+
+    await gh.pr_view(5, repo="org/r")
+    await gh.pr_view(5, repo="org/r", include_status_checks=True)
+
+    calls = _calls(log)
+    default_fields = str(calls[0]["argv"][calls[0]["argv"].index("--json") + 1])
+    opt_in_fields = str(calls[1]["argv"][calls[1]["argv"].index("--json") + 1])
+    assert "statusCheckRollup" not in default_fields
+    assert "statusCheckRollup" in opt_in_fields
 
 
 # ---- head_sha + branch_list + repo_clone + pr_comment + pr_close ----

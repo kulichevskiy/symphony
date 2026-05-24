@@ -246,28 +246,35 @@ class GitHub:
         out = await self._run(argv)
         return out.strip()
 
-    async def pr_view(self, pr: int | str, *, repo: str | None = None) -> dict[str, Any]:
+    async def pr_view(
+        self,
+        pr: int | str,
+        *,
+        repo: str | None = None,
+        include_status_checks: bool = False,
+    ) -> dict[str, Any]:
+        fields = [
+            "number",
+            "title",
+            "state",
+            "url",
+            "headRefName",
+            "headRefOid",
+            "baseRefName",
+            "mergeable",
+            "mergeStateStatus",
+            "isDraft",
+            "mergedAt",
+        ]
+        if include_status_checks:
+            fields.append("statusCheckRollup")
         argv = [
             "pr",
             "view",
             str(pr),
             *self._repo_args(repo),
             "--json",
-            ",".join(
-                [
-                    "number",
-                    "title",
-                    "state",
-                    "url",
-                    "headRefName",
-                    "headRefOid",
-                    "baseRefName",
-                    "mergeable",
-                    "mergeStateStatus",
-                    "isDraft",
-                    "mergedAt",
-                ]
-            ),
+            ",".join(fields),
         ]
         result = await self._run_json(argv)
         if not isinstance(result, dict):
@@ -534,13 +541,20 @@ class GitHub:
         run_match = _ACTIONS_RUN_RE.search(check.link)
         if run_match is None:
             return ""
-        argv = [
-            "run",
-            "view",
+        return await self.run_failed_log_tail(
             run_match.group(1),
-            *self._repo_args(repo),
-            "--log-failed",
-        ]
+            repo=repo,
+            max_bytes=max_bytes,
+        )
+
+    async def run_failed_log_tail(
+        self,
+        run_id: int | str,
+        *,
+        repo: str | None = None,
+        max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    ) -> str:
+        argv = ["run", "view", str(run_id), *self._repo_args(repo), "--log-failed"]
         out = await self._run(argv)
         return _tail_utf8(out, max_bytes=max_bytes)
 
@@ -630,11 +644,12 @@ def _tail_utf8(text: str, *, max_bytes: int) -> str:
     return suffix.decode("utf-8") + tail
 
 
-def _status_check_summary(raw: object) -> dict[str, int]:
+def _status_check_summary(raw: object) -> dict[str, object]:
     checks = _status_check_nodes(raw)
     passing = 0
     failing = 0
     pending = 0
+    details: list[dict[str, object]] = []
     for check in checks:
         state = str(
             check.get("state")
@@ -651,6 +666,8 @@ def _status_check_summary(raw: object) -> dict[str, int]:
             "CANCELED",
             "TIMED_OUT",
             "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "STALE",
         }:
             failing += 1
         elif conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
@@ -665,16 +682,39 @@ def _status_check_summary(raw: object) -> dict[str, int]:
             "CANCELED",
             "TIMED_OUT",
             "ACTION_REQUIRED",
+            "STARTUP_FAILURE",
+            "STALE",
         }:
             failing += 1
         else:
             pending += 1
+        details.append(_status_check_detail(check))
     return {
         "passing": passing,
         "failing": failing,
         "pending": pending,
         "total": len(checks),
+        "checks": details,
     }
+
+
+def _status_check_detail(check: dict[str, Any]) -> dict[str, object]:
+    detail: dict[str, object] = {}
+    for key in (
+        "__typename",
+        "name",
+        "context",
+        "state",
+        "status",
+        "conclusion",
+        "targetUrl",
+        "detailsUrl",
+        "description",
+    ):
+        value = check.get(key)
+        if value is not None:
+            detail[key] = value
+    return detail
 
 
 def _status_check_nodes(raw: object) -> list[dict[str, Any]]:

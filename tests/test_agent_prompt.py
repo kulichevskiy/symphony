@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from symphony.agent.prompt import acceptance_fix_prompt, implement_prompt, merge_prompt
+from symphony.agent.prompt import (
+    acceptance_fix_prompt,
+    implement_prompt,
+    merge_prompt,
+    merge_required_check_fix_prompt,
+)
 
 
 def test_implement_prompt_includes_title_body_and_labels() -> None:
@@ -66,3 +71,37 @@ def test_merge_prompt_limits_final_edits_to_housekeeping_files() -> None:
     assert "source or test change is needed" in prompt
     assert "exit successfully without creating a commit" in prompt
     assert "merge will pause" in prompt
+
+
+def test_merge_required_check_fix_prompt_includes_status_context_and_merge_error() -> None:
+    prompt = merge_required_check_fix_prompt(
+        issue_title="Fix deploy",
+        issue_body="The save flow must ship.",
+        labels=["bug"],
+        pr_number=273,
+        head_sha="abc123",
+        merge_error=(
+            "gh pr merge 273 --squash --repo vibecamp-org/vibecamp exited 1: "
+            "the base branch policy prohibits the merge"
+        ),
+        failing_checks=[
+            {
+                "__typename": "StatusContext",
+                "name": "Vercel",
+                "context": "Vercel",
+                "targetUrl": "https://vercel.com/vibecamp/deployments/123",
+                "description": "Deployment failed.",
+                "state": "FAILURE",
+            }
+        ],
+        action_log_tail="",
+    )
+
+    assert "merge-required-check fix-run agent" in prompt
+    assert "PR #273" in prompt
+    assert "abc123" in prompt
+    assert "Vercel" in prompt
+    assert "https://vercel.com/vibecamp/deployments/123" in prompt
+    assert "Deployment failed." in prompt
+    assert "base branch policy prohibits the merge" in prompt
+    assert "fetch the URL" in prompt
