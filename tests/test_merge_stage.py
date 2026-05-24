@@ -3559,3 +3559,229 @@ async def test_merge_conflict_precheck_does_not_need_state_lookup(
         assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_required_status_failure_precheck_dispatches_fix_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "baseRefName": "main",
+                "mergedAt": None,
+                "statusCheckRollup": [
+                    {
+                        "__typename": "StatusContext",
+                        "context": "Vercel",
+                        "state": "FAILURE",
+                        "targetUrl": "https://vercel.com/org/repo/deployments/123",
+                        "description": "Deployment failed.",
+                    }
+                ],
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="ci", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="approved")
+        )
+        orch._dispatch_merge_required_check_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+        scheduled_merge = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled_merge)  # type: ignore[method-assign]  # noqa: SLF001
+        required_contexts = AsyncMock(return_value=("Vercel",))
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll.get_required_contexts",
+            required_contexts,
+            raising=False,
+        )
+
+        await _poll_and_wait(orch)
+        await scheduled_merge
+
+        required_contexts.assert_awaited_once()
+        assert required_contexts.await_args.args == ("org/repo", "main")
+        assert required_contexts.await_args.kwargs["gh"] is gh
+        assert isinstance(required_contexts.await_args.kwargs["cache"], dict)
+        orch._dispatch_merge_required_check_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._dispatch_merge_required_check_fix_run.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert kwargs["head_sha"] == "abc123"
+        assert kwargs["merge_error"] == "required status check failed before merge"
+        assert [check["context"] for check in kwargs["failing_checks"]] == ["Vercel"]
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        gh.pr_merge.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_optional_status_failure_precheck_preserves_merge_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "baseRefName": "main",
+                "mergedAt": None,
+                "statusCheckRollup": [
+                    {
+                        "__typename": "StatusContext",
+                        "context": "Vercel",
+                        "state": "FAILURE",
+                        "targetUrl": "https://vercel.com/org/repo/deployments/123",
+                        "description": "Deployment failed.",
+                    }
+                ],
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="ci", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="approved")
+        )
+        orch._dispatch_merge_required_check_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+        scheduled_merge = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled_merge)  # type: ignore[method-assign]  # noqa: SLF001
+        required_contexts = AsyncMock(return_value=("ci",))
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll.get_required_contexts",
+            required_contexts,
+            raising=False,
+        )
+
+        scheduled = await orch._poll_merge_candidates()  # noqa: SLF001
+        await asyncio.gather(*scheduled)
+        await scheduled_merge
+
+        required_contexts.assert_awaited_once()
+        orch._dispatch_merge_required_check_fix_run.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_required_status_failure_cost_cap_parks_merge_needs_approval(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock()
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            cost_cap_per_issue_usd=0.25,
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        dispatched = await orch._dispatch_merge_required_check_fix_if_allowed(  # noqa: SLF001
+            binding=_binding(agent="claude"),
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            head_sha="abc123",
+            failing_checks=[
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "FAILURE",
+                }
+            ],
+            merge_error="gh pr merge failed",
+        )
+
+        assert dispatched is False
+        workspace.acquire.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "needs_approval"
+        assert "required-check cost cap reached: $0.5000" in (
+            linear.post_comment.await_args.args[1]
+        )
+    finally:
+        await conn.close()

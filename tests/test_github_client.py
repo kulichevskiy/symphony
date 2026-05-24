@@ -201,6 +201,11 @@ async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) ->
         "failing": 1,
         "pending": 1,
         "total": 3,
+        "checks": [
+            {"state": "SUCCESS"},
+            {"state": "COMPLETED", "conclusion": "FAILURE"},
+            {"state": "PENDING"},
+        ],
     }
     assert [comment["comment_id"] for comment in snapshot["comments"]] == [2, 1]
     calls = _calls(log)
@@ -241,6 +246,7 @@ async def test_pr_external_snapshot_keeps_metadata_when_recent_comments_fail(fak
         "failing": 0,
         "pending": 0,
         "total": 1,
+        "checks": [{"state": "SUCCESS"}],
     }
     assert snapshot["comments"] == []
     assert "missing scope" in snapshot["comments_error"]

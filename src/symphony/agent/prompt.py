@@ -6,7 +6,11 @@ template diffs reviewable.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
 REVIEW_LOG_TAIL_BYTES = 12_000
+REQUIRED_CHECK_LOG_TAIL_LINES = 200
 
 
 def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) -> str:
@@ -203,6 +207,64 @@ def merge_conflict_rebase_fix_prompt(
     )
 
 
+def merge_required_check_fix_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    pr_number: int,
+    head_sha: str,
+    merge_error: str,
+    failing_checks: Sequence[Mapping[str, object]],
+    action_log_tail: str,
+    trigger_signature: str = "",
+    iteration: str = "",
+) -> str:
+    """Build the prompt for required-status-check merge fix-runs."""
+    label_line = ", ".join(labels) if labels else "(no labels)"
+    body = issue_body.strip() if issue_body else "(no description)"
+    log_tail = _tail_lines(
+        action_log_tail.strip() or "(no GitHub Actions failed-log excerpt available)",
+        max_lines=REQUIRED_CHECK_LOG_TAIL_LINES,
+    )
+    template = _load_prompt_template(
+        "merge_required_check_fix.md",
+        fallback=(
+            "You are Symphony's merge-required-check fix-run agent.\n"
+            "GitHub branch protection is blocking PR #{pr_number} because a "
+            "required status check is failing.\n\n"
+            "# Merge Failure\n\n{merge_error}\n\n"
+            "# PR\n\n- PR: #{pr_number}\n- Head SHA: {head_sha}\n"
+            "- Trigger signature: {trigger_signature}\n"
+            "- Review iteration: {iteration}\n\n"
+            "# Required Failing Checks\n\n{failing_checks}\n\n"
+            "# Failed GitHub Actions Log Tail\n\n```\n{action_log_tail}\n```\n\n"
+            "# Issue\n\n## Title\n{issue_title}\n\n## Labels\n{labels}\n\n"
+            "## Description\n{issue_body}\n\n"
+            "# Working Agreement\n\n"
+            "- Make the smallest change that makes the required check pass.\n"
+            "- For StatusContext failures such as Vercel or custom webhooks, "
+            "fetch the URL shown above and use it as the primary failure source.\n"
+            "- For GitHub Actions failures, use the failed log tail above before "
+            "fetching more logs.\n"
+            "- Commit your changes on the current branch (do not push).\n"
+            "- Do not merge the PR or edit unrelated files.\n"
+        ),
+    )
+    return template.format(
+        issue_title=issue_title,
+        issue_body=body,
+        labels=label_line,
+        pr_number=pr_number,
+        head_sha=head_sha or "(unknown)",
+        merge_error=merge_error.strip() or "(no gh merge error captured)",
+        trigger_signature=trigger_signature or "(not recorded)",
+        iteration=iteration or "(not recorded)",
+        failing_checks=_format_required_check_details(failing_checks),
+        action_log_tail=log_tail,
+    )
+
+
 def merge_prompt(
     *,
     issue_title: str,
@@ -237,6 +299,59 @@ def merge_prompt(
         "creating a commit.\n"
         "- Do not merge the PR, push, or edit unrelated files.\n"
     )
+
+
+def _load_prompt_template(name: str, *, fallback: str) -> str:
+    path = Path(__file__).resolve().parents[3] / "prompts" / name
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return fallback
+
+
+def _format_required_check_details(checks: Sequence[Mapping[str, object]]) -> str:
+    if not checks:
+        return "(no failing required checks supplied)"
+    entries: list[str] = []
+    for idx, check in enumerate(checks, start=1):
+        name = _check_value(check, "name") or _check_value(check, "context")
+        parts = [
+            f"## {idx}. {name or '(unnamed check)'}",
+            f"- Type: {_check_value(check, '__typename') or '(unknown)'}",
+            f"- Context: {_check_value(check, 'context') or '(none)'}",
+            f"- State: {_check_value(check, 'state') or '(unknown)'}",
+        ]
+        conclusion = _check_value(check, "conclusion")
+        if conclusion:
+            parts.append(f"- Conclusion: {conclusion}")
+        description = _check_value(check, "description")
+        if description:
+            parts.append(f"- Description: {description}")
+        target_url = _check_value(check, "targetUrl")
+        if target_url:
+            parts.append(f"- Target URL: {target_url}")
+        details_url = _check_value(check, "detailsUrl")
+        if details_url:
+            parts.append(f"- Details URL: {details_url}")
+        run_id = _check_value(check, "runId")
+        if run_id:
+            parts.append(f"- Run ID: {run_id}")
+        entries.append("\n".join(parts))
+    return "\n\n".join(entries)
+
+
+def _check_value(check: Mapping[str, object], key: str) -> str:
+    value = check.get(key)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _tail_lines(text: str, *, max_lines: int) -> str:
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(["...[truncated]", *lines[-max_lines:]])
 
 
 def _tail_utf8(text: str, *, max_bytes: int) -> str:
