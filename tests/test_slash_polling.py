@@ -417,6 +417,56 @@ async def test_operator_wait_handlers_reject_when_binding_and_wait_missing(
         await conn.close()
 
 
+@pytest.mark.parametrize(
+    ("wait_kind", "stage", "status"),
+    [
+        (db.operator_waits.KIND_COST_CAP, "implement", "failed"),
+        (db.operator_waits.KIND_IMPLEMENT_FAILED, "implement", "failed"),
+        (db.operator_waits.KIND_REVIEW_FAILED, "review_fix", "failed"),
+        (db.operator_waits.KIND_MERGE, "merge", "needs_approval"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_operator_wait_reject_missing_blocked_state_keeps_command_unseen(
+    tmp_path: Path,
+    wait_kind: str,
+    stage: str,
+    status: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$reject")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            kind=wait_kind,
+            stage=stage,
+            status=status,
+        )
+        orch = _make_orch(cfg, linear, conn)
+        orch._states["ENG"].pop("Blocked")  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match="missing blocked state"):
+            await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert not await db.comment_events.seen(conn, "c1")
+        assert await db.comment_cursors.get(conn, "iss-1") is None
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "run-1"
+        bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any(
+            "`$reject` ignored" in body and "missing blocked state" in body
+            for body in bodies
+        )
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_retry_acceptance_clears_blocked_wait_and_infra_retries(
     tmp_path: Path,

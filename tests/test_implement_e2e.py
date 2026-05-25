@@ -619,15 +619,16 @@ async def test_failed_implement_stop_keeps_wait_when_blocked_state_missing(
             binding,
         )
 
-        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
-            "iss-1",
-            "failed-run",
-            SlashIntent(
-                kind=SlashKind.STOP,
-                comment_id="c-stop",
-                created_at="2026-05-10T00:05:00+00:00",
-            ),
-        )
+        with pytest.raises(RuntimeError, match="missing blocked state"):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                "iss-1",
+                "failed-run",
+                SlashIntent(
+                    kind=SlashKind.STOP,
+                    comment_id="c-stop",
+                    created_at="2026-05-10T00:05:00+00:00",
+                ),
+            )
 
         linear.move_issue.assert_not_awaited()
         wait = await db.operator_waits.get(conn, "iss-1")
@@ -635,7 +636,10 @@ async def test_failed_implement_stop_keeps_wait_when_blocked_state_missing(
         assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
         assert orch._dispatch_run_ids["iss-1"] == "failed-run"  # noqa: SLF001
         posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
-        assert any("missing blocked state" in body for body in posted)
+        assert any(
+            "`$stop` ignored" in body and "missing blocked state" in body
+            for body in posted
+        )
     finally:
         await conn.close()
 

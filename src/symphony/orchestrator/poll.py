@@ -2111,8 +2111,14 @@ class Orchestrator:
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
-            if blocked_id is not None:
-                await self.linear.move_issue(issue_id, blocked_id)
+            if blocked_id is None:
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"missing blocked state {binding.linear_states.blocked!r}; "
+                    "keeping issue parked",
+                )
+            await self.linear.move_issue(issue_id, blocked_id)
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -2203,23 +2209,12 @@ class Orchestrator:
                     run_id,
                     binding.linear_states.blocked,
                 )
-                try:
-                    await self.linear.post_comment(
-                        issue_id,
-                        truncate_body(
-                            command_rejected(
-                                f"${intent.kind}",
-                                "missing blocked state; keeping issue parked",
-                            )
-                        ),
-                    )
-                except LinearError as e:
-                    log.warning(
-                        "implement stop rejection comment failed for %s: %s",
-                        issue_id,
-                        e,
-                    )
-                return
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"missing blocked state {binding.linear_states.blocked!r}; "
+                    "keeping issue parked",
+                )
             try:
                 await self.linear.move_issue(issue_id, blocked_id)
             except LinearError as e:
@@ -5432,6 +5427,13 @@ class Orchestrator:
             if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
                 states = await self._states_for_binding(binding)
                 blocked_id = states.get(binding.linear_states.blocked)
+                if blocked_id is None:
+                    await self._fail_retryable_slash_command(
+                        issue_id,
+                        intent,
+                        f"missing blocked state {binding.linear_states.blocked!r}; "
+                        "keeping issue parked",
+                    )
                 try:
                     issue = await self.linear.lookup_issue(issue_id)
                 except LinearError as e:
@@ -5559,6 +5561,13 @@ class Orchestrator:
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is None:
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"missing blocked state {binding.linear_states.blocked!r}; "
+                    "keeping issue parked",
+                )
             try:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
