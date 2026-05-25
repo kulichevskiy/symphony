@@ -21,7 +21,7 @@ from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
-from symphony.orchestrator.poll import Orchestrator
+from symphony.orchestrator.poll import Orchestrator, SlashHandlerFailure
 
 
 def _binding() -> RepoBinding:
@@ -922,6 +922,99 @@ async def test_cursor_advances_across_ticks(tmp_path: Path) -> None:
         assert second_after > first_after
         # Cursor was advanced to the most recent observed comment.
         assert second_after.isoformat() == "2026-05-10T11:00:00+00:00"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_handler_failure_stops_processing_later_comments_in_batch(
+    tmp_path: Path,
+) -> None:
+    """SYM-32 P2: when a comment's handler fails (SlashHandlerFailure), the
+    poll loop must NOT keep processing later comments in the same batch.
+    Otherwise a later comment would advance the cursor past the failed one,
+    stranding the failed command (the very silent-drop the fix is preventing).
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        # Two comments back-to-back: first fails, second would otherwise
+        # succeed and advance the cursor past the failure.
+        linear.comments_since = AsyncMock(
+            return_value=[
+                _comment("$retry", cid="c-first", created_at="2026-05-10T01:30:00+00:00"),
+                _comment("$retry", cid="c-second", created_at="2026-05-10T01:31:00+00:00"),
+            ]
+        )
+        linear.move_issue = AsyncMock(side_effect=LinearError("upstream 503"))
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            stage="implement",
+            status="failed",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        # First comment fails -> move_issue attempted once, no further moves.
+        assert linear.move_issue.await_count == 1
+        # Neither comment is marked seen — both must remain replayable next tick.
+        assert not await db.comment_events.seen(conn, "c-first")
+        assert not await db.comment_events.seen(conn, "c-second")
+        # Cursor must not have advanced past the first failed comment.
+        cursor = await db.comment_cursors.get(conn, "iss-1")
+        if cursor is not None:
+            cursor_at, _ = cursor
+            assert cursor_at <= "2026-05-10T01:30:00+00:00"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_failed_retry_preserves_wait_when_lookup_fails(
+    tmp_path: Path,
+) -> None:
+    """SYM-32 P1: when `$retry`/`$approve` on a review_failed wait raises
+    `SlashHandlerFailure` because `lookup_issue` fails, the operator wait
+    must remain intact (in DB and in `_dispatch_run_ids`) so the next poll
+    tick can iterate the issue and retry the command. Clearing the wait
+    before the lookup would orphan the issue from slash polling."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(side_effect=LinearError("lookup down"))
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            stage="review",
+            status="failed",
+        )
+        await _seed_review_state(conn)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+        orch._operator_wait_run_ids.add("run-1")  # noqa: SLF001
+        orch._review_failed_run_bindings["run-1"] = cfg.repos[0]  # noqa: SLF001
+
+        with pytest.raises(SlashHandlerFailure) as excinfo:
+            await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+                "iss-1", "run-1", _intent(SlashKind.RETRY)
+            )
+        assert "look up" in excinfo.value.reason
+
+        # Wait must still be present everywhere — operator can retry on next tick.
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert orch._dispatch_run_ids.get("iss-1") == "run-1"  # noqa: SLF001
+        assert "run-1" in orch._operator_wait_run_ids  # noqa: SLF001
+        assert "run-1" in orch._review_failed_run_bindings  # noqa: SLF001
     finally:
         await conn.close()
 

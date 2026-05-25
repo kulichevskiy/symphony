@@ -1638,11 +1638,31 @@ class Orchestrator:
             for comment in comments:
                 if comment.id in seen_ids:
                     continue
-                await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+                try:
+                    await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+                except SlashHandlerFailure:
+                    # Handler failed mid-transition; the rejection was posted
+                    # and the comment was deliberately NOT marked seen. Stop
+                    # iterating later comments for this issue so the failed
+                    # command stays first-in-line on the next poll tick —
+                    # otherwise a later comment could advance the cursor past
+                    # the failed one, recreating the silent-drop behavior.
+                    break
 
     async def _handle_unseen_slash_comment(
         self, issue_id: str, run_id: str, comment: LinearComment
     ) -> bool:
+        """Process a single slash comment under the comment-event lock.
+
+        Returns True when the comment was handled and persisted (marked seen
+        + cursor advanced). Returns False when the comment was already seen
+        (duplicate). Raises `SlashHandlerFailure` when the handler failed
+        mid-transition (e.g. `linear.move_issue` upstream error); in that
+        case a rejection comment has been posted and the comment is
+        intentionally NOT marked seen, so the caller MUST stop processing
+        later comments for this issue (otherwise their cursor advance would
+        leave the failed comment stranded).
+        """
         async with self._comment_event_lock:
             if await db.comment_events.seen(self._conn, comment.id):
                 return False
@@ -1658,7 +1678,7 @@ class Orchestrator:
                 await self._post_command_rejected(
                     issue_id, exc.slash_text, exc.reason
                 )
-                return False
+                raise
             await db.comment_events.mark(
                 self._conn,
                 issue_id=issue_id,
@@ -5449,7 +5469,10 @@ class Orchestrator:
             return
 
         # $retry or $approve: restart the review monitor.
-        await self._clear_operator_wait(issue_id, run_id)
+        # Look up the issue BEFORE clearing the operator wait — if lookup
+        # fails we want the wait (and its `_dispatch_run_ids` entry) to
+        # survive so the next poll tick can retry. Clearing first would
+        # make the issue invisible to slash polling on the retry.
         try:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
@@ -5458,6 +5481,7 @@ class Orchestrator:
                 slash_text=self._slash_text(intent),
                 reason=f"could not look up issue for retry: {e}",
             ) from e
+        await self._clear_operator_wait(issue_id, run_id)
         new_run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         await db.runs.create(
