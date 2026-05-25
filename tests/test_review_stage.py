@@ -2915,20 +2915,22 @@ async def test_merge_command_keeps_operator_wait_when_lookup_fails(
         linear = MagicMock()
         linear.team_states = AsyncMock(return_value=_states())
         linear.lookup_issue = AsyncMock(side_effect=LinearError("lookup down"))
+        linear.post_comment = AsyncMock(return_value="cmt-1")
         orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
         orch._dispatch_run_ids["iss-1"] = "merge-run"  # noqa: SLF001
         orch._operator_wait_run_ids.add("merge-run")  # noqa: SLF001
         orch._merge_needs_approval_bindings["merge-run"] = binding  # noqa: SLF001
 
-        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
-            "iss-1",
-            "merge-run",
-            SlashIntent(
-                kind=kind,
-                comment_id="c-command",
-                created_at="2026-05-10T00:01:00+00:00",
-            ),
-        )
+        with pytest.raises(RuntimeError, match="lookup down"):
+            await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+                "iss-1",
+                "merge-run",
+                SlashIntent(
+                    kind=kind,
+                    comment_id="c-command",
+                    created_at="2026-05-10T00:01:00+00:00",
+                ),
+            )
 
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
@@ -2936,6 +2938,8 @@ async def test_merge_command_keeps_operator_wait_when_lookup_fails(
         assert orch._dispatch_run_ids["iss-1"] == "merge-run"  # noqa: SLF001
         assert "merge-run" in orch._operator_wait_run_ids  # noqa: SLF001
         assert orch._merge_needs_approval_bindings["merge-run"] is binding  # noqa: SLF001
+        body = linear.post_comment.await_args.args[1]
+        assert "lookup down" in body
     finally:
         await conn.close()
 

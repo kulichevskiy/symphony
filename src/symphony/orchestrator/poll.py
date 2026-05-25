@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import aiosqlite
 import httpx
@@ -161,6 +161,10 @@ ACCEPTANCE_FIX_ITERATION_CAP = 1
 
 
 class _AcceptancePrDiffUnavailable(RuntimeError):
+    pass
+
+
+class _RetryableSlashCommandError(RuntimeError):
     pass
 
 
@@ -1642,7 +1646,18 @@ class Orchestrator:
         self, issue_id: str, run_id: str, comments: list[LinearComment]
     ) -> None:
         for intent in slash.parse(comments):
-            await self._handle_slash_intent(issue_id, run_id, intent)
+            try:
+                await self._handle_slash_intent(issue_id, run_id, intent)
+            except _RetryableSlashCommandError:
+                raise
+            except Exception as e:
+                reason = str(e) or type(e).__name__
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    reason,
+                )
+                raise _RetryableSlashCommandError(reason) from e
 
     async def _advance_comment_cursor(
         self, issue_id: str, latest: str, latest_ids: set[str]
@@ -1821,6 +1836,12 @@ class Orchestrator:
                 issue_id,
                 e,
             )
+
+    async def _fail_retryable_slash_command(
+        self, issue_id: str, intent: SlashIntent, reason: str
+    ) -> NoReturn:
+        await self._post_command_rejected(issue_id, self._slash_text(intent), reason)
+        raise _RetryableSlashCommandError(reason)
 
     async def _handle_active_review_retry_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
@@ -2122,12 +2143,22 @@ class Orchestrator:
                     run_id,
                     binding.linear_states.ready,
                 )
-                return
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"missing ready state {binding.linear_states.ready!r}; "
+                    "keeping issue parked",
+                )
             try:
                 await self.linear.move_issue(issue_id, ready_id)
             except LinearError as e:
                 log.warning("could not move %s to ready for retry: %s", issue_id, e)
-                return
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"could not move issue to {binding.linear_states.ready!r}: {e}",
+                )
+            await self._clear_operator_wait(issue_id, run_id)
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -2143,7 +2174,6 @@ class Orchestrator:
                 log.warning(
                     "implement retry comment failed for issue %s: %s", issue_id, e
                 )
-            await self._clear_operator_wait(issue_id, run_id)
             return
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
@@ -2175,7 +2205,11 @@ class Orchestrator:
                 await self.linear.move_issue(issue_id, blocked_id)
             except LinearError as e:
                 log.warning("could not move %s to blocked: %s", issue_id, e)
-                return
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"could not move issue to {binding.linear_states.blocked!r}: {e}",
+                )
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -2461,15 +2495,14 @@ class Orchestrator:
                     target_state_name,
                     e,
                 )
-                await self._post_command_rejected(
+                await self._fail_retryable_slash_command(
                     issue_id,
-                    self._slash_text(intent),
+                    intent,
                     "could not move issue to an active Linear state; "
-                    "keeping acceptance blocked",
+                    f"keeping acceptance blocked: {e}",
                 )
-                return
-            await db.acceptance_state.reset(self._conn, issue_id)
             await self._clear_operator_wait(issue_id, run_id)
+            await db.acceptance_state.reset(self._conn, issue_id)
             body = acceptance_retry_requested(
                 CommentVars(
                     stage="acceptance",
@@ -2497,7 +2530,11 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for skip-acceptance: %s", issue_id, e)
-                return
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"could not look up issue for skip-acceptance: {e}",
+                )
 
             await db.acceptance_state.record_verdict(
                 self._conn,
@@ -5369,25 +5406,57 @@ class Orchestrator:
                     issue = await self.linear.lookup_issue(issue_id)
                 except LinearError as e:
                     log.warning("could not look up %s for reject: %s", issue_id, e)
-                    await self._clear_operator_wait(issue_id, run_id)
-                    return
+                    await self._fail_retryable_slash_command(
+                        issue_id,
+                        intent,
+                        f"could not look up issue for review reject: {e}",
+                    )
                 if blocked_id is not None:
                     try:
                         await self.linear.move_issue(issue_id, blocked_id)
                     except LinearError as e:
                         log.warning("could not move %s to blocked: %s", issue.identifier, e)
+                        await self._fail_retryable_slash_command(
+                            issue_id,
+                            intent,
+                            f"could not move issue to "
+                            f"{binding.linear_states.blocked!r}: {e}",
+                        )
                 await self._clear_operator_wait(issue_id, run_id)
             else:
                 log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
             return
 
         # $retry or $approve: restart the review monitor.
-        await self._clear_operator_wait(issue_id, run_id)
         try:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for retry: %s", issue_id, e)
-            return
+            await self._fail_retryable_slash_command(
+                issue_id,
+                intent,
+                f"could not look up issue for review retry: {e}",
+            )
+        states = await self._states_for_binding(binding)
+        review_state_id = states.get(binding.linear_states.needs_approval)
+        if review_state_id is None:
+            await self._fail_retryable_slash_command(
+                issue_id,
+                intent,
+                f"missing review state {binding.linear_states.needs_approval!r}; "
+                "keeping issue parked",
+            )
+        try:
+            await self.linear.move_issue(issue_id, review_state_id)
+        except LinearError as e:
+            log.warning("could not move %s to review for retry: %s", issue_id, e)
+            await self._fail_retryable_slash_command(
+                issue_id,
+                intent,
+                f"could not move issue to "
+                f"{binding.linear_states.needs_approval!r}: {e}",
+            )
+        await self._clear_operator_wait(issue_id, run_id)
         new_run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         await db.runs.create(
@@ -5422,7 +5491,6 @@ class Orchestrator:
             ended_at=None,
             cost_usd=0.0,
         )
-        await self._move_issue_to_review_state(binding=binding, issue=issue)
         self._schedule_review_poll(run, binding, issue)
         log.info("restarted review monitor for %s via $retry", issue.identifier)
         body = resumed(
@@ -5460,7 +5528,11 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
-                return
+                await self._fail_retryable_slash_command(
+                    issue_id,
+                    intent,
+                    f"could not look up issue for merge reject: {e}",
+                )
             if blocked_id is not None:
                 try:
                     await self.linear.move_issue(issue_id, blocked_id)
@@ -5469,6 +5541,12 @@ class Orchestrator:
                         "could not move %s to blocked after merge reject: %s",
                         issue.identifier,
                         e,
+                    )
+                    await self._fail_retryable_slash_command(
+                        issue_id,
+                        intent,
+                        f"could not move issue to "
+                        f"{binding.linear_states.blocked!r}: {e}",
                     )
             await self._clear_operator_wait(issue_id, run_id)
             return
@@ -5481,10 +5559,19 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
-            return
+            await self._fail_retryable_slash_command(
+                issue_id,
+                intent,
+                f"could not look up issue for merge re-dispatch: {e}",
+            )
         state = await db.review_state.get(self._conn, issue_id)
         if state.pr_number is None:
             log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "no PR found for merge re-dispatch",
+            )
             return
         pr_number = state.pr_number
         pr_url = state.pr_url or (
@@ -5567,7 +5654,11 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for acceptance slash: %s", issue_id, e)
-            return
+            await self._fail_retryable_slash_command(
+                issue_id,
+                intent,
+                f"could not look up issue for acceptance slash: {e}",
+            )
 
         pr_number = state.pr_number
         pr_url = _pr_url_for_state(

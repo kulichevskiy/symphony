@@ -23,7 +23,7 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import GitHubError
-from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 
@@ -379,6 +379,82 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
 
         restarted_linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
         assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_implement_failed_retry_move_failure_keeps_command_unseen(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id="failed-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        retry_comment = LinearComment(
+            id="c-retry",
+            body="$retry",
+            created_at="2026-05-10T00:05:00+00:00",
+            author_name="user",
+            author_is_me=False,
+            external_thread_type=None,
+        )
+
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[retry_comment])
+        linear.move_issue = AsyncMock(side_effect=[LinearError("move down"), None])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = Orchestrator(cfg, linear, conn, runner=_FakeRunner([]), gh=MagicMock())
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        await orch._track_implement_failed_wait(  # noqa: SLF001
+            "iss-1",
+            "failed-run",
+            binding,
+        )
+
+        with pytest.raises(RuntimeError, match="move down"):
+            await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert not await db.comment_events.seen(conn, "c-retry")
+        assert await db.comment_cursors.get(conn, "iss-1") is None
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "failed-run"
+        rejected_bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("`$retry` ignored" in body and "move down" in body for body in rejected_bodies)
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert await db.comment_events.seen(conn, "c-retry")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-todo"),
+            call("iss-1", "state-todo"),
+        ]
+        posted_bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("Resumed" in body for body in posted_bodies)
     finally:
         await conn.close()
 
