@@ -2945,7 +2945,7 @@ async def test_merge_command_keeps_operator_wait_when_lookup_fails(
 
 
 @pytest.mark.asyncio
-async def test_merge_command_keeps_operator_wait_when_merge_dispatch_dedupes(
+async def test_merge_command_rejects_when_merge_dispatch_would_dedupe(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -3002,18 +3002,16 @@ async def test_merge_command_keeps_operator_wait_when_merge_dispatch_dedupes(
         orch._operator_wait_run_ids.add("merge-run")  # noqa: SLF001
         orch._merge_needs_approval_bindings["merge-run"] = binding  # noqa: SLF001
 
-        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
-            "iss-1",
-            "merge-run",
-            SlashIntent(
-                kind=SlashKind.APPROVE,
-                comment_id="c-command",
-                created_at="2026-05-10T00:01:00+00:00",
-            ),
-        )
-        tasks = list(orch._dispatch_tasks)  # noqa: SLF001
-        assert len(tasks) == 1
-        await asyncio.gather(*tasks)
+        with pytest.raises(RuntimeError, match="active run"):
+            await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+                "iss-1",
+                "merge-run",
+                SlashIntent(
+                    kind=SlashKind.APPROVE,
+                    comment_id="c-command",
+                    created_at="2026-05-10T00:01:00+00:00",
+                ),
+            )
 
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
@@ -3021,7 +3019,81 @@ async def test_merge_command_keeps_operator_wait_when_merge_dispatch_dedupes(
         assert orch._dispatch_run_ids["iss-1"] == "merge-run"  # noqa: SLF001
         assert "merge-run" in orch._operator_wait_run_ids  # noqa: SLF001
         assert orch._merge_needs_approval_bindings["merge-run"] is binding  # noqa: SLF001
-        linear.post_comment.assert_not_awaited()
+        assert list(orch._dispatch_tasks) == []  # noqa: SLF001
+        body = linear.post_comment.await_args.args[1]
+        assert "`$approve` ignored" in body
+        assert "active run" in body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_command_dispatch_block_does_not_mark_comment_seen(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        await _seed_active_review(conn)
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="fix-run",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label="",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        comment = _comment(
+            "$approve",
+            cid="c-approve",
+            created_at="2026-05-10T00:01:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[comment])
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+
+        with pytest.raises(RuntimeError, match="active run"):
+            await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert not await db.comment_events.seen(conn, "c-approve")
+        assert await db.comment_cursors.get(conn, "iss-1") is None
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "merge-run"
+        bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any(
+            "`$approve` ignored" in body and "active run" in body
+            for body in bodies
+        )
     finally:
         await conn.close()
 

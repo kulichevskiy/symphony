@@ -1843,6 +1843,25 @@ class Orchestrator:
         await self._post_command_rejected(issue_id, self._slash_text(intent), reason)
         raise _RetryableSlashCommandError(reason)
 
+    async def _fail_if_active_run_blocks_slash_dispatch(
+        self,
+        issue_id: str,
+        intent: SlashIntent,
+        *,
+        action: str,
+        ignored_stage: str | None = None,
+    ) -> None:
+        if await db.runs.has_active(
+            self._conn,
+            issue_id,
+            ignored_stage=ignored_stage,
+        ):
+            await self._fail_retryable_slash_command(
+                issue_id,
+                intent,
+                f"could not {action}: active run already exists for this issue",
+            )
+
     async def _handle_active_review_retry_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -2464,6 +2483,12 @@ class Orchestrator:
                 if state.pr_number is not None
                 else "(no PR yet)"
             )
+            await self._fail_if_active_run_blocks_slash_dispatch(
+                issue_id,
+                intent,
+                action="retry acceptance",
+                ignored_stage="review",
+            )
             states = await self._states_for_binding(binding)
             active_state_names = (
                 binding.linear_states.needs_approval,
@@ -2479,12 +2504,11 @@ class Orchestrator:
                     "could not retry blocked acceptance run %s: missing active state",
                     run_id,
                 )
-                await self._post_command_rejected(
+                await self._fail_retryable_slash_command(
                     issue_id,
-                    self._slash_text(intent),
+                    intent,
                     "missing active Linear state; keeping acceptance blocked",
                 )
-                return
             target_state_id = states[target_state_name]
             try:
                 await self.linear.move_issue(issue_id, target_state_id)
@@ -2526,6 +2550,12 @@ class Orchestrator:
                     "no PR found for blocked acceptance",
                 )
                 return
+            await self._fail_if_active_run_blocks_slash_dispatch(
+                issue_id,
+                intent,
+                action="skip acceptance",
+                ignored_stage="review",
+            )
             try:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
@@ -5428,6 +5458,11 @@ class Orchestrator:
             return
 
         # $retry or $approve: restart the review monitor.
+        await self._fail_if_active_run_blocks_slash_dispatch(
+            issue_id,
+            intent,
+            action="restart review",
+        )
         try:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
@@ -5555,6 +5590,12 @@ class Orchestrator:
             return
 
         # $approve or $retry: re-dispatch the merge.
+        await self._fail_if_active_run_blocks_slash_dispatch(
+            issue_id,
+            intent,
+            action="re-dispatch merge",
+            ignored_stage="review",
+        )
         try:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
@@ -5649,6 +5690,18 @@ class Orchestrator:
                 "no PR found for acceptance state",
             )
             return
+
+        action = (
+            "skip acceptance"
+            if intent.kind is SlashKind.SKIP_ACCEPTANCE
+            else "retry acceptance"
+        )
+        await self._fail_if_active_run_blocks_slash_dispatch(
+            issue_id,
+            intent,
+            action=action,
+            ignored_stage="review",
+        )
 
         try:
             issue = await self.linear.lookup_issue(issue_id)
