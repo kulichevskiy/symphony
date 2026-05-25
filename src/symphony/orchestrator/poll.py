@@ -1672,13 +1672,28 @@ class Orchestrator:
 
         Returns True when the comment was handled and persisted (marked seen
         + cursor advanced). Returns False when the comment was already seen
-        (duplicate). Raises `SlashHandlerFailure` when the handler failed
-        mid-transition (e.g. `linear.move_issue` upstream error); in that
-        case a rejection comment has been posted and the comment is
-        intentionally NOT marked seen, so the caller MUST stop processing
-        later comments for this issue (otherwise their cursor advance would
-        leave the failed comment stranded).
+        (duplicate) OR carries no actionable intent for us (self-authored or
+        externally mirrored — `slash.parse` filters those out). Raises
+        `SlashHandlerFailure` when the handler failed mid-transition (e.g.
+        `linear.move_issue` upstream error); in that case a rejection
+        comment has been posted and the comment is intentionally NOT marked
+        seen, so the caller MUST stop processing later comments for this
+        issue (otherwise their cursor advance would leave the failed
+        comment stranded).
         """
+        # Self-authored comments (e.g. the `command_rejected` we post after
+        # a `SlashHandlerFailure`) MUST NOT advance the cursor — otherwise a
+        # rejection posted *after* a failed slash command would push the
+        # cursor past the still-unprocessed original, permanently stranding
+        # it. Skip without marking or advancing; the next poll's
+        # `comments_since` will return it again, and we'll cheaply skip it
+        # again until the failed command is retried and the cursor catches
+        # up naturally. Non-self-authored comments (operator chatter,
+        # external-thread mirrors, etc.) keep their pre-existing behavior of
+        # marking-seen + advancing the cursor so the watermark moves
+        # forward.
+        if comment.author_is_me:
+            return False
         async with self._comment_event_lock:
             if await db.comment_events.seen(self._conn, comment.id):
                 return False
