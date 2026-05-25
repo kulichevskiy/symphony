@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from symphony import db
 from symphony.app import build_server_config
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.webhook import WebhookSettings, create_app
 
@@ -357,6 +357,57 @@ async def test_webhook_comment_resumes_operator_waiting_run(tmp_path: Path) -> N
         assert "iss-1" not in orch._dispatch_run_ids  # noqa: SLF001
         assert "run-1" not in orch._operator_wait_run_ids  # noqa: SLF001
         assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_comment_swallows_slash_handler_failure(tmp_path: Path) -> None:
+    """SYM-32: when a slash handler raises `SlashHandlerFailure` while
+    processing a Linear comment webhook, `_handle_webhook_comment` must
+    return a successful `WebhookDispatchResult` (not let the exception bubble
+    into `src/symphony/webhook.py`). The rejection has already been posted
+    inside the lock and the comment is intentionally NOT marked seen so the
+    next poll tick retries — but the webhook delivery dedupe claim must stay
+    in place so Linear doesn't retry the webhook and trigger another
+    rejection comment per retry attempt."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock(side_effect=LinearError("upstream 503"))
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-05-10T01:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-1",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T01:00:00+00:00",
+        )
+
+        result = await orch.handle_linear_webhook(_payload("$retry"))
+
+        # No exception leaked; webhook reports handled so the dedupe claim sticks
+        # and Linear does not retry the delivery.
+        assert result.handled is True
+        # Rejection was posted to Linear.
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any(
+            "$retry" in body and "ignored" in body for body in bodies
+        ), f"expected a command_rejected body, got {bodies!r}"
+        # Operator wait survives — the next poll tick retries.
+        assert await db.operator_waits.get(conn, "iss-1") is not None
     finally:
         await conn.close()
 

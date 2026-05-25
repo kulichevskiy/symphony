@@ -1552,7 +1552,23 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
             )
-        handled = await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+        try:
+            handled = await self._handle_unseen_slash_comment(
+                issue_id, run_id, comment
+            )
+        except SlashHandlerFailure as exc:
+            # Rejection has already been posted inside the lock, and the
+            # comment was deliberately NOT marked seen so the next poll tick
+            # can retry. Returning a successful dispatch result keeps the
+            # webhook delivery dedupe claim in place — re-raising would let
+            # `src/symphony/webhook.py` treat this as a failed delivery,
+            # forget the claim, and the provider would retry quickly,
+            # generating one extra rejection comment per webhook retry.
+            return WebhookDispatchResult(
+                kind="comment",
+                handled=True,
+                detail=f"slash handler failed: {exc.reason}",
+            )
         if not handled:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="comment already handled"
