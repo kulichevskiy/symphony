@@ -164,6 +164,24 @@ class _AcceptancePrDiffUnavailable(RuntimeError):
     pass
 
 
+class SlashHandlerFailure(RuntimeError):
+    """Raised from a `_handle_*_slash_intent` when a critical Linear/GitHub
+    call fails mid-handler (e.g. `move_issue` cannot reach the target state).
+
+    The outer `_handle_unseen_slash_comment` catches this, posts a
+    `command_rejected` Linear comment with `reason`, and intentionally does
+    NOT mark the comment as seen so the next poll tick can retry. This
+    prevents the silent-drop family (SYM-32, #59, #104) where a slash command
+    is read off Linear, advances the cursor, but never triggers the
+    underlying state transition.
+    """
+
+    def __init__(self, slash_text: str, reason: str) -> None:
+        super().__init__(reason)
+        self.slash_text = slash_text
+        self.reason = reason
+
+
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
 
 
@@ -1534,7 +1552,23 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
             )
-        handled = await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+        try:
+            handled = await self._handle_unseen_slash_comment(
+                issue_id, run_id, comment
+            )
+        except SlashHandlerFailure as exc:
+            # Rejection has already been posted inside the lock, and the
+            # comment was deliberately NOT marked seen so the next poll tick
+            # can retry. Returning a successful dispatch result keeps the
+            # webhook delivery dedupe claim in place — re-raising would let
+            # `src/symphony/webhook.py` treat this as a failed delivery,
+            # forget the claim, and the provider would retry quickly,
+            # generating one extra rejection comment per webhook retry.
+            return WebhookDispatchResult(
+                kind="comment",
+                handled=True,
+                detail=f"slash handler failed: {exc.reason}",
+            )
         if not handled:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="comment already handled"
@@ -1617,18 +1651,88 @@ class Orchestrator:
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
+            latest_self_authored: LinearComment | None = None
             for comment in comments:
                 if comment.id in seen_ids:
                     continue
-                await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+                try:
+                    await self._handle_unseen_slash_comment(issue_id, run_id, comment)
+                except SlashHandlerFailure:
+                    # Handler failed mid-transition; the rejection was posted
+                    # and the comment was deliberately NOT marked seen. Stop
+                    # iterating later comments for this issue so the failed
+                    # command stays first-in-line on the next poll tick —
+                    # otherwise a later comment could advance the cursor past
+                    # the failed one, recreating the silent-drop behavior.
+                    # Crucially, the self-authored cursor catch-up below is
+                    # also skipped — we must not advance past any failed
+                    # command.
+                    latest_self_authored = None
+                    break
+                if comment.author_is_me:
+                    # `_handle_unseen_slash_comment` deliberately did not
+                    # advance the cursor for self-authored comments (so a
+                    # `command_rejected` posted mid-failure can't strand the
+                    # failed original). Now that the loop has reached the
+                    # end without a `SlashHandlerFailure`, every prior comment
+                    # in the batch was either handled or safely skipped — so
+                    # we can advance the cursor past the latest self-authored
+                    # one. Without this, `comments_since` would re-fetch the
+                    # same bot-authored comments on every tick, growing
+                    # unboundedly over long outages.
+                    latest_self_authored = comment
+            if latest_self_authored is not None:
+                await self._advance_comment_cursor(
+                    issue_id,
+                    latest_self_authored.created_at,
+                    {latest_self_authored.id},
+                )
 
     async def _handle_unseen_slash_comment(
         self, issue_id: str, run_id: str, comment: LinearComment
     ) -> bool:
+        """Process a single slash comment under the comment-event lock.
+
+        Returns True when the comment was handled and persisted (marked seen
+        + cursor advanced). Returns False when the comment was already seen
+        (duplicate) OR carries no actionable intent for us (self-authored or
+        externally mirrored — `slash.parse` filters those out). Raises
+        `SlashHandlerFailure` when the handler failed mid-transition (e.g.
+        `linear.move_issue` upstream error); in that case a rejection
+        comment has been posted and the comment is intentionally NOT marked
+        seen, so the caller MUST stop processing later comments for this
+        issue (otherwise their cursor advance would leave the failed
+        comment stranded).
+        """
+        # Self-authored comments (e.g. the `command_rejected` we post after
+        # a `SlashHandlerFailure`) MUST NOT advance the cursor — otherwise a
+        # rejection posted *after* a failed slash command would push the
+        # cursor past the still-unprocessed original, permanently stranding
+        # it. Skip without marking or advancing; the next poll's
+        # `comments_since` will return it again, and we'll cheaply skip it
+        # again until the failed command is retried and the cursor catches
+        # up naturally. Non-self-authored comments (operator chatter,
+        # external-thread mirrors, etc.) keep their pre-existing behavior of
+        # marking-seen + advancing the cursor so the watermark moves
+        # forward.
+        if comment.author_is_me:
+            return False
         async with self._comment_event_lock:
             if await db.comment_events.seen(self._conn, comment.id):
                 return False
-            await self._handle_slash_comments(issue_id, run_id, [comment])
+            try:
+                await self._handle_slash_comments(issue_id, run_id, [comment])
+            except SlashHandlerFailure as exc:
+                log.warning(
+                    "slash handler failed for comment %s on issue %s: %s",
+                    comment.id,
+                    issue_id,
+                    exc.reason,
+                )
+                await self._post_command_rejected(
+                    issue_id, exc.slash_text, exc.reason
+                )
+                raise
             await db.comment_events.mark(
                 self._conn,
                 issue_id=issue_id,
@@ -2049,7 +2153,16 @@ class Orchestrator:
                     binding.linear_states.ready,
                 )
                 return
-            await self.linear.move_issue(issue_id, ready_id)
+            try:
+                await self.linear.move_issue(issue_id, ready_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to ready for cost-cap resume: %s", issue_id, e
+                )
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to ready state for resume: {e}",
+                ) from e
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -2072,7 +2185,18 @@ class Orchestrator:
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
             if blocked_id is not None:
-                await self.linear.move_issue(issue_id, blocked_id)
+                try:
+                    await self.linear.move_issue(issue_id, blocked_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to blocked after cost-cap stop: %s",
+                        issue_id,
+                        e,
+                    )
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not move issue to blocked state: {e}",
+                    ) from e
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -2127,7 +2251,10 @@ class Orchestrator:
                 await self.linear.move_issue(issue_id, ready_id)
             except LinearError as e:
                 log.warning("could not move %s to ready for retry: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to ready state for retry: {e}",
+                ) from e
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -2175,7 +2302,10 @@ class Orchestrator:
                 await self.linear.move_issue(issue_id, blocked_id)
             except LinearError as e:
                 log.warning("could not move %s to blocked: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -2497,7 +2627,10 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for skip-acceptance: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not look up issue for skip-acceptance: {e}",
+                ) from e
 
             await db.acceptance_state.record_verdict(
                 self._conn,
@@ -5369,25 +5502,40 @@ class Orchestrator:
                     issue = await self.linear.lookup_issue(issue_id)
                 except LinearError as e:
                     log.warning("could not look up %s for reject: %s", issue_id, e)
-                    await self._clear_operator_wait(issue_id, run_id)
-                    return
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not look up issue for reject: {e}",
+                    ) from e
                 if blocked_id is not None:
                     try:
                         await self.linear.move_issue(issue_id, blocked_id)
                     except LinearError as e:
-                        log.warning("could not move %s to blocked: %s", issue.identifier, e)
+                        log.warning(
+                            "could not move %s to blocked: %s", issue.identifier, e
+                        )
+                        raise SlashHandlerFailure(
+                            slash_text=self._slash_text(intent),
+                            reason=f"could not move issue to blocked state: {e}",
+                        ) from e
                 await self._clear_operator_wait(issue_id, run_id)
             else:
                 log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
             return
 
         # $retry or $approve: restart the review monitor.
-        await self._clear_operator_wait(issue_id, run_id)
+        # Look up the issue BEFORE clearing the operator wait — if lookup
+        # fails we want the wait (and its `_dispatch_run_ids` entry) to
+        # survive so the next poll tick can retry. Clearing first would
+        # make the issue invisible to slash polling on the retry.
         try:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for retry: %s", issue_id, e)
-            return
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for retry: {e}",
+            ) from e
+        await self._clear_operator_wait(issue_id, run_id)
         new_run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         await db.runs.create(
@@ -5460,7 +5608,10 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not look up issue for merge reject: {e}",
+                ) from e
             if blocked_id is not None:
                 try:
                     await self.linear.move_issue(issue_id, blocked_id)
@@ -5470,6 +5621,10 @@ class Orchestrator:
                         issue.identifier,
                         e,
                     )
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not move issue to blocked state: {e}",
+                    ) from e
             await self._clear_operator_wait(issue_id, run_id)
             return
         if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
@@ -5481,7 +5636,10 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
-            return
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for merge re-dispatch: {e}",
+            ) from e
         state = await db.review_state.get(self._conn, issue_id)
         if state.pr_number is None:
             log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
@@ -5567,7 +5725,10 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for acceptance slash: %s", issue_id, e)
-            return
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for acceptance slash: {e}",
+            ) from e
 
         pr_number = state.pr_number
         pr_url = _pr_url_for_state(
