@@ -19,7 +19,7 @@ import pytest
 
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 
@@ -922,5 +922,62 @@ async def test_cursor_advances_across_ticks(tmp_path: Path) -> None:
         assert second_after > first_after
         # Cursor was advanced to the most recent observed comment.
         assert second_after.isoformat() == "2026-05-10T11:00:00+00:00"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_implement_failed_retry_failure_posts_rejection_and_retries_next_tick(
+    tmp_path: Path,
+) -> None:
+    """SYM-32: when `linear.move_issue` raises mid-handler the slash command
+    must not be silently dropped — the orchestrator posts a `command_rejected`
+    Linear comment, does NOT advance the cursor for that comment, and a
+    subsequent poll tick (with `move_issue` recovered) cleanly completes the
+    transition and clears the operator wait."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(
+            return_value=[
+                _comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00")
+            ]
+        )
+        linear.move_issue = AsyncMock(side_effect=[LinearError("upstream 503"), None])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            stage="implement",
+            status="failed",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+
+        # First poll: move_issue raises -> SlashHandlerFailure -> rejection posted,
+        # operator wait remains, comment NOT marked seen.
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert linear.move_issue.await_count == 1
+        rejection_bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any(
+            "$retry" in body and "ignored" in body and "ready" in body
+            for body in rejection_bodies
+        ), f"expected a command_rejected body, got {rejection_bodies!r}"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert not await db.comment_events.seen(conn, "c-retry")
+
+        # Second poll: same comment re-served, move_issue now succeeds ->
+        # operator wait cleared, comment marked seen, cursor advances.
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        assert linear.move_issue.await_count == 2
+        assert linear.move_issue.await_args_list[-1].args == ("iss-1", "state-todo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert await db.comment_events.seen(conn, "c-retry")
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("Resumed" in body for body in bodies)
     finally:
         await conn.close()

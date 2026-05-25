@@ -34,6 +34,7 @@ from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import (
     Orchestrator,
+    SlashHandlerFailure,
     build_fix_runner_command,
     build_runner_command,
     pr_number_from_url,
@@ -2920,15 +2921,17 @@ async def test_merge_command_keeps_operator_wait_when_lookup_fails(
         orch._operator_wait_run_ids.add("merge-run")  # noqa: SLF001
         orch._merge_needs_approval_bindings["merge-run"] = binding  # noqa: SLF001
 
-        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
-            "iss-1",
-            "merge-run",
-            SlashIntent(
-                kind=kind,
-                comment_id="c-command",
-                created_at="2026-05-10T00:01:00+00:00",
-            ),
-        )
+        with pytest.raises(SlashHandlerFailure) as excinfo:
+            await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+                "iss-1",
+                "merge-run",
+                SlashIntent(
+                    kind=kind,
+                    comment_id="c-command",
+                    created_at="2026-05-10T00:01:00+00:00",
+                ),
+            )
+        assert "look up" in excinfo.value.reason
 
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None

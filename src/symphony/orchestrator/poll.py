@@ -164,6 +164,24 @@ class _AcceptancePrDiffUnavailable(RuntimeError):
     pass
 
 
+class SlashHandlerFailure(RuntimeError):
+    """Raised from a `_handle_*_slash_intent` when a critical Linear/GitHub
+    call fails mid-handler (e.g. `move_issue` cannot reach the target state).
+
+    The outer `_handle_unseen_slash_comment` catches this, posts a
+    `command_rejected` Linear comment with `reason`, and intentionally does
+    NOT mark the comment as seen so the next poll tick can retry. This
+    prevents the silent-drop family (SYM-32, #59, #104) where a slash command
+    is read off Linear, advances the cursor, but never triggers the
+    underlying state transition.
+    """
+
+    def __init__(self, slash_text: str, reason: str) -> None:
+        super().__init__(reason)
+        self.slash_text = slash_text
+        self.reason = reason
+
+
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
 
 
@@ -1628,7 +1646,19 @@ class Orchestrator:
         async with self._comment_event_lock:
             if await db.comment_events.seen(self._conn, comment.id):
                 return False
-            await self._handle_slash_comments(issue_id, run_id, [comment])
+            try:
+                await self._handle_slash_comments(issue_id, run_id, [comment])
+            except SlashHandlerFailure as exc:
+                log.warning(
+                    "slash handler failed for comment %s on issue %s: %s",
+                    comment.id,
+                    issue_id,
+                    exc.reason,
+                )
+                await self._post_command_rejected(
+                    issue_id, exc.slash_text, exc.reason
+                )
+                return False
             await db.comment_events.mark(
                 self._conn,
                 issue_id=issue_id,
@@ -2049,7 +2079,16 @@ class Orchestrator:
                     binding.linear_states.ready,
                 )
                 return
-            await self.linear.move_issue(issue_id, ready_id)
+            try:
+                await self.linear.move_issue(issue_id, ready_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to ready for cost-cap resume: %s", issue_id, e
+                )
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to ready state for resume: {e}",
+                ) from e
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -2072,7 +2111,18 @@ class Orchestrator:
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
             if blocked_id is not None:
-                await self.linear.move_issue(issue_id, blocked_id)
+                try:
+                    await self.linear.move_issue(issue_id, blocked_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to blocked after cost-cap stop: %s",
+                        issue_id,
+                        e,
+                    )
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not move issue to blocked state: {e}",
+                    ) from e
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -2127,7 +2177,10 @@ class Orchestrator:
                 await self.linear.move_issue(issue_id, ready_id)
             except LinearError as e:
                 log.warning("could not move %s to ready for retry: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to ready state for retry: {e}",
+                ) from e
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -2175,7 +2228,10 @@ class Orchestrator:
                 await self.linear.move_issue(issue_id, blocked_id)
             except LinearError as e:
                 log.warning("could not move %s to blocked: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -2497,7 +2553,10 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for skip-acceptance: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not look up issue for skip-acceptance: {e}",
+                ) from e
 
             await db.acceptance_state.record_verdict(
                 self._conn,
@@ -5369,13 +5428,21 @@ class Orchestrator:
                     issue = await self.linear.lookup_issue(issue_id)
                 except LinearError as e:
                     log.warning("could not look up %s for reject: %s", issue_id, e)
-                    await self._clear_operator_wait(issue_id, run_id)
-                    return
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not look up issue for reject: {e}",
+                    ) from e
                 if blocked_id is not None:
                     try:
                         await self.linear.move_issue(issue_id, blocked_id)
                     except LinearError as e:
-                        log.warning("could not move %s to blocked: %s", issue.identifier, e)
+                        log.warning(
+                            "could not move %s to blocked: %s", issue.identifier, e
+                        )
+                        raise SlashHandlerFailure(
+                            slash_text=self._slash_text(intent),
+                            reason=f"could not move issue to blocked state: {e}",
+                        ) from e
                 await self._clear_operator_wait(issue_id, run_id)
             else:
                 log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
@@ -5387,7 +5454,10 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for retry: %s", issue_id, e)
-            return
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for retry: {e}",
+            ) from e
         new_run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         await db.runs.create(
@@ -5460,7 +5530,10 @@ class Orchestrator:
                 issue = await self.linear.lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
-                return
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not look up issue for merge reject: {e}",
+                ) from e
             if blocked_id is not None:
                 try:
                     await self.linear.move_issue(issue_id, blocked_id)
@@ -5470,6 +5543,10 @@ class Orchestrator:
                         issue.identifier,
                         e,
                     )
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not move issue to blocked state: {e}",
+                    ) from e
             await self._clear_operator_wait(issue_id, run_id)
             return
         if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
@@ -5481,7 +5558,10 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
-            return
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for merge re-dispatch: {e}",
+            ) from e
         state = await db.review_state.get(self._conn, issue_id)
         if state.pr_number is None:
             log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
@@ -5567,7 +5647,10 @@ class Orchestrator:
             issue = await self.linear.lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for acceptance slash: %s", issue_id, e)
-            return
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for acceptance slash: {e}",
+            ) from e
 
         pr_number = state.pr_number
         pr_url = _pr_url_for_state(
