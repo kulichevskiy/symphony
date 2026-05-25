@@ -1651,6 +1651,7 @@ class Orchestrator:
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
+            latest_self_authored: LinearComment | None = None
             for comment in comments:
                 if comment.id in seen_ids:
                     continue
@@ -1663,7 +1664,29 @@ class Orchestrator:
                     # command stays first-in-line on the next poll tick —
                     # otherwise a later comment could advance the cursor past
                     # the failed one, recreating the silent-drop behavior.
+                    # Crucially, the self-authored cursor catch-up below is
+                    # also skipped — we must not advance past any failed
+                    # command.
+                    latest_self_authored = None
                     break
+                if comment.author_is_me:
+                    # `_handle_unseen_slash_comment` deliberately did not
+                    # advance the cursor for self-authored comments (so a
+                    # `command_rejected` posted mid-failure can't strand the
+                    # failed original). Now that the loop has reached the
+                    # end without a `SlashHandlerFailure`, every prior comment
+                    # in the batch was either handled or safely skipped — so
+                    # we can advance the cursor past the latest self-authored
+                    # one. Without this, `comments_since` would re-fetch the
+                    # same bot-authored comments on every tick, growing
+                    # unboundedly over long outages.
+                    latest_self_authored = comment
+            if latest_self_authored is not None:
+                await self._advance_comment_cursor(
+                    issue_id,
+                    latest_self_authored.created_at,
+                    {latest_self_authored.id},
+                )
 
     async def _handle_unseen_slash_comment(
         self, issue_id: str, run_id: str, comment: LinearComment

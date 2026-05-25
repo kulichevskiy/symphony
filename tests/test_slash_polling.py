@@ -930,46 +930,33 @@ async def test_cursor_advances_across_ticks(tmp_path: Path) -> None:
 async def test_self_authored_rejection_comment_does_not_advance_cursor_past_failed_command(
     tmp_path: Path,
 ) -> None:
-    """SYM-32 P1 (round 2): when a slash handler fails, the
-    `command_rejected` comment we post ourselves is delivered back to us
-    (via webhook OR returned by `comments_since` next tick). It's
-    self-authored, so `slash.parse` skips it — but the old wrapper still
-    marked it seen and advanced the cursor past its timestamp. Because the
-    rejection's timestamp is later than the failed original, the cursor
-    would jump past the original and strand it permanently.
+    """SYM-32 P1 + P2 (round 2): the `command_rejected` comment posted
+    after a failed slash handler is self-authored and arrives back to us.
+    The cursor must NOT advance past it while the failed original is still
+    pending (otherwise the original is stranded — silent drop), but it MUST
+    advance past it once the original recovers (otherwise rejections
+    accumulate unboundedly in the `comments_since` window).
 
-    Verified by: simulate the failure path on poll-tick 1, then simulate
-    `comments_since` returning the rejection comment on tick 2, then
-    `move_issue` recovers on tick 3 and the original $retry succeeds."""
+    Three ticks: tick 1 only the `$retry`, tick 2 `$retry` + rejection
+    while `move_issue` still fails, tick 3 `move_issue` recovers and the
+    `$retry` succeeds."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        # State machine driven from outside the orchestrator.
+        retry = _comment(
+            "$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00"
+        )
+        rejection = _comment(
+            "🚫 `$retry` ignored: could not move ...",
+            cid="c-rejection",
+            created_at="2026-05-10T01:30:30+00:00",
+            is_me=True,
+        )
         comments_per_tick: list[list[LinearComment]] = [
-            [_comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00")],
-            # Tick 2: rejection has been posted; comments_since still returns
-            # the original $retry (older than its timestamp), AND the
-            # self-authored rejection at a LATER timestamp.
-            [
-                _comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00"),
-                _comment(
-                    "🚫 `$retry` ignored: could not move ...",
-                    cid="c-rejection",
-                    created_at="2026-05-10T01:30:30+00:00",
-                    is_me=True,
-                ),
-            ],
-            # Tick 3: same comments; move_issue recovered.
-            [
-                _comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00"),
-                _comment(
-                    "🚫 `$retry` ignored: could not move ...",
-                    cid="c-rejection",
-                    created_at="2026-05-10T01:30:30+00:00",
-                    is_me=True,
-                ),
-            ],
+            [retry],
+            [retry, rejection],
+            [retry, rejection],
         ]
         tick_idx = {"i": 0}
 
@@ -979,7 +966,14 @@ async def test_self_authored_rejection_comment_does_not_advance_cursor_past_fail
             return comments_per_tick[min(i, len(comments_per_tick) - 1)]
 
         linear.comments_since = AsyncMock(side_effect=fake_comments_since)
-        linear.move_issue = AsyncMock(side_effect=[LinearError("upstream 503"), None])
+        # Tick 1: 1 fail. Tick 2: 1 more fail. Tick 3: success.
+        linear.move_issue = AsyncMock(
+            side_effect=[
+                LinearError("upstream 503"),
+                LinearError("upstream 503"),
+                None,
+            ]
+        )
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
         await _seed_operator_wait(
@@ -991,16 +985,15 @@ async def test_self_authored_rejection_comment_does_not_advance_cursor_past_fail
 
         orch = _make_orch(cfg, linear, conn)
 
-        # Tick 1 — only the $retry exists; handler fails; no seen-mark, no cursor advance.
+        # Tick 1 — only the $retry; handler fails; cursor untouched, wait stays.
         await orch._poll_slash_commands()  # noqa: SLF001
         assert linear.move_issue.await_count == 1
         assert not await db.comment_events.seen(conn, "c-retry")
         assert await db.operator_waits.get(conn, "iss-1") is not None
 
-        # Tick 2 — $retry + self-authored rejection now returned. Handler is
-        # invoked for $retry first (still fails -> break). The rejection
-        # would otherwise be processed next; verify the cursor did NOT
-        # advance past the failed $retry's timestamp.
+        # Tick 2 — $retry STILL fails; the rejection is also in the batch but
+        # the loop breaks on the $retry failure BEFORE reaching it. Cursor
+        # must NOT advance past either comment.
         await orch._poll_slash_commands()  # noqa: SLF001
         cursor = await db.comment_cursors.get(conn, "iss-1")
         if cursor is not None:
@@ -1008,17 +1001,24 @@ async def test_self_authored_rejection_comment_does_not_advance_cursor_past_fail
             assert cursor_at <= "2026-05-10T01:30:00+00:00", (
                 f"cursor jumped past failed $retry: {cursor_at}"
             )
-        # Rejection comment must NOT be marked seen (its mark would not
-        # cause harm here but the contract is: self-authored / no-intent
-        # comments don't mutate cursor state).
         assert not await db.comment_events.seen(conn, "c-rejection")
 
-        # Tick 3 — move_issue recovered. Original $retry succeeds, cursor
-        # advances cleanly, operator wait cleared.
+        # Tick 3 — move_issue recovers. $retry succeeds (marks seen, advances
+        # cursor to its timestamp); rejection then iterates safely after it
+        # in the same batch, triggering the post-loop cursor catch-up to
+        # advance past the rejection too. Without that catch-up, the
+        # rejection would be re-fetched on every subsequent tick forever.
         await orch._poll_slash_commands()  # noqa: SLF001
-        assert linear.move_issue.await_count == 2
+        assert linear.move_issue.await_count == 3
         assert await db.operator_waits.get(conn, "iss-1") is None
         assert await db.comment_events.seen(conn, "c-retry")
+        cursor = await db.comment_cursors.get(conn, "iss-1")
+        assert cursor is not None
+        cursor_at, cursor_ids = cursor
+        assert cursor_at == "2026-05-10T01:30:30+00:00", (
+            f"cursor must advance past the self-authored rejection; got {cursor_at}"
+        )
+        assert "c-rejection" in cursor_ids
     finally:
         await conn.close()
 
