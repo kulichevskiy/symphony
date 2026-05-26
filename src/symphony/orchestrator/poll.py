@@ -83,6 +83,7 @@ from ..linear.templates import (
     failed,
     fix_pushed,
     fixing_merge_conflict,
+    is_symphony_comment,
     moved_to_waiting,
     resumed,
     retry_acceptance_requested,
@@ -10353,7 +10354,7 @@ def _comment_from_webhook_payload(
     if isinstance(actor, Mapping):
         raw_name = actor.get("name")
         author_name = raw_name if isinstance(raw_name, str) else ""
-        author_is_me = bool(actor.get("isMe", False))
+    author_is_me = is_symphony_comment(body)
     external_thread_type: str | None = None
     ext = data.get("externalThread")
     if isinstance(ext, Mapping):

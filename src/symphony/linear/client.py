@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 
 from . import queries
+from .templates import is_symphony_comment, mark_symphony_comment
 
 log = logging.getLogger(__name__)
 
@@ -80,19 +81,20 @@ class LinearComment:
     body: str
     created_at: str  # RFC3339
     author_name: str
-    author_is_me: bool
+    author_is_me: bool  # True for marker-tagged Symphony comments, not Linear's user.isMe.
     external_thread_type: str | None  # set if mirrored from GitHub etc.
 
     @classmethod
     def from_node(cls, node: dict[str, Any]) -> LinearComment:
         user = node.get("user") or {}
         ext = node.get("externalThread")
+        body = node["body"]
         return cls(
             id=node["id"],
-            body=node["body"],
+            body=body,
             created_at=node["createdAt"],
             author_name=user.get("name", ""),
-            author_is_me=bool(user.get("isMe", False)),
+            author_is_me=is_symphony_comment(body),
             external_thread_type=ext["type"] if ext else None,
         )
 
@@ -233,7 +235,7 @@ class Linear:
         """Returns the comment id (useful for threading later)."""
         data = await self._query(
             queries.CREATE_COMMENT,
-            {"input": {"issueId": issue_uuid, "body": body}},
+            {"input": {"issueId": issue_uuid, "body": mark_symphony_comment(body)}},
         )
         result = data["commentCreate"]
         if not result.get("success"):
