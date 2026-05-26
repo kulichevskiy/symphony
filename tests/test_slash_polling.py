@@ -539,6 +539,61 @@ async def test_merge_approve_after_restart_dispatches_from_unread_comment(
 
 
 @pytest.mark.asyncio
+async def test_merge_approve_dispatches_when_operator_shares_linear_identity(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        operator_approve = LinearComment.from_node(
+            {
+                "id": "c-approve",
+                "body": "$approve",
+                "createdAt": "2026-05-26T13:49:22Z",
+                "user": {"name": "Operator", "isMe": True},
+                "externalThread": None,
+            }
+        )
+        symphony_rejection = LinearComment.from_node(
+            {
+                "id": "c-rejection",
+                "body": "🚫 `$approve` ignored: no active merge\n\n<!-- symphony:comment -->",
+                "createdAt": "2026-05-26T13:49:33Z",
+                "user": {"name": "Operator", "isMe": True},
+                "externalThread": None,
+            }
+        )
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(
+            return_value=[operator_approve, symphony_rejection]
+        )
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            stage="merge",
+            status="needs_approval",
+        )
+        await _seed_review_state(conn, pr_number=301)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert await db.comment_events.seen(conn, "c-approve")
+        assert not await db.comment_events.seen(conn, "c-rejection")
+        cursor = await db.comment_cursors.get(conn, "iss-1")
+        assert cursor == ("2026-05-26T13:49:33Z", ["c-rejection"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_acceptance_after_restart_dispatches_merge(
     tmp_path: Path,
 ) -> None:

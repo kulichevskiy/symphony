@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from symphony.linear import queries
-from symphony.linear.client import Linear, LinearError, LinearIssue
+from symphony.linear.client import Linear, LinearComment, LinearError, LinearIssue
 
 
 def _comment(cid: str, created_at: str = "2026-05-10T12:00:00+00:00") -> dict[str, Any]:
@@ -164,6 +164,54 @@ async def test_move_issue_logs_issue_identifier_and_target_state(
 def test_comments_since_uses_linear_filter_timestamp_type() -> None:
     assert "$after: DateTimeOrDuration!" in queries.ISSUE_COMMENTS_SINCE
     assert "$after: DateTime!" not in queries.ISSUE_COMMENTS_SINCE
+
+
+def test_comment_from_node_uses_symphony_marker_not_linear_is_me() -> None:
+    operator = LinearComment.from_node(
+        {
+            "id": "c-operator",
+            "body": "$approve",
+            "createdAt": "2026-05-26T13:49:22Z",
+            "user": {"name": "Operator", "isMe": True},
+            "externalThread": None,
+        }
+    )
+    symphony = LinearComment.from_node(
+        {
+            "id": "c-symphony",
+            "body": "$approve\n\n<!-- symphony:comment -->",
+            "createdAt": "2026-05-26T13:49:33Z",
+            "user": {"name": "Operator", "isMe": True},
+            "externalThread": None,
+        }
+    )
+
+    assert operator.author_is_me is False
+    assert symphony.author_is_me is True
+
+
+@pytest.mark.asyncio
+async def test_post_comment_adds_symphony_marker() -> None:
+    linear = Linear("test-key")
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_query(gql: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append((gql, variables))
+        return {"commentCreate": {"success": True, "comment": {"id": "c1"}}}
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    try:
+        comment_id = await linear.post_comment("iss-1", "hello")
+    finally:
+        await linear.aclose()
+
+    assert comment_id == "c1"
+    assert calls == [
+        (
+            queries.CREATE_COMMENT,
+            {"input": {"issueId": "iss-1", "body": "hello\n\n<!-- symphony:comment -->"}},
+        )
+    ]
 
 
 @pytest.mark.asyncio

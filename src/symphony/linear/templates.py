@@ -21,6 +21,23 @@ from dataclasses import dataclass
 COMMENT_BYTE_LIMIT = 4096
 
 _TRUNCATION_SUFFIX = "\n\n…[truncated]"
+SYMPHONY_COMMENT_MARKER = "<!-- symphony:comment -->"
+_SYMPHONY_COMMENT_SUFFIX = f"\n\n{SYMPHONY_COMMENT_MARKER}"
+
+
+def is_symphony_comment(body: str) -> bool:
+    return SYMPHONY_COMMENT_MARKER in body
+
+
+def mark_symphony_comment(body: str, *, limit: int = COMMENT_BYTE_LIMIT) -> str:
+    if is_symphony_comment(body):
+        return body
+    marker_size = len(_SYMPHONY_COMMENT_SUFFIX.encode("utf-8"))
+    if limit <= marker_size:
+        return _SYMPHONY_COMMENT_SUFFIX.encode("utf-8")[:limit].decode(
+            "utf-8", errors="ignore"
+        )
+    return truncate_body(body, limit=limit - marker_size) + _SYMPHONY_COMMENT_SUFFIX
 
 
 def truncate_body(body: str, *, limit: int = COMMENT_BYTE_LIMIT) -> str:

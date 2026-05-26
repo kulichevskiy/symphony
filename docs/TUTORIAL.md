@@ -893,6 +893,10 @@ gh pr view <number> --repo owner/repo --comments
 
 Commands are top-level Linear comments. They start with `$`, not `/`.
 Mirrored GitHub comments are ignored by the Linear command parser.
+Operator commands work with either a dedicated bot/OAuth identity or a personal
+`LINEAR_API_KEY`. Symphony ignores its own comments by an internal footer marker
+on comments it posts, not by Linear's per-user `isMe` flag, so an operator can
+approve/retry from the Linear UI even when the daemon uses that operator's token.
 
 | Command | Meaning |
 | --- | --- |
