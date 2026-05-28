@@ -19,6 +19,7 @@ import pytest
 
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
+from symphony.github import GitHubError
 from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator, SlashHandlerFailure
@@ -170,6 +171,52 @@ async def _seed_review_state(
         pr_url=f"https://github.com/org/repo/pull/{pr_number}",
         github_repo="org/repo",
         issue_label=None,
+    )
+
+
+async def _seed_parked_manual_merge_pr(
+    conn: object,
+    *,
+    issue_id: str = "iss-1",
+    github_repo: str = "org/repo",
+    pr_number: int = 42,
+) -> None:
+    await db.issues.upsert(
+        conn,  # type: ignore[arg-type]
+        id=issue_id,
+        identifier="ENG-1",
+        title="t",
+        team_key="ENG",
+    )
+    await db.issue_prs.upsert(
+        conn,  # type: ignore[arg-type]
+        issue_id=issue_id,
+        github_repo=github_repo,
+        pr_number=pr_number,
+        pr_url=f"https://github.com/{github_repo}/pull/{pr_number}",
+        created_at="2026-05-10T00:00:00+00:00",
+    )
+    await db.runs.create(
+        conn,  # type: ignore[arg-type]
+        id=f"review-{pr_number}",
+        issue_id=issue_id,
+        stage="review",
+        status="completed",
+        pid=None,
+        started_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.runs.update_status(
+        conn,  # type: ignore[arg-type]
+        f"review-{pr_number}",
+        "completed",
+        ended_at="2026-05-10T00:04:00+00:00",
+    )
+    assert await db.issue_prs.mark_parked_for_manual_merge(
+        conn,  # type: ignore[arg-type]
+        issue_id=issue_id,
+        github_repo=github_repo,
+        pr_number=pr_number,
+        parked_at="2026-05-10T00:05:00+00:00",
     )
 
 
@@ -505,6 +552,86 @@ async def test_skip_acceptance_on_blocked_wait_dispatches_merge(
 
 
 @pytest.mark.asyncio
+async def test_approve_on_parked_manual_merge_pr_merges_once(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"auto_merge": False, "merge_strategy": "merge"}
+        )
+        cfg = Config(repos=[binding])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_parked_manual_merge_pr(conn, pr_number=302)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_merge = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._gh.pr_merge.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+            302,
+            strategy="merge",
+            auto=False,
+            repo="org/repo",
+        )
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        linear.post_comment.assert_not_awaited()
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at == "2026-05-10T00:05:00+00:00"
+        assert await db.comment_events.seen(conn, "c1")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_on_parked_manual_merge_pr_reports_merge_error(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding().model_copy(update={"auto_merge": False})])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_parked_manual_merge_pr(conn, pr_number=303)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_merge = AsyncMock(  # type: ignore[attr-defined]  # noqa: SLF001
+            side_effect=GitHubError("branch protection blocked")
+        )
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._gh.pr_merge.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+            303,
+            strategy="squash",
+            auto=False,
+            repo="org/repo",
+        )
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert len(bodies) == 1
+        assert "manual merge failed" in bodies[0]
+        assert "branch protection blocked" in bodies[0]
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at == "2026-05-10T00:05:00+00:00"
+        assert await db.comment_events.seen(conn, "c1")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_approve_after_restart_dispatches_from_unread_comment(
     tmp_path: Path,
 ) -> None:
@@ -526,12 +653,14 @@ async def test_merge_approve_after_restart_dispatches_from_unread_comment(
         await _seed_review_state(conn, pr_number=166)
 
         orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_merge = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
 
         await orch._poll_slash_commands()  # noqa: SLF001
 
         linear.comments_since.assert_awaited_once()
         orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._gh.pr_merge.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         _, seen_ids = await db.comment_cursors.get(conn, "iss-1") or ("", [])
         assert seen_ids == ["c1"]
     finally:
