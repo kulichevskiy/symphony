@@ -39,23 +39,31 @@ class _Heartbeat:
         self._cmd_starts: dict[str, float] = {}
 
     def observe(self, line: str) -> None:
-        """Parse one codex JSON-stream line and track command_execution spans."""
+        """Parse one codex JSON-stream line and track command_execution spans.
+
+        Accepts both the canonical shape (`item.type == "command_execution"`)
+        and the legacy shape that puts `item_type` on the item or the outer
+        event — same fields `activity.parse_codex_activity_line` recognises.
+        """
         try:
             event = json.loads(line)
         except (ValueError, TypeError):
             return
         if not isinstance(event, dict):
             return
-        item = event.get("item")
-        if not isinstance(item, dict) or item.get("type") != "command_execution":
+        kind = event.get("type")
+        if kind not in ("item.started", "item.completed"):
             return
-        item_id = item.get("id")
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = item.get("type") or item.get("item_type") or event.get("item_type")
+        if item_type != "command_execution":
+            return
+        item_id = item.get("id") or event.get("item_id") or event.get("id")
         if not isinstance(item_id, str):
             return
-        kind = event.get("type")
         if kind == "item.started":
             self._cmd_starts.setdefault(item_id, self.last_line)
-        elif kind == "item.completed":
+        else:  # item.completed
             self._cmd_starts.pop(item_id, None)
 
     def deadline(self, now: float, stall_secs: float, command_secs: float) -> float:
