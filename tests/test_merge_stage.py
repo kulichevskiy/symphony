@@ -1470,7 +1470,7 @@ async def test_auto_merge_false_manual_merge_parking_is_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_auto_merge_false_parked_pr_close_is_reconciled(
+async def test_auto_merge_false_parked_pr_close_moves_issue_done_once(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -1480,7 +1480,9 @@ async def test_auto_merge_false_parked_pr_close_is_reconciled(
         parked_issue.state_id = "state-na"
         parked_issue.state_name = "Needs Approval"
         linear = AsyncMock()
-        linear.lookup_issue = AsyncMock(side_effect=[_issue(), parked_issue])
+        linear.lookup_issue = AsyncMock(
+            side_effect=[_issue(), parked_issue, _done_issue()]
+        )
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
         gh = MagicMock()
@@ -1537,27 +1539,30 @@ async def test_auto_merge_false_parked_pr_close_is_reconciled(
         assert pr.parked_at is not None
 
         await _poll_and_wait(orch)
+        await _poll_and_wait(orch)
 
         gh.pr_merge.assert_not_awaited()
         assert gh.pr_view.await_count == 2
         linear.move_issue.assert_has_awaits(
-            [call("iss-1", "state-na"), call("iss-1", "state-na")]
+            [call("iss-1", "state-na"), call("iss-1", "state-done")]
         )
         assert linear.post_comment.await_count == 2
         comments = [args.args[1] for args in linear.post_comment.await_args_list]
         assert "ready for manual merge" in comments[0]
-        assert "pull request closed before merge" in comments[1]
+        assert comments[1] == "🛑 PR closed without merge — marking done"
         merge_run = await db.runs.latest_for_issue_stage(
             conn,
             issue_id="iss-1",
             stage="merge",
             started_at_gte="2026-05-10T00:01:00+00:00",
         )
-        assert merge_run is not None
-        assert merge_run.status == "needs_approval"
+        assert merge_run is None
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_MERGE
+        assert wait is None
+        assert (
+            await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+            is None
+        )
         assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
         await conn.close()

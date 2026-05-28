@@ -150,6 +150,7 @@ CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
 MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
+PARKED_CLOSED_UNMERGED_COMMENT = "🛑 PR closed without merge — marking done"
 _CODE_ONLY_ACCEPTANCE_MODE = "code_only"
 NEEDS_HUMAN_APPROVAL_LABEL = "needs-human-approval"
 _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
@@ -1276,6 +1277,8 @@ class Orchestrator:
         self._parked_manual_merge_revival_issue_ids: set[str] = set()
         self._merged_linear_state_reconcile_ticks = 0
         self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
+        self._parked_closed_unmerged_comment_keys: set[tuple[str, str, int]] = set()
+        self._parked_closed_unmerged_lock = asyncio.Lock()
         self._global_dispatch_sem = asyncio.Semaphore(
             max(config.global_max_concurrent, 1)
         )
@@ -1526,6 +1529,16 @@ class Orchestrator:
             self._reconciler.reconcile_github_event(event),
             source=f"github.{event.event_type}.{event.action or 'unknown'}",
         )
+        if (
+            event.event_type == "pull_request"
+            and event.action == "closed"
+            and event.pr_number is not None
+            and not event.merged
+        ):
+            self._schedule_reconcile_task(
+                self._reconcile_parked_closed_unmerged_pr_event(event),
+                source="parked_closed.github.pull_request.closed",
+            )
         if event.event_type == "pull_request" and event.pr_number is not None:
             self._schedule_reconcile_task(
                 self._reconcile_auto_recoverable_merge_waits(
@@ -6760,7 +6773,11 @@ class Orchestrator:
                 github_repo=binding.github_repo,
             )
             if pr is not None:
-                blocking_pr = await self._blocking_existing_pr(binding, issue, pr)
+                blocking_pr, handled = await self._blocking_existing_pr(
+                    binding, issue, pr
+                )
+                if handled:
+                    return None
                 if blocking_pr is not None:
                     await self._park_already_has_pr(binding, issue, blocking_pr)
                     return None
@@ -6774,9 +6791,9 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         pr: db.issue_prs.IssuePR,
-    ) -> db.issue_prs.IssuePR | None:
+    ) -> tuple[db.issue_prs.IssuePR | None, bool]:
         if pr.merged_at is not None:
-            return pr
+            return pr, False
 
         try:
             view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
@@ -6787,7 +6804,7 @@ class Orchestrator:
                 pr.pr_number,
                 e,
             )
-            return pr
+            return pr, False
 
         if _pr_view_is_merged(view):
             merged_at = str(view.get("mergedAt") or self._now().isoformat())
@@ -6805,9 +6822,16 @@ class Orchestrator:
                     binding.github_repo,
                     pr.pr_number,
                 )
-            return replace(pr, merged_at=merged_at)
+            return replace(pr, merged_at=merged_at), False
 
         if _pr_view_is_closed(view):
+            if pr.parked_at is not None and not binding.auto_merge:
+                await self._mark_parked_closed_unmerged_pr_done(
+                    binding=binding,
+                    issue=issue,
+                    pr=pr,
+                )
+                return None, True
             deleted = await db.issue_prs.delete(
                 self._conn,
                 issue_id=issue.id,
@@ -6821,9 +6845,9 @@ class Orchestrator:
                     binding.github_repo,
                     pr.pr_number,
                 )
-            return None
+            return None, False
 
-        return pr
+        return pr, False
 
     async def _park_already_has_pr(
         self,
@@ -7113,6 +7137,163 @@ class Orchestrator:
             return matches[0]
         return None
 
+    async def _parked_closed_unmerged_pr_for_event(
+        self, event: GitHubWebhookEvent
+    ) -> db.issue_prs.IssuePR | None:
+        if (
+            event.event_type != "pull_request"
+            or event.action.casefold() != "closed"
+            or event.pr_number is None
+            or event.merged
+        ):
+            return None
+        cur = await self._conn.execute(
+            """
+            SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+                   p.binding_key, p.pr_number, p.pr_url, p.created_at,
+                   p.merged_at, p.parked_at
+            FROM issue_prs p
+            JOIN issues i ON i.id = p.issue_id
+            WHERE lower(p.github_repo) = lower(?)
+              AND p.pr_number = ?
+              AND p.merged_at IS NULL
+              AND p.parked_at IS NOT NULL
+            ORDER BY p.created_at DESC
+            LIMIT 1
+            """,
+            (event.repo, event.pr_number),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return db.issue_prs.IssuePR(
+            issue_id=str(row["issue_id"]),
+            identifier=str(row["identifier"]),
+            title=str(row["title"]),
+            team_key=str(row["team_key"]),
+            github_repo=str(row["github_repo"]),
+            binding_key=str(row["binding_key"] or ""),
+            pr_number=int(row["pr_number"]),
+            pr_url=str(row["pr_url"]),
+            created_at=str(row["created_at"]),
+            merged_at=(
+                str(row["merged_at"]) if row["merged_at"] is not None else None
+            ),
+            parked_at=(
+                str(row["parked_at"]) if row["parked_at"] is not None else None
+            ),
+        )
+
+    async def _reconcile_parked_closed_unmerged_pr_event(
+        self, event: GitHubWebhookEvent
+    ) -> int:
+        pr = await self._parked_closed_unmerged_pr_for_event(event)
+        if pr is None:
+            return 0
+        binding = self._binding_for_pr(pr)
+        if binding is None or binding.auto_merge:
+            return 0
+        try:
+            issue = await self.linear.lookup_issue(pr.issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not refresh parked closed-unmerged issue %s: %s",
+                pr.identifier,
+                e,
+            )
+            return 0
+        if issue.team_key != binding.linear_team_key:
+            return 0
+        if binding.issue_label is not None and binding.issue_label not in issue.labels:
+            return 0
+        if await self._mark_parked_closed_unmerged_pr_done(
+            binding=binding,
+            issue=issue,
+            pr=pr,
+        ):
+            return 1
+        return 0
+
+    async def _mark_parked_closed_unmerged_pr_done(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr: db.issue_prs.IssuePR,
+    ) -> bool:
+        async with self._parked_closed_unmerged_lock:
+            current = await db.issue_prs.get(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+            )
+            if (
+                current is None
+                or current.pr_number != pr.pr_number
+                or current.parked_at is None
+            ):
+                return True
+            pr = current
+
+            try:
+                states = await self._states_for_binding(binding)
+            except LinearError as e:
+                log.warning(
+                    "could not load states while closing parked PR %s#%d: %s",
+                    binding.github_repo,
+                    pr.pr_number,
+                    e,
+                )
+                return False
+            done_id = states.get(binding.linear_states.done)
+            if done_id is None:
+                log.warning(
+                    "missing Linear done state %r while closing parked PR for %s",
+                    binding.linear_states.done,
+                    issue.identifier,
+                )
+                return False
+
+            if issue.state_name != binding.linear_states.done and issue.state_id != done_id:
+                try:
+                    await self.linear.move_issue(issue.id, done_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to done after parked PR closed: %s",
+                        issue.identifier,
+                        e,
+                    )
+                    return False
+
+            comment_key = (issue.id, binding.github_repo, pr.pr_number)
+            if comment_key not in self._parked_closed_unmerged_comment_keys:
+                try:
+                    await self.linear.post_comment(
+                        issue.id, truncate_body(PARKED_CLOSED_UNMERGED_COMMENT)
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "could not post parked closed-unmerged comment for %s: %s",
+                        issue.identifier,
+                        e,
+                    )
+                    return False
+                self._parked_closed_unmerged_comment_keys.add(comment_key)
+
+            deleted = await db.issue_prs.delete(
+                self._conn,
+                issue_id=issue.id,
+                github_repo=binding.github_repo,
+                pr_number=pr.pr_number,
+            )
+            if not deleted:
+                log.warning(
+                    "could not delete parked closed-unmerged PR row for %s#%d",
+                    binding.github_repo,
+                    pr.pr_number,
+                )
+            return True
+
     async def _reconcile_merged_issues_linear_state(self) -> int:
         since = self._now() - timedelta(
             hours=MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS
@@ -7366,6 +7547,7 @@ class Orchestrator:
                 if await self._finalize_pr_if_closed(
                     binding=binding,
                     issue=issue,
+                    pr=candidate,
                     pr_number=candidate.pr_number,
                     pr_url=candidate.pr_url,
                     run_id=str(uuid.uuid4()),
@@ -8700,6 +8882,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        pr: db.issue_prs.IssuePR | None = None,
         pr_number: int,
         pr_url: str,
         run_id: str,
@@ -8746,6 +8929,13 @@ class Orchestrator:
                 )
             return True
         if _pr_view_is_closed(view):
+            if pr is not None and pr.parked_at is not None and not binding.auto_merge:
+                await self._mark_parked_closed_unmerged_pr_done(
+                    binding=binding,
+                    issue=issue,
+                    pr=pr,
+                )
+                return True
             await self._mark_merge_needs_approval(
                 binding=binding,
                 issue=issue,
