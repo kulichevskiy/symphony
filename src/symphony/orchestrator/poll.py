@@ -513,7 +513,6 @@ def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
     return issue.state_name in {
         binding.linear_states.in_progress,
         binding.linear_states.code_review,
-        binding.linear_states.needs_approval,
     }
 
 
@@ -6055,6 +6054,23 @@ class Orchestrator:
         self._clear_review_no_signal_rearm_heads(run.id)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
+            try:
+                states = await self._states_for_binding(binding)
+                needs_approval_id = states.get(binding.linear_states.needs_approval)
+                if needs_approval_id is not None:
+                    await self.linear.move_issue(issue.id, needs_approval_id)
+                else:
+                    log.warning(
+                        "missing Linear needs_approval state %r for %s",
+                        binding.linear_states.needs_approval,
+                        issue.identifier,
+                    )
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to needs_approval after review failure: %s",
+                    issue.identifier,
+                    e,
+                )
         state = await db.review_state.get(self._conn, issue.id)
         cost = await db.runs.cost_for_issue(self._conn, issue.id)
         body = failed(

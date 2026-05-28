@@ -160,6 +160,36 @@ def _issue_in_review(*, labels: list[str] | None = None) -> LinearIssue:
     )
 
 
+def _issue_in_code_review(*, labels: list[str] | None = None) -> LinearIssue:
+    return LinearIssue(
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        description="Need OAuth.",
+        url="https://linear.app/team/issue/ENG-1",
+        state_id="state-review",
+        state_name="In Review",
+        state_type="started",
+        team_key="ENG",
+        labels=labels if labels is not None else ["feature"],
+    )
+
+
+def _issue_needs_input(*, labels: list[str] | None = None) -> LinearIssue:
+    return LinearIssue(
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        description="Need OAuth.",
+        url="https://linear.app/team/issue/ENG-1",
+        state_id="state-input",
+        state_name="Needs Input",
+        state_type="started",
+        team_key="ENG",
+        labels=labels if labels is not None else ["feature"],
+    )
+
+
 def _issue_done() -> LinearIssue:
     return LinearIssue(
         id="iss-1",
@@ -1927,6 +1957,103 @@ async def test_review_failure_does_not_register_operator_wait(
         # No operator wait — resurrection handles auto-retry.
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_operator_wait_moves_to_needs_input_lane(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue_in_code_review()
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            linear_states=LinearStates(
+                ready="Todo",
+                code_review="In Review",
+                needs_approval="Needs Input",
+            ),
+        )
+        assert poll_module._review_issue_is_active(issue, binding) is True  # noqa: SLF001
+        assert (  # noqa: SLF001
+            poll_module._review_issue_is_active(_issue_needs_input(), binding) is False
+        )
+
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        run = db.runs.Run(
+            id="review-run",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+            ended_at=None,
+            cost_usd=0.0,
+        )
+        await db.runs.create(
+            conn,
+            id=run.id,
+            issue_id=run.issue_id,
+            stage=run.stage,
+            status=run.status,
+            pid=run.pid,
+            started_at=run.started_at,
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "In Review": "state-review",
+                "Needs Input": "state-input",
+                "Blocked": "state-bl",
+                "Done": "state-done",
+            }
+        }
+
+        await orch._fail_review_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=issue,
+            error="review fix-run failed",
+            last_log="",
+            auto_retry=False,
+            operator_wait=True,
+        )
+
+        linear.move_issue.assert_awaited_once_with(issue.id, "state-input")
+        wait = await db.operator_waits.get(conn, issue.id)
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        history = await db.runs.history_for_issue(conn, issue.id)
+        assert history[-1].status == "failed"
     finally:
         await conn.close()
 
