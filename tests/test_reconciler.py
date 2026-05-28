@@ -94,12 +94,14 @@ def _binding(
     issue_label: str | None = "symphony",
     reconcile_enabled: bool = True,
     done_state: str = "Done",
+    auto_merge: bool = True,
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo=github_repo,
         issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
+        auto_merge=auto_merge,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done=done_state),
     )
 
@@ -509,6 +511,81 @@ async def test_active_pr_locally_merged_marks_pr_only(
     assert rows[1][2] == ACTION_CLEARED
     assert ("issue_prs", "merged_at", None, merged_at) in transitions
     assert not any(row[0] == "operator_waits" and row[2] is not None for row in transitions)
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_false_parked_pr_external_merge_moves_issue_to_done(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    cfg = Config(repos=[_binding(auto_merge=False)])
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-17T11:00:00Z",
+        )
+        assert parked
+
+        reconciler = Reconciler(
+            cfg,
+            conn,
+            _FakeLinear(state_name="Needs Approval"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        assert await _merged_at(conn) == merged_at
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=LinearIssue(
+                id="iss-1",
+                identifier="ENG-1",
+                title="Tracked issue",
+                description="",
+                url="https://linear.app/issue/ENG-1",
+                state_id="state-na",
+                state_name="Needs Approval",
+                state_type="started",
+                team_key="ENG",
+                labels=["symphony"],
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+            clock=lambda: NOW,
+        )
+        orch._states = {"ENG": {"Done": "state-done"}}  # noqa: SLF001
+
+        assert await orch._reconcile_merged_issues_linear_state() == 1  # noqa: SLF001
+    finally:
+        await conn.close()
+
+    linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
 
 
 @pytest.mark.asyncio

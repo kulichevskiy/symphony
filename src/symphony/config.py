@@ -106,7 +106,10 @@ class RepoBinding(BaseModel):
     branch_prefix: str = "symphony"
     base_branch: str | None = None
     merge_strategy: MergeStrategy = "squash"
+    # `allow_auto_merge` controls GitHub's `gh pr merge --auto` flag.
+    # `auto_merge` controls whether Symphony invokes `gh pr merge` at all.
     allow_auto_merge: bool = True
+    auto_merge: bool = True
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
     # Review strategy controls who reviews the PR. `remote` keeps today's

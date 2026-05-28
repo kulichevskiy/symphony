@@ -366,6 +366,17 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
         assert candidates[0].github_repo == "org/repo"
         assert candidates[0].binding_key == '["ENG","org/repo","backend"]'
 
+        assert await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:02:00+00:00",
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].parked_at == "2026-05-10T00:02:00+00:00"
+
         await db.issue_prs.mark_merged(
             conn,
             issue_id="iss-1",

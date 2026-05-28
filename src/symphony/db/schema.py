@@ -83,6 +83,8 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE issue_prs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''"
         )
+    if "parked_at" not in cols:
+        await conn.execute("ALTER TABLE issue_prs ADD COLUMN parked_at TEXT")
 
     cur = await conn.execute("PRAGMA table_info(acceptance_state)")
     cols = {row[1] for row in await cur.fetchall()}

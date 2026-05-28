@@ -52,6 +52,7 @@ repos:
     assert cfg.repos[0].github_repo == "org/api-svc"
     assert cfg.repos[0].agent == "claude"  # default
     assert cfg.repos[0].merge_strategy == "squash"  # default
+    assert cfg.repos[0].auto_merge is True  # default
     assert cfg.repos[0].issue_label == "symphony"
     assert cfg.linear_api_key == "lin_api_test"
     assert cfg.repos[0].linear_states.ready == "Todo"
@@ -709,3 +710,20 @@ repos:
     cfg = Config.load(p)
     assert cfg.repos[0].linear_states.code_review == "Needs Approval"
     assert cfg.repos[0].linear_states.needs_approval == "Needs Approval"
+
+
+def test_repo_binding_auto_merge_can_be_disabled(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    auto_merge: false
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].auto_merge is False
