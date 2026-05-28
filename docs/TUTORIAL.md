@@ -315,6 +315,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: In Review
       needs_approval: In Review
       blocked: In Review
       done: Done

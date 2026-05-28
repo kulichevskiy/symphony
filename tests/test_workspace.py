@@ -47,7 +47,7 @@ def _binding(repo: str = "acme/widgets", branch_prefix: str = "symphony") -> Rep
         linear_team_key="ENG",
         github_repo=repo,
         branch_prefix=branch_prefix,
-        linear_states=LinearStates(ready="Backlog"),
+        linear_states=LinearStates(ready="Backlog", code_review="Needs Approval"),
     )
 
 

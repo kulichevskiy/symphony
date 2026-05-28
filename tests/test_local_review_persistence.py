@@ -93,7 +93,7 @@ def _local_binding() -> RepoBinding:
         agent="claude",
         review_strategy="local",
         reviewer_agent="codex",
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 

@@ -64,7 +64,7 @@ def _binding() -> RepoBinding:
         github_repo="org/repo",
         agent="claude",
         branch_prefix="symphony",
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 
@@ -506,7 +506,11 @@ async def test_failed_implement_stop_keeps_wait_when_blocked_state_missing(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding().model_copy(
-            update={"linear_states": LinearStates(ready="Todo", blocked="Missing")}
+            update={
+                "linear_states": LinearStates(
+                    ready="Todo", code_review="Needs Approval", blocked="Missing"
+                )
+            }
         )
         cfg = Config(
             repos=[binding],

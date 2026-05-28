@@ -56,7 +56,7 @@ def _binding() -> RepoBinding:
         github_repo="org/repo",
         agent="codex",
         branch_prefix="symphony",
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 

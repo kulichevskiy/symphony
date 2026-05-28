@@ -122,6 +122,7 @@ def _binding(
         ),
         linear_states=LinearStates(
             ready="Todo",
+            code_review="Needs Approval",
             in_progress="In Progress",
             needs_approval="Needs Approval",
             in_acceptance="In Acceptance",

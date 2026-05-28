@@ -28,7 +28,7 @@ def _binding() -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 

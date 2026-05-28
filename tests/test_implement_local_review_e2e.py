@@ -64,7 +64,7 @@ def _local_binding() -> RepoBinding:
         review_strategy="local",
         # Force reviewer = codex (default already, but be explicit).
         reviewer_agent="codex",
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 
@@ -416,7 +416,7 @@ async def test_binding_pr_summary_override_off_beats_global_on(
             review_strategy="local",
             reviewer_agent="codex",
             post_local_review_pr_summary=False,  # override
-            linear_states=LinearStates(ready="Todo"),
+            linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
         )
         cfg = Config(
             repos=[binding],

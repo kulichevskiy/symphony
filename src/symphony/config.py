@@ -15,10 +15,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
@@ -59,19 +59,34 @@ class LinearStates(BaseModel):
     declare which state the orchestrator picks issues up from, since teams
     rename or replace it (Backlog, Todo, Up Next, …).
 
-    `blocked` is the agent-error parking lane for cost caps, failed merges,
-    and rejected work. `waiting` is a separate optional dependency-waiting
-    lane used only when pickup should bounce tickets blocked by other Linear
-    issues.
+    `code_review` is the automated PR-review lane; `needs_approval` is the
+    human-input lane for failed merges and stage-failure parking. Legacy
+    configs without `code_review` inherit their old `needs_approval` lane,
+    including that field's legacy default, so existing deployments keep loading
+    during the schema split. `blocked` is the agent-error parking lane for cost
+    caps, failed merges, and rejected work. `waiting` is a separate optional
+    dependency-waiting lane used only when pickup should bounce tickets blocked
+    by other Linear issues.
     """
 
     ready: str = Field(min_length=1)
+    code_review: str = Field(min_length=1)
     in_progress: str = "In Progress"
     needs_approval: str = "Needs Approval"
     in_acceptance: str = "In Acceptance"
     blocked: str = "Blocked"
     waiting: str | None = None
     done: str = "Done"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_legacy_code_review(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "code_review" not in data:
+            needs_approval = data.get(
+                "needs_approval", cls.model_fields["needs_approval"].default
+            )
+            return {**data, "code_review": needs_approval}
+        return data
 
 
 class RepoBinding(BaseModel):

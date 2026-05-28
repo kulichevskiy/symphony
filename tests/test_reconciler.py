@@ -100,7 +100,7 @@ def _binding(
         github_repo=github_repo,
         issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
-        linear_states=LinearStates(ready="Todo", done=done_state),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done=done_state),
     )
 
 
@@ -849,7 +849,7 @@ async def test_tick_skips_candidate_without_matching_binding(tmp_path: Path) -> 
                         linear_team_key="ENG",
                         github_repo="org/other",
                         issue_label="symphony",
-                        linear_states=LinearStates(ready="Todo"),
+                        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
                     )
                 ]
             ),

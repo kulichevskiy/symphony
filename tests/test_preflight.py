@@ -54,6 +54,7 @@ repos:
     linear_states:
       ready: {ready}
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
 {waiting_line}      done: Done
