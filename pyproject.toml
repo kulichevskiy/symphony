@@ -38,6 +38,10 @@ packages = ["src/symphony"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "eval: dataset-backed eval over a corpus (see evals/), not a unit test",
+]
 
 [tool.ruff]
 line-length = 100
