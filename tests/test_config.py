@@ -687,3 +687,25 @@ repos:
     cfg = Config.load(p)
     assert cfg.repos[0].linear_states.code_review == "In Review"
     assert cfg.repos[0].linear_states.needs_approval == "In Review"
+
+
+def test_yaml_missing_code_review_uses_legacy_default_needs_approval(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy bindings that relied on the old default keep loading."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      blocked: Blocked
+      done: Done
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].linear_states.code_review == "Needs Approval"
+    assert cfg.repos[0].linear_states.needs_approval == "Needs Approval"

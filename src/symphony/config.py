@@ -61,11 +61,12 @@ class LinearStates(BaseModel):
 
     `code_review` is the automated PR-review lane; `needs_approval` is the
     human-input lane for failed merges and stage-failure parking. Legacy
-    configs without `code_review` inherit their old `needs_approval` lane so
-    existing deployments keep loading during the schema split. `blocked` is the
-    agent-error parking lane for cost caps, failed merges, and rejected work.
-    `waiting` is a separate optional dependency-waiting lane used only when
-    pickup should bounce tickets blocked by other Linear issues.
+    configs without `code_review` inherit their old `needs_approval` lane,
+    including that field's legacy default, so existing deployments keep loading
+    during the schema split. `blocked` is the agent-error parking lane for cost
+    caps, failed merges, and rejected work. `waiting` is a separate optional
+    dependency-waiting lane used only when pickup should bounce tickets blocked
+    by other Linear issues.
     """
 
     ready: str = Field(min_length=1)
@@ -80,12 +81,11 @@ class LinearStates(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _derive_legacy_code_review(cls, data: Any) -> Any:
-        if (
-            isinstance(data, dict)
-            and "code_review" not in data
-            and "needs_approval" in data
-        ):
-            return {**data, "code_review": data["needs_approval"]}
+        if isinstance(data, dict) and "code_review" not in data:
+            needs_approval = data.get(
+                "needs_approval", cls.model_fields["needs_approval"].default
+            )
+            return {**data, "code_review": needs_approval}
         return data
 
 
