@@ -6892,16 +6892,6 @@ class Orchestrator:
             )
             return
 
-        parked = await db.issue_prs.mark_parked_for_manual_merge(
-            self._conn,
-            issue_id=issue.id,
-            github_repo=binding.github_repo,
-            pr_number=pr_number,
-            parked_at=self._now().isoformat(),
-        )
-        if not parked:
-            return
-
         try:
             await self.linear.move_issue(issue.id, needs_approval_id)
         except LinearError as e:
@@ -6910,6 +6900,16 @@ class Orchestrator:
                 issue.identifier,
                 e,
             )
+            return
+
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            self._conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=pr_number,
+            parked_at=self._now().isoformat(),
+        )
+        if not parked:
             return
 
         body = f"✅ review passed, ready for manual merge: {pr_url}"
@@ -7110,18 +7110,18 @@ class Orchestrator:
                         )
                     )
                     continue
-                if _needs_human_approval_label_present(issue):
-                    await self._open_merge_wait_for_human_approval_label(
-                        binding=binding,
-                        issue=issue,
-                        pr_url=candidate.pr_url,
-                    )
-                    continue
                 if not binding.auto_merge:
                     await self._park_pr_for_manual_merge(
                         binding=binding,
                         issue=issue,
                         pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                    )
+                    continue
+                if _needs_human_approval_label_present(issue):
+                    await self._open_merge_wait_for_human_approval_label(
+                        binding=binding,
+                        issue=issue,
                         pr_url=candidate.pr_url,
                     )
                     continue

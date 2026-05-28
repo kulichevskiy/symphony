@@ -1345,6 +1345,138 @@ async def test_auto_merge_false_manual_merge_parking_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_auto_merge_false_parks_before_human_approval_wait(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        issue = _issue()
+        issue.labels = ["feature", "needs-human-approval"]
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=issue)
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "state": "OPEN",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude", auto_merge=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+
+        await _poll_and_wait(orch)
+
+        gh.pr_merge.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        linear.post_comment.assert_awaited_once_with(
+            "iss-1",
+            "✅ review passed, ready for manual merge: "
+            "https://github.com/org/repo/pull/42",
+        )
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_false_retries_when_manual_merge_move_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(side_effect=[LinearError("move down"), None])
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "state": "OPEN",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude", auto_merge=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+
+        await _poll_and_wait(orch)
+
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        linear.post_comment.assert_not_awaited()
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at is None
+        assert (await db.issue_prs.list_merge_candidates(conn))[0].pr_number == 42
+
+        await _poll_and_wait(orch)
+
+        assert linear.move_issue.await_count == 2
+        linear.post_comment.assert_awaited_once()
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at is not None
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_candidate_skips_when_issue_left_active_state(
     tmp_path: Path,
 ) -> None:
