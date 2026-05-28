@@ -1180,8 +1180,10 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
+    review_task: asyncio.Task[bool] | None = None
     try:
         await _seed_review_candidate(conn)
+        await db.runs.update_status(conn, "review", "running")
         runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
@@ -1241,12 +1243,28 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
+        review_task = asyncio.create_task(asyncio.Event().wait())
+        orch._review_poll_tasks.add(review_task)  # noqa: SLF001
+        orch._review_poll_run_ids.add("review")  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = "review"  # noqa: SLF001
+        orch._review_poll_run_tasks["review"] = review_task  # noqa: SLF001
+
         await _poll_and_wait(orch)
+        await asyncio.gather(review_task, return_exceptions=True)
 
         gh.pr_merge.assert_not_awaited()
         push_fn.assert_not_awaited()
         workspace.acquire.assert_not_awaited()
         assert runner.captured_spec is None
+        assert review_task.cancelled()
+        assert "review" not in orch._review_poll_run_ids  # noqa: SLF001
+        assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
+        assert "review" not in orch._review_poll_run_tasks  # noqa: SLF001
+        assert review_task not in orch._review_poll_tasks  # noqa: SLF001
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_run = next(r for r in history if r.id == "review")
+        assert review_run.status == "completed"
+        assert review_run.ended_at is not None
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_awaited_once_with(
             "iss-1",
@@ -1260,6 +1278,9 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
         assert pr.parked_at is not None
         assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
+        if review_task is not None and not review_task.done():
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
         await conn.close()
 
 

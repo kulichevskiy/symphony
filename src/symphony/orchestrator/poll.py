@@ -6902,6 +6902,8 @@ class Orchestrator:
             )
             return
 
+        await self._complete_review_monitors_for_merge(issue)
+
         parked = await db.issue_prs.mark_parked_for_manual_merge(
             self._conn,
             issue_id=issue.id,
