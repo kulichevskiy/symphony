@@ -7085,21 +7085,14 @@ class Orchestrator:
                 )
 
             if verdict.kind is VerdictKind.APPROVED or conflict_fix_ready:
-                if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
-                    continue
-                binding_key = _binding_key(binding)
-                if (
-                    self._scheduled_slot_count() >= self.config.global_max_concurrent
-                    or self._scheduled_binding_counts.get(binding_key, 0)
-                    >= binding.max_concurrent
-                ):
-                    continue
                 if (
                     binding.acceptance.mode != "off"
                     and not await self._acceptance_passed_for_candidate(
                         candidate, binding, head_sha
                     )
                 ):
+                    if self._dispatch_capacity(binding) <= 0:
+                        continue
                     if await self._acceptance_infra_retry_backoff_active(
                         candidate.issue_id
                     ):
@@ -7121,6 +7114,8 @@ class Orchestrator:
                         pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
                     )
+                    continue
+                if self._dispatch_capacity(binding) <= 0:
                     continue
                 if _needs_human_approval_label_present(issue):
                     await self._open_merge_wait_for_human_approval_label(

@@ -1286,6 +1286,76 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
         await conn.close()
 
 
+@pytest.mark.parametrize(("global_cap", "binding_cap"), [(0, 2), (2, 0)])
+@pytest.mark.asyncio
+async def test_auto_merge_false_parks_without_dispatch_capacity(
+    tmp_path: Path,
+    global_cap: int,
+    binding_cap: int,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "state": "OPEN",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_merge = AsyncMock()
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        binding = _binding(agent="claude", auto_merge=False).model_copy(
+            update={"max_concurrent": binding_cap}
+        )
+
+        cfg = Config(
+            repos=[binding],
+            global_max_concurrent=global_cap,
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+
+        await _poll_and_wait(orch)
+
+        gh.pr_merge.assert_not_awaited()
+        assert runner.captured_spec is None
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        linear.post_comment.assert_awaited_once_with(
+            "iss-1",
+            "✅ review passed, ready for manual merge: "
+            "https://github.com/org/repo/pull/42",
+        )
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at is not None
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_auto_merge_false_manual_merge_parking_is_idempotent(
     tmp_path: Path,
