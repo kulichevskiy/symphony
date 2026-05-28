@@ -1265,6 +1265,7 @@ class Orchestrator:
         # re-arm for the current PR head. Keyed by (run_id, head_sha) so a new
         # commit naturally allows one fresh ping.
         self._review_no_signal_rearm_heads: set[tuple[str, str]] = set()
+        self._parked_manual_merge_revival_issue_ids: set[str] = set()
         self._merged_linear_state_reconcile_ticks = 0
         self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
         self._global_dispatch_sem = asyncio.Semaphore(
@@ -1595,7 +1596,8 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="issue", handled=False, detail="missing issue id"
             )
-        if _linear_issue_state_changed(payload):
+        state_changed = _linear_issue_state_changed(payload)
+        if state_changed:
             self._schedule_reconcile_task(
                 self._reconciler.reconcile_linear_issue_event(
                     issue_id=issue_id,
@@ -1603,16 +1605,37 @@ class Orchestrator:
                 ),
                 source=f"linear.issue.{action or 'update'}",
             )
+        old_state_id, old_state_name, new_state_id, new_state_name = (
+            _linear_issue_state_transition(payload)
+        )
         issue = await self.linear.lookup_issue(issue_id)
+        revived = False
+        if state_changed:
+            revived = (
+                await self._schedule_parked_manual_merge_revival_for_issue_event(
+                    issue=issue,
+                    old_state_id=old_state_id,
+                    old_state_name=old_state_name,
+                    new_state_id=new_state_id,
+                    new_state_name=new_state_name,
+                )
+                is not None
+            )
         binding = self._ready_binding_for_issue(issue)
         if binding is None:
             return WebhookDispatchResult(
-                kind="issue", handled=False, detail="issue is not dispatchable"
+                kind="issue",
+                handled=revived,
+                detail=(
+                    "parked manual merge revived"
+                    if revived
+                    else "issue is not dispatchable"
+                ),
             )
         task = await self._schedule_ready_issue(binding, issue)
         return WebhookDispatchResult(
             kind="issue",
-            handled=task is not None,
+            handled=task is not None or revived,
             detail="" if task is not None else "issue is already scheduled or active",
         )
 
@@ -4998,6 +5021,188 @@ class Orchestrator:
                     )
             return True
 
+    async def _schedule_parked_manual_merge_revival_for_issue_event(
+        self,
+        *,
+        issue: LinearIssue,
+        old_state_id: str | None,
+        old_state_name: str | None,
+        new_state_id: str | None,
+        new_state_name: str | None,
+    ) -> asyncio.Task[None] | None:
+        candidate = await db.issue_prs.get_for_issue(self._conn, issue_id=issue.id)
+        if candidate is None or candidate.parked_at is None:
+            return None
+        binding = self._binding_for_pr(candidate)
+        if binding is None:
+            log.warning(
+                "no binding for parked manual-merge revive candidate %s in %s",
+                candidate.identifier,
+                candidate.github_repo,
+            )
+            return None
+        if candidate.issue_id in self._scheduled_issue_ids:
+            return None
+        if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
+            return None
+        if await db.runs.has_active(
+            self._conn,
+            candidate.issue_id,
+            ignored_stage="review",
+        ):
+            return None
+        return await self._schedule_parked_manual_merge_revival_if_requested(
+            binding=binding,
+            issue=issue,
+            candidate=candidate,
+            view=None,
+            old_state_id=old_state_id,
+            old_state_name=old_state_name,
+            new_state_id=new_state_id,
+            new_state_name=new_state_name,
+        )
+
+    async def _schedule_parked_manual_merge_revival_if_requested(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        candidate: db.issue_prs.IssuePR,
+        view: dict[str, object] | None,
+        old_state_id: str | None = None,
+        old_state_name: str | None = None,
+        new_state_id: str | None = None,
+        new_state_name: str | None = None,
+    ) -> asyncio.Task[None] | None:
+        if candidate.parked_at is None:
+            return None
+        if binding.linear_states.code_review == binding.linear_states.needs_approval:
+            return None
+        if issue.state_name != binding.linear_states.code_review:
+            return None
+        if not _merge_issue_matches_binding(issue, binding):
+            return None
+        if issue.id in self._parked_manual_merge_revival_issue_ids:
+            return None
+        if not await self._parked_manual_merge_transition_matches(
+            binding=binding,
+            old_state_id=old_state_id,
+            old_state_name=old_state_name,
+            new_state_id=new_state_id,
+            new_state_name=new_state_name,
+        ):
+            return None
+        if view is None:
+            try:
+                view = await self._gh.pr_view(
+                    candidate.pr_number,
+                    repo=binding.github_repo,
+                    include_status_checks=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not view parked manual-merge PR %s#%d before revive: %s",
+                    binding.github_repo,
+                    candidate.pr_number,
+                    e,
+                )
+                return None
+        cleared = await db.issue_prs.clear_parked_for_manual_merge(
+            self._conn,
+            issue_id=candidate.issue_id,
+            github_repo=binding.github_repo,
+            pr_number=candidate.pr_number,
+        )
+        if not cleared:
+            return None
+        return self._schedule_parked_manual_merge_revival(
+            binding=binding,
+            issue=issue,
+            pr_number=candidate.pr_number,
+            pr_url=candidate.pr_url,
+            view=view,
+        )
+
+    async def _parked_manual_merge_transition_matches(
+        self,
+        *,
+        binding: RepoBinding,
+        old_state_id: str | None,
+        old_state_name: str | None,
+        new_state_id: str | None,
+        new_state_name: str | None,
+    ) -> bool:
+        if old_state_name is not None and old_state_name != (
+            binding.linear_states.needs_approval
+        ):
+            return False
+        if new_state_name is not None and new_state_name != (
+            binding.linear_states.code_review
+        ):
+            return False
+        if old_state_id is None and new_state_id is None:
+            return True
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states before parked manual-merge revive: %s",
+                e,
+            )
+            return False
+        needs_approval_id = states.get(binding.linear_states.needs_approval)
+        code_review_id = states.get(binding.linear_states.code_review)
+        if old_state_id is not None and old_state_id != needs_approval_id:
+            return False
+        if new_state_id is not None and new_state_id != code_review_id:
+            return False
+        return True
+
+    def _schedule_parked_manual_merge_revival(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        view: dict[str, object],
+    ) -> asyncio.Task[None]:
+        self._parked_manual_merge_revival_issue_ids.add(issue.id)
+
+        async def dispatch_conflict_fix() -> None:
+            await self._dispatch_merge_conflict_rebase_fix_run(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                view=view,
+            )
+
+        task = asyncio.create_task(dispatch_conflict_fix())
+        self._dispatch_tasks.add(task)
+        task.add_done_callback(
+            partial(
+                self._parked_manual_merge_revival_task_done,
+                issue_id=issue.id,
+            )
+        )
+        return task
+
+    def _parked_manual_merge_revival_task_done(
+        self, task: asyncio.Task[None], *, issue_id: str
+    ) -> None:
+        self._dispatch_tasks.discard(task)
+        self._parked_manual_merge_revival_issue_ids.discard(issue_id)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception(
+                "parked manual-merge revival task crashed for issue_id=%s",
+                issue_id,
+            )
+
     async def _dispatch_merge_conflict_fix_run(
         self,
         *,
@@ -7000,6 +7205,16 @@ class Orchestrator:
                 ):
                     continue
                 if candidate.parked_at is not None:
+                    revived = (
+                        await self._schedule_parked_manual_merge_revival_if_requested(
+                            binding=binding,
+                            issue=issue,
+                            candidate=candidate,
+                            view=view,
+                        )
+                    )
+                    if revived is not None:
+                        scheduled.append(revived)
                     continue
                 if _pr_view_has_merge_conflict(view):
                     await db.issue_prs.clear_merge_conflict_fixed(
@@ -10402,6 +10617,43 @@ def _linear_issue_state_changed(payload: Mapping[str, Any]) -> bool:
     ):
         return True
     return False
+
+
+def _linear_issue_state_transition(
+    payload: Mapping[str, Any],
+) -> tuple[str | None, str | None, str | None, str | None]:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None, None, None, None
+    updated_from = payload.get("updatedFrom") or data.get("updatedFrom")
+    old_state_id: str | None = None
+    old_state_name: str | None = None
+    if isinstance(updated_from, Mapping):
+        old_state_id, old_state_name = _linear_state_fields(updated_from)
+    new_state_id, new_state_name = _linear_state_fields(data)
+    return old_state_id, old_state_name, new_state_id, new_state_name
+
+
+def _linear_state_fields(source: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    state_id: str | None = None
+    state_name: str | None = None
+    state = source.get("state")
+    if isinstance(state, Mapping):
+        state_id = _first_str(state, "id", "stateId", "state_id")
+        state_name = _first_str(state, "name", "stateName", "state_name")
+    elif isinstance(state, str):
+        state_name = state
+    state_id = state_id or _first_str(source, "stateId", "state_id")
+    state_name = state_name or _first_str(source, "stateName", "state_name")
+    return state_id, state_name
+
+
+def _first_str(source: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _comment_issue_id_from_webhook_payload(payload: Mapping[str, Any]) -> str | None:

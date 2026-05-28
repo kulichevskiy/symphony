@@ -154,6 +154,18 @@ def _binding(
     )
 
 
+def _split_review_binding(*, auto_merge: bool = False) -> RepoBinding:
+    return _binding(agent="claude", auto_merge=auto_merge).model_copy(
+        update={
+            "linear_states": LinearStates(
+                ready="Todo",
+                code_review="In Review",
+                needs_approval="Needs Input",
+            )
+        }
+    )
+
+
 def _issue() -> LinearIssue:
     return LinearIssue(
         id="iss-1",
@@ -196,10 +208,19 @@ def _states() -> dict[str, str]:
     return {
         "Todo": "state-todo",
         "In Progress": "state-progress",
+        "In Review": "state-review",
+        "Needs Input": "state-input",
         "Needs Approval": "state-na",
         "Blocked": "state-bl",
         "Done": "state-done",
     }
+
+
+def _issue_in_review() -> LinearIssue:
+    issue = _issue()
+    issue.state_id = "state-review"
+    issue.state_name = "In Review"
+    return issue
 
 
 async def _seed_review_candidate(
@@ -1527,6 +1548,152 @@ async def test_auto_merge_false_parked_pr_close_is_reconciled(
         assert wait is not None
         assert wait.kind == db.operator_waits.KIND_MERGE
         assert await db.issue_prs.list_merge_candidates(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_needs_input_to_review_revives_parked_manual_merge_pr(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:02:00+00:00",
+        )
+        assert parked
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        gh = MagicMock()
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "mergedAt": None,
+        }
+        gh.pr_view = AsyncMock(return_value=view)
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._reconciler = MagicMock()  # noqa: SLF001
+        orch._reconciler.reconcile_linear_issue_event = AsyncMock(return_value=2)  # type: ignore[attr-defined]
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+
+        payload = {
+            "type": "Issue",
+            "action": "update",
+            "webhookTimestamp": int(datetime(2026, 5, 10, tzinfo=UTC).timestamp() * 1000),
+            "updatedFrom": {"stateId": "state-input"},
+            "data": {"id": "iss-1", "state": {"id": "state-review"}},
+        }
+        result = await orch.handle_linear_webhook(payload)
+        await orch.drain_reconcile_event_tasks()
+        await orch.drain_dispatch_tasks()
+
+        assert result.handled is True
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._dispatch_merge_conflict_rebase_fix_run.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["binding"] == binding
+        assert kwargs["issue"].state_name == "In Review"
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert kwargs["view"] == view
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        assert pr.parked_at is None
+
+        await orch.handle_linear_webhook(payload)
+        await orch.drain_reconcile_event_tasks()
+        await orch.drain_dispatch_tasks()
+
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_needs_input_to_review_revives_parked_manual_merge_pr(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:02:00+00:00",
+        )
+        assert parked
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        gh = MagicMock()
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "mergedAt": None,
+        }
+        gh.pr_view = AsyncMock(return_value=view)
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        assert pr.parked_at is None
     finally:
         await conn.close()
 

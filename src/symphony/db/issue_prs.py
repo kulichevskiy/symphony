@@ -116,6 +116,57 @@ async def mark_parked_for_manual_merge(
     return updated
 
 
+async def clear_parked_for_manual_merge(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    commit: bool = True,
+) -> bool:
+    cur = await conn.execute(
+        """
+        SELECT parked_at
+        FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND merged_at IS NULL
+          AND parked_at IS NOT NULL
+        """,
+        (issue_id, github_repo, pr_number),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+    old_parked_at = row["parked_at"]
+    cur = await conn.execute(
+        """
+        UPDATE issue_prs
+        SET parked_at = NULL
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND merged_at IS NULL
+          AND parked_at = ?
+        """,
+        (issue_id, github_repo, pr_number, old_parked_at),
+    )
+    updated = (cur.rowcount or 0) > 0
+    if updated:
+        await state_transitions.record_transition(
+            conn,
+            issue_id,
+            "issue_prs",
+            "parked_at",
+            old_parked_at,
+            None,
+        )
+    if commit:
+        await conn.commit()
+    return updated
+
+
 async def mark_merge_conflict_fixed(
     conn: aiosqlite.Connection,
     *,
@@ -532,6 +583,7 @@ async def list_recent_merged(
 
 __all__ = [
     "IssuePR",
+    "clear_parked_for_manual_merge",
     "delete",
     "get",
     "get_for_issue",
