@@ -666,8 +666,10 @@ repos:
         Config.load(p)
 
 
-def test_yaml_missing_code_review_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """A binding without `code_review` must be rejected at load time."""
+def test_yaml_missing_code_review_uses_legacy_needs_approval(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy bindings keep loading with review pointed at their old lane."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = """
 repos:
@@ -676,11 +678,12 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
-      needs_approval: Needs Approval
+      needs_approval: In Review
       blocked: Blocked
       done: Done
 """
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
-    with pytest.raises(ValidationError, match="code_review"):
-        Config.load(p)
+    cfg = Config.load(p)
+    assert cfg.repos[0].linear_states.code_review == "In Review"
+    assert cfg.repos[0].linear_states.needs_approval == "In Review"
