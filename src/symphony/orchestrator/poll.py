@@ -7194,6 +7194,18 @@ class Orchestrator:
         if binding is None or binding.auto_merge:
             return 0
         try:
+            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not verify parked closed-unmerged PR state for %s#%d: %s",
+                binding.github_repo,
+                pr.pr_number,
+                e,
+            )
+            return 0
+        if _pr_view_is_merged(view) or not _pr_view_is_closed(view):
+            return 0
+        try:
             issue = await self.linear.lookup_issue(pr.issue_id)
         except LinearError as e:
             log.warning(
