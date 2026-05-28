@@ -159,6 +159,7 @@ ACCEPTANCE_INFRA_RETRY_LIMIT = 2
 ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
 ACCEPTANCE_FIX_ITERATION_CAP = 1
+MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
 
 class _AcceptancePrDiffUnavailable(RuntimeError):
@@ -507,6 +508,13 @@ def _binding_label_from_storage_key(binding_key: str) -> str | None:
     if label is None:
         return ""
     return str(label)
+
+
+def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
+    return (
+        f"{MANUAL_MERGE_PARKED_RUN_PREFIX}"
+        f"{pr.issue_id}:{pr.github_repo}:{pr.pr_number}"
+    )
 
 
 def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
@@ -1547,9 +1555,12 @@ class Orchestrator:
                 kind="comment", handled=False, detail="missing issue id"
             )
         await self._restore_operator_waits()
-        run_id = self._dispatch_run_ids.get(issue_id) or self._review_poll_issue_ids.get(
+        run_id = self._dispatch_run_ids.get(
+            issue_id
+        ) or self._review_poll_issue_ids.get(
             issue_id
         )
+        run_id = run_id or await self._parked_manual_merge_run_id_for_issue(issue_id)
         if run_id is None or not self._slash_command_run_eligible(run_id):
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
@@ -1621,7 +1632,33 @@ class Orchestrator:
             run_id in self._active_run_ids
             or run_id in self._operator_wait_run_ids
             or run_id in self._review_poll_run_ids
+            or run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX)
         )
+
+    async def _parked_manual_merge_slash_pairs(self) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for pr in await db.issue_prs.list_merge_candidates(self._conn):
+            if pr.parked_at is None:
+                continue
+            if self._binding_for_pr(pr) is None:
+                log.warning(
+                    "cannot watch parked manual-merge PR %s#%d: no binding",
+                    pr.github_repo,
+                    pr.pr_number,
+                )
+                continue
+            pairs.append((pr.issue_id, _manual_merge_parked_run_id(pr)))
+        return pairs
+
+    async def _parked_manual_merge_run_id_for_issue(
+        self, issue_id: str
+    ) -> str | None:
+        pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
+        if pr is None or pr.merged_at is not None or pr.parked_at is None:
+            return None
+        if self._binding_for_pr(pr) is None:
+            return None
+        return _manual_merge_parked_run_id(pr)
 
     async def _poll_slash_commands(self) -> None:
         """For each active run, fetch new comments and dispatch slash intents.
@@ -1632,17 +1669,25 @@ class Orchestrator:
         restarts and (b) avoids losing comments tied at the boundary timestamp.
         """
         await self._restore_operator_waits()
-        pairs = list(self._dispatch_run_ids.items())
+        active_pairs = list(self._dispatch_run_ids.items())
         # Also include issues in active review polling that have no active fix run.
-        dispatch_issue_ids = {iid for iid, _ in pairs}
-        pairs += [
+        dispatch_issue_ids = {iid for iid, _ in active_pairs}
+        active_pairs += [
             (iid, run_id)
             for iid, run_id in self._review_poll_issue_ids.items()
             if iid not in dispatch_issue_ids
         ]
-        for issue_id, run_id in pairs:
+        pairs: list[tuple[str, str]] = []
+        paired_issue_ids: set[str] = set()
+        parked_pairs = await self._parked_manual_merge_slash_pairs()
+        for issue_id, run_id in [*active_pairs, *parked_pairs]:
             if not self._slash_command_run_eligible(run_id):
                 continue
+            if issue_id in paired_issue_ids:
+                continue
+            paired_issue_ids.add(issue_id)
+            pairs.append((issue_id, run_id))
+        for issue_id, run_id in pairs:
             try:
                 after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
             except Exception:  # noqa: BLE001 — keep loop alive
@@ -1777,7 +1822,10 @@ class Orchestrator:
         starts, and the first poll tick could immediately kill it even though
         the command was not intended for it.
         """
-        run_started = await self._run_started_at(run_id)
+        if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
+            run_started = await self._manual_merge_parked_started_at(issue_id)
+        else:
+            run_started = await self._run_started_at(run_id)
         stored = await db.comment_cursors.get(self._conn, issue_id)
         if stored is None:
             return run_started, set()
@@ -1796,9 +1844,27 @@ class Orchestrator:
             return _parse_rfc3339(row[0])
         return datetime(1970, 1, 1, tzinfo=UTC)
 
+    async def _manual_merge_parked_started_at(self, issue_id: str) -> datetime:
+        pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
+        if pr is None or not pr.parked_at:
+            return datetime(1970, 1, 1, tzinfo=UTC)
+        try:
+            return _parse_rfc3339(pr.parked_at)
+        except ValueError:
+            log.warning(
+                "invalid parked_at timestamp for manual-merge PR %s#%d: %r",
+                pr.github_repo,
+                pr.pr_number,
+                pr.parked_at,
+            )
+            return datetime(1970, 1, 1, tzinfo=UTC)
+
     async def _handle_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
+        if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
+            await self._handle_parked_manual_merge_slash_intent(issue_id, intent)
+            return
         if run_id in self._cost_cap_run_bindings:
             await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
             return
@@ -1927,6 +1993,67 @@ class Orchestrator:
                 issue_id,
                 e,
             )
+
+    async def _handle_parked_manual_merge_slash_intent(
+        self,
+        issue_id: str,
+        intent: SlashIntent,
+        *,
+        binding: RepoBinding | None = None,
+        pr: db.issue_prs.IssuePR | None = None,
+    ) -> None:
+        if intent.kind is not SlashKind.APPROVE:
+            log.info(
+                "slash %s for parked manual-merge issue %s ignored",
+                intent.kind,
+                issue_id,
+            )
+            return
+        if pr is None:
+            pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
+        if pr is None or pr.merged_at is not None or pr.parked_at is None:
+            await self._post_command_rejected(
+                issue_id,
+                "$approve",
+                "manual-merge parking marker is no longer active",
+            )
+            return
+        if binding is None:
+            binding = self._binding_for_pr(pr)
+        if binding is None:
+            await self._post_command_rejected(
+                issue_id,
+                "$approve",
+                "no repository binding found for parked manual merge",
+            )
+            return
+        try:
+            await self._gh.pr_merge(
+                pr.pr_number,
+                strategy=binding.merge_strategy,
+                auto=False,
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "manual merge failed for parked PR %s#%d on %s: %s",
+                binding.github_repo,
+                pr.pr_number,
+                pr.identifier,
+                e,
+            )
+            body = (
+                f"manual merge failed for {pr.pr_url}: {e}\n\n"
+                "The issue remains parked; reply with `$approve` to try again."
+            )
+            try:
+                await self.linear.post_comment(issue_id, truncate_body(body))
+            except LinearError as comment_error:
+                log.warning(
+                    "could not post manual merge failure for %s: %s",
+                    pr.identifier,
+                    comment_error,
+                )
 
     async def _handle_active_review_retry_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
@@ -5602,6 +5729,24 @@ class Orchestrator:
                 expected_kinds=(db.operator_waits.KIND_MERGE,),
             )
             if binding is None:
+                return
+        if intent.kind is SlashKind.APPROVE:
+            parked_pr = await db.issue_prs.get(
+                self._conn,
+                issue_id=issue_id,
+                github_repo=binding.github_repo,
+            )
+            if (
+                parked_pr is not None
+                and parked_pr.merged_at is None
+                and parked_pr.parked_at is not None
+            ):
+                await self._handle_parked_manual_merge_slash_intent(
+                    issue_id,
+                    intent,
+                    binding=binding,
+                    pr=parked_pr,
+                )
                 return
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
             states = await self._states_for_binding(binding)
