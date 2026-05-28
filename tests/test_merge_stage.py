@@ -1649,6 +1649,117 @@ async def test_webhook_needs_input_to_review_revives_parked_manual_merge_pr(
         await conn.close()
 
 
+@pytest.mark.parametrize(
+    ("view", "expected_status", "expected_move"),
+    [
+        (
+            {
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "state": "MERGED",
+                "mergedAt": "2026-05-10T00:03:00+00:00",
+            },
+            "done",
+            ("iss-1", "state-done"),
+        ),
+        (
+            {
+                "headRefOid": "abc123",
+                "mergeable": "UNKNOWN",
+                "mergeStateStatus": "UNKNOWN",
+                "baseRefName": "main",
+                "state": "CLOSED",
+                "mergedAt": None,
+            },
+            "needs_approval",
+            ("iss-1", "state-input"),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_webhook_needs_input_to_review_finalizes_inactive_parked_pr(
+    tmp_path: Path,
+    view: dict[str, object],
+    expected_status: str,
+    expected_move: tuple[str, str],
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked_at = "2026-05-10T00:02:00+00:00"
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at=parked_at,
+        )
+        assert parked
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value=view)
+        workspace = MagicMock()
+        workspace.cleanup = AsyncMock()
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._reconciler = MagicMock()  # noqa: SLF001
+        orch._reconciler.reconcile_linear_issue_event = AsyncMock(return_value=2)  # type: ignore[attr-defined]
+        dispatch = AsyncMock(return_value=True)
+        orch._dispatch_merge_conflict_rebase_fix_run = dispatch  # noqa: SLF001
+
+        payload = {
+            "type": "Issue",
+            "action": "update",
+            "webhookTimestamp": int(datetime(2026, 5, 10, tzinfo=UTC).timestamp() * 1000),
+            "updatedFrom": {"stateId": "state-input"},
+            "data": {"id": "iss-1", "state": {"id": "state-review"}},
+        }
+        await orch.handle_linear_webhook(payload)
+        await orch.drain_reconcile_event_tasks()
+        await orch.drain_dispatch_tasks()
+
+        dispatch.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with(*expected_move)
+        merge_run = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="merge",
+            started_at_gte="2026-05-10T00:01:00+00:00",
+        )
+        assert merge_run is not None
+        assert merge_run.status == expected_status
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        if expected_status == "done":
+            assert pr.merged_at is not None
+        else:
+            wait = await db.operator_waits.get(conn, "iss-1")
+            assert wait is not None
+            assert wait.kind == db.operator_waits.KIND_MERGE
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_poll_needs_input_to_review_revives_parked_manual_merge_pr(
     tmp_path: Path,

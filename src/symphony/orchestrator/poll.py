@@ -5118,6 +5118,16 @@ class Orchestrator:
                     e,
                 )
                 return None
+        if await self._finalize_pr_if_closed(
+            binding=binding,
+            issue=issue,
+            pr_number=candidate.pr_number,
+            pr_url=candidate.pr_url,
+            run_id=str(uuid.uuid4()),
+            create_run=True,
+            view=view,
+        ):
+            return None
         async def clear_parked_marker(_run_id: str) -> None:
             await db.issue_prs.clear_parked_for_manual_merge(
                 self._conn,
