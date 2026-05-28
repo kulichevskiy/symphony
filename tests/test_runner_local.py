@@ -147,13 +147,17 @@ async def test_runner_stalls_when_command_exceeds_command_secs(tmp_path: Path) -
     # The in-flight extension is bounded: a command that never completes
     # within command_secs is still killed (backstop against a deadlocked
     # agent that emitted item.started but hangs forever).
+    #
+    # command_secs < stall_secs so the cap, not the stall window, must be
+    # the binding deadline. With the prior `max(stall, command)` formula
+    # this test passed only because `sleep 30` outran stall_secs too.
     started = '{"type":"item.started","item":{"id":"c1","type":"command_execution"}}'
     runner = LocalRunner()
     spec = RunnerSpec(
         run_id="r-inflight-cap",
         workspace_path=tmp_path,
-        command=["sh", "-c", f"printf '%s\\n' '{started}'; sleep 30"],
-        stall_secs=10,
+        command=["sh", "-c", f"printf '%s\\n' '{started}'; sleep 8"],
+        stall_secs=30,
         command_secs=1,
     )
     events = await asyncio.wait_for(_collect_events(runner, spec), timeout=15)

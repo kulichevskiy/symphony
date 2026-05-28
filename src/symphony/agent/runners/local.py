@@ -59,10 +59,16 @@ class _Heartbeat:
             self._cmd_starts.pop(item_id, None)
 
     def deadline(self, now: float, stall_secs: float, command_secs: float) -> float:
-        """Effective time by which fresh activity must have occurred."""
+        """Effective time by which fresh activity must have occurred.
+
+        While at least one `command_execution` is in flight, `command_secs`
+        is the hard outer cap on that single command — measured from its
+        own start, not from `last_line`. The stall window only applies in
+        the gaps between commands.
+        """
         if self._cmd_starts:
             oldest = min(self._cmd_starts.values())
-            return max(oldest + command_secs, self.last_line + stall_secs)
+            return oldest + command_secs
         return self.last_line + stall_secs
 
 
