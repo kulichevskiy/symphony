@@ -512,6 +512,7 @@ def _binding_label_from_storage_key(binding_key: str) -> str | None:
 def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
     return issue.state_name in {
         binding.linear_states.in_progress,
+        binding.linear_states.code_review,
         binding.linear_states.needs_approval,
     }
 
@@ -519,6 +520,7 @@ def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
 def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bool:
     active_states = {
         binding.linear_states.in_progress,
+        binding.linear_states.code_review,
         binding.linear_states.needs_approval,
     }
     if binding.acceptance.mode != "off":
@@ -9524,7 +9526,7 @@ class Orchestrator:
     ) -> None:
         try:
             states = await self._states_for_binding(binding)
-            review_state_id = states.get(binding.linear_states.needs_approval)
+            review_state_id = states.get(binding.linear_states.code_review)
         except LinearError as e:
             log.warning(
                 "could not load states while moving %s to review: %s",
@@ -9535,7 +9537,7 @@ class Orchestrator:
         if review_state_id is None:
             log.warning(
                 "missing Linear review state %r for %s",
-                binding.linear_states.needs_approval,
+                binding.linear_states.code_review,
                 issue.identifier,
             )
             return
@@ -9545,7 +9547,7 @@ class Orchestrator:
             log.warning(
                 "could not move %s to review state %r: %s",
                 issue.identifier,
-                binding.linear_states.needs_approval,
+                binding.linear_states.code_review,
                 e,
             )
 

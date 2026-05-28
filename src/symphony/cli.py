@@ -322,6 +322,7 @@ async def _preflight(config_path: Path) -> None:
                 name
                 for name in (
                     binding.linear_states.in_progress,
+                    binding.linear_states.code_review,
                     binding.linear_states.needs_approval,
                     binding.linear_states.blocked,
                     binding.linear_states.waiting,

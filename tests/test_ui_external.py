@@ -56,7 +56,9 @@ def _config(*, done_state: str = "Done") -> Config:
                 linear_team_key="ENG",
                 github_repo="org/repo",
                 issue_label="symphony",
-                linear_states=LinearStates(ready="Todo", done=done_state),
+                linear_states=LinearStates(
+                    ready="Todo", code_review="Needs Approval", done=done_state
+                ),
             )
         ],
     )
@@ -295,13 +297,15 @@ async def test_external_snapshot_resolves_binding_by_issue_label(tmp_path: Path)
                 linear_team_key="ENG",
                 github_repo="org/repo",
                 issue_label="other",
-                linear_states=LinearStates(ready="Todo", done="Done"),
+                linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done="Done"),
             ),
             RepoBinding(
                 linear_team_key="ENG",
                 github_repo="org/repo",
                 issue_label="symphony",
-                linear_states=LinearStates(ready="Todo", done="Completed"),
+                linear_states=LinearStates(
+                    ready="Todo", code_review="Needs Approval", done="Completed"
+                ),
             ),
         ],
     )
@@ -328,13 +332,15 @@ async def test_external_snapshot_resolves_empty_issue_label_binding(tmp_path: Pa
                 linear_team_key="ENG",
                 github_repo="org/repo",
                 issue_label="other",
-                linear_states=LinearStates(ready="Todo", done="Done"),
+                linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done="Done"),
             ),
             RepoBinding(
                 linear_team_key="ENG",
                 github_repo="org/repo",
                 issue_label="",
-                linear_states=LinearStates(ready="Todo", done="Completed"),
+                linear_states=LinearStates(
+                    ready="Todo", code_review="Needs Approval", done="Completed"
+                ),
             ),
         ],
     )

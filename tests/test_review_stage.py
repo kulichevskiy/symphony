@@ -96,7 +96,7 @@ def _binding(
         issue_label=issue_label,
         branch_prefix="symphony",
         review_strategy=review_strategy,
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 
@@ -316,6 +316,79 @@ async def test_implement_success_posts_codex_review_and_records_review_handoff(
             call("iss-1", "state-progress"),
             call("iss-1", "state-na"),
         ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_handoff_uses_code_review_and_merge_failure_uses_needs_approval(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            linear_states=LinearStates(
+                ready="Todo",
+                code_review="In Review",
+                needs_approval="Needs Input",
+            ),
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_FakeRunner([]),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {  # noqa: SLF001
+            "ENG": {
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "In Review": "state-review",
+                "Needs Input": "state-input",
+                "Blocked": "state-bl",
+                "Done": "state-done",
+            }
+        }
+
+        await orch._move_issue_to_review_state(binding=binding, issue=issue)  # noqa: SLF001
+        await orch._mark_merge_needs_approval(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            pr_url="https://github.com/org/repo/pull/42",
+            run_id="merge-run",
+            reason="branch protection blocked",
+            create_run=True,
+        )
+
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-review"),
+            call("iss-1", "state-input"),
+        ]
+        history = await db.runs.history_for_issue(conn, issue.id)
+        assert history[-1].stage == "merge"
+        assert history[-1].status == "needs_approval"
     finally:
         await conn.close()
 

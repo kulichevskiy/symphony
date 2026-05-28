@@ -21,6 +21,7 @@ _BINDING_STATES = """
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -54,6 +55,7 @@ repos:
     assert cfg.repos[0].issue_label == "symphony"
     assert cfg.linear_api_key == "lin_api_test"
     assert cfg.repos[0].linear_states.ready == "Todo"
+    assert cfg.repos[0].linear_states.code_review == "In Review"
     assert cfg.repos[0].linear_states.waiting is None
     assert cfg.ui.enabled is True
 
@@ -140,7 +142,7 @@ def test_acceptance_config_defaults() -> None:
     binding = RepoBinding(
         linear_team_key="ENG",
         github_repo="org/repo",
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
     assert binding.acceptance == AcceptanceConfig()
@@ -172,6 +174,7 @@ repos:
       time_cap_minutes: 0.1
     linear_states:
       ready: Todo
+      code_review: In Review
       in_acceptance: QA Acceptance
 """
     p = tmp_path / "cfg.yaml"
@@ -295,7 +298,7 @@ repos:
         RepoBinding(
             linear_team_key="ENG",
             github_repo="org/repo",
-            linear_states=LinearStates(ready="Todo"),
+            linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
         ).reconcile_enabled
         is True
     )
@@ -333,6 +336,7 @@ repos:
     linear_states:
       ready: Backlog
       in_progress: Doing
+      code_review: Review
       needs_approval: Review
       blocked: Blocked
       waiting: Waiting
@@ -342,6 +346,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -351,6 +356,7 @@ repos:
     cfg = Config.load(p)
     assert cfg.repos[0].linear_states.ready == "Backlog"
     assert cfg.repos[0].linear_states.in_progress == "Doing"
+    assert cfg.repos[0].linear_states.code_review == "Review"
     assert cfg.repos[0].linear_states.waiting == "Waiting"
     assert cfg.repos[1].linear_states.ready == "Todo"
 
@@ -649,6 +655,7 @@ repos:
     github_repo: org/api-svc
     linear_states:
       in_progress: In Progress
+      code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -656,4 +663,24 @@ repos:
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
     with pytest.raises(ValidationError):
+        Config.load(p)
+
+
+def test_yaml_missing_code_review_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A binding without `code_review` must be rejected at load time."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="code_review"):
         Config.load(p)

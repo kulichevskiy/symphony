@@ -96,7 +96,7 @@ def _binding(
         branch_prefix="symphony",
         cost_cap_usd=cost_cap_usd,
         cost_warning_pct=cost_warning_pct,
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 
@@ -680,6 +680,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done

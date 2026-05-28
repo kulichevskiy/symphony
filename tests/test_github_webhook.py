@@ -84,7 +84,7 @@ def _binding(
         github_repo="org/repo",
         webhook_enabled=webhook_enabled,
         webhook_secret=webhook_secret,
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 
@@ -113,7 +113,7 @@ def test_cli_rejects_enabled_github_webhook_repo_without_secret() -> None:
             RepoBinding(
                 linear_team_key="WEB",
                 github_repo="org/web",
-                linear_states=LinearStates(ready="Todo"),
+                linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
             ),
         ]
     )

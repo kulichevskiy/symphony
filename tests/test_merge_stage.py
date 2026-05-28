@@ -148,7 +148,7 @@ def _binding(
         agent=agent,  # type: ignore[arg-type]
         issue_label=issue_label,
         branch_prefix=branch_prefix,
-        linear_states=LinearStates(ready="Todo"),
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
 
@@ -1620,9 +1620,12 @@ async def test_merge_agent_new_commit_requires_fresh_review_before_merge(
         gh = MagicMock()
         pr_view_calls = 0
 
-        async def pr_view(_pr_number: int, *, repo: str) -> dict[str, object]:
+        async def pr_view(
+            _pr_number: int, *, repo: str, include_status_checks: bool = False
+        ) -> dict[str, object]:
             nonlocal pr_view_calls
             assert repo == "org/repo"
+            assert include_status_checks in {False, True}
             pr_view_calls += 1
             head_sha = approved_head_sha
             if pr_view_calls > 1:

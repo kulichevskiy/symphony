@@ -209,6 +209,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -272,6 +273,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -281,6 +283,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -384,6 +387,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
@@ -393,6 +397,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: Needs Approval
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done

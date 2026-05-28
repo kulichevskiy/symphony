@@ -162,6 +162,7 @@ repos:
     linear_states:
       ready: Todo
       in_progress: In Progress
+      code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
       done: Done
