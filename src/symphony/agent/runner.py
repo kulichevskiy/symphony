@@ -28,6 +28,11 @@ class RunnerSpec:
     command: list[str]  # ["claude", "--print", "--output-format", "stream-json", ...]
     env: dict[str, str] = field(default_factory=dict)
     stall_secs: float = 300
+    # Outer cap for a single agent tool call (command_execution). While the
+    # agent has a command in flight the stall watchdog measures against this
+    # instead of `stall_secs`, so a long-but-healthy subprocess (broad rg,
+    # pnpm install, pytest) isn't killed as a false-positive stall.
+    command_secs: float = 1800
     stage: str = ""  # implement|review|merge — telemetry only
 
 

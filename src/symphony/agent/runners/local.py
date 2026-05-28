@@ -14,6 +14,7 @@ Mirrors the load-bearing parts of the Rust `agent/process.rs`:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -21,6 +22,62 @@ from contextlib import suppress
 from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
+_WATCHDOG_POLL_SECS = 1.0
+
+
+class _Heartbeat:
+    """Tracks runner liveness for the stall watchdog.
+
+    `last_line` is the monotonic time of the most recent stdout/stderr line.
+    `_cmd_starts` maps an in-flight codex `command_execution` item id to the
+    time it started, so the watchdog can extend its deadline while a tool
+    call is genuinely running (the agent emits no output in that window).
+    """
+
+    def __init__(self, last_line: float) -> None:
+        self.last_line = last_line
+        self._cmd_starts: dict[str, float] = {}
+
+    def observe(self, line: str) -> None:
+        """Parse one codex JSON-stream line and track command_execution spans.
+
+        Accepts both the canonical shape (`item.type == "command_execution"`)
+        and the legacy shape that puts `item_type` on the item or the outer
+        event — same fields `activity.parse_codex_activity_line` recognises.
+        """
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind not in ("item.started", "item.completed"):
+            return
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = item.get("type") or item.get("item_type") or event.get("item_type")
+        if item_type != "command_execution":
+            return
+        item_id = item.get("id") or event.get("item_id") or event.get("id")
+        if not isinstance(item_id, str):
+            return
+        if kind == "item.started":
+            self._cmd_starts.setdefault(item_id, self.last_line)
+        else:  # item.completed
+            self._cmd_starts.pop(item_id, None)
+
+    def deadline(self, now: float, stall_secs: float, command_secs: float) -> float:
+        """Effective time by which fresh activity must have occurred.
+
+        While at least one `command_execution` is in flight, `command_secs`
+        is the hard outer cap on that single command — measured from its
+        own start, not from `last_line`. The stall window only applies in
+        the gaps between commands.
+        """
+        if self._cmd_starts:
+            oldest = min(self._cmd_starts.values())
+            return oldest + command_secs
+        return self.last_line + stall_secs
 
 
 class LocalRunner:
@@ -57,9 +114,10 @@ class LocalRunner:
             with suppress(ProcessLookupError):
                 _terminate_process_group(proc.pid)
         yield RunnerEvent(kind="started", pid=proc.pid)
-        activity = asyncio.Event()
         stalled = asyncio.Event()
         events: asyncio.Queue[RunnerEvent] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        hb = _Heartbeat(last_line=loop.time())
 
         async def pump(stream: asyncio.StreamReader | None, kind: str) -> None:
             if stream is None:
@@ -72,31 +130,38 @@ class LocalRunner:
                 if not raw:
                     break
                 line = raw.decode(errors="replace").rstrip("\n")
-                activity.set()
+                hb.last_line = loop.time()
+                if kind == "stdout":
+                    hb.observe(line)
                 await events.put(RunnerEvent(kind=kind, line=line))  # type: ignore[arg-type]
 
         async def watchdog() -> None:
+            # Poll-based: a run is "alive" if the agent printed a line within
+            # `stall_secs`, OR it has a tool call in flight that started less
+            # than `command_secs` ago. The second clause is what keeps a long
+            # innocent subprocess (broad rg, pnpm install) from tripping the
+            # stall — the agent emits no stdout while waiting on its own tool.
             while True:
-                try:
-                    await asyncio.wait_for(activity.wait(), timeout=spec.stall_secs)
-                except TimeoutError:
-                    if proc.returncode is not None:
-                        return
-                    # PID-based liveness: don't trust status fields here.
-                    if not _pid_alive(proc.pid):
-                        return
-                    stalled.set()
-                    _terminate_process_group(proc.pid)
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=5.0)
-                    except TimeoutError:
-                        with suppress(ProcessLookupError):
-                            _kill_process_group(proc.pid)
-                        with suppress(Exception):
-                            await proc.wait()
+                await asyncio.sleep(_WATCHDOG_POLL_SECS)
+                if proc.returncode is not None:
                     return
-                else:
-                    activity.clear()
+                now = loop.time()
+                deadline = hb.deadline(now, spec.stall_secs, spec.command_secs)
+                if now < deadline:
+                    continue
+                # PID-based liveness: don't trust status fields here.
+                if not _pid_alive(proc.pid):
+                    return
+                stalled.set()
+                _terminate_process_group(proc.pid)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except TimeoutError:
+                    with suppress(ProcessLookupError):
+                        _kill_process_group(proc.pid)
+                    with suppress(Exception):
+                        await proc.wait()
+                return
 
         stdout_task = asyncio.create_task(pump(proc.stdout, "stdout"))
         stderr_task = asyncio.create_task(pump(proc.stderr, "stderr"))
@@ -125,7 +190,6 @@ class LocalRunner:
                             cleaned_process_group = True
                         if stdout_task.done() and stderr_task.done():
                             break
-                        loop = asyncio.get_running_loop()
                         if drain_deadline is None:
                             drain_deadline = loop.time() + _STREAM_DRAIN_SECS
                         if loop.time() >= drain_deadline:

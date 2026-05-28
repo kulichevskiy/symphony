@@ -9268,6 +9268,7 @@ class Orchestrator:
                     reviewer_codex_model=reviewer_codex_model,
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
+                    command_secs=self.config.command_timeout_secs,
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
                     cost_cap_usd=cost_cap_usd,
@@ -9897,6 +9898,7 @@ class Orchestrator:
             workspace_path=workspace_path,
             command=command,
             stall_secs=self.config.stall_timeout_secs,
+            command_secs=self.config.command_timeout_secs,
             stage=stage,
         )
 
@@ -10060,6 +10062,7 @@ class Orchestrator:
             workspace_path=workspace_path,
             command=command,
             stall_secs=self.config.stall_timeout_secs,
+            command_secs=self.config.command_timeout_secs,
             stage=stage,
         )
 

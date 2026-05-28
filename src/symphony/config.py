@@ -292,6 +292,11 @@ class Config(BaseModel):
     cost_cap_per_issue_usd: float = 100.0
     cost_warning_pct: int = 75
     stall_timeout_secs: int = 300
+    # Outer cap for a single agent tool call (command_execution). While the
+    # agent has a command in flight, the stall watchdog measures against this
+    # instead of `stall_timeout_secs`, so a long-but-healthy subprocess (broad
+    # rg, pnpm install, pytest) isn't killed as a false-positive stall.
+    command_timeout_secs: int = 1800
     activity_comments_enabled: bool = True
     activity_comment_interval_secs: int = Field(default=300, ge=1)
     activity_comment_min_interval_secs: int = Field(default=120, ge=1)

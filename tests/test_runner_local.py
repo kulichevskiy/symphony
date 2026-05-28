@@ -115,6 +115,87 @@ async def test_runner_kills_on_stall(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_does_not_stall_while_command_in_flight(tmp_path: Path) -> None:
+    # Agent emits item.started for a command_execution, then is silent past
+    # stall_secs while its tool runs, then emits item.completed and exits.
+    # The in-flight command must extend the deadline to command_secs so the
+    # healthy run is not killed as a false-positive stall (the 2026-05-26
+    # incident: a broad rg ran >stall_secs with no agent output).
+    started = '{"type":"item.started","item":{"id":"c1","type":"command_execution"}}'
+    completed = '{"type":"item.completed","item":{"id":"c1","type":"command_execution"}}'
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-inflight",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            f"printf '%s\\n' '{started}'; sleep 3; printf '%s\\n' '{completed}'; exit 0",
+        ],
+        stall_secs=1,
+        command_secs=30,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=15)
+    kinds = [e.kind for e in events]
+    assert "stall_timeout" not in kinds
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_recognises_legacy_command_execution_shape(tmp_path: Path) -> None:
+    # Older codex builds emit `item_type` (on the item or on the event) instead
+    # of `item.type`. activity.parse_codex_activity_line already accepts that;
+    # the watchdog must too, or a legacy-shape tool call falls back to
+    # stall_secs and gets killed by the very false-positive this PR fixes.
+    started = (
+        '{"type":"item.started","item":{"id":"c1","item_type":"command_execution"}}'
+    )
+    completed = (
+        '{"type":"item.completed","item":{"id":"c1","item_type":"command_execution"}}'
+    )
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-legacy",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            f"printf '%s\\n' '{started}'; sleep 3; printf '%s\\n' '{completed}'; exit 0",
+        ],
+        stall_secs=1,
+        command_secs=30,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=15)
+    kinds = [e.kind for e in events]
+    assert "stall_timeout" not in kinds
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_stalls_when_command_exceeds_command_secs(tmp_path: Path) -> None:
+    # The in-flight extension is bounded: a command that never completes
+    # within command_secs is still killed (backstop against a deadlocked
+    # agent that emitted item.started but hangs forever).
+    #
+    # command_secs < stall_secs so the cap, not the stall window, must be
+    # the binding deadline. With the prior `max(stall, command)` formula
+    # this test passed only because `sleep 30` outran stall_secs too.
+    started = '{"type":"item.started","item":{"id":"c1","type":"command_execution"}}'
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-inflight-cap",
+        workspace_path=tmp_path,
+        command=["sh", "-c", f"printf '%s\\n' '{started}'; sleep 8"],
+        stall_secs=30,
+        command_secs=1,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=15)
+    assert events[-1].kind == "stall_timeout"
+
+
+@pytest.mark.asyncio
 async def test_runner_kill_terminates(tmp_path: Path) -> None:
     runner = LocalRunner()
     spec = RunnerSpec(
