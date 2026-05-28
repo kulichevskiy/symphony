@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -136,6 +137,16 @@ async def _poll_and_wait(orch: Orchestrator) -> None:
         await asyncio.gather(*tasks)
 
 
+async def _dispatch_rebase_fix_with_started_callback(**kwargs: object) -> bool:
+    on_started = cast(
+        Callable[[str], Awaitable[None]] | None,
+        kwargs.get("on_started"),
+    )
+    if on_started is not None:
+        await on_started("review-fix-run")
+    return True
+
+
 def _binding(
     *,
     agent: str = "codex",
@@ -151,6 +162,18 @@ def _binding(
         branch_prefix=branch_prefix,
         auto_merge=auto_merge,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+    )
+
+
+def _split_review_binding(*, auto_merge: bool = False) -> RepoBinding:
+    return _binding(agent="claude", auto_merge=auto_merge).model_copy(
+        update={
+            "linear_states": LinearStates(
+                ready="Todo",
+                code_review="In Review",
+                needs_approval="Needs Input",
+            )
+        }
     )
 
 
@@ -196,10 +219,19 @@ def _states() -> dict[str, str]:
     return {
         "Todo": "state-todo",
         "In Progress": "state-progress",
+        "In Review": "state-review",
+        "Needs Input": "state-input",
         "Needs Approval": "state-na",
         "Blocked": "state-bl",
         "Done": "state-done",
     }
+
+
+def _issue_in_review() -> LinearIssue:
+    issue = _issue()
+    issue.state_id = "state-review"
+    issue.state_name = "In Review"
+    return issue
 
 
 async def _seed_review_candidate(
@@ -1528,6 +1560,384 @@ async def test_auto_merge_false_parked_pr_close_is_reconciled(
         assert wait.kind == db.operator_waits.KIND_MERGE
         assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_needs_input_to_review_revives_parked_manual_merge_pr(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:02:00+00:00",
+        )
+        assert parked
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        gh = MagicMock()
+        view: dict[str, object] = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "mergedAt": None,
+        }
+        gh.pr_view = AsyncMock(return_value=view)
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._reconciler = MagicMock()  # noqa: SLF001
+        orch._reconciler.reconcile_linear_issue_event = AsyncMock(return_value=2)  # type: ignore[attr-defined]
+        dispatch = AsyncMock(side_effect=_dispatch_rebase_fix_with_started_callback)
+        orch._dispatch_merge_conflict_rebase_fix_run = dispatch  # noqa: SLF001
+
+        payload = {
+            "type": "Issue",
+            "action": "update",
+            "webhookTimestamp": int(datetime(2026, 5, 10, tzinfo=UTC).timestamp() * 1000),
+            "updatedFrom": {"stateId": "state-input"},
+            "data": {"id": "iss-1", "state": {"id": "state-review"}},
+        }
+        result = await orch.handle_linear_webhook(payload)
+        await orch.drain_reconcile_event_tasks()
+        await orch.drain_dispatch_tasks()
+
+        assert result.handled is True
+        dispatch.assert_awaited_once()
+        await_args = dispatch.await_args
+        assert await_args is not None
+        kwargs = await_args.kwargs
+        assert kwargs["binding"] == binding
+        assert kwargs["issue"].state_name == "In Review"
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert kwargs["view"] == view
+        assert callable(kwargs["on_started"])
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        assert pr.parked_at is None
+
+        await orch.handle_linear_webhook(payload)
+        await orch.drain_reconcile_event_tasks()
+        await orch.drain_dispatch_tasks()
+
+        dispatch.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize(
+    ("view", "expected_status", "expected_move"),
+    [
+        (
+            {
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "state": "MERGED",
+                "mergedAt": "2026-05-10T00:03:00+00:00",
+            },
+            "done",
+            ("iss-1", "state-done"),
+        ),
+        (
+            {
+                "headRefOid": "abc123",
+                "mergeable": "UNKNOWN",
+                "mergeStateStatus": "UNKNOWN",
+                "baseRefName": "main",
+                "state": "CLOSED",
+                "mergedAt": None,
+            },
+            "needs_approval",
+            ("iss-1", "state-input"),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_webhook_needs_input_to_review_finalizes_inactive_parked_pr(
+    tmp_path: Path,
+    view: dict[str, object],
+    expected_status: str,
+    expected_move: tuple[str, str],
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked_at = "2026-05-10T00:02:00+00:00"
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at=parked_at,
+        )
+        assert parked
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value=view)
+        workspace = MagicMock()
+        workspace.cleanup = AsyncMock()
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._reconciler = MagicMock()  # noqa: SLF001
+        orch._reconciler.reconcile_linear_issue_event = AsyncMock(return_value=2)  # type: ignore[attr-defined]
+        dispatch = AsyncMock(return_value=True)
+        orch._dispatch_merge_conflict_rebase_fix_run = dispatch  # noqa: SLF001
+
+        payload = {
+            "type": "Issue",
+            "action": "update",
+            "webhookTimestamp": int(datetime(2026, 5, 10, tzinfo=UTC).timestamp() * 1000),
+            "updatedFrom": {"stateId": "state-input"},
+            "data": {"id": "iss-1", "state": {"id": "state-review"}},
+        }
+        await orch.handle_linear_webhook(payload)
+        await orch.drain_reconcile_event_tasks()
+        await orch.drain_dispatch_tasks()
+
+        dispatch.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with(*expected_move)
+        merge_run = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="merge",
+            started_at_gte="2026-05-10T00:01:00+00:00",
+        )
+        assert merge_run is not None
+        assert merge_run.status == expected_status
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        if expected_status == "done":
+            assert pr.merged_at is not None
+        else:
+            wait = await db.operator_waits.get(conn, "iss-1")
+            assert wait is not None
+            assert wait.kind == db.operator_waits.KIND_MERGE
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_poll_needs_input_to_review_revives_parked_manual_merge_pr(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:02:00+00:00",
+        )
+        assert parked
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        gh = MagicMock()
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "mergedAt": None,
+        }
+        gh.pr_view = AsyncMock(return_value=view)
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        dispatch = AsyncMock(side_effect=_dispatch_rebase_fix_with_started_callback)
+        orch._dispatch_merge_conflict_rebase_fix_run = dispatch  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        dispatch.assert_awaited_once()
+        await_args = dispatch.await_args
+        assert await_args is not None
+        kwargs = await_args.kwargs
+        assert callable(kwargs["on_started"])
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        assert pr.parked_at is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_parked_manual_merge_marker_survives_queued_revival(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    task: asyncio.Task[None] | None = None
+    try:
+        binding = _split_review_binding(auto_merge=False)
+        await _seed_review_candidate(conn, binding_key=_binding_storage_key(binding))
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:02:00+00:00",
+        )
+        assert parked
+
+        workspace_path = tmp_path / "ws" / "org_repo" / "ENG-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+        view: dict[str, object] = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "mergedAt": None,
+        }
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                **view,
+                "headRefOid": "fixedsha",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+        cfg = Config(
+            repos=[binding],
+            global_max_concurrent=1,
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=_FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+
+        await orch._global_dispatch_sem.acquire()  # noqa: SLF001
+        try:
+            candidate = await db.issue_prs.get(
+                conn,
+                issue_id="iss-1",
+                github_repo="org/repo",
+            )
+            assert candidate is not None
+            task = await orch._schedule_parked_manual_merge_revival_if_requested(  # noqa: SLF001
+                binding=binding,
+                issue=_issue_in_review(),
+                candidate=candidate,
+                view=view,
+            )
+            assert task is not None
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if orch._scheduled_issue_refcounts.get("iss-1") == 1:  # noqa: SLF001
+                    break
+
+            assert orch._scheduled_issue_refcounts.get("iss-1") == 1  # noqa: SLF001
+            assert task.done() is False
+            queued_pr = await db.issue_prs.get(
+                conn,
+                issue_id="iss-1",
+                github_repo="org/repo",
+            )
+            assert queued_pr is not None
+            assert queued_pr.parked_at == "2026-05-10T00:02:00+00:00"
+            assert (
+                await db.runs.latest_for_issue_stage(
+                    conn,
+                    issue_id="iss-1",
+                    stage="review_fix",
+                )
+                is None
+            )
+        finally:
+            orch._global_dispatch_sem.release()  # noqa: SLF001
+
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        assert pr.parked_at is None
+        review_fix = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="review_fix",
+        )
+        assert review_fix is not None
+        assert review_fix.status == "completed"
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         await conn.close()
 
 
