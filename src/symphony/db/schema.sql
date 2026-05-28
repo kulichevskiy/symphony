@@ -41,6 +41,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 -- PR opened for an issue. The row bridges the async Review/Merge ticks:
 -- Implement creates the PR and Review handoff, later ticks poll the same PR
 -- until Review + CI are green, then Merge marks it merged.
+-- `parked_at` records the auto_merge=false handoff where Review passed and
+-- Symphony is waiting for a human to merge from GitHub.
 CREATE TABLE IF NOT EXISTS issue_prs (
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     github_repo TEXT NOT NULL,
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS issue_prs (
     pr_url      TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     merged_at   TEXT,
+    parked_at   TEXT,
     PRIMARY KEY (issue_id, github_repo)
 );
 

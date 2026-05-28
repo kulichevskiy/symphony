@@ -23,6 +23,7 @@ class IssuePR:
     pr_url: str
     created_at: str
     merged_at: str | None
+    parked_at: str | None
 
 
 def _row_to_issue_pr(row: aiosqlite.Row) -> IssuePR:
@@ -37,6 +38,7 @@ def _row_to_issue_pr(row: aiosqlite.Row) -> IssuePR:
         pr_url=row["pr_url"],
         created_at=row["created_at"],
         merged_at=row["merged_at"],
+        parked_at=row["parked_at"],
     )
 
 
@@ -61,7 +63,8 @@ async def upsert(
             pr_number  = excluded.pr_number,
             pr_url     = excluded.pr_url,
             created_at = excluded.created_at,
-            merged_at  = NULL
+            merged_at  = NULL,
+            parked_at  = NULL
         """,
         (issue_id, github_repo, binding_key, pr_number, pr_url, created_at),
     )
@@ -75,6 +78,42 @@ async def upsert(
         (issue_id, github_repo, pr_number, created_at),
     )
     await conn.commit()
+
+
+async def mark_parked_for_manual_merge(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    parked_at: str,
+    commit: bool = True,
+) -> bool:
+    cur = await conn.execute(
+        """
+        UPDATE issue_prs
+        SET parked_at = ?
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND merged_at IS NULL
+          AND parked_at IS NULL
+        """,
+        (parked_at, issue_id, github_repo, pr_number),
+    )
+    updated = (cur.rowcount or 0) > 0
+    if updated:
+        await state_transitions.record_transition(
+            conn,
+            issue_id,
+            "issue_prs",
+            "parked_at",
+            None,
+            parked_at,
+        )
+    if commit:
+        await conn.commit()
+    return updated
 
 
 async def mark_merge_conflict_fixed(
@@ -186,7 +225,8 @@ async def get(
     cur = await conn.execute(
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
-               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
+               p.parked_at
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.issue_id = ? AND p.github_repo = ?
@@ -207,7 +247,8 @@ async def get_for_issue(
     cur = await conn.execute(
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
-               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
+               p.parked_at
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.issue_id = ?
@@ -397,7 +438,8 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
     cur = await conn.execute(
         f"""
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
-               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
+               p.parked_at
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL
@@ -440,10 +482,12 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     cur = await conn.execute(
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
-               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
+               p.parked_at
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL
+          AND p.parked_at IS NULL
           AND EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
@@ -471,7 +515,8 @@ async def list_recent_merged(
     cur = await conn.execute(
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
-               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
+               p.parked_at
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NOT NULL
@@ -495,6 +540,7 @@ __all__ = [
     "list_orphaned_review_prs",
     "list_recent_merged",
     "mark_merged",
+    "mark_parked_for_manual_merge",
     "update_merged",
     "upsert",
 ]

@@ -6864,6 +6864,64 @@ class Orchestrator:
             create_run=True,
         )
 
+    async def _park_pr_for_manual_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+    ) -> None:
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking %s for manual merge: %s",
+                issue.identifier,
+                e,
+            )
+            return
+
+        needs_approval_id = states.get(binding.linear_states.needs_approval)
+        if needs_approval_id is None:
+            log.warning(
+                "missing Linear needs_approval state %r while parking %s for "
+                "manual merge",
+                binding.linear_states.needs_approval,
+                issue.identifier,
+            )
+            return
+
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            self._conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            pr_number=pr_number,
+            parked_at=self._now().isoformat(),
+        )
+        if not parked:
+            return
+
+        try:
+            await self.linear.move_issue(issue.id, needs_approval_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s to needs approval for manual merge: %s",
+                issue.identifier,
+                e,
+            )
+            return
+
+        body = f"✅ review passed, ready for manual merge: {pr_url}"
+        try:
+            await self.linear.post_comment(issue.id, body)
+        except LinearError as e:
+            log.warning(
+                "could not post manual merge comment for %s: %s",
+                issue.identifier,
+                e,
+            )
+
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
@@ -7056,6 +7114,14 @@ class Orchestrator:
                     await self._open_merge_wait_for_human_approval_label(
                         binding=binding,
                         issue=issue,
+                        pr_url=candidate.pr_url,
+                    )
+                    continue
+                if not binding.auto_merge:
+                    await self._park_pr_for_manual_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
                     )
                     continue
