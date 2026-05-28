@@ -1205,3 +1205,176 @@ async def test_orchestrator_github_webhook_calls_reconciler(tmp_path: Path) -> N
         await conn.close()
 
     spy.reconcile_github_event.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_github_webhook_closed_unmerged_parked_pr_moves_done_once(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-17T11:00:00Z",
+        )
+        assert parked
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=LinearIssue(
+                id="iss-1",
+                identifier="ENG-1",
+                title="Tracked issue",
+                description="",
+                url="https://linear.app/issue/ENG-1",
+                state_id="state-na",
+                state_name="Needs Approval",
+                state_type="started",
+                team_key="ENG",
+                labels=["symphony"],
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "state": "CLOSED",
+                "mergeable": None,
+                "merged": False,
+                "mergedAt": None,
+                "url": "https://github.com/org/repo/pull/42",
+            }
+        )
+        runner = MagicMock()
+        runner.kill = AsyncMock()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=Path("/dev/null"))
+        workspace.release = MagicMock()
+        orch = Orchestrator(
+            Config(repos=[_binding(auto_merge=False)]),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+            clock=lambda: NOW,
+        )
+        orch._states = {"ENG": {"Done": "state-done"}}  # noqa: SLF001
+        event = GitHubWebhookEvent(
+            event_type="pull_request",
+            action="closed",
+            repo="ORG/REPO",
+            delivery_id="delivery-1",
+            pr_number=42,
+            merged=False,
+        )
+
+        await orch.handle_github_webhook(event)
+        await orch.drain_reconcile_event_tasks()
+        await orch.handle_github_webhook(event)
+        await orch.drain_reconcile_event_tasks()
+
+        pr = await db.issue_prs.get(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+        )
+    finally:
+        await conn.close()
+
+    linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+    linear.post_comment.assert_awaited_once_with(
+        "iss-1", "🛑 PR closed without merge — marking done"
+    )
+    gh.pr_view.assert_any_await(42, repo="org/repo")
+    assert pr is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_github_webhook_closed_unmerged_parked_pr_rechecks_reopen(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-17T11:00:00Z",
+        )
+        assert parked
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(
+            return_value=LinearIssue(
+                id="iss-1",
+                identifier="ENG-1",
+                title="Tracked issue",
+                description="",
+                url="https://linear.app/issue/ENG-1",
+                state_id="state-na",
+                state_name="Needs Approval",
+                state_type="started",
+                team_key="ENG",
+                labels=["symphony"],
+            )
+        )
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock()
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "merged": False,
+                "mergedAt": None,
+                "url": "https://github.com/org/repo/pull/42",
+            }
+        )
+        runner = MagicMock()
+        runner.kill = AsyncMock()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=Path("/dev/null"))
+        workspace.release = MagicMock()
+        orch = Orchestrator(
+            Config(repos=[_binding(auto_merge=False)]),
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+            clock=lambda: NOW,
+        )
+        event = GitHubWebhookEvent(
+            event_type="pull_request",
+            action="closed",
+            repo="ORG/REPO",
+            delivery_id="delivery-1",
+            pr_number=42,
+            merged=False,
+        )
+
+        await orch.handle_github_webhook(event)
+        await orch.drain_reconcile_event_tasks()
+
+        pr = await db.issue_prs.get(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+        )
+    finally:
+        await conn.close()
+
+    gh.pr_view.assert_any_await(42, repo="org/repo")
+    linear.move_issue.assert_not_awaited()
+    linear.post_comment.assert_not_awaited()
+    assert pr is not None
