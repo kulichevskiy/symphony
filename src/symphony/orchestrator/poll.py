@@ -4801,6 +4801,7 @@ class Orchestrator:
         view: dict[str, object] | None,
         merge_run_id: str | None = None,
         dispatch_capacity_held: bool = False,
+        on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> bool:
         base_ref = await self._resolve_pr_base_ref(
             binding=binding,
@@ -4857,6 +4858,16 @@ class Orchestrator:
                 started_at=datetime.now(UTC).isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
+            if on_started is not None:
+                try:
+                    await on_started(fix_run_id)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "merge-conflict rebase fix-run start callback failed "
+                        "for %s run %s",
+                        issue.identifier,
+                        fix_run_id,
+                    )
 
             prompt = merge_conflict_rebase_fix_prompt(
                 issue_title=issue.title,
@@ -5107,20 +5118,21 @@ class Orchestrator:
                     e,
                 )
                 return None
-        cleared = await db.issue_prs.clear_parked_for_manual_merge(
-            self._conn,
-            issue_id=candidate.issue_id,
-            github_repo=binding.github_repo,
-            pr_number=candidate.pr_number,
-        )
-        if not cleared:
-            return None
+        async def clear_parked_marker(_run_id: str) -> None:
+            await db.issue_prs.clear_parked_for_manual_merge(
+                self._conn,
+                issue_id=candidate.issue_id,
+                github_repo=binding.github_repo,
+                pr_number=candidate.pr_number,
+            )
+
         return self._schedule_parked_manual_merge_revival(
             binding=binding,
             issue=issue,
             pr_number=candidate.pr_number,
             pr_url=candidate.pr_url,
             view=view,
+            on_started=clear_parked_marker,
         )
 
     async def _parked_manual_merge_transition_matches(
@@ -5166,6 +5178,7 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
         view: dict[str, object],
+        on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> asyncio.Task[None]:
         self._parked_manual_merge_revival_issue_ids.add(issue.id)
 
@@ -5176,6 +5189,7 @@ class Orchestrator:
                 pr_number=pr_number,
                 pr_url=pr_url,
                 view=view,
+                on_started=on_started,
             )
 
         task = asyncio.create_task(dispatch_conflict_fix())
