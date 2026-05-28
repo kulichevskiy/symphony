@@ -7514,7 +7514,19 @@ class Orchestrator:
                     e,
                 )
                 continue
-            if not _merge_issue_matches_binding(issue, binding):
+            parked_done_cleanup = (
+                candidate.parked_at is not None
+                and not binding.auto_merge
+                and issue.team_key == binding.linear_team_key
+                and issue.state_name == binding.linear_states.done
+                and (
+                    binding.issue_label is None or binding.issue_label in issue.labels
+                )
+            )
+            if (
+                not _merge_issue_matches_binding(issue, binding)
+                and not parked_done_cleanup
+            ):
                 log.info(
                     "skipping merge candidate %s: issue is no longer active for "
                     "binding %s/%s",

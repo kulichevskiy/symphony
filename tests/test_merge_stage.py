@@ -1569,6 +1569,84 @@ async def test_auto_merge_false_parked_pr_close_moves_issue_done_once(
 
 
 @pytest.mark.asyncio
+async def test_auto_merge_false_parked_pr_close_retries_comment_after_done_move(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        parked = await db.issue_prs.mark_parked_for_manual_merge(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            parked_at="2026-05-10T00:05:00+00:00",
+        )
+        assert parked
+        parked_issue = _issue()
+        parked_issue.state_id = "state-na"
+        parked_issue.state_name = "Needs Approval"
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(side_effect=[parked_issue, _done_issue()])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(
+            side_effect=[LinearError("comments down"), "cmt-1"]
+        )
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "UNKNOWN",
+                "mergeStateStatus": "UNKNOWN",
+                "state": "CLOSED",
+                "mergedAt": None,
+            }
+        )
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude", auto_merge=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        linear.post_comment.assert_awaited_once_with(
+            "iss-1", "🛑 PR closed without merge — marking done"
+        )
+        assert (
+            await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        ) is not None
+
+        await _poll_and_wait(orch)
+
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        assert linear.post_comment.await_count == 2
+        assert linear.post_comment.await_args.args[1] == (
+            "🛑 PR closed without merge — marking done"
+        )
+        assert (
+            await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        ) is None
+        assert gh.pr_view.await_count == 2
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_webhook_needs_input_to_review_revives_parked_manual_merge_pr(
     tmp_path: Path,
 ) -> None:
