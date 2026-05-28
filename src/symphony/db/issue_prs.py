@@ -478,6 +478,8 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     The Review stage records a completed handoff row immediately after
     pinging `@codex review`; later ticks keep re-checking the linked PR until
     the review classifier says it is approved and mergeable.
+    Parked manual-merge PRs stay eligible so the poller can reconcile an
+    external close or merge before skipping normal merge work.
     """
     cur = await conn.execute(
         """
@@ -487,7 +489,6 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL
-          AND p.parked_at IS NULL
           AND EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id

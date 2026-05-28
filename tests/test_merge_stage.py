@@ -7,7 +7,7 @@ import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -1276,7 +1276,9 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
         )
         assert pr is not None
         assert pr.parked_at is not None
-        assert await db.issue_prs.list_merge_candidates(conn) == []
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].parked_at == pr.parked_at
     finally:
         if review_task is not None and not review_task.done():
             review_task.cancel()
@@ -1361,6 +1363,100 @@ async def test_auto_merge_false_manual_merge_parking_is_idempotent(
         )
         assert second_pr is not None
         assert second_pr.parked_at == first_parked_at
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_false_parked_pr_close_is_reconciled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        parked_issue = _issue()
+        parked_issue.state_id = "state-na"
+        parked_issue.state_name = "Needs Approval"
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(side_effect=[_issue(), parked_issue])
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            side_effect=[
+                {
+                    "headRefOid": "abc123",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "state": "OPEN",
+                    "mergedAt": None,
+                },
+                {
+                    "headRefOid": "abc123",
+                    "mergeable": "UNKNOWN",
+                    "mergeStateStatus": "UNKNOWN",
+                    "state": "CLOSED",
+                    "mergedAt": None,
+                },
+            ]
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude", auto_merge=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=_FakeRunner([RunnerEvent(kind="exit", returncode=0)]),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+
+        await _poll_and_wait(orch)
+        pr = await db.issue_prs.get(
+            conn, issue_id="iss-1", github_repo="org/repo"
+        )
+        assert pr is not None
+        assert pr.parked_at is not None
+
+        await _poll_and_wait(orch)
+
+        gh.pr_merge.assert_not_awaited()
+        assert gh.pr_view.await_count == 2
+        linear.move_issue.assert_has_awaits(
+            [call("iss-1", "state-na"), call("iss-1", "state-na")]
+        )
+        assert linear.post_comment.await_count == 2
+        comments = [args.args[1] for args in linear.post_comment.await_args_list]
+        assert "ready for manual merge" in comments[0]
+        assert "pull request closed before merge" in comments[1]
+        merge_run = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="merge",
+            started_at_gte="2026-05-10T00:01:00+00:00",
+        )
+        assert merge_run is not None
+        assert merge_run.status == "needs_approval"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
         await conn.close()
 
@@ -1492,7 +1588,9 @@ async def test_auto_merge_false_retries_when_manual_merge_move_fails(
         )
         assert pr is not None
         assert pr.parked_at is not None
-        assert await db.issue_prs.list_merge_candidates(conn) == []
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].parked_at == pr.parked_at
     finally:
         await conn.close()
 

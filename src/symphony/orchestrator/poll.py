@@ -6999,6 +6999,8 @@ class Orchestrator:
                     view=view,
                 ):
                     continue
+                if candidate.parked_at is not None:
+                    continue
                 if _pr_view_has_merge_conflict(view):
                     await db.issue_prs.clear_merge_conflict_fixed(
                         self._conn,
