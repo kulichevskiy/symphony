@@ -87,6 +87,11 @@ def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:
     assert "--json" in argv
     assert "--model" in argv and argv[argv.index("--model") + 1] == "gpt-5.1-codex"
     assert "-o" in argv and argv[argv.index("-o") + 1] == "/tmp/last.txt"
+    assert "--strict-mcp-config" not in argv
+    assert "--mcp-config" not in argv
+    assert "--bare" not in argv
+    assert "--tools" not in argv
+    assert "--allowedTools" not in argv
     # The prompt must be the last positional argument so codex picks it up.
     assert argv[-1] == "please review"
 
@@ -110,6 +115,21 @@ def test_build_local_review_command_claude_uses_print_stream_json() -> None:
     assert "--print" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert argv[-1] == "please review"
+
+
+def test_build_local_review_command_claude_isolates_reviewer_environment() -> None:
+    argv = build_local_review_command(
+        agent="claude",
+        prompt="please review",
+        base_branch="main",
+    )
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
+    assert "--bare" in argv
+    assert "--tools" in argv
+    assert argv[argv.index("--tools") + 1] == "Bash,Read"
+    assert "--allowedTools" in argv
+    assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
 
 
 def test_build_local_review_command_unknown_agent_raises() -> None:
