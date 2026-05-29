@@ -40,6 +40,9 @@ VERDICT_CHANGES_REQUESTED_MARKER = "<<<VERDICT:CHANGES_REQUESTED>>>"
 
 ReviewerAgent = Literal["claude", "codex"]
 
+_CLAUDE_REVIEWER_TOOLS = "Bash,Read"
+_CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read"
+
 
 class LocalVerdictKind(StrEnum):
     APPROVED = "approved"
@@ -147,8 +150,10 @@ def build_local_review_command(
     flag; the parameter is kept in the signature because callers and
     tests use it.
 
-    `claude` runs through `--print` with the same prompt; the prompt
-    itself tells the agent to run `git diff` via its bash tool.
+    `claude` runs through `--print` with the same prompt, but in a
+    bare, reviewer-only environment: no inherited MCP servers, hooks,
+    plugins, or tools beyond the Bash/Read surface needed for `git diff`
+    and changed-file reads.
     """
     _ = base_branch
     if agent == "codex":
@@ -172,6 +177,12 @@ def build_local_review_command(
             "--output-format",
             "stream-json",
             "--verbose",
+            "--bare",
+            "--strict-mcp-config",
+            "--tools",
+            _CLAUDE_REVIEWER_TOOLS,
+            "--allowedTools",
+            _CLAUDE_REVIEWER_ALLOWED_TOOLS,
             prompt,
         ]
     raise ValueError(f"unknown reviewer agent {agent!r}")
