@@ -140,7 +140,7 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert settings["disableAllHooks"] is True
     assert "--bare" not in argv
     assert "--tools" in argv
-    assert argv[argv.index("--tools") + 1] == "Bash(git diff *),Read"
+    assert argv[argv.index("--tools") + 1] == "Bash,Read"
     assert "--allowedTools" in argv
     assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
     assert "--disallowedTools" in argv
