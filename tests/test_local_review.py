@@ -132,7 +132,7 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert argv[argv.index("--permission-mode") + 1] == "default"
     assert "--disable-slash-commands" in argv
     assert "--setting-sources" in argv
-    assert argv[argv.index("--setting-sources") + 1] == "user"
+    assert argv[argv.index("--setting-sources") + 1] == ""
     assert "--settings" in argv
     settings = json.loads(argv[argv.index("--settings") + 1])
     assert settings["autoMemoryEnabled"] is False

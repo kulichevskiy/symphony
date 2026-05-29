@@ -67,6 +67,7 @@ _CLAUDE_REVIEWER_SETTINGS = json.dumps(
     sort_keys=True,
     separators=(",", ":"),
 )
+_CLAUDE_REVIEWER_SETTING_SOURCES = ""
 
 
 class LocalVerdictKind(StrEnum):
@@ -176,9 +177,10 @@ def build_local_review_command(
     tests use it.
 
     `claude` runs through `--print` with the same prompt. It uses explicit
-    non-bare isolation controls so auth still loads, while project/local
-    settings, MCP servers, hooks, skills, auto memory, CLAUDE.md, and tools
-    outside the reviewer's read-only surface are kept out of the subprocess.
+    non-bare isolation controls so auth still loads, while user/project/local
+    filesystem settings, MCP servers, hooks, skills, auto memory, CLAUDE.md,
+    and tools outside the reviewer's read-only surface are kept out of the
+    subprocess.
     """
     _ = base_branch
     if agent == "codex":
@@ -207,7 +209,7 @@ def build_local_review_command(
             "--strict-mcp-config",
             "--disable-slash-commands",
             "--setting-sources",
-            "user",
+            _CLAUDE_REVIEWER_SETTING_SOURCES,
             "--settings",
             _CLAUDE_REVIEWER_SETTINGS,
             "--disallowedTools",
