@@ -48,7 +48,7 @@ from .local_review import (
     build_local_review_command,
     local_review_prompt,
 )
-from .local_review_io import collect_runner_output
+from .local_review_io import CollectedRunnerOutput, collect_runner_output
 from .local_review_loop import (
     FixerOutput,
     IterationCallback,
@@ -78,6 +78,17 @@ _RUN_ID_SAFE_RE = re.compile(r"[^a-zA-Z0-9_.\-]")
 def _safe_run_id(parent_run_id: str, suffix: str) -> str:
     base = _RUN_ID_SAFE_RE.sub("-", parent_run_id) or "run"
     return f"{base}-{suffix}"
+
+
+def _persist_runner_transcript(
+    log_dir: Path, stem: str, collected: CollectedRunnerOutput
+) -> None:
+    (log_dir / f"{stem}.out.log").write_text(
+        collected.stdout, encoding="utf-8", errors="replace"
+    )
+    (log_dir / f"{stem}.err.log").write_text(
+        collected.stderr, encoding="utf-8", errors="replace"
+    )
 
 
 def _build_fix_command(
@@ -201,6 +212,9 @@ async def run_local_review_session(
         finally:
             if report_active_run_id is not None:
                 await report_active_run_id(None)
+        _persist_runner_transcript(
+            last_message_dir, f"review-{iteration}", collected
+        )
         cost_delta = reviewer_estimator.total_cost_usd - cost_before
 
         last_message_text: str | None = None
@@ -272,6 +286,9 @@ async def run_local_review_session(
         finally:
             if report_active_run_id is not None:
                 await report_active_run_id(None)
+        _persist_runner_transcript(
+            last_message_dir, f"fix-{iteration}", collected
+        )
         cost_delta = fixer_estimator.total_cost_usd - cost_before
         if collected.terminal_kind == "spawn_failed":
             return FixerOutput(
