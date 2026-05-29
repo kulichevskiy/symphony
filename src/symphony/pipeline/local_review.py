@@ -42,6 +42,32 @@ ReviewerAgent = Literal["claude", "codex"]
 
 _CLAUDE_REVIEWER_TOOLS = "Bash,Read"
 _CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read"
+_CLAUDE_REVIEWER_DISALLOWED_TOOLS = ",".join(
+    (
+        "Glob",
+        "Grep",
+        "LS",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookRead",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "TodoWrite",
+        "Task",
+    )
+)
+_CLAUDE_REVIEWER_SETTINGS = json.dumps(
+    {
+        "autoMemoryEnabled": False,
+        "claudeMdExcludes": ["**/CLAUDE.md", "**/CLAUDE.local.md"],
+        "disableAllHooks": True,
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
+_CLAUDE_REVIEWER_SETTING_SOURCES = ""
 
 
 class LocalVerdictKind(StrEnum):
@@ -150,10 +176,11 @@ def build_local_review_command(
     flag; the parameter is kept in the signature because callers and
     tests use it.
 
-    `claude` runs through `--print` with the same prompt, but in a
-    bare, reviewer-only environment: no inherited MCP servers, hooks,
-    plugins, or tools beyond the Bash/Read surface needed for `git diff`
-    and changed-file reads.
+    `claude` runs through `--print` with the same prompt. It uses explicit
+    non-bare isolation controls so auth still loads, while user/project/local
+    filesystem settings, MCP servers, hooks, skills, auto memory, CLAUDE.md,
+    and tools outside the reviewer's read-only surface are kept out of the
+    subprocess.
     """
     _ = base_branch
     if agent == "codex":
@@ -177,12 +204,21 @@ def build_local_review_command(
             "--output-format",
             "stream-json",
             "--verbose",
-            "--bare",
+            "--permission-mode",
+            "default",
             "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--setting-sources",
+            _CLAUDE_REVIEWER_SETTING_SOURCES,
+            "--settings",
+            _CLAUDE_REVIEWER_SETTINGS,
+            "--disallowedTools",
+            _CLAUDE_REVIEWER_DISALLOWED_TOOLS,
             "--tools",
             _CLAUDE_REVIEWER_TOOLS,
             "--allowedTools",
             _CLAUDE_REVIEWER_ALLOWED_TOOLS,
+            "--",
             prompt,
         ]
     raise ValueError(f"unknown reviewer agent {agent!r}")

@@ -89,6 +89,8 @@ def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:
     assert "-o" in argv and argv[argv.index("-o") + 1] == "/tmp/last.txt"
     assert "--strict-mcp-config" not in argv
     assert "--mcp-config" not in argv
+    assert "--permission-mode" not in argv
+    assert "--disallowedTools" not in argv
     assert "--bare" not in argv
     assert "--tools" not in argv
     assert "--allowedTools" not in argv
@@ -114,6 +116,7 @@ def test_build_local_review_command_claude_uses_print_stream_json() -> None:
     assert argv[0] == "claude"
     assert "--print" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert argv[-2:] == ["--", "please review"]
     assert argv[-1] == "please review"
 
 
@@ -125,11 +128,36 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     )
     assert "--strict-mcp-config" in argv
     assert "--mcp-config" not in argv
-    assert "--bare" in argv
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "default"
+    assert "--disable-slash-commands" in argv
+    assert "--setting-sources" in argv
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--settings" in argv
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["claudeMdExcludes"] == ["**/CLAUDE.md", "**/CLAUDE.local.md"]
+    assert settings["disableAllHooks"] is True
+    assert "--bare" not in argv
     assert "--tools" in argv
     assert argv[argv.index("--tools") + 1] == "Bash,Read"
     assert "--allowedTools" in argv
     assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
+    assert "--disallowedTools" in argv
+    disallowed_tools = argv[argv.index("--disallowedTools") + 1].split(",")
+    assert {"Edit", "Write", "MultiEdit", "NotebookEdit"}.issubset(
+        disallowed_tools
+    )
+    assert {"Glob", "Grep", "LS", "NotebookRead", "WebFetch", "WebSearch"}.issubset(
+        disallowed_tools
+    )
+    assert "Bash" not in disallowed_tools
+    assert "Read" not in disallowed_tools
+    assert argv.index("--disallowedTools") < argv.index("--tools")
+    assert argv.index("--tools") < argv.index("--allowedTools")
+    assert argv.index("--settings") < argv.index("--tools")
+    assert argv[argv.index("--allowedTools") + 2] == "--"
+    assert argv[-2:] == ["--", "please review"]
 
 
 def test_build_local_review_command_unknown_agent_raises() -> None:
