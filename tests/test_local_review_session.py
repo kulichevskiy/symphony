@@ -69,6 +69,46 @@ def _ok_fix_stream() -> list[RunnerEvent]:
     ]
 
 
+def _review_stream_with_transcript(
+    *, agent: str, message: str, prefix: str, stderr: str
+) -> tuple[list[RunnerEvent], str, str]:
+    if agent == "codex":
+        final = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "i", "type": "agent_message", "text": message},
+            }
+        )
+    else:
+        final = json.dumps({"type": "result", "result": message})
+    stdout = f"{prefix}\n{final}"
+    return (
+        [
+            RunnerEvent(kind="stdout", line=prefix),
+            RunnerEvent(kind="stderr", line=stderr),
+            RunnerEvent(kind="stdout", line=final),
+            RunnerEvent(kind="exit", returncode=0),
+        ],
+        stdout,
+        stderr,
+    )
+
+
+def _fix_stream_with_transcript() -> tuple[list[RunnerEvent], str, str]:
+    stdout = "fixer-started\nfixer-done"
+    stderr = "fixer-warning"
+    return (
+        [
+            RunnerEvent(kind="stdout", line="fixer-started"),
+            RunnerEvent(kind="stderr", line=stderr),
+            RunnerEvent(kind="stdout", line="fixer-done"),
+            RunnerEvent(kind="exit", returncode=0),
+        ],
+        stdout,
+        stderr,
+    )
+
+
 @pytest.mark.asyncio
 async def test_first_review_approves_and_session_returns_approved(
     tmp_path: Path,
@@ -118,6 +158,70 @@ async def test_first_review_approves_and_session_returns_approved(
     assert "--base" not in spec.command
     prompt_arg = spec.command[-1]
     assert "origin/main" in prompt_arg
+
+
+@pytest.mark.parametrize("reviewer_agent", ["claude", "codex"])
+@pytest.mark.parametrize("implementer_agent", ["claude", "codex"])
+@pytest.mark.asyncio
+async def test_persists_transcripts_for_review_and_fix_iterations(
+    tmp_path: Path, reviewer_agent: str, implementer_agent: str
+) -> None:
+    review_0, review_0_out, review_0_err = _review_stream_with_transcript(
+        agent=reviewer_agent,
+        message=f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+        prefix="reviewer-zero-started",
+        stderr="reviewer-zero-warning",
+    )
+    fix_0, fix_0_out, fix_0_err = _fix_stream_with_transcript()
+    review_1, review_1_out, review_1_err = _review_stream_with_transcript(
+        agent=reviewer_agent,
+        message=f"looks good\n{VERDICT_APPROVED_MARKER}",
+        prefix="reviewer-one-started",
+        stderr="reviewer-one-warning",
+    )
+    runner = _ScriptedRunner(scripts=[review_0, fix_0, review_1])
+    log_dir = tmp_path / "logs" / "local_review" / "run-transcript"
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "workspace",
+        base_branch="main",
+        parent_run_id="run-transcript",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent=implementer_agent,
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent=reviewer_agent,
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=log_dir,
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert (
+        (log_dir / "review-0.out.log").read_text(encoding="utf-8")
+        == review_0_out
+    )
+    assert (
+        (log_dir / "review-0.err.log").read_text(encoding="utf-8")
+        == review_0_err
+    )
+    assert (log_dir / "fix-0.out.log").read_text(encoding="utf-8") == fix_0_out
+    assert (log_dir / "fix-0.err.log").read_text(encoding="utf-8") == fix_0_err
+    assert (
+        (log_dir / "review-1.out.log").read_text(encoding="utf-8")
+        == review_1_out
+    )
+    assert (
+        (log_dir / "review-1.err.log").read_text(encoding="utf-8")
+        == review_1_err
+    )
 
 
 @pytest.mark.asyncio
@@ -236,6 +340,7 @@ async def test_reviewer_spawn_failure_returns_reviewer_failed(
     runner = _ScriptedRunner(
         scripts=[[RunnerEvent(kind="spawn_failed", error="codex not on PATH")]],
     )
+    log_dir = tmp_path / "last"
 
     async def head_sha(_: Path) -> str:
         return "sha-1"
@@ -254,12 +359,14 @@ async def test_reviewer_spawn_failure_returns_reviewer_failed(
         reviewer_codex_model="gpt-5.1-codex",
         cap=5,
         stall_secs=300,
-        last_message_dir=tmp_path / "last",
+        last_message_dir=log_dir,
         head_sha_provider=head_sha,
     )
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.error is not None
     assert "spawn_failed" in result.error
+    assert (log_dir / "review-0.out.log").read_text(encoding="utf-8") == ""
+    assert (log_dir / "review-0.err.log").read_text(encoding="utf-8") == ""
 
 
 @pytest.mark.asyncio
@@ -306,6 +413,7 @@ async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
     async def head_sha(_: Path) -> str:
         return "sha-1"
 
+    log_dir = tmp_path / "last"
     result = await run_local_review_session(
         runner=runner,
         workspace_path=tmp_path / "ws",
@@ -320,11 +428,13 @@ async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
         reviewer_codex_model="gpt-5.1-codex",
         cap=5,
         stall_secs=300,
-        last_message_dir=tmp_path / "last",
+        last_message_dir=log_dir,
         head_sha_provider=head_sha,
     )
     assert result.outcome == LoopOutcome.FIX_RUN_FAILED
     assert result.error == "fix-run stalled"
+    assert (log_dir / "fix-0.out.log").read_text(encoding="utf-8") == ""
+    assert (log_dir / "fix-0.err.log").read_text(encoding="utf-8") == ""
 
 
 @pytest.mark.asyncio
