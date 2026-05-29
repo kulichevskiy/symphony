@@ -130,6 +130,14 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert "--mcp-config" not in argv
     assert "--permission-mode" in argv
     assert argv[argv.index("--permission-mode") + 1] == "default"
+    assert "--disable-slash-commands" in argv
+    assert "--setting-sources" in argv
+    assert argv[argv.index("--setting-sources") + 1] == "user"
+    assert "--settings" in argv
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    assert settings["autoMemoryEnabled"] is False
+    assert settings["claudeMdExcludes"] == ["**/CLAUDE.md", "**/CLAUDE.local.md"]
+    assert settings["disableAllHooks"] is True
     assert "--bare" not in argv
     assert "--tools" not in argv
     assert "--allowedTools" in argv
@@ -140,6 +148,7 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
         disallowed_tools
     )
     assert argv.index("--disallowedTools") < argv.index("--allowedTools")
+    assert argv.index("--settings") < argv.index("--allowedTools")
     assert argv[argv.index("--allowedTools") + 2] == "--"
     assert argv[-2:] == ["--", "please review"]
 

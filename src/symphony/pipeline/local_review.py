@@ -51,6 +51,15 @@ _CLAUDE_REVIEWER_DISALLOWED_TOOLS = ",".join(
         "Task",
     )
 )
+_CLAUDE_REVIEWER_SETTINGS = json.dumps(
+    {
+        "autoMemoryEnabled": False,
+        "claudeMdExcludes": ["**/CLAUDE.md", "**/CLAUDE.local.md"],
+        "disableAllHooks": True,
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+)
 
 
 class LocalVerdictKind(StrEnum):
@@ -159,9 +168,10 @@ def build_local_review_command(
     flag; the parameter is kept in the signature because callers and
     tests use it.
 
-    `claude` runs through `--print` with the same prompt. It uses a strict
-    MCP configuration and explicit tool allow/deny lists so inherited local
-    settings cannot give the reviewer editing tools.
+    `claude` runs through `--print` with the same prompt. It uses explicit
+    non-bare isolation controls so auth still loads, while project/local
+    settings, MCP servers, hooks, skills, auto memory, and CLAUDE.md are
+    kept out of the reviewer subprocess.
     """
     _ = base_branch
     if agent == "codex":
@@ -188,6 +198,11 @@ def build_local_review_command(
             "--permission-mode",
             "default",
             "--strict-mcp-config",
+            "--disable-slash-commands",
+            "--setting-sources",
+            "user",
+            "--settings",
+            _CLAUDE_REVIEWER_SETTINGS,
             "--disallowedTools",
             _CLAUDE_REVIEWER_DISALLOWED_TOOLS,
             "--allowedTools",
