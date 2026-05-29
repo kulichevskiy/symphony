@@ -114,6 +114,7 @@ def test_build_local_review_command_claude_uses_print_stream_json() -> None:
     assert argv[0] == "claude"
     assert "--print" in argv
     assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert argv[-2:] == ["--", "please review"]
     assert argv[-1] == "please review"
 
 
@@ -125,11 +126,11 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     )
     assert "--strict-mcp-config" in argv
     assert "--mcp-config" not in argv
-    assert "--bare" in argv
-    assert "--tools" in argv
-    assert argv[argv.index("--tools") + 1] == "Bash,Read"
+    assert "--bare" not in argv
+    assert "--tools" not in argv
     assert "--allowedTools" in argv
     assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
+    assert argv[-2:] == ["--", "please review"]
 
 
 def test_build_local_review_command_unknown_agent_raises() -> None:
