@@ -151,24 +151,28 @@ class _ReviewerScript:
     messages: list[str]
     costs: list[float]
     head_shas: list[str] = field(default_factory=list)
+    message_by_call: bool = False
     calls: list[int] = field(default_factory=list)
 
     async def __call__(self, i: int) -> ReviewerOutput:
         self.calls.append(i)
+        message_index = len(self.calls) - 1 if self.message_by_call else i
         stdout = json.dumps(
             {
                 "type": "item.completed",
                 "item": {
                     "id": "i",
                     "type": "agent_message",
-                    "text": self.messages[i],
+                    "text": self.messages[message_index],
                 },
             }
         )
         return ReviewerOutput(
             stdout=stdout,
-            head_sha=self.head_shas[i] if self.head_shas else f"sha{i}",
-            cost_usd=self.costs[i],
+            head_sha=(
+                self.head_shas[message_index] if self.head_shas else f"sha{i}"
+            ),
+            cost_usd=self.costs[message_index],
         )
 
 
@@ -201,6 +205,29 @@ async def test_loop_total_cost_sums_reviewer_and_fixer() -> None:
     )
     assert result.outcome == LoopOutcome.APPROVED
     assert result.total_cost_usd == pytest.approx(0.10 + 0.20 + 0.05)
+
+
+@pytest.mark.asyncio
+async def test_loop_total_cost_includes_retried_reviewer() -> None:
+    reviewer = _ReviewerScript(
+        messages=[
+            "No verdict marker.",
+            f"good\n{VERDICT_APPROVED_MARKER}",
+        ],
+        costs=[0.10, 0.05],
+        head_shas=["s1", "s1"],
+        message_by_call=True,
+    )
+    fixer = _FixerScript(costs=[])
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    assert reviewer.calls == [0, 0]
+    assert result.total_cost_usd == pytest.approx(0.15)
 
 
 # --- cap-breach behavior ---------------------------------------------

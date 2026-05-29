@@ -28,10 +28,10 @@ The loop:
 
   for i in range(cap):
       out = await reviewer(prompt)
-      if reviewer failed              → reviewer_failed
+      if reviewer failed              → retry once, then reviewer_failed
       verdict = parse(out)
+      if UNPARSEABLE                  → retry once, then reviewer_failed
       if APPROVED                     → approved
-      if UNPARSEABLE                  → reviewer_failed
       if verdict identical to prev    → stuck_loop  (dedup gate)
       fix_ok = await fixer(findings)
       if not fix_ok                   → fix_run_failed
@@ -104,6 +104,7 @@ ReviewerCallable = Callable[[int], Awaitable[ReviewerOutput]]
 FixerCallable = Callable[[int, LocalVerdict], Awaitable[FixerOutput]]
 
 
+REVIEWER_FAILURE_RETRIES = 1
 SkipPredicate = Callable[[], bool]
 
 # Fired after each reviewer's verdict is parsed but before any fix-run is
@@ -171,6 +172,18 @@ async def run_local_review_loop(
             total_cost_usd=total_cost,
         )
 
+    def _cost_cap_breached_result(iterations: int, *, phase: str) -> LoopResult:
+        return LoopResult(
+            outcome=LoopOutcome.COST_CAP_BREACHED,
+            iterations=iterations,
+            verdicts=tuple(verdicts),
+            error=(
+                f"cost cap ${cost_cap_usd:.2f} reached {phase} "
+                f"(prior=${prior_cost_usd:.4f}, session=${total_cost:.4f})"
+            ),
+            total_cost_usd=total_cost,
+        )
+
     for i in range(cap):
         # Skip-event check at iteration boundaries. An operator who posts
         # `$skip-local-review` mid-loop will see at most one extra
@@ -178,28 +191,55 @@ async def run_local_review_loop(
         # `stall_secs`, not by `cap × stall_secs`.
         if _skip():
             return _skipped_result(i)
-        out = await reviewer(i)
-        total_cost += out.cost_usd
-        # If the orchestrator killed the reviewer mid-subprocess via
-        # `$skip-local-review`, the runner will emit a failure terminal.
-        # Prefer SKIPPED over REVIEWER_FAILED so the audit trail reflects
-        # operator intent, not "the reviewer crashed".
-        if _skip():
-            return _skipped_result(i + 1)
-        if not out.ok:
+        verdict: LocalVerdict | None = None
+        reviewer_error: str | None = None
+        for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
+            out = await reviewer(i)
+            total_cost += out.cost_usd
+            # If the orchestrator killed the reviewer mid-subprocess via
+            # `$skip-local-review`, the runner will emit a failure terminal.
+            # Prefer SKIPPED over REVIEWER_FAILED so the audit trail reflects
+            # operator intent, not "the reviewer crashed".
+            if _skip():
+                return _skipped_result(i + 1)
+            if not out.ok:
+                reviewer_error = out.error or "reviewer failed"
+                if _cap_breached():
+                    return _cost_cap_breached_result(
+                        i + 1, phase="during local review"
+                    )
+                if attempt < REVIEWER_FAILURE_RETRIES:
+                    continue
+                return LoopResult(
+                    outcome=LoopOutcome.REVIEWER_FAILED,
+                    iterations=i + 1,
+                    verdicts=tuple(verdicts),
+                    error=reviewer_error,
+                    total_cost_usd=total_cost,
+                )
+            parsed = parse_local_review_output(
+                agent=reviewer_agent,
+                stdout=out.stdout,
+                head_sha=out.head_sha,
+                last_message_file=out.last_message_file,
+            )
+            if (
+                parsed.kind == LocalVerdictKind.UNPARSEABLE
+                and attempt < REVIEWER_FAILURE_RETRIES
+                and not _cap_breached()
+            ):
+                continue
+            verdict = parsed
+            break
+
+        if verdict is None:
             return LoopResult(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
                 verdicts=tuple(verdicts),
-                error=out.error or "reviewer failed",
+                error=reviewer_error or "reviewer failed",
                 total_cost_usd=total_cost,
             )
-        verdict = parse_local_review_output(
-            agent=reviewer_agent,
-            stdout=out.stdout,
-            head_sha=out.head_sha,
-            last_message_file=out.last_message_file,
-        )
         verdicts.append(verdict)
 
         # Heartbeat: fire the callback once per iteration so the
@@ -220,15 +260,8 @@ async def run_local_review_loop(
         # also paying for a fix-run. Doing it after the verdict parse
         # lets callers see *what* the reviewer found before we aborted.
         if _cap_breached():
-            return LoopResult(
-                outcome=LoopOutcome.COST_CAP_BREACHED,
-                iterations=i + 1,
-                verdicts=tuple(verdicts),
-                error=(
-                    f"cost cap ${cost_cap_usd:.2f} reached during local review "
-                    f"(prior=${prior_cost_usd:.4f}, session=${total_cost:.4f})"
-                ),
-                total_cost_usd=total_cost,
+            return _cost_cap_breached_result(
+                i + 1, phase="during local review"
             )
 
         if verdict.kind == LocalVerdictKind.APPROVED:
@@ -276,16 +309,7 @@ async def run_local_review_loop(
                 total_cost_usd=total_cost,
             )
         if _cap_breached():
-            return LoopResult(
-                outcome=LoopOutcome.COST_CAP_BREACHED,
-                iterations=i + 1,
-                verdicts=tuple(verdicts),
-                error=(
-                    f"cost cap ${cost_cap_usd:.2f} reached after fix-run "
-                    f"(prior=${prior_cost_usd:.4f}, session=${total_cost:.4f})"
-                ),
-                total_cost_usd=total_cost,
-            )
+            return _cost_cap_breached_result(i + 1, phase="after fix-run")
 
     return LoopResult(
         outcome=LoopOutcome.EXHAUSTED,

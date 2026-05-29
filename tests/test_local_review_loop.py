@@ -42,17 +42,22 @@ class _ReviewerScript:
     messages: list[str]
     head_shas: list[str] = field(default_factory=list)
     fail_on: set[int] = field(default_factory=set)
+    fail_by_call: set[int] = field(default_factory=set)
+    message_by_call: bool = False
     calls: list[int] = field(default_factory=list)
 
     async def __call__(self, i: int) -> ReviewerOutput:
         self.calls.append(i)
-        if i in self.fail_on:
+        message_index = len(self.calls) - 1 if self.message_by_call else i
+        if i in self.fail_on or len(self.calls) - 1 in self.fail_by_call:
             return ReviewerOutput(
                 stdout="", head_sha="", ok=False, error="reviewer crashed"
             )
         return ReviewerOutput(
-            stdout=_codex_jsonl(self.messages[i]),
-            head_sha=self.head_shas[i] if self.head_shas else f"sha{i}",
+            stdout=_codex_jsonl(self.messages[message_index]),
+            head_sha=(
+                self.head_shas[message_index] if self.head_shas else f"sha{i}"
+            ),
         )
 
 
@@ -218,6 +223,26 @@ async def test_reviewer_subprocess_failure_aborts_loop() -> None:
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.iterations == 1
     assert result.error == "reviewer crashed"
+    assert reviewer.calls == [0, 0]
+    assert fixer.received == []
+
+
+@pytest.mark.asyncio
+async def test_reviewer_subprocess_failure_retried_once_then_approved() -> None:
+    reviewer = _ReviewerScript(
+        messages=[f"recovered\n{VERDICT_APPROVED_MARKER}"],
+        fail_by_call={0},
+    )
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    assert result.iterations == 1
+    assert reviewer.calls == [0, 0]
     assert fixer.received == []
 
 
@@ -240,6 +265,55 @@ async def test_unparseable_review_treated_as_reviewer_failure() -> None:
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.iterations == 1
     assert result.error == "reviewer emitted no verdict marker"
+
+
+@pytest.mark.asyncio
+async def test_unparseable_review_retried_once_then_approved() -> None:
+    reviewer = _ReviewerScript(
+        messages=[
+            "I have opinions but forgot the marker.",
+            f"fixed on retry\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["same-head", "same-head"],
+        message_by_call=True,
+    )
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    assert result.iterations == 1
+    assert reviewer.calls == [0, 0]
+    assert fixer.received == []
+    assert result.last_verdict is not None
+    assert result.last_verdict.kind.value == "approved"
+
+
+@pytest.mark.asyncio
+async def test_unparseable_review_retried_once_then_reviewer_failed() -> None:
+    reviewer = _ReviewerScript(
+        messages=[
+            "I have opinions but forgot the marker.",
+            "Still no marker.",
+        ],
+        head_shas=["same-head", "same-head"],
+        message_by_call=True,
+    )
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.iterations == 1
+    assert reviewer.calls == [0, 0]
+    assert result.error == "reviewer emitted no verdict marker"
+    assert fixer.received == []
 
 
 @pytest.mark.asyncio

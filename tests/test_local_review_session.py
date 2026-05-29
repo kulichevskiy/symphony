@@ -338,7 +338,10 @@ async def test_reviewer_spawn_failure_returns_reviewer_failed(
     tmp_path: Path,
 ) -> None:
     runner = _ScriptedRunner(
-        scripts=[[RunnerEvent(kind="spawn_failed", error="codex not on PATH")]],
+        scripts=[
+            [RunnerEvent(kind="spawn_failed", error="codex not on PATH")],
+            [RunnerEvent(kind="spawn_failed", error="codex not on PATH")],
+        ],
     )
     log_dir = tmp_path / "last"
 
@@ -367,12 +370,16 @@ async def test_reviewer_spawn_failure_returns_reviewer_failed(
     assert "spawn_failed" in result.error
     assert (log_dir / "review-0.out.log").read_text(encoding="utf-8") == ""
     assert (log_dir / "review-0.err.log").read_text(encoding="utf-8") == ""
+    assert [spec.run_id for spec in runner.specs] == ["run-1-rev-0", "run-1-rev-0"]
 
 
 @pytest.mark.asyncio
 async def test_reviewer_stall_returns_reviewer_failed(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
-        scripts=[[RunnerEvent(kind="stall_timeout")]],
+        scripts=[
+            [RunnerEvent(kind="stall_timeout")],
+            [RunnerEvent(kind="stall_timeout")],
+        ],
     )
 
     async def head_sha(_: Path) -> str:
@@ -397,6 +404,7 @@ async def test_reviewer_stall_returns_reviewer_failed(tmp_path: Path) -> None:
     )
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.error == "reviewer stalled"
+    assert [spec.run_id for spec in runner.specs] == ["run-1-rev-0", "run-1-rev-0"]
 
 
 @pytest.mark.asyncio
