@@ -43,10 +43,16 @@ ReviewerAgent = Literal["claude", "codex"]
 _CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read"
 _CLAUDE_REVIEWER_DISALLOWED_TOOLS = ",".join(
     (
+        "Glob",
+        "Grep",
+        "LS",
         "Edit",
         "Write",
         "MultiEdit",
+        "NotebookRead",
         "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
         "TodoWrite",
         "Task",
     )

@@ -147,6 +147,11 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert {"Edit", "Write", "MultiEdit", "NotebookEdit"}.issubset(
         disallowed_tools
     )
+    assert {"Glob", "Grep", "LS", "NotebookRead", "WebFetch", "WebSearch"}.issubset(
+        disallowed_tools
+    )
+    assert "Bash" not in disallowed_tools
+    assert "Read" not in disallowed_tools
     assert argv.index("--disallowedTools") < argv.index("--allowedTools")
     assert argv.index("--settings") < argv.index("--allowedTools")
     assert argv[argv.index("--allowedTools") + 2] == "--"
