@@ -41,6 +41,16 @@ VERDICT_CHANGES_REQUESTED_MARKER = "<<<VERDICT:CHANGES_REQUESTED>>>"
 ReviewerAgent = Literal["claude", "codex"]
 
 _CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read"
+_CLAUDE_REVIEWER_DISALLOWED_TOOLS = ",".join(
+    (
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "TodoWrite",
+        "Task",
+    )
+)
 
 
 class LocalVerdictKind(StrEnum):
@@ -150,8 +160,8 @@ def build_local_review_command(
     tests use it.
 
     `claude` runs through `--print` with the same prompt. It uses a strict
-    MCP configuration and the Bash/Read surface needed for `git diff` and
-    changed-file reads.
+    MCP configuration and explicit tool allow/deny lists so inherited local
+    settings cannot give the reviewer editing tools.
     """
     _ = base_branch
     if agent == "codex":
@@ -175,7 +185,11 @@ def build_local_review_command(
             "--output-format",
             "stream-json",
             "--verbose",
+            "--permission-mode",
+            "default",
             "--strict-mcp-config",
+            "--disallowedTools",
+            _CLAUDE_REVIEWER_DISALLOWED_TOOLS,
             "--allowedTools",
             _CLAUDE_REVIEWER_ALLOWED_TOOLS,
             "--",

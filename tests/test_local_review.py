@@ -89,6 +89,8 @@ def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:
     assert "-o" in argv and argv[argv.index("-o") + 1] == "/tmp/last.txt"
     assert "--strict-mcp-config" not in argv
     assert "--mcp-config" not in argv
+    assert "--permission-mode" not in argv
+    assert "--disallowedTools" not in argv
     assert "--bare" not in argv
     assert "--tools" not in argv
     assert "--allowedTools" not in argv
@@ -126,10 +128,19 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     )
     assert "--strict-mcp-config" in argv
     assert "--mcp-config" not in argv
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "default"
     assert "--bare" not in argv
     assert "--tools" not in argv
     assert "--allowedTools" in argv
     assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
+    assert "--disallowedTools" in argv
+    disallowed_tools = argv[argv.index("--disallowedTools") + 1].split(",")
+    assert {"Edit", "Write", "MultiEdit", "NotebookEdit"}.issubset(
+        disallowed_tools
+    )
+    assert argv.index("--disallowedTools") < argv.index("--allowedTools")
+    assert argv[argv.index("--allowedTools") + 2] == "--"
     assert argv[-2:] == ["--", "please review"]
 
 
