@@ -139,7 +139,8 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert settings["claudeMdExcludes"] == ["**/CLAUDE.md", "**/CLAUDE.local.md"]
     assert settings["disableAllHooks"] is True
     assert "--bare" not in argv
-    assert "--tools" not in argv
+    assert "--tools" in argv
+    assert argv[argv.index("--tools") + 1] == "Bash(git diff *),Read"
     assert "--allowedTools" in argv
     assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
     assert "--disallowedTools" in argv
@@ -152,8 +153,9 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     )
     assert "Bash" not in disallowed_tools
     assert "Read" not in disallowed_tools
-    assert argv.index("--disallowedTools") < argv.index("--allowedTools")
-    assert argv.index("--settings") < argv.index("--allowedTools")
+    assert argv.index("--disallowedTools") < argv.index("--tools")
+    assert argv.index("--tools") < argv.index("--allowedTools")
+    assert argv.index("--settings") < argv.index("--tools")
     assert argv[argv.index("--allowedTools") + 2] == "--"
     assert argv[-2:] == ["--", "please review"]
 

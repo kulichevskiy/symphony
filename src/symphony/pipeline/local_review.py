@@ -40,7 +40,8 @@ VERDICT_CHANGES_REQUESTED_MARKER = "<<<VERDICT:CHANGES_REQUESTED>>>"
 
 ReviewerAgent = Literal["claude", "codex"]
 
-_CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read"
+_CLAUDE_REVIEWER_TOOLS = "Bash(git diff *),Read"
+_CLAUDE_REVIEWER_ALLOWED_TOOLS = _CLAUDE_REVIEWER_TOOLS
 _CLAUDE_REVIEWER_DISALLOWED_TOOLS = ",".join(
     (
         "Glob",
@@ -176,8 +177,8 @@ def build_local_review_command(
 
     `claude` runs through `--print` with the same prompt. It uses explicit
     non-bare isolation controls so auth still loads, while project/local
-    settings, MCP servers, hooks, skills, auto memory, and CLAUDE.md are
-    kept out of the reviewer subprocess.
+    settings, MCP servers, hooks, skills, auto memory, CLAUDE.md, and tools
+    outside the reviewer's read-only surface are kept out of the subprocess.
     """
     _ = base_branch
     if agent == "codex":
@@ -211,6 +212,8 @@ def build_local_review_command(
             _CLAUDE_REVIEWER_SETTINGS,
             "--disallowedTools",
             _CLAUDE_REVIEWER_DISALLOWED_TOOLS,
+            "--tools",
+            _CLAUDE_REVIEWER_TOOLS,
             "--allowedTools",
             _CLAUDE_REVIEWER_ALLOWED_TOOLS,
             "--",
