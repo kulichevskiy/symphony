@@ -22,11 +22,11 @@ async def upsert(
         INSERT INTO issues (id, provider, site, identifier, title, team_key)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
-            provider   = excluded.provider,
-            site       = excluded.site,
             identifier = excluded.identifier,
             title      = excluded.title,
             team_key   = excluded.team_key
+        WHERE issues.provider = excluded.provider
+          AND issues.site = excluded.site
         """,
         (id, provider, site, identifier, title, team_key),
     )

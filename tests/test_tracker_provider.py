@@ -155,6 +155,53 @@ async def test_warmup_registers_configured_tracker_context(tmp_path) -> None:  #
 
 
 @pytest.mark.asyncio
+async def test_issue_upsert_does_not_steal_existing_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="shared-issue-id",
+            identifier="ENG-1",
+            title="Default issue",
+            team_key="ENG",
+            provider="linear",
+            site="default",
+        )
+        await db.issues.upsert(
+            conn,
+            id="shared-issue-id",
+            identifier="ENG-2",
+            title="Secondary issue",
+            team_key="ENG",
+            provider="linear",
+            site="secondary",
+        )
+
+        cur = await conn.execute(
+            """
+            SELECT provider, site, identifier, title, team_key
+              FROM issues
+             WHERE id = ?
+            """,
+            ("shared-issue-id",),
+        )
+        row = await cur.fetchone()
+
+        assert row is not None
+        assert dict(row) == {
+            "provider": "linear",
+            "site": "default",
+            "identifier": "ENG-1",
+            "title": "Default issue",
+            "team_key": "ENG",
+        }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_operator_wait_restore_uses_persisted_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 
