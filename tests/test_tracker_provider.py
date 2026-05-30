@@ -107,6 +107,38 @@ def test_for_binding_builds_linear_or_jira_tracker(monkeypatch) -> None:  # type
         asyncio.run(jira.aclose())
 
 
+def test_for_binding_registers_jira_secret_base_url(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from symphony.jira.client import JiraTracker
+    from symphony.tracker import TrackerRegistry, for_binding
+
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    secrets = Secrets()
+    binding = RepoBinding(
+        provider="jira",
+        project_key="SYM",
+        github_repo="org/repo",
+        states=TrackerStates(ready="To Do", code_review="In Review"),
+    )
+    registry = TrackerRegistry()
+
+    jira = for_binding(binding, secrets, registry=registry)
+    try:
+        assert isinstance(jira, JiraTracker)
+        assert binding.tracker_site == "https://jira.example.test"
+        assert (
+            registry.resolve(
+                TrackerContext(provider="jira", site="https://jira.example.test")
+            )
+            is jira
+        )
+    finally:
+        import asyncio
+
+        asyncio.run(jira.aclose())
+
+
 def test_orchestrator_and_reconciler_do_not_store_linear_client_attrs() -> None:
     assert "self.linear" not in inspect.getsource(Orchestrator)
     assert "self._linear" not in inspect.getsource(Reconciler)
@@ -209,6 +241,40 @@ async def test_warmup_registers_configured_tracker_context(tmp_path) -> None:  #
         assert orch._states == {  # noqa: SLF001
             ("linear-alt", "secondary", "ENG"): {"Todo": "state-secondary"},
         }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_uses_supplied_tracker_registry(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+    from symphony.tracker import TrackerRegistry
+
+    linear_binding = _binding()
+    jira_binding = RepoBinding(
+        provider="jira",
+        project_key="SYM",
+        base_url="https://jira.example.test",
+        github_repo="org/repo",
+        states=TrackerStates(ready="To Do", code_review="In Review"),
+    )
+    linear = AsyncMock()
+    jira = AsyncMock()
+    registry = TrackerRegistry()
+    registry.register("linear", "default", linear)
+    registry.register("jira", "https://jira.example.test", jira)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = Orchestrator(
+            Config(repos=[linear_binding, jira_binding]),
+            registry,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+
+        assert orch.tracker(linear_binding) is linear
+        assert orch.tracker(jira_binding) is jira
     finally:
         await conn.close()
 

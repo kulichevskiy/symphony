@@ -140,6 +140,30 @@ repos:
     assert secrets.jira_webhook_secret == "jira-webhook-secret"
 
 
+def test_jira_binding_can_use_env_base_url(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    raw = """
+repos:
+  - provider: jira
+    project_key: SYM
+    github_repo: org/api-svc
+    states:
+      ready: To Do
+      code_review: In Review
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+
+    assert binding.base_url is None
+    assert binding.tracker_provider == "jira"
+    assert binding.tracker_site == "https://jira.example.test"
+
+
 def test_ui_can_be_disabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = """

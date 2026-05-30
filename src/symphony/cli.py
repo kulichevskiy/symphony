@@ -15,8 +15,10 @@ import os
 import re
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import click
 
@@ -27,11 +29,12 @@ from .agent.codex_cli import (
     ensure_symphony_permissions_profile,
 )
 from .app import build_server_config, create_app
-from .config import Config, RepoBinding
+from .config import Config, RepoBinding, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
+from .tracker import DEFAULT_PROVIDER, DEFAULT_SITE, TrackerRegistry, for_binding
 from .webhook import WebhookSettings
 
 _ANSI_RESET = "\x1b[0m"
@@ -163,6 +166,27 @@ def _config_can_run_codex_cli(cfg: Config) -> bool:
     return any(_binding_can_run_codex_cli(binding) for binding in cfg.repos)
 
 
+def _config_has_linear_bindings(cfg: Config) -> bool:
+    return any(binding.provider == "linear" for binding in cfg.repos)
+
+
+@asynccontextmanager
+async def _configured_tracker_registry(
+    cfg: Config,
+) -> AsyncIterator[tuple[TrackerRegistry, Linear | None]]:
+    secrets = Secrets()
+    registry = TrackerRegistry()
+    external_linear: Linear | None = None
+    async with AsyncExitStack() as stack:
+        for binding in cfg.repos:
+            tracker = for_binding(binding, secrets, registry=registry)
+            await stack.enter_async_context(cast(Any, tracker))
+            if binding.provider == "linear" and external_linear is None:
+                external_linear = cast(Linear, tracker)
+                registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
+        yield registry, external_linear
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--config",
@@ -185,14 +209,14 @@ def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
 
 async def _run(config_path: Path, *, once: bool) -> None:
     cfg = Config.load(config_path)
-    if not cfg.linear_api_key:
+    if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
         sys.exit(2)
-    async with Linear(cfg.linear_api_key) as linear:
+    async with _configured_tracker_registry(cfg) as (trackers, external_linear):
         conn = await db.connect(cfg.db_path)
         try:
-            orch = Orchestrator(cfg, linear, conn)
-            await reconcile(conn, orch.tracker)
+            orch = Orchestrator(cfg, trackers, conn)
+            await reconcile(conn, trackers)
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access
@@ -224,7 +248,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_db_path=cfg.db_path,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                     ui_external_config=cfg,
-                    ui_external_linear=linear,
+                    ui_external_linear=external_linear,
                     ui_external_github=orch._gh,  # pylint: disable=protected-access
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()

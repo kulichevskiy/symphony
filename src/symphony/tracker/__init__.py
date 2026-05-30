@@ -115,6 +115,7 @@ def for_binding(
     registry: TrackerRegistry | None = None,
 ) -> IssueTracker:
     """Build the concrete tracker for a binding and optionally register it."""
+    binding.apply_tracker_secret_defaults(jira_base_url=secrets.jira_base_url)
     if binding.provider == "linear":
         from ..linear.client import LinearTracker
 

@@ -294,7 +294,13 @@ def _install_fake_linear(monkeypatch, fake: _FakeLinear) -> None:  # type: ignor
     def _factory(_api_key: str) -> _FakeLinear:
         return fake
 
+    def _for_binding(binding, _secrets, *, registry=None):  # type: ignore[no-untyped-def]
+        if registry is not None:
+            registry.register(binding.tracker_provider, binding.tracker_site, fake)
+        return fake
+
     monkeypatch.setattr("symphony.cli.Linear", _factory)
+    monkeypatch.setattr("symphony.cli.for_binding", _for_binding)
 
 
 def test_dispatch_creates_run_for_known_team_binding(

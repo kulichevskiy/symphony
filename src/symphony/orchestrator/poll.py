@@ -1239,7 +1239,7 @@ class Orchestrator:
     def __init__(
         self,
         config: Config,
-        linear: IssueTracker,
+        tracker_or_registry: IssueTracker | TrackerRegistry,
         conn: aiosqlite.Connection,
         *,
         runner: Runner | None = None,
@@ -1250,8 +1250,11 @@ class Orchestrator:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
-        self._trackers = TrackerRegistry()
-        _register_configured_trackers(self._trackers, config, linear)
+        if isinstance(tracker_or_registry, TrackerRegistry):
+            self._trackers = tracker_or_registry
+        else:
+            self._trackers = TrackerRegistry()
+            _register_configured_trackers(self._trackers, config, tracker_or_registry)
         self._conn = conn
         self._shutdown = asyncio.Event()
         self._gh: GitHub = gh if gh is not None else GitHub()

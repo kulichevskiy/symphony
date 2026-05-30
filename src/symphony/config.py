@@ -164,15 +164,23 @@ class RepoBinding(BaseModel):
     reconcile_enabled: bool = True
     states: TrackerStates = Field(validation_alias=AliasChoices("states", "linear_states"))
 
-    def _apply_tracker_context_defaults(self) -> None:
-        if self.provider == "jira" and not self.base_url:
-            raise ValueError("jira bindings require base_url")
+    def _apply_tracker_context_defaults(
+        self, *, jira_base_url: str | None = None
+    ) -> None:
         if not self.tracker_provider:
             self.tracker_provider = self.provider
-        if not self.tracker_site:
-            self.tracker_site = (
-                self.base_url if self.provider == "jira" and self.base_url else "default"
-            )
+        default_site = "default"
+        if self.provider == "jira":
+            default_site = (self.base_url or jira_base_url or "default").rstrip("/")
+        if not self.tracker_site or (
+            self.provider == "jira"
+            and self.tracker_site == "default"
+            and default_site != "default"
+        ):
+            self.tracker_site = default_site
+
+    def apply_tracker_secret_defaults(self, *, jira_base_url: str | None = None) -> None:
+        self._apply_tracker_context_defaults(jira_base_url=jira_base_url)
 
     @model_validator(mode="after")
     def _derive_tracker_context(self) -> Self:
@@ -392,6 +400,8 @@ class Config(BaseModel):
                 "jira_webhook_secret": secrets.jira_webhook_secret,
             }
         )
+        for binding in cfg.repos:
+            binding.apply_tracker_secret_defaults(jira_base_url=cfg.jira_base_url)
         # Expand ~ now so downstream code can assume absolute paths.
         cfg = cfg.model_copy(
             update={
