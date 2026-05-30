@@ -711,6 +711,132 @@ async def test_issue_webhook_provider_context_limits_unseen_lookup(tmp_path) -> 
 
 
 @pytest.mark.asyncio
+async def test_issue_webhook_provider_context_wins_over_default_storage_id(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+        scheduled_task = object()
+        orch._schedule_dispatch = MagicMock(return_value=scheduled_task)  # type: ignore[method-assign]  # noqa: SLF001
+
+        result = await orch.handle_linear_webhook(
+            {
+                "type": "Issue",
+                "action": "create",
+                "data": {"id": issue.id},
+            },
+            provider="linear-alt",
+        )
+
+        assert result.handled is True
+        default_tracker.lookup_issue.assert_not_awaited()
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        orch._schedule_dispatch.assert_called_once_with(secondary_binding, issue)  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_slash_polling_fetches_comments_with_tracker_issue_id_for_scoped_issue(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        default_tracker = AsyncMock()
+        default_tracker.comments_since = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.comments_since = AsyncMock(return_value=[])
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+        orch._review_poll_issue_ids[scoped_issue_id] = "review-run"  # noqa: SLF001
+        orch._review_poll_run_ids.add("review-run")  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        default_tracker.comments_since.assert_not_awaited()
+        secondary_tracker.comments_since.assert_awaited_once()
+        assert secondary_tracker.comments_since.await_args.args[0] == issue.id
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_binding_lookup_uses_stored_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 

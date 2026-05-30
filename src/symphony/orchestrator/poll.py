@@ -1352,11 +1352,11 @@ class Orchestrator:
     def linear(self) -> IssueTracker:
         return self.tracker(TrackerContext())
 
-    async def _stored_tracker_context_for_issue(
+    async def _stored_tracker_identity_for_issue(
         self, issue_id: str
-    ) -> TrackerContext | None:
+    ) -> tuple[str, TrackerContext] | None:
         cur = await self._conn.execute(
-            "SELECT provider, site FROM issues WHERE id = ?",
+            "SELECT tracker_issue_id, provider, site FROM issues WHERE id = ?",
             (issue_id,),
         )
         row = await cur.fetchone()
@@ -1366,10 +1366,48 @@ class Orchestrator:
         site = str(row["site"] or "")
         if not provider or not site:
             return None
-        return TrackerContext(provider=provider, site=site)
+        tracker_issue_id = str(row["tracker_issue_id"] or issue_id)
+        return tracker_issue_id, TrackerContext(provider=provider, site=site)
+
+    async def _stored_tracker_context_for_issue(
+        self, issue_id: str, *, provider: str | None = None
+    ) -> TrackerContext | None:
+        if provider is None:
+            identity = await self._stored_tracker_identity_for_issue(issue_id)
+            if identity is None:
+                return None
+            return identity[1]
+
+        cur = await self._conn.execute(
+            """
+            SELECT provider, site
+              FROM issues
+             WHERE provider = ?
+               AND (id = ? OR tracker_issue_id = ?)
+             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
+             LIMIT 1
+            """,
+            (provider, issue_id, issue_id, issue_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        row_provider = str(row["provider"] or "")
+        site = str(row["site"] or "")
+        if not row_provider or not site:
+            return None
+        return TrackerContext(provider=row_provider, site=site)
 
     async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
         return await self._stored_tracker_context_for_issue(issue_id) or TrackerContext()
+
+    async def _tracker_identity_for_issue(
+        self, issue_id: str
+    ) -> tuple[str, TrackerContext]:
+        return await self._stored_tracker_identity_for_issue(issue_id) or (
+            issue_id,
+            TrackerContext(),
+        )
 
     async def _tracker_for_issue_id(self, issue_id: str) -> IssueTracker:
         return self.tracker(await self._tracker_context_for_issue(issue_id))
@@ -1396,7 +1434,9 @@ class Orchestrator:
     async def _lookup_webhook_issue(
         self, issue_id: str, *, provider: str | None = None
     ) -> tuple[LinearIssue, TrackerContext]:
-        stored_ctx = await self._stored_tracker_context_for_issue(issue_id)
+        stored_ctx = await self._stored_tracker_context_for_issue(
+            issue_id, provider=provider
+        )
         if stored_ctx is not None:
             return await self.tracker(stored_ctx).lookup_issue(issue_id), stored_ctx
 
@@ -1852,9 +1892,13 @@ class Orchestrator:
             except Exception:  # noqa: BLE001 — keep loop alive
                 log.exception("failed to resolve cursor for issue %s", issue_id)
                 continue
-            tracker_ctx = await self._tracker_context_for_issue(issue_id)
+            tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
+                issue_id
+            )
             try:
-                comments = await self.tracker(tracker_ctx).comments_since(issue_id, after)
+                comments = await self.tracker(tracker_ctx).comments_since(
+                    tracker_issue_id, after
+                )
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
