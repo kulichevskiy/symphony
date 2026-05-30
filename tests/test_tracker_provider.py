@@ -155,12 +155,12 @@ async def test_warmup_registers_configured_tracker_context(tmp_path) -> None:  #
 
 
 @pytest.mark.asyncio
-async def test_issue_upsert_does_not_steal_existing_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
+async def test_issue_upsert_treats_tracker_context_as_identity(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
+        default_storage_id = await db.issues.upsert(
             conn,
             id="shared-issue-id",
             identifier="ENG-1",
@@ -169,7 +169,7 @@ async def test_issue_upsert_does_not_steal_existing_tracker_context(tmp_path) ->
             provider="linear",
             site="default",
         )
-        await db.issues.upsert(
+        secondary_storage_id = await db.issues.upsert(
             conn,
             id="shared-issue-id",
             identifier="ENG-2",
@@ -178,25 +178,49 @@ async def test_issue_upsert_does_not_steal_existing_tracker_context(tmp_path) ->
             provider="linear",
             site="secondary",
         )
+        await db.issues.upsert(
+            conn,
+            id="shared-issue-id",
+            identifier="ENG-2",
+            title="Secondary issue updated",
+            team_key="ENG",
+            provider="linear",
+            site="secondary",
+        )
 
         cur = await conn.execute(
             """
-            SELECT provider, site, identifier, title, team_key
+            SELECT id, tracker_issue_id, provider, site, identifier, title, team_key
               FROM issues
-             WHERE id = ?
+             WHERE tracker_issue_id = ?
+             ORDER BY site ASC
             """,
             ("shared-issue-id",),
         )
-        row = await cur.fetchone()
+        rows = await cur.fetchall()
 
-        assert row is not None
-        assert dict(row) == {
-            "provider": "linear",
-            "site": "default",
-            "identifier": "ENG-1",
-            "title": "Default issue",
-            "team_key": "ENG",
-        }
+        assert default_storage_id == "shared-issue-id"
+        assert secondary_storage_id != default_storage_id
+        assert [dict(row) for row in rows] == [
+            {
+                "id": "shared-issue-id",
+                "tracker_issue_id": "shared-issue-id",
+                "provider": "linear",
+                "site": "default",
+                "identifier": "ENG-1",
+                "title": "Default issue",
+                "team_key": "ENG",
+            },
+            {
+                "id": secondary_storage_id,
+                "tracker_issue_id": "shared-issue-id",
+                "provider": "linear",
+                "site": "secondary",
+                "identifier": "ENG-2",
+                "title": "Secondary issue updated",
+                "team_key": "ENG",
+            },
+        ]
     finally:
         await conn.close()
 

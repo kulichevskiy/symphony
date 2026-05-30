@@ -14,12 +14,13 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 
 CREATE TABLE IF NOT EXISTS issues (
-    id          TEXT PRIMARY KEY,
-    provider    TEXT NOT NULL DEFAULT 'linear',
-    site        TEXT NOT NULL DEFAULT 'default',
-    identifier  TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    team_key    TEXT NOT NULL
+    id               TEXT PRIMARY KEY,
+    tracker_issue_id TEXT NOT NULL,
+    provider         TEXT NOT NULL DEFAULT 'linear',
+    site             TEXT NOT NULL DEFAULT 'default',
+    identifier       TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    team_key         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS runs (

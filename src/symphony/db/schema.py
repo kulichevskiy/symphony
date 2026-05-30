@@ -35,6 +35,13 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     """Idempotent column adds for tables that pre-existed prior schema bumps."""
     cur = await conn.execute("PRAGMA table_info(issues)")
     issue_cols = {row[1] for row in await cur.fetchall()}
+    if "tracker_issue_id" not in issue_cols:
+        await conn.execute(
+            "ALTER TABLE issues ADD COLUMN tracker_issue_id TEXT NOT NULL DEFAULT ''"
+        )
+        await conn.execute(
+            "UPDATE issues SET tracker_issue_id = id WHERE tracker_issue_id = ''"
+        )
     if "provider" not in issue_cols:
         await conn.execute(
             "ALTER TABLE issues ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
@@ -43,6 +50,12 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE issues ADD COLUMN site TEXT NOT NULL DEFAULT 'default'"
         )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_tracker_identity
+        ON issues(provider, site, tracker_issue_id)
+        """
+    )
 
     cur = await conn.execute("PRAGMA table_info(comment_cursors)")
     cols = {row[1] for row in await cur.fetchall()}
