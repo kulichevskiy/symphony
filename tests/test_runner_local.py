@@ -8,6 +8,7 @@ parsing is exercised in iteration 4+ once the prompt + parser exist.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -40,13 +41,13 @@ async def test_runner_drains_tail_output_after_process_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_readline = asyncio.StreamReader.readline
+    original_read = asyncio.StreamReader.read
 
-    async def delayed_readline(self: asyncio.StreamReader) -> bytes:
+    async def delayed_read(self: asyncio.StreamReader, n: int = -1) -> bytes:
         await asyncio.sleep(0.4)
-        return await original_readline(self)
+        return await original_read(self, n)
 
-    monkeypatch.setattr(asyncio.StreamReader, "readline", delayed_readline)
+    monkeypatch.setattr(asyncio.StreamReader, "read", delayed_read)
     runner = LocalRunner()
     spec = RunnerSpec(
         run_id="r-tail",
@@ -138,6 +139,51 @@ async def test_runner_does_not_stall_while_command_in_flight(tmp_path: Path) -> 
     events = await asyncio.wait_for(_collect_events(runner, spec), timeout=15)
     kinds = [e.kind for e in events]
     assert "stall_timeout" not in kinds
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_delivers_large_command_completion_line(tmp_path: Path) -> None:
+    script = """
+import json
+import sys
+import time
+
+started = {"type": "item.started", "item": {"id": "c-large", "type": "command_execution"}}
+completed = {
+    "type": "item.completed",
+    "item": {
+        "id": "c-large",
+        "type": "command_execution",
+        "aggregated_output": "x" * (17 * 1024 * 1024),
+    },
+}
+for event in (started, completed):
+    sys.stdout.write(json.dumps(event) + "\\n")
+    sys.stdout.flush()
+time.sleep(4.0)
+"""
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-large-completion",
+        workspace_path=tmp_path,
+        command=[sys.executable, "-c", script],
+        stall_secs=5,
+        command_secs=3,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=20)
+
+    stdout_lines = [e.line for e in events if e.kind == "stdout"]
+    completed_lines = [
+        line
+        for line in stdout_lines
+        if (payload := json.loads(line)).get("type") == "item.completed"
+        and payload.get("item", {}).get("id") == "c-large"
+    ]
+    assert completed_lines
+    assert len(completed_lines[0].encode()) > 16 * 1024 * 1024
+    assert "stall_timeout" not in [e.kind for e in events]
     exits = [e for e in events if e.kind == "exit"]
     assert exits and exits[0].returncode == 0
 

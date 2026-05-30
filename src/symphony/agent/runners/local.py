@@ -23,6 +23,8 @@ from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
 _WATCHDOG_POLL_SECS = 1.0
+_SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024
+_STREAM_READ_CHUNK_BYTES = 64 * 1024
 
 
 class _Heartbeat:
@@ -54,7 +56,8 @@ class _Heartbeat:
         kind = event.get("type")
         if kind not in ("item.started", "item.completed"):
             return
-        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        raw_item = event.get("item")
+        item: dict[str, object] = raw_item if isinstance(raw_item, dict) else {}
         item_type = item.get("type") or item.get("item_type") or event.get("item_type")
         if item_type != "command_execution":
             return
@@ -103,6 +106,9 @@ class LocalRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL,
+                # Buffer watermark only. The pump below frames JSONL itself
+                # so one codex line may exceed this without being dropped.
+                limit=_SUBPROCESS_BUFFER_LIMIT,
             )
         except (OSError, FileNotFoundError) as e:
             yield RunnerEvent(kind="spawn_failed", error=f"{type(e).__name__}: {e}")
@@ -122,18 +128,37 @@ class LocalRunner:
         async def pump(stream: asyncio.StreamReader | None, kind: str) -> None:
             if stream is None:
                 return
-            while True:
-                try:
-                    raw = await stream.readline()
-                except Exception:  # noqa: BLE001 — pump must not crash the run
-                    break
-                if not raw:
-                    break
-                line = raw.decode(errors="replace").rstrip("\n")
+            pending = bytearray()
+
+            async def publish(raw_line: bytes) -> None:
+                line = raw_line.decode(errors="replace")
                 hb.last_line = loop.time()
                 if kind == "stdout":
                     hb.observe(line)
                 await events.put(RunnerEvent(kind=kind, line=line))  # type: ignore[arg-type]
+
+            while True:
+                try:
+                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+                except Exception:  # noqa: BLE001 — pump must not crash the run
+                    break
+                if not chunk:
+                    break
+                if b"\n" not in chunk:
+                    pending.extend(chunk)
+                    continue
+                parts = chunk.split(b"\n")
+                if pending:
+                    pending.extend(parts[0])
+                    await publish(bytes(pending))
+                    pending.clear()
+                else:
+                    await publish(parts[0])
+                for raw_line in parts[1:-1]:
+                    await publish(raw_line)
+                pending.extend(parts[-1])
+            if pending:
+                await publish(bytes(pending))
 
         async def watchdog() -> None:
             # Poll-based: a run is "alive" if the agent printed a line within
