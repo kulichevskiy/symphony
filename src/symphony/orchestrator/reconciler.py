@@ -830,7 +830,13 @@ def _label_from_binding_key(binding_key: str) -> str | None:
 
 def _binding_storage_key(binding: RepoBinding) -> str:
     return json.dumps(
-        (binding.linear_team_key, binding.github_repo, binding.issue_label or ""),
+        (
+            binding.linear_team_key,
+            binding.github_repo,
+            binding.issue_label or "",
+            binding.tracker_provider,
+            binding.tracker_site,
+        ),
         separators=(",", ":"),
     )
 

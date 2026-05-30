@@ -156,7 +156,7 @@ from .reconciler import Reconciler
 log = logging.getLogger(__name__)
 
 PushFn = Callable[[Path, str], Awaitable[None]]
-BindingKey = tuple[str, str, str]
+BindingKey = tuple[str, str, str, str, str]
 CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
@@ -502,6 +502,8 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
         binding.linear_team_key,
         binding.github_repo,
         binding.issue_label or "",
+        binding.tracker_provider,
+        binding.tracker_site,
     )
 
 

@@ -53,6 +53,26 @@ def test_orchestrator_and_reconciler_do_not_store_linear_client_attrs() -> None:
     assert "self._linear" not in inspect.getsource(Reconciler)
 
 
+def test_binding_identity_includes_tracker_context() -> None:
+    from symphony.orchestrator import poll as poll_module
+    from symphony.orchestrator import reconciler as reconciler_module
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+
+    assert poll_module._binding_key(default_binding) != poll_module._binding_key(  # noqa: SLF001
+        secondary_binding
+    )
+    assert poll_module._binding_storage_key(  # noqa: SLF001
+        default_binding
+    ) != poll_module._binding_storage_key(secondary_binding)  # noqa: SLF001
+    assert reconciler_module._binding_storage_key(  # noqa: SLF001
+        default_binding
+    ) != reconciler_module._binding_storage_key(secondary_binding)  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_warmup_caches_states_by_provider_site_and_team(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
