@@ -245,6 +245,91 @@ async def test_runner_recovers_when_stream_reports_oversized_line(
 
 
 @pytest.mark.asyncio
+async def test_runner_resets_command_heartbeat_for_skipped_oversized_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = {
+        "type": "item.started",
+        "item": {"id": "c-overrun", "type": "command_execution"},
+    }
+    completed = {
+        "type": "item.completed",
+        "item": {
+            "id": "c-overrun",
+            "type": "command_execution",
+            "aggregated_output": "x" * (4 * 1024 * 1024 + 1),
+        },
+    }
+
+    class _CommandCompletionOverrunStream:
+        def __init__(self) -> None:
+            self._payload = json.dumps(completed).encode() + b"\nafter\n"
+            self._offset = 0
+            self._read_started = False
+            self._raised = False
+
+        async def read(self, n: int = -1) -> bytes:
+            if not self._read_started:
+                self._read_started = True
+                return json.dumps(started).encode() + b"\n"
+            if not self._raised:
+                self._raised = True
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+            if self._offset >= len(self._payload):
+                return b""
+            if n < 0:
+                n = len(self._payload) - self._offset
+            chunk = self._payload[self._offset : self._offset + n]
+            self._offset += len(chunk)
+            return chunk
+
+    class _FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = _CommandCompletionOverrunStream()
+            self.stderr = None
+            self.pid = 123456
+            self.returncode: int | None = None
+            self._wait_task: asyncio.Task[int] | None = None
+
+        async def wait(self) -> int:
+            if self._wait_task is None:
+                self._wait_task = asyncio.create_task(self._complete())
+            return await self._wait_task
+
+        async def _complete(self) -> int:
+            await asyncio.sleep(1.4)
+            self.returncode = 0
+            return 0
+
+    async def fake_create_subprocess_exec(*_args: object, **_kwargs: object) -> _FakeProcess:
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr("symphony.agent.runners.local._pid_alive", lambda _pid: True)
+    monkeypatch.setattr("symphony.agent.runners.local._terminate_process_group", lambda _pid: None)
+
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-overrun-completion",
+        workspace_path=tmp_path,
+        command=["fake-agent"],
+        stall_secs=10,
+        command_secs=0.2,
+    )
+
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=10)
+
+    assert [e.line for e in events if e.kind == "stdout"] == [
+        json.dumps(started),
+        "after",
+    ]
+    assert "stall_timeout" not in [e.kind for e in events]
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+
+
+@pytest.mark.asyncio
 async def test_runner_recognises_legacy_command_execution_shape(tmp_path: Path) -> None:
     # Older codex builds emit `item_type` (on the item or on the event) instead
     # of `item.type`. activity.parse_codex_activity_line already accepts that;

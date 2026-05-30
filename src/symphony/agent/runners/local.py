@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import suppress
 
@@ -26,6 +27,8 @@ _STREAM_DRAIN_SECS = 2.0
 _WATCHDOG_POLL_SECS = 1.0
 _SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024
 _STREAM_READ_CHUNK_BYTES = 64 * 1024
+_OVERSIZED_LINE_PREFIX_BYTES = 64 * 1024
+_JSON_ID_RE = re.compile(r'"(?:id|item_id)"\s*:\s*"([^"]+)"')
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +74,21 @@ class _Heartbeat:
             self._cmd_starts.setdefault(item_id, self.last_line)
         else:  # item.completed
             self._cmd_starts.pop(item_id, None)
+
+    def observe_oversized_stdout(self, prefix: bytes) -> None:
+        """Best-effort command completion tracking for a skipped stdout line."""
+        if not self._cmd_starts:
+            return
+        text = prefix.decode(errors="replace")
+        if '"item.completed"' not in text or '"command_execution"' not in text:
+            return
+        matched = False
+        for item_id in _JSON_ID_RE.findall(text):
+            if item_id in self._cmd_starts:
+                self._cmd_starts.pop(item_id, None)
+                matched = True
+        if not matched and len(self._cmd_starts) == 1:
+            self._cmd_starts.clear()
 
     def deadline(self, now: float, stall_secs: float, command_secs: float) -> float:
         """Effective time by which fresh activity must have occurred.
@@ -155,16 +173,25 @@ class LocalRunner:
                     await publish(raw_line)
                 pending.extend(parts[-1])
 
-            async def drain_oversized_line() -> bytes | None:
+            async def drain_oversized_line() -> tuple[bytes | None, bytes]:
                 pending.clear()
+                prefix = bytearray()
+
+                def remember_prefix(data: bytes) -> None:
+                    remaining = _OVERSIZED_LINE_PREFIX_BYTES - len(prefix)
+                    if remaining > 0:
+                        prefix.extend(data[:remaining])
+
                 while True:
                     chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
                     if not chunk:
-                        return None
+                        return None, bytes(prefix)
                     newline_at = chunk.find(b"\n")
                     if newline_at < 0:
+                        remember_prefix(chunk)
                         continue
-                    return chunk[newline_at + 1 :]
+                    remember_prefix(chunk[:newline_at])
+                    return chunk[newline_at + 1 :], bytes(prefix)
 
             while True:
                 try:
@@ -180,9 +207,13 @@ class LocalRunner:
                         e,
                     )
                     try:
-                        remainder = await drain_oversized_line()
+                        remainder, skipped_prefix = await drain_oversized_line()
                     except Exception:  # noqa: BLE001 — stream is no longer recoverable
                         break
+                    if skipped_prefix:
+                        hb.last_line = loop.time()
+                        if kind == "stdout":
+                            hb.observe_oversized_stdout(skipped_prefix)
                     if remainder is None:
                         break
                     if remainder:
