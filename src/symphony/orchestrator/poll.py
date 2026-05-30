@@ -1375,12 +1375,12 @@ class Orchestrator:
         return self.tracker(await self._tracker_context_for_issue(issue_id))
 
     def _configured_tracker_contexts(
-        self, *, provider: str = DEFAULT_PROVIDER
+        self, *, provider: str | None = None
     ) -> list[TrackerContext]:
         contexts: list[TrackerContext] = []
         seen: set[TrackerContext] = set()
         for binding in self.config.repos:
-            if binding.tracker_provider != provider:
+            if provider is not None and binding.tracker_provider != provider:
                 continue
             ctx = _tracker_context_for_binding(binding)
             if ctx in seen:
@@ -1388,11 +1388,13 @@ class Orchestrator:
             seen.add(ctx)
             contexts.append(ctx)
         if not contexts:
-            contexts.append(TrackerContext(provider=provider, site=DEFAULT_SITE))
+            contexts.append(
+                TrackerContext(provider=provider or DEFAULT_PROVIDER, site=DEFAULT_SITE)
+            )
         return contexts
 
     async def _lookup_webhook_issue(
-        self, issue_id: str, *, provider: str = DEFAULT_PROVIDER
+        self, issue_id: str, *, provider: str | None = None
     ) -> tuple[LinearIssue, TrackerContext]:
         stored_ctx = await self._stored_tracker_context_for_issue(issue_id)
         if stored_ctx is not None:
@@ -1408,7 +1410,7 @@ class Orchestrator:
                 not_found = exc
         if not_found is not None:
             raise not_found
-        ctx = TrackerContext(provider=provider, site=DEFAULT_SITE)
+        ctx = TrackerContext(provider=provider or DEFAULT_PROVIDER, site=DEFAULT_SITE)
         return await self.tracker(ctx).lookup_issue(issue_id), ctx
 
     async def warmup(self) -> None:
@@ -1614,7 +1616,7 @@ class Orchestrator:
         return scheduled
 
     async def handle_linear_webhook(
-        self, payload: dict[str, Any]
+        self, payload: dict[str, Any], *, provider: str | None = None
     ) -> WebhookDispatchResult:
         """Handle a verified Linear webhook payload.
 
@@ -1627,7 +1629,7 @@ class Orchestrator:
         if event_type == "comment":
             return await self._handle_webhook_comment(payload)
         if event_type == "issue":
-            return await self._handle_webhook_issue(payload)
+            return await self._handle_webhook_issue(payload, provider=provider)
         return WebhookDispatchResult(
             kind=event_type or "unknown",
             handled=False,
@@ -1724,7 +1726,7 @@ class Orchestrator:
         return WebhookDispatchResult(kind="comment", handled=True)
 
     async def _handle_webhook_issue(
-        self, payload: Mapping[str, Any]
+        self, payload: Mapping[str, Any], *, provider: str | None = None
     ) -> WebhookDispatchResult:
         action = str(payload.get("action") or "").casefold()
         if action and action not in {"create", "update"}:
@@ -1753,7 +1755,7 @@ class Orchestrator:
         old_state_id, old_state_name, new_state_id, new_state_name = (
             _linear_issue_state_transition(payload)
         )
-        issue, tracker_ctx = await self._lookup_webhook_issue(issue_id)
+        issue, tracker_ctx = await self._lookup_webhook_issue(issue_id, provider=provider)
         revived = False
         if state_changed:
             revived = (
@@ -2712,10 +2714,24 @@ class Orchestrator:
     async def _binding_for_review_issue_id(
         self, issue_id: str, *, state: db.review_state.ReviewState
     ) -> RepoBinding | None:
-        cur = await self._conn.execute("SELECT team_key FROM issues WHERE id = ?", (issue_id,))
+        cur = await self._conn.execute(
+            "SELECT provider, site, team_key FROM issues WHERE id = ?",
+            (issue_id,),
+        )
         row = await cur.fetchone()
         team_key = str(row["team_key"]) if row is not None else ""
+        tracker_ctx: TrackerContext | None = None
+        if row is not None:
+            provider = str(row["provider"] or "")
+            site = str(row["site"] or "")
+            if provider and site:
+                tracker_ctx = TrackerContext(provider=provider, site=site)
         for binding in self.config.repos:
+            if (
+                tracker_ctx is not None
+                and _tracker_context_for_binding(binding) != tracker_ctx
+            ):
+                continue
             if team_key and binding.linear_team_key != team_key:
                 continue
             if state.github_repo and binding.github_repo != state.github_repo:
