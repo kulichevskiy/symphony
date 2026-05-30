@@ -119,6 +119,16 @@ class _BackoffRequested(RuntimeError):
         self.error = error
 
 
+def _register_configured_trackers(
+    registry: TrackerRegistry,
+    config: Config,
+    tracker: IssueTracker,
+) -> None:
+    registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
+    for binding in config.repos:
+        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+
+
 def reconcile_dry_run_enabled(env: Mapping[str, str] | None = None) -> bool:
     value = (env or os.environ).get("SYMPHONY_RECONCILE_DRYRUN", "")
     return value.strip().casefold() in {"1", "true", "yes", "on"}
@@ -183,11 +193,7 @@ class Reconciler:
             self._trackers = tracker_or_registry
         else:
             self._trackers = TrackerRegistry()
-            self._trackers.register(
-                DEFAULT_PROVIDER,
-                DEFAULT_SITE,
-                tracker_or_registry,
-            )
+            _register_configured_trackers(self._trackers, config, tracker_or_registry)
         self._gh = gh
         self._clock = clock
         self._backoff_until: datetime | None = None

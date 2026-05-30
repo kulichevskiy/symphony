@@ -9,7 +9,7 @@ from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import Linear, LinearError
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import Reconciler
-from symphony.tracker import Issue
+from symphony.tracker import Issue, TrackerContext
 
 
 def _binding(team_key: str = "ENG") -> RepoBinding:
@@ -71,6 +71,22 @@ def test_binding_identity_includes_tracker_context() -> None:
     assert reconciler_module._binding_storage_key(  # noqa: SLF001
         default_binding
     ) != reconciler_module._binding_storage_key(secondary_binding)  # noqa: SLF001
+
+
+def test_reconciler_registers_configured_tracker_contexts() -> None:
+    binding = _binding()
+    binding.tracker_site = "secondary"
+    tracker = MagicMock()
+
+    reconciler = Reconciler(
+        Config(repos=[binding]),
+        MagicMock(),
+        tracker,
+        MagicMock(),
+    )
+
+    assert reconciler.tracker(TrackerContext()) is tracker
+    assert reconciler.tracker(TrackerContext(provider="linear", site="secondary")) is tracker
 
 
 @pytest.mark.asyncio
