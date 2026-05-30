@@ -27,6 +27,7 @@ class OperatorWait:
     issue_id: str
     run_id: str
     kind: str
+    provider: str
     tracker_provider: str
     tracker_site: str
     linear_team_key: str
@@ -45,16 +46,19 @@ async def upsert(
     github_repo: str,
     issue_label: str,
     created_at: str,
+    provider: str | None = None,
     tracker_provider: str = "linear",
     tracker_site: str = "default",
 ) -> None:
     old = await get(conn, issue_id)
+    effective_provider = provider or tracker_provider
     await conn.execute(
         """
         INSERT INTO operator_waits (
             issue_id,
             run_id,
             kind,
+            provider,
             tracker_provider,
             tracker_site,
             linear_team_key,
@@ -62,10 +66,11 @@ async def upsert(
             issue_label,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id) DO UPDATE SET
             run_id = excluded.run_id,
             kind = excluded.kind,
+            provider = excluded.provider,
             tracker_provider = excluded.tracker_provider,
             tracker_site = excluded.tracker_site,
             linear_team_key = excluded.linear_team_key,
@@ -77,6 +82,7 @@ async def upsert(
             issue_id,
             run_id,
             kind,
+            effective_provider,
             tracker_provider,
             tracker_site,
             linear_team_key,
@@ -106,6 +112,7 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
             issue_id,
             run_id,
             kind,
+            provider,
             tracker_provider,
             tracker_site,
             linear_team_key,
@@ -122,6 +129,7 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
             issue_id=str(row["issue_id"]),
             run_id=str(row["run_id"]),
             kind=str(row["kind"]),
+            provider=str(row["provider"]),
             tracker_provider=str(row["tracker_provider"]),
             tracker_site=str(row["tracker_site"]),
             linear_team_key=str(row["linear_team_key"]),
@@ -140,6 +148,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
             issue_id,
             run_id,
             kind,
+            provider,
             tracker_provider,
             tracker_site,
             linear_team_key,
@@ -158,6 +167,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
         issue_id=str(row["issue_id"]),
         run_id=str(row["run_id"]),
         kind=str(row["kind"]),
+        provider=str(row["provider"]),
         tracker_provider=str(row["tracker_provider"]),
         tracker_site=str(row["tracker_site"]),
         linear_team_key=str(row["linear_team_key"]),
@@ -176,6 +186,7 @@ async def get_by_run_id(
             issue_id,
             run_id,
             kind,
+            provider,
             tracker_provider,
             tracker_site,
             linear_team_key,
@@ -194,6 +205,7 @@ async def get_by_run_id(
         issue_id=str(row["issue_id"]),
         run_id=str(row["run_id"]),
         kind=str(row["kind"]),
+        provider=str(row["provider"]),
         tracker_provider=str(row["tracker_provider"]),
         tracker_site=str(row["tracker_site"]),
         linear_team_key=str(row["linear_team_key"]),

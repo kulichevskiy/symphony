@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import Config, LinearStates, RepoBinding, Secrets, TrackerStates
 from symphony.linear.client import Linear, LinearError
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
@@ -66,6 +66,45 @@ def test_linear_tracker_implements_issue_tracker_protocol() -> None:
         import asyncio
 
         asyncio.run(linear.aclose())
+
+
+def test_for_binding_builds_linear_or_jira_tracker(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from symphony.jira.client import JiraTracker
+    from symphony.linear.client import LinearTracker
+    from symphony.tracker import TrackerRegistry, for_binding
+
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    secrets = Secrets()
+    linear_binding = _binding()
+    jira_binding = RepoBinding(
+        provider="jira",
+        project_key="SYM",
+        base_url="https://jira.example.test",
+        github_repo="org/repo",
+        states=TrackerStates(ready="To Do", code_review="In Review"),
+    )
+    registry = TrackerRegistry()
+
+    linear = for_binding(linear_binding, secrets, registry=registry)
+    jira = for_binding(jira_binding, secrets, registry=registry)
+    try:
+        assert isinstance(linear, LinearTracker)
+        assert isinstance(jira, JiraTracker)
+        assert registry.resolve(TrackerContext(provider="linear", site="default")) is linear
+        assert (
+            registry.resolve(
+                TrackerContext(provider="jira", site="https://jira.example.test")
+            )
+            is jira
+        )
+    finally:
+        import asyncio
+
+        asyncio.run(linear.aclose())
+        asyncio.run(jira.aclose())
 
 
 def test_orchestrator_and_reconciler_do_not_store_linear_client_attrs() -> None:

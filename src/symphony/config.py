@@ -13,9 +13,10 @@ provides at boot.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -51,10 +52,10 @@ class AcceptanceConfig(BaseModel):
     time_cap_minutes: float = Field(default=15.0, gt=0)
 
 
-class LinearStates(BaseModel):
-    """Workflow state names per role.
+class TrackerStates(BaseModel):
+    """Issue-tracker workflow state names per role.
 
-    Names must match the Linear team's workflow exactly. Symphony does not
+    Names must match the tracker project's workflow exactly. Symphony does not
     create or rename states. `ready` has no default — every binding must
     declare which state the orchestrator picks issues up from, since teams
     rename or replace it (Backlog, Todo, Up Next, …).
@@ -89,19 +90,26 @@ class LinearStates(BaseModel):
         return data
 
 
-class RepoBinding(BaseModel):
-    """One (Linear team, GitHub repo) pairing.
+LinearStates = TrackerStates
 
-    Symphony scans `linear_team_key`'s issues for ones in the configured
+
+class RepoBinding(BaseModel):
+    """One issue-tracker project to GitHub repo pairing.
+
+    Symphony scans `project_key`'s issues for ones in the configured
     "ready" state with `issue_label` (if set), and dispatches them to
     `github_repo`. Per-repo `max_concurrent` is enforced in addition to the
     global cap so a single noisy team can't starve others.
     """
 
-    linear_team_key: str
+    provider: Literal["linear", "jira"] = "linear"
+    project_key: str = Field(
+        validation_alias=AliasChoices("project_key", "linear_team_key")
+    )
     github_repo: str
-    tracker_provider: str = "linear"
-    tracker_site: str = "default"
+    tracker_provider: str = ""
+    tracker_site: str = ""
+    base_url: str | None = None
     agent: Literal["claude", "codex"] = "claude"
     codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None
@@ -154,7 +162,52 @@ class RepoBinding(BaseModel):
     webhook_enabled: bool = True
     webhook_secret: str | None = None
     reconcile_enabled: bool = True
-    linear_states: LinearStates
+    states: TrackerStates = Field(validation_alias=AliasChoices("states", "linear_states"))
+
+    def _apply_tracker_context_defaults(self) -> None:
+        if self.provider == "jira" and not self.base_url:
+            raise ValueError("jira bindings require base_url")
+        if not self.tracker_provider:
+            self.tracker_provider = self.provider
+        if not self.tracker_site:
+            self.tracker_site = (
+                self.base_url if self.provider == "jira" and self.base_url else "default"
+            )
+
+    @model_validator(mode="after")
+    def _derive_tracker_context(self) -> Self:
+        self._apply_tracker_context_defaults()
+        return self
+
+    @property
+    def linear_team_key(self) -> str:
+        return self.project_key
+
+    @linear_team_key.setter
+    def linear_team_key(self, value: str) -> None:
+        self.project_key = value
+
+    @property
+    def linear_states(self) -> TrackerStates:
+        return self.states
+
+    @linear_states.setter
+    def linear_states(self, value: TrackerStates) -> None:
+        self.states = value
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if update is not None:
+            normalized = dict(update)
+            if "linear_team_key" in normalized and "project_key" not in normalized:
+                normalized["project_key"] = normalized.pop("linear_team_key")
+            if "linear_states" in normalized and "states" not in normalized:
+                normalized["states"] = normalized.pop("linear_states")
+            update = normalized
+        copied = super().model_copy(update=update, deep=deep)
+        copied._apply_tracker_context_defaults()
+        return copied
 
     @field_validator("codex_model")
     @classmethod
@@ -221,6 +274,10 @@ class Secrets(BaseSettings):
     github_webhook_secret: str = Field(
         default="", validation_alias="GITHUB_WEBHOOK_SECRET"
     )
+    jira_base_url: str = Field(default="", validation_alias="JIRA_BASE_URL")
+    jira_email: str = Field(default="", validation_alias="JIRA_EMAIL")
+    jira_api_token: str = Field(default="", validation_alias="JIRA_API_TOKEN")
+    jira_webhook_secret: str = Field(default="", validation_alias="JIRA_WEBHOOK_SECRET")
 
 
 class UIStatusThresholds(BaseModel):
@@ -314,6 +371,10 @@ class Config(BaseModel):
     linear_api_key: str = ""
     linear_webhook_secret: str = ""
     github_webhook_secret: str = ""
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = ""
+    jira_webhook_secret: str = ""
 
     @classmethod
     def load(cls, path: Path) -> Config:
@@ -325,6 +386,10 @@ class Config(BaseModel):
                 "linear_api_key": secrets.linear_api_key,
                 "linear_webhook_secret": secrets.linear_webhook_secret,
                 "github_webhook_secret": secrets.github_webhook_secret,
+                "jira_base_url": secrets.jira_base_url,
+                "jira_email": secrets.jira_email,
+                "jira_api_token": secrets.jira_api_token,
+                "jira_webhook_secret": secrets.jira_webhook_secret,
             }
         )
         # Expand ~ now so downstream code can assume absolute paths.

@@ -76,6 +76,7 @@ async def _preserve_pidless_review_retry_path(
         github_repo=state.github_repo,
         issue_label=state.issue_label,
         created_at=created_at,
+        provider=str(row["provider"]),
         tracker_provider=str(row["provider"]),
         tracker_site=str(row["site"]),
     )

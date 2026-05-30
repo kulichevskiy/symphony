@@ -6,7 +6,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from ..config import RepoBinding, Secrets
 
 DEFAULT_PROVIDER = "linear"
 DEFAULT_SITE = "default"
@@ -103,3 +106,31 @@ class TrackerRegistry:
             return self._trackers[key]
         except KeyError as exc:
             raise KeyError(f"no issue tracker registered for {key}") from exc
+
+
+def for_binding(
+    binding: RepoBinding,
+    secrets: Secrets,
+    *,
+    registry: TrackerRegistry | None = None,
+) -> IssueTracker:
+    """Build the concrete tracker for a binding and optionally register it."""
+    if binding.provider == "linear":
+        from ..linear.client import LinearTracker
+
+        tracker: IssueTracker = LinearTracker(secrets.linear_api_key)
+    elif binding.provider == "jira":
+        from ..jira.client import JiraTracker
+
+        tracker = JiraTracker(
+            base_url=binding.base_url or secrets.jira_base_url,
+            email=secrets.jira_email,
+            api_token=secrets.jira_api_token,
+            webhook_secret=secrets.jira_webhook_secret,
+        )
+    else:
+        raise ValueError(f"unsupported issue tracker provider {binding.provider!r}")
+
+    if registry is not None:
+        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+    return tracker

@@ -2636,6 +2636,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -2893,6 +2894,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -2955,6 +2957,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -2974,6 +2977,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -6142,6 +6146,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -6161,6 +6166,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -10182,6 +10188,7 @@ class Orchestrator:
                     github_repo=binding.github_repo,
                     issue_label=binding.issue_label or "",
                     created_at=datetime.now(UTC).isoformat(),
+                    provider=binding.provider,
                     tracker_provider=binding.tracker_provider,
                     tracker_site=binding.tracker_site,
                 )
