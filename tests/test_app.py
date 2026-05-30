@@ -37,7 +37,7 @@ def _dist(tmp_path: Path) -> Path:
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text(
-        "<!doctype html><html><body>symphonyd UI v0</body></html>"
+        "<!doctype html><html><body>symphony UI v0</body></html>"
     )
     return dist
 
@@ -241,7 +241,7 @@ async def test_ui_mount_serves_index_and_spa_fallback(tmp_path: Path) -> None:
 
     assert root.status_code == 200
     assert nested.status_code == 200
-    assert "symphonyd UI v0" in root.text
+    assert "symphony UI v0" in root.text
     assert nested.text == root.text
 
 

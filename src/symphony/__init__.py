@@ -1,4 +1,4 @@
-"""symphonyd — headless Symphony port.
+"""symphony — headless Symphony port.
 
 See ../README.md for status and ../../docs/python-port-research.md for design.
 """

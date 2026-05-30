@@ -17,15 +17,15 @@ The fix is to pin the writable worktree per invocation. For the current
 worktree-cwd run, Symphony resolves:
 
 ```text
-/Users/ak/Code/symphonyd/workspaces/kulichevskiy_ssymphonyd/sym-26
+/Users/ak/Code/symphony/workspaces/kulichevskiy_ssymphony/sym-26
 ```
 
 and passes this Codex config override:
 
 ```text
-permissions.symphony-git.filesystem.":project_roots"."/Users/ak/Code/symphonyd/workspaces/kulichevskiy_ssymphonyd/sym-26"="write"
+permissions.symphony-git.filesystem.":project_roots"."/Users/ak/Code/symphony/workspaces/kulichevskiy_ssymphony/sym-26"="write"
 ```
 
 At runtime the absolute value is derived from `workspace_path.resolve()`, so a
-VIB worktree such as `/Users/ak/Code/symphonyd/workspaces/vibecamp-org_svibecamp/vib-94`
+VIB worktree such as `/Users/ak/Code/symphony/workspaces/vibecamp-org_svibecamp/vib-94`
 gets its own absolute `:project_roots` write entry instead of relying on `.`.

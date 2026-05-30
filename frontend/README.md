@@ -1,4 +1,4 @@
-# symphonyd frontend
+# symphony frontend
 
 Minimal Vite + React 19 shell for the daemon UI. Production builds are served by
 FastAPI from `frontend/dist/` at `/ui/`.
