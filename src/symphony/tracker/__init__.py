@@ -128,6 +128,12 @@ def for_binding(
             email=secrets.jira_email,
             api_token=secrets.jira_api_token,
             webhook_secret=secrets.jira_webhook_secret,
+            project_key=binding.project_key,
+            states={
+                str(state_name): str(state_name)
+                for state_name in binding.states.model_dump().values()
+                if state_name
+            },
         )
     else:
         raise ValueError(f"unsupported issue tracker provider {binding.provider!r}")

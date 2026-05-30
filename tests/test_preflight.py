@@ -34,7 +34,13 @@ def _install_fake(monkeypatch, fake: _FakeLinear) -> None:  # type: ignore[no-un
     def _factory(_api_key: str) -> _FakeLinear:
         return fake
 
+    def _for_binding(binding, _secrets, *, registry=None):  # type: ignore[no-untyped-def]
+        if registry is not None:
+            registry.register(binding.tracker_provider, binding.tracker_site, fake)
+        return fake
+
     monkeypatch.setattr("symphony.cli.Linear", _factory)
+    monkeypatch.setattr("symphony.cli.for_binding", _for_binding)
 
 
 def _isolate_codex_home(tmp_path: Path, monkeypatch) -> Path:  # type: ignore[no-untyped-def]
@@ -85,6 +91,35 @@ def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     assert result.exit_code == 0, result.output
     assert not (codex_home / "config.toml").exists()
     assert "codex permissions profile not required" in result.output
+
+
+def test_preflight_allows_jira_binding_without_linear_key(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        """
+repos:
+  - provider: jira
+    project_key: SYM
+    base_url: https://jira.example.test
+    github_repo: org/api-svc
+    states:
+      ready: To Do
+      code_review: In Review
+"""
+    )
+
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert "jira projects visible to this key: ['SYM']" in result.output
+    assert "SYM → org/api-svc: states ok" in result.output
 
 
 def test_preflight_creates_codex_profile_when_binding_uses_codex_agent(

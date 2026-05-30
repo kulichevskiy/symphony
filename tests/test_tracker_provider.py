@@ -280,6 +280,49 @@ async def test_orchestrator_uses_supplied_tracker_registry(tmp_path) -> None:  #
 
 
 @pytest.mark.asyncio
+async def test_jira_binding_does_not_crash_warmup_or_tick(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+    from symphony.jira.client import JiraTracker
+    from symphony.tracker import TrackerRegistry, for_binding
+
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    binding = RepoBinding(
+        provider="jira",
+        project_key="SYM",
+        base_url="https://jira.example.test",
+        github_repo="org/repo",
+        states=TrackerStates(ready="To Do", code_review="In Review"),
+    )
+    registry = TrackerRegistry()
+    jira = for_binding(binding, Secrets(), registry=registry)
+    assert isinstance(jira, JiraTracker)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = Orchestrator(
+            Config(repos=[binding]),
+            registry,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+
+        await orch.warmup()
+        scheduled = await orch._tick()  # noqa: SLF001
+
+        assert scheduled == []
+        assert orch._states[("jira", "https://jira.example.test", "SYM")][  # noqa: SLF001
+            "To Do"
+        ] == "To Do"
+    finally:
+        await jira.aclose()
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_issue_upsert_treats_tracker_context_as_identity(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 
