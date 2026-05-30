@@ -18,16 +18,26 @@ const STATE_LABELS: Record<CanonicalStatusState, string> = {
 };
 
 const STATE_CLASSES: Record<CanonicalStatusState, string> = {
-  drift_detected: "border-red-500 bg-red-100 text-red-950",
-  halted: "border-red-300 bg-red-50 text-red-900",
-  paused: "border-amber-300 bg-amber-50 text-amber-900",
-  awaiting_merge: "border-blue-300 bg-blue-50 text-blue-900",
-  running: "border-blue-300 bg-blue-50 text-blue-900",
-  failed: "border-red-300 bg-red-50 text-red-900",
-  awaiting_review_trigger: "border-violet-300 bg-violet-50 text-violet-900",
-  pr_open: "border-cyan-300 bg-cyan-50 text-cyan-900",
-  done: "border-green-300 bg-green-50 text-green-900",
-  idle: "border-gray-300 bg-gray-50 text-gray-700",
+  drift_detected:
+    "border-red-500 bg-red-100 text-red-950 dark:border-red-500 dark:bg-red-950/60 dark:text-red-100",
+  halted:
+    "border-red-300 bg-red-50 text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200",
+  paused:
+    "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200",
+  awaiting_merge:
+    "border-blue-300 bg-blue-50 text-blue-900 dark:border-blue-700 dark:bg-blue-950/40 dark:text-blue-200",
+  running:
+    "border-blue-300 bg-blue-50 text-blue-900 dark:border-blue-700 dark:bg-blue-950/40 dark:text-blue-200",
+  failed:
+    "border-red-300 bg-red-50 text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200",
+  awaiting_review_trigger:
+    "border-violet-300 bg-violet-50 text-violet-900 dark:border-violet-700 dark:bg-violet-950/40 dark:text-violet-200",
+  pr_open:
+    "border-cyan-300 bg-cyan-50 text-cyan-900 dark:border-cyan-700 dark:bg-cyan-950/40 dark:text-cyan-200",
+  done:
+    "border-green-300 bg-green-50 text-green-900 dark:border-green-700 dark:bg-green-950/40 dark:text-green-200",
+  idle:
+    "border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300",
 };
 
 function useRelativeClock() {
@@ -109,7 +119,7 @@ export function StuckOverlay({ status }: { status: CanonicalStatus }) {
   }
 
   return (
-    <span className="whitespace-nowrap text-xs font-semibold text-red-600">
+    <span className="whitespace-nowrap text-xs font-semibold text-red-600 dark:text-red-400">
       ⚠ stuck {formatDuration(status.stuck_for)}
     </span>
   );
@@ -131,7 +141,7 @@ function NoProgressChip({
       ? null
       : formatDuration(latestActivityAgeSecs);
   return (
-    <span className="whitespace-nowrap rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-xs font-semibold text-amber-900">
+    <span className="whitespace-nowrap rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-xs font-semibold text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
       ⏸ no progress{duration ? ` ${duration}` : ""}
     </span>
   );
