@@ -3305,14 +3305,15 @@ class Orchestrator:
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
             if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
-            tracker = await self._tracker_for_issue_id(run.issue_id)
+            tracker_ctx = await self._tracker_context_for_issue(run.issue_id)
+            tracker = self.tracker(tracker_ctx)
             try:
                 issue = await tracker.lookup_issue(run.issue_id)
             except LinearError as e:
                 log.warning("could not resolve issue for review run %s: %s", run.id, e)
                 continue
             state = await db.review_state.get(self._conn, issue.id)
-            binding = self._binding_for_review(issue, state)
+            binding = self._binding_for_review(issue, state, tracker_ctx=tracker_ctx)
             if binding is None:
                 log.warning(
                     "no repo binding found for active review run %s (%s)",
@@ -3351,8 +3352,15 @@ class Orchestrator:
             scheduled.append(self._schedule_review_poll(run, binding, issue))
         return scheduled
 
-    def _binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
+    def _binding_for_issue(
+        self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
+    ) -> RepoBinding | None:
         for binding in self.config.repos:
+            if (
+                tracker_ctx is not None
+                and _tracker_context_for_binding(binding) != tracker_ctx
+            ):
+                continue
             if binding.linear_team_key != issue.team_key:
                 continue
             if binding.issue_label and binding.issue_label not in issue.labels:
@@ -3361,10 +3369,18 @@ class Orchestrator:
         return None
 
     def _binding_for_review(
-        self, issue: LinearIssue, state: db.review_state.ReviewState
+        self,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+        tracker_ctx: TrackerContext | None = None,
     ) -> RepoBinding | None:
         if state.github_repo:
             for binding in self.config.repos:
+                if (
+                    tracker_ctx is not None
+                    and _tracker_context_for_binding(binding) != tracker_ctx
+                ):
+                    continue
                 if binding.linear_team_key != issue.team_key:
                     continue
                 if binding.github_repo != state.github_repo:
@@ -3373,7 +3389,7 @@ class Orchestrator:
                     continue
                 return binding
             return None
-        return self._binding_for_issue(issue)
+        return self._binding_for_issue(issue, tracker_ctx=tracker_ctx)
 
     def _schedule_review_poll(
         self, run: db.runs.Run, binding: RepoBinding, issue: LinearIssue
@@ -3482,7 +3498,8 @@ class Orchestrator:
         if not any(live_run.id == run.id for live_run in live_review_runs):
             log.info("skipping review run %s: run is no longer live", run.id)
             return None
-        tracker = self.tracker(binding)
+        tracker_ctx = _tracker_context_for_binding(binding)
+        tracker = self.tracker(tracker_ctx)
         try:
             current = await tracker.lookup_issue(run.issue_id)
         except LinearError as e:
@@ -3493,7 +3510,9 @@ class Orchestrator:
             )
             return None
         state = await db.review_state.get(self._conn, current.id)
-        current_binding = self._binding_for_review(current, state)
+        current_binding = self._binding_for_review(
+            current, state, tracker_ctx=tracker_ctx
+        )
         if current_binding is None:
             log.warning(
                 "no repo binding found for active review run %s (%s)",
@@ -6387,7 +6406,8 @@ class Orchestrator:
                 log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
             return
 
-        issue_tracker = await self._tracker_for_issue_id(issue_id)
+        tracker_ctx = await self._tracker_context_for_issue(issue_id)
+        issue_tracker = self.tracker(tracker_ctx)
         try:
             issue = await issue_tracker.lookup_issue(issue_id)
         except LinearError as e:
@@ -6407,7 +6427,7 @@ class Orchestrator:
                 log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
             return
 
-        binding = self._binding_for_review(issue, state)
+        binding = self._binding_for_review(issue, state, tracker_ctx=tracker_ctx)
         if binding is None:
             log.warning("no binding for skip-review on %s", issue.identifier)
             return

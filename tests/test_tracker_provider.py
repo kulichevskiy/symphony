@@ -515,6 +515,79 @@ async def test_review_binding_lookup_uses_stored_tracker_context(tmp_path) -> No
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_review_poll_uses_stored_tracker_context_for_rebound_binding(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    issue.state_name = "Needs Approval"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider="linear-alt",
+            site="secondary",
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+        scheduled_task = object()
+        orch._schedule_review_poll = MagicMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=scheduled_task
+        )
+
+        scheduled = await orch._poll_review_runs()  # noqa: SLF001
+
+        assert scheduled == [scheduled_task]
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        default_tracker.lookup_issue.assert_not_awaited()
+        args = orch._schedule_review_poll.call_args.args  # noqa: SLF001
+        assert args[1] is secondary_binding
+        assert args[2] is issue
+    finally:
+        await conn.close()
+
+
 def test_poll_no_longer_computes_author_is_me_from_comment_body() -> None:
     source = inspect.getsource(Orchestrator)
     assert "is_symphony_comment" not in source
