@@ -517,7 +517,7 @@ def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
 
 
 def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
-    return (binding.tracker_provider, binding.linear_team_key)
+    return (binding.tracker_provider, binding.tracker_site, binding.linear_team_key)
 
 
 def _binding_label_from_storage_key(binding_key: str) -> str | None:

@@ -54,26 +54,36 @@ def test_orchestrator_and_reconciler_do_not_store_linear_client_attrs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_warmup_caches_states_by_provider_and_team(tmp_path) -> None:  # type: ignore[no-untyped-def]
+async def test_warmup_caches_states_by_provider_site_and_team(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
-    from symphony.tracker import DEFAULT_PROVIDER
+    from symphony.tracker import DEFAULT_PROVIDER, DEFAULT_SITE
 
+    binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_site = "secondary"
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         linear = AsyncMock()
         linear.viewer_team_keys = AsyncMock(return_value=["ENG"])
-        linear.team_states = AsyncMock(return_value={"Todo": "state-todo"})
+        linear.team_states = AsyncMock(return_value={"Todo": "state-default"})
+        secondary = AsyncMock()
+        secondary.viewer_team_keys = AsyncMock(return_value=["ENG"])
+        secondary.team_states = AsyncMock(return_value={"Todo": "state-secondary"})
         orch = Orchestrator(
-            Config(repos=[_binding()]),
+            Config(repos=[binding, secondary_binding]),
             linear,
             conn,
             gh=MagicMock(),
             workspace=MagicMock(),
         )
+        orch._trackers.register("linear", "secondary", secondary)  # noqa: SLF001
 
         await orch.warmup()
 
-        assert orch._states == {(DEFAULT_PROVIDER, "ENG"): {"Todo": "state-todo"}}  # noqa: SLF001
+        assert orch._states == {  # noqa: SLF001
+            (DEFAULT_PROVIDER, DEFAULT_SITE, "ENG"): {"Todo": "state-default"},
+            (DEFAULT_PROVIDER, "secondary", "ENG"): {"Todo": "state-secondary"},
+        }
     finally:
         await conn.close()
 

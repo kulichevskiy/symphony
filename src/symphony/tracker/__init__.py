@@ -12,7 +12,7 @@ DEFAULT_PROVIDER = "linear"
 DEFAULT_SITE = "default"
 
 TrackerKey = tuple[str, str]
-StateCacheKey = tuple[str, str]
+StateCacheKey = tuple[str, str, str]
 
 
 @dataclass(frozen=True)
