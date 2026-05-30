@@ -1389,6 +1389,114 @@ async def test_acceptance_blocked_skip_uses_tracker_issue_id_for_scoped_issue(
 
 
 @pytest.mark.asyncio
+async def test_merge_wait_reconcile_uses_tracker_issue_id_for_scoped_issue(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+    from symphony.orchestrator import poll as poll_module
+    from symphony.pipeline.review_classifier import Verdict, VerdictKind
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    issue.state_name = secondary_binding.linear_states.code_review
+    issue.state_id = "state-review"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id=scoped_issue_id,
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key=secondary_binding.linear_team_key,
+            github_repo=secondary_binding.github_repo,
+            issue_label=secondary_binding.issue_label or "",
+            created_at="2026-05-10T00:03:00+00:00",
+            tracker_provider=secondary_binding.tracker_provider,
+            tracker_site=secondary_binding.tracker_site,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            github_repo=secondary_binding.github_repo,
+            binding_key=poll_module._binding_storage_key(secondary_binding),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:01:00+00:00",
+        )
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        secondary_tracker.post_comment = AsyncMock(return_value="c-reconcile")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "mergedAt": None,
+            }
+        )
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=gh,
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 1  # noqa: SLF001
+
+        default_tracker.lookup_issue.assert_not_awaited()
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        secondary_tracker.post_comment.assert_awaited_once()
+        assert secondary_tracker.post_comment.await_args.args[0] == issue.id
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_merge_candidate_refresh_uses_tracker_issue_id_for_scoped_issue(
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]

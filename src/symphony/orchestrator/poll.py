@@ -3182,9 +3182,10 @@ class Orchestrator:
         if pr is None or pr.merged_at is not None:
             return False
 
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(wait.issue_id)
         tracker = self.tracker(binding)
         try:
-            issue = await tracker.lookup_issue(wait.issue_id)
+            issue = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning(
                 "could not look up %s before merge wait reconcile: %s",
@@ -3277,7 +3278,7 @@ class Orchestrator:
                 f"{classifier} auto-recovery (no `$approve` needed)."
             )
             try:
-                await tracker.post_comment(wait.issue_id, truncate_body(body))
+                await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "could not post merge wait reconcile comment for %s: %s",
