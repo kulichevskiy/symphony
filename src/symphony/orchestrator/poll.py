@@ -2526,6 +2526,7 @@ class Orchestrator:
             if binding is None:
                 return
 
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(binding)
         if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
             states = await self._states_for_binding(binding)
@@ -2538,7 +2539,7 @@ class Orchestrator:
                 )
                 return
             try:
-                await tracker.move_issue(issue_id, ready_id)
+                await tracker.move_issue(tracker_issue_id, ready_id)
             except LinearError as e:
                 log.warning(
                     "could not move %s to ready for cost-cap resume: %s", issue_id, e
@@ -2557,7 +2558,7 @@ class Orchestrator:
                 )
             )
             try:
-                await tracker.post_comment(issue_id, truncate_body(body))
+                await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "cost-cap resume comment failed for issue %s: %s", issue_id, e
@@ -2570,7 +2571,7 @@ class Orchestrator:
             blocked_id = states.get(binding.linear_states.blocked)
             if blocked_id is not None:
                 try:
-                    await tracker.move_issue(issue_id, blocked_id)
+                    await tracker.move_issue(tracker_issue_id, blocked_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to blocked after cost-cap stop: %s",
