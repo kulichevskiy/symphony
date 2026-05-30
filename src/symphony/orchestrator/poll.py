@@ -1699,7 +1699,8 @@ class Orchestrator:
         old_state_id, old_state_name, new_state_id, new_state_name = (
             _linear_issue_state_transition(payload)
         )
-        issue = await self.tracker(TrackerContext()).lookup_issue(issue_id)
+        tracker_ctx = await self._tracker_context_for_issue(issue_id)
+        issue = await self.tracker(tracker_ctx).lookup_issue(issue_id)
         revived = False
         if state_changed:
             revived = (
@@ -1712,7 +1713,7 @@ class Orchestrator:
                 )
                 is not None
             )
-        binding = self._ready_binding_for_issue(issue)
+        binding = self._ready_binding_for_issue(issue, tracker_ctx)
         if binding is None:
             return WebhookDispatchResult(
                 kind="issue",
@@ -7090,9 +7091,16 @@ class Orchestrator:
             ", ".join(blockers),
         )
 
-    def _ready_binding_for_issue(self, issue: LinearIssue) -> RepoBinding | None:
+    def _ready_binding_for_issue(
+        self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
+    ) -> RepoBinding | None:
         issue_labels = set(issue.labels)
         for binding in self.config.repos:
+            if (
+                tracker_ctx is not None
+                and _tracker_context_for_binding(binding) != tracker_ctx
+            ):
+                continue
             if binding.linear_team_key != issue.team_key:
                 continue
             if issue.state_name != binding.linear_states.ready:
