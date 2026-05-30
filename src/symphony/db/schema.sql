@@ -184,6 +184,8 @@ CREATE TABLE IF NOT EXISTS operator_waits (
     issue_id        TEXT PRIMARY KEY REFERENCES issues(id),
     run_id          TEXT NOT NULL REFERENCES runs(id),
     kind            TEXT NOT NULL,
+    tracker_provider TEXT NOT NULL DEFAULT 'linear',
+    tracker_site     TEXT NOT NULL DEFAULT 'default',
     linear_team_key TEXT NOT NULL,
     github_repo     TEXT NOT NULL,
     issue_label     TEXT NOT NULL DEFAULT '',

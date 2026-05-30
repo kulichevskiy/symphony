@@ -117,3 +117,34 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
             "ALTER TABLE merge_conflict_fix_marks "
             "ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''"
         )
+
+    cur = await conn.execute("PRAGMA table_info(operator_waits)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "tracker_provider" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits "
+            "ADD COLUMN tracker_provider TEXT NOT NULL DEFAULT 'linear'"
+        )
+        await conn.execute(
+            """
+            UPDATE operator_waits
+               SET tracker_provider = COALESCE(
+                   (SELECT provider FROM issues WHERE issues.id = operator_waits.issue_id),
+                   'linear'
+               )
+            """
+        )
+    if "tracker_site" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits "
+            "ADD COLUMN tracker_site TEXT NOT NULL DEFAULT 'default'"
+        )
+        await conn.execute(
+            """
+            UPDATE operator_waits
+               SET tracker_site = COALESCE(
+                   (SELECT site FROM issues WHERE issues.id = operator_waits.issue_id),
+                   'default'
+               )
+            """
+        )

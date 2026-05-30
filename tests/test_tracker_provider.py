@@ -155,6 +155,60 @@ async def test_warmup_registers_configured_tracker_context(tmp_path) -> None:  #
 
 
 @pytest.mark.asyncio
+async def test_operator_wait_restore_uses_persisted_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_site = "secondary"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Test issue",
+            team_key="ENG",
+            provider="linear",
+            site="secondary",
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-1",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T01:00:00+00:00",
+            tracker_provider="linear",
+            tracker_site="secondary",
+        )
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            AsyncMock(),
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+
+        await orch._restore_operator_waits()  # noqa: SLF001
+
+        assert orch._implement_failed_run_bindings["run-1"] is secondary_binding  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_binding_scoped_lookup_uses_binding_tracker(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 

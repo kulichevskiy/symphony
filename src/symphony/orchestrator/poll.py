@@ -2515,6 +2515,8 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
         )
 
     async def _handle_implement_failed_slash_intent(
@@ -2631,8 +2633,11 @@ class Orchestrator:
             binding = self._binding_for_operator_wait(wait)
             if binding is None:
                 log.warning(
-                    "cannot restore operator wait for issue %s: no binding for %s/%s label=%r",
+                    "cannot restore operator wait for issue %s: "
+                    "no binding for %s/%s/%s/%s label=%r",
                     wait.issue_id,
+                    wait.tracker_provider,
+                    wait.tracker_site,
                     wait.linear_team_key,
                     wait.github_repo,
                     wait.issue_label,
@@ -2731,6 +2736,8 @@ class Orchestrator:
                 binding.linear_team_key == wait.linear_team_key
                 and binding.github_repo == wait.github_repo
                 and (binding.issue_label or "") == wait.issue_label
+                and binding.tracker_provider == wait.tracker_provider
+                and binding.tracker_site == wait.tracker_site
             ):
                 return binding
         return None
@@ -2750,6 +2757,8 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
         )
 
     async def _track_acceptance_blocked_wait(
@@ -2810,6 +2819,8 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
         )
 
     async def _track_acceptance_rejected_wait(
@@ -2827,6 +2838,8 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
         )
 
     async def _acceptance_pr_url(self, issue_id: str) -> str:
@@ -5967,6 +5980,8 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
         )
 
     async def _track_review_stopped_wait(
@@ -5984,6 +5999,8 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
         )
 
     async def _handle_review_failed_slash_intent(
@@ -9989,6 +10006,8 @@ class Orchestrator:
                     github_repo=binding.github_repo,
                     issue_label=binding.issue_label or "",
                     created_at=datetime.now(UTC).isoformat(),
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
                 )
             except Exception:
                 log.warning(
