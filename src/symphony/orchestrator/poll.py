@@ -9226,9 +9226,8 @@ class Orchestrator:
         """
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
-        self._dispatch_run_ids[issue.id] = run_id
 
-        await db.issues.upsert(
+        issue_id = await db.issues.upsert(
             self._conn,
             id=issue.id,
             provider=binding.tracker_provider,
@@ -9240,7 +9239,7 @@ class Orchestrator:
         inserted = await db.runs.create_if_not_dispatched(
             self._conn,
             id=run_id,
-            issue_id=issue.id,
+            issue_id=issue_id,
             stage="implement",
             status="running",
             pid=None,
@@ -9252,6 +9251,7 @@ class Orchestrator:
                 issue.identifier,
             )
             return None
+        self._dispatch_run_ids[issue_id] = run_id
 
         try:
             states = await self._states_for_binding(binding)
@@ -9346,7 +9346,7 @@ class Orchestrator:
             )
             return run_id
 
-        prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+        prior_total = await db.runs.cost_for_issue(self._conn, issue_id)
 
         try:
             cumulative_cost, final_kind, final_returncode, cap_breached = (

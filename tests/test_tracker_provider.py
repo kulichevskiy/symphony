@@ -226,6 +226,56 @@ async def test_issue_upsert_treats_tracker_context_as_identity(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_dispatch_uses_scoped_issue_id_returned_by_upsert(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            AsyncMock(),
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._states_for_binding = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=LinearError("states unavailable")
+        )
+
+        run_id = await orch._dispatch_one(secondary_binding, issue)  # noqa: SLF001
+
+        scoped_issue_id = db.issues.contextual_id(
+            id=issue.id,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        cur = await conn.execute(
+            "SELECT issue_id, status FROM runs WHERE id = ?",
+            (run_id,),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert dict(row) == {"issue_id": scoped_issue_id, "status": "failed"}
+        assert orch._dispatch_run_ids == {scoped_issue_id: run_id}  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_operator_wait_restore_uses_persisted_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 
