@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -25,6 +26,8 @@ _STREAM_DRAIN_SECS = 2.0
 _WATCHDOG_POLL_SECS = 1.0
 _SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024
 _STREAM_READ_CHUNK_BYTES = 64 * 1024
+
+log = logging.getLogger(__name__)
 
 
 class _Heartbeat:
@@ -137,16 +140,10 @@ class LocalRunner:
                     hb.observe(line)
                 await events.put(RunnerEvent(kind=kind, line=line))  # type: ignore[arg-type]
 
-            while True:
-                try:
-                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
-                except Exception:  # noqa: BLE001 — pump must not crash the run
-                    break
-                if not chunk:
-                    break
+            async def process_chunk(chunk: bytes) -> None:
                 if b"\n" not in chunk:
                     pending.extend(chunk)
-                    continue
+                    return
                 parts = chunk.split(b"\n")
                 if pending:
                     pending.extend(parts[0])
@@ -157,6 +154,45 @@ class LocalRunner:
                 for raw_line in parts[1:-1]:
                     await publish(raw_line)
                 pending.extend(parts[-1])
+
+            async def drain_oversized_line() -> bytes | None:
+                pending.clear()
+                while True:
+                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+                    if not chunk:
+                        return None
+                    newline_at = chunk.find(b"\n")
+                    if newline_at < 0:
+                        continue
+                    return chunk[newline_at + 1 :]
+
+            while True:
+                try:
+                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+                except (asyncio.LimitOverrunError, ValueError) as e:
+                    if not _is_stream_limit_overrun(e):
+                        break
+                    log.warning(
+                        "skipping oversized %s line for run_id=%s after stream reader "
+                        "limit overrun: %s",
+                        kind,
+                        spec.run_id,
+                        e,
+                    )
+                    try:
+                        remainder = await drain_oversized_line()
+                    except Exception:  # noqa: BLE001 — stream is no longer recoverable
+                        break
+                    if remainder is None:
+                        break
+                    if remainder:
+                        await process_chunk(remainder)
+                    continue
+                except Exception:  # noqa: BLE001 — pump must not crash the run
+                    break
+                if not chunk:
+                    break
+                await process_chunk(chunk)
             if pending:
                 await publish(bytes(pending))
 
@@ -276,6 +312,13 @@ def _pid_alive(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _is_stream_limit_overrun(exc: BaseException) -> bool:
+    if isinstance(exc, asyncio.LimitOverrunError):
+        return True
+    message = str(exc).lower()
+    return "separator" in message and "limit" in message
 
 
 def _terminate_process_group(pid: int | None) -> None:

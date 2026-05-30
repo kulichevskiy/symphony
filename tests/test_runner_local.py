@@ -189,6 +189,62 @@ time.sleep(4.0)
 
 
 @pytest.mark.asyncio
+async def test_runner_recovers_when_stream_reports_oversized_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _ValueErrorThenPayloadStream:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self._offset = 0
+            self._raised = False
+
+        async def read(self, n: int = -1) -> bytes:
+            if not self._raised:
+                self._raised = True
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+            if self._offset >= len(self._payload):
+                return b""
+            if n < 0:
+                n = len(self._payload) - self._offset
+            chunk = self._payload[self._offset : self._offset + n]
+            self._offset += len(chunk)
+            return chunk
+
+    class _FakeProcess:
+        stdout = _ValueErrorThenPayloadStream(b"x" * (4 * 1024 * 1024 + 1) + b"\nnormal\n")
+        stderr = None
+        pid = None
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    async def fake_create_subprocess_exec(*_args: object, **_kwargs: object) -> _FakeProcess:
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-overrun",
+        workspace_path=tmp_path,
+        command=["fake-agent"],
+        stall_secs=10,
+    )
+
+    with caplog.at_level("WARNING", logger="symphony.agent.runners.local"):
+        events = await asyncio.wait_for(_collect_events(runner, spec), timeout=10)
+
+    assert [e.line for e in events if e.kind == "stdout"] == ["normal"]
+    assert "stall_timeout" not in [e.kind for e in events]
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+    assert "skipping oversized stdout line" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_runner_recognises_legacy_command_execution_shape(tmp_path: Path) -> None:
     # Older codex builds emit `item_type` (on the item or on the event) instead
     # of `item.type`. activity.parse_codex_activity_line already accepts that;
