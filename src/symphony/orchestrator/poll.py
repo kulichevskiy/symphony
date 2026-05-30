@@ -2230,10 +2230,11 @@ class Orchestrator:
     async def _post_command_rejected(
         self, issue_id: str, slash_text: str, reason: str
     ) -> None:
-        tracker = await self._tracker_for_issue_id(issue_id)
+        tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(issue_id)
+        tracker = self.tracker(tracker_ctx)
         try:
             await tracker.post_comment(
-                issue_id, truncate_body(command_rejected(slash_text, reason))
+                tracker_issue_id, truncate_body(command_rejected(slash_text, reason))
             )
         except LinearError as e:
             log.warning(
@@ -2968,6 +2969,7 @@ class Orchestrator:
         if binding is None:
             return
 
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(binding)
         state = await db.acceptance_state.get(self._conn, issue_id)
         if intent.kind is SlashKind.RETRY_ACCEPTANCE:
@@ -2999,7 +3001,7 @@ class Orchestrator:
                 return
             target_state_id = states[target_state_name]
             try:
-                await tracker.move_issue(issue_id, target_state_id)
+                await tracker.move_issue(tracker_issue_id, target_state_id)
             except LinearError as e:
                 log.warning(
                     "could not move %s to %s for acceptance retry: %s",
@@ -3026,7 +3028,7 @@ class Orchestrator:
                 )
             )
             try:
-                await tracker.post_comment(issue_id, truncate_body(body))
+                await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("acceptance retry comment failed for %s: %s", issue_id, e)
             return
@@ -3040,7 +3042,7 @@ class Orchestrator:
                 )
                 return
             try:
-                issue = await tracker.lookup_issue(issue_id)
+                issue = await tracker.lookup_issue(tracker_issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for skip-acceptance: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -3079,7 +3081,7 @@ class Orchestrator:
                 )
             )
             try:
-                await tracker.post_comment(issue_id, truncate_body(body))
+                await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("acceptance skip comment failed for %s: %s", issue_id, e)
             return

@@ -7,6 +7,7 @@ import pytest
 
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import Linear, LinearError
+from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import Reconciler
 from symphony.tracker import Comment, Issue, TrackerContext
@@ -43,6 +44,14 @@ def _comment(body: str) -> Comment:
         author_name="operator",
         author_is_me=False,
         external_thread_type=None,
+    )
+
+
+def _intent(kind: SlashKind) -> SlashIntent:
+    return SlashIntent(
+        kind=kind,
+        comment_id="c-command",
+        created_at="2026-05-10T12:00:00+00:00",
     )
 
 
@@ -1014,6 +1023,190 @@ async def test_implement_failed_retry_moves_tracker_issue_id_for_scoped_issue(
         secondary_tracker.post_comment.assert_awaited_once()
         assert secondary_tracker.post_comment.await_args.args[0] == issue.id
         assert scoped_issue_id not in orch._dispatch_run_ids  # noqa: SLF001
+        assert await db.operator_waits.get(conn, scoped_issue_id) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_blocked_retry_moves_tracker_issue_id_for_scoped_issue(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=scoped_issue_id,
+            stage="acceptance",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
+            linear_team_key=secondary_binding.linear_team_key,
+            github_repo=secondary_binding.github_repo,
+            issue_label=secondary_binding.issue_label or "",
+            created_at="2026-05-10T01:00:00+00:00",
+            tracker_provider=secondary_binding.tracker_provider,
+            tracker_site=secondary_binding.tracker_site,
+        )
+        default_tracker = AsyncMock()
+        default_tracker.move_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.team_states = AsyncMock(
+            return_value={secondary_binding.linear_states.needs_approval: "state-review"}
+        )
+        secondary_tracker.move_issue = AsyncMock()
+        secondary_tracker.post_comment = AsyncMock(return_value="c-resumed")
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+
+        await orch._handle_acceptance_blocked_slash_intent(  # noqa: SLF001
+            scoped_issue_id,
+            "run-1",
+            _intent(SlashKind.RETRY_ACCEPTANCE),
+        )
+
+        default_tracker.move_issue.assert_not_awaited()
+        secondary_tracker.move_issue.assert_awaited_once_with(issue.id, "state-review")
+        secondary_tracker.post_comment.assert_awaited_once()
+        assert secondary_tracker.post_comment.await_args.args[0] == issue.id
+        assert await db.operator_waits.get(conn, scoped_issue_id) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_blocked_skip_uses_tracker_issue_id_for_scoped_issue(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=scoped_issue_id,
+            stage="acceptance",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            scoped_issue_id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
+            mode="code_only",
+            preview_url="",
+            extracted_criteria="",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
+            linear_team_key=secondary_binding.linear_team_key,
+            github_repo=secondary_binding.github_repo,
+            issue_label=secondary_binding.issue_label or "",
+            created_at="2026-05-10T01:00:00+00:00",
+            tracker_provider=secondary_binding.tracker_provider,
+            tracker_site=secondary_binding.tracker_site,
+        )
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        secondary_tracker.post_comment = AsyncMock(return_value="c-skipped")
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._handle_acceptance_blocked_slash_intent(  # noqa: SLF001
+            scoped_issue_id,
+            "run-1",
+            _intent(SlashKind.SKIP_ACCEPTANCE),
+        )
+
+        default_tracker.lookup_issue.assert_not_awaited()
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        secondary_tracker.post_comment.assert_awaited_once()
+        assert secondary_tracker.post_comment.await_args.args[0] == issue.id
         assert await db.operator_waits.get(conn, scoped_issue_id) is None
     finally:
         await conn.close()
