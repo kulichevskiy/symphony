@@ -100,6 +100,8 @@ class RepoBinding(BaseModel):
 
     linear_team_key: str
     github_repo: str
+    tracker_provider: str = "linear"
+    tracker_site: str = "default"
     agent: Literal["claude", "codex"] = "claude"
     codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None

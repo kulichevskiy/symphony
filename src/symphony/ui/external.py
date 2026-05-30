@@ -454,7 +454,7 @@ class ExternalSnapshotService:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._config = config
-        self._linear = linear
+        self._issue_tracker_client = linear
         self._github = github
         self.cache = cache or ExternalSnapshotCache()
         self._clock = clock
@@ -514,7 +514,7 @@ class ExternalSnapshotService:
             return self.cache.source_error(issue_id, SOURCE_LINEAR, backoff_error)
 
         try:
-            payload = await self._linear.issue_external_snapshot(issue_id)
+            payload = await self._issue_tracker_client.issue_external_snapshot(issue_id)
             payload["comments"] = [
                 _truncate_comment(comment)
                 for comment in payload.get("comments", [])

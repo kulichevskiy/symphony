@@ -15,13 +15,14 @@ import asyncio
 import inspect
 import logging
 import mimetypes
-from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from ..tracker import Blocker, Comment, Issue
 from . import queries
 from .templates import is_symphony_comment, mark_symphony_comment
 
@@ -34,29 +35,7 @@ class LinearError(RuntimeError):
     """Raised on any non-2xx, transport error, or `errors[]` in the body."""
 
 
-@dataclass
-class Blocker:
-    id: str
-    identifier: str
-    state_type: str
-    archived: bool
-
-
-@dataclass
-class LinearIssue:
-    id: str  # UUID
-    identifier: str  # "ENG-123"
-    title: str
-    description: str
-    url: str
-    state_id: str
-    state_name: str
-    state_type: str  # backlog|unstarted|started|triage|completed|canceled
-    team_key: str
-    labels: list[str] = field(default_factory=list)
-    blocked_by: list[Blocker] = field(default_factory=list)
-    updated_at: str = ""
-
+class LinearIssue(Issue):
     @classmethod
     def from_node(cls, node: dict[str, Any]) -> LinearIssue:
         return cls(
@@ -75,15 +54,7 @@ class LinearIssue:
         )
 
 
-@dataclass
-class LinearComment:
-    id: str
-    body: str
-    created_at: str  # RFC3339
-    author_name: str
-    author_is_me: bool  # True for marker-tagged Symphony comments, not Linear's user.isMe.
-    external_thread_type: str | None  # set if mirrored from GitHub etc.
-
+class LinearComment(Comment):
     @classmethod
     def from_node(cls, node: dict[str, Any]) -> LinearComment:
         user = node.get("user") or {}
@@ -99,7 +70,40 @@ class LinearComment:
         )
 
 
-class Linear:
+def comment_from_webhook_payload(payload: Mapping[str, Any]) -> LinearComment | None:
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    comment_id = data.get("id")
+    body = data.get("body")
+    created_at = data.get("createdAt") or payload.get("createdAt")
+    if not isinstance(comment_id, str) or not comment_id:
+        return None
+    if not isinstance(body, str):
+        return None
+    if not isinstance(created_at, str) or not created_at:
+        return None
+    actor = payload.get("actor")
+    author_name = ""
+    if isinstance(actor, Mapping):
+        raw_name = actor.get("name")
+        author_name = raw_name if isinstance(raw_name, str) else ""
+    external_thread_type: str | None = None
+    ext = data.get("externalThread")
+    if isinstance(ext, Mapping):
+        raw_type = ext.get("type")
+        external_thread_type = raw_type if isinstance(raw_type, str) else None
+    return LinearComment(
+        id=comment_id,
+        body=body,
+        created_at=created_at,
+        author_name=author_name,
+        author_is_me=is_symphony_comment(body),
+        external_thread_type=external_thread_type,
+    )
+
+
+class LinearTracker:
     """Async Linear client.
 
     One HTTP client is reused across the process; request timeouts are
@@ -118,7 +122,7 @@ class Linear:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> Linear:
+    async def __aenter__(self) -> LinearTracker:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -474,3 +478,6 @@ def _relation_page_info(node: dict[str, Any], connection_name: str) -> dict[str,
     connection = node.get(connection_name) or {}
     page_info: dict[str, Any] = connection.get("pageInfo") or {}
     return page_info
+
+
+Linear = LinearTracker

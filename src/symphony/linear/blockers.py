@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from .client import LinearIssue
+from ..tracker import Issue
 
 OPEN_BLOCKER_TYPES = frozenset({"backlog", "unstarted", "started", "triage"})
 
 
-def open_blocker_ids(issue: LinearIssue) -> list[str]:
+def open_blocker_ids(issue: Issue) -> list[str]:
     """Return open blocker identifiers in Linear's relation order."""
     return [
         blocker.identifier
@@ -16,5 +16,5 @@ def open_blocker_ids(issue: LinearIssue) -> list[str]:
     ]
 
 
-def is_blocked(issue: LinearIssue) -> bool:
+def is_blocked(issue: Issue) -> bool:
     return bool(open_blocker_ids(issue))

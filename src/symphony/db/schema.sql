@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS repos (
 
 CREATE TABLE IF NOT EXISTS issues (
     id          TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL DEFAULT 'linear',
+    site        TEXT NOT NULL DEFAULT 'default',
     identifier  TEXT NOT NULL,
     title       TEXT NOT NULL,
     team_key    TEXT NOT NULL

@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from .config import RepoBinding
-from .linear.client import LinearIssue
+from .tracker import Issue
 
 log = logging.getLogger(__name__)
 
@@ -83,10 +83,10 @@ class Workspace:
         # the encoding stays injective.
         return github_repo.replace("_", "_u").replace("/", "_s")
 
-    def path_for(self, binding: RepoBinding, issue: LinearIssue) -> Path:
+    def path_for(self, binding: RepoBinding, issue: Issue) -> Path:
         return self._root / self.repo_safe(binding.github_repo) / issue.identifier.lower()
 
-    async def acquire(self, binding: RepoBinding, issue: LinearIssue) -> Path:
+    async def acquire(self, binding: RepoBinding, issue: Issue) -> Path:
         """Idempotent: clone if missing, fetch if present, then check out branch."""
         path = self.path_for(binding, issue)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
@@ -106,11 +106,11 @@ class Workspace:
             self._in_use.add(path)
         return path
 
-    def release(self, binding: RepoBinding, issue: LinearIssue) -> None:
+    def release(self, binding: RepoBinding, issue: Issue) -> None:
         """Mark a workspace no longer in active use (eligible for sweep)."""
         self._in_use.discard(self.path_for(binding, issue))
 
-    async def cleanup(self, issue: LinearIssue) -> None:
+    async def cleanup(self, issue: Issue) -> None:
         """Remove the workspace dir for `issue` from every repo namespace."""
         if not self._root.exists():
             return

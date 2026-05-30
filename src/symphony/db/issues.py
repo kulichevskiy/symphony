@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import aiosqlite
 
+from ..tracker import DEFAULT_PROVIDER, DEFAULT_SITE
+
 
 async def upsert(
     conn: aiosqlite.Connection,
@@ -12,16 +14,20 @@ async def upsert(
     identifier: str,
     title: str,
     team_key: str,
+    provider: str = DEFAULT_PROVIDER,
+    site: str = DEFAULT_SITE,
 ) -> None:
     await conn.execute(
         """
-        INSERT INTO issues (id, identifier, title, team_key)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO issues (id, provider, site, identifier, title, team_key)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
+            provider   = excluded.provider,
+            site       = excluded.site,
             identifier = excluded.identifier,
             title      = excluded.title,
             team_key   = excluded.team_key
         """,
-        (id, identifier, title, team_key),
+        (id, provider, site, identifier, title, team_key),
     )
     await conn.commit()

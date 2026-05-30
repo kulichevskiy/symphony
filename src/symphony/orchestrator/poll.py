@@ -67,7 +67,7 @@ from ..github.client import GitHub, GitHubError, PRChecks, _is_merge_conflict_er
 from ..github.webhook import GitHubWebhookEvent
 from ..linear import slash
 from ..linear.blockers import is_blocked, open_blocker_ids
-from ..linear.client import Linear, LinearComment, LinearError, LinearIssue
+from ..linear.client import LinearError, comment_from_webhook_payload
 from ..linear.slash import SlashIntent, SlashKind
 from ..linear.templates import (
     CommentVars,
@@ -83,7 +83,6 @@ from ..linear.templates import (
     failed,
     fix_pushed,
     fixing_merge_conflict,
-    is_symphony_comment,
     moved_to_waiting,
     resumed,
     retry_acceptance_requested,
@@ -137,6 +136,20 @@ from ..pipeline.review_classifier import (
 )
 from ..pipeline.state_machine import on_runner_event
 from ..pipeline.taste_guide import load_taste_guide
+from ..tracker import (
+    DEFAULT_PROVIDER,
+    DEFAULT_SITE,
+    IssueTracker,
+    StateCacheKey,
+    TrackerContext,
+    TrackerRegistry,
+)
+from ..tracker import (
+    Comment as LinearComment,
+)
+from ..tracker import (
+    Issue as LinearIssue,
+)
 from ..workspace import Workspace
 from .reconciler import Reconciler
 
@@ -494,6 +507,17 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
 
 def _binding_storage_key(binding: RepoBinding) -> str:
     return json.dumps(_binding_key(binding), separators=(",", ":"))
+
+
+def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
+    return TrackerContext(
+        provider=binding.tracker_provider,
+        site=binding.tracker_site,
+    )
+
+
+def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
+    return (binding.tracker_provider, binding.linear_team_key)
 
 
 def _binding_label_from_storage_key(binding_key: str) -> str | None:
@@ -1203,7 +1227,7 @@ class Orchestrator:
     def __init__(
         self,
         config: Config,
-        linear: Linear,
+        linear: IssueTracker,
         conn: aiosqlite.Connection,
         *,
         runner: Runner | None = None,
@@ -1214,7 +1238,8 @@ class Orchestrator:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
-        self.linear = linear
+        self._trackers = TrackerRegistry()
+        self._trackers.register(DEFAULT_PROVIDER, DEFAULT_SITE, linear)
         self._conn = conn
         self._shutdown = asyncio.Event()
         self._gh: GitHub = gh if gh is not None else GitHub()
@@ -1229,9 +1254,9 @@ class Orchestrator:
             force_push_fn if force_push_fn is not None else _default_force_push
         )
         self._clock = clock
-        # Cache of (team_key -> {state_name: state_uuid}). Re-fetched on
+        # Cache of ((provider, team_key) -> {state_name: state_uuid}). Re-fetched on
         # startup; never mutated at runtime.
-        self._states: dict[str, dict[str, str]] = {}
+        self._states: dict[StateCacheKey, dict[str, str]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
         self._known_waiting_issue_ids: set[str] = set()
@@ -1293,7 +1318,7 @@ class Orchestrator:
         self._reconciler = Reconciler(
             config,
             conn,
-            linear,
+            self._trackers,
             self._gh,
             clock=clock,
         )
@@ -1306,9 +1331,32 @@ class Orchestrator:
             return self._clock()
         return datetime.now(UTC)
 
+    def tracker(self, ctx: TrackerContext | RepoBinding | None = None) -> IssueTracker:
+        if isinstance(ctx, RepoBinding):
+            ctx = _tracker_context_for_binding(ctx)
+        return self._trackers.resolve(ctx)
+
+    @property
+    def linear(self) -> IssueTracker:
+        return self.tracker()
+
+    async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
+        cur = await self._conn.execute(
+            "SELECT provider, site FROM issues WHERE id = ?",
+            (issue_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return TrackerContext()
+        provider = str(row["provider"] or "")
+        site = str(row["site"] or "")
+        if not provider or not site:
+            return TrackerContext()
+        return TrackerContext(provider=provider, site=site)
+
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
-        viewer_keys = await self.linear.viewer_team_keys()
+        viewer_keys = await self.tracker().viewer_team_keys()
         log.info("linear viewer sees teams: %s", viewer_keys)
         for binding in self.config.repos:
             if binding.linear_team_key not in viewer_keys:
@@ -1318,10 +1366,11 @@ class Orchestrator:
                     binding.linear_team_key,
                 )
                 continue
-            self._states[binding.linear_team_key] = await self.linear.team_states(
+            state_key = _state_cache_key(binding)
+            self._states[state_key] = await self.tracker(binding).team_states(
                 binding.linear_team_key
             )
-            self._validate_waiting_state(binding, self._states[binding.linear_team_key])
+            self._validate_waiting_state(binding, self._states[state_key])
 
     def _validate_waiting_state(
         self, binding: RepoBinding, states: dict[str, str]
@@ -1341,10 +1390,20 @@ class Orchestrator:
         self._shutdown.set()
 
     async def _states_for_binding(self, binding: RepoBinding) -> dict[str, str]:
-        states = self._states.get(binding.linear_team_key)
+        state_key = _state_cache_key(binding)
+        states = self._states.get(state_key)
         if states is None:
-            states = await self.linear.team_states(binding.linear_team_key)
-            self._states[binding.linear_team_key] = states
+            # Older tests and long-lived in-process callers may have seeded
+            # the pre-refactor team-key cache directly. Normalize it on read.
+            legacy_states = cast(dict[object, dict[str, str]], self._states).get(
+                binding.linear_team_key
+            )
+            if isinstance(legacy_states, dict):
+                states = legacy_states
+                self._states[state_key] = states
+        if states is None:
+            states = await self.tracker(binding).team_states(binding.linear_team_key)
+            self._states[state_key] = states
         return states
 
     async def run(self) -> None:
@@ -1632,7 +1691,7 @@ class Orchestrator:
         old_state_id, old_state_name, new_state_id, new_state_name = (
             _linear_issue_state_transition(payload)
         )
-        issue = await self.linear.lookup_issue(issue_id)
+        issue = await self.tracker(TrackerContext()).lookup_issue(issue_id)
         revived = False
         if state_changed:
             revived = (
@@ -1729,8 +1788,9 @@ class Orchestrator:
             except Exception:  # noqa: BLE001 — keep loop alive
                 log.exception("failed to resolve cursor for issue %s", issue_id)
                 continue
+            tracker_ctx = await self._tracker_context_for_issue(issue_id)
             try:
-                comments = await self.linear.comments_since(issue_id, after)
+                comments = await self.tracker(tracker_ctx).comments_since(issue_id, after)
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
@@ -2019,7 +2079,7 @@ class Orchestrator:
         self, issue_id: str, slash_text: str, reason: str
     ) -> None:
         try:
-            await self.linear.post_comment(
+            await self.tracker().post_comment(
                 issue_id, truncate_body(command_rejected(slash_text, reason))
             )
         except LinearError as e:
@@ -2083,7 +2143,7 @@ class Orchestrator:
                 "The issue remains parked; reply with `$approve` to try again."
             )
             try:
-                await self.linear.post_comment(issue_id, truncate_body(body))
+                await self.tracker().post_comment(issue_id, truncate_body(body))
             except LinearError as comment_error:
                 log.warning(
                     "could not post manual merge failure for %s: %s",
@@ -2152,7 +2212,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue_id, truncate_body(body))
+            await self.tracker().post_comment(issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("active review retry comment failed for %s: %s", issue_id, e)
 
@@ -2174,7 +2234,7 @@ class Orchestrator:
                 issue_id,
             )
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue_id,
                     truncate_body(
                         command_rejected(
@@ -2227,7 +2287,7 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 log.exception("could not kill concurrent review run %s", fix_run_id)
                 try:
-                    await self.linear.post_comment(
+                    await self.tracker().post_comment(
                         issue_id,
                         truncate_body(
                             command_rejected(
@@ -2290,7 +2350,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue_id, truncate_body(body))
+            await self.tracker().post_comment(issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("review stop confirmation failed for %s: %s", issue_id, e)
 
@@ -2319,7 +2379,7 @@ class Orchestrator:
                 )
                 return
             try:
-                await self.linear.move_issue(issue_id, ready_id)
+                await self.tracker().move_issue(issue_id, ready_id)
             except LinearError as e:
                 log.warning(
                     "could not move %s to ready for cost-cap resume: %s", issue_id, e
@@ -2338,7 +2398,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue_id, truncate_body(body))
+                await self.tracker().post_comment(issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "cost-cap resume comment failed for issue %s: %s", issue_id, e
@@ -2351,7 +2411,7 @@ class Orchestrator:
             blocked_id = states.get(binding.linear_states.blocked)
             if blocked_id is not None:
                 try:
-                    await self.linear.move_issue(issue_id, blocked_id)
+                    await self.tracker().move_issue(issue_id, blocked_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to blocked after cost-cap stop: %s",
@@ -2413,7 +2473,7 @@ class Orchestrator:
                 )
                 return
             try:
-                await self.linear.move_issue(issue_id, ready_id)
+                await self.tracker().move_issue(issue_id, ready_id)
             except LinearError as e:
                 log.warning("could not move %s to ready for retry: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -2430,7 +2490,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue_id, truncate_body(body))
+                await self.tracker().post_comment(issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "implement retry comment failed for issue %s: %s", issue_id, e
@@ -2447,7 +2507,7 @@ class Orchestrator:
                     binding.linear_states.blocked,
                 )
                 try:
-                    await self.linear.post_comment(
+                    await self.tracker().post_comment(
                         issue_id,
                         truncate_body(
                             command_rejected(
@@ -2464,7 +2524,7 @@ class Orchestrator:
                     )
                 return
             try:
-                await self.linear.move_issue(issue_id, blocked_id)
+                await self.tracker().move_issue(issue_id, blocked_id)
             except LinearError as e:
                 log.warning("could not move %s to blocked: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -2645,7 +2705,7 @@ class Orchestrator:
         )
         if target_id is not None:
             try:
-                await self.linear.move_issue(issue.id, target_id)
+                await self.tracker().move_issue(issue.id, target_id)
             except LinearError as e:
                 log.warning(
                     "could not park acceptance-blocked %s: %s",
@@ -2664,7 +2724,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("acceptance blocked comment failed on %s: %s", issue.identifier, e)
 
@@ -2748,7 +2808,7 @@ class Orchestrator:
                 return
             target_state_id = states[target_state_name]
             try:
-                await self.linear.move_issue(issue_id, target_state_id)
+                await self.tracker().move_issue(issue_id, target_state_id)
             except LinearError as e:
                 log.warning(
                     "could not move %s to %s for acceptance retry: %s",
@@ -2775,7 +2835,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue_id, truncate_body(body))
+                await self.tracker().post_comment(issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("acceptance retry comment failed for %s: %s", issue_id, e)
             return
@@ -2789,7 +2849,7 @@ class Orchestrator:
                 )
                 return
             try:
-                issue = await self.linear.lookup_issue(issue_id)
+                issue = await self.tracker().lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for skip-acceptance: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -2828,7 +2888,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue_id, truncate_body(body))
+                await self.tracker().post_comment(issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("acceptance skip comment failed for %s: %s", issue_id, e)
             return
@@ -2901,7 +2961,7 @@ class Orchestrator:
             return False
 
         try:
-            issue = await self.linear.lookup_issue(wait.issue_id)
+            issue = await self.tracker().lookup_issue(wait.issue_id)
         except LinearError as e:
             log.warning(
                 "could not look up %s before merge wait reconcile: %s",
@@ -2994,7 +3054,7 @@ class Orchestrator:
                 f"{classifier} auto-recovery (no `$approve` needed)."
             )
             try:
-                await self.linear.post_comment(wait.issue_id, truncate_body(body))
+                await self.tracker().post_comment(wait.issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "could not post merge wait reconcile comment for %s: %s",
@@ -3144,7 +3204,7 @@ class Orchestrator:
             if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
             try:
-                issue = await self.linear.lookup_issue(run.issue_id)
+                issue = await self.tracker().lookup_issue(run.issue_id)
             except LinearError as e:
                 log.warning("could not resolve issue for review run %s: %s", run.id, e)
                 continue
@@ -3320,7 +3380,7 @@ class Orchestrator:
             log.info("skipping review run %s: run is no longer live", run.id)
             return None
         try:
-            current = await self.linear.lookup_issue(run.issue_id)
+            current = await self.tracker().lookup_issue(run.issue_id)
         except LinearError as e:
             log.warning(
                 "could not revalidate %s before review polling: %s",
@@ -4211,7 +4271,7 @@ class Orchestrator:
                 cost=f"${prior_cost:.2f}",
             )
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue.id, truncate_body(reviewing_feedback(v))
                 )
             except LinearError as e:
@@ -4378,7 +4438,7 @@ class Orchestrator:
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue.id, truncate_body(fix_pushed(v_done))
                 )
             except LinearError as e:
@@ -5406,7 +5466,7 @@ class Orchestrator:
                 cost=f"${prior_cost:.2f}",
             )
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue.id, truncate_body(fixing_merge_conflict(v_start))
                 )
             except LinearError as e:
@@ -5734,7 +5794,7 @@ class Orchestrator:
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue.id, truncate_body(fix_pushed(v_done))
                 )
             except LinearError as e:
@@ -5870,7 +5930,7 @@ class Orchestrator:
                 states = await self._states_for_binding(binding)
                 blocked_id = states.get(binding.linear_states.blocked)
                 try:
-                    issue = await self.linear.lookup_issue(issue_id)
+                    issue = await self.tracker().lookup_issue(issue_id)
                 except LinearError as e:
                     log.warning("could not look up %s for reject: %s", issue_id, e)
                     raise SlashHandlerFailure(
@@ -5879,7 +5939,7 @@ class Orchestrator:
                     ) from e
                 if blocked_id is not None:
                     try:
-                        await self.linear.move_issue(issue_id, blocked_id)
+                        await self.tracker().move_issue(issue_id, blocked_id)
                     except LinearError as e:
                         log.warning(
                             "could not move %s to blocked: %s", issue.identifier, e
@@ -5899,7 +5959,7 @@ class Orchestrator:
         # survive so the next poll tick can retry. Clearing first would
         # make the issue invisible to slash polling on the retry.
         try:
-            issue = await self.linear.lookup_issue(issue_id)
+            issue = await self.tracker().lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for retry: %s", issue_id, e)
             raise SlashHandlerFailure(
@@ -5954,7 +6014,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue_id, truncate_body(body))
+            await self.tracker().post_comment(issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("retry comment failed for %s: %s", issue_id, e)
 
@@ -5994,7 +6054,7 @@ class Orchestrator:
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
             try:
-                issue = await self.linear.lookup_issue(issue_id)
+                issue = await self.tracker().lookup_issue(issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -6003,7 +6063,7 @@ class Orchestrator:
                 ) from e
             if blocked_id is not None:
                 try:
-                    await self.linear.move_issue(issue_id, blocked_id)
+                    await self.tracker().move_issue(issue_id, blocked_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to blocked after merge reject: %s",
@@ -6022,7 +6082,7 @@ class Orchestrator:
 
         # $approve or $retry: re-dispatch the merge.
         try:
-            issue = await self.linear.lookup_issue(issue_id)
+            issue = await self.tracker().lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
             raise SlashHandlerFailure(
@@ -6046,7 +6106,7 @@ class Orchestrator:
         async def on_merge_started(new_run_id: str) -> None:
             await self._clear_operator_wait(issue_id, run_id)
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue_id,
                     truncate_body(
                         resumed(
@@ -6111,7 +6171,7 @@ class Orchestrator:
             return
 
         try:
-            issue = await self.linear.lookup_issue(issue_id)
+            issue = await self.tracker().lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for acceptance slash: %s", issue_id, e)
             raise SlashHandlerFailure(
@@ -6158,7 +6218,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue_id, truncate_body(body))
+                await self.tracker().post_comment(issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("skip-acceptance comment failed for %s: %s", issue_id, e)
             return
@@ -6183,7 +6243,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue_id, truncate_body(body))
+            await self.tracker().post_comment(issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("retry-acceptance comment failed for %s: %s", issue_id, e)
 
@@ -6200,7 +6260,7 @@ class Orchestrator:
         monitor_run_id = self._review_poll_issue_ids.get(issue_id)
         if monitor_run_id is None or monitor_run_id not in self._review_poll_run_ids:
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue_id,
                     truncate_body(
                         command_rejected(
@@ -6214,7 +6274,7 @@ class Orchestrator:
             return
 
         try:
-            issue = await self.linear.lookup_issue(issue_id)
+            issue = await self.tracker().lookup_issue(issue_id)
         except LinearError as e:
             log.warning("could not look up %s for skip-review: %s", issue_id, e)
             return
@@ -6222,7 +6282,7 @@ class Orchestrator:
         state = await db.review_state.get(self._conn, issue_id)
         if state.pr_number is None:
             try:
-                await self.linear.post_comment(
+                await self.tracker().post_comment(
                     issue_id,
                     truncate_body(
                         command_rejected("$skip-review", "no PR found for this issue")
@@ -6253,7 +6313,7 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 log.exception("skip-review: could not kill fix run %s", fix_run_id)
                 try:
-                    await self.linear.post_comment(
+                    await self.tracker().post_comment(
                         issue_id,
                         truncate_body(
                             command_rejected(
@@ -6312,7 +6372,7 @@ class Orchestrator:
             next_stage="merge",
         )
         try:
-            await self.linear.post_comment(issue_id, truncate_body(skip_review_forced(v)))
+            await self.tracker().post_comment(issue_id, truncate_body(skip_review_forced(v)))
         except LinearError as e:
             log.warning("could not post skip-review comment for %s: %s", issue.identifier, e)
 
@@ -6349,7 +6409,7 @@ class Orchestrator:
                 except ValueError:
                     pass
             try:
-                issue = await self.linear.lookup_issue(pr.issue_id)
+                issue = await self.tracker().lookup_issue(pr.issue_id)
             except LinearError as e:
                 log.warning(
                     "could not look up orphaned review issue %s: %s",
@@ -6393,7 +6453,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue.id, truncate_body(body))
+                await self.tracker().post_comment(issue.id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "resurrection comment failed for %s: %s", issue.identifier, e
@@ -6445,7 +6505,7 @@ class Orchestrator:
                 states = await self._states_for_binding(binding)
                 needs_approval_id = states.get(binding.linear_states.needs_approval)
                 if needs_approval_id is not None:
-                    await self.linear.move_issue(issue.id, needs_approval_id)
+                    await self.tracker().move_issue(issue.id, needs_approval_id)
                 else:
                     log.warning(
                         "missing Linear needs_approval state %r for %s",
@@ -6483,7 +6543,7 @@ class Orchestrator:
                 "Reply with `$reject` or `$stop` to leave it halted.\n"
             )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("review failed comment failed on %s: %s", issue.identifier, e)
 
@@ -6523,7 +6583,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "orphaned review failed comment failed on %s: %s",
@@ -6558,14 +6618,14 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("stuck-loop comment failed on %s: %s", issue.identifier, e)
         try:
             states = await self._states_for_binding(binding)
             needs_approval_id = states.get(binding.linear_states.needs_approval)
             if needs_approval_id is not None:
-                await self.linear.move_issue(issue.id, needs_approval_id)
+                await self.tracker().move_issue(issue.id, needs_approval_id)
         except LinearError as e:
             log.warning("could not park %s for approval: %s", issue.identifier, e)
         await db.runs.update_status(
@@ -6583,17 +6643,18 @@ class Orchestrator:
         ready_state = binding.linear_states.ready
         waiting_state = binding.linear_states.waiting
         waiting_issues: list[LinearIssue] = []
+        tracker = self.tracker(binding)
         try:
             if waiting_state is None:
-                issues = await self.linear.issues_in_state(
+                issues = await tracker.issues_in_state(
                     binding.linear_team_key, ready_state, binding.issue_label
                 )
             else:
                 ready_result, waiting_result = await asyncio.gather(
-                    self.linear.issues_in_state(
+                    tracker.issues_in_state(
                         binding.linear_team_key, ready_state, binding.issue_label
                     ),
-                    self.linear.issues_in_state(
+                    tracker.issues_in_state(
                         binding.linear_team_key, waiting_state, binding.issue_label
                     ),
                     return_exceptions=True,
@@ -6668,7 +6729,7 @@ class Orchestrator:
 
         for issue in unblocked_issues:
             try:
-                await self.linear.move_issue(issue.id, ready_id)
+                await self.tracker().move_issue(issue.id, ready_id)
             except LinearError as e:
                 log.warning("could not auto-unblock %s to Ready: %s", issue.identifier, e)
                 continue
@@ -6894,7 +6955,7 @@ class Orchestrator:
                 return
             else:
                 try:
-                    await self.linear.move_issue(issue.id, target_id)
+                    await self.tracker().move_issue(issue.id, target_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s after existing PR guard for PR #%d: %s",
@@ -6905,7 +6966,7 @@ class Orchestrator:
                     return
 
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "could not comment after existing PR guard for %s PR #%d: %s",
@@ -6946,7 +7007,7 @@ class Orchestrator:
         ready_id = states.get(binding.linear_states.ready)
 
         try:
-            await self.linear.move_issue(issue.id, waiting_id)
+            await self.tracker().move_issue(issue.id, waiting_id)
         except LinearError as e:
             log.warning(
                 "could not move %s to waiting for dependency blockers %s: %s",
@@ -6967,7 +7028,7 @@ class Orchestrator:
             blockers,
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "could not comment after moving %s to waiting for blockers %s: %s",
@@ -6977,7 +7038,7 @@ class Orchestrator:
             )
             if ready_id is not None:
                 try:
-                    await self.linear.move_issue(issue.id, ready_id)
+                    await self.tracker().move_issue(issue.id, ready_id)
                 except LinearError as rollback_error:
                     log.warning(
                         "could not move %s back to ready after waiting comment failed: %s",
@@ -7068,7 +7129,7 @@ class Orchestrator:
         self, binding: RepoBinding, issue: LinearIssue
     ) -> LinearIssue | None:
         try:
-            current = await self.linear.lookup_issue(issue.id)
+            current = await self.tracker().lookup_issue(issue.id)
         except LinearError as e:
             log.warning("could not revalidate %s before dispatch: %s", issue.identifier, e)
             return None
@@ -7206,7 +7267,7 @@ class Orchestrator:
         if _pr_view_is_merged(view) or not _pr_view_is_closed(view):
             return 0
         try:
-            issue = await self.linear.lookup_issue(pr.issue_id)
+            issue = await self.tracker().lookup_issue(pr.issue_id)
         except LinearError as e:
             log.warning(
                 "could not refresh parked closed-unmerged issue %s: %s",
@@ -7268,7 +7329,7 @@ class Orchestrator:
 
             if issue.state_name != binding.linear_states.done and issue.state_id != done_id:
                 try:
-                    await self.linear.move_issue(issue.id, done_id)
+                    await self.tracker().move_issue(issue.id, done_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to done after parked PR closed: %s",
@@ -7280,7 +7341,7 @@ class Orchestrator:
             comment_key = (issue.id, binding.github_repo, pr.pr_number)
             if comment_key not in self._parked_closed_unmerged_comment_keys:
                 try:
-                    await self.linear.post_comment(
+                    await self.tracker().post_comment(
                         issue.id, truncate_body(PARKED_CLOSED_UNMERGED_COMMENT)
                     )
                 except LinearError as e:
@@ -7339,7 +7400,7 @@ class Orchestrator:
                 )
                 continue
             try:
-                issue = await self.linear.lookup_issue(pr.issue_id)
+                issue = await self.tracker().lookup_issue(pr.issue_id)
             except LinearError as e:
                 log.warning(
                     "could not refresh merged issue %s for state reconcile: %s",
@@ -7352,7 +7413,7 @@ class Orchestrator:
 
             observed_state = issue.state_name or issue.state_id or "unknown"
             try:
-                await self.linear.move_issue(issue.id, done_id)
+                await self.tracker().move_issue(issue.id, done_id)
             except LinearError as e:
                 log.warning(
                     "could not re-move merged issue %s from %s to %s: %s",
@@ -7373,7 +7434,7 @@ class Orchestrator:
                 f"was merged at {pr.merged_at}."
             )
             try:
-                await self.linear.post_comment(issue.id, truncate_body(body))
+                await self.tracker().post_comment(issue.id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "could not post merged issue drift correction comment for %s: %s",
@@ -7405,7 +7466,7 @@ class Orchestrator:
         self, issue: LinearIssue
     ) -> LinearIssue:
         try:
-            return await self.linear.lookup_issue(issue.id)
+            return await self.tracker().lookup_issue(issue.id)
         except LinearError as e:
             log.warning(
                 "could not refresh %s labels before acceptance merge handoff: %s",
@@ -7460,7 +7521,7 @@ class Orchestrator:
             return
 
         try:
-            await self.linear.move_issue(issue.id, needs_approval_id)
+            await self.tracker().move_issue(issue.id, needs_approval_id)
         except LinearError as e:
             log.warning(
                 "could not move %s to needs approval for manual merge: %s",
@@ -7483,7 +7544,7 @@ class Orchestrator:
 
         body = f"✅ review passed, ready for manual merge: {pr_url}"
         try:
-            await self.linear.post_comment(issue.id, body)
+            await self.tracker().post_comment(issue.id, body)
         except LinearError as e:
             log.warning(
                 "could not post manual merge comment for %s: %s",
@@ -7518,7 +7579,7 @@ class Orchestrator:
             if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
                 continue
             try:
-                issue = await self.linear.lookup_issue(candidate.issue_id)
+                issue = await self.tracker().lookup_issue(candidate.issue_id)
             except LinearError as e:
                 log.warning(
                     "could not refresh %s before merge: %s",
@@ -7920,7 +7981,7 @@ class Orchestrator:
                 verdict=verdict,
                 pr_url=pr_url,
             )
-            comment_id = await self.linear.post_comment(issue.id, truncate_body(body))
+            comment_id = await self.tracker().post_comment(issue.id, truncate_body(body))
             if comment_id:
                 return f"{issue.url}#comment-{comment_id}"
         except LinearError as e:
@@ -7939,7 +8000,7 @@ class Orchestrator:
     ) -> None:
         try:
             body = format_acceptance_criteria_comment(criteria)
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "acceptance criteria comment failed on %s: %s",
@@ -7962,7 +8023,7 @@ class Orchestrator:
         for screenshot in verdict.screenshots:
             try:
                 path = _acceptance_artifact_path(workspace_path, screenshot.path)
-                url = await self.linear.upload_issue_attachment(
+                url = await self.tracker().upload_issue_attachment(
                     issue_uuid=issue.id,
                     path=path,
                     title=f"Acceptance screenshot: {screenshot.label}",
@@ -8356,7 +8417,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue.id, truncate_body(body))
+                await self.tracker().post_comment(issue.id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "acceptance rejected wait comment failed on %s: %s",
@@ -8660,7 +8721,7 @@ class Orchestrator:
         issue: LinearIssue,
     ) -> LinearIssue | None:
         try:
-            current = await self.linear.lookup_issue(issue.id)
+            current = await self.tracker().lookup_issue(issue.id)
         except LinearError as e:
             log.warning(
                 "could not revalidate %s before merge execution: %s",
@@ -8779,7 +8840,7 @@ class Orchestrator:
             run_id=str(run.id),
         )
         try:
-            await self.linear.post_comment(issue.id, codex_lgtm(v))
+            await self.tracker().post_comment(issue.id, codex_lgtm(v))
         except LinearError as e:
             log.warning(
                 "could not post codex_lgtm comment for %s: %s",
@@ -8988,6 +9049,8 @@ class Orchestrator:
         await db.issues.upsert(
             self._conn,
             id=issue.id,
+            provider=binding.tracker_provider,
+            site=binding.tracker_site,
             identifier=issue.identifier,
             title=issue.title,
             team_key=issue.team_key,
@@ -9052,6 +9115,7 @@ class Orchestrator:
         )
 
         # 1. 🚀 "starting" Linear comment.
+        tracker = self.tracker(binding)
         starting = run_started(
             CommentVars(
                 stage="implement",
@@ -9061,7 +9125,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(starting))
+            await tracker.post_comment(issue.id, truncate_body(starting))
         except LinearError as e:
             log.warning("could not announce dispatch on %s: %s", issue.identifier, e)
             await db.runs.update_status(
@@ -9074,7 +9138,7 @@ class Orchestrator:
 
         # 2. Move the Linear issue to In Progress.
         try:
-            await self.linear.move_issue(issue.id, in_progress_id)
+            await tracker.move_issue(issue.id, in_progress_id)
         except LinearError as e:
             log.warning(
                 "could not move %s to %s: %s",
@@ -9237,7 +9301,7 @@ class Orchestrator:
                     cost=f"${cumulative_cost:.4f}",
                 )
             )
-            await self.linear.post_comment(issue.id, truncate_body(done_body))
+            await tracker.post_comment(issue.id, truncate_body(done_body))
         except LinearError as e:
             log.warning("stage_done comment failed on %s: %s", issue.identifier, e)
 
@@ -9666,7 +9730,7 @@ class Orchestrator:
             return
 
         total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
-        await self.linear.move_issue(issue.id, done_id)
+        await self.tracker().move_issue(issue.id, done_id)
         final_body = stage_done(
             CommentVars(
                 stage="merge",
@@ -9679,7 +9743,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(final_body))
+            await self.tracker().post_comment(issue.id, truncate_body(final_body))
         except LinearError as e:
             log.warning(
                 "could not post final merge comment for %s: %s",
@@ -9755,7 +9819,7 @@ class Orchestrator:
             )
             if needs_approval_id is not None:
                 try:
-                    await self.linear.move_issue(issue.id, needs_approval_id)
+                    await self.tracker().move_issue(issue.id, needs_approval_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to needs approval after merge failure: %s",
@@ -9769,7 +9833,7 @@ class Orchestrator:
                     issue.identifier,
                 )
             try:
-                await self.linear.post_comment(issue.id, truncate_body(body))
+                await self.tracker().post_comment(issue.id, truncate_body(body))
             except LinearError as e:
                 log.warning("needs approval comment failed on %s: %s", issue.identifier, e)
         finally:
@@ -10060,7 +10124,7 @@ class Orchestrator:
             f"cap={cap})."
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "local-review starting comment failed on %s: %s",
@@ -10094,7 +10158,7 @@ class Orchestrator:
             body_parts.append(f"> {snippet}")
         body = "\n\n".join(body_parts)
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "local-review iter comment failed on %s: %s",
@@ -10120,7 +10184,7 @@ class Orchestrator:
             body_parts.append("Last findings:\n\n" + last_findings)
         body = "\n\n".join(body_parts)
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning(
                 "local-review comment post failed on %s: %s", issue.identifier, e
@@ -10222,7 +10286,7 @@ class Orchestrator:
             )
             return
         try:
-            await self.linear.move_issue(issue.id, review_state_id)
+            await self.tracker(binding).move_issue(issue.id, review_state_id)
         except LinearError as e:
             log.warning(
                 "could not move %s to review state %r: %s",
@@ -10252,7 +10316,7 @@ class Orchestrator:
             )
             return
         try:
-            await self.linear.move_issue(issue.id, acceptance_state_id)
+            await self.tracker(binding).move_issue(issue.id, acceptance_state_id)
         except LinearError as e:
             log.warning(
                 "could not move %s to acceptance state %r: %s",
@@ -10400,7 +10464,7 @@ class Orchestrator:
         ):
             return False
         try:
-            await self.linear.post_comment(issue.id, body)
+            await self.tracker().post_comment(issue.id, body)
         except LinearError as e:
             log.warning(
                 "activity comment failed on %s run %s: %s",
@@ -10811,7 +10875,7 @@ class Orchestrator:
             )
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("cost_warning comment failed on %s: %s", issue.identifier, e)
             return False
@@ -10846,7 +10910,7 @@ class Orchestrator:
             parked = False
             if needs_approval_id is not None:
                 try:
-                    await self.linear.move_issue(issue.id, needs_approval_id)
+                    await self.tracker().move_issue(issue.id, needs_approval_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to needs_approval after cap breach: %s",
@@ -10863,7 +10927,7 @@ class Orchestrator:
                 )
             if not parked and blocked_id is not None:
                 try:
-                    await self.linear.move_issue(issue.id, blocked_id)
+                    await self.tracker().move_issue(issue.id, blocked_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to blocked after cap breach: %s",
@@ -10890,7 +10954,7 @@ class Orchestrator:
                 )
             )
             try:
-                await self.linear.post_comment(issue.id, truncate_body(body))
+                await self.tracker().post_comment(issue.id, truncate_body(body))
             except LinearError as e:
                 log.warning(
                     "cost_cap_reached comment failed on %s: %s", issue.identifier, e
@@ -10941,7 +11005,7 @@ class Orchestrator:
                         or rollback_state_id
                     )
         try:
-            await self.linear.move_issue(issue.id, target_state_id)
+            await self.tracker().move_issue(issue.id, target_state_id)
         except LinearError as e:
             log.warning(
                 "could not park %s after failed dispatch: %s",
@@ -10967,7 +11031,7 @@ class Orchestrator:
             "Reply with `$reject` or `$stop` to leave it halted.\n"
         )
         try:
-            await self.linear.post_comment(issue.id, truncate_body(body))
+            await self.tracker().post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("implement failed comment post failed on %s: %s", issue.identifier, e)
 
@@ -11057,35 +11121,4 @@ def _comment_issue_id_from_webhook_payload(payload: Mapping[str, Any]) -> str | 
 def _comment_from_webhook_payload(
     payload: Mapping[str, Any]
 ) -> LinearComment | None:
-    data = payload.get("data")
-    if not isinstance(data, Mapping):
-        return None
-    comment_id = data.get("id")
-    body = data.get("body")
-    created_at = data.get("createdAt") or payload.get("createdAt")
-    if not isinstance(comment_id, str) or not comment_id:
-        return None
-    if not isinstance(body, str):
-        return None
-    if not isinstance(created_at, str) or not created_at:
-        return None
-    actor = payload.get("actor")
-    author_name = ""
-    author_is_me = False
-    if isinstance(actor, Mapping):
-        raw_name = actor.get("name")
-        author_name = raw_name if isinstance(raw_name, str) else ""
-    author_is_me = is_symphony_comment(body)
-    external_thread_type: str | None = None
-    ext = data.get("externalThread")
-    if isinstance(ext, Mapping):
-        raw_type = ext.get("type")
-        external_thread_type = raw_type if isinstance(raw_type, str) else None
-    return LinearComment(
-        id=comment_id,
-        body=body,
-        created_at=created_at,
-        author_name=author_name,
-        author_is_me=author_is_me,
-        external_thread_type=external_thread_type,
-    )
+    return comment_from_webhook_payload(payload)
