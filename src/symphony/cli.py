@@ -39,6 +39,7 @@ from .tracker import (
     DEFAULT_SITE,
     TrackerContext,
     TrackerRegistry,
+    context_for_binding,
     for_binding,
 )
 from .webhook import WebhookSettings
@@ -177,7 +178,7 @@ def _config_has_linear_bindings(cfg: Config) -> bool:
 
 
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
-    return TrackerContext(provider=binding.tracker_provider, site=binding.tracker_site)
+    return context_for_binding(binding)
 
 
 @asynccontextmanager

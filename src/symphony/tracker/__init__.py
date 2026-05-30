@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 DEFAULT_PROVIDER = "linear"
 DEFAULT_SITE = "default"
 
-TrackerKey = tuple[str, str]
+TrackerKey = tuple[str, str, str]
 StateCacheKey = tuple[str, str, str]
 
 
@@ -22,6 +22,7 @@ StateCacheKey = tuple[str, str, str]
 class TrackerContext:
     provider: str = DEFAULT_PROVIDER
     site: str = DEFAULT_SITE
+    project_key: str = ""
 
 
 @dataclass
@@ -94,18 +95,48 @@ class TrackerRegistry:
         provider: str,
         site: str,
         tracker: IssueTracker,
+        project_key: str = "",
     ) -> None:
-        self._trackers[(provider, site)] = tracker
+        self._trackers[(provider, site, project_key)] = tracker
 
     def resolve(self, ctx: TrackerContext | None = None) -> IssueTracker:
         key = (
             ctx.provider if ctx is not None else DEFAULT_PROVIDER,
             ctx.site if ctx is not None else DEFAULT_SITE,
+            ctx.project_key if ctx is not None else "",
         )
-        try:
+        if key in self._trackers:
             return self._trackers[key]
-        except KeyError as exc:
-            raise KeyError(f"no issue tracker registered for {key}") from exc
+
+        provider, site, project_key = key
+        if project_key:
+            fallback = (provider, site, "")
+            if fallback in self._trackers:
+                return self._trackers[fallback]
+        else:
+            matches = [
+                tracker
+                for (registered_provider, registered_site, _), tracker in self._trackers.items()
+                if registered_provider == provider and registered_site == site
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise KeyError(
+                    "multiple issue trackers registered for "
+                    f"{(provider, site)}; provide project_key"
+                )
+
+        raise KeyError(f"no issue tracker registered for {key}")
+
+
+def context_for_binding(binding: RepoBinding) -> TrackerContext:
+    project_key = binding.project_key if binding.provider == "jira" else ""
+    return TrackerContext(
+        provider=binding.tracker_provider,
+        site=binding.tracker_site,
+        project_key=project_key,
+    )
 
 
 def for_binding(
@@ -139,5 +170,11 @@ def for_binding(
         raise ValueError(f"unsupported issue tracker provider {binding.provider!r}")
 
     if registry is not None:
-        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+        ctx = context_for_binding(binding)
+        registry.register(
+            ctx.provider,
+            ctx.site,
+            tracker,
+            project_key=ctx.project_key,
+        )
     return tracker
