@@ -89,6 +89,36 @@ async def test_warmup_caches_states_by_provider_site_and_team(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_warmup_registers_configured_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    binding = _binding()
+    binding.tracker_provider = "linear-alt"
+    binding.tracker_site = "secondary"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        tracker = AsyncMock()
+        tracker.viewer_team_keys = AsyncMock(return_value=["ENG"])
+        tracker.team_states = AsyncMock(return_value={"Todo": "state-secondary"})
+        orch = Orchestrator(
+            Config(repos=[binding]),
+            tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+
+        await orch.warmup()
+
+        assert orch.tracker(binding) is tracker
+        assert orch._states == {  # noqa: SLF001
+            ("linear-alt", "secondary", "ENG"): {"Todo": "state-secondary"},
+        }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_binding_scoped_lookup_uses_binding_tracker(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 

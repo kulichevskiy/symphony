@@ -520,6 +520,16 @@ def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
     return (binding.tracker_provider, binding.tracker_site, binding.linear_team_key)
 
 
+def _register_configured_trackers(
+    registry: TrackerRegistry,
+    config: Config,
+    tracker: IssueTracker,
+) -> None:
+    registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
+    for binding in config.repos:
+        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+
+
 def _binding_label_from_storage_key(binding_key: str) -> str | None:
     if not binding_key:
         return None
@@ -1239,7 +1249,7 @@ class Orchestrator:
     ) -> None:
         self.config = config
         self._trackers = TrackerRegistry()
-        self._trackers.register(DEFAULT_PROVIDER, DEFAULT_SITE, linear)
+        _register_configured_trackers(self._trackers, config, linear)
         self._conn = conn
         self._shutdown = asyncio.Event()
         self._gh: GitHub = gh if gh is not None else GitHub()
