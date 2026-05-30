@@ -1,6 +1,6 @@
 """Per-issue persistent workspace clones.
 
-Each issue gets a private clone at `{root}/{repo_safe}/{issue_id_lower}/`.
+Each issue gets a private clone at `{root}/{repo_namespace}/{issue_id_lower}/`.
 The clone persists across stages (Implement / Review fix-runs / Merge) so
 fix-runs don't pay the clone cost on every retry. Stale clones are swept
 on mtime — the simplest signal that nothing is running against the dir.
@@ -83,8 +83,18 @@ class Workspace:
         # the encoding stays injective.
         return github_repo.replace("_", "_u").replace("/", "_s")
 
+    @classmethod
+    def repo_namespace(cls, binding: RepoBinding) -> str:
+        return "__".join(
+            (
+                cls.repo_safe(binding.tracker_provider),
+                cls.repo_safe(binding.tracker_site),
+                cls.repo_safe(binding.github_repo),
+            )
+        )
+
     def path_for(self, binding: RepoBinding, issue: Issue) -> Path:
-        return self._root / self.repo_safe(binding.github_repo) / issue.identifier.lower()
+        return self._root / self.repo_namespace(binding) / issue.identifier.lower()
 
     async def acquire(self, binding: RepoBinding, issue: Issue) -> Path:
         """Idempotent: clone if missing, fetch if present, then check out branch."""
