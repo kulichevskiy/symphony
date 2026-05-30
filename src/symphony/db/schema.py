@@ -161,3 +161,20 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
                )
             """
         )
+    cur = await conn.execute("PRAGMA table_info(operator_waits)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "provider" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits "
+            "ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
+        )
+        await conn.execute(
+            """
+            UPDATE operator_waits
+               SET provider = COALESCE(
+                   (SELECT provider FROM issues WHERE issues.id = operator_waits.issue_id),
+                   NULLIF(tracker_provider, ''),
+                   'linear'
+               )
+            """
+        )

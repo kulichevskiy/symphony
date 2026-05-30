@@ -15,8 +15,10 @@ import os
 import re
 import signal
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import click
 
@@ -27,11 +29,19 @@ from .agent.codex_cli import (
     ensure_symphony_permissions_profile,
 )
 from .app import build_server_config, create_app
-from .config import Config, RepoBinding
+from .config import Config, RepoBinding, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
+from .tracker import (
+    DEFAULT_PROVIDER,
+    DEFAULT_SITE,
+    TrackerContext,
+    TrackerRegistry,
+    context_for_binding,
+    for_binding,
+)
 from .webhook import WebhookSettings
 
 _ANSI_RESET = "\x1b[0m"
@@ -163,6 +173,31 @@ def _config_can_run_codex_cli(cfg: Config) -> bool:
     return any(_binding_can_run_codex_cli(binding) for binding in cfg.repos)
 
 
+def _config_has_linear_bindings(cfg: Config) -> bool:
+    return any(binding.provider == "linear" for binding in cfg.repos)
+
+
+def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
+    return context_for_binding(binding)
+
+
+@asynccontextmanager
+async def _configured_tracker_registry(
+    cfg: Config,
+) -> AsyncIterator[tuple[TrackerRegistry, Linear | None]]:
+    secrets = Secrets()
+    registry = TrackerRegistry()
+    external_linear: Linear | None = None
+    async with AsyncExitStack() as stack:
+        for binding in cfg.repos:
+            tracker = for_binding(binding, secrets, registry=registry)
+            await stack.enter_async_context(cast(Any, tracker))
+            if binding.provider == "linear" and external_linear is None:
+                external_linear = cast(Linear, tracker)
+                registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
+        yield registry, external_linear
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--config",
@@ -185,14 +220,14 @@ def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
 
 async def _run(config_path: Path, *, once: bool) -> None:
     cfg = Config.load(config_path)
-    if not cfg.linear_api_key:
+    if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
         sys.exit(2)
-    async with Linear(cfg.linear_api_key) as linear:
+    async with _configured_tracker_registry(cfg) as (trackers, external_linear):
         conn = await db.connect(cfg.db_path)
         try:
-            orch = Orchestrator(cfg, linear, conn)
-            await reconcile(conn, orch.tracker)
+            orch = Orchestrator(cfg, trackers, conn)
+            await reconcile(conn, trackers)
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access
@@ -224,7 +259,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_db_path=cfg.db_path,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                     ui_external_config=cfg,
-                    ui_external_linear=linear,
+                    ui_external_linear=external_linear,
                     ui_external_github=orch._gh,  # pylint: disable=protected-access
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
@@ -265,14 +300,75 @@ async def _run(config_path: Path, *, once: bool) -> None:
     required=True,
 )
 def preflight(config_path: Path) -> None:
-    """Validate Linear auth, list visible teams, and confirm configured states exist."""
+    """Validate issue tracker auth and confirm configured states exist."""
     _setup_logging()
     asyncio.run(_preflight(config_path))
 
 
+async def _preflight_configured_bindings(
+    cfg: Config, trackers: TrackerRegistry
+) -> bool:
+    visible_by_ctx: dict[TrackerContext, list[str]] = {}
+    ok = True
+    for binding in cfg.repos:
+        ctx = _tracker_context_for_binding(binding)
+        tracker = trackers.resolve(ctx)
+        visible = visible_by_ctx.get(ctx)
+        if visible is None:
+            try:
+                visible = await tracker.viewer_team_keys()
+            except LinearError as e:
+                click.echo(f"{binding.provider} auth failed: {e}", err=True)
+                sys.exit(1)
+            visible_by_ctx[ctx] = visible
+            visible_label = (
+                "linear teams"
+                if binding.provider == "linear"
+                else f"{binding.provider} projects"
+            )
+            click.echo(f"{visible_label} visible to this key: {visible}")
+        if binding.project_key not in visible:
+            click.echo(
+                f"  ✗ {binding.project_key}: not visible — will be skipped at runtime"
+            )
+            ok = False
+            continue
+        states = await tracker.team_states(binding.project_key)
+        ready = binding.states.ready
+        if not ready or ready not in states:
+            click.echo(
+                f"  ✗ {binding.project_key}: ready state "
+                f"{ready!r} not in project workflow; "
+                f"available: {sorted(states.keys())}"
+            )
+            ok = False
+            continue
+        missing = [
+            name
+            for name in (
+                binding.states.in_progress,
+                binding.states.code_review,
+                binding.states.needs_approval,
+                binding.states.blocked,
+                binding.states.waiting,
+                binding.states.done,
+            )
+            if name is not None and name not in states
+        ]
+        if missing:
+            click.echo(
+                f"  ✗ {binding.project_key}: missing states {missing}; "
+                f"available: {sorted(states.keys())}"
+            )
+            ok = False
+        else:
+            click.echo(f"  ✓ {binding.project_key} → {binding.github_repo}: states ok")
+    return ok
+
+
 async def _preflight(config_path: Path) -> None:
     cfg = Config.load(config_path)
-    if not cfg.linear_api_key:
+    if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY is empty", err=True)
         sys.exit(2)
     if _config_can_run_codex_cli(cfg):
@@ -293,52 +389,13 @@ async def _preflight(config_path: Path) -> None:
             )
     else:
         click.echo("codex permissions profile not required by configured repos")
-    async with Linear(cfg.linear_api_key) as linear:
-        try:
-            visible = await linear.viewer_team_keys()
-        except LinearError as e:
-            click.echo(f"linear auth failed: {e}", err=True)
-            sys.exit(1)
-        click.echo(f"linear teams visible to this key: {visible}")
-        ok = True
-        for binding in cfg.repos:
-            if binding.linear_team_key not in visible:
-                click.echo(
-                    f"  ✗ {binding.linear_team_key}: not visible — will be skipped at runtime"
-                )
-                ok = False
-                continue
-            states = await linear.team_states(binding.linear_team_key)
-            ready = binding.linear_states.ready
-            if not ready or ready not in states:
-                click.echo(
-                    f"  ✗ {binding.linear_team_key}: ready state "
-                    f"{ready!r} not in team workflow; "
-                    f"available: {sorted(states.keys())}"
-                )
-                ok = False
-                continue
-            missing = [
-                name
-                for name in (
-                    binding.linear_states.in_progress,
-                    binding.linear_states.code_review,
-                    binding.linear_states.needs_approval,
-                    binding.linear_states.blocked,
-                    binding.linear_states.waiting,
-                    binding.linear_states.done,
-                )
-                if name is not None and name not in states
-            ]
-            if missing:
-                click.echo(
-                    f"  ✗ {binding.linear_team_key}: missing states {missing}; "
-                    f"available: {sorted(states.keys())}"
-                )
-                ok = False
-            else:
-                click.echo(f"  ✓ {binding.linear_team_key} → {binding.github_repo}: states ok")
-        sys.exit(0 if ok else 1)
+    try:
+        async with _configured_tracker_registry(cfg) as (trackers, _):
+            ok = await _preflight_configured_bindings(cfg, trackers)
+    except ValueError as e:
+        click.echo(str(e), err=True)
+        sys.exit(2)
+    sys.exit(0 if ok else 1)
 
 
 @main.group()

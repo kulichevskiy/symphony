@@ -76,6 +76,7 @@ async def _preserve_pidless_review_retry_path(
         github_repo=state.github_repo,
         issue_label=state.issue_label,
         created_at=created_at,
+        provider=str(row["provider"]),
         tracker_provider=str(row["provider"]),
         tracker_site=str(row["site"]),
     )
@@ -114,7 +115,7 @@ async def _tracker_identity_for_issue(
     issue_id: str,
 ) -> tuple[str, TrackerContext]:
     cur = await conn.execute(
-        "SELECT tracker_issue_id, provider, site FROM issues WHERE id = ?",
+        "SELECT tracker_issue_id, provider, site, team_key FROM issues WHERE id = ?",
         (issue_id,),
     )
     row = await cur.fetchone()
@@ -125,7 +126,12 @@ async def _tracker_identity_for_issue(
     if not provider or not site:
         return issue_id, TrackerContext()
     tracker_issue_id = str(row["tracker_issue_id"] or issue_id)
-    return tracker_issue_id, TrackerContext(provider=provider, site=site)
+    project_key = str(row["team_key"] or "") if provider == "jira" else ""
+    return tracker_issue_id, TrackerContext(
+        provider=provider,
+        site=site,
+        project_key=project_key,
+    )
 
 
 async def _post_reconcile_comment(

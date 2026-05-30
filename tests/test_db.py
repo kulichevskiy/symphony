@@ -776,6 +776,7 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
         assert got is not None
         assert got.run_id == "run-1"
         assert got.kind == db.operator_waits.KIND_COST_CAP
+        assert got.provider == "linear"
         assert got.issue_label == "ready"
         assert await db.operator_waits.list_all(conn) == [got]
         transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
@@ -795,6 +796,98 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
         ]
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_waits_provider_column_migrates_existing_rows(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "legacy.sqlite"
+    legacy = await aiosqlite.connect(p)
+    try:
+        await legacy.executescript(
+            """
+            CREATE TABLE issues (
+                id               TEXT PRIMARY KEY,
+                tracker_issue_id TEXT NOT NULL,
+                provider         TEXT NOT NULL DEFAULT 'linear',
+                site             TEXT NOT NULL DEFAULT 'default',
+                identifier       TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                team_key         TEXT NOT NULL
+            );
+            CREATE TABLE runs (
+                id          TEXT PRIMARY KEY,
+                issue_id    TEXT NOT NULL REFERENCES issues(id),
+                stage       TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                pid         INTEGER,
+                started_at  TEXT NOT NULL,
+                ended_at    TEXT,
+                cost_usd    REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE operator_waits (
+                issue_id         TEXT PRIMARY KEY REFERENCES issues(id),
+                run_id           TEXT NOT NULL REFERENCES runs(id),
+                kind             TEXT NOT NULL,
+                tracker_provider TEXT NOT NULL DEFAULT 'linear',
+                tracker_site     TEXT NOT NULL DEFAULT 'default',
+                linear_team_key  TEXT NOT NULL,
+                github_repo      TEXT NOT NULL,
+                issue_label      TEXT NOT NULL DEFAULT '',
+                created_at       TEXT NOT NULL
+            );
+            INSERT INTO issues (
+                id, tracker_issue_id, provider, site, identifier, title, team_key
+            ) VALUES (
+                'iss-1', 'ISS-1', 'jira', 'https://jira.example.test', 'SYM-1', 't', 'SYM'
+            );
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at
+            ) VALUES (
+                'run-1', 'iss-1', 'implement', 'failed', NULL, '2026-05-10T00:00:00+00:00'
+            );
+            INSERT INTO operator_waits (
+                issue_id,
+                run_id,
+                kind,
+                tracker_provider,
+                tracker_site,
+                linear_team_key,
+                github_repo,
+                issue_label,
+                created_at
+            ) VALUES (
+                'iss-1',
+                'run-1',
+                'implement_failed',
+                'jira',
+                'https://jira.example.test',
+                'SYM',
+                'org/repo',
+                'symphony',
+                '2026-05-10T01:00:00+00:00'
+            );
+            """
+        )
+        await legacy.commit()
+    finally:
+        await legacy.close()
+
+    conn = await db.connect(p)
+    try:
+        cur = await conn.execute("PRAGMA table_info(operator_waits)")
+        columns = {str(row["name"]) for row in await cur.fetchall()}
+        wait = await db.operator_waits.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert "provider" in columns
+    assert wait is not None
+    assert wait.provider == "jira"
+    assert wait.tracker_provider == "jira"
+    assert wait.tracker_site == "https://jira.example.test"
+    assert wait.linear_team_key == "SYM"
 
 
 @pytest.mark.asyncio

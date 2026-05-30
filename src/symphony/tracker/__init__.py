@@ -6,12 +6,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from ..config import RepoBinding, Secrets
 
 DEFAULT_PROVIDER = "linear"
 DEFAULT_SITE = "default"
 
-TrackerKey = tuple[str, str]
+TrackerKey = tuple[str, str, str]
 StateCacheKey = tuple[str, str, str]
 
 
@@ -19,6 +22,7 @@ StateCacheKey = tuple[str, str, str]
 class TrackerContext:
     provider: str = DEFAULT_PROVIDER
     site: str = DEFAULT_SITE
+    project_key: str = ""
 
 
 @dataclass
@@ -91,15 +95,86 @@ class TrackerRegistry:
         provider: str,
         site: str,
         tracker: IssueTracker,
+        project_key: str = "",
     ) -> None:
-        self._trackers[(provider, site)] = tracker
+        self._trackers[(provider, site, project_key)] = tracker
 
     def resolve(self, ctx: TrackerContext | None = None) -> IssueTracker:
         key = (
             ctx.provider if ctx is not None else DEFAULT_PROVIDER,
             ctx.site if ctx is not None else DEFAULT_SITE,
+            ctx.project_key if ctx is not None else "",
         )
-        try:
+        if key in self._trackers:
             return self._trackers[key]
-        except KeyError as exc:
-            raise KeyError(f"no issue tracker registered for {key}") from exc
+
+        provider, site, project_key = key
+        if project_key:
+            fallback = (provider, site, "")
+            if fallback in self._trackers:
+                return self._trackers[fallback]
+        else:
+            matches = [
+                tracker
+                for (registered_provider, registered_site, _), tracker in self._trackers.items()
+                if registered_provider == provider and registered_site == site
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise KeyError(
+                    "multiple issue trackers registered for "
+                    f"{(provider, site)}; provide project_key"
+                )
+
+        raise KeyError(f"no issue tracker registered for {key}")
+
+
+def context_for_binding(binding: RepoBinding) -> TrackerContext:
+    project_key = binding.project_key if binding.provider == "jira" else ""
+    return TrackerContext(
+        provider=binding.tracker_provider,
+        site=binding.tracker_site,
+        project_key=project_key,
+    )
+
+
+def for_binding(
+    binding: RepoBinding,
+    secrets: Secrets,
+    *,
+    registry: TrackerRegistry | None = None,
+) -> IssueTracker:
+    """Build the concrete tracker for a binding and optionally register it."""
+    binding.apply_tracker_secret_defaults(jira_base_url=secrets.jira_base_url)
+    if binding.provider == "linear":
+        from ..linear.client import LinearTracker
+
+        tracker: IssueTracker = LinearTracker(secrets.linear_api_key)
+    elif binding.provider == "jira":
+        from ..jira.client import JiraTracker
+
+        tracker = JiraTracker(
+            base_url=binding.base_url or secrets.jira_base_url,
+            email=secrets.jira_email,
+            api_token=secrets.jira_api_token,
+            webhook_secret=secrets.jira_webhook_secret,
+            project_key=binding.project_key,
+            states={
+                str(state_name): str(state_name)
+                for state_name in binding.states.model_dump().values()
+                if state_name
+            },
+        )
+    else:
+        raise ValueError(f"unsupported issue tracker provider {binding.provider!r}")
+
+    if registry is not None:
+        ctx = context_for_binding(binding)
+        registry.register(
+            ctx.provider,
+            ctx.site,
+            tracker,
+            project_key=ctx.project_key,
+        )
+    return tracker

@@ -143,6 +143,7 @@ from ..tracker import (
     StateCacheKey,
     TrackerContext,
     TrackerRegistry,
+    context_for_binding,
 )
 from ..tracker import (
     Comment as LinearComment,
@@ -512,10 +513,7 @@ def _binding_storage_key(binding: RepoBinding) -> str:
 
 
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
-    return TrackerContext(
-        provider=binding.tracker_provider,
-        site=binding.tracker_site,
-    )
+    return context_for_binding(binding)
 
 
 def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
@@ -529,7 +527,13 @@ def _register_configured_trackers(
 ) -> None:
     registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
     for binding in config.repos:
-        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+        ctx = _tracker_context_for_binding(binding)
+        registry.register(
+            ctx.provider,
+            ctx.site,
+            tracker,
+            project_key=ctx.project_key,
+        )
 
 
 def _binding_label_from_storage_key(binding_key: str) -> str | None:
@@ -1239,7 +1243,7 @@ class Orchestrator:
     def __init__(
         self,
         config: Config,
-        linear: IssueTracker,
+        tracker_or_registry: IssueTracker | TrackerRegistry,
         conn: aiosqlite.Connection,
         *,
         runner: Runner | None = None,
@@ -1250,8 +1254,11 @@ class Orchestrator:
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
-        self._trackers = TrackerRegistry()
-        _register_configured_trackers(self._trackers, config, linear)
+        if isinstance(tracker_or_registry, TrackerRegistry):
+            self._trackers = tracker_or_registry
+        else:
+            self._trackers = TrackerRegistry()
+            _register_configured_trackers(self._trackers, config, tracker_or_registry)
         self._conn = conn
         self._shutdown = asyncio.Event()
         self._gh: GitHub = gh if gh is not None else GitHub()
@@ -1356,7 +1363,7 @@ class Orchestrator:
         self, issue_id: str
     ) -> tuple[str, TrackerContext] | None:
         cur = await self._conn.execute(
-            "SELECT tracker_issue_id, provider, site FROM issues WHERE id = ?",
+            "SELECT tracker_issue_id, provider, site, team_key FROM issues WHERE id = ?",
             (issue_id,),
         )
         row = await cur.fetchone()
@@ -1367,7 +1374,12 @@ class Orchestrator:
         if not provider or not site:
             return None
         tracker_issue_id = str(row["tracker_issue_id"] or issue_id)
-        return tracker_issue_id, TrackerContext(provider=provider, site=site)
+        project_key = str(row["team_key"] or "") if provider == "jira" else ""
+        return tracker_issue_id, TrackerContext(
+            provider=provider,
+            site=site,
+            project_key=project_key,
+        )
 
     async def _storage_issue_ids_for_tracker_issue(
         self, issue_id: str, *, provider: str | None = None
@@ -1426,7 +1438,7 @@ class Orchestrator:
 
         cur = await self._conn.execute(
             """
-            SELECT provider, site
+            SELECT provider, site, team_key
               FROM issues
              WHERE provider = ?
                AND (id = ? OR tracker_issue_id = ?)
@@ -1442,7 +1454,8 @@ class Orchestrator:
         site = str(row["site"] or "")
         if not row_provider or not site:
             return None
-        return TrackerContext(provider=row_provider, site=site)
+        project_key = str(row["team_key"] or "") if row_provider == "jira" else ""
+        return TrackerContext(provider=row_provider, site=site, project_key=project_key)
 
     async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
         return await self._stored_tracker_context_for_issue(issue_id) or TrackerContext()
@@ -2636,6 +2649,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -2845,7 +2859,12 @@ class Orchestrator:
             provider = str(row["provider"] or "")
             site = str(row["site"] or "")
             if provider and site:
-                tracker_ctx = TrackerContext(provider=provider, site=site)
+                project_key = str(row["team_key"] or "") if provider == "jira" else ""
+                tracker_ctx = TrackerContext(
+                    provider=provider,
+                    site=site,
+                    project_key=project_key,
+                )
         for binding in self.config.repos:
             if (
                 tracker_ctx is not None
@@ -2893,6 +2912,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -2955,6 +2975,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -2974,6 +2995,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -6142,6 +6164,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -6161,6 +6184,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
             created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
@@ -10182,6 +10206,7 @@ class Orchestrator:
                     github_repo=binding.github_repo,
                     issue_label=binding.issue_label or "",
                     created_at=datetime.now(UTC).isoformat(),
+                    provider=binding.provider,
                     tracker_provider=binding.tracker_provider,
                     tracker_site=binding.tracker_site,
                 )

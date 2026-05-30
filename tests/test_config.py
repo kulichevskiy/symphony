@@ -13,6 +13,8 @@ from symphony.config import (
     Config,
     LinearStates,
     RepoBinding,
+    Secrets,
+    TrackerStates,
     UIStatusThresholds,
 )
 from symphony.ui.status import CanonicalState
@@ -59,6 +61,107 @@ repos:
     assert cfg.repos[0].linear_states.code_review == "In Review"
     assert cfg.repos[0].linear_states.waiting is None
     assert cfg.ui.enabled is True
+
+
+def test_repo_binding_accepts_legacy_linear_aliases(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
+    raw = """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    linear_states:
+      ready: Todo
+      code_review: In Review
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+
+    assert binding.provider == "linear"
+    assert binding.project_key == "ENG"
+    assert binding.linear_team_key == "ENG"
+    assert binding.states.ready == "Todo"
+    assert binding.linear_states.code_review == "In Review"
+
+
+def test_repo_binding_model_copy_accepts_legacy_linear_aliases() -> None:
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/api-svc",
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+    )
+
+    copied = binding.model_copy(
+        update={
+            "linear_team_key": "WEB",
+            "linear_states": LinearStates(ready="Backlog", code_review="In Review"),
+        }
+    )
+
+    assert copied.project_key == "WEB"
+    assert copied.linear_team_key == "WEB"
+    assert copied.states.ready == "Backlog"
+    assert copied.linear_states.code_review == "In Review"
+
+
+def test_jira_binding_and_secrets_validate(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    monkeypatch.setenv("JIRA_WEBHOOK_SECRET", "jira-webhook-secret")
+    raw = """
+repos:
+  - provider: jira
+    project_key: SYM
+    base_url: https://jira.example.test
+    github_repo: org/api-svc
+    states:
+      ready: To Do
+      code_review: In Review
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+    secrets = Secrets()
+
+    assert binding.provider == "jira"
+    assert binding.project_key == "SYM"
+    assert binding.base_url == "https://jira.example.test"
+    assert isinstance(binding.states, TrackerStates)
+    assert binding.states.ready == "To Do"
+    assert secrets.jira_base_url == "https://jira.example.test"
+    assert secrets.jira_email == "bot@example.test"
+    assert secrets.jira_api_token == "jira-token"
+    assert secrets.jira_webhook_secret == "jira-webhook-secret"
+
+
+def test_jira_binding_can_use_env_base_url(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+    raw = """
+repos:
+  - provider: jira
+    project_key: SYM
+    github_repo: org/api-svc
+    states:
+      ready: To Do
+      code_review: In Review
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+
+    assert binding.base_url is None
+    assert binding.tracker_provider == "jira"
+    assert binding.tracker_site == "https://jira.example.test"
 
 
 def test_ui_can_be_disabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

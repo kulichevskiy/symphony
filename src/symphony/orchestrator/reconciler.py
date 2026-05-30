@@ -31,6 +31,7 @@ from ..tracker import (
     IssueTracker,
     TrackerContext,
     TrackerRegistry,
+    context_for_binding,
 )
 from ..tracker import (
     Issue as LinearIssue,
@@ -126,7 +127,13 @@ def _register_configured_trackers(
 ) -> None:
     registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
     for binding in config.repos:
-        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+        ctx = context_for_binding(binding)
+        registry.register(
+            ctx.provider,
+            ctx.site,
+            tracker,
+            project_key=ctx.project_key,
+        )
 
 
 def reconcile_dry_run_enabled(env: Mapping[str, str] | None = None) -> bool:
@@ -556,12 +563,10 @@ class Reconciler:
         provider = str(row["provider"] or "")
         site = str(row["site"] or "")
         if provider and site:
-            return TrackerContext(provider=provider, site=site)
+            project_key = str(row["team_key"] or "") if provider == "jira" else ""
+            return TrackerContext(provider=provider, site=site, project_key=project_key)
         for binding in bindings:
-            return TrackerContext(
-                provider=binding.tracker_provider,
-                site=binding.tracker_site,
-            )
+            return context_for_binding(binding)
         return TrackerContext()
 
     async def _open_prs(self, issue_id: str) -> list[LocalIssuePr]:
