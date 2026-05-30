@@ -1104,6 +1104,107 @@ async def test_implement_failed_retry_moves_tracker_issue_id_for_scoped_issue(
 
 
 @pytest.mark.asyncio
+async def test_review_failed_retry_uses_tracker_issue_id_for_scoped_issue(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id=scoped_issue_id,
+            stage="review",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.review_state.begin_review(
+            conn,
+            scoped_issue_id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo=secondary_binding.github_repo,
+            issue_label=secondary_binding.issue_label,
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            linear_team_key=secondary_binding.linear_team_key,
+            github_repo=secondary_binding.github_repo,
+            issue_label=secondary_binding.issue_label or "",
+            created_at="2026-05-10T01:00:00+00:00",
+            tracker_provider=secondary_binding.tracker_provider,
+            tracker_site=secondary_binding.tracker_site,
+        )
+        default_tracker = AsyncMock()
+        default_tracker.comments_since = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.comments_since = AsyncMock(return_value=[_comment("$retry")])
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        secondary_tracker.team_states = AsyncMock(
+            return_value={"Needs Approval": "state-review"}
+        )
+        secondary_tracker.move_issue = AsyncMock()
+        secondary_tracker.post_comment = AsyncMock(return_value="c-resumed")
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=gh,
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+        orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        default_tracker.comments_since.assert_not_awaited()
+        secondary_tracker.comments_since.assert_awaited_once()
+        assert secondary_tracker.comments_since.await_args.args[0] == issue.id
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        secondary_tracker.move_issue.assert_awaited_once_with(issue.id, "state-review")
+        secondary_tracker.post_comment.assert_awaited_once()
+        assert secondary_tracker.post_comment.await_args.args[0] == issue.id
+        assert scoped_issue_id not in orch._dispatch_run_ids  # noqa: SLF001
+        assert await db.operator_waits.get(conn, scoped_issue_id) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_acceptance_blocked_retry_moves_tracker_issue_id_for_scoped_issue(
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -1283,6 +1384,82 @@ async def test_acceptance_blocked_skip_uses_tracker_issue_id_for_scoped_issue(
         secondary_tracker.post_comment.assert_awaited_once()
         assert secondary_tracker.post_comment.await_args.args[0] == issue.id
         assert await db.operator_waits.get(conn, scoped_issue_id) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_candidate_refresh_uses_tracker_issue_id_for_scoped_issue(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+    from symphony.orchestrator import poll as poll_module
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id=scoped_issue_id,
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            github_repo=secondary_binding.github_repo,
+            binding_key=poll_module._binding_storage_key(secondary_binding),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:01:00+00:00",
+        )
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+
+        scheduled = await orch._poll_merge_candidates()  # noqa: SLF001
+
+        assert scheduled == []
+        default_tracker.lookup_issue.assert_not_awaited()
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
     finally:
         await conn.close()
 

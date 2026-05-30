@@ -6180,13 +6180,14 @@ class Orchestrator:
             )
             if binding is None:
                 return
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(binding)
         if intent.kind not in (SlashKind.RETRY, SlashKind.APPROVE):
             if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
                 states = await self._states_for_binding(binding)
                 blocked_id = states.get(binding.linear_states.blocked)
                 try:
-                    issue = await tracker.lookup_issue(issue_id)
+                    issue = await tracker.lookup_issue(tracker_issue_id)
                 except LinearError as e:
                     log.warning("could not look up %s for reject: %s", issue_id, e)
                     raise SlashHandlerFailure(
@@ -6195,7 +6196,7 @@ class Orchestrator:
                     ) from e
                 if blocked_id is not None:
                     try:
-                        await tracker.move_issue(issue_id, blocked_id)
+                        await tracker.move_issue(tracker_issue_id, blocked_id)
                     except LinearError as e:
                         log.warning(
                             "could not move %s to blocked: %s", issue.identifier, e
@@ -6215,7 +6216,7 @@ class Orchestrator:
         # survive so the next poll tick can retry. Clearing first would
         # make the issue invisible to slash polling on the retry.
         try:
-            issue = await tracker.lookup_issue(issue_id)
+            issue = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning("could not look up %s for retry: %s", issue_id, e)
             raise SlashHandlerFailure(
@@ -6270,7 +6271,7 @@ class Orchestrator:
             )
         )
         try:
-            await tracker.post_comment(issue_id, truncate_body(body))
+            await tracker.post_comment(tracker_issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("retry comment failed for %s: %s", issue_id, e)
 
@@ -7862,8 +7863,11 @@ class Orchestrator:
             if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
                 continue
             tracker = self.tracker(binding)
+            tracker_issue_id, _ = await self._tracker_identity_for_issue(
+                candidate.issue_id
+            )
             try:
-                issue = await tracker.lookup_issue(candidate.issue_id)
+                issue = await tracker.lookup_issue(tracker_issue_id)
             except LinearError as e:
                 log.warning(
                     "could not refresh %s before merge: %s",
