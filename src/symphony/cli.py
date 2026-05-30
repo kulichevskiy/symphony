@@ -191,8 +191,8 @@ async def _run(config_path: Path, *, once: bool) -> None:
     async with Linear(cfg.linear_api_key) as linear:
         conn = await db.connect(cfg.db_path)
         try:
-            await reconcile(conn, linear)
             orch = Orchestrator(cfg, linear, conn)
+            await reconcile(conn, orch.tracker)
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access

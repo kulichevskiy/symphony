@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import cast
 
 import aiosqlite
 
 from .. import db
-from ..linear.client import Linear, LinearError
+from ..linear.client import LinearError
+from ..tracker import IssueTracker, TrackerContext, TrackerRegistry
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +29,9 @@ _RETRY_BODY = (
     "agent subprocess or review monitor is gone. Review monitors will resume "
     "automatically when possible; otherwise reply `$retry` to dispatch again.\n"
 )
+
+TrackerResolver = Callable[[TrackerContext], IssueTracker]
+TrackerInput = IssueTracker | TrackerRegistry | TrackerResolver
 
 
 async def _preserve_pidless_review_retry_path(
@@ -92,11 +98,65 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
+def _tracker_resolver(tracker_or_resolver: TrackerInput) -> TrackerResolver:
+    if isinstance(tracker_or_resolver, TrackerRegistry):
+        return tracker_or_resolver.resolve
+    if hasattr(tracker_or_resolver, "post_comment"):
+        tracker = cast(IssueTracker, tracker_or_resolver)
+        return lambda _ctx: tracker
+    return tracker_or_resolver
+
+
+async def _tracker_context_for_issue(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+) -> TrackerContext:
+    cur = await conn.execute(
+        "SELECT provider, site FROM issues WHERE id = ?",
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return TrackerContext()
+    provider = str(row["provider"] or "")
+    site = str(row["site"] or "")
+    if not provider or not site:
+        return TrackerContext()
+    return TrackerContext(provider=provider, site=site)
+
+
+async def _post_reconcile_comment(
+    conn: aiosqlite.Connection,
+    tracker_for_context: TrackerResolver,
+    issue_id: str,
+) -> None:
+    ctx = await _tracker_context_for_issue(conn, issue_id)
+    try:
+        tracker = tracker_for_context(ctx)
+    except KeyError as e:
+        log.warning(
+            "could not resolve reconcile tracker on %s provider=%s site=%s: %s",
+            issue_id,
+            ctx.provider,
+            ctx.site,
+            e,
+        )
+        return
+    try:
+        await tracker.post_comment(issue_id, _RETRY_BODY)
+    except LinearError as e:
+        log.warning("could not post reconcile comment on %s: %s", issue_id, e)
+
+
+async def reconcile(
+    conn: aiosqlite.Connection,
+    tracker_or_resolver: TrackerInput,
+) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
 
     Returns the number of rows flipped.
     """
+    tracker_for_context = _tracker_resolver(tracker_or_resolver)
     rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
     now = datetime.now(UTC).isoformat()
@@ -112,10 +172,7 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
         await db.runs.update_status(
             conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
         )
-        try:
-            await linear.post_comment(run.issue_id, _RETRY_BODY)
-        except LinearError as e:
-            log.warning("could not post reconcile comment on %s: %s", run.issue_id, e)
+        await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
 
     for run in await db.runs.list_live_review_without_pid(conn):
@@ -136,9 +193,6 @@ async def reconcile(conn: aiosqlite.Connection, linear: Linear) -> int:
                 conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
             )
             await _preserve_pidless_review_retry_path(conn, run, created_at=now)
-        try:
-            await linear.post_comment(run.issue_id, _RETRY_BODY)
-        except LinearError as e:
-            log.warning("could not post reconcile comment on %s: %s", run.issue_id, e)
+        await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
     return flipped

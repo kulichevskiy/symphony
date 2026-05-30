@@ -11,6 +11,7 @@ import pytest
 
 from symphony import db
 from symphony.orchestrator.reconcile import reconcile
+from symphony.tracker import TrackerContext
 
 
 @pytest.mark.asyncio
@@ -69,6 +70,58 @@ async def test_reconcile_marks_dead_pids_interrupted_and_comments(tmp_path: Path
         row = await cur.fetchone()
         assert row is not None
         assert row[0] == "interrupted"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_posts_comment_through_persisted_tracker_context(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-secondary",
+            identifier="ALT-2",
+            title="t",
+            team_key="ALT",
+            provider="linear-alt",
+            site="secondary",
+        )
+        await db.runs.create(
+            conn,
+            id="dead-secondary",
+            issue_id="iss-secondary",
+            stage="implement",
+            status="running",
+            pid=999_999,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        default_tracker = AsyncMock()
+        default_tracker.post_comment = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.post_comment = AsyncMock(return_value="cmt-1")
+        contexts: list[TrackerContext] = []
+
+        def tracker(ctx: TrackerContext) -> AsyncMock:
+            contexts.append(ctx)
+            if ctx == TrackerContext(provider="linear-alt", site="secondary"):
+                return secondary_tracker
+            return default_tracker
+
+        flipped = await reconcile(conn, tracker)
+
+        assert flipped == 1
+        assert contexts == [TrackerContext(provider="linear-alt", site="secondary")]
+        secondary_tracker.post_comment.assert_awaited_once()
+        call = secondary_tracker.post_comment.await_args
+        assert call is not None
+        assert call.args[0] == "iss-secondary"
+        default_tracker.post_comment.assert_not_awaited()
     finally:
         await conn.close()
 
