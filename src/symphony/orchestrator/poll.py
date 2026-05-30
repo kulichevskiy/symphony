@@ -3349,14 +3349,16 @@ class Orchestrator:
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
             if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
-            tracker_ctx = await self._tracker_context_for_issue(run.issue_id)
+            tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
+                run.issue_id
+            )
             tracker = self.tracker(tracker_ctx)
             try:
-                issue = await tracker.lookup_issue(run.issue_id)
+                issue = await tracker.lookup_issue(tracker_issue_id)
             except LinearError as e:
                 log.warning("could not resolve issue for review run %s: %s", run.id, e)
                 continue
-            state = await db.review_state.get(self._conn, issue.id)
+            state = await db.review_state.get(self._conn, run.issue_id)
             binding = self._binding_for_review(issue, state, tracker_ctx=tracker_ctx)
             if binding is None:
                 log.warning(
@@ -3517,7 +3519,7 @@ class Orchestrator:
         rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
         rearm_done = True
         if rearm_retry_pending:
-            state = await db.review_state.get(self._conn, current_issue.id)
+            state = await db.review_state.get(self._conn, run.issue_id)
             rearm_done = await self._retrigger_codex_review_unless_approved(
                 binding=current_binding,
                 issue=current_issue,
@@ -3542,10 +3544,12 @@ class Orchestrator:
         if not any(live_run.id == run.id for live_run in live_review_runs):
             log.info("skipping review run %s: run is no longer live", run.id)
             return None
-        tracker_ctx = _tracker_context_for_binding(binding)
+        tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
+            run.issue_id
+        )
         tracker = self.tracker(tracker_ctx)
         try:
-            current = await tracker.lookup_issue(run.issue_id)
+            current = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning(
                 "could not revalidate %s before review polling: %s",
@@ -3553,7 +3557,7 @@ class Orchestrator:
                 e,
             )
             return None
-        state = await db.review_state.get(self._conn, current.id)
+        state = await db.review_state.get(self._conn, run.issue_id)
         current_binding = self._binding_for_review(
             current, state, tracker_ctx=tracker_ctx
         )
@@ -3699,7 +3703,8 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
     ) -> bool:
-        state = await db.review_state.get(self._conn, issue.id)
+        storage_issue_id = run.issue_id
+        state = await db.review_state.get(self._conn, storage_issue_id)
         if state.pr_number is None:
             await self._fail_review_run(
                 run=run,
@@ -3714,7 +3719,7 @@ class Orchestrator:
             checks = await self._gh.pr_checks(state.pr_number, repo=binding.github_repo)
         except GitHubError as e:
             failures = await db.review_state.bump_ci_fetch_failures(
-                self._conn, issue.id
+                self._conn, storage_issue_id
             )
             log.warning(
                 "gh pr checks failed for %s#%d (%d/%d): %s",
@@ -3734,10 +3739,10 @@ class Orchestrator:
                         f"{failures} consecutive times: {e}"
                     ),
                     last_log=str(e),
-                )
+            )
             return False
 
-        await db.review_state.reset_ci_fetch_failures(self._conn, issue.id)
+        await db.review_state.reset_ci_fetch_failures(self._conn, storage_issue_id)
 
         head_sha = _unknown_head_ci_scope(checks)
         mergeable: str = ""
@@ -3956,11 +3961,11 @@ class Orchestrator:
                 iteration=state.iteration + 1,
             )
             if dispatched:
-                await db.review_state.bump_iteration(self._conn, issue.id)
+                await db.review_state.bump_iteration(self._conn, storage_issue_id)
                 # Clear rather than set the signature: if the rebase produced no
                 # new commit (HEAD SHA unchanged), we still want the next poll to
                 # re-evaluate instead of being blocked by the dedup gate.
-                await db.review_state.set_signature(self._conn, issue.id, "")
+                await db.review_state.set_signature(self._conn, storage_issue_id, "")
             return dispatched
         if not should_dispatch_fix_run(
             prev_signature=state.last_trigger_signature,
@@ -3997,9 +4002,9 @@ class Orchestrator:
                 iteration=iteration,
             )
         if dispatched:
-            await db.review_state.bump_iteration(self._conn, issue.id)
+            await db.review_state.bump_iteration(self._conn, storage_issue_id)
             await db.review_state.set_signature(
-                self._conn, issue.id, verdict.trigger_signature
+                self._conn, storage_issue_id, verdict.trigger_signature
             )
         return dispatched
 

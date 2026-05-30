@@ -890,11 +890,22 @@ async def test_review_poll_uses_stored_tracker_context_for_rebound_binding(
     secondary_binding = _binding()
     secondary_binding.tracker_provider = "linear-alt"
     secondary_binding.tracker_site = "secondary"
+    secondary_binding.issue_label = "symphony"
     issue = _issue()
+    issue.labels = []
     issue.state_name = "Needs Approval"
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
             conn,
             id=issue.id,
             identifier=issue.identifier,
@@ -905,16 +916,16 @@ async def test_review_poll_uses_stored_tracker_context_for_rebound_binding(
         )
         await db.review_state.begin_review(
             conn,
-            issue.id,
+            scoped_issue_id,
             pr_number=42,
             pr_url="https://github.com/org/repo/pull/42",
             github_repo="org/repo",
-            issue_label=None,
+            issue_label="symphony",
         )
         await db.runs.create(
             conn,
             id="review-run",
-            issue_id=issue.id,
+            issue_id=scoped_issue_id,
             stage="review",
             status="running",
             pid=None,
@@ -947,6 +958,7 @@ async def test_review_poll_uses_stored_tracker_context_for_rebound_binding(
         secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
         default_tracker.lookup_issue.assert_not_awaited()
         args = orch._schedule_review_poll.call_args.args  # noqa: SLF001
+        assert args[0].issue_id == scoped_issue_id
         assert args[1] is secondary_binding
         assert args[2] is issue
     finally:
