@@ -1389,6 +1389,32 @@ class Orchestrator:
         rows = await cur.fetchall()
         return [str(row["id"]) for row in rows]
 
+    async def _storage_issue_id_for_tracker_issue(
+        self, issue_id: str, tracker_ctx: TrackerContext
+    ) -> str:
+        cur = await self._conn.execute(
+            """
+            SELECT id
+              FROM issues
+             WHERE provider = ?
+               AND site = ?
+               AND (id = ? OR tracker_issue_id = ?)
+             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
+             LIMIT 1
+            """,
+            (
+                tracker_ctx.provider,
+                tracker_ctx.site,
+                issue_id,
+                issue_id,
+                issue_id,
+            ),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return issue_id
+        return str(row["id"])
+
     async def _stored_tracker_context_for_issue(
         self, issue_id: str, *, provider: str | None = None
     ) -> TrackerContext | None:
@@ -1828,10 +1854,14 @@ class Orchestrator:
                 kind="issue", handled=False, detail="missing issue id"
             )
         state_changed = _linear_issue_state_changed(payload)
+        issue, tracker_ctx = await self._lookup_webhook_issue(issue_id, provider=provider)
+        storage_issue_id = await self._storage_issue_id_for_tracker_issue(
+            issue.id, tracker_ctx
+        )
         if state_changed:
             self._schedule_reconcile_task(
                 self._reconciler.reconcile_linear_issue_event(
-                    issue_id=issue_id,
+                    issue_id=storage_issue_id,
                     action=action or "update",
                 ),
                 source=f"linear.issue.{action or 'update'}",
@@ -1839,7 +1869,6 @@ class Orchestrator:
         old_state_id, old_state_name, new_state_id, new_state_name = (
             _linear_issue_state_transition(payload)
         )
-        issue, tracker_ctx = await self._lookup_webhook_issue(issue_id, provider=provider)
         revived = False
         if state_changed:
             revived = (
