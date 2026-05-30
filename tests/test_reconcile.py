@@ -127,6 +127,65 @@ async def test_reconcile_posts_comment_through_persisted_tracker_context(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_posts_comment_with_tracker_issue_id_for_scoped_issue(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="shared-issue-id",
+            identifier="ENG-1",
+            title="Default issue",
+            team_key="ENG",
+            provider="linear",
+            site="default",
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id="shared-issue-id",
+            identifier="ALT-2",
+            title="Secondary issue",
+            team_key="ALT",
+            provider="linear-alt",
+            site="secondary",
+        )
+        await db.runs.create(
+            conn,
+            id="dead-secondary",
+            issue_id=scoped_issue_id,
+            stage="implement",
+            status="running",
+            pid=999_999,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        default_tracker = AsyncMock()
+        default_tracker.post_comment = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.post_comment = AsyncMock(return_value="cmt-1")
+
+        def tracker(ctx: TrackerContext) -> AsyncMock:
+            if ctx == TrackerContext(provider="linear-alt", site="secondary"):
+                return secondary_tracker
+            return default_tracker
+
+        flipped = await reconcile(conn, tracker)
+
+        assert flipped == 1
+        secondary_tracker.post_comment.assert_awaited_once()
+        call = secondary_tracker.post_comment.await_args
+        assert call is not None
+        assert call.args[0] == "shared-issue-id"
+        assert call.args[0] != scoped_issue_id
+        default_tracker.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments(
     tmp_path: Path,
 ) -> None:

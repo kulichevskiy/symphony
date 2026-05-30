@@ -109,22 +109,23 @@ def _tracker_resolver(tracker_or_resolver: TrackerInput) -> TrackerResolver:
     return tracker_or_resolver
 
 
-async def _tracker_context_for_issue(
+async def _tracker_identity_for_issue(
     conn: aiosqlite.Connection,
     issue_id: str,
-) -> TrackerContext:
+) -> tuple[str, TrackerContext]:
     cur = await conn.execute(
-        "SELECT provider, site FROM issues WHERE id = ?",
+        "SELECT tracker_issue_id, provider, site FROM issues WHERE id = ?",
         (issue_id,),
     )
     row = await cur.fetchone()
     if row is None:
-        return TrackerContext()
+        return issue_id, TrackerContext()
     provider = str(row["provider"] or "")
     site = str(row["site"] or "")
     if not provider or not site:
-        return TrackerContext()
-    return TrackerContext(provider=provider, site=site)
+        return issue_id, TrackerContext()
+    tracker_issue_id = str(row["tracker_issue_id"] or issue_id)
+    return tracker_issue_id, TrackerContext(provider=provider, site=site)
 
 
 async def _post_reconcile_comment(
@@ -132,7 +133,7 @@ async def _post_reconcile_comment(
     tracker_for_context: TrackerResolver,
     issue_id: str,
 ) -> None:
-    ctx = await _tracker_context_for_issue(conn, issue_id)
+    tracker_issue_id, ctx = await _tracker_identity_for_issue(conn, issue_id)
     try:
         tracker = tracker_for_context(ctx)
     except KeyError as e:
@@ -145,7 +146,7 @@ async def _post_reconcile_comment(
         )
         return
     try:
-        await tracker.post_comment(issue_id, _RETRY_BODY)
+        await tracker.post_comment(tracker_issue_id, _RETRY_BODY)
     except LinearError as e:
         log.warning("could not post reconcile comment on %s: %s", issue_id, e)
 

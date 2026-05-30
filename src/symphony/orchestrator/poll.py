@@ -1369,6 +1369,26 @@ class Orchestrator:
         tracker_issue_id = str(row["tracker_issue_id"] or issue_id)
         return tracker_issue_id, TrackerContext(provider=provider, site=site)
 
+    async def _storage_issue_ids_for_tracker_issue(
+        self, issue_id: str, *, provider: str | None = None
+    ) -> list[str]:
+        query = """
+            SELECT id
+              FROM issues
+             WHERE (id = ? OR tracker_issue_id = ?)
+        """
+        params: list[str] = [issue_id, issue_id]
+        if provider is not None:
+            query += " AND provider = ?"
+            params.append(provider)
+        query += """
+             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, id
+        """
+        params.append(issue_id)
+        cur = await self._conn.execute(query, params)
+        rows = await cur.fetchall()
+        return [str(row["id"]) for row in rows]
+
     async def _stored_tracker_context_for_issue(
         self, issue_id: str, *, provider: str | None = None
     ) -> TrackerContext | None:
@@ -1667,7 +1687,7 @@ class Orchestrator:
         """
         event_type = str(payload.get("type") or "").casefold()
         if event_type == "comment":
-            return await self._handle_webhook_comment(payload)
+            return await self._handle_webhook_comment(payload, provider=provider)
         if event_type == "issue":
             return await self._handle_webhook_issue(payload, provider=provider)
         return WebhookDispatchResult(
@@ -1719,7 +1739,7 @@ class Orchestrator:
         )
 
     async def _handle_webhook_comment(
-        self, payload: Mapping[str, Any]
+        self, payload: Mapping[str, Any], *, provider: str | None = None
     ) -> WebhookDispatchResult:
         comment = _comment_from_webhook_payload(payload)
         if comment is None:
@@ -1731,20 +1751,44 @@ class Orchestrator:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="missing issue id"
             )
-        await self._restore_operator_waits()
-        run_id = self._dispatch_run_ids.get(
-            issue_id
-        ) or self._review_poll_issue_ids.get(
-            issue_id
+        candidate_issue_ids = await self._storage_issue_ids_for_tracker_issue(
+            issue_id, provider=provider
         )
-        run_id = run_id or await self._parked_manual_merge_run_id_for_issue(issue_id)
-        if run_id is None or not self._slash_command_run_eligible(run_id):
+        if issue_id not in candidate_issue_ids:
+            candidate_issue_ids.append(issue_id)
+        await self._restore_operator_waits()
+        storage_issue_id = issue_id
+        run_id: str | None = None
+        for candidate_issue_id in candidate_issue_ids:
+            candidate_run_id = self._dispatch_run_ids.get(
+                candidate_issue_id
+            ) or self._review_poll_issue_ids.get(candidate_issue_id)
+            if candidate_run_id is None or not self._slash_command_run_eligible(
+                candidate_run_id
+            ):
+                continue
+            storage_issue_id = candidate_issue_id
+            run_id = candidate_run_id
+            break
+        if run_id is None:
+            for candidate_issue_id in candidate_issue_ids:
+                candidate_run_id = await self._parked_manual_merge_run_id_for_issue(
+                    candidate_issue_id
+                )
+                if candidate_run_id is None or not self._slash_command_run_eligible(
+                    candidate_run_id
+                ):
+                    continue
+                storage_issue_id = candidate_issue_id
+                run_id = candidate_run_id
+                break
+        if run_id is None:
             return WebhookDispatchResult(
                 kind="comment", handled=False, detail="no active run"
             )
         try:
             handled = await self._handle_unseen_slash_comment(
-                issue_id, run_id, comment
+                storage_issue_id, run_id, comment
             )
         except SlashHandlerFailure as exc:
             # Rejection has already been posted inside the lock, and the

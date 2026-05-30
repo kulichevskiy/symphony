@@ -322,6 +322,62 @@ async def test_webhook_comment_uses_slash_path_and_poll_does_not_refire(
 
 
 @pytest.mark.asyncio
+async def test_webhook_comment_uses_scoped_active_run_for_tracker_issue_id(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        default_binding = _binding()
+        secondary_binding = _binding()
+        secondary_binding.tracker_provider = "linear-alt"
+        secondary_binding.tracker_site = "secondary"
+        cfg = Config(repos=[default_binding, secondary_binding])
+        linear = AsyncMock()
+        orch = _make_orch(cfg, linear, conn)
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-0",
+            title="default",
+            team_key="ENG",
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="secondary",
+            team_key="ENG",
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=scoped_issue_id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-11T11:00:00+00:00",
+        )
+        orch._active_run_ids.add("run-1")  # noqa: SLF001
+        orch._dispatch_run_ids[scoped_issue_id] = "run-1"  # noqa: SLF001
+
+        result = await orch.handle_linear_webhook(_payload())
+
+        assert result.handled is True
+        orch._runner.kill.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+            "run-1"
+        )
+        assert await db.comment_cursors.get(conn, "iss-1") is None
+        cursor = await db.comment_cursors.get(conn, scoped_issue_id)
+        assert cursor == ("2026-05-11T12:00:00+00:00", ["c1"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_webhook_comment_resumes_operator_waiting_run(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
