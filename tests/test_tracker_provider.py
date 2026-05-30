@@ -276,6 +276,96 @@ async def test_dispatch_uses_scoped_issue_id_returned_by_upsert(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        tracker = AsyncMock()
+        tracker.team_states = AsyncMock(
+            return_value={
+                "Todo": "state-todo",
+                "In Progress": "state-progress",
+                "Needs Approval": "state-review",
+            }
+        )
+        tracker.post_comment = AsyncMock(return_value="cmt-1")
+        tracker.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.repo_default_branch = AsyncMock(return_value="main")
+        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "workspace")
+        workspace.release = MagicMock()
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            tracker,
+            conn,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._run_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(0.25, "exit", 0, False)
+        )
+
+        run_id = await orch._dispatch_one(secondary_binding, issue)  # noqa: SLF001
+
+        scoped_issue_id = db.issues.contextual_id(
+            id=issue.id,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        cur = await conn.execute(
+            "SELECT issue_id, stage, status FROM runs ORDER BY stage"
+        )
+        rows = [dict(row) for row in await cur.fetchall()]
+        assert rows == [
+            {"issue_id": scoped_issue_id, "stage": "implement", "status": "completed"},
+            {"issue_id": scoped_issue_id, "stage": "review", "status": "running"},
+        ]
+        cur = await conn.execute(
+            "SELECT issue_id, pr_number, github_repo FROM review_state"
+        )
+        assert [dict(row) for row in await cur.fetchall()] == [
+            {
+                "issue_id": scoped_issue_id,
+                "pr_number": 42,
+                "github_repo": "org/repo",
+            }
+        ]
+        pr = await db.issue_prs.get_for_issue(conn, issue_id=scoped_issue_id)
+        assert pr is not None
+        assert pr.pr_number == 42
+        assert await db.issue_prs.get_for_issue(conn, issue_id=issue.id) is None
+        assert run_id is not None
+        assert orch._dispatch_run_ids[scoped_issue_id] == run_id  # noqa: SLF001
+        assert all(
+            call.args[0] == issue.id for call in tracker.post_comment.await_args_list
+        )
+        assert all(
+            call.args[0] == issue.id for call in tracker.move_issue.await_args_list
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_operator_wait_restore_uses_persisted_tracker_context(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 
@@ -325,6 +415,81 @@ async def test_operator_wait_restore_uses_persisted_tracker_context(tmp_path) ->
         await orch._restore_operator_waits()  # noqa: SLF001
 
         assert orch._implement_failed_run_bindings["run-1"] is secondary_binding  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_translates_scoped_storage_id_before_tracker_lookup(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_provider = "linear-alt"
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+            provider=default_binding.tracker_provider,
+            site=default_binding.tracker_site,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=secondary_binding.tracker_provider,
+            site=secondary_binding.tracker_site,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=scoped_issue_id,
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T01:00:00+00:00",
+            tracker_provider=secondary_binding.tracker_provider,
+            tracker_site=secondary_binding.tracker_site,
+        )
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=AssertionError("default tracker used")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        reconciler = Reconciler(
+            Config(repos=[default_binding, secondary_binding]),
+            conn,
+            default_tracker,
+            MagicMock(),
+        )
+        reconciler._trackers.register(  # noqa: SLF001
+            "linear-alt", "secondary", secondary_tracker
+        )
+
+        observed = await reconciler.reconcile_issue(scoped_issue_id, reason="test")
+
+        assert observed == 2
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        default_tracker.lookup_issue.assert_not_awaited()
     finally:
         await conn.close()
 

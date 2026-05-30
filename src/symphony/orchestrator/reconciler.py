@@ -321,8 +321,9 @@ class Reconciler:
         done_state_names = self._done_state_names(matched_bindings)
         tracker_ctx = self._tracker_context_from_issue_row(issue_row, matched_bindings)
         try:
+            tracker_issue_id = str(issue_row["tracker_issue_id"] or issue_id)
             linear_issue, linear_payload = await self._tracker_payload(
-                issue_id,
+                tracker_issue_id,
                 tracker_ctx,
             )
             github_prs, github_payload = await self._github_payload(prs)
@@ -538,7 +539,11 @@ class Reconciler:
 
     async def _issue_row(self, issue_id: str) -> aiosqlite.Row | None:
         cur = await self._conn.execute(
-            "SELECT id, provider, site, identifier, title, team_key FROM issues WHERE id = ?",
+            """
+            SELECT id, tracker_issue_id, provider, site, identifier, title, team_key
+            FROM issues
+            WHERE id = ?
+            """,
             (issue_id,),
         )
         return await cur.fetchone()

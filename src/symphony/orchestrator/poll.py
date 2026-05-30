@@ -9341,6 +9341,7 @@ class Orchestrator:
                 run_id,
                 str(e),
                 issue=issue,
+                storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
@@ -9353,6 +9354,7 @@ class Orchestrator:
                 await self._run_agent(
                     binding=binding,
                     issue=issue,
+                    storage_issue_id=issue_id,
                     run_id=run_id,
                     workspace_path=workspace_path,
                     prior_total=prior_total,
@@ -9364,6 +9366,7 @@ class Orchestrator:
                 run_id,
                 f"agent execution failed: {e}",
                 issue=issue,
+                storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
@@ -9384,6 +9387,7 @@ class Orchestrator:
             await self._handle_cap_breach(
                 binding=binding,
                 issue=issue,
+                storage_issue_id=issue_id,
                 run_id=run_id,
                 cumulative_total=prior_total + cumulative_cost,
             )
@@ -9406,6 +9410,7 @@ class Orchestrator:
                 run_id,
                 f"runner ended with {final_kind}",
                 issue=issue,
+                storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
@@ -9421,6 +9426,7 @@ class Orchestrator:
             local_review_result = await self._run_local_review_phase(
                 binding=binding,
                 issue=issue,
+                storage_issue_id=issue_id,
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
             )
@@ -9435,6 +9441,7 @@ class Orchestrator:
                 run_id,
                 f"push failed: {e}",
                 issue=issue,
+                storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
@@ -9466,6 +9473,7 @@ class Orchestrator:
                 run_id,
                 f"pr_create failed: {e}",
                 issue=issue,
+                storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
@@ -9507,6 +9515,7 @@ class Orchestrator:
         await self._start_review_stage(
             binding=binding,
             issue=issue,
+            storage_issue_id=issue_id,
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
@@ -10057,6 +10066,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         workspace_path: Path,
         parent_run_id: str,
     ) -> LoopResult | None:
@@ -10072,6 +10082,7 @@ class Orchestrator:
         must never dead-end an issue. The remote `@codex` flow runs
         afterwards regardless.
         """
+        storage_issue_id = storage_issue_id or issue.id
         try:
             base_branch = binding.base_branch
             if base_branch is None:
@@ -10119,7 +10130,7 @@ class Orchestrator:
             # alone — the new row would otherwise contribute $0 and
             # noisy up the trace.
             prior_cost_usd = await db.runs.cost_for_issue(
-                self._conn, issue.id
+                self._conn, storage_issue_id
             )
 
             # Create a `runs` row so the local-review cost participates
@@ -10131,7 +10142,7 @@ class Orchestrator:
             await db.runs.create(
                 self._conn,
                 id=local_review_run_id,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 stage="local_review",
                 status="running",
                 pid=None,
@@ -10144,11 +10155,11 @@ class Orchestrator:
             # `_active_run_ids` set was discarded when the implement
             # subprocess exited; we re-add it for the duration of the
             # local-review phase and clean up in `finally`.
-            self._local_review_skip_flags[issue.id] = False
+            self._local_review_skip_flags[storage_issue_id] = False
             self._active_run_ids.add(parent_run_id)
 
             def _should_skip() -> bool:
-                return bool(self._local_review_skip_flags.get(issue.id))
+                return bool(self._local_review_skip_flags.get(storage_issue_id))
 
             async def _on_iteration(
                 i: int, verdict: LocalVerdict, cost_so_far: float
@@ -10163,9 +10174,9 @@ class Orchestrator:
 
             async def _report_active(run_id: str | None) -> None:
                 if run_id is None:
-                    self._local_review_active_run_ids.pop(issue.id, None)
+                    self._local_review_active_run_ids.pop(storage_issue_id, None)
                 else:
-                    self._local_review_active_run_ids[issue.id] = run_id
+                    self._local_review_active_run_ids[storage_issue_id] = run_id
 
             result: LoopResult | None = None
             try:
@@ -10194,8 +10205,8 @@ class Orchestrator:
                 )
             finally:
                 self._active_run_ids.discard(parent_run_id)
-                self._local_review_skip_flags.pop(issue.id, None)
-                self._local_review_active_run_ids.pop(issue.id, None)
+                self._local_review_skip_flags.pop(storage_issue_id, None)
+                self._local_review_active_run_ids.pop(storage_issue_id, None)
                 await self._finalize_local_review_run(
                     run_id=local_review_run_id,
                     result=result,
@@ -10390,6 +10401,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         pr_url: str,
         post_codex_review: bool = True,
     ) -> str | None:
@@ -10406,10 +10418,11 @@ class Orchestrator:
         the run row from being created, but is logged loudly so an
         operator can re-ping with a slash command if needed.
         """
+        storage_issue_id = storage_issue_id or issue.id
         pr_number = pr_number_from_url(pr_url)
         await db.review_state.begin_review(
             self._conn,
-            issue.id,
+            storage_issue_id,
             pr_number=pr_number,
             pr_url=pr_url,
             github_repo=binding.github_repo,
@@ -10424,7 +10437,7 @@ class Orchestrator:
         else:
             await db.issue_prs.upsert(
                 self._conn,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 github_repo=binding.github_repo,
                 binding_key=_binding_storage_key(binding),
                 pr_number=pr_number,
@@ -10452,7 +10465,7 @@ class Orchestrator:
         await db.runs.create(
             self._conn,
             id=review_run_id,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             stage="review",
             status="running",
             pid=None,
@@ -10691,6 +10704,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         run_id: str,
         workspace_path: Path,
         prior_total: float,
@@ -10705,6 +10719,7 @@ class Orchestrator:
         runner is killed and the loop exits with `cap_breached=True` so
         the caller can park the issue at `needs_approval`.
         """
+        storage_issue_id = storage_issue_id or issue.id
         cap_usd = effective_cap(
             global_cap_usd=self.config.cost_cap_per_issue_usd,
             binding_override=binding.cost_cap_usd,
@@ -10714,7 +10729,8 @@ class Orchestrator:
             binding_override=binding.cost_warning_pct,
         )
         warning_already_fired = (
-            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
+            await db.cost_marks.warning_posted_at(self._conn, storage_issue_id)
+            is not None
         )
 
         max_budget_usd: float | None = None
@@ -10738,6 +10754,7 @@ class Orchestrator:
         return await self._run_stage_command(
             binding=binding,
             issue=issue,
+            storage_issue_id=storage_issue_id,
             command=command,
             run_id=run_id,
             workspace_path=workspace_path,
@@ -10807,6 +10824,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         command: list[str],
         run_id: str,
         workspace_path: Path,
@@ -10816,6 +10834,7 @@ class Orchestrator:
         warning_pct: int,
         warning_already_fired: bool,
     ) -> tuple[float, str, int | None, bool]:
+        storage_issue_id = storage_issue_id or issue.id
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
@@ -10869,6 +10888,7 @@ class Orchestrator:
                                 warning_already_fired = await self._post_cost_warning(
                                     binding=binding,
                                     issue=issue,
+                                    storage_issue_id=storage_issue_id,
                                     run_id=run_id,
                                     stage=stage,
                                     cumulative_total=new_total,
@@ -11054,11 +11074,13 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         run_id: str,
         stage: str,
         cumulative_total: float,
         cap_usd: float,
     ) -> bool:
+        storage_issue_id = storage_issue_id or issue.id
         pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
         body = cost_warning(
             CommentVars(
@@ -11077,7 +11099,7 @@ class Orchestrator:
             log.warning("cost_warning comment failed on %s: %s", issue.identifier, e)
             return False
         await db.cost_marks.mark_warning_posted(
-            self._conn, issue.id, datetime.now(UTC).isoformat()
+            self._conn, storage_issue_id, datetime.now(UTC).isoformat()
         )
         return True
 
@@ -11086,11 +11108,13 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         run_id: str,
         cumulative_total: float,
         stage: str = "implement",
     ) -> None:
         """Park a cost-capped issue and post a cost-cap escalation."""
+        storage_issue_id = storage_issue_id or issue.id
         try:
             tracker = self.tracker(binding)
             try:
@@ -11157,7 +11181,7 @@ class Orchestrator:
                 log.warning(
                     "cost_cap_reached comment failed on %s: %s", issue.identifier, e
                 )
-            await self._track_operator_wait(issue.id, run_id, binding)
+            await self._track_operator_wait(storage_issue_id, run_id, binding)
         finally:
             await db.runs.update_status(
                 self._conn,
@@ -11180,9 +11204,11 @@ class Orchestrator:
         reason: str,
         *,
         issue: LinearIssue,
+        storage_issue_id: str | None = None,
         rollback_state_id: str,
         binding: RepoBinding | None = None,
     ) -> None:
+        storage_issue_id = storage_issue_id or issue.id
         await self._fail_run(run_id, reason)
         target_state_id = rollback_state_id
         if binding is not None:
@@ -11217,8 +11243,8 @@ class Orchestrator:
             )
         if binding is None:
             return
-        await self._track_implement_failed_wait(issue.id, run_id, binding)
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        cost = await db.runs.cost_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
                 stage="implement",
