@@ -23,6 +23,7 @@ from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
 _WATCHDOG_POLL_SECS = 1.0
+_SUBPROCESS_STREAM_LIMIT = 16 * 1024 * 1024
 
 
 class _Heartbeat:
@@ -103,6 +104,7 @@ class LocalRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.DEVNULL,
+                limit=_SUBPROCESS_STREAM_LIMIT,
             )
         except (OSError, FileNotFoundError) as e:
             yield RunnerEvent(kind="spawn_failed", error=f"{type(e).__name__}: {e}")
