@@ -582,7 +582,7 @@ wheels = [
 ]
 
 [[package]]
-name = "symphonyd"
+name = "symphony"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [

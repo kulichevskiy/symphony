@@ -209,7 +209,7 @@ async def _configured_tracker_registry(
 @click.option("--once", is_flag=True, help="Run one poll tick and exit.")
 @click.pass_context
 def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
-    """symphonyd — headless Symphony port."""
+    """symphony — headless Symphony port."""
     _setup_logging()
     if ctx.invoked_subcommand is None:
         if config_path is None:
@@ -409,7 +409,7 @@ def runs() -> None:
     "db_path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
-    help="Path to the symphonyd SQLite file.",
+    help="Path to the symphony SQLite file.",
 )
 @click.option(
     "--limit",
@@ -489,7 +489,7 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
     "db_path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
-    help="Path to the symphonyd SQLite file.",
+    help="Path to the symphony SQLite file.",
 )
 def runs_local_review_trace(issue_identifier: str, db_path: Path) -> None:
     """List local-review phases for a single issue.
@@ -564,7 +564,7 @@ def _duration_secs(started_at: str | None, ended_at: str | None) -> float | None
     "db_path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=True,
-    help="Path to the symphonyd SQLite file.",
+    help="Path to the symphony SQLite file.",
 )
 def runs_local_review_stats(db_path: Path) -> None:
     """Aggregate local-review telemetry: approval rate, cost, duration.

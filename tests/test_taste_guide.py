@@ -8,7 +8,7 @@ from symphony.pipeline.taste_guide import load_taste_guide
 
 
 def test_load_taste_guide_concatenates_global_then_binding(tmp_path: Path) -> None:
-    repo_root = tmp_path / "symphonyd"
+    repo_root = tmp_path / "symphony"
     repo_root.mkdir()
     binding_guide = repo_root / "docs" / "sample-ux.md"
     binding_guide.parent.mkdir()

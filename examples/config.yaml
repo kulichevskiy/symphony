@@ -1,4 +1,4 @@
-# Example symphonyd config. Copy this and edit the two LINEAR_TEAM_KEY /
+# Example symphony config. Copy this and edit the two LINEAR_TEAM_KEY /
 # GITHUB_REPO entries plus the LINEAR_API_KEY env var.
 # Set LINEAR_WEBHOOK_SECRET and/or GITHUB_WEBHOOK_SECRET to start the
 # loopback-only webhook receiver.
