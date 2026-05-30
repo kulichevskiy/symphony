@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.linear.client import Linear
+from symphony.linear.client import Linear, LinearError
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import Reconciler
 from symphony.tracker import Issue
@@ -217,7 +217,50 @@ async def test_issue_webhook_uses_recorded_tracker_context(tmp_path) -> None:  #
         assert result.handled is True
         secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
         default_tracker.lookup_issue.assert_not_awaited()
-        orch._schedule_dispatch.assert_called_once_with(secondary_binding, issue)  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_dispatch.assert_called_once_with(secondary_binding, issue)  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_unseen_issue_webhook_probes_configured_tracker_contexts(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from symphony import db
+
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_site = "secondary"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        default_tracker = AsyncMock()
+        default_tracker.lookup_issue = AsyncMock(
+            side_effect=LinearError(f"issue not found: {issue.id}")
+        )
+        secondary_tracker = AsyncMock()
+        secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
+        orch = Orchestrator(
+            Config(repos=[default_binding, secondary_binding]),
+            default_tracker,
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._trackers.register("linear", "secondary", secondary_tracker)  # noqa: SLF001
+        scheduled_task = object()
+        orch._schedule_dispatch = MagicMock(return_value=scheduled_task)  # type: ignore[method-assign]  # noqa: SLF001
+
+        result = await orch.handle_linear_webhook(
+            {
+                "type": "Issue",
+                "action": "create",
+                "data": {"id": issue.id},
+            }
+        )
+
+        assert result.handled is True
+        default_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        orch._schedule_dispatch.assert_called_once_with(secondary_binding, issue)  # noqa: SLF001
     finally:
         await conn.close()
 

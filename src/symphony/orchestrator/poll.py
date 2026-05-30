@@ -1266,8 +1266,8 @@ class Orchestrator:
             force_push_fn if force_push_fn is not None else _default_force_push
         )
         self._clock = clock
-        # Cache of ((provider, team_key) -> {state_name: state_uuid}). Re-fetched on
-        # startup; never mutated at runtime.
+        # Cache of ((provider, site, team_key) -> {state_name: state_uuid}).
+        # Re-fetched on startup; never mutated at runtime.
         self._states: dict[StateCacheKey, dict[str, str]] = {}
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
@@ -1352,22 +1352,64 @@ class Orchestrator:
     def linear(self) -> IssueTracker:
         return self.tracker(TrackerContext())
 
-    async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
+    async def _stored_tracker_context_for_issue(
+        self, issue_id: str
+    ) -> TrackerContext | None:
         cur = await self._conn.execute(
             "SELECT provider, site FROM issues WHERE id = ?",
             (issue_id,),
         )
         row = await cur.fetchone()
         if row is None:
-            return TrackerContext()
+            return None
         provider = str(row["provider"] or "")
         site = str(row["site"] or "")
         if not provider or not site:
-            return TrackerContext()
+            return None
         return TrackerContext(provider=provider, site=site)
+
+    async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
+        return await self._stored_tracker_context_for_issue(issue_id) or TrackerContext()
 
     async def _tracker_for_issue_id(self, issue_id: str) -> IssueTracker:
         return self.tracker(await self._tracker_context_for_issue(issue_id))
+
+    def _configured_tracker_contexts(
+        self, *, provider: str = DEFAULT_PROVIDER
+    ) -> list[TrackerContext]:
+        contexts: list[TrackerContext] = []
+        seen: set[TrackerContext] = set()
+        for binding in self.config.repos:
+            if binding.tracker_provider != provider:
+                continue
+            ctx = _tracker_context_for_binding(binding)
+            if ctx in seen:
+                continue
+            seen.add(ctx)
+            contexts.append(ctx)
+        if not contexts:
+            contexts.append(TrackerContext(provider=provider, site=DEFAULT_SITE))
+        return contexts
+
+    async def _lookup_webhook_issue(
+        self, issue_id: str, *, provider: str = DEFAULT_PROVIDER
+    ) -> tuple[LinearIssue, TrackerContext]:
+        stored_ctx = await self._stored_tracker_context_for_issue(issue_id)
+        if stored_ctx is not None:
+            return await self.tracker(stored_ctx).lookup_issue(issue_id), stored_ctx
+
+        not_found: LinearError | None = None
+        for ctx in self._configured_tracker_contexts(provider=provider):
+            try:
+                return await self.tracker(ctx).lookup_issue(issue_id), ctx
+            except LinearError as exc:
+                if not str(exc).startswith(f"issue not found: {issue_id}"):
+                    raise
+                not_found = exc
+        if not_found is not None:
+            raise not_found
+        ctx = TrackerContext(provider=provider, site=DEFAULT_SITE)
+        return await self.tracker(ctx).lookup_issue(issue_id), ctx
 
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
@@ -1711,8 +1753,7 @@ class Orchestrator:
         old_state_id, old_state_name, new_state_id, new_state_name = (
             _linear_issue_state_transition(payload)
         )
-        tracker_ctx = await self._tracker_context_for_issue(issue_id)
-        issue = await self.tracker(tracker_ctx).lookup_issue(issue_id)
+        issue, tracker_ctx = await self._lookup_webhook_issue(issue_id)
         revived = False
         if state_changed:
             revived = (
