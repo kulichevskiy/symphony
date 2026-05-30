@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import suppress
 
@@ -25,6 +27,10 @@ _STREAM_DRAIN_SECS = 2.0
 _WATCHDOG_POLL_SECS = 1.0
 _SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024
 _STREAM_READ_CHUNK_BYTES = 64 * 1024
+_OVERSIZED_LINE_PREFIX_BYTES = 64 * 1024
+_JSON_ID_RE = re.compile(r'"(?:id|item_id)"\s*:\s*"([^"]+)"')
+
+log = logging.getLogger(__name__)
 
 
 class _Heartbeat:
@@ -68,6 +74,21 @@ class _Heartbeat:
             self._cmd_starts.setdefault(item_id, self.last_line)
         else:  # item.completed
             self._cmd_starts.pop(item_id, None)
+
+    def observe_oversized_stdout(self, prefix: bytes) -> None:
+        """Best-effort command completion tracking for a skipped stdout line."""
+        if not self._cmd_starts:
+            return
+        text = prefix.decode(errors="replace")
+        if '"item.completed"' not in text or '"command_execution"' not in text:
+            return
+        matched = False
+        for item_id in _JSON_ID_RE.findall(text):
+            if item_id in self._cmd_starts:
+                self._cmd_starts.pop(item_id, None)
+                matched = True
+        if not matched and len(self._cmd_starts) == 1:
+            self._cmd_starts.clear()
 
     def deadline(self, now: float, stall_secs: float, command_secs: float) -> float:
         """Effective time by which fresh activity must have occurred.
@@ -137,16 +158,10 @@ class LocalRunner:
                     hb.observe(line)
                 await events.put(RunnerEvent(kind=kind, line=line))  # type: ignore[arg-type]
 
-            while True:
-                try:
-                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
-                except Exception:  # noqa: BLE001 — pump must not crash the run
-                    break
-                if not chunk:
-                    break
+            async def process_chunk(chunk: bytes) -> None:
                 if b"\n" not in chunk:
                     pending.extend(chunk)
-                    continue
+                    return
                 parts = chunk.split(b"\n")
                 if pending:
                     pending.extend(parts[0])
@@ -157,6 +172,58 @@ class LocalRunner:
                 for raw_line in parts[1:-1]:
                     await publish(raw_line)
                 pending.extend(parts[-1])
+
+            async def drain_oversized_line() -> tuple[bytes | None, bytes]:
+                pending.clear()
+                prefix = bytearray()
+
+                def remember_prefix(data: bytes) -> None:
+                    remaining = _OVERSIZED_LINE_PREFIX_BYTES - len(prefix)
+                    if remaining > 0:
+                        prefix.extend(data[:remaining])
+
+                while True:
+                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+                    if not chunk:
+                        return None, bytes(prefix)
+                    newline_at = chunk.find(b"\n")
+                    if newline_at < 0:
+                        remember_prefix(chunk)
+                        continue
+                    remember_prefix(chunk[:newline_at])
+                    return chunk[newline_at + 1 :], bytes(prefix)
+
+            while True:
+                try:
+                    chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+                except (asyncio.LimitOverrunError, ValueError) as e:
+                    if not _is_stream_limit_overrun(e):
+                        break
+                    log.warning(
+                        "skipping oversized %s line for run_id=%s after stream reader "
+                        "limit overrun: %s",
+                        kind,
+                        spec.run_id,
+                        e,
+                    )
+                    try:
+                        remainder, skipped_prefix = await drain_oversized_line()
+                    except Exception:  # noqa: BLE001 — stream is no longer recoverable
+                        break
+                    if skipped_prefix:
+                        hb.last_line = loop.time()
+                        if kind == "stdout":
+                            hb.observe_oversized_stdout(skipped_prefix)
+                    if remainder is None:
+                        break
+                    if remainder:
+                        await process_chunk(remainder)
+                    continue
+                except Exception:  # noqa: BLE001 — pump must not crash the run
+                    break
+                if not chunk:
+                    break
+                await process_chunk(chunk)
             if pending:
                 await publish(bytes(pending))
 
@@ -276,6 +343,13 @@ def _pid_alive(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _is_stream_limit_overrun(exc: BaseException) -> bool:
+    if isinstance(exc, asyncio.LimitOverrunError):
+        return True
+    message = str(exc).lower()
+    return "separator" in message and "limit" in message
 
 
 def _terminate_process_group(pid: int | None) -> None:
