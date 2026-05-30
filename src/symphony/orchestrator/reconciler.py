@@ -24,7 +24,17 @@ from .. import db
 from ..config import Config, RepoBinding
 from ..github.client import GitHub, GitHubError
 from ..github.webhook import GitHubWebhookEvent
-from ..linear.client import Linear, LinearError, LinearIssue
+from ..linear.client import LinearError
+from ..tracker import (
+    DEFAULT_PROVIDER,
+    DEFAULT_SITE,
+    IssueTracker,
+    TrackerContext,
+    TrackerRegistry,
+)
+from ..tracker import (
+    Issue as LinearIssue,
+)
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +119,16 @@ class _BackoffRequested(RuntimeError):
         self.error = error
 
 
+def _register_configured_trackers(
+    registry: TrackerRegistry,
+    config: Config,
+    tracker: IssueTracker,
+) -> None:
+    registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
+    for binding in config.repos:
+        registry.register(binding.tracker_provider, binding.tracker_site, tracker)
+
+
 def reconcile_dry_run_enabled(env: Mapping[str, str] | None = None) -> bool:
     value = (env or os.environ).get("SYMPHONY_RECONCILE_DRYRUN", "")
     return value.strip().casefold() in {"1", "true", "yes", "on"}
@@ -162,17 +182,24 @@ class Reconciler:
         self,
         config: Config,
         conn: aiosqlite.Connection,
-        linear: Linear,
+        tracker_or_registry: IssueTracker | TrackerRegistry,
         gh: GitHub,
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self._conn = conn
-        self._linear = linear
+        if isinstance(tracker_or_registry, TrackerRegistry):
+            self._trackers = tracker_or_registry
+        else:
+            self._trackers = TrackerRegistry()
+            _register_configured_trackers(self._trackers, config, tracker_or_registry)
         self._gh = gh
         self._clock = clock
         self._backoff_until: datetime | None = None
+
+    def tracker(self, ctx: TrackerContext | None = None) -> IssueTracker:
+        return self._trackers.resolve(ctx)
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -292,8 +319,13 @@ class Reconciler:
 
         observed_at = self._now().isoformat()
         done_state_names = self._done_state_names(matched_bindings)
+        tracker_ctx = self._tracker_context_from_issue_row(issue_row, matched_bindings)
         try:
-            linear_issue, linear_payload = await self._linear_payload(issue_id)
+            tracker_issue_id = str(issue_row["tracker_issue_id"] or issue_id)
+            linear_issue, linear_payload = await self._tracker_payload(
+                tracker_issue_id,
+                tracker_ctx,
+            )
             github_prs, github_payload = await self._github_payload(prs)
         except _BackoffRequested:
             raise
@@ -507,10 +539,30 @@ class Reconciler:
 
     async def _issue_row(self, issue_id: str) -> aiosqlite.Row | None:
         cur = await self._conn.execute(
-            "SELECT id, identifier, title, team_key FROM issues WHERE id = ?",
+            """
+            SELECT id, tracker_issue_id, provider, site, identifier, title, team_key
+            FROM issues
+            WHERE id = ?
+            """,
             (issue_id,),
         )
         return await cur.fetchone()
+
+    def _tracker_context_from_issue_row(
+        self,
+        row: aiosqlite.Row,
+        bindings: list[RepoBinding],
+    ) -> TrackerContext:
+        provider = str(row["provider"] or "")
+        site = str(row["site"] or "")
+        if provider and site:
+            return TrackerContext(provider=provider, site=site)
+        for binding in bindings:
+            return TrackerContext(
+                provider=binding.tracker_provider,
+                site=binding.tracker_site,
+            )
+        return TrackerContext()
 
     async def _open_prs(self, issue_id: str) -> list[LocalIssuePr]:
         cur = await self._conn.execute(
@@ -535,11 +587,13 @@ class Reconciler:
             for row in rows
         ]
 
-    async def _linear_payload(
-        self, issue_id: str
+    async def _tracker_payload(
+        self,
+        issue_id: str,
+        ctx: TrackerContext,
     ) -> tuple[LinearIssue | None, dict[str, object]]:
         try:
-            issue = await self._linear.lookup_issue(issue_id)
+            issue = await self.tracker(ctx).lookup_issue(issue_id)
         except LinearError as exc:
             if _should_backoff(str(exc)):
                 raise _BackoffRequested(source=SOURCE_LINEAR, error=str(exc)) from exc
@@ -787,7 +841,13 @@ def _label_from_binding_key(binding_key: str) -> str | None:
 
 def _binding_storage_key(binding: RepoBinding) -> str:
     return json.dumps(
-        (binding.linear_team_key, binding.github_repo, binding.issue_label or ""),
+        (
+            binding.linear_team_key,
+            binding.github_repo,
+            binding.issue_label or "",
+            binding.tracker_provider,
+            binding.tracker_site,
+        ),
         separators=(",", ":"),
     )
 

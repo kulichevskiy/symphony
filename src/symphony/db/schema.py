@@ -33,6 +33,30 @@ async def apply_schema(conn: aiosqlite.Connection) -> None:
 
 async def _migrate(conn: aiosqlite.Connection) -> None:
     """Idempotent column adds for tables that pre-existed prior schema bumps."""
+    cur = await conn.execute("PRAGMA table_info(issues)")
+    issue_cols = {row[1] for row in await cur.fetchall()}
+    if "tracker_issue_id" not in issue_cols:
+        await conn.execute(
+            "ALTER TABLE issues ADD COLUMN tracker_issue_id TEXT NOT NULL DEFAULT ''"
+        )
+        await conn.execute(
+            "UPDATE issues SET tracker_issue_id = id WHERE tracker_issue_id = ''"
+        )
+    if "provider" not in issue_cols:
+        await conn.execute(
+            "ALTER TABLE issues ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
+        )
+    if "site" not in issue_cols:
+        await conn.execute(
+            "ALTER TABLE issues ADD COLUMN site TEXT NOT NULL DEFAULT 'default'"
+        )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_tracker_identity
+        ON issues(provider, site, tracker_issue_id)
+        """
+    )
+
     cur = await conn.execute("PRAGMA table_info(comment_cursors)")
     cols = {row[1] for row in await cur.fetchall()}
     if "last_seen_ids" not in cols:
@@ -105,4 +129,35 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE merge_conflict_fix_marks "
             "ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''"
+        )
+
+    cur = await conn.execute("PRAGMA table_info(operator_waits)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "tracker_provider" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits "
+            "ADD COLUMN tracker_provider TEXT NOT NULL DEFAULT 'linear'"
+        )
+        await conn.execute(
+            """
+            UPDATE operator_waits
+               SET tracker_provider = COALESCE(
+                   (SELECT provider FROM issues WHERE issues.id = operator_waits.issue_id),
+                   'linear'
+               )
+            """
+        )
+    if "tracker_site" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits "
+            "ADD COLUMN tracker_site TEXT NOT NULL DEFAULT 'default'"
+        )
+        await conn.execute(
+            """
+            UPDATE operator_waits
+               SET tracker_site = COALESCE(
+                   (SELECT site FROM issues WHERE issues.id = operator_waits.issue_id),
+                   'default'
+               )
+            """
         )

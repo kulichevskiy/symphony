@@ -14,10 +14,13 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 
 CREATE TABLE IF NOT EXISTS issues (
-    id          TEXT PRIMARY KEY,
-    identifier  TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    team_key    TEXT NOT NULL
+    id               TEXT PRIMARY KEY,
+    tracker_issue_id TEXT NOT NULL,
+    provider         TEXT NOT NULL DEFAULT 'linear',
+    site             TEXT NOT NULL DEFAULT 'default',
+    identifier       TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    team_key         TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -182,6 +185,8 @@ CREATE TABLE IF NOT EXISTS operator_waits (
     issue_id        TEXT PRIMARY KEY REFERENCES issues(id),
     run_id          TEXT NOT NULL REFERENCES runs(id),
     kind            TEXT NOT NULL,
+    tracker_provider TEXT NOT NULL DEFAULT 'linear',
+    tracker_site     TEXT NOT NULL DEFAULT 'default',
     linear_team_key TEXT NOT NULL,
     github_repo     TEXT NOT NULL,
     issue_label     TEXT NOT NULL DEFAULT '',

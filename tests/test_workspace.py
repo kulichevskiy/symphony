@@ -85,6 +85,25 @@ def test_repo_safe_is_injective_for_underscore_collisions() -> None:
     assert Workspace.repo_safe("acme/foo__bar") != Workspace.repo_safe("acme__foo/bar")
 
 
+def test_path_for_namespaces_by_tracker_context(tmp_path: Path) -> None:
+    async def clone_fn(repo: str, dest: Path) -> None:
+        raise AssertionError("clone should not be called")
+
+    ws = Workspace(root=tmp_path / "ws", clone_fn=clone_fn)
+    default_binding = _binding()
+    secondary_binding = _binding()
+    secondary_binding.tracker_site = "secondary/site"
+
+    issue = _issue("ENG-1")
+
+    assert ws.path_for(default_binding, issue) == (
+        tmp_path / "ws" / "linear__default__acme_swidgets" / "eng-1"
+    )
+    assert ws.path_for(secondary_binding, issue) == (
+        tmp_path / "ws" / "linear__secondary_ssite__acme_swidgets" / "eng-1"
+    )
+
+
 @pytest.mark.asyncio
 async def test_acquire_clones_and_checks_out_branch(tmp_path: Path) -> None:
     remote = await _make_remote(tmp_path)
@@ -92,7 +111,7 @@ async def test_acquire_clones_and_checks_out_branch(tmp_path: Path) -> None:
 
     path = await ws.acquire(_binding(), _issue("ENG-123"))
 
-    assert path == tmp_path / "ws" / "acme_swidgets" / "eng-123"
+    assert path == tmp_path / "ws" / "linear__default__acme_swidgets" / "eng-123"
     assert (path / ".git").exists()
     assert (path / "README.md").exists()
 

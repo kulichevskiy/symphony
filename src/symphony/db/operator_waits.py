@@ -27,6 +27,8 @@ class OperatorWait:
     issue_id: str
     run_id: str
     kind: str
+    tracker_provider: str
+    tracker_site: str
     linear_team_key: str
     github_repo: str
     issue_label: str
@@ -43,6 +45,8 @@ async def upsert(
     github_repo: str,
     issue_label: str,
     created_at: str,
+    tracker_provider: str = "linear",
+    tracker_site: str = "default",
 ) -> None:
     old = await get(conn, issue_id)
     await conn.execute(
@@ -51,15 +55,19 @@ async def upsert(
             issue_id,
             run_id,
             kind,
+            tracker_provider,
+            tracker_site,
             linear_team_key,
             github_repo,
             issue_label,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id) DO UPDATE SET
             run_id = excluded.run_id,
             kind = excluded.kind,
+            tracker_provider = excluded.tracker_provider,
+            tracker_site = excluded.tracker_site,
             linear_team_key = excluded.linear_team_key,
             github_repo = excluded.github_repo,
             issue_label = excluded.issue_label,
@@ -69,6 +77,8 @@ async def upsert(
             issue_id,
             run_id,
             kind,
+            tracker_provider,
+            tracker_site,
             linear_team_key,
             github_repo,
             issue_label,
@@ -96,6 +106,8 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
             issue_id,
             run_id,
             kind,
+            tracker_provider,
+            tracker_site,
             linear_team_key,
             github_repo,
             issue_label,
@@ -110,6 +122,8 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
             issue_id=str(row["issue_id"]),
             run_id=str(row["run_id"]),
             kind=str(row["kind"]),
+            tracker_provider=str(row["tracker_provider"]),
+            tracker_site=str(row["tracker_site"]),
             linear_team_key=str(row["linear_team_key"]),
             github_repo=str(row["github_repo"]),
             issue_label=str(row["issue_label"] or ""),
@@ -126,6 +140,8 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
             issue_id,
             run_id,
             kind,
+            tracker_provider,
+            tracker_site,
             linear_team_key,
             github_repo,
             issue_label,
@@ -142,6 +158,8 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
         issue_id=str(row["issue_id"]),
         run_id=str(row["run_id"]),
         kind=str(row["kind"]),
+        tracker_provider=str(row["tracker_provider"]),
+        tracker_site=str(row["tracker_site"]),
         linear_team_key=str(row["linear_team_key"]),
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"] or ""),
@@ -158,6 +176,8 @@ async def get_by_run_id(
             issue_id,
             run_id,
             kind,
+            tracker_provider,
+            tracker_site,
             linear_team_key,
             github_repo,
             issue_label,
@@ -174,6 +194,8 @@ async def get_by_run_id(
         issue_id=str(row["issue_id"]),
         run_id=str(row["run_id"]),
         kind=str(row["kind"]),
+        tracker_provider=str(row["tracker_provider"]),
+        tracker_site=str(row["tracker_site"]),
         linear_team_key=str(row["linear_team_key"]),
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"] or ""),

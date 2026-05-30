@@ -16,12 +16,13 @@ Filter rules:
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .client import LinearComment
+    from ..tracker import Comment
 
 _PATTERN = re.compile(
     r"^\s*\$("
@@ -79,7 +80,7 @@ def _command_text(body: str) -> str:
     return text
 
 
-def parse(comments: list[LinearComment]) -> list[SlashIntent]:
+def parse(comments: Sequence[Comment]) -> list[SlashIntent]:
     """Pure function: filter and classify. No I/O."""
     out: list[SlashIntent] = []
     for c in comments:
