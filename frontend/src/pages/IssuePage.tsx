@@ -86,20 +86,26 @@ function SectionTable<T extends object>({
 }
 
 const RUN_STATUS_ROW_CLASS: Record<string, string> = {
-  running: "bg-blue-50",
-  failed: "bg-red-50",
-  interrupted: "bg-red-50",
-  completed: "bg-green-50/50",
-  done: "bg-green-50/50",
+  running: "bg-blue-50 dark:bg-blue-950/30",
+  failed: "bg-red-50 dark:bg-red-950/30",
+  interrupted: "bg-red-50 dark:bg-red-950/30",
+  completed: "bg-green-50/50 dark:bg-green-950/20",
+  done: "bg-green-50/50 dark:bg-green-950/20",
 };
 
 const RUN_STATUS_BADGE_CLASS: Record<string, string> = {
-  running: "border-blue-300 bg-blue-100 text-blue-900",
-  failed: "border-red-300 bg-red-100 text-red-900",
-  interrupted: "border-red-400 bg-red-100 text-red-950",
-  completed: "border-green-300 bg-green-100 text-green-900",
-  done: "border-green-300 bg-green-100 text-green-900",
-  needs_approval: "border-amber-300 bg-amber-100 text-amber-900",
+  running:
+    "border-blue-300 bg-blue-100 text-blue-900 dark:border-blue-700 dark:bg-blue-950/50 dark:text-blue-200",
+  failed:
+    "border-red-300 bg-red-100 text-red-900 dark:border-red-700 dark:bg-red-950/50 dark:text-red-200",
+  interrupted:
+    "border-red-400 bg-red-100 text-red-950 dark:border-red-600 dark:bg-red-950/60 dark:text-red-100",
+  completed:
+    "border-green-300 bg-green-100 text-green-900 dark:border-green-700 dark:bg-green-950/50 dark:text-green-200",
+  done:
+    "border-green-300 bg-green-100 text-green-900 dark:border-green-700 dark:bg-green-950/50 dark:text-green-200",
+  needs_approval:
+    "border-amber-300 bg-amber-100 text-amber-900 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-200",
 };
 
 function runRowClassName(row: { status?: string | null }) {
@@ -113,7 +119,9 @@ function RunStatusBadge({ status }: { status: string | null | undefined }) {
   if (!status) {
     return <span className="text-muted-foreground">null</span>;
   }
-  const cls = RUN_STATUS_BADGE_CLASS[status] ?? "border-gray-300 bg-gray-50 text-gray-700";
+  const cls =
+    RUN_STATUS_BADGE_CLASS[status] ??
+    "border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300";
   return <Badge className={cn("font-mono", cls)}>{status}</Badge>;
 }
 
@@ -185,8 +193,8 @@ function FieldRow({
     <div
       className={cn(
         "grid min-h-9 grid-cols-[9rem_minmax(0,1fr)] items-center gap-3 border-t px-3 py-2 text-sm first:border-t-0",
-        flag && !isWarning ? "bg-red-50 text-red-950" : null,
-        isWarning ? "bg-amber-50 text-amber-950" : null,
+        flag && !isWarning ? "bg-red-50 text-red-950 dark:bg-red-950/40 dark:text-red-100" : null,
+        isWarning ? "bg-amber-50 text-amber-950 dark:bg-amber-950/40 dark:text-amber-100" : null,
       )}
       title={fieldTitle(flag)}
     >
@@ -213,7 +221,7 @@ function SourceAlert({
     ? ` — showing data from ${formatUtc(snapshot.stale_fetched_at)}`
     : "";
   return (
-    <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900">
+    <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200">
       {source} returned {snapshot.error}
       {stale}
     </div>
@@ -238,7 +246,10 @@ function LinearCard({
         <div className="flex min-w-0 flex-wrap gap-1">
           {(snapshot.labels ?? []).length > 0 ? (
             (snapshot.labels ?? []).map((label) => (
-              <Badge key={label} className="border-gray-300 bg-gray-50 text-gray-700">
+              <Badge
+                key={label}
+                className="border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300"
+              >
                 {label}
               </Badge>
             ))
@@ -269,7 +280,7 @@ export function GithubCard({
       </div>
       <SourceAlert source="GitHub" snapshot={snapshot} />
       {snapshot.comments_error ? (
-        <div className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+        <div className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
           GitHub review comments unavailable: {snapshot.comments_error}
         </div>
       ) : null}
@@ -367,10 +378,10 @@ export function ExternalTruthSection({
   const hasSourceError = Boolean(snapshot?.linear.error || snapshot?.github.error);
   const statusClass =
     driftCount > 0
-      ? "border-red-300 bg-red-50 text-red-900"
+      ? "border-red-300 bg-red-50 text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200"
       : hasSourceError
-        ? "border-amber-300 bg-amber-50 text-amber-900"
-        : "border-green-300 bg-green-50 text-green-900";
+        ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
+        : "border-green-300 bg-green-50 text-green-900 dark:border-green-700 dark:bg-green-950/40 dark:text-green-200";
   const statusLabel =
     driftCount > 0
       ? `Drift detected ⚠ (${driftCount})`
@@ -440,7 +451,7 @@ function ObservationsPanel({
       <h2 className="mb-3 text-base font-semibold tracking-normal">Recent observations</h2>
       {isLoading ? <p className="text-sm text-muted-foreground">Loading</p> : null}
       {error ? (
-        <p className="text-sm text-red-600">{(error as Error).message}</p>
+        <p className="text-sm text-red-600 dark:text-red-400">{(error as Error).message}</p>
       ) : null}
       {!isLoading && !error && rows.length === 0 ? (
         <p className="text-sm text-muted-foreground">(none)</p>
@@ -463,7 +474,7 @@ function ObservationsPanel({
                 <TableCell className="font-mono text-xs">{row.source}</TableCell>
                 <TableCell className="font-mono text-xs">
                   {row.drift_kind ? (
-                    <span className="text-red-700">{row.drift_kind}</span>
+                    <span className="text-red-700 dark:text-red-300">{row.drift_kind}</span>
                   ) : (
                     <span className="text-muted-foreground">null</span>
                   )}
@@ -555,7 +566,7 @@ export function IssuePage() {
       <div className="mx-auto w-full max-w-6xl px-6 py-2">
         {isLoading ? <p className="py-5 text-sm text-muted-foreground">Loading</p> : null}
         {error ? (
-          <p className="py-5 text-sm text-red-600">{(error as Error).message}</p>
+          <p className="py-5 text-sm text-red-600 dark:text-red-400">{(error as Error).message}</p>
         ) : null}
         {data ? (
           <>
@@ -568,7 +579,7 @@ export function IssuePage() {
               }}
             />
             {externalQuery.error ? (
-              <p className="border-t py-3 text-sm text-red-600">
+              <p className="border-t py-3 text-sm text-red-600 dark:text-red-400">
                 {(externalQuery.error as Error).message}
               </p>
             ) : null}
