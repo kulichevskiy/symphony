@@ -19,7 +19,7 @@ from .runs import (
 
 BACKFILL_PREFIX = "[backfill] "
 
-_MONITOR_STAGES = frozenset({"review", "local_review"})
+_MONITOR_STAGES = frozenset({"review"})
 _LOCAL_REVIEW_LOG_RE = re.compile(r"^(review|fix)-(\d+)\.(out|err)\.log$")
 _ERROR_EVENT_TYPES = frozenset({"turn.failed", "error"})
 _TRANSCRIPT_EVENT_TYPES = frozenset(

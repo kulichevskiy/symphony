@@ -258,6 +258,46 @@ async def test_backfill_reads_local_review_transcript_directory(
     assert "reviewer crashed" in rows["local-review-row"]["termination_detail"]
 
 
+@pytest.mark.asyncio
+async def test_backfill_local_review_without_transcript_is_unknown(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    issue_id = "iss-local-review-no-transcript"
+    await _seed_run(
+        db_path,
+        run_id="implement-parent",
+        issue_id=issue_id,
+        stage="implement",
+        status="completed",
+        started_at="2026-05-31T00:00:00+00:00",
+    )
+    await _seed_run(
+        db_path,
+        run_id="local-review-row",
+        issue_id=issue_id,
+        stage="local_review",
+        status="failed",
+        started_at="2026-05-31T00:01:00+00:00",
+    )
+    _write_local_review_log(
+        log_root,
+        "implement-parent",
+        "review-0.err.log",
+        "spawn failed before stdout",
+    )
+
+    result = run_backfill(db_path=db_path, log_root=log_root)
+
+    assert result.updated == 1
+    rows = _rows(db_path)
+    assert rows["local-review-row"]["termination_kind"] == "unknown"
+    assert "spawn failed before stdout" in rows["local-review-row"][
+        "termination_detail"
+    ]
+
+
 def test_backfilled_detail_keeps_prefix_and_live_termination_cap(tmp_path: Path) -> None:
     log_path = tmp_path / "run.log"
     body = "\n".join(f"line {i:03d} " + ("x" * 160) for i in range(200))
