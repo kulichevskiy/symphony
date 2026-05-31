@@ -19,29 +19,32 @@ async def _seed_run(
     db_path: Path,
     *,
     run_id: str,
+    issue_id: str | None = None,
     stage: str = "implement",
     status: str = "failed",
+    started_at: str = "2026-05-31T00:00:00+00:00",
     termination_kind: str = "",
     termination_detail: str = "",
     exit_returncode: int | None = None,
 ) -> None:
+    storage_issue_id = issue_id or f"iss-{run_id}"
     conn = await db.connect(db_path)
     try:
         await db.issues.upsert(
             conn,
-            id=f"iss-{run_id}",
-            identifier=f"ENG-{run_id}",
+            id=storage_issue_id,
+            identifier=f"ENG-{storage_issue_id}",
             title="test",
             team_key="ENG",
         )
         await db.runs.create(
             conn,
             id=run_id,
-            issue_id=f"iss-{run_id}",
+            issue_id=storage_issue_id,
             stage=stage,
             status="running",
             pid=None,
-            started_at="2026-05-31T00:00:00+00:00",
+            started_at=started_at,
         )
         await conn.execute(
             """
@@ -76,6 +79,18 @@ def _write_log(log_root: Path, run_id: str, *events: object) -> None:
     (log_root / f"{run_id}.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_local_review_log(
+    log_root: Path, parent_run_id: str, name: str, *events: object
+) -> None:
+    log_dir = log_root / "local_review" / parent_run_id
+    log_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        event if isinstance(event, str) else json.dumps(event, separators=(",", ":"))
+        for event in events
+    ]
+    (log_dir / name).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _rows(db_path: Path) -> dict[str, sqlite3.Row]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -101,7 +116,8 @@ async def test_backfill_updates_empty_terminal_runs_and_is_idempotent(
     await _seed_run(db_path, run_id="agent-failed", status="failed")
     await _seed_run(db_path, run_id="stalled", status="interrupted")
     await _seed_run(db_path, run_id="monitor", stage="review", status="failed")
-    await _seed_run(db_path, run_id="missing", status="needs_approval")
+    await _seed_run(db_path, run_id="missing", status="failed")
+    await _seed_run(db_path, run_id="needs-approval", status="needs_approval")
     await _seed_run(db_path, run_id="success", status="completed")
     await _seed_run(
         db_path,
@@ -125,10 +141,11 @@ async def test_backfill_updates_empty_terminal_runs_and_is_idempotent(
     first = run_backfill(db_path=db_path, log_root=log_root)
     second = run_backfill(db_path=db_path, log_root=log_root)
 
-    assert first.updated == 4
+    assert first.updated == 5
     assert second.updated == 0
     assert dict(first.aggregate) == {
         "agent_nonzero_exit": 1,
+        "awaiting_human_merge": 1,
         "monitor_terminated": 1,
         "spawn_failed": 1,
         "stall_timeout": 1,
@@ -142,11 +159,13 @@ async def test_backfill_updates_empty_terminal_runs_and_is_idempotent(
     assert rows["monitor"]["termination_kind"] == "monitor_terminated"
     assert rows["missing"]["termination_kind"] == "unknown"
     assert "missing log" in rows["missing"]["termination_detail"]
+    assert rows["needs-approval"]["termination_kind"] == "awaiting_human_merge"
+    assert "needs_approval" in rows["needs-approval"]["termination_detail"]
     assert rows["success"]["termination_kind"] == ""
     assert rows["live-captured"]["termination_kind"] == "spawn_failed"
     assert rows["live-captured"]["termination_detail"] == "live detail"
     assert rows["live-captured"]["exit_returncode"] == 127
-    for run_id in ("agent-failed", "stalled", "monitor", "missing"):
+    for run_id in ("agent-failed", "stalled", "monitor", "missing", "needs-approval"):
         assert rows[run_id]["termination_detail"].startswith(BACKFILL_PREFIX)
         assert rows[run_id]["exit_returncode"] is None
 
@@ -199,6 +218,44 @@ def test_classify_log_termination_completed_tail_on_failed_run_is_agent_exit(
     assert result.kind == "agent_nonzero_exit"
     assert result.detail.startswith(BACKFILL_PREFIX)
     assert "turn.completed" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_backfill_reads_local_review_transcript_directory(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    issue_id = "iss-local-review"
+    await _seed_run(
+        db_path,
+        run_id="implement-parent",
+        issue_id=issue_id,
+        stage="implement",
+        status="completed",
+        started_at="2026-05-31T00:00:00+00:00",
+    )
+    await _seed_run(
+        db_path,
+        run_id="local-review-row",
+        issue_id=issue_id,
+        stage="local_review",
+        status="failed",
+        started_at="2026-05-31T00:01:00+00:00",
+    )
+    _write_local_review_log(
+        log_root,
+        "implement-parent",
+        "review-0.out.log",
+        {"type": "turn.failed", "error": {"message": "reviewer crashed"}},
+    )
+
+    result = run_backfill(db_path=db_path, log_root=log_root)
+
+    assert result.updated == 1
+    rows = _rows(db_path)
+    assert rows["local-review-row"]["termination_kind"] == "agent_nonzero_exit"
+    assert "reviewer crashed" in rows["local-review-row"]["termination_detail"]
 
 
 def test_backfilled_detail_keeps_prefix_and_live_termination_cap(tmp_path: Path) -> None:

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .runs import (
+    NEEDS_APPROVAL_STATUS,
     TERMINAL_NON_SUCCESS_STATUSES,
     TERMINATION_DETAIL_MAX_BYTES,
     TERMINATION_DETAIL_MAX_LINES,
@@ -18,6 +20,7 @@ from .runs import (
 BACKFILL_PREFIX = "[backfill] "
 
 _MONITOR_STAGES = frozenset({"review", "local_review"})
+_LOCAL_REVIEW_LOG_RE = re.compile(r"^(review|fix)-(\d+)\.(out|err)\.log$")
 _ERROR_EVENT_TYPES = frozenset({"turn.failed", "error"})
 _TRANSCRIPT_EVENT_TYPES = frozenset(
     {
@@ -55,7 +58,7 @@ def classify_log_termination(*, log_path: Path, stage: str) -> TerminationClassi
         )
 
     try:
-        raw = log_path.read_text(encoding="utf-8", errors="replace")
+        raw = _read_log_text(log_path)
     except OSError as exc:
         return TerminationClassification(
             kind="unknown",
@@ -119,7 +122,7 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
     try:
         rows = conn.execute(
             f"""
-            SELECT id, stage, status
+            SELECT id, issue_id, stage, status, started_at
             FROM runs
             WHERE status IN ({placeholders})
               AND COALESCE(termination_kind, '') = ''
@@ -133,9 +136,10 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
         with conn:
             for row in rows:
                 run_id = str(row["id"])
-                classification = classify_log_termination(
-                    log_path=log_root / f"{run_id}.log",
-                    stage=str(row["stage"]),
+                classification = _classify_run_termination(
+                    conn=conn,
+                    row=row,
+                    log_root=log_root,
                 )
                 cur = conn.execute(
                     f"""
@@ -162,6 +166,88 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
         conn.close()
 
     return BackfillResult(updated=updated, aggregate=aggregate)
+
+
+def _classify_run_termination(
+    *, conn: sqlite3.Connection, row: sqlite3.Row, log_root: Path
+) -> TerminationClassification:
+    status = str(row["status"])
+    if status == NEEDS_APPROVAL_STATUS:
+        return TerminationClassification(
+            kind="awaiting_human_merge",
+            detail=_backfill_detail("historical needs_approval operator handoff"),
+        )
+
+    stage = str(row["stage"])
+    return classify_log_termination(
+        log_path=_log_path_for_row(conn=conn, log_root=log_root, row=row),
+        stage=stage,
+    )
+
+
+def _log_path_for_row(
+    *, conn: sqlite3.Connection, log_root: Path, row: sqlite3.Row
+) -> Path:
+    run_id = str(row["id"])
+    if str(row["stage"]) != "local_review":
+        return log_root / f"{run_id}.log"
+
+    parent_run_id = _local_review_parent_run_id(conn=conn, row=row)
+    if parent_run_id:
+        return log_root / "local_review" / parent_run_id
+    return log_root / "local_review" / run_id
+
+
+def _local_review_parent_run_id(
+    *, conn: sqlite3.Connection, row: sqlite3.Row
+) -> str | None:
+    parent = conn.execute(
+        """
+        SELECT id
+        FROM runs
+        WHERE issue_id = ?
+          AND stage = 'implement'
+          AND started_at <= ?
+        ORDER BY started_at DESC, id DESC
+        LIMIT 1
+        """,
+        (row["issue_id"], row["started_at"]),
+    ).fetchone()
+    if parent is None:
+        return None
+    return str(parent["id"])
+
+
+def _read_log_text(log_path: Path) -> str:
+    if log_path.is_dir():
+        return _read_log_directory(log_path)
+    return log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _read_log_directory(log_path: Path) -> str:
+    parts: list[str] = []
+    for child in sorted(
+        (
+            path
+            for path in log_path.iterdir()
+            if path.is_file() and path.name.endswith(".log")
+        ),
+        key=_local_review_log_sort_key,
+    ):
+        text = child.read_text(encoding="utf-8", errors="replace").rstrip()
+        if text:
+            parts.append(f"== {child.name} ==\n{text}")
+    return "\n".join(parts)
+
+
+def _local_review_log_sort_key(path: Path) -> tuple[int, int, int, str]:
+    match = _LOCAL_REVIEW_LOG_RE.match(path.name)
+    if match is None:
+        return (1, 0, 0, path.name)
+    phase, iteration, stream = match.groups()
+    phase_index = int(iteration) * 2 + (0 if phase == "review" else 1)
+    stream_index = 0 if stream == "out" else 1
+    return (0, phase_index, stream_index, path.name)
 
 
 def _json_events(raw: str) -> list[dict[str, Any]]:
