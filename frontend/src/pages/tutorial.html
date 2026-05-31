@@ -1,0 +1,3260 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>symphonyd — интерактивный учебник</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=Instrument+Serif:ital@0;1&family=Geist:wght@300..700&family=JetBrains+Mono:wght@400;500;600&display=swap" />
+<style>
+  :root {
+    /* Warm dark palette — editorial */
+    --bg:         #100e0b;
+    --bg-elev:    #181511;
+    --bg-soft:    #1a1612;
+    --bg-softer:  #221d18;
+    --border:     #3a342d;
+    --border-2:   #2a2520;
+    --border-3:   #221e19;
+    --text:       #f4eee0;
+    --text-dim:   #cfc5b2;
+    --muted:      #8e8576;
+    --muted-2:    #6a6357;
+    --accent:     #d97757;       /* coral */
+    --accent-hi:  #e88766;
+    --accent-soft: rgba(217,119,87,0.13);
+    --accent-2:   #c5a572;       /* warm gold */
+    --ok:         #8fbf7a;
+    --warn:       #e0b066;
+    --bad:        #d97070;
+    --code-bg:    #15120e;
+
+    --font-sans:    "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --font-mono:    "JetBrains Mono", "SF Mono", "Menlo", "Consolas", ui-monospace, monospace;
+    --font-serif:   "Newsreader", "Iowan Old Style", "Charter", "Cambria", "Georgia", ui-serif, serif;
+    --font-display: "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+
+    --r-sm: 4px;
+    --r-md: 6px;
+    --r-lg: 10px;
+    --shadow-lg: 0 16px 48px -16px rgba(0,0,0,0.55), 0 4px 12px -4px rgba(0,0,0,0.4);
+
+    --side-w: 296px;
+    --pad-main: clamp(20px, 4vw, 72px);
+  }
+
+  * { box-sizing: border-box; }
+  *::selection { background: var(--accent); color: #110f0c; }
+
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-serif);
+    font-size: 19px;
+    line-height: 1.65;
+    font-variation-settings: "opsz" 16;
+    font-feature-settings: "kern", "liga", "calt", "onum";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    -webkit-text-size-adjust: 100%;
+    overflow-wrap: break-word;
+  }
+  body {
+    min-height: 100dvh;
+    background: var(--bg);
+  }
+
+  /* UI chrome stays sans */
+  aside, header.scn-header, .controls, button, .pill, .legend, .step-counter,
+  .db-table, ul.refs, svg.statemachine text, svg.statemachine .edge-label,
+  .mobile-nav, .menu-toggle, .progress-bar {
+    font-family: var(--font-sans);
+  }
+  code, pre, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+
+  a {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  a:hover { border-bottom-color: var(--accent); }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+  button {
+    font: inherit; font-size: 14px;
+    background: transparent; color: var(--text-dim);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 8px 16px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button:hover { border-color: var(--accent); color: var(--text); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: 0.32; cursor: not-allowed; }
+  button:disabled:hover { border-color: var(--border); color: var(--text-dim); }
+
+  /* ============================================ */
+  /* App shell                                    */
+  /* ============================================ */
+  #app {
+    display: grid;
+    grid-template-columns: var(--side-w) 1fr;
+    min-height: 100dvh;
+  }
+
+  aside#sidebar {
+    background: var(--bg-elev);
+    border-right: 1px solid var(--border-3);
+    padding: 36px 24px 28px;
+    overflow-y: auto;
+    position: sticky;
+    top: 0;
+    height: 100dvh;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  aside#sidebar::-webkit-scrollbar { width: 8px; }
+  aside#sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  aside h1 {
+    font-family: var(--font-display);
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    margin: 0 0 4px 0;
+    color: var(--text);
+  }
+  aside h1 .accent { color: var(--accent); font-weight: 500; }
+  aside .tagline {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.55;
+    margin-bottom: 32px;
+    font-family: var(--font-sans);
+    font-weight: 300;
+    letter-spacing: 0.005em;
+  }
+  aside h2 {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--muted-2);
+    margin: 32px 0 10px 0;
+    font-weight: 500;
+    font-family: var(--font-sans);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  aside h2::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border-3);
+  }
+  aside h2:first-of-type { margin-top: 0; }
+  aside h2:first-of-type::after { display: none; }
+  aside ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 1px; }
+  aside li {
+    padding: 11px 12px 11px 14px;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    font-size: 14px;
+    color: var(--text-dim);
+    line-height: 1.4;
+    font-family: var(--font-sans);
+    font-weight: 400;
+    letter-spacing: 0.002em;
+    transition: background 0.18s, color 0.18s, padding-left 0.18s;
+    -webkit-tap-highlight-color: transparent;
+    position: relative;
+  }
+  aside li:hover { background: rgba(217,119,87,0.05); color: var(--text); padding-left: 18px; }
+  aside li.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 500;
+    padding-left: 18px;
+  }
+  aside li.active::before {
+    content: "";
+    position: absolute;
+    left: 4px; top: 12px; bottom: 12px;
+    width: 2px;
+    background: var(--accent);
+    border-radius: 1px;
+  }
+  aside li.active .scn-num { color: var(--accent); font-weight: 500; }
+  .scn-num {
+    color: var(--muted-2);
+    margin-right: 12px;
+    font-variant-numeric: tabular-nums;
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+    font-weight: 400;
+  }
+
+  aside .colophon {
+    margin-top: 40px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border-3);
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    color: var(--muted-2);
+    line-height: 1.6;
+    letter-spacing: 0.01em;
+  }
+  aside .colophon b { color: var(--text-dim); font-weight: 500; }
+
+  main {
+    padding: 56px var(--pad-main) 96px;
+    min-width: 0;
+    max-width: 100%;
+    animation: fadeUp 0.42s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: none; }
+  }
+  #content { animation: fadeUp 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+
+  /* Scenario header */
+  header.scn-header {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: start;
+    column-gap: 28px;
+    padding-bottom: 24px;
+    margin-bottom: 36px;
+    border-bottom: 1px solid var(--border-3);
+    position: relative;
+  }
+  .scn-numeral {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+    padding-top: 10px;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .scn-title { min-width: 0; padding-top: 2px; }
+  .scn-kicker {
+    display: block;
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+  .scn-kicker .dot-sep {
+    display: inline-block;
+    width: 3px; height: 3px;
+    border-radius: 50%;
+    background: var(--muted-2);
+    margin: 0 10px;
+    transform: translateY(-2px);
+  }
+  .scn-title h2 {
+    margin: 0 0 12px 0;
+    font-family: var(--font-display);
+    font-size: clamp(28px, 3.2vw, 38px);
+    font-weight: 600;
+    letter-spacing: -0.018em;
+    line-height: 1.15;
+    text-wrap: balance;
+    color: var(--text);
+  }
+  .scn-title h2 em { font-style: normal; color: inherit; }
+  .scn-title p {
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 17px;
+    line-height: 1.55;
+    max-width: 68ch;
+    font-family: var(--font-serif);
+    text-wrap: pretty;
+    font-weight: 400;
+  }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    padding-top: 2px;
+  }
+  .step-counter {
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    min-width: 60px;
+    text-align: center;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    letter-spacing: 0.04em;
+  }
+
+  /* ============================================ */
+  /* Diagram                                      */
+  /* ============================================ */
+  .diagram-wrap {
+    background: var(--bg-soft);
+    border: 1px solid var(--border-3);
+    border-radius: var(--r-md);
+    padding: 18px;
+    margin: 4px 0 8px;
+    overflow: hidden;
+    position: relative;
+  }
+  .diagram-expand {
+    position: absolute;
+    top: 10px; right: 10px;
+    z-index: 2;
+    width: 36px; height: 36px;
+    padding: 0;
+    background: var(--bg-elev);
+    border: 1px solid var(--border-2);
+    border-radius: var(--r-sm);
+    color: var(--text-dim);
+    font-size: 16px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .diagram-expand:hover { opacity: 1; border-color: var(--accent); color: var(--text); }
+  .diagram-scroll-hint {
+    display: none;
+    position: absolute;
+    bottom: 8px; right: 14px;
+    z-index: 2;
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(24,21,17,0.85);
+    padding: 3px 8px;
+    border-radius: 10px;
+    pointer-events: none;
+    backdrop-filter: blur(4px);
+  }
+  .diagram-scroller {
+    width: 100%;
+    height: auto;
+  }
+
+  /* Fullscreen diagram modal */
+  .diagram-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(10, 8, 6, 0.92);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    display: none;
+    padding: 24px;
+    align-items: center;
+    justify-content: center;
+  }
+  .diagram-modal.open { display: flex; }
+  .diagram-modal-inner {
+    width: 100%;
+    height: 100%;
+    max-width: 1400px;
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+  }
+  .diagram-modal-inner svg.statemachine {
+    width: auto;
+    height: auto;
+    max-width: min(100%, 1400px);
+    max-height: 100%;
+    aspect-ratio: 900 / 700;
+  }
+  .diagram-modal-close {
+    position: absolute;
+    top: max(16px, env(safe-area-inset-top));
+    right: 16px;
+    z-index: 2;
+    width: 44px; height: 44px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text);
+    font-size: 26px;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .diagram-modal-close:hover { border-color: var(--accent); }
+  svg.statemachine {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 900 / 700;
+    max-height: 600px;
+    display: block;
+  }
+  svg .node rect {
+    fill: var(--bg-elev);
+    stroke: var(--border);
+    stroke-width: 1;
+    transition: fill 0.25s, stroke 0.25s;
+  }
+  svg .node text {
+    fill: var(--text-dim);
+    font: 500 13px var(--font-sans);
+    letter-spacing: 0.005em;
+    text-anchor: middle;
+    dominant-baseline: middle;
+    pointer-events: none;
+  }
+  svg .node.sub rect {
+    fill: var(--bg-softer);
+    stroke: var(--border-2);
+  }
+  svg .node.sub text {
+    font-size: 11.5px;
+    fill: var(--muted);
+  }
+  svg .node.side rect {
+    stroke-dasharray: 4 3;
+    stroke: var(--muted-2);
+  }
+  svg .node.side text { fill: var(--muted); }
+  svg .node:hover rect { stroke: var(--accent); cursor: pointer; }
+  svg .node:hover text { fill: var(--text); }
+  svg .node.active rect { fill: var(--accent); stroke: var(--accent); }
+  svg .node.active text { fill: #110f0c; font-weight: 600; }
+  svg .node.warn rect { fill: var(--warn); stroke: var(--warn); }
+  svg .node.warn text { fill: #110f0c; font-weight: 600; }
+  svg .node.bad rect { fill: var(--bad); stroke: var(--bad); }
+  svg .node.bad text { fill: #fff; font-weight: 600; }
+
+  svg .edge {
+    fill: none;
+    stroke: var(--border);
+    stroke-width: 1.3;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+    marker-end: url(#arrow);
+    transition: stroke 0.2s, stroke-width 0.2s;
+  }
+  svg .edge.dashed {
+    stroke: var(--muted-2);
+    stroke-dasharray: 5 3;
+    marker-end: url(#arrow-dashed);
+  }
+  svg .edge.active {
+    stroke: var(--accent);
+    stroke-width: 2.2;
+    marker-end: url(#arrow-active);
+  }
+
+  svg #arrow path { fill: var(--border); }
+  svg #arrow-dashed path { fill: var(--muted-2); }
+  svg #arrow-active path { fill: var(--accent); }
+
+  svg .edge-label-g rect {
+    fill: var(--bg-soft);
+    stroke: none;
+  }
+  svg .edge-label {
+    fill: var(--muted);
+    font: 500 11px var(--font-mono);
+    letter-spacing: 0.02em;
+    dominant-baseline: middle;
+    pointer-events: none;
+  }
+  svg .edge-label-g[data-for="e-impl-needs"] rect,
+  svg .edge-label-g[data-for="e-review-needs"] rect,
+  svg .edge-label-g[data-for="e-merge-needs"] rect,
+  svg .edge-label-g[data-for="e-accept-needs"] rect,
+  svg .edge-label-g[data-for="e-needs-back"] rect { fill: var(--bg-soft); }
+
+  /* ============================================ */
+  /* Cards & narrative                            */
+  /* ============================================ */
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+    gap: 40px;
+    margin-top: 16px;
+  }
+  .card {
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--border-3);
+    border-radius: 0;
+    padding: 24px 0 4px;
+    margin-bottom: 0;
+    min-width: 0;
+  }
+  .card:first-of-type { border-top: none; padding-top: 0; }
+  .card h3 {
+    margin: 0 0 16px 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    font-weight: 600;
+    font-family: var(--font-sans);
+  }
+
+  .narrative {
+    font-size: 17px;
+    line-height: 1.65;
+    color: var(--text);
+    max-width: 68ch;
+    font-variation-settings: "opsz" 16;
+  }
+  .narrative > :first-child { margin-top: 0; }
+  .narrative > :last-child { margin-bottom: 0; }
+  .narrative h4 {
+    margin: 32px 0 14px 0;
+    font-family: var(--font-display);
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    color: var(--text);
+    line-height: 1.25;
+    text-wrap: balance;
+    font-style: normal;
+  }
+  .narrative h4:first-child { margin-top: 0; }
+  .narrative p { margin: 0 0 16px 0; text-wrap: pretty; }
+  .narrative ul { margin: 0 0 18px 0; padding-left: 24px; }
+  .narrative ul li::marker { color: var(--muted-2); }
+  .narrative li { margin-bottom: 8px; text-wrap: pretty; padding-left: 2px; }
+  .narrative strong { color: var(--text); font-weight: 600; }
+  .narrative em { font-style: italic; color: var(--text-dim); }
+  .narrative .hl { background: var(--accent-soft); padding: 1px 6px; border-radius: 3px; color: var(--accent); }
+  .narrative code {
+    background: var(--bg-soft);
+    padding: 1px 6px;
+    border-radius: 3px;
+    color: var(--accent-2);
+    font-size: 0.86em;
+    border: 1px solid var(--border-3);
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+    font-weight: 500;
+  }
+  .narrative a code { color: var(--accent); }
+
+  /* Step title for narrative card */
+  .step-headline {
+    font-family: var(--font-sans);
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin: 0 0 16px 0;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border-3);
+  }
+  .step-headline .num {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    text-transform: none;
+  }
+
+  /* "Технически" disclosure */
+  .narrative details {
+    margin: 24px 0 8px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border-3);
+    border-left: 2px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 14px 22px;
+    font-size: 16.5px;
+    transition: border-left-color 0.15s;
+  }
+  .narrative details[open] {
+    padding-bottom: 16px;
+    border-left-color: var(--accent);
+    background: var(--bg-softer);
+  }
+  .narrative details > summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-weight: 600;
+    user-select: none;
+    outline: none;
+    padding: 2px 0;
+    font-family: var(--font-sans);
+    list-style: none;
+  }
+  .narrative details > summary::-webkit-details-marker { display: none; }
+  .narrative details > summary::before {
+    content: "▸ ";
+    display: inline-block;
+    transition: transform 0.15s;
+    color: var(--muted-2);
+  }
+  .narrative details[open] > summary::before { transform: rotate(90deg); }
+  .narrative details[open] > summary { margin-bottom: 12px; color: var(--accent); }
+  .narrative details[open] > summary::before { color: var(--accent); }
+  .narrative details p { margin: 10px 0; line-height: 1.65; font-size: inherit; }
+  .narrative details ul { margin: 10px 0; padding-left: 22px; }
+  .narrative details li { margin-bottom: 7px; line-height: 1.6; font-size: inherit; }
+
+  /* Reference lists */
+  ul.refs { list-style: none; padding: 0; margin: 0; }
+  ul.refs li {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border-3);
+    font-size: 13.5px;
+    line-height: 1.55;
+  }
+  ul.refs li:last-child { border-bottom: none; }
+  ul.refs li:first-child { padding-top: 0; }
+  ul.refs .ref-path {
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  ul.refs .ref-desc {
+    color: var(--muted);
+    display: block;
+    margin-top: 5px;
+    font-size: 13.5px;
+    line-height: 1.5;
+  }
+
+  /* DB tables */
+  .db-table { margin-bottom: 20px; }
+  .db-table .name {
+    font-family: var(--font-mono);
+    color: var(--accent-2);
+    margin-bottom: 8px;
+    font-size: 13px;
+  }
+  .db-table .name a { color: var(--accent-2); }
+  .db-table .name a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  .db-table table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border-3);
+    border-radius: var(--r-sm);
+    overflow: hidden;
+  }
+  .db-table th, .db-table td {
+    padding: 9px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border-3);
+    vertical-align: top;
+    word-break: break-word;
+  }
+  .db-table tr:last-child td { border-bottom: none; }
+  .db-table th {
+    background: transparent;
+    color: var(--muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    font-family: var(--font-sans);
+  }
+  .db-table tr.added td { background: rgba(143, 191, 122, 0.07); }
+  .db-table tr.changed td { background: rgba(224, 176, 102, 0.07); }
+  .db-table tr.removed td {
+    background: rgba(217, 112, 112, 0.06);
+    color: var(--muted);
+    text-decoration: line-through;
+  }
+  .db-table td b { color: var(--text-dim); font-weight: 600; }
+
+  /* Code blocks */
+  pre.code {
+    background: var(--code-bg);
+    border: 1px solid var(--border-3);
+    border-radius: var(--r-sm);
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.65;
+    margin: 0;
+    -webkit-overflow-scrolling: touch;
+  }
+  pre.code .ln { color: var(--muted-2); margin-right: 14px; user-select: none; }
+  pre.code .hl-line { background: var(--accent-soft); margin: 0 -18px; padding: 0 18px; }
+
+  /* ============================================ */
+  /* Drawer (side-panel)                          */
+  /* ============================================ */
+  .drawer-bg {
+    position: fixed; inset: 0;
+    background: rgba(10, 8, 6, 0.55);
+    backdrop-filter: blur(2px);
+    display: none;
+    z-index: 40;
+  }
+  .drawer-bg.open { display: block; }
+  .drawer {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(600px, 100vw);
+    background: var(--bg-elev);
+    border-left: 1px solid var(--border-3);
+    padding: 40px 44px;
+    overflow-y: auto;
+    z-index: 41;
+    transform: translateX(100%);
+    transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: var(--shadow-lg);
+  }
+  .drawer.open { transform: translateX(0); }
+  .drawer header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 22px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border-3);
+    gap: 16px;
+  }
+  .drawer h2 {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    text-wrap: balance;
+  }
+  .drawer h4 {
+    margin: 26px 0 10px 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    color: var(--muted);
+    letter-spacing: 0.12em;
+    font-weight: 600;
+    font-family: var(--font-sans);
+  }
+  .drawer .close-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    font-size: 28px;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: var(--r-sm);
+    transition: color 0.15s, background 0.15s;
+    flex-shrink: 0;
+  }
+  .drawer .close-btn:hover { color: var(--text); background: var(--bg-softer); }
+  .drawer p {
+    margin: 0 0 12px 0;
+    font-size: 16px;
+    line-height: 1.65;
+    color: var(--text);
+    font-family: var(--font-serif);
+    text-wrap: pretty;
+  }
+  .drawer code {
+    background: var(--bg-soft);
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: var(--accent-2);
+    font-size: 0.85em;
+    border: 1px solid var(--border-3);
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+
+  /* Pills, legend */
+  .pill {
+    display: inline-block;
+    padding: 3px 10px;
+    font-size: 12px;
+    border-radius: 10px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    margin-right: 5px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+  }
+  .pill.implement  { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+  .pill.review     { background: rgba(197,165,114,0.14); color: var(--accent-2); border-color: transparent; }
+  .pill.merge      { background: rgba(143,191,122,0.14); color: var(--ok); border-color: transparent; }
+  .pill.acceptance { background: rgba(224,176,102,0.14); color: var(--warn); border-color: transparent; }
+  .pill.fail       { background: rgba(217,112,112,0.14); color: var(--bad); border-color: transparent; }
+
+  .legend {
+    display: flex;
+    gap: 18px 22px;
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .legend > span { display: inline-flex; align-items: center; }
+  .legend .dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    background: var(--accent);
+    margin-right: 8px;
+  }
+  .legend .dot.warn { background: var(--warn); }
+  .legend .dot.bad { background: var(--bad); }
+  .legend .dot.idle { background: transparent; border: 1px solid var(--border); }
+
+  /* Intro */
+  .intro { max-width: 70ch; margin: 0; }
+  .intro-eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 24px;
+  }
+  .intro-eyebrow .line {
+    flex: 0 0 28px;
+    height: 1px;
+    background: var(--accent);
+  }
+  .intro h2 {
+    font-family: var(--font-display);
+    font-size: clamp(32px, 4.4vw, 52px);
+    font-weight: 600;
+    letter-spacing: -0.022em;
+    line-height: 1.08;
+    margin: 0 0 28px 0;
+    color: var(--text);
+    text-wrap: balance;
+  }
+  .intro h2 em { font-style: normal; color: inherit; }
+  .intro .lede {
+    font-family: var(--font-serif);
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--text-dim);
+    margin-bottom: 36px;
+    font-style: normal;
+    font-weight: 400;
+    max-width: 60ch;
+    text-wrap: pretty;
+    padding-left: 14px;
+    border-left: 2px solid var(--accent);
+  }
+  .intro p {
+    font-size: 18px;
+    line-height: 1.68;
+    color: var(--text);
+    margin-bottom: 18px;
+    text-wrap: pretty;
+  }
+  .intro .has-dropcap { /* drop-cap disabled — too editorial */ }
+  .intro .has-dropcap::first-letter { all: unset; }
+  .intro .start-hint {
+    color: var(--text);
+    margin-top: 36px;
+    padding: 18px 22px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border-3);
+    border-left: 2px solid var(--accent);
+    border-radius: 0 var(--r-sm) var(--r-sm) 0;
+    font-size: 16px;
+    line-height: 1.55;
+    font-family: var(--font-sans);
+  }
+  .intro .start-hint strong { color: var(--accent); font-weight: 600; }
+
+  /* ============================================ */
+  /* Mobile menu toggle & sidebar overlay         */
+  /* ============================================ */
+  .menu-toggle {
+    display: none;
+    position: fixed;
+    top: 12px; left: 12px;
+    z-index: 70;
+    width: 44px; height: 44px;
+    align-items: center; justify-content: center;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text);
+    font-size: 20px;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+  }
+  .menu-toggle:hover { border-color: var(--accent); color: var(--text); }
+  .sidebar-bg {
+    position: fixed; inset: 0;
+    z-index: 50;
+    background: rgba(10, 8, 6, 0.6);
+    display: none;
+  }
+  .sidebar-bg.open { display: block; }
+
+  /* Step nav — sticky at bottom in scenario mode, all viewport widths */
+  .mobile-nav {
+    display: none;
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    z-index: 30;
+    background: var(--bg-elev);
+    border-top: 1px solid var(--border-3);
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+    gap: 10px;
+    align-items: center;
+  }
+  body.scenario-mode .mobile-nav { display: flex; }
+  body.scenario-mode main { padding-bottom: 96px; }
+  .mobile-nav button {
+    flex: 1;
+    max-width: 200px;
+    min-height: 44px;
+    font-size: 14px;
+    padding: 10px 12px;
+    background: var(--bg-soft);
+    color: var(--text);
+    border-color: var(--border-2);
+  }
+  .mobile-nav button:hover { border-color: var(--accent); }
+  .mobile-nav .step-counter {
+    flex-shrink: 0;
+    min-width: 80px;
+    font-size: 13px;
+    color: var(--muted);
+    text-align: center;
+  }
+  .mobile-nav .progress-bar {
+    position: absolute;
+    top: 0; left: 0;
+    height: 2px;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.2s ease;
+  }
+
+  /* On desktop, hide the redundant in-header controls (sticky bar handles it) */
+  @media (min-width: 761px) {
+    header.scn-header .controls { display: none; }
+  }
+
+  /* ============================================ */
+  /* Tablet — ≤ 1000px                            */
+  /* ============================================ */
+  @media (max-width: 1000px) {
+    .grid { grid-template-columns: 1fr; gap: 4px; }
+    .narrative { max-width: none; }
+    .drawer { width: min(520px, 100vw); padding: 32px 28px; }
+    header.scn-header {
+      grid-template-columns: auto 1fr;
+      column-gap: 20px;
+    }
+    header.scn-header .controls {
+      grid-column: 1 / -1;
+      justify-content: flex-end;
+      padding-top: 12px;
+      margin-top: 12px;
+      border-top: 1px solid var(--border-3);
+    }
+    .scn-numeral { font-size: 12px; padding-top: 8px; }
+    .scn-title h2 { font-size: clamp(24px, 3.8vw, 32px); }
+    .scn-title p { font-size: 16px; }
+  }
+
+  /* ============================================ */
+  /* Mobile — ≤ 760px                             */
+  /* ============================================ */
+  @media (max-width: 760px) {
+    html, body {
+      font-size: 17px;
+      line-height: 1.6;
+    }
+
+    #app { grid-template-columns: 1fr; }
+
+    aside#sidebar {
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      width: min(86vw, 320px);
+      height: 100dvh;
+      z-index: 60;
+      isolation: isolate;
+      will-change: transform;
+      transform: translateX(-100%);
+      transition: transform 0.24s cubic-bezier(0.4, 0, 0.2, 1);
+      padding: 72px 22px 28px;
+      box-shadow: var(--shadow-lg);
+      background: var(--bg-elev);
+    }
+    aside#sidebar.open { transform: translateX(0); }
+    aside li { padding: 12px 12px; font-size: 15px; }
+
+    .menu-toggle { display: flex; }
+
+    main {
+      padding: 70px 18px 96px;
+    }
+
+    header.scn-header {
+      grid-template-columns: 1fr;
+      gap: 12px;
+      padding-bottom: 20px;
+      margin-bottom: 22px;
+    }
+    .scn-numeral { font-size: 11.5px; padding-top: 0; }
+    .scn-title { padding-top: 0; }
+    .scn-kicker { font-size: 10.5px; letter-spacing: 0.16em; margin-bottom: 8px; }
+    /* Hide desktop controls — bottom mobile-nav takes over */
+    header.scn-header .controls { display: none; }
+
+    .scn-title h2 { font-size: 24px; line-height: 1.2; }
+    .scn-title p { font-size: 15.5px; }
+
+    .intro h2 { font-size: 32px; margin-bottom: 22px; line-height: 1.1; }
+    .intro .lede { font-size: 17px; padding-left: 12px; }
+    .intro p { font-size: 16.5px; margin-bottom: 16px; }
+    .intro ul { padding-left: 22px; }
+    .intro .start-hint { font-size: 15.5px; padding: 16px 18px; }
+
+    .narrative { font-size: 17px; line-height: 1.7; }
+    .narrative h4 { font-size: 22px; margin: 28px 0 12px; }
+    .narrative ul { padding-left: 22px; }
+    .narrative details { padding: 12px 16px; font-size: 16px; }
+
+    .card { padding: 20px 0 0; }
+    .card h3 { margin-bottom: 12px; }
+
+    .diagram-wrap {
+      padding: 0;
+      margin: 0 -2px 8px;
+      overflow: hidden;
+    }
+    .diagram-scroller {
+      overflow-x: auto;
+      overflow-y: hidden;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: thin;
+    }
+    .diagram-scroller::-webkit-scrollbar { height: 6px; }
+    .diagram-scroller::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 3px; }
+    svg.statemachine {
+      width: 760px;
+      min-width: 760px;
+      max-width: none;
+      max-height: none;
+      height: auto;
+      aspect-ratio: 900 / 700;
+      display: block;
+      padding: 14px;
+    }
+    svg .node text { font-size: 13px; }
+    svg .edge-label { font-size: 11.5px; }
+    .diagram-scroll-hint { display: block; }
+    .diagram-modal { padding: 8px; }
+    .diagram-modal-inner { padding: 0; }
+    .diagram-modal-inner svg.statemachine { min-width: 760px; padding: 0; }
+
+    .legend { font-size: 12px; gap: 12px 18px; }
+
+    .db-table { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .db-table table { min-width: 320px; font-size: 12px; }
+
+    ul.refs li { padding: 14px 0; }
+    ul.refs .ref-path { font-size: 12.5px; }
+    ul.refs .ref-desc { font-size: 13.5px; }
+
+    .drawer {
+      width: 100vw;
+      max-width: 100vw;
+      padding: 24px 20px calc(40px + env(safe-area-inset-bottom));
+    }
+    .drawer h2 { font-size: 20px; }
+    .drawer p { font-size: 15.5px; }
+    .drawer .close-btn { width: 44px; height: 44px; font-size: 30px; }
+
+    /* show bottom nav only when scenario is active (toggled by JS body class) */
+    body.scenario-mode main { padding-bottom: 96px; }
+  }
+
+  /* ============================================ */
+  /* Small mobile — ≤ 380px                       */
+  /* ============================================ */
+  @media (max-width: 380px) {
+    main { padding: 68px 14px 96px; }
+    .scn-title h2 { font-size: 22px; }
+    .intro h2 { font-size: 28px; }
+    .narrative h4 { font-size: 20px; }
+    .mobile-nav button { font-size: 13.5px; padding: 10px 10px; }
+  }
+
+  /* ============================================ */
+  /* Motion preferences                           */
+  /* ============================================ */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+    }
+  }
+
+  /* ============================================ */
+  /* Print                                        */
+  /* ============================================ */
+  @media print {
+    aside#sidebar, .menu-toggle, .mobile-nav, .controls, .drawer, .drawer-bg, .sidebar-bg { display: none !important; }
+    #app { display: block; }
+    main { padding: 0; }
+    body { background: white; color: black; font-size: 12pt; }
+    .diagram-wrap { border-color: #999; }
+  }
+</style>
+</head>
+<body>
+
+<button class="menu-toggle" id="menuToggle" aria-label="Открыть меню">☰</button>
+<div class="sidebar-bg" id="sidebarBg"></div>
+
+<div id="app">
+  <aside id="sidebar">
+    <h1>symphony<span class="accent">d</span></h1>
+    <div class="tagline">интерактивный учебник по жизненному циклу issue</div>
+
+    <h2>Сценарии</h2>
+    <ul id="scenarios"></ul>
+
+    <h2>Справочник</h2>
+    <ul id="reference">
+      <li data-ref="overview">Обзор архитектуры</li>
+      <li data-ref="modules">Модули кода</li>
+      <li data-ref="tables">SQLite таблицы</li>
+      <li data-ref="slash">Slash-команды</li>
+      <li data-ref="verdicts">Verdicts (Review + Acceptance)</li>
+    </ul>
+
+    <div class="colophon">
+      Один Python-демон. Три источника правды: <b>Linear</b>, <b>GitHub</b>, <b>SQLite</b>.<br />
+      <span style="opacity:0.7">Учебник — 10 сценариев и 5 справочных разделов.</span>
+    </div>
+  </aside>
+
+  <main id="content"></main>
+</div>
+
+<nav class="mobile-nav" id="mobileNav" aria-label="Навигация по шагам">
+  <span class="progress-bar" id="progressBar"></span>
+  <button id="prevStepMobile" type="button">‹ Назад</button>
+  <span class="step-counter" id="stepCounterMobile">— / —</span>
+  <button id="nextStepMobile" type="button">Вперёд ›</button>
+</nav>
+
+<div class="drawer-bg" id="drawerBg"></div>
+<div class="diagram-modal" id="diagramModal" role="dialog" aria-label="State machine">
+  <button class="diagram-modal-close" type="button" onclick="closeDiagramModal()" aria-label="Закрыть">×</button>
+  <div class="diagram-modal-inner" id="diagramModalInner"></div>
+</div>
+<aside class="drawer" id="drawer">
+  <header>
+    <h2 id="drawerTitle"></h2>
+    <button class="close-btn" id="drawerClose">×</button>
+  </header>
+  <div id="drawerBody"></div>
+</aside>
+
+<script>
+"use strict";
+
+// ============================================================
+//  REPO ROOT (used for vscode:// links)
+// ============================================================
+const REPO_ROOT = "/Users/ak/Code/symphonyd";
+function vscLink(rel, line) {
+  const path = REPO_ROOT + "/" + rel;
+  const suffix = line ? ":" + line : "";
+  return "vscode://file" + path + suffix;
+}
+function refLink(rel, line, label) {
+  const text = (label || rel) + (line ? ":" + line : "");
+  return `<a class="ref-path mono" href="${vscLink(rel, line)}">${text}</a>`;
+}
+
+// ============================================================
+//  MODULE CATALOGUE
+// ============================================================
+const MODULES = {
+  "orchestrator/poll.py": {
+    role: "Главный event-loop. Сюда стекаются все стадии: discovery, dispatch, review-poll, merge-poll, slash-команды, acceptance. ~9400 строк.",
+    entrypoints: [
+      ["_tick", 1280, "Один такт poll-цикла: merge → review → resurrect → scan → slash."],
+      ["_scan_binding", 5352, "Сканирует Linear на issues в Ready и в Waiting состоянии."],
+      ["_schedule_ready_issue", 5531, "Capacity-check + дедуп + создание dispatch task."],
+      ["_dispatch_one", 7410, "Implement-стадия от начала до PR. Persist-first, announce-second."],
+      ["_run_local_review_phase", 8146, "Внутренний local-review loop до открытия PR."],
+      ["_start_review_stage", 8469, "Открывает review-monitor run и review_state."],
+      ["_poll_review_runs", 2663, "Главный review tick: классификатор + dispatch fix-runs."],
+      ["_dispatch_review_comment_fix_run", 3705, "Codex fix-run по комментариям review."],
+      ["_dispatch_merge_conflict_rebase_fix_run", 3976, "Авто-rebase fix-run по конфликту."],
+      ["_poll_merge_candidates", 6027, "Approved + mergeable PRs → merge dispatch."],
+      ["_merge_approved_pr", 7725, "Merge-runner + acceptance handoff."],
+      ["_run_acceptance_stage", 6483, "Claude-агент с verdict-footer (pass/reject/infra_error)."],
+      ["_dispatch_acceptance_fix_run", 6858, "Acceptance fix-run по reject verdict."],
+      ["_mark_merge_done", 7989, "Терминальный success — переводит issue в Done."],
+      ["_mark_merge_needs_approval", 8048, "Парковка в needs_approval + operator_wait."],
+      ["_handle_cap_breach", 9161, "Превышение cost cap → парковка."],
+      ["_handle_slash_intent", 1548, "Маршрутизатор всех slash-команд по типу operator wait."],
+      ["_handle_cost_cap_slash_intent", 1883, "Резюм при cost cap по $approve/$reject."],
+      ["_handle_implement_failed_slash_intent", 1957, "Дисптч retry после implement failure."],
+      ["_handle_merge_needs_approval_slash_intent", 4782, "$approve/$retry на merge wait."],
+      ["_handle_acceptance_rejected_slash_intent", 4872, "Acceptance reject: $retry/$skip."],
+      ["_handle_skip_review_intent", 4980, "$skip-review: review monitor → merge напрямую."],
+      ["_open_merge_wait_for_human_approval_label", 6010, "SYM-23 override: лейбл блокирует merge."],
+      ["_needs_human_approval_label_present", 510, "Чтение лейбла needs-human-approval."],
+    ],
+  },
+  "orchestrator/reconcile.py": {
+    role: "Startup reconcile: помечает interrupted все runs с не-живым PID после рестарта демона.",
+    entrypoints: [
+      ["run", 16, "Главная точка входа: scan runs.status='running' и проверка PID."],
+    ],
+  },
+  "orchestrator/reconciler.py": {
+    role: "Continuous reconcile внешней правды (GitHub PR, Linear states), drift-детект.",
+    entrypoints: [],
+  },
+  "pipeline/review_classifier.py": {
+    role: "Чистая функция: (comments, ci, snapshot) → Verdict + trigger_signature. 9 правил приоритета.",
+    entrypoints: [
+      ["review_classifier", 178, "Основной классификатор. 9 правил в порядке приоритета."],
+      ["should_dispatch_fix_run", 392, "Dedup gate: тот же сигнал дважды не диспатчим."],
+      ["has_hit_iteration_cap", 407, "Кап 12 итераций → escape в needs_approval."],
+    ],
+  },
+  "pipeline/acceptance_classifier.py": {
+    role: "Парсер транскрипта Claude → AcceptanceVerdict (pass/reject/infra_error).",
+    entrypoints: [
+      ["acceptance_classifier", 125, "Парсит транскрипт, ищет footer, классифицирует infra-ошибки."],
+      ["extract_acceptance_criteria", 198, "Парсит markdown-секцию Acceptance Criteria из issue."],
+    ],
+  },
+  "pipeline/state_machine.py": {
+    role: "Чистая функция on_runner_event: (stage, event_kind, returncode) → next status/halt.",
+    entrypoints: [
+      ["on_runner_event", 27, "Решает completed/failed на основе exit-кода runner-процесса."],
+    ],
+  },
+  "pipeline/local_review_loop.py": {
+    role: "Iterative local Codex review до открытия PR (@codex-bot in-workspace).",
+    entrypoints: [],
+  },
+  "pipeline/cost_guard.py": {
+    role: "Cost cap per-issue/per-binding; стрим cost из транскрипта runner.",
+    entrypoints: [],
+  },
+  "linear/slash.py": {
+    role: "Чистый парсер slash-команд из Linear-комментариев. Игнорирует mirrored из GitHub и собственные сообщения symphony.",
+    entrypoints: [
+      ["parse", 82, "list[LinearComment] → list[SlashIntent]"],
+      ["SlashKind", 38, "Enum: approve/reject/retry/stop/retry-acceptance/skip-acceptance/skip-review/skip-local-review."],
+      ["_is_thumbs_up", 56, "Standalone 👍 эквивалентен $approve."],
+    ],
+  },
+  "linear/client.py": {
+    role: "Linear API клиент (GraphQL). issues_in_state, post_comment, move_issue.",
+    entrypoints: [],
+  },
+  "github/client.py": {
+    role: "GitHub API клиент. pr_view, pr_checks, gh pr merge, reviews/comments.",
+    entrypoints: [],
+  },
+  "db/schema.sql": {
+    role: "Схема SQLite (14 таблиц). Идемпотентно применяется при старте.",
+    entrypoints: [],
+  },
+};
+
+// ============================================================
+//  SQLITE TABLES (key reference)
+// ============================================================
+const TABLES = {
+  runs: {
+    purpose: "Одна строка на запуск стадии. status: running/completed/done/needs_approval/failed/interrupted. stage: implement/review/review_fix/merge/acceptance/acceptance_fix.",
+    columns: ["id", "issue_id", "stage", "status", "pid", "started_at", "ended_at", "cost_usd"],
+  },
+  issues: {
+    purpose: "Метаданные issue (write-once).",
+    columns: ["id", "identifier", "title", "team_key"],
+  },
+  issue_prs: {
+    purpose: "Мост между Implement и последующими стадиями. PK: (issue_id, github_repo).",
+    columns: ["issue_id", "github_repo", "binding_key", "pr_number", "pr_url", "created_at", "merged_at"],
+  },
+  review_state: {
+    purpose: "Per-issue состояние Review: iteration (cap 12), trigger_signature dedup, PR info.",
+    columns: ["issue_id", "iteration", "last_trigger_signature", "ci_fetch_failures", "pr_number", "pr_url", "github_repo", "issue_label", "codex_lgtm_comment_id"],
+  },
+  acceptance_state: {
+    purpose: "Per-issue состояние Acceptance: iteration, режим (off/code_only/dev/preview), criteria, last_verdict, infra_retries.",
+    columns: ["issue_id", "iteration", "pr_number", "pr_url", "pr_head_sha", "mode", "preview_url", "extracted_criteria", "last_verdict", "last_artifacts_url", "infra_retries"],
+  },
+  operator_waits: {
+    purpose: "Запуск, заблокированный до slash-команды оператора. Переживает рестарт. kind: COST_CAP / IMPLEMENT_FAILED / REVIEW_FAILED / REVIEW_STOPPED / MERGE / ACCEPTANCE_BLOCKED / ACCEPTANCE_REJECTED.",
+    columns: ["issue_id", "run_id", "kind", "linear_team_key", "github_repo", "issue_label", "created_at"],
+  },
+  comment_cursors: {
+    purpose: "Boundary для polling Linear-комментариев. last_seen_at + last_seen_ids предотвращают потерю комментов на границе timestamp.",
+    columns: ["issue_id", "last_seen_at", "last_seen_ids"],
+  },
+  comment_events: {
+    purpose: "Dedup доставки одного комментария между webhook и poll. Survives reordering.",
+    columns: ["comment_id", "issue_id", "seen_at"],
+  },
+  merge_conflict_fix_marks: {
+    purpose: "После успешного rebase-fix: маркер 'этот head_sha уже исправлен' позволяет следующему review tick обойти no-signal verdict один раз.",
+    columns: ["issue_id", "github_repo", "pr_number", "pr_created_at", "head_sha", "marked_at"],
+  },
+  issue_cost_marks: {
+    purpose: "Идемпотентность cost-warning (постится один раз на issue).",
+    columns: ["issue_id", "warning_posted_at"],
+  },
+  webhook_deliveries: {
+    purpose: "Dedup webhook'ов. status pending → handled после успеха.",
+    columns: ["id", "received_at", "status"],
+  },
+  activity_comment_marks: {
+    purpose: "Rate-limit для Codex activity stream постов на Linear.",
+    columns: ["run_id", "first_unpublished_at", "last_event_at", "event_count_since_post", "last_posted_at", "last_fingerprint"],
+  },
+  state_transitions: {
+    purpose: "Аудит-лог мутаций таблиц. Используется UI timeline для дебага.",
+    columns: ["id", "issue_id", "table_name", "field", "old_value", "new_value", "ts"],
+  },
+  external_observations: {
+    purpose: "Наблюдения из GitHub/Linear webhooks и poll, drift detection.",
+    columns: ["id", "issue_id", "source", "observed_at", "payload_json", "drift_kind", "action_taken"],
+  },
+  repos: {
+    purpose: "Биндинг: Linear team key → GitHub repo.",
+    columns: ["linear_team_key", "github_repo"],
+  },
+  review_rearm_retries: {
+    purpose: "Воскрешённые review-monitor runs, ждущие повторного re-arm от live-monitor.",
+    columns: ["run_id"],
+  },
+  activity_command_marks: {
+    purpose: "Heartbeat для command items в activity stream.",
+    columns: ["run_id", "item_id", "last_heartbeat_at"],
+  },
+};
+
+// ============================================================
+//  SLASH COMMANDS REFERENCE
+// ============================================================
+const SLASH = [
+  { cmd: "$approve / $approved / 👍", kind: "approve",
+    purpose: "Подтвердить ожидающее operator-wait. Действие зависит от kind wait (cost cap → resume, merge wait → proceed merge, acceptance reject → confirm pass)." },
+  { cmd: "$reject", kind: "reject",
+    purpose: "Отклонить wait. Обычно эквивалентно «остановить и пометить failed» в текущем wait kind." },
+  { cmd: "$retry", kind: "retry",
+    purpose: "Перезапустить failed стадию (implement, review). Создаёт новый run с тем же stage." },
+  { cmd: "$retry-acceptance", kind: "retry-acceptance",
+    purpose: "Сбросить acceptance-rejection и перезапустить acceptance-стадию." },
+  { cmd: "$skip-acceptance", kind: "skip-acceptance",
+    purpose: "Пропустить acceptance — issue идёт в Done." },
+  { cmd: "$skip-review", kind: "skip-review",
+    purpose: "Закрыть review monitor досрочно и сразу запустить merge (skip_review=True)." },
+  { cmd: "$skip-local-review", kind: "skip-local-review",
+    purpose: "Пропустить local review loop и сразу открыть PR." },
+  { cmd: "$stop", kind: "stop",
+    purpose: "Остановить активный runner (kill PID). Если review-monitor — мягко остановить мониторинг." },
+];
+
+// ============================================================
+//  STATE MACHINE NODES (SVG positions)
+// ============================================================
+const NODES = [
+  { id: "ready",          x: 370, y: 24,  w: 160, h: 44, label: "Ready (Linear)",      kind: "main" },
+  { id: "implement",      x: 370, y: 102, w: 160, h: 44, label: "Implement",            kind: "main" },
+  { id: "local_review",   x: 370, y: 178, w: 160, h: 36, label: "Local review",         kind: "sub"  },
+  { id: "pr_open",        x: 370, y: 232, w: 160, h: 36, label: "PR opened",            kind: "sub"  },
+  { id: "review",         x: 370, y: 308, w: 160, h: 44, label: "Review (monitor)",     kind: "main" },
+  { id: "review_fix",     x: 680, y: 308, w: 170, h: 44, label: "Review fix",           kind: "main" },
+  { id: "merge",          x: 370, y: 410, w: 160, h: 44, label: "Merge",                kind: "main" },
+  { id: "acceptance",     x: 370, y: 498, w: 160, h: 44, label: "Acceptance",           kind: "main" },
+  { id: "acceptance_fix", x: 680, y: 498, w: 170, h: 44, label: "Acceptance fix",       kind: "main" },
+  { id: "done",           x: 370, y: 600, w: 160, h: 44, label: "Done",                 kind: "main" },
+  { id: "needs_approval", x: 110, y: 410, w: 190, h: 44, label: "Needs approval",       kind: "side" },
+];
+const EDGES = [
+  // happy path (center column, straight verticals)
+  { id: "e-ready-impl",         from: "ready",          to: "implement",       route: "v",   label: "" },
+  { id: "e-impl-local",         from: "implement",      to: "local_review",    route: "v",   label: "" },
+  { id: "e-local-pr",           from: "local_review",   to: "pr_open",         route: "v",   label: "" },
+  { id: "e-pr-review",          from: "pr_open",        to: "review",          route: "v",   label: "" },
+  { id: "e-review-merge",       from: "review",         to: "merge",           route: "v",   label: "APPROVED" },
+  { id: "e-merge-accept",       from: "merge",          to: "acceptance",      route: "v",   label: "" },
+  { id: "e-accept-done",        from: "acceptance",     to: "done",            route: "v",   label: "pass" },
+  // review fix loop
+  { id: "e-review-fix",         from: "review",         to: "review_fix",      route: "h",   label: "CHANGES_REQUESTED" },
+  { id: "e-fix-review",         from: "review_fix",     to: "review",          route: "arc-top", label: "fix pushed" },
+  // acceptance fix loop
+  { id: "e-accept-fix",         from: "acceptance",     to: "acceptance_fix",  route: "h",   label: "reject" },
+  { id: "e-fix-accept",         from: "acceptance_fix", to: "acceptance",      route: "arc-top", label: "rerun" },
+  // failure paths (dashed → needs_approval, left column)
+  { id: "e-impl-needs",         from: "implement",      to: "needs_approval",  route: "L-down", label: "fail / cost cap", dashed: true },
+  { id: "e-review-needs",       from: "review",         to: "needs_approval",  route: "L-down", label: "iter cap / fail", dashed: true },
+  { id: "e-merge-needs",        from: "merge",          to: "needs_approval",  route: "h",   label: "conflict / fail", dashed: true },
+  { id: "e-accept-needs",       from: "acceptance",     to: "needs_approval",  route: "L-up", label: "infra exhausted", dashed: true },
+  // recovery path (curves around the left)
+  { id: "e-needs-back",         from: "needs_approval", to: "implement",       route: "arc-left", label: "$retry / $approve", dashed: true },
+];
+
+// ============================================================
+//  SCENARIOS
+//
+//  Each step:
+//    title:      one line summary
+//    active:     [nodeId, ...]  highlighted main nodes
+//    activeEdge: edgeId (optional)
+//    narrative:  HTML
+//    refs:       [{file, line, fn, desc}]
+//    db:         [{table, op: 'insert'|'update'|'select'|'delete', row: {...} }]
+// ============================================================
+const SCENARIOS = [
+  // ----------------------------------------------------------
+  {
+    id: "happy-remote",
+    title: "1. Happy path (remote review)",
+    desc: "Issue в Ready → Codex implement → PR → Codex review APPROVED → merge → Claude acceptance pass → Done.",
+    steps: [
+      {
+        title: "Symphony замечает новый тикет",
+        active: ["ready"],
+        narrative: `<p>Демон работает циклически: примерно раз в минуту (<code>poll_interval_secs: 60</code> в config'е) он делает один «такт». На каждом такте обходит все bindings из config'а — для каждого спрашивает Linear: «какие тикеты сейчас лежат в state <code>ready</code> и помечены лейблом <code>symphony</code>?»</p>
+        <p>В нашем сценарии нашёлся один: <strong>SYM-42 — Add foo</strong>. Мы его только что туда положили.</p>
+        <p>Что именно считать состоянием <code>ready</code>, мы сами выбираем в config'е (<code>linear_states.ready</code> — у нас везде стоит <code>Todo</code>, но у другой команды это могла бы быть <code>Backlog</code> или <code>Up Next</code>). Symphony не предполагает фиксированных названий.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Цикл — <code>_tick()</code> в <code>poll.py:1280</code>. Порядок шагов внутри такта: merge → review → resurrect → scan binding → slash.</li>
+            <li>Сканирование одного binding'а — <code>_scan_binding</code> в <code>poll.py:5352</code>.</li>
+            <li>Запрос в Linear — <code>linear.issues_in_state(team_key, ready_state, label=binding.issue_label)</code>. Под капотом — GraphQL: <code>state.name == ready_state AND label.name == issue_label</code>.</li>
+            <li>Параллельно (если в config'е объявлен <code>waiting</code>-state) — отдельный запрос за тикетами в waiting, чтобы проверить, не разблокировались ли они.</li>
+            <li>В БД на этом шаге ещё ничего не записывается. Запись в <code>runs</code> появится только когда symphony решит, что для этого тикета пора стартовать <code>implement</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 1280, fn: "_tick", desc: "Главный такт. Порядок: merge → review → resurrect → scan binding → slash."},
+          {file: "src/symphony/orchestrator/poll.py", line: 5352, fn: "_scan_binding", desc: "Загружает issues в ready (+waiting, если задано)."},
+        ],
+        db: [
+          {table: "runs", op: "select", row: {note: "has_running_or_completed(issue_id) ⇒ false"}},
+        ],
+      },
+      {
+        title: "Решаем: за этот тикет берёмся",
+        active: ["ready"],
+        narrative: `<p>Symphony нашёл тикет — но это ещё не значит, что прямо сейчас за него стоит браться. Прежде чем запустить Codex, надо проверить несколько вещей: есть ли вообще свободный «слот» (мы не хотим параллельно гонять десять Codex'ов на одной машине); не работает ли уже какой-то процесс над этим же тикетом; нет ли уже открытого PR для него.</p>
+        <p>Все эти проверки идут под одним общим замком — чтобы два такта подряд не приняли решение независимо друг от друга и не задвоили работу.</p>
+        <p>В нашем случае слотов хватает, никто этим тикетом не занимается, PR ещё нет. Решение: ставим задачу на запуск Codex.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Точка входа — <code>_schedule_ready_issue</code> в <code>poll.py:5531</code>, всё тело под <code>self._schedule_lock</code> (asyncio.Lock на инстансе orchestrator).</li>
+            <li>Capacity — <code>_dispatch_capacity</code> в <code>poll.py:5450</code>: учитывает <code>global_max_concurrent</code> и <code>binding.max_concurrent</code>.</li>
+            <li>Дедуп: in-memory <code>_scheduled_issue_ids</code> (тикеты, для которых уже создана dispatch-задача в этом такте) и <code>_dispatch_run_ids</code> (тикеты с уже бегущим run'ом).</li>
+            <li>Проверка существующего PR — SELECT в <code>issue_prs</code> по <code>(issue_id, github_repo)</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 5531, fn: "_schedule_ready_issue", desc: "Capacity + дедуп + existing-PR check."},
+          {file: "src/symphony/orchestrator/poll.py", line: 5450, fn: "_dispatch_capacity", desc: "Считает свободные слоты по global_max_concurrent и binding.max_concurrent."},
+        ],
+        db: [
+          {table: "issue_prs", op: "select", row: {note: "по (issue_id, github_repo) ⇒ nothing"}},
+        ],
+      },
+      {
+        title: "Сначала запись в БД, потом видимые действия",
+        active: ["implement"],
+        activeEdge: "e-ready-impl",
+        narrative: `<p>Запуск Codex — операция с побочными эффектами: надо запостить 🚀-комментарий в Linear, перенести тикет в колонку In Progress и стартовать subprocess. Порядок важен.</p>
+        <p>Symphony делает их строго в таком порядке: <strong>сначала пишет в свою БД</strong>, что для этого тикета стартовал implement-run (атомарная вставка), и только <strong>после успешной записи</strong> идёт постить комментарий в Linear и двигать тикет. Если демон упадёт после комментария, но до записи в БД, то на следующем такте он запостит дубль 🚀; если же он упадёт <em>между</em> insert'ом и комментарием — на следующем такте он увидит уже существующий run и не запустится повторно, а просто продолжит наблюдать.</p>
+        <p>Перевести «сначала запиши, потом действуй» в общее правило: <strong>persist first, announce second</strong>.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Точка входа — <code>_dispatch_one</code> в <code>poll.py:7410</code>.</li>
+            <li>Атомарная вставка — <code>db.runs.create_if_not_dispatched(stage='implement', status='running')</code>. Если такая запись уже есть для этого <code>(issue_id, stage)</code> — INSERT возвращает None, и dispatch тихо выходит.</li>
+            <li>Comment в Linear — шаблон <code>run_started</code> из <code>linear/templates.py</code>, постится из <code>poll.py:7491</code>.</li>
+            <li>Перевод тикета — <code>move_issue → In Progress</code> в <code>poll.py:7513</code>.</li>
+            <li>В таблицу <code>issues</code> вставляется снапшот тикета (если ещё не был сохранён), в <code>runs</code> — новая строка с <code>stage='implement', status='running'</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 7410, fn: "_dispatch_one", desc: "Implement стадия от записи в БД до запуска агента."},
+          {file: "src/symphony/orchestrator/poll.py", line: 7491, fn: "starting comment", desc: "Использует шаблон run_started из linear/templates.py."},
+          {file: "src/symphony/orchestrator/poll.py", line: 7513, fn: "move_issue → In Progress", desc: "Linear API call."},
+        ],
+        db: [
+          {table: "issues", op: "insert", row: {id: "iss-001", identifier: "SYM-42", title: "Add foo", team_key: "SYM"}},
+          {table: "runs", op: "insert", row: {id: "run-impl-1", issue_id: "iss-001", stage: "implement", status: "running", pid: null, cost_usd: 0}},
+        ],
+      },
+      {
+        title: "Codex пишет код в отдельном клоне репозитория",
+        active: ["implement"],
+        narrative: `<p>Symphony не запускает Codex прямо в той копии репо, где живёт сам — он держит отдельный <strong>workspace</strong> для каждого тикета. Это git-клон в <code>workspaces/&lt;binding&gt;/&lt;issue&gt;/</code>, отрезанный от всех остальных тикетов. Так несколько Codex'ов могут работать параллельно, не наступая друг другу на ветки.</p>
+        <p>Внутри workspace symphony создаёт новую ветку и запускает Codex CLI как subprocess. Codex стримит JSON-события (что он делает, какие тулзы вызывает, какой текст генерирует) в stdout. Symphony эти события парсит на лету и периодически собирает их в один читаемый комментарий в Linear — это «activity stream», по нему мы видим, чем агент сейчас занят, не открывая логи.</p>
+        <p>Параллельно с этим symphony считает стоимость прогона (Codex отдаёт <code>total_cost_usd</code> в стрим) и обновляет PID запущенного процесса в БД — чтобы при рестарте демон мог понять, что subprocess до сих пор жив.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Workspace — <code>_workspace.acquire(binding, issue)</code>, реализация в <code>workspace.py</code>. Возвращает путь к git-клону и acquired-lock'у, освобождается при завершении run.</li>
+            <li>Запуск agent'а — <code>_run_agent</code> в <code>poll.py:8769</code>. Spawn'ит Codex CLI с нужной моделью (<code>codex_model</code> из binding'а), читает stdout как поток JSONL.</li>
+            <li>Парсинг стрима — <code>_record_activity_stdout</code> в <code>poll.py:8624</code>. Аккумулирует события в буфер, периодически постит сводный комментарий через <code>activity_comment_marks</code> (чтобы не спамить Linear).</li>
+            <li>PID пишется в <code>runs.pid</code> сразу после <code>asyncio.create_subprocess_exec</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 8769, fn: "_run_agent", desc: "Spawn codex subprocess, stream JSONL, аккумулирует cost."},
+          {file: "src/symphony/orchestrator/poll.py", line: 8624, fn: "_record_activity_stdout", desc: "Парсит stream-json, копит активность для Linear-комментариев."},
+          {file: "src/symphony/workspace.py", line: 1, fn: "Workspace", desc: "Управление per-issue git клонами."},
+        ],
+        db: [
+          {table: "runs", op: "update", row: {id: "run-impl-1", pid: 54321}},
+          {table: "activity_comment_marks", op: "insert", row: {run_id: "run-impl-1", event_count_since_post: 0}},
+        ],
+      },
+      {
+        title: "Опциональное самоисследование перед PR",
+        active: ["implement", "local_review"],
+        activeEdge: "e-impl-local",
+        narrative: `<p>Перед тем как открыть PR на GitHub, symphony может прогнать ещё один Codex прямо в том же workspace — но уже с другим промптом, в роли ревьюера. Этот «локальный ревью» работает по циклу: ревьюер читает свой же diff, пишет замечания → если есть что чинить, запускается Codex-fixer и применяет правки → ревьюер смотрит снова. Сходимся, когда ревьюер сказал «ок».</p>
+        <p>Идея — найти и исправить очевидное (типа забытый импорт или сломанный тест) до того, как мы беспокоим внешний CI и человека-наблюдателя. Включается флагом в config'е (<code>local_review.mode</code>), по умолчанию выключено.</p>
+        <p>Важно: даже если локальный ревью упал или не сошёлся за N итераций, поток на этом не останавливается — PR всё равно откроется, дальше будет «настоящий» remote review.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Точка входа — <code>_run_local_review_phase</code> в <code>poll.py:8146</code>. Запускается перед push'ем, ошибки ловит наружу.</li>
+            <li>Сам цикл — <code>run_local_review_loop</code> в <code>pipeline/local_review_loop.py</code>. Cap по итерациям задаётся в config'е.</li>
+            <li>Одна сессия (reviewer-codex) — <code>pipeline/local_review.py</code>, обёртка над codex CLI с reviewer-prompt'ом.</li>
+            <li>Можно полностью пропустить slash-командой <code>$skip-local-review</code> до запуска (см. сценарий 2).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push, ловит ошибки."},
+          {file: "src/symphony/pipeline/local_review_loop.py", line: 1, fn: "run_local_review_loop", desc: "Цикл codex review/fix до сходимости."},
+          {file: "src/symphony/pipeline/local_review.py", line: 1, fn: "Local review session", desc: "Сессионная обёртка над codex CLI."},
+        ],
+        db: [],
+      },
+      {
+        title: "Push ветки и открытие PR",
+        active: ["pr_open"],
+        activeEdge: "e-local-pr",
+        narrative: `<p>Codex завершился без ошибок. Symphony переводит implement-run в <code>completed</code>, делает <code>git push</code> ветки в GitHub и вызывает <code>gh pr create</code>. PR открывается с заголовком в формате <code>SYM-42: Add foo</code> и описанием, в которое подставлен текст тикета.</p>
+        <p>Номер PR (например, <code>#123</code>) и его URL symphony запоминает в таблице <code>issue_prs</code> — теперь у этого тикета есть якорь на GitHub-стороне, и все следующие стадии (ревью, мерж, acceptance) будут на этот PR смотреть.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Решение «завершить run и продолжить» принимает чистая функция-классификатор — <code>on_runner_event</code> в <code>pipeline/state_machine.py:27</code>. На вход — событие subprocess (exit), на выход — <code>Transition(next_run_status='completed', halt=True)</code>. <code>exit≠0</code> вернёт <code>failed</code> (см. сценарий 6).</li>
+            <li>Push — <code>_default_push</code> в <code>poll.py:716</code>. Использует <code>git push origin &lt;branch&gt;</code>.</li>
+            <li>PR-заголовок собирается в <code>build_pr_title</code> в <code>poll.py:311</code>.</li>
+            <li>Cost run'а (накопленный из стрима Codex) пишется в <code>runs.cost_usd</code> при <code>completed</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/state_machine.py", line: 27, fn: "on_runner_event", desc: "Pure transition: exit=0 → completed, иначе failed."},
+          {file: "src/symphony/orchestrator/poll.py", line: 716, fn: "_default_push", desc: "git push origin <branch>."},
+          {file: "src/symphony/orchestrator/poll.py", line: 311, fn: "build_pr_title", desc: "PR title из issue.identifier + title."},
+        ],
+        db: [
+          {table: "runs", op: "update", row: {id: "run-impl-1", status: "completed", ended_at: "…", cost_usd: 0.42}},
+          {table: "issue_prs", op: "insert", row: {issue_id: "iss-001", github_repo: "kulichevskiy/foo", pr_number: 123, pr_url: "https://github.com/...", merged_at: null}},
+        ],
+      },
+      {
+        title: "Стадия ревью: запускаем «наблюдателя» за PR",
+        active: ["review"],
+        activeEdge: "e-pr-review",
+        narrative: `<p>PR открыт — но что это значит? GitHub теперь запустит свой CI (тесты, линтеры), а Codex-бот в репо автоматически возьмётся писать код-ревью (он подписан на новые PR). Нам надо подождать, пока всё это отработает, и потом разобраться: всё хорошо — мержим; есть замечания — чиним; что-то ломается — зовём человека.</p>
+        <p>Symphony открывает для этого PR отдельный «monitor» — запись в <code>runs</code> со стадией <code>review</code>. Этот monitor — не subprocess, а просто маркер «за этим PR теперь надо следить на каждом такте». Параллельно создаётся запись в <code>review_state</code>, где будет копиться счётчик попыток исправлений (см. сценарий 3). И тикет в Linear переезжает в колонку In Review.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Открытие monitor'а — <code>_start_review_stage</code> в <code>poll.py:8469</code>.</li>
+            <li>Перевод тикета в Linear-state, который в config'е помечен как <code>needs_approval</code> (у нас это <code>In Review</code>) — <code>_move_issue_to_review_state</code> в <code>poll.py:8544</code>.</li>
+            <li>Состояние ревью переживает рестарт демона: <code>review_state.iteration</code>, <code>review_state.last_trigger_signature</code> хранят прогресс fix-цикла.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 8469, fn: "_start_review_stage", desc: "Открывает review monitor и review_state."},
+          {file: "src/symphony/orchestrator/poll.py", line: 8544, fn: "_move_issue_to_review_state", desc: "Linear move."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-review-1", issue_id: "iss-001", stage: "review", status: "running"}},
+          {table: "review_state", op: "insert", row: {issue_id: "iss-001", iteration: 0, pr_number: 123, pr_url: "https://github.com/..."}},
+        ],
+      },
+      {
+        title: "На следующем такте: классификатор говорит «approved»",
+        active: ["review"],
+        narrative: `<p>Раз в минуту monitor собирает свежий снапшот PR: что говорят GitHub-чеки (CI), что говорит <code>gh pr view</code> про mergeability, какие новые комментарии и ревью появились с прошлого раза. Эту кучу данных он отдаёт чистой функции — <strong>review classifier</strong>.</p>
+        <p>Classifier — это последовательность из 9 правил, упорядоченных по приоритету. Он проходит их сверху вниз и возвращает один из трёх вердиктов: <code>APPROVED</code> (можно мержить), <code>CHANGES_REQUESTED</code> (есть что чинить — кто, в каком файле, по какой причине) или <code>PENDING</code> (сигнала пока нет, ждём).</p>
+        <p>В нашем happy path: CI зелёный, конфликтов нет, inline-комментариев от Codex нет, а есть ревью от Codex-бота с фразой «no major issues» в теле. Это правило №7 → вердикт <code>APPROVED</code>.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Tick — <code>_poll_review_runs</code> в <code>poll.py:2663</code> (для всех активных PR'ов), <code>_poll_review_run</code> в <code>poll.py:2997</code> (для одного PR).</li>
+            <li>Classifier — чистая функция <code>review_classifier</code> в <code>pipeline/review_classifier.py:178</code>.</li>
+            <li>Полная таблица 9 правил — в справочнике «Verdicts» в сайдбаре.</li>
+            <li>Маркер approval'а Codex — константа <code>CODEX_NO_ISSUES_MARKER</code> в <code>review_classifier.py:49</code> (литеральная строка, которую Codex-бот вставляет в одобряющий комментарий).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 2663, fn: "_poll_review_runs", desc: "Главный review tick."},
+          {file: "src/symphony/orchestrator/poll.py", line: 2997, fn: "_poll_review_run", desc: "Один PR: fetch + classifier + (опц.) dispatch fix-run."},
+          {file: "src/symphony/pipeline/review_classifier.py", line: 178, fn: "review_classifier", desc: "9 правил в порядке приоритета."},
+          {file: "src/symphony/pipeline/review_classifier.py", line: 49, fn: "CODEX_NO_ISSUES_MARKER", desc: '"any major issues" в Codex COMMENTED → approval.'},
+        ],
+        db: [],
+      },
+      {
+        title: "Стадия merge: ещё один Codex доводит PR до мержа",
+        active: ["merge"],
+        activeEdge: "e-review-merge",
+        narrative: `<p>Вердикт APPROVED — пора мержить. Symphony это делает не одним вызовом <code>gh pr merge</code>, а ещё одним прогоном Codex'а, на этот раз с merge-промптом. Зачем: между моментом ревью и моментом мержа PR мог немного «подвинуться» (новые коммиты в main, изменения в conflict resolution), плюс надо корректно выбрать стратегию (squash / rebase / merge commit) и оформить итоговый commit message. Merge-agent делает это решение и финально вызывает <code>gh pr merge</code>.</p>
+        <p>Перед запуском symphony синхронизирует локальный workspace с remote (на случай, если в нём успели застрять старые правки) — и только потом отдаёт workspace merge-agent'у.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Поиск кандидатов на мерж — <code>_poll_merge_candidates</code> в <code>poll.py:6027</code>. Условие: есть строка в <code>issue_prs</code> с <code>merged_at IS NULL</code> + есть completed review run + classifier на последнем такте дал APPROVED.</li>
+            <li>Запуск merge stage — <code>_merge_approved_pr</code> в <code>poll.py:7725</code>. Создаёт <code>runs</code> со stage='merge'.</li>
+            <li>Сам merge-agent — <code>_run_merge_agent</code> в <code>poll.py:8831</code>.</li>
+            <li>Review run помечается <code>completed</code> в момент перехода в merge.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6027, fn: "_poll_merge_candidates", desc: "Approved + mergeable → merge dispatch."},
+          {file: "src/symphony/orchestrator/poll.py", line: 7725, fn: "_merge_approved_pr", desc: "Создаёт merge run, синхронизирует workspace, запускает merge agent."},
+          {file: "src/symphony/orchestrator/poll.py", line: 8831, fn: "_run_merge_agent", desc: "Spawn merge codex."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-merge-1", issue_id: "iss-001", stage: "merge", status: "running"}},
+          {table: "runs", op: "update", row: {id: "run-review-1", status: "completed"}},
+        ],
+      },
+      {
+        title: "PR смержен — передача в acceptance",
+        active: ["acceptance"],
+        activeEdge: "e-merge-accept",
+        narrative: `<p>Merge-agent отработал и сделал <code>gh pr merge</code>. Symphony фиксирует время мержа в <code>issue_prs.merged_at</code> — это «точка невозврата»: код уже в main.</p>
+        <p>Но мы ещё не закрываем тикет. Технический смысл сделан, теперь надо проверить смысл задачи: <strong>а решает ли смерженный код то, что просили в тикете?</strong> Для этого symphony запускает ещё один проход — <strong>acceptance</strong>. Это отдельный агент (Claude или Codex, в зависимости от config'а), который получает в контекст diff смерженного PR и acceptance-criteria из описания тикета, и должен вынести вердикт: pass или reject.</p>
+        <p>Глубина проверки настраивается per-binding режимом <code>acceptance.mode</code>: <code>off</code> (пропускать совсем), <code>code_only</code> (читать только diff), <code>dev</code> (поднять dev-сервер и проверить вживую), <code>preview</code> (использовать preview-deployment).</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Финализация merge run + handoff в acceptance — <code>_mark_merge_done</code> в <code>poll.py:7989</code>.</li>
+            <li>Acceptance stage — <code>_run_acceptance_stage</code> в <code>poll.py:6483</code>. Запускает Claude SDK (или Codex) с готовым промптом.</li>
+            <li>Извлечение критериев из описания тикета — <code>extract_acceptance_criteria</code> в <code>pipeline/acceptance_classifier.py:198</code>. Ищет заголовок «### Acceptance Criteria» / «### Checklist» и парсит чеклист.</li>
+            <li>Создаётся <code>runs</code> со stage='acceptance' и <code>acceptance_state</code> с <code>iteration=0</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 7989, fn: "_mark_merge_done", desc: "Завершает merge run; запускает acceptance handoff."},
+          {file: "src/symphony/orchestrator/poll.py", line: 6483, fn: "_run_acceptance_stage", desc: "Claude SDK с acceptance prompt."},
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 198, fn: "extract_acceptance_criteria", desc: "Парсит ### Acceptance Criteria / Checklist из description."},
+        ],
+        db: [
+          {table: "issue_prs", op: "update", row: {issue_id: "iss-001", merged_at: "2026-05-23T10:34Z"}},
+          {table: "runs", op: "update", row: {id: "run-merge-1", status: "completed"}},
+          {table: "runs", op: "insert", row: {id: "run-acc-1", issue_id: "iss-001", stage: "acceptance", status: "running"}},
+          {table: "acceptance_state", op: "insert", row: {issue_id: "iss-001", iteration: 0, pr_number: 123, mode: "code_only"}},
+        ],
+      },
+      {
+        title: "Вердикт acceptance: pass → тикет закрывается",
+        active: ["done"],
+        activeEdge: "e-accept-done",
+        narrative: `<p>Acceptance-агент в финальном сообщении подтверждает: код делает то, что просили. Чтобы symphony могла однозначно это распарсить (а не пытаться понять «pass» из свободного текста), агент по контракту обязан закончить своё финальное сообщение HTML-комментарием-маркером: <code>&lt;!-- symphony-acceptance-verdict: pass --&gt;</code>.</p>
+        <p>Symphony читает транскрипт прогона, ищет этот маркер, видит pass — и переводит тикет в Done. Все runs закрыты, итоговая сумма стоимости подбита, в Linear постится финальный комментарий с вердиктом и ссылкой на PR.</p>
+        <p>Тикет прошёл весь путь: <strong>Todo → In Progress → In Review → Done</strong>.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Classifier — <code>acceptance_classifier</code> в <code>pipeline/acceptance_classifier.py:125</code>. Достаёт финальное assistant-сообщение из stream-json, матчит footer регэкспом.</li>
+            <li>Литеральные маркеры — <code>ACCEPTANCE_FOOTER_PASS</code> / <code>ACCEPTANCE_FOOTER_REJECT</code> в <code>acceptance_classifier.py:18</code>.</li>
+            <li>Постинг вердикта в Linear — <code>_post_acceptance_verdict_comment</code> в <code>poll.py:6387</code>.</li>
+            <li>Возможны два других исхода: <code>reject</code> (см. сценарий 9) и <code>infra_error</code> (см. сценарий 10).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 125, fn: "acceptance_classifier", desc: "Парсит транскрипт, ищет footer, классифицирует."},
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 18, fn: "ACCEPTANCE_FOOTER_PASS", desc: "HTML-комментарий-маркер pass."},
+          {file: "src/symphony/orchestrator/poll.py", line: 6387, fn: "_post_acceptance_verdict_comment", desc: "Постит verdict в Linear."},
+        ],
+        db: [
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-001", last_verdict: "pass"}},
+          {table: "runs", op: "update", row: {id: "run-acc-1", status: "done", cost_usd: 0.18}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "happy-local",
+    title: "2. Happy path с local review",
+    desc: "Codex проводит review локально в workspace до открытия PR. После сходимости — открывается уже «отполированный» PR.",
+    steps: [
+      {
+        title: "Implement закончился — проверяем, нужен ли local review",
+        active: ["implement", "local_review"],
+        activeEdge: "e-impl-local",
+        narrative: `<p>Codex закончил implement (exit 0). Прежде чем пушить ветку и открывать PR, symphony проверяет: включён ли для этого binding'а локальный ревью? И не приходил ли в Linear-комментариях <code>$skip-local-review</code> от нас?</p>
+        <p>Если оба условия дают «да, ревью нужен» — symphony остаётся в workspace и запускает следующий проход уже как локальный ревьюер.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Запуск фазы — <code>_run_local_review_phase</code> в <code>poll.py:8146</code>.</li>
+            <li>Skip-intent — <code>_handle_skip_local_review_intent</code> в <code>poll.py:1745</code>. Если мы поставили <code>$skip-local-review</code> в комментарий ДО запуска implement'а — фаза просто не стартует.</li>
+            <li>Режим читается из <code>binding.local_review.mode</code> в config'е (<code>off</code> / <code>review_only</code> / <code>review_and_fix</code>).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push."},
+          {file: "src/symphony/orchestrator/poll.py", line: 1745, fn: "_handle_skip_local_review_intent", desc: "Если оператор послал $skip-local-review — local review пропускается."},
+        ],
+        db: [],
+      },
+      {
+        title: "Одна итерация: Codex смотрит на свой же diff",
+        active: ["local_review"],
+        narrative: `<p>В одном проходе Codex с reviewer-промптом получает на вход diff между базой ветки и текущим HEAD (<code>git diff base...HEAD</code>). Его задача — либо вернуть «всё ок» (👍-эмодзи или approval-маркер в теле), либо описать, что чинить.</p>
+        <p>Если есть, что чинить, и режим включает fix-фазу — symphony запускает <em>следующую</em> итерацию: тот же workspace, но теперь Codex с fixer-промптом, в контекст которого вложены замечания ревьюера. Fixer вносит правки, делает коммит — и ревьюер запускается снова.</p>
+        <p>Каждая итерация постится в Linear отдельным комментарием, чтобы мы могли подсмотреть процесс не открывая логов.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Цикл — <code>run_local_review_loop</code> в <code>pipeline/local_review_loop.py</code>. Cap по итерациям задаётся в config'е.</li>
+            <li>Постинг прогресса в Linear — <code>_post_local_review_iteration_comment</code> в <code>poll.py:8411</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/local_review_loop.py", line: 1, fn: "run_local_review_loop", desc: "Цикл review/fix iterations с cap."},
+          {file: "src/symphony/orchestrator/poll.py", line: 8411, fn: "_post_local_review_iteration_comment", desc: "Iteration update в Linear."},
+        ],
+        db: [],
+      },
+      {
+        title: "Сошлись: LGTM",
+        active: ["local_review"],
+        narrative: `<p>Ревьюер вернул approval — цикл закрылся со статусом <code>approved</code>. Symphony постит summary-комментарий в Linear: «локальный ревью сошёлся за N итераций» и идёт к push'у.</p>
+        <p>А если цикл не сошёлся? Например, ревьюер и фиксер N раз пингуют друг друга, и Codex упорно не может закрыть последнее замечание. Цикл всё равно завершается — но со статусом <code>exhausted</code>. Это <strong>не блокирует</strong> поток: PR откроется в любом случае, дальше за дело возьмётся remote-ревьюер. Идея локального ревью — найти лёгкие баги до GitHub, а не быть последней инстанцией.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Маппинг <code>LoopResult</code> → строка-статус для Linear-комментария — <code>_local_review_status_from_result</code> в <code>poll.py:322</code>.</li>
+            <li>Финализация run'а — <code>_finalize_local_review_run</code> в <code>poll.py:8312</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 322, fn: "_local_review_status_from_result", desc: "Mapping LoopResult → string status для Linear комментария."},
+          {file: "src/symphony/orchestrator/poll.py", line: 8312, fn: "_finalize_local_review_run", desc: "Финализирует local review run, постит summary."},
+        ],
+        db: [],
+      },
+      {
+        title: "PR открыт уже «отполированный»",
+        active: ["pr_open", "review"],
+        activeEdge: "e-pr-review",
+        narrative: `<p>После того как локальный ревью отработал, дальше всё как в сценарии 1: push ветки, <code>gh pr create</code>, открытие review monitor'а. Разница только в качестве PR на входе: очевидные баги уже подчищены, ревьюеру на GitHub нечего ловить.</p>
+        <p>Remote-ревью всё равно остаётся вторым уровнем защиты — особенно когда локальный ревью завершился со статусом <code>exhausted</code> (см. предыдущий шаг).</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Анонс старта в Linear — <code>_post_local_review_starting_comment</code> в <code>poll.py:8389</code>.</li>
+            <li>Решение «нужно ли явно дёргать @codex-review» — <code>_should_post_codex_review</code> в <code>poll.py:339</code> (по умолчанию Codex-бот подхватывает PR сам).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 8389, fn: "_post_local_review_starting_comment", desc: "Анонс начала local review в Linear."},
+          {file: "src/symphony/orchestrator/poll.py", line: 339, fn: "_should_post_codex_review", desc: "Логика когда нужно явно запросить @codex review."},
+        ],
+        db: [
+          {table: "issue_prs", op: "insert", row: {issue_id: "iss-002", pr_number: 124, merged_at: null}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "review-fix-cycle",
+    title: "3. Review fix-cycle (CI fail)",
+    desc: "CI красит required check → classifier возвращает CHANGES_REQUESTED → fix-run → re-review → APPROVED.",
+    steps: [
+      {
+        title: "CI упал — классификатор это видит",
+        active: ["review"],
+        narrative: `<p>Через несколько тактов после открытия PR прилетает плохая новость: один из обязательных GitHub-чеков (например, юнит-тесты) завершился с <code>failure</code>. На ближайшем review-такте monitor забирает свежий снапшот PR и отдаёт его классификатору.</p>
+        <p>Правило №1 (самое приоритетное) — «есть упавший required check». Срабатывает первым: classifier возвращает <code>CHANGES_REQUESTED</code> с причиной «failing CI» и <strong>стабильным сигнатурным ключом</strong> вида <code>ci:&lt;head_sha&gt;:&lt;check_name&gt;</code>. Зачем ключ — увидим на следующем шаге.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Правило — <code>Rule 1</code> в <code>review_classifier.py:186</code>. Условие: <code>check.status=='completed' AND check.conclusion in BLOCKING_CHECK_CONCLUSIONS</code>.</li>
+            <li>Список «блокирующих» исходов чека — <code>BLOCKING_CHECK_CONCLUSIONS</code> в <code>review_classifier.py:56</code>: <code>action_required</code>, <code>cancelled</code>, <code>failure</code>, <code>stale</code>, <code>startup_failure</code>, <code>timed_out</code>.</li>
+            <li>Сигнатура (<code>trigger_signature</code>) специально привязана к <code>head_sha</code> + имени чека — она не зависит от рестарта демона.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/review_classifier.py", line: 186, fn: "Rule 1 — failing CI", desc: "if c.status=='completed' and c.conclusion in BLOCKING_CHECK_CONCLUSIONS."},
+          {file: "src/symphony/pipeline/review_classifier.py", line: 56, fn: "BLOCKING_CHECK_CONCLUSIONS", desc: "frozenset: action_required, cancelled, failure, stale, startup_failure, timed_out."},
+        ],
+        db: [],
+      },
+      {
+        title: "Защита от зацикливания: «мы уже это пробовали?»",
+        active: ["review"],
+        narrative: `<p>Прежде чем кидаться чинить, symphony сравнивает сигнатуру текущего вердикта с сигнатурой <em>предыдущего</em> диспатча (хранится в <code>review_state.last_trigger_signature</code>). Если они совпадают — значит, в прошлый раз мы уже запускали fix именно на этот сигнал, fix отработал, а GitHub нам прислал тот же fail повторно. Это означает, что Codex не справился — повторять то же самое бессмысленно, мы вошли бы в петлю.</p>
+        <p>В нашем сценарии это первый fail, прошлой сигнатуры нет → симфония считает, что попытка fix'а имеет смысл, и идёт дальше.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Проверка — <code>should_dispatch_fix_run(prev_signature, new_signature)</code> в <code>review_classifier.py:392</code>. Возвращает <code>True</code> только если <code>new_signature</code> непустой И отличается от <code>prev_signature</code>.</li>
+            <li>Колонка хранения — <code>review_state.last_trigger_signature</code>, см. <code>db/schema.sql:115</code>. Обновляется ниже по потоку, когда fix-run реально запускается.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/review_classifier.py", line: 392, fn: "should_dispatch_fix_run", desc: "True iff new_signature non-empty AND ≠ prev_signature."},
+          {file: "src/symphony/db/schema.sql", line: 115, fn: "review_state.last_trigger_signature", desc: "Хранит signature последнего диспатча."},
+        ],
+        db: [],
+      },
+      {
+        title: "Защита от бесконечного цикла: счётчик итераций",
+        active: ["review"],
+        narrative: `<p>Вторая защита — простой счётчик. На каждый fix-run в <code>review_state.iteration</code> прибавляется единица. Если значение достигло cap'а (по умолчанию 12), symphony перестаёт пытаться чинить автоматически и паркует тикет — переводит его в <code>needs_approval</code> и зовёт нас комментарием в Linear.</p>
+        <p>В нашем случае iteration=0 (ещё ни одного fix не было) → cap не достигнут → идём диспатчить.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Проверка — <code>has_hit_iteration_cap</code> в <code>review_classifier.py:407</code>.</li>
+            <li>Дефолт cap'а — <code>DEFAULT_REVIEW_ITERATION_CAP = 12</code> в <code>review_classifier.py:53</code>.</li>
+            <li>Парковка по cap'у — <code>_park_review_for_approval</code> в <code>poll.py:5307</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/review_classifier.py", line: 407, fn: "has_hit_iteration_cap", desc: "Кап 12 итераций."},
+          {file: "src/symphony/pipeline/review_classifier.py", line: 53, fn: "DEFAULT_REVIEW_ITERATION_CAP", desc: "= 12 (PRD §pipeline)."},
+          {file: "src/symphony/orchestrator/poll.py", line: 5307, fn: "_park_review_for_approval", desc: "При cap → парковка."},
+        ],
+        db: [],
+      },
+      {
+        title: "Запускаем fix-run по упавшему чеку",
+        active: ["review_fix"],
+        activeEdge: "e-review-fix",
+        narrative: `<p>Symphony создаёт новый <code>runs</code> со стадией <code>review_fix</code>, забирает хвост лога упавшего чека через <code>gh</code> CLI (чтобы Codex видел, что именно сломалось), формирует fix-промпт и запускает Codex в том же workspace.</p>
+        <p>Одновременно с этим обновляются два поля в <code>review_state</code>: счётчик итераций (+1) и сигнатура текущего fail. С этого момента, если на следующих тактах прилетит тот же fail на том же head_sha, защита из предыдущего шага не даст запустить ещё один fix-run.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Диспатч — <code>_dispatch_ci_fix_run</code> в <code>poll.py:3307</code>.</li>
+            <li>Хвост лога — <code>_failing_check_log_tail</code> в <code>poll.py:4632</code>.</li>
+            <li>Сборка промпта — <code>build_fix_runner_command</code> в <code>poll.py:401</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 3307, fn: "_dispatch_ci_fix_run", desc: "Codex fix-run по упавшему CI."},
+          {file: "src/symphony/orchestrator/poll.py", line: 4632, fn: "_failing_check_log_tail", desc: "Берёт хвост лога check'а для контекста codex."},
+          {file: "src/symphony/orchestrator/poll.py", line: 401, fn: "build_fix_runner_command", desc: "Прoмпт-команда для fix codex."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-rfix-1", stage: "review_fix", status: "running"}},
+          {table: "review_state", op: "update", row: {issue_id: "iss-003", iteration: 1, last_trigger_signature: "ci:abc:test-foo"}},
+        ],
+      },
+      {
+        title: "Fix-run пушит исправление",
+        active: ["review_fix"],
+        narrative: `<p>Codex чинит баг (в нашем сценарии — например, поправил ассерт в тесте), коммитит правку и пушит. Новый коммит меняет <code>head_sha</code> PR, GitHub автоматически перезапускает CI на новой версии.</p>
+        <p>Symphony сразу после завершения fix-run'а делает sanity-check: HEAD действительно сдвинулся? Если нет — это означает, что Codex не внёс изменений, и формально run прошёл «успешно», но по сути это no-op. В таком случае symphony это видит и не засчитывает попытку.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Проверка — <code>_validate_review_fix_advanced</code> в <code>poll.py:4594</code>. Сравнивает <code>head_sha</code> до и после.</li>
+            <li>Push — обычный <code>git push</code> (не force), потому что мы добавляем коммит поверх ветки.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 4594, fn: "_validate_review_fix_advanced", desc: "Проверка что HEAD реально двинулся после fix."},
+        ],
+        db: [
+          {table: "runs", op: "update", row: {id: "run-rfix-1", status: "completed"}},
+        ],
+      },
+      {
+        title: "Следующий такт: CI зелёный, ревью одобрено",
+        active: ["review"],
+        activeEdge: "e-fix-review",
+        narrative: `<p>Время идёт, GitHub перепрогоняет CI на новом коммите — теперь зелено. Codex-бот по новому head_sha пишет свежее ревью с «no major issues». На очередном review-такте classifier видит: CI ok, mergeable, есть approval — вердикт <code>APPROVED</code>. Дальше идём по тому же пути, что и в сценарии 1: merge → acceptance → Done.</p>
+        <p><strong>А если повезло меньше?</strong> Бывает, что fix Codex'а починил исходный fail, но «вытащил» другой regression — упал другой тест. Новый fail → новая сигнатура → новый fix-run. Так может повторяться до тех пор, пока счётчик итераций не упрётся в cap (12). После этого тикет паркуется в <code>needs_approval</code> и зовёт нас.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Правило одобрения от Codex-бота — <code>Rule 7</code> в <code>review_classifier.py:363</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/review_classifier.py", line: 363, fn: "Rule 7", desc: "Codex approval signals."},
+        ],
+        db: [],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "merge-conflict",
+    title: "4. Merge conflict + auto rebase-fix",
+    desc: "PR одобрен, но появился merge-conflict с main. Codex запускает rebase-fix, marker позволяет следующему review tick обойти no-signal.",
+    steps: [
+      {
+        title: "Конфликт с main — кто-то ушёл вперёд",
+        active: ["review"],
+        narrative: `<p>На очередном review-такте <code>gh pr view</code> возвращает <code>mergeable=CONFLICTING</code>. Значит, пока symphony возилась с этим PR, в main улетело что-то, что трогает те же файлы — и теперь наша ветка чисто не накатывается.</p>
+        <p>В classifier'е есть отдельное правило именно под этот случай — №3, оно проверяется <em>раньше</em>, чем правила про комментарии и ревью. Иначе можно было бы залипнуть: представим, что Codex когда-то оставил inline-комментарий, потом мы его закрыли, и формально на PR есть «устаревшие» сигналы от Codex — classifier бы их учёл и не заметил конфликта. Поэтому конфликт — высокий приоритет.</p>
+        <p>Вердикт: <code>CHANGES_REQUESTED</code> с причиной <code>merge_conflict</code> и сигнатурой <code>merge_conflict:&lt;head_sha&gt;</code>.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Правило — <code>Rule 3 — merge conflict</code> в <code>review_classifier.py:215</code>.</li>
+            <li>Поле <code>verdict.merge_conflict=True</code> сигнализирует orchestrator'у, что нужен особый fix-путь (rebase), а не обычный CI-fix.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/review_classifier.py", line: 215, fn: "Rule 3 — merge conflict", desc: "if snapshot.mergeable == 'CONFLICTING'."},
+        ],
+        db: [],
+      },
+      {
+        title: "Запускаем rebase-fix: Codex разрешает конфликты",
+        active: ["review_fix"],
+        activeEdge: "e-review-fix",
+        narrative: `<p>Symphony берёт workspace для этого тикета, делает <code>git fetch</code> и пробует <code>git rebase</code> на свежий main. Если rebase прошёл чисто (конфликта по факту нет, mergeable=CONFLICTING был ложной тревогой) — отлично, просто force-пушим. Если конфликт реален — symphony запускает в этом workspace Codex с rebase-промптом. Его задача: разобраться в конфликте, оставить корректную версию каждого файла, сделать <code>git add</code> и <code>git rebase --continue</code>. Так — до полного завершения rebase'а.</p>
+        <p>После успешного rebase ветка делает force-push (с <code>--force-with-lease</code>, чтобы не затереть чужие коммиты, если кто-то параллельно успел пушнуть). Это меняет <code>head_sha</code> PR — GitHub перезапустит CI.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Точка входа — <code>_dispatch_merge_conflict_rebase_fix_run</code> в <code>poll.py:3976</code>.</li>
+            <li>Обёртки над git — <code>_git_rebase</code> (<code>poll.py:836</code>), <code>_git_add_and_continue_rebase</code> (<code>poll.py:896</code>), <code>_default_force_push</code> (<code>poll.py:735</code>).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 3976, fn: "_dispatch_merge_conflict_rebase_fix_run", desc: "Авто rebase-fix."},
+          {file: "src/symphony/orchestrator/poll.py", line: 836, fn: "_git_rebase", desc: "git rebase wrapper."},
+          {file: "src/symphony/orchestrator/poll.py", line: 896, fn: "_git_add_and_continue_rebase", desc: "После resolve — continue."},
+          {file: "src/symphony/orchestrator/poll.py", line: 735, fn: "_default_force_push", desc: "git push --force-with-lease."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-rebase-1", stage: "review_fix", status: "running"}},
+        ],
+      },
+      {
+        title: "Маркер «этот head уже починен» — обход «no-signal»",
+        active: ["review"],
+        narrative: `<p>После force-push у PR новый <code>head_sha</code>. И тут возникает тонкая проблема: classifier хочет видеть какой-то «свежий сигнал» — успешный CI, апрув от Codex — прежде чем разрешить merge. Но на только что появившемся коммите ни CI, ни Codex ещё ничего сказать не успели. По умолчанию classifier вернёт <code>no_signal</code> → PENDING, и мы будем тупо ждать, хотя на самом деле всё, что было нужно (rebase) — уже сделано.</p>
+        <p>Чтобы вытащить symphony из этого ожидания, после успешного rebase она вставляет специальный маркер в таблицу <code>merge_conflict_fix_marks</code>: «для этого тикета на этом head_sha rebase уже отработал, можно идти в merge». Маркер переживает рестарт. На следующем такте orchestrator увидит этот маркер и пропустит «нужен свежий сигнал».</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Вставка маркера — <code>_mark_merge_conflict_fix_needs_approval</code> в <code>poll.py:3958</code>.</li>
+            <li>Таблица — <code>merge_conflict_fix_marks</code> в <code>db/schema.sql:62</code>. Ключ: <code>(issue_id, pr_number, head_sha)</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 3958, fn: "_mark_merge_conflict_fix_needs_approval", desc: "Вставляет marker в merge_conflict_fix_marks."},
+          {file: "src/symphony/db/schema.sql", line: 62, fn: "merge_conflict_fix_marks", desc: "Маркер выживает рестарт."},
+        ],
+        db: [
+          {table: "merge_conflict_fix_marks", op: "insert", row: {issue_id: "iss-004", pr_number: 125, head_sha: "def456…", marked_at: "…"}},
+          {table: "runs", op: "update", row: {id: "run-rebase-1", status: "completed"}},
+        ],
+      },
+      {
+        title: "Чистим залежавшиеся merge-wait'ы (фикс #127)",
+        active: ["review"],
+        narrative: `<p>Тонкий момент, который раньше был багом. Если до конфликта тикет успел один раз дойти до merge и там что-то заставило его припарковаться в <code>needs_approval</code> (например, мы вмешались, или сработал label-override), то запись об этом ожидании оставалась в БД. Когда rebase-fix чинил ситуацию, эта старая запись всё ещё мозолила глаза orchestrator'у и блокировала прогресс.</p>
+        <p>Починили в #127: сразу после успешного rebase symphony явно проходит по всем «висящим» merge-wait'ам этого тикета, помечает их как <code>interrupted</code> и удаляет соответствующие <code>operator_waits</code>. Теперь тикет реально готов к новой попытке мержа.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Чистка — <code>_interrupt_stale_merge_needs_approval_for_state</code> в <code>poll.py:3495</code>.</li>
+            <li>Контекст бага — см. PR #127 в истории репо.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 3495, fn: "_interrupt_stale_merge_needs_approval_for_state", desc: "Чистит stale waits для issue."},
+        ],
+        db: [
+          {table: "operator_waits", op: "delete", row: {issue_id: "iss-004", note: "если был старый merge wait"}},
+        ],
+      },
+      {
+        title: "Маркер обходит no-signal — идём в merge",
+        active: ["merge"],
+        activeEdge: "e-review-merge",
+        narrative: `<p>На следующем review-такте classifier видит: CI ещё не отработал, новых ревью нет, конфликта нет — вердикт <code>no_signal</code> → PENDING. Обычно тут было бы продолжение ожидания.</p>
+        <p>Но orchestrator перед тем, как поверить «PENDING», заглядывает в <code>merge_conflict_fix_marks</code>: «есть ли маркер для этого тикета на этом head_sha?». Маркер есть (мы его поставили двумя шагами раньше) → bypass, дёрнем merge-стадию прямо сейчас. Сразу после успешного мержа маркер удаляется, чтобы не висел навсегда.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Очистка маркера после мержа — <code>clear_conflict_fix_marker</code> в <code>poll.py:6196</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6196, fn: "clear_conflict_fix_marker", desc: "Очистка marker после merge."},
+        ],
+        db: [
+          {table: "merge_conflict_fix_marks", op: "delete", row: {issue_id: "iss-004"}},
+          {table: "runs", op: "insert", row: {id: "run-merge-2", stage: "merge", status: "running"}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "cost-cap-approve",
+    title: "5. Cost cap breach → $approve resumes",
+    desc: "Cumulative cost issue превысил cap → парковка в needs_approval. Оператор пишет $approve, run возобновляется.",
+    steps: [
+      {
+        title: "Symphony считает расходы в реальном времени",
+        active: ["implement"],
+        narrative: `<p>Codex в своём стриме событий после каждого «шага» (вызова модели, инструмента, генерации текста) посылает свежее значение <code>total_cost_usd</code>. Symphony подхватывает это значение на лету и складывает с накопленной стоимостью всех предыдущих run'ов этого же тикета — implement, fix-run'ов, и т.д. Получается «текущий cumulative cost для тикета».</p>
+        <p>На каждом таком обновлении symphony сравнивает это число с лимитом, заданным в config'е (<code>binding.cost_cap_per_issue_usd</code>). В нашем сценарии тикет потребовал нескольких fix-итераций, и cumulative cost только что перешёл за установленный лимит.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Логика лимита — <code>cost_guard</code> в <code>pipeline/cost_guard.py</code>. Применяется per-issue и per-binding (общий лимит на binding тоже можно задать).</li>
+            <li>Стриминг и accounting cost'а — <code>_run_runner</code> в <code>poll.py:9047</code>. Каждое событие <code>type=result</code> от Codex обновляет внутренний счётчик.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/cost_guard.py", line: 1, fn: "cost_guard", desc: "Cap enforcement per-issue/per-binding."},
+          {file: "src/symphony/orchestrator/poll.py", line: 9047, fn: "_run_runner", desc: "Стримит stdout, аккумулирует cost, проверяет cap."},
+        ],
+        db: [],
+      },
+      {
+        title: "Предупреждение в Linear: «уже 80% от лимита»",
+        active: ["implement"],
+        narrative: `<p>Прежде чем жёстко припарковать тикет, symphony постит в Linear «жёлтое» предупреждение, когда расходы доходят до условного порога (например, 80% от cap'а). Это удобно: мы можем заранее увидеть, что что-то идёт не так, и вмешаться (например, остановить или скорректировать тикет) до того, как сработает hard cap.</p>
+        <p>Предупреждение постится <strong>один раз на тикет</strong>. Symphony отмечает факт постинга в таблице <code>issue_cost_marks</code> — если демон рестартнётся и снова дойдёт до тех же 80%, дубль не запостит.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Постинг — <code>_post_cost_warning</code> в <code>poll.py:9130</code>.</li>
+            <li>Идемпотентность — колонка <code>issue_cost_marks.warning_posted_at</code> (<code>db/schema.sql:152</code>).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 9130, fn: "_post_cost_warning", desc: "Постит warning один раз на issue."},
+          {file: "src/symphony/db/schema.sql", line: 152, fn: "issue_cost_marks", desc: "Идемпотентность warning."},
+        ],
+        db: [
+          {table: "issue_cost_marks", op: "insert", row: {issue_id: "iss-005", warning_posted_at: "…"}},
+        ],
+      },
+      {
+        title: "Лимит превышен — паркуем тикет",
+        active: ["needs_approval"],
+        activeEdge: "e-impl-needs",
+        narrative: `<p>Cumulative cost перешёл за hard cap — symphony останавливает текущий Codex, переводит тикет в state <code>needs_approval</code> (у нас это колонка In Review) и постит в Linear комментарий с подробностями: сколько потрачено, в каком run'е словили cap.</p>
+        <p>Параллельно symphony вставляет запись в таблицу <code>operator_waits</code> с типом <code>COST_CAP</code>. Эта запись и есть формальное «парковочное место»: пока она есть, тикет не возьмут на работу автоматически, нужно явное вмешательство. Запись переживает рестарт демона.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Обработчик — <code>_handle_cap_breach</code> в <code>poll.py:9161</code>.</li>
+            <li>Таблица — <code>operator_waits</code> в <code>db/schema.sql:178</code>. <code>kind='COST_CAP'</code> определяет, какой именно хендлер запустится при slash-команде на этот wait.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 9161, fn: "_handle_cap_breach", desc: "Парковка после превышения cap."},
+          {file: "src/symphony/db/schema.sql", line: 178, fn: "operator_waits", desc: "kind COST_CAP сохраняется в БД."},
+        ],
+        db: [
+          {table: "runs", op: "update", row: {id: "run-impl-5", status: "needs_approval", ended_at: "…"}},
+          {table: "operator_waits", op: "insert", row: {issue_id: "iss-005", run_id: "run-impl-5", kind: "COST_CAP"}},
+        ],
+      },
+      {
+        title: "Мы пишем $approve в комментарии Linear",
+        active: ["needs_approval"],
+        narrative: `<p>Мы видим в Linear комментарий «cost cap reached», подтверждаем себе, что продолжать имеет смысл, и пишем ответный комментарий с одним словом: <code>$approve</code>.</p>
+        <p>На ближайшем такте symphony отдельной подпроцедурой читает свежие комментарии по всем тикетам (что появилось с прошлого раза — отслеживается курсорами), дедупит уже виденные (чтобы один и тот же комментарий не сработал дважды) и парсит их на slash-команды. Наша <code>$approve</code> распознаётся как <code>SlashIntent(kind=APPROVE)</code>.</p>
+        <p>Дальше — маршрутизация. Тип wait'а на тикете — <code>COST_CAP</code>, значит, обрабатывать <code>$approve</code> будет именно cost-cap-хендлер, а не какой-то другой. Это важно: одна и та же команда (<code>$approve</code>) может означать разные вещи в зависимости от того, чего именно мы ждём.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Поллинг комментариев — <code>_poll_slash_commands</code> в <code>poll.py:1445</code>.</li>
+            <li>Маршрутизатор — <code>_handle_slash_intent</code> в <code>poll.py:1548</code>. Сам выбирает специализированный хендлер по типу wait'а на тикете.</li>
+            <li>Парсинг — чистая функция <code>parse</code> в <code>linear/slash.py:82</code>: <code>list[LinearComment] → list[SlashIntent]</code>.</li>
+            <li>Дедуп — таблицы <code>comment_cursors</code> (last-seen comment per issue) и <code>comment_events</code> (виденные comment_id).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 1445, fn: "_poll_slash_commands", desc: "Главный poll slash-команд."},
+          {file: "src/symphony/orchestrator/poll.py", line: 1548, fn: "_handle_slash_intent", desc: "Маршрутизатор: kind wait определяет хендлер."},
+          {file: "src/symphony/linear/slash.py", line: 82, fn: "parse", desc: "Pure: list[LinearComment] → list[SlashIntent]."},
+        ],
+        db: [
+          {table: "comment_events", op: "insert", row: {comment_id: "c1", issue_id: "iss-005", seen_at: "…"}},
+        ],
+      },
+      {
+        title: "Продолжаем: новый run, тикет снова в работе",
+        active: ["implement"],
+        activeEdge: "e-needs-back",
+        narrative: `<p>Cost-cap-хендлер при <code>$approve</code> делает три вещи: удаляет запись из <code>operator_waits</code>, поднимает effective cap для этого тикета (либо сбрасывает счётчик прогресса — в зависимости от настройки), и создаёт новый <code>runs</code> со стадией <code>implement</code>. Тикет переезжает обратно в In Progress, и Codex продолжает с того места, где остановился.</p>
+        <p>Альтернатива: мы пишем <code>$reject</code>. Тогда хендлер просто очищает wait, но никаких новых run'ов не создаёт — тикет остаётся в <code>needs_approval</code>. То есть мы согласились, что дальше работать не стоит.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Хендлер — <code>_handle_cost_cap_slash_intent</code> в <code>poll.py:1883</code>.</li>
+            <li>Удаление wait'а — <code>_clear_operator_wait</code> в <code>poll.py:2399</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 1883, fn: "_handle_cost_cap_slash_intent", desc: "Resume после $approve, или clear после $reject."},
+          {file: "src/symphony/orchestrator/poll.py", line: 2399, fn: "_clear_operator_wait", desc: "Удаляет operator_waits."},
+        ],
+        db: [
+          {table: "operator_waits", op: "delete", row: {issue_id: "iss-005"}},
+          {table: "runs", op: "insert", row: {id: "run-impl-5b", stage: "implement", status: "running"}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "implement-fail-retry",
+    title: "6. Implement failure → $retry",
+    desc: "Codex упал с non-zero exit. Issue паркуется. Оператор пишет $retry — новый dispatch.",
+    steps: [
+      {
+        title: "Codex упал с ненулевым exit code",
+        active: ["implement"],
+        narrative: `<p>Subprocess Codex'а завершился с exit=1. Причина может быть разная: внутренняя ошибка CLI, сломалась sandbox, кончилась память, упала сетевая зависимость. Symphony не пытается угадать причину — она просто видит «не получилось».</p>
+        <p>Та же чистая функция-классификатор, которая в happy path сказала «exit=0 → completed», теперь говорит «exit≠0 → failed». Run помечается как <code>failed</code>, дальнейшие шаги (push, открытие PR) не запускаются.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Решение — <code>on_runner_event</code> в <code>pipeline/state_machine.py:27</code>. На вход — событие exit, на выход — <code>Transition(next_run_status='failed', halt=True)</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/state_machine.py", line: 27, fn: "on_runner_event", desc: "exit + rc≠0 → failed."},
+        ],
+        db: [
+          {table: "runs", op: "update", row: {id: "run-impl-6", status: "failed", ended_at: "…"}},
+        ],
+      },
+      {
+        title: "Паркуем тикет, зовём нас",
+        active: ["needs_approval"],
+        activeEdge: "e-impl-needs",
+        narrative: `<p>Поскольку symphony не знает, фатально ли упал Codex (баг в имплементации) или это случайность (sandbox чихнула), решение возлагается на нас. Тикет переезжает в <code>needs_approval</code>, в Linear летит подробный комментарий: какой exit code, последние строки логов, какой run упал. Создаётся запись в <code>operator_waits</code> с типом <code>IMPLEMENT_FAILED</code> — теперь slash-команды на этом тикете будут роутиться именно в обработчик «implement упал».</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Точка входа — <code>_track_implement_failed_wait</code> в <code>poll.py:1940</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 1940, fn: "_track_implement_failed_wait", desc: "Парковка после implement fail."},
+        ],
+        db: [
+          {table: "operator_waits", op: "insert", row: {issue_id: "iss-006", run_id: "run-impl-6", kind: "IMPLEMENT_FAILED"}},
+        ],
+      },
+      {
+        title: "Мы пишем $retry — symphony пробует снова",
+        active: ["needs_approval"],
+        narrative: `<p>Мы изучаем логи (например, понимаем, что это был временный сбой sandbox) и решаем дать ещё одну попытку. Пишем в Linear-комментарий: <code>$retry</code>.</p>
+        <p>Slash-парсер находит intent, маршрутизатор смотрит на тип wait'а (<code>IMPLEMENT_FAILED</code>) и зовёт соответствующий хендлер. Тот при <code>$retry</code> очищает wait, создаёт новый implement-run и возвращает тикет в In Progress.</p>
+        <p>Альтернативы: <code>$reject</code> или <code>$stop</code> — wait очищается, новых run'ов не создаётся, тикет остаётся в <code>needs_approval</code> (требует ручного вмешательства).</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Хендлер — <code>_handle_implement_failed_slash_intent</code> в <code>poll.py:1957</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 1957, fn: "_handle_implement_failed_slash_intent", desc: "Retry/reject для implement fail."},
+        ],
+        db: [
+          {table: "operator_waits", op: "delete", row: {issue_id: "iss-006"}},
+          {table: "runs", op: "insert", row: {id: "run-impl-6b", stage: "implement", status: "running"}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "label-override",
+    title: "7. needs-human-approval label override (SYM-23)",
+    desc: "На issue висит лейбл `needs-human-approval`. Merge не диспатчится автоматически — issue паркуется в needs_approval сразу после approval.",
+    steps: [
+      {
+        title: "Ревью одобрено — но висит «осторожный» лейбл",
+        active: ["review"],
+        narrative: `<p>Всё как в happy path: classifier сказал APPROVED, mergeable, очередной такт по идее должен запустить merge. Но на тикете висит лейбл <code>needs-human-approval</code>. Это может быть лейбл, который мы поставили вручную (потому что задача чувствительная), или который автоматически назначен по правилу (например, тикет в проекте с префиксом «infra-»).</p>
+        <p>Договор такой: пока этот лейбл есть, symphony не будет мержить автоматически. Лейбл — это «жёлтый стоп-сигнал».</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Сканирование кандидатов на мерж — <code>_poll_merge_candidates</code> в <code>poll.py:6027</code>.</li>
+            <li>Детект лейбла — <code>_needs_human_approval_label_present</code> в <code>poll.py:510</code>. Имя константы — <code>NEEDS_HUMAN_APPROVAL_LABEL</code>.</li>
+            <li>История фичи — SYM-23 (поддержка label override для merge).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6027, fn: "_poll_merge_candidates", desc: "Merge dispatch loop."},
+          {file: "src/symphony/orchestrator/poll.py", line: 510, fn: "_needs_human_approval_label_present", desc: "Проверка лейбла на issue."},
+        ],
+        db: [],
+      },
+      {
+        title: "Вместо мержа — парковка с явной причиной",
+        active: ["needs_approval"],
+        activeEdge: "e-merge-needs",
+        narrative: `<p>Видя лейбл, symphony делает парковку, аналогичную тому, что мы видели в сценариях 5 и 6: закрывает review monitor (его работа на этом этапе сделана), создаёт новый merge-run в БД и сразу переводит его в статус <code>needs_approval</code>. В <code>operator_waits</code> появляется запись с типом <code>MERGE</code> и нотой, что причина — лейбл.</p>
+        <p>В Linear летит комментарий: «PR одобрен ревью, но висит needs-human-approval — нужен <code>$approve</code> от человека и/или снятие лейбла».</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Парковка по лейблу — <code>_open_merge_wait_for_human_approval_label</code> в <code>poll.py:6010</code>.</li>
+            <li>Создание merge-run в needs_approval — <code>_mark_merge_needs_approval</code> в <code>poll.py:8048</code> с <code>create_run=True</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6010, fn: "_open_merge_wait_for_human_approval_label", desc: "Создаёт merge wait без запуска merge."},
+          {file: "src/symphony/orchestrator/poll.py", line: 8048, fn: "_mark_merge_needs_approval", desc: "create_run=True вставляет новый runs row."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-merge-7", stage: "merge", status: "running"}},
+          {table: "runs", op: "update", row: {id: "run-merge-7", status: "needs_approval"}},
+          {table: "operator_waits", op: "insert", row: {issue_id: "iss-007", kind: "MERGE", note: "label-driven"}},
+        ],
+      },
+      {
+        title: "Мы снимаем лейбл и пишем $approve — мерж стартует",
+        active: ["merge"],
+        activeEdge: "e-needs-back",
+        narrative: `<p>Мы лично смотрим PR, убеждаемся, что мержить безопасно, снимаем лейбл <code>needs-human-approval</code> и пишем <code>$approve</code>. Merge-needs-approval-хендлер очищает wait, создаёт новый merge-run и идёт по обычному merge-пути (Codex с merge-промптом → <code>gh pr merge</code>).</p>
+        <p>Если мы напишем <code>$approve</code>, но забудем снять лейбл — поведение зависит от реализации хендлера: в текущей версии он перепроверяет лейбл и может перепарковать тикет (то есть «approve без снятия лейбла» не работает как ожидаемо). Это намеренная защита: важно, чтобы лейбл действительно отражал актуальное решение, а не висел исторически.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Хендлер — <code>_handle_merge_needs_approval_slash_intent</code> в <code>poll.py:4782</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 4782, fn: "_handle_merge_needs_approval_slash_intent", desc: "$approve/$retry на merge wait."},
+        ],
+        db: [
+          {table: "operator_waits", op: "delete", row: {issue_id: "iss-007"}},
+          {table: "runs", op: "insert", row: {id: "run-merge-7b", stage: "merge", status: "running"}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "skip-review",
+    title: "8. $skip-review bypass",
+    desc: "Оператор уверен в коде и хочет пропустить ожидание Codex review. $skip-review закрывает monitor и сразу диспатчит merge.",
+    steps: [
+      {
+        title: "PR в ревью, ждём CI и Codex — но мы не хотим ждать",
+        active: ["review"],
+        narrative: `<p>Стандартная ситуация: PR открыт, monitor его наблюдает, classifier на текущем такте говорит PENDING — потому что CI ещё гоняет тесты, а Codex-бот ещё не оставил ревью. По обычному пути нам пришлось бы подождать минут 5–10.</p>
+        <p>Мы уверены в этом PR (например, это совсем мелкий патч, который мы уже глазами проверили) и хотим не ждать ничего, а сразу мержить.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Monitor — <code>_poll_review_runs</code> в <code>poll.py:2663</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 2663, fn: "_poll_review_runs", desc: "Review monitor loop."},
+        ],
+        db: [],
+      },
+      {
+        title: "Пишем $skip-review",
+        active: ["review", "merge"],
+        narrative: `<p>Мы пишем в Linear-комментарии: <code>$skip-review</code>. На ближайшем такте symphony его подхватывает, маршрутизатор узнаёт команду и зовёт специальный хендлер «пропустить ревью». Тот делает два шага: останавливает review monitor (помечает review-run как <code>completed</code> с примечанием «stopped by $skip-review») и сразу запускает merge-стадию с флагом «ревью не нужно».</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Хендлер — <code>_handle_skip_review_intent</code> в <code>poll.py:4980</code>.</li>
+            <li>Остановка monitor'а — <code>_stop_review_monitor</code> в <code>poll.py:1801</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 4980, fn: "_handle_skip_review_intent", desc: "Закрывает review monitor + merge dispatch."},
+          {file: "src/symphony/orchestrator/poll.py", line: 1801, fn: "_stop_review_monitor", desc: "Стопит monitor, ставит wait для recovery."},
+        ],
+        db: [
+          {table: "runs", op: "update", row: {id: "run-review-8", status: "completed", note: "stopped by $skip-review"}},
+        ],
+      },
+      {
+        title: "Merge с флагом skip_review",
+        active: ["merge"],
+        activeEdge: "e-review-merge",
+        narrative: `<p>Merge запускается, но с одной тонкостью: флаг <code>skip_review=True</code> говорит дедуп-проверке игнорировать любые висящие <code>review_fix</code>-run'ы при принятии решения «можно ли стартовать merge». Без этого флага дедуп мог бы решить: «в БД есть незавершённый <code>review_fix</code> для этого тикета, мерж нельзя» — и завис бы. С флагом — нет, идём в merge.</p>
+        <p>Дальше — обычный merge: Codex с merge-промптом → <code>gh pr merge</code> → acceptance → Done.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Параметр — <code>skip_review=True</code> в <code>_merge_approved_pr</code> (<code>poll.py:7725</code>).</li>
+            <li>Реализация — <code>ignored_stages=('review_fix',)</code> в <code>poll.py:7745</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 7725, fn: "_merge_approved_pr", desc: "Параметр skip_review меняет dedup поведение."},
+          {file: "src/symphony/orchestrator/poll.py", line: 7745, fn: "ignored_stages", desc: "skip_review=True ⇒ игнорировать review_fix в дедуп проверке."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-merge-8", stage: "merge", status: "running"}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "acceptance-reject",
+    title: "9. Acceptance reject → fix-loop",
+    desc: "Claude видит, что код не соответствует acceptance criteria. Возвращает reject. Codex запускается с acceptance-fix prompt.",
+    steps: [
+      {
+        title: "Acceptance запущен после мержа",
+        active: ["acceptance"],
+        activeEdge: "e-merge-accept",
+        narrative: `<p>Как в happy path: PR в main, symphony запустила acceptance-агент. В контексте у него — diff смерженного PR и список acceptance criteria, выдернутый из описания тикета (секции «### Acceptance Criteria» или «### Checklist»). Режим этого binding'а — <code>code_only</code>: смотрим только код, без поднятия сервера и preview.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Запуск — <code>_run_acceptance_stage</code> в <code>poll.py:6483</code>.</li>
+            <li>Подготовка diff'а — <code>_acceptance_pr_diff</code> в <code>poll.py:6366</code>.</li>
+            <li>В <code>acceptance_state</code> пишутся извлечённые criteria и режим — это удобно для последующего разбора, что именно проверял агент.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6483, fn: "_run_acceptance_stage", desc: "Claude SDK acceptance stage."},
+          {file: "src/symphony/orchestrator/poll.py", line: 6366, fn: "_acceptance_pr_diff", desc: "Готовит diff для контекста."},
+        ],
+        db: [
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-009", extracted_criteria: '["foo must validate", "bar must log"]'}},
+        ],
+      },
+      {
+        title: "Вердикт: reject (одного из критериев нет)",
+        active: ["acceptance"],
+        narrative: `<p>Acceptance-агент проверил diff и обнаружил: один из критериев («foo должно валидировать что-то») не закрыт — соответствующего кода в diff'е нет. В финальном сообщении он объясняет, чего не хватает, и ставит маркер <code>&lt;!-- symphony-acceptance-verdict: reject --&gt;</code>.</p>
+        <p>Symphony парсит транскрипт, видит reject. Поскольку никаких признаков инфраструктурного сбоя нет (агент не упал, тулзы не таймаутили — см. сценарий 10 про другой случай), вердикт остаётся <code>reject</code>: это содержательный отказ.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Classifier — <code>acceptance_classifier</code> в <code>pipeline/acceptance_classifier.py:125</code>.</li>
+            <li>Маркер — <code>ACCEPTANCE_FOOTER_REJECT</code> в <code>acceptance_classifier.py:19</code>.</li>
+            <li>Логика «infra-error перебивает reject» — <code>acceptance_classifier.py:169</code>. Применяется только если есть детали infra-сбоя.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 125, fn: "acceptance_classifier", desc: "Парсит транскрипт, возвращает AcceptanceVerdict."},
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 19, fn: "ACCEPTANCE_FOOTER_REJECT", desc: "HTML-комментарий-маркер reject."},
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 169, fn: "infra-error override", desc: "Если есть infra_error_details — verdict перебивается на infra_error."},
+        ],
+        db: [
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-009", last_verdict: "reject"}},
+        ],
+      },
+      {
+        title: "Запускаем acceptance-fix: дописываем недостающее",
+        active: ["acceptance_fix"],
+        activeEdge: "e-accept-fix",
+        narrative: `<p>Symphony создаёт новый <code>runs</code> со стадией <code>acceptance_fix</code> и запускает Codex с acceptance-fix-промптом. В контексте у него — что именно ревьюер счёл недостающим, и список всех criteria. Задача — дописать недостающий код.</p>
+        <p>Тонкий момент: PR уже смержен, отдельной ветки больше нет. Поэтому acceptance-fix коммитит <strong>прямо в main</strong>. Счётчик <code>acceptance_state.iteration</code> +1.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Диспатч — <code>_dispatch_acceptance_fix_run</code> в <code>poll.py:6858</code>.</li>
+            <li>Шаблон промпта — <code>ACCEPTANCE_FIX_PROMPT</code> в <code>poll.py:51</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6858, fn: "_dispatch_acceptance_fix_run", desc: "Acceptance fix-run по reject verdict."},
+          {file: "src/symphony/orchestrator/poll.py", line: 51, fn: "ACCEPTANCE_FIX_PROMPT", desc: "Шаблон промпта для acceptance fix."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-afix-1", stage: "acceptance_fix", status: "running"}},
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-009", iteration: 1}},
+        ],
+      },
+      {
+        title: "Перезапуск acceptance — теперь pass",
+        active: ["acceptance"],
+        activeEdge: "e-fix-accept",
+        narrative: `<p>После acceptance-fix symphony заново запускает acceptance-стадию. Агент видит обновлённый diff (теперь с дописанной валидацией), проверяет criteria — на этот раз всё на месте, вердикт <code>pass</code>. Тикет переходит в Done.</p>
+        <p>А если снова reject? Стартует следующая итерация acceptance_fix. Цикл не бесконечный: счётчик <code>acceptance_state.iteration</code> упирается в cap, после чего тикет паркуется в <code>needs_approval</code> — нужна наша помощь.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Финализация happy-исхода — <code>_mark_merge_done</code> в <code>poll.py:7989</code>.</li>
+            <li>Отдельный счётчик инфраструктурных ретраев — <code>acceptance_state.infra_retries</code> (см. сценарий 10).</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 7989, fn: "_mark_merge_done", desc: "Финальный success для (merged+accepted) issue."},
+        ],
+        db: [
+          {table: "runs", op: "insert", row: {id: "run-acc-2", stage: "acceptance", status: "running"}},
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-009", last_verdict: "pass"}},
+        ],
+      },
+    ],
+  },
+
+  // ----------------------------------------------------------
+  {
+    id: "acceptance-infra",
+    title: "10. Acceptance infra_error (vs real reject)",
+    desc: "Acceptance падает из-за инфра-проблемы (playwright timeout, dev-сервер не поднялся, Claude crash). Differentiated от reject — допускается retry с backoff.",
+    steps: [
+      {
+        title: "Тулза в acceptance-агенте упала",
+        active: ["acceptance"],
+        narrative: `<p>В режиме <code>dev</code> или <code>preview</code> acceptance-агент использует внешние инструменты — например, <code>playwright</code>, чтобы зайти на страницу и проверить поведение. И вот <code>playwright</code> вернулся с timeout: страница не открылась за отведённое время.</p>
+        <p>В stream-json от Claude/Codex это выглядит как блок с <code>is_error: true</code>. Symphony сканирует все такие блоки и проверяет содержимое: если в тексте есть слова, характерные для инфра-сбоев (<code>playwright</code> + <code>timeout</code>, <code>npm install hang</code>, <code>dev server failed</code>, <code>preview 404</code>), классифицирует это как инфраструктурный сбой, а не как ошибку проверки.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Детекция упавших тулз — <code>_tool_failure_details</code> в <code>pipeline/acceptance_classifier.py:409</code>.</li>
+            <li>Текстовые паттерны — <code>_is_agent_infra_text</code> в <code>acceptance_classifier.py:501</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 409, fn: "_tool_failure_details", desc: "Сканит tool_result с is_error, классифицирует infra signals."},
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 501, fn: "_is_agent_infra_text", desc: "playwright+timeout, npm install hang, dev server failed, preview 404."},
+        ],
+        db: [],
+      },
+      {
+        title: "Infra-error перебивает reject",
+        active: ["acceptance"],
+        narrative: `<p>В нашем сценарии агент в финале честно говорит: «не могу подтвердить pass, потому что не смог проверить» — и ставит маркер reject. Но из-за упавшей <code>playwright</code> у нас есть инфра-детали.</p>
+        <p>Тут срабатывает важное правило в classifier'е: <strong>если вердикт ≠ pass И есть детали инфра-сбоя — итог переписывается на <code>infra_error</code></strong>. Логика: «честный reject» (агент посмотрел код и сказал «не работает») и «технический reject» (агент не смог посмотреть) — это очень разные ситуации. Первый требует ручного разбора, второй — просто ретрая. Перепутать их = либо лишний раз дёргать нас, либо бесконечно ретраить настоящий баг. Заметим, что <strong>pass</strong> не перебивается: если агент сказал «всё хорошо», даже на фоне infra-деталей мы ему верим.</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Условие — <code>acceptance_classifier.py:169</code>: <code>if kind != 'pass' and parsed.infra_error_details</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/pipeline/acceptance_classifier.py", line: 169, fn: "infra-error override", desc: "Перебивает reject если есть infra details (но не pass — pass честный)."},
+        ],
+        db: [
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-010", last_verdict: "infra_error"}},
+        ],
+      },
+      {
+        title: "Ретрай с backoff",
+        active: ["acceptance"],
+        narrative: `<p>Symphony увеличивает <strong>отдельный</strong> счётчик — <code>acceptance_state.infra_retries</code> (это не тот же счётчик, что для содержательных rejection'ов). Сразу же дёргать retry нет смысла: тулза, скорее всего, не успела очнуться. Поэтому symphony отдельной проверкой говорит «бэкофф ещё активен, пропускаем». На следующих тактах, когда бэкофф пройдёт, запустится новый acceptance-run.</p>
+        <p>Возможные исходы: новый прогон даст pass (тулза очнулась) — тикет в Done; снова <code>infra_error</code> — счётчик +1, бэкофф длиннее; <code>reject</code> на содержательной проверке — обычный acceptance-fix цикл (сценарий 9).</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Бэкофф — <code>_acceptance_infra_retry_backoff_active</code> в <code>poll.py:6251</code>.</li>
+            <li>Колонка — <code>acceptance_state.infra_retries</code> в <code>db/schema.sql:138</code>. Специально отдельная от <code>iteration</code>, чтобы инфра-сбои не съедали бюджет содержательных попыток.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 6251, fn: "_acceptance_infra_retry_backoff_active", desc: "Backoff после infra_error."},
+          {file: "src/symphony/db/schema.sql", line: 138, fn: "acceptance_state.infra_retries", desc: "Счётчик infra-ошибок отдельный от обычных iterations."},
+        ],
+        db: [
+          {table: "acceptance_state", op: "update", row: {issue_id: "iss-010", infra_retries: 1}},
+        ],
+      },
+      {
+        title: "Cap → парковка, зовём нас",
+        active: ["needs_approval"],
+        activeEdge: "e-accept-needs",
+        narrative: `<p>Если инфра-сбои не унимаются и <code>infra_retries</code> упёрся в cap, symphony паркует тикет: создаётся <code>operator_waits</code> с типом <code>ACCEPTANCE_BLOCKED</code> (или <code>ACCEPTANCE_REJECTED</code> — зависит от того, был ли это инфра-сбой или содержательный отказ). В Linear летит подробный комментарий.</p>
+        <p>Мы можем разрулить двумя командами: <code>$retry-acceptance</code> сбрасывает счётчик и даёт ещё один шанс (например, если мы починили внешнюю причину); <code>$skip-acceptance</code> переводит тикет сразу в Done, не пытаясь больше прогонять acceptance (если мы уверены, что код корректный, и просто не хотим бороться с тулзой).</p>
+        <details><summary>Технически</summary>
+          <ul>
+            <li>Парковка — <code>_track_acceptance_blocked_wait</code> в <code>poll.py:2185</code>.</li>
+            <li>Хендлер slash-команд для этого wait'а — <code>_handle_acceptance_blocked_slash_intent</code> в <code>poll.py:2269</code>.</li>
+          </ul>
+        </details>`,
+        refs: [
+          {file: "src/symphony/orchestrator/poll.py", line: 2185, fn: "_track_acceptance_blocked_wait", desc: "ACCEPTANCE_BLOCKED wait."},
+          {file: "src/symphony/orchestrator/poll.py", line: 2269, fn: "_handle_acceptance_blocked_slash_intent", desc: "$retry-acceptance / $skip-acceptance handler."},
+        ],
+        db: [
+          {table: "operator_waits", op: "insert", row: {issue_id: "iss-010", kind: "ACCEPTANCE_BLOCKED"}},
+        ],
+      },
+    ],
+  },
+];
+
+// ============================================================
+//  RENDERING
+// ============================================================
+const $ = (sel, parent=document) => parent.querySelector(sel);
+const $$ = (sel, parent=document) => Array.from(parent.querySelectorAll(sel));
+
+let activeScenarioIdx = 0;
+let activeStepIdx = 0;
+let mode = "intro"; // "intro" | "scenario" | "ref"
+
+function renderSidebar() {
+  const list = $("#scenarios");
+  list.innerHTML = "";
+  SCENARIOS.forEach((s, i) => {
+    const li = document.createElement("li");
+    li.dataset.scenario = String(i);
+    li.innerHTML = `<span class="scn-num">${(i+1).toString().padStart(2, "0")}</span>${s.title.replace(/^\d+\.\s*/, "")}`;
+    li.addEventListener("click", () => { selectScenario(i); closeMobileSidebar(); });
+    list.appendChild(li);
+  });
+  $$("#reference li").forEach(li => {
+    li.addEventListener("click", () => { selectReference(li.dataset.ref); closeMobileSidebar(); });
+  });
+}
+
+function openMobileSidebar() {
+  $("#sidebar").classList.add("open");
+  $("#sidebarBg").classList.add("open");
+}
+function closeMobileSidebar() {
+  $("#sidebar").classList.remove("open");
+  $("#sidebarBg").classList.remove("open");
+}
+
+function setActiveSidebar() {
+  $$("#scenarios li").forEach((li, i) => {
+    li.classList.toggle("active", mode === "scenario" && i === activeScenarioIdx);
+  });
+  $$("#reference li").forEach(li => {
+    li.classList.toggle("active", mode === "ref" && li.dataset.ref === currentRef);
+  });
+}
+
+let currentRef = null;
+function selectReference(key) {
+  mode = "ref";
+  currentRef = key;
+  renderReference(key);
+  setActiveSidebar();
+}
+
+function selectScenario(idx) {
+  mode = "scenario";
+  activeScenarioIdx = idx;
+  activeStepIdx = 0;
+  renderScenario();
+  setActiveSidebar();
+}
+
+function renderDiagram() {
+  return `
+    <button class="diagram-expand" type="button" aria-label="Развернуть схему на весь экран" onclick="openDiagramModal(event)">⤢</button>
+    <span class="diagram-scroll-hint">← прокрути →</span>
+    <div class="diagram-scroller">${buildSVG()}</div>
+  `;
+}
+
+function openDiagramModal(e) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const modal = document.getElementById("diagramModal");
+  const inner = document.getElementById("diagramModalInner");
+  if (!modal || !inner) return;
+  inner.innerHTML = buildSVG();
+  // re-apply highlights based on current step
+  if (mode === "scenario") {
+    const scenario = SCENARIOS[activeScenarioIdx];
+    const step = scenario && scenario.steps[activeStepIdx];
+    if (step) {
+      const active = (step.active) || [];
+      active.forEach(id => {
+        const node = inner.querySelector("#node-" + id);
+        if (node) node.classList.add("active");
+      });
+      if (step.activeEdge) {
+        const edge = inner.querySelector("#" + step.activeEdge);
+        if (edge) edge.classList.add("active");
+      }
+    }
+  }
+  inner.querySelectorAll("svg .node").forEach(n => {
+    n.addEventListener("click", () => {
+      closeDiagramModal();
+      showNodeDrawer(n.dataset.node);
+    });
+  });
+  modal.classList.add("open");
+  document.body.style.overflow = "hidden";
+}
+function closeDiagramModal() {
+  const modal = document.getElementById("diagramModal");
+  if (modal) modal.classList.remove("open");
+  document.body.style.overflow = "";
+}
+
+function buildSVG() {
+  const W = 900, H = 700;
+  const lines = [];
+  lines.push(`<svg class="statemachine" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">`);
+  lines.push(`<defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+    <marker id="arrow-active" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+    <marker id="arrow-dashed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z"/>
+    </marker>
+  </defs>`);
+
+  // helper: anchors on rect sides
+  const N = (id) => NODES.find(n => n.id === id);
+  const top    = (n) => ({ x: n.x + n.w/2,        y: n.y });
+  const bottom = (n) => ({ x: n.x + n.w/2,        y: n.y + n.h });
+  const left   = (n) => ({ x: n.x,                y: n.y + n.h/2 });
+  const right  = (n) => ({ x: n.x + n.w,          y: n.y + n.h/2 });
+  const fmt    = (p) => `${p.x.toFixed(1)} ${p.y.toFixed(1)}`;
+
+  // Edges (before nodes so nodes paint on top)
+  const labelMarkup = []; // labels rendered after edges, so they're on top
+  for (const e of EDGES) {
+    const a = N(e.from), b = N(e.to);
+    if (!a || !b) continue;
+
+    let d = "", lp = null;          // path data, label position
+    const route = e.route || "v";
+
+    if (route === "v") {
+      // vertical, same column
+      const downward = a.y < b.y;
+      const s = downward ? bottom(a) : top(a);
+      const t = downward ? top(b)    : bottom(b);
+      d = `M ${fmt(s)} L ${fmt(t)}`;
+      lp = { x: s.x + 10, y: (s.y + t.y)/2 + 4, anchor: "start" };
+
+    } else if (route === "h") {
+      // horizontal, same row (or near-same)
+      const rightward = a.x < b.x;
+      const s = rightward ? right(a) : left(a);
+      const t = rightward ? left(b)  : right(b);
+      d = `M ${fmt(s)} L ${fmt(t)}`;
+      lp = { x: (s.x + t.x)/2, y: s.y - 10, anchor: "middle" };
+
+    } else if (route === "arc-top") {
+      // U-arc above two same-row nodes (return path)
+      const s = top(a);
+      const t = top(b);
+      const peakY = Math.min(s.y, t.y) - 44;
+      d = `M ${fmt(s)} C ${s.x} ${peakY} ${t.x} ${peakY} ${t.x} ${t.y}`;
+      lp = { x: (s.x + t.x)/2, y: peakY + 4, anchor: "middle" };
+
+    } else if (route === "L-down" || route === "L-up") {
+      // L-shape: exit horizontally toward target column, then vertical to target top/bottom
+      const isDown = route === "L-down";
+      const s = left(a);                                  // exit source's left edge
+      const cornerX = b.x + b.w/2;                        // target's column
+      const cornerY = s.y;
+      const t = isDown ? top(b) : bottom(b);
+      d = `M ${fmt(s)} L ${cornerX.toFixed(1)} ${cornerY.toFixed(1)} L ${fmt(t)}`;
+      // place label midpoint of horizontal leg
+      lp = { x: (s.x + cornerX)/2, y: s.y - 10, anchor: "middle" };
+
+    } else if (route === "arc-left") {
+      // wide bezier curving on the left margin: needs_approval → implement
+      const s = left(a);                                  // exit source's left
+      const t = left(b);                                  // enter target's left
+      const cx1 = 24, cy1 = s.y;
+      const cx2 = 24, cy2 = t.y;
+      d = `M ${fmt(s)} C ${cx1} ${cy1} ${cx2} ${cy2} ${fmt(t)}`;
+      lp = { x: 36, y: (s.y + t.y)/2 + 4, anchor: "start" };
+
+    } else {
+      // fallback: straight center-to-center
+      const ax = a.x + a.w/2, ay = a.y + a.h/2;
+      const bx = b.x + b.w/2, by = b.y + b.h/2;
+      d = `M ${ax} ${ay} L ${bx} ${by}`;
+      lp = { x: (ax+bx)/2, y: (ay+by)/2 - 8, anchor: "middle" };
+    }
+
+    const dashed = e.dashed ? " dashed" : "";
+    lines.push(`<path id="${e.id}" class="edge${dashed}" d="${d}"/>`);
+
+    if (e.label && lp) {
+      // measure-ish: each char ~5.5px at 11px font
+      const padX = 7, padY = 3;
+      const textW = e.label.length * 5.7 + padX * 2;
+      const textH = 11 + padY * 2;
+      let bx = lp.x, by = lp.y - textH/2 + 2;
+      if (lp.anchor === "middle") bx = lp.x - textW/2;
+      else if (lp.anchor === "start") bx = lp.x - padX;
+      labelMarkup.push(`<g class="edge-label-g" data-for="${e.id}">
+        <rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${textW.toFixed(1)}" height="${textH}" rx="3"/>
+        <text class="edge-label" x="${lp.x.toFixed(1)}" y="${(lp.y + 3).toFixed(1)}" text-anchor="${lp.anchor}">${e.label}</text>
+      </g>`);
+    }
+  }
+
+  // Nodes
+  for (const n of NODES) {
+    const kindClass = n.kind === "sub" ? " sub" : n.kind === "side" ? " side" : "";
+    const rx = n.kind === "sub" ? 6 : 10;
+    lines.push(`<g class="node${kindClass}" id="node-${n.id}" data-node="${n.id}" transform="translate(${n.x} ${n.y})">
+      <rect width="${n.w}" height="${n.h}" rx="${rx}" ry="${rx}"/>
+      <text x="${n.w/2}" y="${n.h/2 + 1}">${n.label}</text>
+    </g>`);
+  }
+
+  // Labels last → always on top of edges AND nodes
+  lines.push(labelMarkup.join("\n"));
+
+  lines.push(`</svg>`);
+  return lines.join("\n");
+}
+
+function applyStepHighlights(step) {
+  // Reset
+  $$("svg .node").forEach(n => n.classList.remove("active", "warn", "bad"));
+  $$("svg .edge").forEach(e => e.classList.remove("active"));
+  // Mark active nodes
+  const active = (step && step.active) || [];
+  active.forEach(id => {
+    const node = document.getElementById("node-" + id);
+    if (node) node.classList.add("active");
+  });
+  if (step && step.activeEdge) {
+    const edge = document.getElementById(step.activeEdge);
+    if (edge) edge.classList.add("active");
+  }
+}
+
+function renderScenario() {
+  const scenario = SCENARIOS[activeScenarioIdx];
+  const step = scenario.steps[activeStepIdx];
+  const total = scenario.steps.length;
+
+  // Extract leading "N." for an editorial numeral
+  const m = scenario.title.match(/^\s*(\d+)\s*\.\s*(.+)$/);
+  const numeral = m ? m[1] : String(activeScenarioIdx + 1);
+  const cleanTitle = m ? m[2] : scenario.title;
+  const isFailure = activeScenarioIdx >= 3 && activeScenarioIdx <= 7;
+  const isOperator = activeScenarioIdx >= 8;
+  const kind = isFailure ? "Failure path" : isOperator ? "Operator action" : "Happy path";
+
+  const content = $("#content");
+  content.innerHTML = `
+    <header class="scn-header">
+      <div class="scn-numeral">SCEN. ${String(activeScenarioIdx + 1).padStart(2, "0")}</div>
+      <div class="scn-title">
+        <span class="scn-kicker">${kind}<span class="dot-sep"></span>${String(activeScenarioIdx + 1).padStart(2, "0")} / ${String(SCENARIOS.length).padStart(2, "0")}</span>
+        <h2>${cleanTitle}</h2>
+        <p>${scenario.desc}</p>
+      </div>
+      <div class="controls">
+        <button id="prevStep">‹ Назад</button>
+        <span class="step-counter">${String(activeStepIdx + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}</span>
+        <button id="nextStep">Вперёд ›</button>
+      </div>
+    </header>
+
+    <div class="card">
+      <h3>State machine</h3>
+      <div class="diagram-wrap" id="diagramWrap">${renderDiagram()}</div>
+      <div class="legend">
+        <span><span class="dot"></span>текущая стадия</span>
+        <span><span class="dot warn"></span>пауза/ожидание</span>
+        <span><span class="dot bad"></span>fail</span>
+        <span><span class="dot idle"></span>idle</span>
+        <span>· пунктир = операторская ветка / failure path</span>
+        <span>· кликни на узел — описание модуля</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="step-headline"><span class="num">${String(activeStepIdx + 1).padStart(2, "0")}</span><span>${step.title}</span></div>
+      <div class="narrative">${step.narrative}</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Код (file:line)</h3>
+        <ul class="refs">
+          ${(step.refs || []).map(r => `
+            <li>
+              <a class="ref-path mono" href="${vscLink(r.file, r.line)}">${r.file}:${r.line}</a>
+              ${r.fn ? `<span class="mono" style="color:var(--accent-2)"> · ${r.fn}</span>` : ""}
+              <span class="ref-desc">${r.desc || ""}</span>
+            </li>
+          `).join("") || "<li class='ref-desc'>(нет конкретных code-ссылок на этом шаге)</li>"}
+        </ul>
+      </div>
+
+      <div class="card">
+        <h3>SQLite (изменения на этом шаге)</h3>
+        ${renderDbStep(step.db)}
+      </div>
+    </div>
+  `;
+
+  $("#prevStep").disabled = activeStepIdx === 0;
+  $("#nextStep").disabled = activeStepIdx === total - 1;
+  $("#prevStep").addEventListener("click", () => { if (activeStepIdx > 0) { activeStepIdx--; renderScenario(); }});
+  $("#nextStep").addEventListener("click", () => { if (activeStepIdx < total - 1) { activeStepIdx++; renderScenario(); }});
+
+  // Mobile bottom-nav mirror
+  const mPrev = $("#prevStepMobile");
+  const mNext = $("#nextStepMobile");
+  const mCounter = $("#stepCounterMobile");
+  const mProgress = $("#progressBar");
+  if (mPrev && mNext && mCounter) {
+    mPrev.disabled = activeStepIdx === 0;
+    mNext.disabled = activeStepIdx === total - 1;
+    mCounter.textContent = String(activeStepIdx + 1).padStart(2, "0") + " / " + String(total).padStart(2, "0");
+    if (mProgress) mProgress.style.width = ((activeStepIdx + 1) / total * 100) + "%";
+  }
+  document.body.classList.add("scenario-mode");
+
+  // Scroll narrative into view for mobile after step change
+  const scrollTarget = document.querySelector(".scn-title h2");
+  if (scrollTarget && window.matchMedia("(max-width: 760px)").matches) {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }
+
+  // Wire node clicks
+  $$("svg .node").forEach(node => {
+    node.addEventListener("click", () => showNodeDrawer(node.dataset.node));
+  });
+
+  applyStepHighlights(step);
+
+  // Re-trigger fade-in on each step change
+  const c = $("#content");
+  c.style.animation = "none";
+  void c.offsetWidth;
+  c.style.animation = "";
+}
+
+function renderDbStep(db) {
+  if (!db || db.length === 0) {
+    return `<p style="color:var(--muted); font-size:13px; margin:0">Чтения без изменений.</p>`;
+  }
+  const by = {};
+  for (const d of db) {
+    by[d.table] = by[d.table] || [];
+    by[d.table].push(d);
+  }
+  let out = "";
+  for (const table of Object.keys(by)) {
+    out += `<div class="db-table">`;
+    out += `<div class="name"><a href="#" data-table="${table}">${table}</a></div>`;
+    out += `<table>`;
+    out += `<thead><tr><th>op</th><th>row</th></tr></thead><tbody>`;
+    for (const d of by[table]) {
+      const cls = d.op === "insert" ? "added" : d.op === "delete" ? "removed" : d.op === "update" ? "changed" : "";
+      const rowText = Object.entries(d.row || {}).map(([k, v]) => `<b>${k}</b>=${v === null ? "NULL" : JSON.stringify(v)}`).join(", ");
+      out += `<tr class="${cls}"><td>${d.op}</td><td>${rowText}</td></tr>`;
+    }
+    out += `</tbody></table></div>`;
+  }
+  // wire table click to drawer after rendering
+  setTimeout(() => {
+    $$(".db-table .name a").forEach(a => {
+      a.addEventListener("click", (e) => { e.preventDefault(); showTableDrawer(a.dataset.table); });
+    });
+  }, 0);
+  return out;
+}
+
+function showNodeDrawer(nodeId) {
+  const NODE_DOCS = {
+    ready: {
+      title: "Ready (Linear state)",
+      body: `<p>Issue лежит в Linear-state, обозначенном как <code>ready_state</code> в <code>config.local.yaml</code> для соответствующего binding. Symphony сканит этот state раз в poll-интервал (60s по умолчанию).</p>
+      <p>Для попадания в Ready: оператор переводит issue вручную или ставит лейбл <code>symphony</code> и переводит. Дополнительно может действовать <code>issue_label</code> фильтр в binding.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 5352, "_scan_binding", "Загружает issues_in_state(ready) и issues_in_state(waiting).")}
+        ${refRow("src/symphony/linear/queries.py", 1, "issues_in_state", "GraphQL запрос к Linear.")}
+        ${refRow("src/symphony/config.py", 1, "RepoBinding", "ready_state, waiting_state, in_progress, etc.")}
+      </ul>`,
+    },
+    implement: {
+      title: "Implement",
+      body: `<p>Codex CLI запускается на чистом workspace, реализует issue, делает <code>git commit</code> и <code>git push</code>. Тут активен <strong>cost guard</strong>: total cost для issue (включая все прежние runs) считается на каждом event.</p>
+      <p>После успешного завершения — push + <code>gh pr create</code> и переход в <code>PR opened</code>.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 7410, "_dispatch_one", "Главная функция implement-стадии.")}
+        ${refRow("src/symphony/orchestrator/poll.py", 8769, "_run_agent", "Spawn codex subprocess, парсит stream-json.")}
+        ${refRow("src/symphony/agent/prompt.py", 1, "implement prompt template", "")}
+        ${refRow("src/symphony/pipeline/cost_guard.py", 1, "cost_guard", "Cap enforcement.")}
+      </ul>`,
+    },
+    local_review: {
+      title: "Local review",
+      body: `<p>Sub-стадия Implement. Codex запускается в режиме reviewer ДО открытия PR, итеративно review/fix внутри workspace. Не блокирует поток — даже при ошибке PR открывается, и remote @codex-review подхватит.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 8146, "_run_local_review_phase", "")}
+        ${refRow("src/symphony/pipeline/local_review_loop.py", 1, "loop", "")}
+        ${refRow("src/symphony/pipeline/local_review.py", 1, "session", "")}
+        ${refRow("docs/local-review-flow.md", 1, "design doc", "")}
+      </ul>`,
+    },
+    pr_open: {
+      title: "PR opened",
+      body: `<p>Промежуточное состояние: <code>issue_prs</code> уже есть, но review monitor ещё не открыт. <code>_start_review_stage</code> создаст следующий run.</p>`,
+    },
+    review: {
+      title: "Review (monitor)",
+      body: `<p>На каждом такте <code>_poll_review_run</code>: fetch checks/reviews/comments, classifier по 9 правилам, либо ничего (PENDING), либо fix-run dispatch (CHANGES_REQUESTED), либо merge dispatch (APPROVED).</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 2663, "_poll_review_runs", "")}
+        ${refRow("src/symphony/orchestrator/poll.py", 2997, "_poll_review_run", "")}
+        ${refRow("src/symphony/pipeline/review_classifier.py", 178, "review_classifier", "9 priority rules")}
+      </ul>`,
+    },
+    review_fix: {
+      title: "Review fix",
+      body: `<p>Codex с fix-prompt. Получает контекст: что не так (failing check log tail, codex comment body, или conflict info). Iteration cap = 12.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 3307, "_dispatch_ci_fix_run", "по упавшему CI")}
+        ${refRow("src/symphony/orchestrator/poll.py", 3705, "_dispatch_review_comment_fix_run", "по комментариям review")}
+        ${refRow("src/symphony/orchestrator/poll.py", 3976, "_dispatch_merge_conflict_rebase_fix_run", "по конфликту")}
+      </ul>`,
+    },
+    merge: {
+      title: "Merge",
+      body: `<p>Codex с merge-prompt. Делает финальную проверку, <code>gh pr merge</code>. После успеха — acceptance handoff.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 7725, "_merge_approved_pr", "")}
+        ${refRow("src/symphony/orchestrator/poll.py", 8831, "_run_merge_agent", "")}
+        ${refRow("src/symphony/orchestrator/poll.py", 7989, "_mark_merge_done", "")}
+      </ul>`,
+    },
+    acceptance: {
+      title: "Acceptance",
+      body: `<p>Claude SDK с acceptance-prompt. Mode: off / code_only / dev / preview. Проверяет соответствие diff acceptance criteria, возвращает verdict footer (pass/reject/infra_error).</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 6483, "_run_acceptance_stage", "")}
+        ${refRow("src/symphony/pipeline/acceptance_classifier.py", 125, "acceptance_classifier", "")}
+        ${refRow("src/symphony/pipeline/acceptance_classifier.py", 198, "extract_acceptance_criteria", "из issue description")}
+      </ul>`,
+    },
+    acceptance_fix: {
+      title: "Acceptance fix",
+      body: `<p>Codex с acceptance-fix-prompt. PR уже мержен, fix идёт прямой коммит в main. После — повторный acceptance run.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 6858, "_dispatch_acceptance_fix_run", "")}
+        ${refRow("src/symphony/orchestrator/poll.py", 9018, "_run_acceptance_fix_agent", "")}
+      </ul>`,
+    },
+    done: {
+      title: "Done",
+      body: `<p>Терминальный success. Issue в Done Linear state. Все runs закрыты (status=done или completed).</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 7989, "_mark_merge_done", "")}
+      </ul>`,
+    },
+    needs_approval: {
+      title: "Needs approval",
+      body: `<p>Парк для всех нештатных ситуаций: cost cap, implement fail, review iteration cap, merge fail, acceptance reject, label override.</p>
+      <p>Состояние переживает рестарт демона — <code>operator_waits</code> восстанавливается через <code>_restore_operator_waits</code> на старте.</p>
+      <h4>Связанные файлы</h4>
+      <ul class="refs">
+        ${refRow("src/symphony/orchestrator/poll.py", 8048, "_mark_merge_needs_approval", "")}
+        ${refRow("src/symphony/orchestrator/poll.py", 2043, "_restore_operator_waits", "восстановление после рестарта")}
+        ${refRow("src/symphony/db/schema.sql", 178, "operator_waits", "")}
+      </ul>`,
+    },
+  };
+  const doc = NODE_DOCS[nodeId];
+  if (!doc) return;
+  $("#drawerTitle").innerHTML = doc.title;
+  $("#drawerBody").innerHTML = doc.body;
+  $("#drawer").classList.add("open");
+  $("#drawerBg").classList.add("open");
+}
+
+function refRow(file, line, fn, desc) {
+  return `<li>
+    <a class="ref-path mono" href="${vscLink(file, line)}">${file}:${line}</a>
+    ${fn ? `<span class="mono" style="color:var(--accent-2)"> · ${fn}</span>` : ""}
+    <span class="ref-desc">${desc || ""}</span>
+  </li>`;
+}
+
+function showTableDrawer(name) {
+  const t = TABLES[name];
+  if (!t) return;
+  $("#drawerTitle").innerHTML = `<span class="mono">${name}</span>`;
+  $("#drawerBody").innerHTML = `
+    <p>${t.purpose}</p>
+    <h4>Колонки</h4>
+    <pre class="code">${t.columns.map(c => "  " + c).join("\n")}</pre>
+    <h4>Схема</h4>
+    <p><a class="ref-path mono" href="${vscLink("src/symphony/db/schema.sql", schemaLineFor(name))}">src/symphony/db/schema.sql</a></p>
+  `;
+  $("#drawer").classList.add("open");
+  $("#drawerBg").classList.add("open");
+}
+
+function schemaLineFor(name) {
+  const map = {
+    repos: 11, issues: 16, runs: 23, issue_prs: 44,
+    merge_conflict_fix_marks: 62, comment_cursors: 76, comment_events: 85,
+    webhook_deliveries: 97, review_state: 112, acceptance_state: 127,
+    review_rearm_retries: 143, issue_cost_marks: 152, activity_comment_marks: 159,
+    activity_command_marks: 168, operator_waits: 178, state_transitions: 192,
+    external_observations: 208,
+  };
+  return map[name] || 1;
+}
+
+function closeDrawer() {
+  $("#drawer").classList.remove("open");
+  $("#drawerBg").classList.remove("open");
+}
+
+function renderReference(key) {
+  document.body.classList.remove("scenario-mode");
+  const content = $("#content");
+  if (key === "overview") {
+    content.innerHTML = `
+      <header class="scn-header">
+        <div class="scn-title"><h2>Обзор архитектуры</h2><p>Symphony как state machine + персистентная очередь.</p></div>
+      </header>
+      <div class="card">
+        <h3>Mental model</h3>
+        <p>Symphony — это <strong>headless orchestrator</strong>. Один процесс (daemon) циклично:</p>
+        <ol>
+          <li>читает Linear (issues, comments) — <em>наблюдает за миром</em></li>
+          <li>читает GitHub (PRs, CI, reviews) — <em>наблюдает за миром</em></li>
+          <li>применяет чистые классификаторы (<code>review_classifier</code>, <code>acceptance_classifier</code>, <code>state_machine.on_runner_event</code>) — <em>принимает решение</em></li>
+          <li>спавнит Codex/Claude subprocess для имплементации, fix, merge, acceptance — <em>выполняет работу</em></li>
+          <li>пишет в SQLite (state.sqlite) — <em>запоминает</em></li>
+          <li>постит комментарии в Linear, делает push/merge на GitHub — <em>оставляет receipts</em></li>
+        </ol>
+        <p>SQLite — единственный источник правды о состоянии. После рестарта демон делает <strong>startup reconcile</strong> (помечает мёртвые runs interrupted) и <strong>restore operator_waits</strong> (поднимает active waits в память).</p>
+      </div>
+      <div class="diagram-wrap">${renderDiagram()}</div>
+      <p style="color:var(--muted); font-size:13px">Кликни на любой узел диаграммы — получишь описание стадии и ссылки в код.</p>
+    `;
+    $$("svg .node").forEach(node => {
+      node.addEventListener("click", () => showNodeDrawer(node.dataset.node));
+    });
+  } else if (key === "modules") {
+    const moduleHtml = Object.entries(MODULES).map(([path, m]) => `
+      <div class="card">
+        <h3><a class="ref-path mono" href="${vscLink(path)}">src/symphony/${path}</a></h3>
+        <p>${m.role}</p>
+        ${m.entrypoints.length ? `<h4 style="margin-top:10px; font-size:12px; color:var(--muted); text-transform:uppercase">Ключевые функции</h4>
+        <ul class="refs">
+          ${m.entrypoints.map(([fn, line, desc]) => `
+            <li>
+              <a class="ref-path mono" href="${vscLink(path, line)}">${fn}</a>
+              <span class="mono" style="color:var(--muted)"> · ${path}:${line}</span>
+              <span class="ref-desc">${desc}</span>
+            </li>
+          `).join("")}
+        </ul>` : ""}
+      </div>
+    `).join("");
+    content.innerHTML = `
+      <header class="scn-header"><div class="scn-title"><h2>Модули кода</h2><p>Карта src/symphony/ с ролями и ключевыми entry-point'ами.</p></div></header>
+      ${moduleHtml}
+    `;
+  } else if (key === "tables") {
+    const tablesHtml = Object.entries(TABLES).map(([name, t]) => `
+      <div class="card">
+        <h3><a class="ref-path mono" href="${vscLink("src/symphony/db/schema.sql", schemaLineFor(name))}">${name}</a></h3>
+        <p>${t.purpose}</p>
+        <pre class="code">${t.columns.map(c => "  " + c).join("\n")}</pre>
+      </div>
+    `).join("");
+    content.innerHTML = `
+      <header class="scn-header"><div class="scn-title"><h2>SQLite таблицы</h2><p>14 таблиц + 3 вспомогательные. Все определены в <a class="mono" href="${vscLink("src/symphony/db/schema.sql")}">db/schema.sql</a>.</p></div></header>
+      ${tablesHtml}
+    `;
+  } else if (key === "slash") {
+    const rows = SLASH.map(s => `
+      <tr>
+        <td class="mono" style="color:var(--accent); white-space:nowrap">${s.cmd}</td>
+        <td>${s.purpose}</td>
+      </tr>
+    `).join("");
+    content.innerHTML = `
+      <header class="scn-header"><div class="scn-title"><h2>Slash-команды</h2><p>Все распознаваемые intents и их эффекты.</p></div></header>
+      <div class="card">
+        <h3>Команды</h3>
+        <table style="width:100%; border-collapse:collapse; font-size:13px">
+          <thead><tr style="border-bottom:1px solid var(--border); color:var(--muted); text-align:left">
+            <th style="padding:8px 0">Команда</th><th style="padding:8px 0">Эффект</th>
+          </tr></thead>
+          <tbody style="vertical-align: top">${rows.replace(/<tr>/g, '<tr style="border-bottom:1px dashed var(--border)">').replace(/<td/g, '<td style="padding:10px 8px 10px 0"')}</tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>Парсер</h3>
+        <p>Все intent'ы детектятся чистой функцией <a class="ref-path mono" href="${vscLink("src/symphony/linear/slash.py", 82)}">linear/slash.py:parse</a>.</p>
+        <p>Фильтры:</p>
+        <ul>
+          <li><code>author_is_me=True</code> — игнор (Symphony не отвечает себе)</li>
+          <li><code>external_thread_type ≠ None</code> — комментарий зеркалирован из GitHub, обработается с той стороны</li>
+          <li><code>👍</code> alone — эквивалент <code>$approve</code> (с учётом variation selectors и skin tones)</li>
+        </ul>
+        <p>Маршрутизация — <a class="ref-path mono" href="${vscLink("src/symphony/orchestrator/poll.py", 1548)}">poll.py:_handle_slash_intent</a>: тип <code>operator_waits.kind</code> определяет, какой хендлер вызвать.</p>
+      </div>
+    `;
+  } else if (key === "verdicts") {
+    content.innerHTML = `
+      <header class="scn-header"><div class="scn-title"><h2>Verdicts</h2><p>Review classifier (9 правил) и Acceptance classifier (3 kind'а).</p></div></header>
+      <div class="card">
+        <h3>Review classifier — 9 правил приоритета</h3>
+        <p>Чистая функция <a class="ref-path mono" href="${vscLink("src/symphony/pipeline/review_classifier.py", 178)}">review_classifier(comments, ci, snapshot) → Verdict</a>. Возвращает: <code>VerdictKind</code> (APPROVED / CHANGES_REQUESTED / PENDING), <code>trigger_signature</code> (для дедупа), <code>rule</code> (какое правило сработало).</p>
+        <ol>
+          <li><strong>failing_ci</strong>: required check в conclusion ∈ {action_required, cancelled, failure, stale, startup_failure, timed_out} → CHANGES_REQUESTED</li>
+          <li><strong>pending_ci</strong>: required check ещё не completed → PENDING</li>
+          <li><strong>merge_conflict</strong>: mergeable=CONFLICTING → CHANGES_REQUESTED. Проверяется ДО comment rules, чтобы конфликт ловился даже при stale Codex комментариях</li>
+          <li><strong>codex_inline</strong>: Codex bot inline comment на HEAD, не перекрытый более новым Codex approval → CHANGES_REQUESTED</li>
+          <li><strong>codex_review</strong>: Codex bot COMMENTED review на HEAD с substantive body (длиннее ${"CODEX_BOILERPLATE_THRESHOLD"}=750), не перекрытый approval → CHANGES_REQUESTED</li>
+          <li><strong>human_changes_requested</strong>: человеческий CHANGES_REQUESTED review на HEAD → CHANGES_REQUESTED</li>
+          <li><strong>codex_approved</strong>: Codex COMMENTED содержит "any major issues" ИЛИ +1 reaction после HEAD time → APPROVED (если mergeable)</li>
+          <li><strong>human_approved</strong>: человеческий APPROVED → APPROVED (если mergeable)</li>
+          <li><strong>approved_unknown_mergeable</strong>: approved но mergeable=UNKNOWN → PENDING (не гоняем gh pr merge впустую)</li>
+        </ol>
+        <p style="color:var(--muted); font-size:13px"><strong>Дедуп:</strong> <a class="ref-path mono" href="${vscLink("src/symphony/pipeline/review_classifier.py", 392)}">should_dispatch_fix_run(prev_sig, new_sig)</a> — диспатчим только если signature non-empty и отличается от прошлого. Один и тот же сигнал = «уже пробовали, не помогло».</p>
+        <p style="color:var(--muted); font-size:13px"><strong>Cap:</strong> <a class="ref-path mono" href="${vscLink("src/symphony/pipeline/review_classifier.py", 407)}">has_hit_iteration_cap</a> = 12.</p>
+      </div>
+      <div class="card">
+        <h3>Acceptance classifier</h3>
+        <p>Чистая функция <a class="ref-path mono" href="${vscLink("src/symphony/pipeline/acceptance_classifier.py", 125)}">acceptance_classifier(transcript, criteria, cost) → AcceptanceVerdict</a>.</p>
+        <ul>
+          <li><strong>pass</strong>: footer <code>&lt;!-- symphony-acceptance-verdict: pass --&gt;</code></li>
+          <li><strong>reject</strong>: footer <code>&lt;!-- symphony-acceptance-verdict: reject --&gt;</code></li>
+          <li><strong>infra_error</strong>: footer infra_error ИЛИ Claude не дописал финальное сообщение ИЛИ tool_result с is_error + сигнал ("playwright timeout", "dev server failed", "preview 404", "npm install hang") ИЛИ result.subtype ∈ cap/timeout signals</li>
+        </ul>
+        <p style="color:var(--muted); font-size:13px"><strong>Important override:</strong> если есть infra signals И kind ≠ pass, infra_error перебивает reject — это retry-able, не нужно эскалировать оператору. Pass остаётся pass (Claude уверенно подтвердил).</p>
+      </div>
+    `;
+  }
+}
+
+// ============================================================
+//  WIRE UP
+// ============================================================
+function renderIntro() {
+  mode = "intro";
+  document.body.classList.remove("scenario-mode");
+  setActiveSidebar();
+  $("#content").innerHTML = `
+    <div class="intro narrative">
+      <div class="intro-eyebrow"><span class="line"></span>symphonyd / docs / lifecycle.book</div>
+      <h2>Жизненный цикл issue</h2>
+      <p class="lede">Один Python-демон ведёт тикет из Linear через Codex, GitHub-ревью и acceptance-проверку. Учебник разбирает каждый шаг — happy path, отклонения и операторские вмешательства.</p>
+
+      <h4>Что делает symphony</h4>
+      <p>Мы создаём тикет в Linear, вешаем лейбл <code>symphony</code> и переносим в колонку Todo. Через минуту symphony это замечает, поднимает локально Codex в отдельном worktree, тот пишет код и открывает PR в связанном GitHub-репозитории. Дальше symphony ведёт PR через ревью (второй Codex-проход + GitHub CI), мержит, и наконец прогоняет acceptance-проверку — отдельный Codex/Claude-проход, который читает уже смерженный код и решает, реально ли он закрывает то, что просили в тикете.</p>
+      <p>Если на каком-то этапе что-то ломается, у symphony два варианта: либо повторить шаг автоматически (например, попросить Codex починить замечания ревьюера), либо припарковать тикет и позвать нас — комментарием в Linear и переводом тикета в колонку In Review.</p>
+      <p>Это один Python-демон, запущенный у нас на машине. Фронтенда у него нет (есть отдельный UI для просмотра состояния, но он не нужен для работы). Управляем мы через Linear: лейблы, статусы и slash-команды в комментариях (<code>$approve</code>, <code>$retry</code>, <code>$stop</code> и т.д.).</p>
+
+      <h4>Из чего он состоит</h4>
+      <p>Три источника правды, между которыми symphony постоянно курсирует:</p>
+      <ul>
+        <li><strong>Linear</strong> — тикеты, их статусы (колонки), комментарии. Symphony читает тикеты и комментарии, переводит тикеты между колонками, постит свои комментарии.</li>
+        <li><strong>GitHub</strong> — PR-ы, CI-проверки, ревью. Symphony открывает PR, читает их состояние, мержит.</li>
+        <li><strong>Локальный SQLite-файл</strong> (<code>state.sqlite</code> в корне проекта) — единственное место, где symphony помнит, что он делает прямо сейчас. Если демон перезапустится, он восстановит работу из этого файла.</li>
+      </ul>
+      <p>Связку «Linear-команда ↔ GitHub-репо» symphony называет <strong>binding</strong>. В <code>config.local.yaml</code> у нас несколько bindings (VIB → vibecamp, ADJ → creative-management-suite, LP → loop) — symphony обрабатывает их параллельно. Для каждого binding'а отдельно настраивается, как у этой команды называется колонка «готов к работе» (<code>linear_states.ready</code>), какой лейбл считать триггером (<code>issue_label</code>), какая модель Codex используется и т.п.</p>
+
+      <h4>Как пользоваться учебником</h4>
+      <p>В сайдбаре — 10 сценариев. Первый — happy path: тикет проходит весь путь без приключений. Остальные показывают, что бывает, когда что-то идёт не так (упало ревью, конфликт мержа, превышен бюджет, acceptance не прошёл) или когда мы вмешиваемся вручную (slash-команды, лейблы).</p>
+      <p>На каждом шаге:</p>
+      <ul>
+        <li>state machine подсвечивает текущую стадию и активную дугу;</li>
+        <li>текст объясняет, что symphony делает прямо сейчас — короткий заголовок и плотное объяснение, без жаргона;</li>
+        <li>раскрывающийся блок <em>«Технически»</em> — точные имена функций, file:line, имена таблиц, граничные условия. Если детали не нужны — игнорируем;</li>
+        <li>«Код» справа — ссылки в VS Code на конкретные функции;</li>
+        <li>«SQLite» — какие строки добавлены / изменены / удалены на этом шаге.</li>
+      </ul>
+      <p>Любой узел state machine кликабелен → панель с описанием модуля и ссылками. Любая SQLite-таблица в блоке «SQLite» кликабельна → панель со схемой.</p>
+      <div class="diagram-wrap">${renderDiagram()}</div>
+      <p class="start-hint">Начни с <strong>«1. Happy path (remote review)»</strong> — он закладывает базу. Дальше сценарии 2–10 показывают отклонения и edge cases.</p>
+    </div>
+  `;
+  $$("svg .node").forEach(node => {
+    node.addEventListener("click", () => showNodeDrawer(node.dataset.node));
+  });
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  renderSidebar();
+  renderIntro();
+  $("#drawerClose").addEventListener("click", closeDrawer);
+  $("#drawerBg").addEventListener("click", closeDrawer);
+  $("#menuToggle").addEventListener("click", openMobileSidebar);
+  $("#sidebarBg").addEventListener("click", closeMobileSidebar);
+
+  // Mobile bottom-nav: forward to currently-rendered desktop controls
+  const fwdClick = (btnId) => () => {
+    const target = document.getElementById(btnId);
+    if (target && !target.disabled) target.click();
+  };
+  const mPrev = document.getElementById("prevStepMobile");
+  const mNext = document.getElementById("nextStepMobile");
+  if (mPrev) mPrev.addEventListener("click", fwdClick("prevStep"));
+  if (mNext) mNext.addEventListener("click", fwdClick("nextStep"));
+
+  // Tap outside the diagram modal contents closes it
+  const diagModal = document.getElementById("diagramModal");
+  if (diagModal) {
+    diagModal.addEventListener("click", (e) => {
+      if (e.target === diagModal) closeDiagramModal();
+    });
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { closeDrawer(); closeMobileSidebar(); closeDiagramModal(); }
+    if (mode === "scenario") {
+      if (e.key === "ArrowRight" || e.key === "PageDown") {
+        const total = SCENARIOS[activeScenarioIdx].steps.length;
+        if (activeStepIdx < total - 1) { activeStepIdx++; renderScenario(); }
+      }
+      if (e.key === "ArrowLeft" || e.key === "PageUp") {
+        if (activeStepIdx > 0) { activeStepIdx--; renderScenario(); }
+      }
+    }
+  });
+});
+</script>
+
+</body>
+</html>
