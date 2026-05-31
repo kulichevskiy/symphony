@@ -1203,7 +1203,18 @@
 // ============================================================
 //  REPO ROOT (used for vscode:// links)
 // ============================================================
-const REPO_ROOT = "/Users/ak/Code/symphonyd";
+// Root for vscode:// deep links. Defaults to the documented checkout name
+// (README clones kulichevskiy/symphony into ./symphony); override per-machine
+// with ?repo=/abs/path or localStorage 'symphony_repo_root'.
+const REPO_ROOT = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get("repo");
+    if (q) return q.replace(/\/+$/, "");
+    const stored = localStorage.getItem("symphony_repo_root");
+    if (stored) return stored.replace(/\/+$/, "");
+  } catch (_) {}
+  return "/Users/ak/Code/symphony";
+})();
 function vscLink(rel, line) {
   const path = REPO_ROOT + "/" + rel;
   const suffix = line ? ":" + line : "";
