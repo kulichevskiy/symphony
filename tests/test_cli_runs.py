@@ -121,6 +121,48 @@ def test_runs_ls_lists_runs_from_sqlite(tmp_path: Path) -> None:
     assert "2026-05-10T00:00:00+00:00" in out
 
 
+def test_runs_ls_surfaces_termination_kind_for_non_success(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "state.sqlite"
+    _populate(p)
+
+    async def _mark_failed() -> None:
+        conn = await db.connect(p)
+        try:
+            await db.runs.update_status(
+                conn,
+                "run-a",
+                "failed",
+                ended_at="2026-05-10T00:05:00+00:00",
+                kind="agent_nonzero_exit",
+                detail="live captured stderr",
+                returncode=2,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_mark_failed())
+
+    result = CliRunner().invoke(main, ["runs", "ls", "--db", str(p)])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[0].split("\t") == [
+        "id",
+        "issue",
+        "stage",
+        "status",
+        "termination_kind",
+        "cost",
+        "started_at",
+    ]
+    assert (
+        "run-a\tENG-1\timplement\tfailed\tagent_nonzero_exit\t$1.50"
+        in result.output
+    )
+    assert "run-b\tENG-2\treview\tcompleted\t\t$0.25" in result.output
+
+
 def test_runs_show_displays_full_detail(tmp_path: Path) -> None:
     p = tmp_path / "state.sqlite"
     _populate(p)
@@ -134,6 +176,45 @@ def test_runs_show_displays_full_detail(tmp_path: Path) -> None:
     assert "1.5" in out
     # The comment cursor for the issue is part of the detail surface.
     assert "2026-05-10T00:30:00+00:00" in out
+
+
+def test_runs_show_displays_termination_detail_and_returncode(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "state.sqlite"
+    _populate(p)
+    detail = (
+        "[backfill] captured from previous run metadata\n"
+        "stderr: command exited with status 2\n"
+        "…[truncated 42 bytes]"
+    )
+
+    async def _mark_failed() -> None:
+        conn = await db.connect(p)
+        try:
+            await db.runs.update_status(
+                conn,
+                "run-a",
+                "failed",
+                ended_at="2026-05-10T00:05:00+00:00",
+                kind="agent_nonzero_exit",
+                detail=detail,
+                returncode=2,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_mark_failed())
+
+    result = CliRunner().invoke(main, ["runs", "show", "run-a", "--db", str(p)])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "termination_kind:   agent_nonzero_exit" in out
+    assert "exit_returncode:    2" in out
+    assert "termination_detail:" in out
+    assert "[backfill] captured from previous run metadata" in out
+    assert "stderr: command exited with status 2" in out
+    assert "…[truncated 42 bytes]" in out
 
 
 def test_runs_show_unknown_id_errors(tmp_path: Path) -> None:

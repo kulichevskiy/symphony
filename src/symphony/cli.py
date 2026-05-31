@@ -431,12 +431,17 @@ async def _runs_ls(db_path: Path, limit: int) -> None:
     if not rows:
         click.echo("(no runs)")
         return
-    click.echo("id\tissue\tstage\tstatus\tcost\tstarted_at")
+    click.echo("id\tissue\tstage\tstatus\ttermination_kind\tcost\tstarted_at")
     for r in rows:
         run = r.run
+        termination_kind = (
+            run.termination_kind
+            if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
+            else ""
+        )
         click.echo(
             f"{run.id}\t{r.identifier}\t{run.stage}\t{run.status}\t"
-            f"${run.cost_usd:.2f}\t{run.started_at}"
+            f"{termination_kind}\t${run.cost_usd:.2f}\t{run.started_at}"
         )
 
 
@@ -473,6 +478,16 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
     click.echo(f"started_at:     {run.started_at}")
     click.echo(f"ended_at:       {run.ended_at or '-'}")
     click.echo(f"cost_usd:       {run.cost_usd}")
+    if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+        click.echo(f"termination_kind:   {run.termination_kind or '-'}")
+        returncode = run.exit_returncode if run.exit_returncode is not None else "-"
+        click.echo(f"exit_returncode:    {returncode}")
+        if run.termination_detail:
+            click.echo("termination_detail:")
+            for line in run.termination_detail.splitlines():
+                click.echo(f"  {line}")
+        else:
+            click.echo("termination_detail: -")
     click.echo(f"comment cursor: {cursor or '-'}")
     click.echo("stage history:")
     for h in history:
