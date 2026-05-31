@@ -290,7 +290,8 @@ def create_issue_detail_router(
         runs = await _fetch_all(
             conn,
             """
-            SELECT id, stage, status, pid, started_at, ended_at, cost_usd
+            SELECT id, stage, status, pid, started_at, ended_at, cost_usd,
+                   termination_kind, termination_detail, exit_returncode
             FROM runs
             WHERE issue_id = ?
             ORDER BY started_at DESC, id DESC
