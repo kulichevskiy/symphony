@@ -3107,6 +3107,8 @@ async def test_merge_agent_enforces_issue_cost_cap(tmp_path: Path) -> None:
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history[-1].stage == "merge"
         assert history[-1].status == "needs_approval"
+        assert history[-1].termination_kind == "cost_cap"
+        assert "cost cap reached" in history[-1].termination_detail
         assert history[-1].cost_usd == pytest.approx(0.75)
     finally:
         await conn.close()

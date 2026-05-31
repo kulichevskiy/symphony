@@ -74,9 +74,12 @@ def classify_termination(
         if part
     ).casefold()
 
-    if status == "needs_approval":
-        return "awaiting_human_merge", detail
-    if cap_breached or final_kind == "cost_cap" or "cost cap" in text or "cost_cap" in text:
+    if (
+        cap_breached
+        or final_kind == "cost_cap"
+        or "cost cap" in text
+        or "cost_cap" in text
+    ):
         return "cost_cap", detail
     if final_kind == "stall_timeout":
         return "stall_timeout", detail
@@ -84,6 +87,8 @@ def classify_termination(
         return "spawn_failed", detail
     if final_kind == "exit" and returncode not in (None, 0):
         return "agent_nonzero_exit", detail
+    if status == "needs_approval":
+        return "awaiting_human_merge", detail
     if "superseded" in text or "stale merge" in text:
         return "superseded", detail
     if (

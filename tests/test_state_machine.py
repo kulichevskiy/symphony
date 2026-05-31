@@ -136,6 +136,38 @@ def test_transition_is_frozen_dataclass() -> None:
             "manual merge",
         ),
         (
+            {
+                "status": "needs_approval",
+                "cap_breached": True,
+                "reason": "cost cap reached: $1.2500",
+            },
+            "cost_cap",
+            "cost cap",
+        ),
+        (
+            {
+                "status": "needs_approval",
+                "final_kind": "stall_timeout",
+                "reason": "merge runner ended with stall_timeout",
+            },
+            "stall_timeout",
+            "stall_timeout",
+        ),
+        (
+            {
+                "status": "needs_approval",
+                "final_kind": "spawn_failed",
+                "reason": "merge runner ended with spawn_failed",
+            },
+            "spawn_failed",
+            "spawn_failed",
+        ),
+        (
+            {"status": "needs_approval", "final_kind": "exit", "returncode": 2},
+            "agent_nonzero_exit",
+            "return code 2",
+        ),
+        (
             {"status": "failed", "reason": ""},
             "unknown",
             "failed",
