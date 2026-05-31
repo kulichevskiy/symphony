@@ -179,7 +179,12 @@ async def reconcile(
             run.pid,
         )
         await db.runs.update_status(
-            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+            conn,
+            run.id,
+            db.runs.INTERRUPTED_STATUS,
+            ended_at=now,
+            kind="orphaned",
+            detail=f"Host restarted; pid {run.pid} is no longer alive",
         )
         await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
@@ -191,7 +196,12 @@ async def reconcile(
             run.issue_id,
         )
         await db.runs.update_status(
-            conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=None
+            conn,
+            run.id,
+            db.runs.INTERRUPTED_STATUS,
+            ended_at=None,
+            kind="orphaned",
+            detail="Host restarted; pidless review monitor orphaned",
         )
         # Linked, still-open PRs are resumed by _resurrect_review_runs() on the
         # next poll. Leave ended_at NULL so startup reconcile does not trigger
@@ -199,7 +209,12 @@ async def reconcile(
         # resurrection query ignores still need the operator-wait retry path.
         if not await db.issue_prs.has_orphaned_review_pr(conn, issue_id=run.issue_id):
             await db.runs.update_status(
-                conn, run.id, db.runs.INTERRUPTED_STATUS, ended_at=now
+                conn,
+                run.id,
+                db.runs.INTERRUPTED_STATUS,
+                ended_at=now,
+                kind="orphaned",
+                detail="Host restarted; pidless review monitor orphaned",
             )
             await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)

@@ -8,6 +8,7 @@ startup reconcile walks `running` rows and flips orphaned ones to
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -15,11 +16,20 @@ import aiosqlite
 
 from . import operator_waits
 
+log = logging.getLogger(__name__)
+
 # Statuses that mean "this run is supposed to be alive". Kept as a tuple so
 # callers (poll dedupe, reconcile) share a single source of truth.
 LIVE_STATUSES: tuple[str, ...] = ("running",)
 FAILED_STATUS: str = "failed"
 INTERRUPTED_STATUS: str = "interrupted"
+NEEDS_APPROVAL_STATUS: str = "needs_approval"
+TERMINAL_NON_SUCCESS_STATUSES: frozenset[str] = frozenset(
+    {FAILED_STATUS, INTERRUPTED_STATUS, NEEDS_APPROVAL_STATUS}
+)
+SUCCESS_STATUSES: frozenset[str] = frozenset({"completed", "done"})
+TERMINATION_DETAIL_MAX_BYTES: int = 4096
+TERMINATION_DETAIL_MAX_LINES: int = 80
 
 # Terminal review-monitor statuses that indicate the monitor died or was
 # stopped before it could keep polling the linked PR.
@@ -42,9 +52,13 @@ class Run:
     started_at: str
     ended_at: str | None
     cost_usd: float
+    termination_kind: str = ""
+    termination_detail: str = ""
+    exit_returncode: int | None = None
 
 
 def _row_to_run(row: aiosqlite.Row) -> Run:
+    keys = set(row.keys())
     return Run(
         id=row["id"],
         issue_id=row["issue_id"],
@@ -54,6 +68,15 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         cost_usd=row["cost_usd"],
+        termination_kind=(
+            row["termination_kind"] if "termination_kind" in keys else ""
+        ),
+        termination_detail=(
+            row["termination_detail"] if "termination_detail" in keys else ""
+        ),
+        exit_returncode=(
+            row["exit_returncode"] if "exit_returncode" in keys else None
+        ),
     )
 
 
@@ -183,6 +206,9 @@ async def update_status(
     status: str,
     *,
     ended_at: str | None = None,
+    kind: str | None = None,
+    detail: str | None = None,
+    returncode: int | None = None,
 ) -> None:
     cur = await conn.execute(
         """
@@ -193,14 +219,92 @@ async def update_status(
         (run_id,),
     )
     run = await cur.fetchone()
-    await conn.execute(
-        "UPDATE runs SET status = ?, ended_at = COALESCE(?, ended_at) WHERE id = ?",
-        (status, ended_at, run_id),
-    )
+    if status in TERMINAL_NON_SUCCESS_STATUSES:
+        termination_kind = kind or "unknown"
+        if kind is None:
+            log.warning(
+                "missing termination kind for terminal run status: run_id=%s status=%s",
+                run_id,
+                status,
+            )
+        await conn.execute(
+            """
+            UPDATE runs
+               SET status = ?,
+                   ended_at = COALESCE(?, ended_at),
+                   termination_kind = ?,
+                   termination_detail = ?,
+                   exit_returncode = ?
+             WHERE id = ?
+            """,
+            (
+                status,
+                ended_at,
+                termination_kind,
+                _truncate_termination_detail(detail or ""),
+                returncode,
+                run_id,
+            ),
+        )
+    elif status in SUCCESS_STATUSES:
+        await conn.execute(
+            """
+            UPDATE runs
+               SET status = ?,
+                   ended_at = COALESCE(?, ended_at),
+                   termination_kind = '',
+                   termination_detail = '',
+                   exit_returncode = NULL
+             WHERE id = ?
+            """,
+            (status, ended_at, run_id),
+        )
+    else:
+        await conn.execute(
+            "UPDATE runs SET status = ?, ended_at = COALESCE(?, ended_at) WHERE id = ?",
+            (status, ended_at, run_id),
+        )
     if run is not None and status == "completed":
         completed_at = ended_at or run["ended_at"] or run["started_at"]
         await _clear_stale_wait_for_completed_run(conn, run, completed_at)
     await conn.commit()
+
+
+def _truncate_termination_detail(detail: str) -> str:
+    text = str(detail)
+    original_bytes = text.encode("utf-8", errors="replace")
+    if (
+        len(original_bytes) <= TERMINATION_DETAIL_MAX_BYTES
+        and len(text.splitlines()) <= TERMINATION_DETAIL_MAX_LINES
+    ):
+        return text
+
+    line_tail = text
+    if len(text.splitlines()) > TERMINATION_DETAIL_MAX_LINES:
+        lines = text.splitlines(keepends=True)
+        line_tail = "".join(lines[-TERMINATION_DETAIL_MAX_LINES:])
+
+    tail_bytes = line_tail.encode("utf-8", errors="replace")
+    truncated_bytes = len(original_bytes) - len(tail_bytes)
+    while True:
+        marker = f"…[truncated {truncated_bytes} bytes]"
+        marker_bytes = ("\n" + marker).encode("utf-8")
+        budget = max(0, TERMINATION_DETAIL_MAX_BYTES - len(marker_bytes))
+        kept_tail_bytes = tail_bytes[-budget:] if budget else b""
+        kept_tail = kept_tail_bytes.decode("utf-8", errors="ignore")
+        new_truncated_bytes = len(original_bytes) - len(
+            kept_tail.encode("utf-8", errors="replace")
+        )
+        if new_truncated_bytes == truncated_bytes:
+            break
+        truncated_bytes = new_truncated_bytes
+
+    marker = f"…[truncated {truncated_bytes} bytes]"
+    if not kept_tail:
+        return marker.encode("utf-8")[:TERMINATION_DETAIL_MAX_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+    return f"{kept_tail}\n{marker}"
 
 
 def _parse_timestamp(value: str | None) -> datetime | None:
@@ -263,8 +367,8 @@ async def interrupt_stale_merge_needs_approval(
         params.append(before)
     cur = await conn.execute(
         f"""
-        UPDATE runs
-        SET status = 'interrupted', ended_at = ?
+        SELECT id
+        FROM runs
         WHERE issue_id = ?
           AND stage = 'merge'
           AND status = 'needs_approval'
@@ -279,25 +383,50 @@ async def interrupt_stale_merge_needs_approval(
           )
           {before_filter}
         """,
-        params,
+        params[1:],
     )
-    await conn.commit()
-    return cur.rowcount or 0
+    rows = await cur.fetchall()
+    ended_at = str(params[0])
+    interrupted = 0
+    for row in rows:
+        await update_status(
+            conn,
+            row["id"],
+            INTERRUPTED_STATUS,
+            ended_at=ended_at,
+            kind="superseded",
+            detail=(
+                "superseded stale merge needs_approval by newer PR "
+                f"{github_repo}#{pr_number}"
+            ),
+        )
+        interrupted += 1
+    return interrupted
 
 
 async def interrupt_running_merge(conn: aiosqlite.Connection, run_id: str) -> int:
     cur = await conn.execute(
         """
-        UPDATE runs
-        SET status = 'interrupted', ended_at = ?
+        SELECT id
+        FROM runs
         WHERE id = ?
           AND stage = 'merge'
           AND status = 'running'
         """,
-        (datetime.now(UTC).isoformat(), run_id),
+        (run_id,),
     )
-    await conn.commit()
-    return cur.rowcount or 0
+    row = await cur.fetchone()
+    if row is None:
+        return 0
+    await update_status(
+        conn,
+        run_id,
+        INTERRUPTED_STATUS,
+        ended_at=datetime.now(UTC).isoformat(),
+        kind="superseded",
+        detail="superseded running merge by newer PR/fix result",
+    )
+    return 1
 
 
 async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -> None:
@@ -400,7 +529,8 @@ async def list_live_with_pid(conn: aiosqlite.Connection) -> list[Run]:
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
-        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE status IN ({placeholders}) AND pid IS NOT NULL
         """,
@@ -415,7 +545,8 @@ async def list_live_review_without_pid(conn: aiosqlite.Connection) -> list[Run]:
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
-        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE stage = 'review' AND status IN ({placeholders}) AND pid IS NULL
         """,
@@ -432,7 +563,8 @@ async def list_live_by_stage(
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
-        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE stage = ? AND status IN ({placeholders})
         ORDER BY started_at ASC
@@ -470,7 +602,8 @@ async def list_recent(
     cur = await conn.execute(
         f"""
         SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
-               r.ended_at, r.cost_usd, i.identifier
+               r.ended_at, r.cost_usd, r.termination_kind,
+               r.termination_detail, r.exit_returncode, i.identifier
         FROM runs r
         JOIN issues i ON i.id = r.issue_id
         WHERE r.status IN ({placeholders})
@@ -494,7 +627,8 @@ async def get_with_issue(
     cur = await conn.execute(
         """
         SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
-               r.ended_at, r.cost_usd, i.identifier
+               r.ended_at, r.cost_usd, r.termination_kind,
+               r.termination_detail, r.exit_returncode, i.identifier
         FROM runs r
         JOIN issues i ON i.id = r.issue_id
         WHERE r.id = ?
@@ -513,7 +647,8 @@ async def history_for_issue(
     """Stage history: all runs for an issue, oldest first."""
     cur = await conn.execute(
         """
-        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE issue_id = ?
         ORDER BY started_at ASC
@@ -539,7 +674,8 @@ async def latest_for_issue_stage(
     )
     cur = await conn.execute(
         f"""
-        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE issue_id = ? AND stage = ?{started_filter}
         ORDER BY started_at DESC

@@ -31,7 +31,10 @@ CREATE TABLE IF NOT EXISTS runs (
     pid         INTEGER,
     started_at  TEXT NOT NULL,
     ended_at    TEXT,
-    cost_usd    REAL NOT NULL DEFAULT 0
+    cost_usd    REAL NOT NULL DEFAULT 0,
+    termination_kind   TEXT NOT NULL DEFAULT '',
+    termination_detail TEXT NOT NULL DEFAULT '',
+    exit_returncode    INTEGER
 );
 
 -- Active-run lookup: dedupe in poll (status='running') and reconcile

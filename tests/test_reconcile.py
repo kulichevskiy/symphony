@@ -66,10 +66,18 @@ async def test_reconcile_marks_dead_pids_interrupted_and_comments(tmp_path: Path
         rows = await db.runs.list_live_with_pid(conn)
         assert [r.id for r in rows] == ["alive"]
 
-        cur = await conn.execute("SELECT status FROM runs WHERE id=?", ("dead",))
+        cur = await conn.execute(
+            """
+            SELECT status, termination_kind, termination_detail
+            FROM runs WHERE id=?
+            """,
+            ("dead",),
+        )
         row = await cur.fetchone()
         assert row is not None
         assert row[0] == "interrupted"
+        assert row["termination_kind"] == "orphaned"
+        assert "pid 999999" in row["termination_detail"]
     finally:
         await conn.close()
 
@@ -233,12 +241,18 @@ async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments
         assert "Host restarted" in call.args[1]
 
         cur = await conn.execute(
-            "SELECT status, ended_at FROM runs WHERE id=?", ("pidless-review",)
+            """
+            SELECT status, ended_at, termination_kind, termination_detail
+            FROM runs WHERE id=?
+            """,
+            ("pidless-review",),
         )
         row = await cur.fetchone()
         assert row is not None
         assert row[0] == db.runs.INTERRUPTED_STATUS
         assert row[1] is not None
+        assert row["termination_kind"] == "orphaned"
+        assert "pidless review" in row["termination_detail"]
 
         cur = await conn.execute(
             "SELECT status, ended_at FROM runs WHERE id=?", ("pidless-implement",)

@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import aiosqlite
 import httpx
@@ -134,7 +134,7 @@ from ..pipeline.review_classifier import (
 from ..pipeline.review_classifier import (
     CheckRun as ReviewCheckRun,
 )
-from ..pipeline.state_machine import on_runner_event
+from ..pipeline.state_machine import classify_termination, on_runner_event
 from ..pipeline.taste_guide import load_taste_guide
 from ..tracker import (
     DEFAULT_PROVIDER,
@@ -345,6 +345,12 @@ class WebhookDispatchResult:
     detail: str = ""
 
 
+class _TerminationKwargs(TypedDict):
+    kind: str
+    detail: str
+    returncode: int | None
+
+
 def build_pr_title(issue: LinearIssue) -> str:
     return f"[{issue.identifier}] {issue.title}"
 
@@ -371,6 +377,36 @@ def _local_review_status_from_result(result: LoopResult | None) -> str:
     if result.outcome == LoopOutcome.SKIPPED:
         return "interrupted"
     return "failed"
+
+
+def _termination_kwargs(
+    *,
+    status: str,
+    final_kind: str | None = None,
+    returncode: int | None = None,
+    cap_breached: bool = False,
+    exc: BaseException | str | None = None,
+    reason: str | None = None,
+) -> _TerminationKwargs:
+    kind, detail = classify_termination(
+        status=status,
+        final_kind=final_kind,
+        returncode=returncode,
+        cap_breached=cap_breached,
+        exc=exc,
+        reason=reason,
+    )
+    return {"kind": kind, "detail": detail, "returncode": returncode}
+
+
+def _local_review_termination_reason(result: LoopResult | None) -> str:
+    if result is None:
+        return "local-review session failed"
+    if result.outcome == LoopOutcome.SKIPPED:
+        return "local-review skipped by operator"
+    if result.error:
+        return result.error
+    return f"local-review ended with {result.outcome.value}"
 
 
 def _should_post_codex_review(
@@ -2518,6 +2554,8 @@ class Orchestrator:
             run_id,
             "interrupted",
             ended_at=now,
+            kind="cancelled",
+            detail="$stop interrupted review monitor",
         )
         if fix_run_id is not None and fix_run_id != run_id:
             await db.runs.update_status(
@@ -2525,6 +2563,8 @@ class Orchestrator:
                 fix_run_id,
                 "interrupted",
                 ended_at=now,
+                kind="cancelled",
+                detail="$stop interrupted active review fix-run",
             )
             self._dispatch_run_ids.pop(issue_id, None)
             self._active_run_ids.discard(fix_run_id)
@@ -4211,6 +4251,11 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"review fix-run execution failed: {e}",
+                    ),
                 )
                 await self._fail_review_run(
                     run=run,
@@ -4239,6 +4284,12 @@ class Orchestrator:
                     fix_run_id,
                     transition.next_run_status,
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status=transition.next_run_status,
+                        final_kind=final_kind,
+                        returncode=final_returncode,
+                        reason=f"review fix-run ended with {final_kind}",
+                    ),
                 )
                 await self._fail_review_run(
                     run=run,
@@ -4628,6 +4679,11 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"review fix-run execution failed: {e}",
+                    ),
                 )
                 await self._fail_review_run(
                     run=run,
@@ -4656,6 +4712,12 @@ class Orchestrator:
                     fix_run_id,
                     transition.next_run_status,
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status=transition.next_run_status,
+                        final_kind=final_kind,
+                        returncode=final_returncode,
+                        reason=f"review fix-run ended with {final_kind}",
+                    ),
                 )
                 await self._fail_review_run(
                     run=run,
@@ -5070,6 +5132,11 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"required-check fix-run failed: {e}",
+                    ),
                 )
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
@@ -5093,6 +5160,14 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        cap_breached=True,
+                        reason=(
+                            "required-check cost cap reached: "
+                            f"${prior_total + cost:.4f}"
+                        ),
+                    ),
                 )
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
@@ -5117,6 +5192,12 @@ class Orchestrator:
                     fix_run_id,
                     transition.next_run_status,
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status=transition.next_run_status,
+                        final_kind=final_kind,
+                        returncode=final_returncode,
+                        reason=f"required-check fix-run ended with {final_kind}",
+                    ),
                 )
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
@@ -5135,6 +5216,13 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        reason=(
+                            "required-check fix-run completed without advancing "
+                            f"{branch}; HEAD stayed at {short_sha}"
+                        ),
+                    ),
                 )
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
@@ -5386,6 +5474,11 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"merge-conflict fix-run failed: {e}",
+                    ),
                 )
                 await self._mark_merge_conflict_fix_needs_approval(
                     binding=binding,
@@ -5410,6 +5503,11 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        cap_breached=True,
+                        reason=f"merge-conflict cost cap reached: ${total_cost:.4f}",
+                    ),
                 )
                 await self._mark_merge_conflict_fix_needs_approval(
                     binding=binding,
@@ -5434,6 +5532,12 @@ class Orchestrator:
                     fix_run_id,
                     transition.next_run_status,
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status=transition.next_run_status,
+                        final_kind=final_kind,
+                        returncode=final_returncode,
+                        reason=f"merge-conflict fix-run failed: runner ended with {final_kind}",
+                    ),
                 )
                 await self._mark_merge_conflict_fix_needs_approval(
                     binding=binding,
@@ -5914,6 +6018,11 @@ class Orchestrator:
                             fix_run_id,
                             "failed",
                             ended_at=datetime.now(UTC).isoformat(),
+                            **_termination_kwargs(
+                                status="failed",
+                                exc=e,
+                                reason=f"merge-conflict fix-run execution failed: {e}",
+                            ),
                         )
                         await self._fail_review_run(
                             run=run,
@@ -5941,6 +6050,12 @@ class Orchestrator:
                             fix_run_id,
                             transition.next_run_status,
                             ended_at=datetime.now(UTC).isoformat(),
+                            **_termination_kwargs(
+                                status=transition.next_run_status,
+                                final_kind=final_kind,
+                                returncode=final_returncode,
+                                reason=f"merge-conflict fix-run ended with {final_kind}",
+                            ),
                         )
                         await self._fail_review_run(
                             run=run,
@@ -5970,6 +6085,11 @@ class Orchestrator:
                             fix_run_id,
                             "failed",
                             ended_at=datetime.now(UTC).isoformat(),
+                            **_termination_kwargs(
+                                status="failed",
+                                exc=e,
+                                reason=f"rebase --continue failed: {e}",
+                            ),
                         )
                         await self._fail_review_run(
                             run=run,
@@ -6002,6 +6122,10 @@ class Orchestrator:
                                 fix_run_id,
                                 "failed",
                                 ended_at=datetime.now(UTC).isoformat(),
+                                **_termination_kwargs(
+                                    status="failed",
+                                    reason=error,
+                                ),
                             )
                             await self._fail_review_run(
                                 run=run,
@@ -6112,6 +6236,13 @@ class Orchestrator:
             fix_run_id,
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
+            **_termination_kwargs(
+                status="failed",
+                reason=(
+                    f"review fix-run completed without advancing {branch}; "
+                    f"HEAD stayed at {short_sha}"
+                ),
+            ),
         )
         await self._fail_review_run(
             run=run,
@@ -6632,7 +6763,12 @@ class Orchestrator:
 
         if fix_run_id is not None and fix_run_id != monitor_run_id:
             await db.runs.update_status(
-                self._conn, fix_run_id, "interrupted", ended_at=now
+                self._conn,
+                fix_run_id,
+                "interrupted",
+                ended_at=now,
+                kind="cancelled",
+                detail="$approve interrupted active review fix-run for merge",
             )
             self._dispatch_run_ids.pop(issue_id, None)
             self._active_run_ids.discard(fix_run_id)
@@ -6785,6 +6921,7 @@ class Orchestrator:
             run.id,
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
+            **_termination_kwargs(status="failed", reason=error),
         )
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
@@ -6850,6 +6987,7 @@ class Orchestrator:
             run.id,
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
+            **_termination_kwargs(status="failed", reason=error),
         )
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
@@ -8699,6 +8837,10 @@ class Orchestrator:
                         run_id,
                         "failed",
                         ended_at=ended_at,
+                        **_termination_kwargs(
+                            status="failed",
+                            reason=f"acceptance infra_error: {verdict.details}",
+                        ),
                     )
                     await self._track_acceptance_blocked_wait(
                         binding=binding,
@@ -8714,6 +8856,10 @@ class Orchestrator:
                     run_id,
                     "failed",
                     ended_at=ended_at,
+                    **_termination_kwargs(
+                        status="failed",
+                        reason=f"acceptance infra_error: {verdict.details}",
+                    ),
                 )
                 return run_id
 
@@ -8723,6 +8869,10 @@ class Orchestrator:
                 run_id,
                 "failed",
                 ended_at=ended_at,
+                **_termination_kwargs(
+                    status="failed",
+                    reason=f"acceptance rejected: {verdict.details}",
+                ),
             )
             if state.iteration < ACCEPTANCE_FIX_ITERATION_CAP:
                 dispatched = await self._dispatch_acceptance_fix_run(
@@ -8760,13 +8910,18 @@ class Orchestrator:
                     e,
                 )
             return run_id
-        except Exception:
+        except Exception as e:
             log.exception("acceptance stage failed for %s", issue.identifier)
             await db.runs.update_status(
                 self._conn,
                 run_id,
                 "failed",
                 ended_at=datetime.now(UTC).isoformat(),
+                **_termination_kwargs(
+                    status="failed",
+                    exc=e,
+                    reason=f"acceptance stage failed: {e}",
+                ),
             )
             return run_id
         finally:
@@ -8846,13 +9001,18 @@ class Orchestrator:
                     prompt=prompt,
                     prior_total=prior_total,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
                 log.exception("acceptance fix-run execution failed for %s", issue.identifier)
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"acceptance fix-run execution failed: {e}",
+                    ),
                 )
                 return False
             finally:
@@ -8873,6 +9033,12 @@ class Orchestrator:
                     fix_run_id,
                     transition.next_run_status,
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status=transition.next_run_status,
+                        final_kind=final_kind,
+                        returncode=final_returncode,
+                        reason=f"acceptance fix-run ended with {final_kind}",
+                    ),
                 )
                 return False
 
@@ -8892,6 +9058,13 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        reason=(
+                            "acceptance fix-run completed without advancing "
+                            f"{branch}; HEAD stayed at {short_sha}; status={status_short}"
+                        ),
+                    ),
                 )
                 return False
 
@@ -8908,6 +9081,11 @@ class Orchestrator:
                     fix_run_id,
                     "failed",
                     ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"push failed: {e}",
+                    ),
                 )
                 return False
 
@@ -9470,6 +9648,10 @@ class Orchestrator:
                 run_id,
                 "failed",
                 ended_at=datetime.now(UTC).isoformat(),
+                **_termination_kwargs(
+                    status="failed",
+                    reason=f"post_comment failed: {e}",
+                ),
             )
             return run_id
 
@@ -9494,11 +9676,12 @@ class Orchestrator:
             log.exception("workspace acquire failed for %s", issue.identifier)
             await self._fail_run_and_reset_issue(
                 run_id,
-                str(e),
+                f"workspace acquire failed: {e}",
                 issue=issue,
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
+                exc=e,
             )
             return run_id
 
@@ -9524,6 +9707,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
+                exc=e,
             )
             return run_id
         finally:
@@ -9568,6 +9752,8 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
+                final_kind=final_kind,
+                returncode=final_returncode,
             )
             return run_id
 
@@ -9599,6 +9785,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
+                exc=e,
             )
             return run_id
 
@@ -9631,6 +9818,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
+                exc=e,
             )
             return run_id
 
@@ -9746,6 +9934,7 @@ class Orchestrator:
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=f"workspace acquire failed: {e}",
+                    exc=e,
                 )
                 return run_id
 
@@ -9786,6 +9975,7 @@ class Orchestrator:
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=f"merge agent execution failed: {e}",
+                    exc=e,
                 )
                 return run_id
 
@@ -9806,6 +9996,7 @@ class Orchestrator:
                         "cost cap reached: "
                         f"${prior_total + cumulative_cost:.4f}"
                     ),
+                    cap_breached=True,
                 )
                 return run_id
 
@@ -9821,6 +10012,8 @@ class Orchestrator:
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=f"merge runner ended with {final_kind}",
+                    final_kind=final_kind,
+                    returncode=final_returncode,
                 )
                 return run_id
 
@@ -9834,6 +10027,7 @@ class Orchestrator:
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=str(e),
+                    exc=e,
                 )
                 return run_id
 
@@ -9856,6 +10050,7 @@ class Orchestrator:
                         pr_url=pr_url,
                         run_id=run_id,
                         reason=f"post-push HEAD verification failed: {e}",
+                        exc=e,
                     )
                     return run_id
             else:
@@ -9996,6 +10191,7 @@ class Orchestrator:
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=str(e),
+                    exc=e,
                 )
                 return run_id
 
@@ -10020,6 +10216,7 @@ class Orchestrator:
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=f"merge finalization failed: {e}",
+                    exc=e,
                 )
                 return run_id
             if not merged:
@@ -10124,6 +10321,10 @@ class Orchestrator:
         run_id: str,
         reason: str,
         create_run: bool = False,
+        final_kind: str | None = None,
+        returncode: int | None = None,
+        cap_breached: bool = False,
+        exc: BaseException | str | None = None,
     ) -> None:
         if create_run:
             inserted = await db.runs.create_if_no_active(
@@ -10190,6 +10391,14 @@ class Orchestrator:
                 run_id,
                 "needs_approval",
                 ended_at=datetime.now(UTC).isoformat(),
+                **_termination_kwargs(
+                    status="needs_approval",
+                    final_kind=final_kind,
+                    returncode=returncode,
+                    cap_breached=cap_breached,
+                    exc=exc,
+                    reason=reason,
+                ),
             )
             # Register so $approve/$reject can be received after restart.
             # Done inside finally so it runs even when a non-LinearError above escapes.
@@ -10411,12 +10620,28 @@ class Orchestrator:
                 )
         status = _local_review_status_from_result(result)
         try:
-            await db.runs.update_status(
-                self._conn,
-                run_id,
-                status,
-                ended_at=datetime.now(UTC).isoformat(),
-            )
+            if status == "completed":
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    status,
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+            else:
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    status,
+                    ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status=status,
+                        cap_breached=(
+                            result is not None
+                            and result.outcome == LoopOutcome.COST_CAP_BREACHED
+                        ),
+                        reason=_local_review_termination_reason(result),
+                    ),
+                )
         except Exception:  # noqa: BLE001
             log.warning(
                 "could not finalize local-review run %s (status=%s)",
@@ -11344,14 +11569,36 @@ class Orchestrator:
                 run_id,
                 "failed",
                 ended_at=datetime.now(UTC).isoformat(),
+                **_termination_kwargs(
+                    status="failed",
+                    cap_breached=True,
+                    reason=f"cost cap reached: ${cumulative_total:.4f}",
+                ),
             )
 
-    async def _fail_run(self, run_id: str, _reason: str) -> None:
+    async def _fail_run(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        final_kind: str | None = None,
+        returncode: int | None = None,
+        cap_breached: bool = False,
+        exc: BaseException | str | None = None,
+    ) -> None:
         await db.runs.update_status(
             self._conn,
             run_id,
             "failed",
             ended_at=datetime.now(UTC).isoformat(),
+            **_termination_kwargs(
+                status="failed",
+                final_kind=final_kind,
+                returncode=returncode,
+                cap_breached=cap_breached,
+                exc=exc,
+                reason=reason,
+            ),
         )
 
     async def _fail_run_and_reset_issue(
@@ -11363,9 +11610,20 @@ class Orchestrator:
         storage_issue_id: str | None = None,
         rollback_state_id: str,
         binding: RepoBinding | None = None,
+        final_kind: str | None = None,
+        returncode: int | None = None,
+        cap_breached: bool = False,
+        exc: BaseException | str | None = None,
     ) -> None:
         storage_issue_id = storage_issue_id or issue.id
-        await self._fail_run(run_id, reason)
+        await self._fail_run(
+            run_id,
+            reason,
+            final_kind=final_kind,
+            returncode=returncode,
+            cap_breached=cap_breached,
+            exc=exc,
+        )
         target_state_id = rollback_state_id
         if binding is not None:
             try:
