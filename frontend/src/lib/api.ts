@@ -51,6 +51,9 @@ export type IssueDetail = {
     started_at: string;
     ended_at: string | null;
     cost_usd: number;
+    termination_kind: string;
+    termination_detail: string;
+    exit_returncode: number | null;
   }>;
   issue_prs: Array<{
     github_repo: string;

@@ -21,11 +21,13 @@ import type {
   ExternalObservation,
   ExternalComment,
   GithubPrSnapshot,
+  IssueDetail,
   IssueExternalSnapshot,
   LinearSnapshot,
 } from "@/lib/api";
 
 type CellValue = string | number | null;
+type RunRow = IssueDetail["runs"][number];
 
 type Column<T extends object> = {
   key: Extract<keyof T, string>;
@@ -123,6 +125,53 @@ function RunStatusBadge({ status }: { status: string | null | undefined }) {
     RUN_STATUS_BADGE_CLASS[status] ??
     "border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300";
   return <Badge className={cn("font-mono", cls)}>{status}</Badge>;
+}
+
+const SUCCESS_RUN_STATUSES = new Set(["completed", "done"]);
+
+function terminationTitle(run: Pick<RunRow, "termination_detail" | "exit_returncode">) {
+  const parts: string[] = [];
+  const detail = run.termination_detail.trim();
+  if (detail) {
+    parts.push(detail);
+  }
+  if (run.exit_returncode !== null) {
+    parts.push(`exit_returncode=${run.exit_returncode}`);
+  }
+  return parts.join("\n") || undefined;
+}
+
+function RunTerminationBadge({
+  run,
+}: {
+  run: Pick<RunRow, "status" | "termination_kind" | "termination_detail" | "exit_returncode">;
+}) {
+  const kind = run.termination_kind.trim();
+  if (!kind || SUCCESS_RUN_STATUSES.has(run.status)) {
+    return null;
+  }
+  const title = terminationTitle(run);
+  return (
+    <Badge
+      className="max-w-[220px] truncate border-amber-300 bg-amber-100 font-mono text-amber-950 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-100"
+      title={title}
+    >
+      {kind}
+    </Badge>
+  );
+}
+
+export function RunStatusCell({
+  run,
+}: {
+  run: Pick<RunRow, "status" | "termination_kind" | "termination_detail" | "exit_returncode">;
+}) {
+  return (
+    <div className="flex max-w-full flex-wrap items-center gap-1.5">
+      <RunStatusBadge status={run.status} />
+      <RunTerminationBadge run={run} />
+    </div>
+  );
 }
 
 function formatUtc(ts?: string | null) {
@@ -609,7 +658,7 @@ export function IssuePage() {
                 {
                   key: "status",
                   label: "status",
-                  render: (row) => <RunStatusBadge status={row.status} />,
+                  render: (row) => <RunStatusCell run={row} />,
                 },
                 { key: "pid", label: "pid" },
                 { key: "started_at", label: "started_at" },

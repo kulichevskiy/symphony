@@ -1017,6 +1017,9 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "started_at": "2026-05-17T10:20:00Z",
                 "ended_at": None,
                 "cost_usd": 0.5,
+                "termination_kind": "",
+                "termination_detail": "",
+                "exit_returncode": None,
             },
             {
                 "id": "run-1",
@@ -1026,6 +1029,9 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "started_at": "2026-05-17T10:00:00Z",
                 "ended_at": "2026-05-17T10:10:00Z",
                 "cost_usd": 1.25,
+                "termination_kind": "",
+                "termination_detail": "",
+                "exit_returncode": None,
             },
         ],
         "issue_prs": [
@@ -1077,6 +1083,68 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
         ],
         "issue_cost_marks": {"warning_posted_at": "2026-05-17T10:40:00Z"},
     }
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_api_serializes_run_termination_fields(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-termination",
+            identifier="ENG-9",
+            title="Show failure reason",
+            team_key="ENG",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+                termination_kind, termination_detail, exit_returncode
+            )
+            VALUES (
+                'run-failed', 'iss-termination', 'implement', 'failed', NULL,
+                '2026-05-17T10:00:00Z', '2026-05-17T10:05:00Z', 0,
+                'agent_nonzero_exit', '[backfill] return code 2', 2
+            )
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/iss-termination")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    assert response.json()["runs"] == [
+        {
+            "id": "run-failed",
+            "stage": "implement",
+            "status": "failed",
+            "pid": None,
+            "started_at": "2026-05-17T10:00:00Z",
+            "ended_at": "2026-05-17T10:05:00Z",
+            "cost_usd": 0.0,
+            "termination_kind": "agent_nonzero_exit",
+            "termination_detail": "[backfill] return code 2",
+            "exit_returncode": 2,
+        }
+    ]
 
 
 @pytest.mark.asyncio
