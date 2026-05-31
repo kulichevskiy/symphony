@@ -151,6 +151,40 @@ async def test_backfill_updates_empty_terminal_runs_and_is_idempotent(
         assert rows[run_id]["exit_returncode"] is None
 
 
+@pytest.mark.asyncio
+async def test_backfill_rejects_missing_log_root_before_marking_runs_unknown(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    await _seed_run(db_path, run_id="still-eligible", status="failed")
+
+    with pytest.raises(FileNotFoundError, match="log root not found"):
+        run_backfill(db_path=db_path, log_root=tmp_path / "missing-logs")
+
+    rows = _rows(db_path)
+    assert rows["still-eligible"]["termination_kind"] == ""
+    assert rows["still-eligible"]["termination_detail"] == ""
+    assert rows["still-eligible"]["exit_returncode"] is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_log_root_that_is_not_a_directory(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    log_root.write_text("not a directory", encoding="utf-8")
+    await _seed_run(db_path, run_id="still-eligible", status="failed")
+
+    with pytest.raises(NotADirectoryError, match="log root is not a directory"):
+        run_backfill(db_path=db_path, log_root=log_root)
+
+    rows = _rows(db_path)
+    assert rows["still-eligible"]["termination_kind"] == ""
+    assert rows["still-eligible"]["termination_detail"] == ""
+    assert rows["still-eligible"]["exit_returncode"] is None
+
+
 def test_classify_log_termination_completed_tail_on_failed_run_is_agent_exit(
     tmp_path: Path,
 ) -> None:

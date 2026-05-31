@@ -107,6 +107,10 @@ def classify_log_termination(*, log_path: Path, stage: str) -> TerminationClassi
 def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
+    if not log_root.exists():
+        raise FileNotFoundError(f"log root not found: {log_root}")
+    if not log_root.is_dir():
+        raise NotADirectoryError(f"log root is not a directory: {log_root}")
 
     statuses = tuple(sorted(TERMINAL_NON_SUCCESS_STATUSES))
     placeholders = ",".join("?" * len(statuses))
