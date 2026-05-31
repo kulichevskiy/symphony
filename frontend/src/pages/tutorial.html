@@ -1215,10 +1215,21 @@ const REPO_ROOT = (() => {
   } catch (_) {}
   return "/Users/ak/Code/symphony";
 })();
+// vscLink output lands in `href="${...}"` strings assigned via innerHTML, and
+// REPO_ROOT can come from ?repo=/localStorage — escape for the attribute context
+// so a crafted override can't break out and inject handlers.
+function escapeAttr(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 function vscLink(rel, line) {
   const path = REPO_ROOT + "/" + rel;
   const suffix = line ? ":" + line : "";
-  return "vscode://file" + path + suffix;
+  return escapeAttr("vscode://file" + path + suffix);
 }
 function refLink(rel, line, label) {
   const text = (label || rel) + (line ? ":" + line : "");
