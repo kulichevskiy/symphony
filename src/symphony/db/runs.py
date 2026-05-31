@@ -270,26 +270,31 @@ async def update_status(
     await conn.commit()
 
 
-def _truncate_termination_detail(detail: str) -> str:
+def _truncate_termination_detail(
+    detail: str,
+    *,
+    max_bytes: int = TERMINATION_DETAIL_MAX_BYTES,
+    max_lines: int = TERMINATION_DETAIL_MAX_LINES,
+) -> str:
     text = str(detail)
     original_bytes = text.encode("utf-8", errors="replace")
     if (
-        len(original_bytes) <= TERMINATION_DETAIL_MAX_BYTES
-        and len(text.splitlines()) <= TERMINATION_DETAIL_MAX_LINES
+        len(original_bytes) <= max_bytes
+        and len(text.splitlines()) <= max_lines
     ):
         return text
 
     line_tail = text
-    if len(text.splitlines()) > TERMINATION_DETAIL_MAX_LINES:
+    if len(text.splitlines()) > max_lines:
         lines = text.splitlines(keepends=True)
-        line_tail = "".join(lines[-TERMINATION_DETAIL_MAX_LINES:])
+        line_tail = "".join(lines[-max_lines:])
 
     tail_bytes = line_tail.encode("utf-8", errors="replace")
     truncated_bytes = len(original_bytes) - len(tail_bytes)
     while True:
         marker = f"…[truncated {truncated_bytes} bytes]"
         marker_bytes = ("\n" + marker).encode("utf-8")
-        budget = max(0, TERMINATION_DETAIL_MAX_BYTES - len(marker_bytes))
+        budget = max(0, max_bytes - len(marker_bytes))
         kept_tail_bytes = tail_bytes[-budget:] if budget else b""
         kept_tail = kept_tail_bytes.decode("utf-8", errors="ignore")
         new_truncated_bytes = len(original_bytes) - len(
@@ -301,7 +306,7 @@ def _truncate_termination_detail(detail: str) -> str:
 
     marker = f"…[truncated {truncated_bytes} bytes]"
     if not kept_tail:
-        return marker.encode("utf-8")[:TERMINATION_DETAIL_MAX_BYTES].decode(
+        return marker.encode("utf-8")[:max_bytes].decode(
             "utf-8", errors="ignore"
         )
     return f"{kept_tail}\n{marker}"
