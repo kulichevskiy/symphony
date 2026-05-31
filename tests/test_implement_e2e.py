@@ -220,6 +220,8 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert len(history) == 2
         assert history[0].stage == "implement"
         assert history[0].status == "completed"
+        assert history[0].termination_kind == ""
+        assert history[0].termination_detail == ""
         assert history[0].pid == 4242
         assert history[1].stage == "review"
         assert history[1].status == "running"
@@ -333,6 +335,10 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        assert history[0].termination_kind == "agent_nonzero_exit"
+        assert history[0].termination_kind != "unknown"
+        assert "return code 2" in history[0].termination_detail
+        assert history[0].exit_returncode == 2
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
         assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED

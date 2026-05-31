@@ -57,6 +57,19 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         """
     )
 
+    cur = await conn.execute("PRAGMA table_info(runs)")
+    run_cols = {row[1] for row in await cur.fetchall()}
+    if "termination_kind" not in run_cols:
+        await conn.execute(
+            "ALTER TABLE runs ADD COLUMN termination_kind TEXT NOT NULL DEFAULT ''"
+        )
+    if "termination_detail" not in run_cols:
+        await conn.execute(
+            "ALTER TABLE runs ADD COLUMN termination_detail TEXT NOT NULL DEFAULT ''"
+        )
+    if "exit_returncode" not in run_cols:
+        await conn.execute("ALTER TABLE runs ADD COLUMN exit_returncode INTEGER")
+
     cur = await conn.execute("PRAGMA table_info(comment_cursors)")
     cols = {row[1] for row in await cur.fetchall()}
     if "last_seen_ids" not in cols:

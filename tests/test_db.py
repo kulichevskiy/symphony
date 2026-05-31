@@ -7,6 +7,7 @@ so we also incidentally cover persistence-across-reconnect.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -113,6 +114,158 @@ async def test_indices_present_for_active_and_cost_lookups(tmp_path: Path) -> No
     # supporting per-issue cost aggregation (issue_id-keyed).
     assert any("status" in n.lower() or "active" in n.lower() for n in runs_idx), runs_idx
     assert any("issue" in n.lower() or "cost" in n.lower() for n in runs_idx), runs_idx
+
+
+@pytest.mark.asyncio
+async def test_runs_schema_has_termination_columns(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cur = await conn.execute("PRAGMA table_info(runs)")
+        cols = {row[1]: row for row in await cur.fetchall()}
+    finally:
+        await conn.close()
+
+    assert cols["termination_kind"][2] == "TEXT"
+    assert cols["termination_kind"][3] == 1
+    assert cols["termination_detail"][2] == "TEXT"
+    assert cols["termination_detail"][3] == 1
+    assert cols["exit_returncode"][2] == "INTEGER"
+
+
+@pytest.mark.asyncio
+async def test_update_status_persists_unknown_for_unclassified_terminal_status(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="r1",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await db.runs.update_status(
+                conn, "r1", "failed", ended_at="2026-05-10T00:01:00+00:00"
+            )
+
+        cur = await conn.execute(
+            """
+            SELECT termination_kind, termination_detail, exit_returncode
+            FROM runs WHERE id = ?
+            """,
+            ("r1",),
+        )
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert row is not None
+    assert row["termination_kind"] == "unknown"
+    assert row["termination_detail"] == ""
+    assert row["exit_returncode"] is None
+    assert "missing termination kind" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_update_status_truncates_termination_detail_tail_first(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="r1",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        detail = "\n".join(
+            f"line {i:03d} " + ("x" * 120)
+            for i in range(200)
+        )
+
+        await db.runs.update_status(
+            conn,
+            "r1",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+            kind="push_failed",
+            detail=detail,
+            returncode=2,
+        )
+
+        cur = await conn.execute(
+            """
+            SELECT termination_kind, termination_detail, exit_returncode
+            FROM runs WHERE id = ?
+            """,
+            ("r1",),
+        )
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert row is not None
+    stored = row["termination_detail"]
+    assert row["termination_kind"] == "push_failed"
+    assert row["exit_returncode"] == 2
+    assert len(stored.encode("utf-8")) <= 4096
+    assert "…[truncated " in stored
+    assert "line 199" in stored
+    assert "line 000" not in stored
+
+
+@pytest.mark.asyncio
+async def test_update_status_success_leaves_termination_columns_empty(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="r1",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00"
+        )
+
+        cur = await conn.execute(
+            """
+            SELECT termination_kind, termination_detail, exit_returncode
+            FROM runs WHERE id = ?
+            """,
+            ("r1",),
+        )
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert row is not None
+    assert row["termination_kind"] == ""
+    assert row["termination_detail"] == ""
+    assert row["exit_returncode"] is None
 
 
 @pytest.mark.asyncio

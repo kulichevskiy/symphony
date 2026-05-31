@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import pytest
 
-from symphony.pipeline.state_machine import Transition, on_runner_event
+from symphony.pipeline.state_machine import (
+    Transition,
+    classify_termination,
+    on_runner_event,
+)
 
 
 @pytest.mark.parametrize(
@@ -61,3 +65,90 @@ def test_transition_is_frozen_dataclass() -> None:
     t = Transition(next_run_status="completed", next_linear_state=None, halt=True)
     with pytest.raises(FrozenInstanceError):
         t.next_run_status = "failed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected_kind,detail_part",
+    [
+        (
+            {"status": "failed", "final_kind": "exit", "returncode": 2},
+            "agent_nonzero_exit",
+            "return code 2",
+        ),
+        (
+            {"status": "failed", "final_kind": "stall_timeout"},
+            "stall_timeout",
+            "stall_timeout",
+        ),
+        (
+            {"status": "failed", "final_kind": "spawn_failed", "reason": "ENOENT"},
+            "spawn_failed",
+            "ENOENT",
+        ),
+        (
+            {"status": "failed", "final_kind": "cost_cap", "cap_breached": True},
+            "cost_cap",
+            "cost cap",
+        ),
+        (
+            {"status": "failed", "exc": RuntimeError("agent stream exploded")},
+            "execution_error",
+            "agent stream exploded",
+        ),
+        (
+            {"status": "failed", "reason": "fix-run completed without advancing branch"},
+            "validation_failed",
+            "without advancing",
+        ),
+        (
+            {"status": "failed", "reason": "push failed: rejected"},
+            "push_failed",
+            "rejected",
+        ),
+        (
+            {"status": "failed", "reason": "rebase --continue failed: conflicts"},
+            "rebase_failed",
+            "conflicts",
+        ),
+        (
+            {"status": "failed", "reason": "move_issue failed: 500"},
+            "tracker_error",
+            "move_issue",
+        ),
+        (
+            {"status": "interrupted", "reason": "dispatch cancelled"},
+            "cancelled",
+            "cancelled",
+        ),
+        (
+            {"status": "interrupted", "reason": "Host restarted; pid 999 died"},
+            "orphaned",
+            "Host restarted",
+        ),
+        (
+            {"status": "interrupted", "reason": "superseded by newer PR"},
+            "superseded",
+            "superseded",
+        ),
+        (
+            {"status": "needs_approval", "reason": "manual merge required"},
+            "awaiting_human_merge",
+            "manual merge",
+        ),
+        (
+            {"status": "failed", "reason": ""},
+            "unknown",
+            "failed",
+        ),
+    ],
+)
+def test_classify_termination_covers_terminal_enums(
+    kwargs: dict[str, object], expected_kind: str, detail_part: str
+) -> None:
+    kind, detail = classify_termination(**kwargs)
+    assert kind == expected_kind
+    assert detail_part in detail
+
+
+def test_classify_termination_success_is_empty() -> None:
+    assert classify_termination(status="completed") == ("", "")

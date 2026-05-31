@@ -196,6 +196,9 @@ async def test_cap_breach_parks_issue_at_needs_approval(tmp_path: Path) -> None:
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status == "failed"
+        assert history[0].termination_kind == "cost_cap"
+        assert history[0].termination_kind != "unknown"
+        assert "cost cap reached" in history[0].termination_detail
         # Cost was persisted on the run before the breach handler ran.
         assert history[0].cost_usd == pytest.approx(16.0)
 
