@@ -1,0 +1,50 @@
+name: pages
+
+# Publishes the interactive lifecycle tutorial to GitHub Pages.
+# Source of truth: frontend/src/pages/tutorial.html
+# Live URL: https://kulichevskiy.github.io/symphony/tutorial.html
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - frontend/src/pages/tutorial.html
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp frontend/src/pages/tutorial.html _site/tutorial.html
+          # Serve the tutorial at the site root too, so the bare URL isn't a 404.
+          cp frontend/src/pages/tutorial.html _site/index.html
+          # Skip Jekyll processing of the static HTML.
+          touch _site/.nojekyll
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
