@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, TypedDict
+
+from .cost_guard import UsageDelta
 
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
 AcceptanceScreenshotKind = Literal["hero", "criterion"]
@@ -93,6 +95,7 @@ class AcceptanceVerdict:
     preview_url: str = ""
     screenshots: tuple[AcceptanceScreenshot, ...] = ()
     criterion_results: tuple[AcceptanceCriterionResult, ...] = ()
+    usage: UsageDelta = field(default_factory=UsageDelta)
 
 
 @dataclass(frozen=True)

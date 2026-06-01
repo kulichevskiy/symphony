@@ -198,7 +198,7 @@ async def test_local_review_run_row_persisted_with_cost_and_completed_status(
                     "usage": {
                         "input_tokens": 100_000,
                         "output_tokens": 10_000,
-                        "cached_input_tokens": 0,
+                        "cached_input_tokens": 20_000,
                     },
                 }
             ),
@@ -248,12 +248,17 @@ async def test_local_review_run_row_persisted_with_cost_and_completed_status(
         assert len(lr_rows) == 1
         lr = lr_rows[0]
         assert lr.status == "completed"
-        # 100k input @ $1.25/M + 10k output @ $10/M = $0.125 + $0.10 = $0.225
-        assert lr.cost_usd == pytest.approx(0.225, rel=1e-6)
+        # 80k input @ $1.25/M + 20k cached input @ $0.125/M +
+        # 10k output @ $10/M = $0.10 + $0.0025 + $0.10 = $0.2025
+        assert lr.cost_usd == pytest.approx(0.2025, rel=1e-6)
+        assert lr.input_tokens == 100_000
+        assert lr.output_tokens == 10_000
+        assert lr.cache_write_tokens == 0
+        assert lr.cache_read_tokens == 20_000
         assert lr.ended_at is not None
 
         # cost_for_issue now sums implement + local_review.
         total = await db.runs.cost_for_issue(conn, "iss-1")
-        assert total == pytest.approx(0.42 + 0.225, rel=1e-6)
+        assert total == pytest.approx(0.42 + 0.2025, rel=1e-6)
     finally:
         await conn.close()

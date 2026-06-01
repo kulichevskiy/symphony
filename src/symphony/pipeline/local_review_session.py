@@ -203,6 +203,10 @@ async def run_local_review_session(
             stage="local_review",
         )
         cost_before = reviewer_estimator.total_cost_usd
+        input_before = reviewer_estimator.total_input_tokens
+        output_before = reviewer_estimator.total_output_tokens
+        cache_write_before = reviewer_estimator.total_cache_write_tokens
+        cache_read_before = reviewer_estimator.total_cache_read_tokens
         if report_active_run_id is not None:
             await report_active_run_id(spec.run_id)
         try:
@@ -216,6 +220,14 @@ async def run_local_review_session(
             last_message_dir, f"review-{iteration}", collected
         )
         cost_delta = reviewer_estimator.total_cost_usd - cost_before
+        input_delta = reviewer_estimator.total_input_tokens - input_before
+        output_delta = reviewer_estimator.total_output_tokens - output_before
+        cache_write_delta = (
+            reviewer_estimator.total_cache_write_tokens - cache_write_before
+        )
+        cache_read_delta = (
+            reviewer_estimator.total_cache_read_tokens - cache_read_before
+        )
 
         last_message_text: str | None = None
         if last_message_path.exists():
@@ -234,6 +246,10 @@ async def run_local_review_session(
                 ok=False,
                 error=f"spawn_failed: {collected.spawn_error or 'unknown'}",
                 cost_usd=cost_delta,
+                input_tokens=input_delta,
+                output_tokens=output_delta,
+                cache_write_tokens=cache_write_delta,
+                cache_read_tokens=cache_read_delta,
             )
         if collected.stall_timeout:
             return ReviewerOutput(
@@ -243,6 +259,10 @@ async def run_local_review_session(
                 ok=False,
                 error="reviewer stalled",
                 cost_usd=cost_delta,
+                input_tokens=input_delta,
+                output_tokens=output_delta,
+                cache_write_tokens=cache_write_delta,
+                cache_read_tokens=cache_read_delta,
             )
         # A non-zero exit is *not* automatically failure — the reviewer
         # may still have emitted a usable agent_message before crashing.
@@ -254,6 +274,10 @@ async def run_local_review_session(
             last_message_file=last_message_text,
             ok=True,
             cost_usd=cost_delta,
+            input_tokens=input_delta,
+            output_tokens=output_delta,
+            cache_write_tokens=cache_write_delta,
+            cache_read_tokens=cache_read_delta,
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
@@ -277,6 +301,10 @@ async def run_local_review_session(
             stage="local_review_fix",
         )
         cost_before = fixer_estimator.total_cost_usd
+        input_before = fixer_estimator.total_input_tokens
+        output_before = fixer_estimator.total_output_tokens
+        cache_write_before = fixer_estimator.total_cache_write_tokens
+        cache_read_before = fixer_estimator.total_cache_read_tokens
         if report_active_run_id is not None:
             await report_active_run_id(spec.run_id)
         try:
@@ -290,23 +318,50 @@ async def run_local_review_session(
             last_message_dir, f"fix-{iteration}", collected
         )
         cost_delta = fixer_estimator.total_cost_usd - cost_before
+        input_delta = fixer_estimator.total_input_tokens - input_before
+        output_delta = fixer_estimator.total_output_tokens - output_before
+        cache_write_delta = (
+            fixer_estimator.total_cache_write_tokens - cache_write_before
+        )
+        cache_read_delta = fixer_estimator.total_cache_read_tokens - cache_read_before
         if collected.terminal_kind == "spawn_failed":
             return FixerOutput(
                 ok=False,
                 error=f"spawn_failed: {collected.spawn_error or 'unknown'}",
                 cost_usd=cost_delta,
+                input_tokens=input_delta,
+                output_tokens=output_delta,
+                cache_write_tokens=cache_write_delta,
+                cache_read_tokens=cache_read_delta,
             )
         if collected.stall_timeout:
             return FixerOutput(
-                ok=False, error="fix-run stalled", cost_usd=cost_delta
+                ok=False,
+                error="fix-run stalled",
+                cost_usd=cost_delta,
+                input_tokens=input_delta,
+                output_tokens=output_delta,
+                cache_write_tokens=cache_write_delta,
+                cache_read_tokens=cache_read_delta,
             )
         if not collected.ok_exit:
             return FixerOutput(
                 ok=False,
                 error=f"fix-run exited rc={collected.returncode}",
                 cost_usd=cost_delta,
+                input_tokens=input_delta,
+                output_tokens=output_delta,
+                cache_write_tokens=cache_write_delta,
+                cache_read_tokens=cache_read_delta,
             )
-        return FixerOutput(ok=True, cost_usd=cost_delta)
+        return FixerOutput(
+            ok=True,
+            cost_usd=cost_delta,
+            input_tokens=input_delta,
+            output_tokens=output_delta,
+            cache_write_tokens=cache_write_delta,
+            cache_read_tokens=cache_read_delta,
+        )
 
     return await run_local_review_loop(
         reviewer_agent=reviewer_agent,

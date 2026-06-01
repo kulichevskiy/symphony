@@ -52,6 +52,10 @@ class Run:
     started_at: str
     ended_at: str | None
     cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
     termination_kind: str = ""
     termination_detail: str = ""
     exit_returncode: int | None = None
@@ -68,6 +72,14 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         started_at=row["started_at"],
         ended_at=row["ended_at"],
         cost_usd=row["cost_usd"],
+        input_tokens=(row["input_tokens"] if "input_tokens" in keys else 0),
+        output_tokens=(row["output_tokens"] if "output_tokens" in keys else 0),
+        cache_write_tokens=(
+            row["cache_write_tokens"] if "cache_write_tokens" in keys else 0
+        ),
+        cache_read_tokens=(
+            row["cache_read_tokens"] if "cache_read_tokens" in keys else 0
+        ),
         termination_kind=(
             row["termination_kind"] if "termination_kind" in keys else ""
         ),
@@ -212,7 +224,8 @@ async def update_status(
 ) -> None:
     cur = await conn.execute(
         """
-        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens
         FROM runs
         WHERE id = ?
         """,
@@ -439,14 +452,42 @@ async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -
     await conn.commit()
 
 
+async def add_usage(
+    conn: aiosqlite.Connection,
+    run_id: str,
+    *,
+    cost_usd: float,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE runs
+           SET cost_usd = cost_usd + ?,
+               input_tokens = input_tokens + ?,
+               output_tokens = output_tokens + ?,
+               cache_write_tokens = cache_write_tokens + ?,
+               cache_read_tokens = cache_read_tokens + ?
+         WHERE id = ?
+        """,
+        (
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            run_id,
+        ),
+    )
+    await conn.commit()
+
+
 async def add_cost(
     conn: aiosqlite.Connection, run_id: str, cost_usd: float
 ) -> None:
-    await conn.execute(
-        "UPDATE runs SET cost_usd = cost_usd + ? WHERE id = ?",
-        (cost_usd, run_id),
-    )
-    await conn.commit()
+    await add_usage(conn, run_id, cost_usd=cost_usd)
 
 
 async def mark_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> None:
@@ -535,6 +576,7 @@ async def list_live_with_pid(conn: aiosqlite.Connection) -> list[Run]:
     cur = await conn.execute(
         f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE status IN ({placeholders}) AND pid IS NOT NULL
@@ -551,6 +593,7 @@ async def list_live_review_without_pid(conn: aiosqlite.Connection) -> list[Run]:
     cur = await conn.execute(
         f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE stage = 'review' AND status IN ({placeholders}) AND pid IS NULL
@@ -569,6 +612,7 @@ async def list_live_by_stage(
     cur = await conn.execute(
         f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE stage = ? AND status IN ({placeholders})
@@ -607,7 +651,8 @@ async def list_recent(
     cur = await conn.execute(
         f"""
         SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
-               r.ended_at, r.cost_usd, r.termination_kind,
+               r.ended_at, r.cost_usd, r.input_tokens, r.output_tokens,
+               r.cache_write_tokens, r.cache_read_tokens, r.termination_kind,
                r.termination_detail, r.exit_returncode, i.identifier
         FROM runs r
         JOIN issues i ON i.id = r.issue_id
@@ -632,7 +677,8 @@ async def get_with_issue(
     cur = await conn.execute(
         """
         SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
-               r.ended_at, r.cost_usd, r.termination_kind,
+               r.ended_at, r.cost_usd, r.input_tokens, r.output_tokens,
+               r.cache_write_tokens, r.cache_read_tokens, r.termination_kind,
                r.termination_detail, r.exit_returncode, i.identifier
         FROM runs r
         JOIN issues i ON i.id = r.issue_id
@@ -653,6 +699,7 @@ async def history_for_issue(
     cur = await conn.execute(
         """
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE issue_id = ?
@@ -680,6 +727,7 @@ async def latest_for_issue_stage(
     cur = await conn.execute(
         f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
         WHERE issue_id = ? AND stage = ?{started_filter}

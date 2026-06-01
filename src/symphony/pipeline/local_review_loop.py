@@ -75,6 +75,10 @@ class ReviewerOutput:
     ok: bool = True
     error: str | None = None
     cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,10 @@ class FixerOutput:
     ok: bool
     error: str | None = None
     cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,10 @@ class LoopResult:
     # Callers feed this into the issue's cumulative cost so the local
     # loop participates in the same cap-breach logic as Implement.
     total_cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
 
     @property
     def last_verdict(self) -> LocalVerdict | None:
@@ -156,6 +168,40 @@ async def run_local_review_loop(
     verdicts: list[LocalVerdict] = []
     prev_signature = ""
     total_cost = 0.0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cache_write_tokens = 0
+    total_cache_read_tokens = 0
+
+    def _record_usage(out: ReviewerOutput | FixerOutput) -> None:
+        nonlocal total_cost
+        nonlocal total_input_tokens
+        nonlocal total_output_tokens
+        nonlocal total_cache_write_tokens
+        nonlocal total_cache_read_tokens
+        total_cost += out.cost_usd
+        total_input_tokens += out.input_tokens
+        total_output_tokens += out.output_tokens
+        total_cache_write_tokens += out.cache_write_tokens
+        total_cache_read_tokens += out.cache_read_tokens
+
+    def _result(
+        *,
+        outcome: LoopOutcome,
+        iterations: int,
+        error: str | None = None,
+    ) -> LoopResult:
+        return LoopResult(
+            outcome=outcome,
+            iterations=iterations,
+            verdicts=tuple(verdicts),
+            error=error,
+            total_cost_usd=total_cost,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cache_write_tokens=total_cache_write_tokens,
+            cache_read_tokens=total_cache_read_tokens,
+        )
 
     def _cap_breached() -> bool:
         return cost_cap_usd > 0 and (prior_cost_usd + total_cost) >= cost_cap_usd
@@ -164,24 +210,20 @@ async def run_local_review_loop(
         return should_skip is not None and should_skip()
 
     def _skipped_result(iterations: int) -> LoopResult:
-        return LoopResult(
+        return _result(
             outcome=LoopOutcome.SKIPPED,
             iterations=iterations,
-            verdicts=tuple(verdicts),
             error="operator requested $skip-local-review",
-            total_cost_usd=total_cost,
         )
 
     def _cost_cap_breached_result(iterations: int, *, phase: str) -> LoopResult:
-        return LoopResult(
+        return _result(
             outcome=LoopOutcome.COST_CAP_BREACHED,
             iterations=iterations,
-            verdicts=tuple(verdicts),
             error=(
                 f"cost cap ${cost_cap_usd:.2f} reached {phase} "
                 f"(prior=${prior_cost_usd:.4f}, session=${total_cost:.4f})"
             ),
-            total_cost_usd=total_cost,
         )
 
     for i in range(cap):
@@ -195,7 +237,7 @@ async def run_local_review_loop(
         reviewer_error: str | None = None
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
-            total_cost += out.cost_usd
+            _record_usage(out)
             # If the orchestrator killed the reviewer mid-subprocess via
             # `$skip-local-review`, the runner will emit a failure terminal.
             # Prefer SKIPPED over REVIEWER_FAILED so the audit trail reflects
@@ -210,12 +252,10 @@ async def run_local_review_loop(
                     )
                 if attempt < REVIEWER_FAILURE_RETRIES:
                     continue
-                return LoopResult(
+                return _result(
                     outcome=LoopOutcome.REVIEWER_FAILED,
                     iterations=i + 1,
-                    verdicts=tuple(verdicts),
                     error=reviewer_error,
-                    total_cost_usd=total_cost,
                 )
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
@@ -233,12 +273,10 @@ async def run_local_review_loop(
             break
 
         if verdict is None:
-            return LoopResult(
+            return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
-                verdicts=tuple(verdicts),
                 error=reviewer_error or "reviewer failed",
-                total_cost_usd=total_cost,
             )
         verdicts.append(verdict)
 
@@ -265,19 +303,15 @@ async def run_local_review_loop(
             )
 
         if verdict.kind == LocalVerdictKind.APPROVED:
-            return LoopResult(
+            return _result(
                 outcome=LoopOutcome.APPROVED,
                 iterations=i + 1,
-                verdicts=tuple(verdicts),
-                total_cost_usd=total_cost,
             )
         if verdict.kind == LocalVerdictKind.UNPARSEABLE:
-            return LoopResult(
+            return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
-                verdicts=tuple(verdicts),
                 error="reviewer emitted no verdict marker",
-                total_cost_usd=total_cost,
             )
 
         # CHANGES_REQUESTED — gate on the dedup signature before paying
@@ -285,37 +319,31 @@ async def run_local_review_loop(
         # stuck-loop pattern the broader pipeline already avoids in the
         # remote case (see review_classifier.should_dispatch_fix_run).
         if verdict.trigger_signature == prev_signature:
-            return LoopResult(
+            return _result(
                 outcome=LoopOutcome.STUCK_LOOP,
                 iterations=i + 1,
-                verdicts=tuple(verdicts),
                 error="reviewer produced the same trigger twice in a row",
-                total_cost_usd=total_cost,
             )
         prev_signature = verdict.trigger_signature
 
         fix = await fixer(i, verdict)
-        total_cost += fix.cost_usd
+        _record_usage(fix)
         # Same priority as the reviewer side: an operator-killed fix-run
         # surfaces as SKIPPED, not FIX_RUN_FAILED.
         if _skip():
             return _skipped_result(i + 1)
         if not fix.ok:
-            return LoopResult(
+            return _result(
                 outcome=LoopOutcome.FIX_RUN_FAILED,
                 iterations=i + 1,
-                verdicts=tuple(verdicts),
                 error=fix.error or "fix-run failed",
-                total_cost_usd=total_cost,
             )
         if _cap_breached():
             return _cost_cap_breached_result(i + 1, phase="after fix-run")
 
-    return LoopResult(
+    return _result(
         outcome=LoopOutcome.EXHAUSTED,
         iterations=cap,
-        verdicts=tuple(verdicts),
-        total_cost_usd=total_cost,
     )
 
 

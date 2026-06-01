@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at  TEXT NOT NULL,
     ended_at    TEXT,
     cost_usd    REAL NOT NULL DEFAULT 0,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
     termination_kind   TEXT NOT NULL DEFAULT '',
     termination_detail TEXT NOT NULL DEFAULT '',
     exit_returncode    INTEGER

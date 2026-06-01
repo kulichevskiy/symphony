@@ -21,6 +21,24 @@ class CostDecision:
     cap_breached: bool
 
 
+@dataclass(frozen=True)
+class UsageDelta:
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+
+    def has_usage(self) -> bool:
+        return (
+            self.cost_usd != 0
+            or self.input_tokens != 0
+            or self.output_tokens != 0
+            or self.cache_write_tokens != 0
+            or self.cache_read_tokens != 0
+        )
+
+
 def estimate_codex_cost_usd(
     *,
     input_tokens: int,
@@ -93,19 +111,39 @@ class UsageCostEstimator:
     agent: str
     codex_model: str
     last_estimated_input_tokens: int = 0
-    last_estimated_cached_input_tokens: int = 0
+    last_estimated_cache_write_tokens: int = 0
+    last_estimated_cache_read_tokens: int = 0
     last_estimated_output_tokens: int = 0
     total_cost_usd: float = field(default=0.0, init=False)
+    total_input_tokens: int = field(default=0, init=False)
+    total_output_tokens: int = field(default=0, init=False)
+    total_cache_write_tokens: int = field(default=0, init=False)
+    total_cache_read_tokens: int = field(default=0, init=False)
 
-    def delta(self, usage: Usage) -> float:
+    def delta(self, usage: Usage) -> UsageDelta:
         if self.agent != "codex" or usage.cost_usd > 0:
             self.total_cost_usd += usage.cost_usd
-            return usage.cost_usd
+            delta = UsageDelta(
+                cost_usd=usage.cost_usd,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+            )
+            self.total_input_tokens += delta.input_tokens
+            self.total_output_tokens += delta.output_tokens
+            self.total_cache_write_tokens += delta.cache_write_tokens
+            self.total_cache_read_tokens += delta.cache_read_tokens
+            return delta
         input_delta = max(
             usage.input_tokens - self.last_estimated_input_tokens, 0
         )
-        cached_input_delta = max(
-            usage.cached_input_tokens - self.last_estimated_cached_input_tokens,
+        cache_write_delta = max(
+            usage.cache_write_tokens - self.last_estimated_cache_write_tokens,
+            0,
+        )
+        cache_read_delta = max(
+            usage.cache_read_tokens - self.last_estimated_cache_read_tokens,
             0,
         )
         output_delta = max(
@@ -114,25 +152,41 @@ class UsageCostEstimator:
         self.last_estimated_input_tokens = max(
             self.last_estimated_input_tokens, usage.input_tokens
         )
-        self.last_estimated_cached_input_tokens = max(
-            self.last_estimated_cached_input_tokens,
-            usage.cached_input_tokens,
+        self.last_estimated_cache_write_tokens = max(
+            self.last_estimated_cache_write_tokens,
+            usage.cache_write_tokens,
+        )
+        self.last_estimated_cache_read_tokens = max(
+            self.last_estimated_cache_read_tokens,
+            usage.cache_read_tokens,
         )
         self.last_estimated_output_tokens = max(
             self.last_estimated_output_tokens, usage.output_tokens
         )
         cost = estimate_codex_cost_usd(
             input_tokens=input_delta,
-            cached_input_tokens=cached_input_delta,
+            cached_input_tokens=cache_read_delta,
             output_tokens=output_delta,
             model=self.codex_model,
         )
         self.total_cost_usd += cost
-        return cost
+        delta = UsageDelta(
+            cost_usd=cost,
+            input_tokens=input_delta,
+            output_tokens=output_delta,
+            cache_write_tokens=cache_write_delta,
+            cache_read_tokens=cache_read_delta,
+        )
+        self.total_input_tokens += delta.input_tokens
+        self.total_output_tokens += delta.output_tokens
+        self.total_cache_write_tokens += delta.cache_write_tokens
+        self.total_cache_read_tokens += delta.cache_read_tokens
+        return delta
 
 
 __all__ = [
     "CostDecision",
+    "UsageDelta",
     "UsageCostEstimator",
     "effective_cap",
     "effective_warning_pct",
