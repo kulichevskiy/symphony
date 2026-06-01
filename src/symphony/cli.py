@@ -622,7 +622,7 @@ async def _runs_local_review_stats(db_path: Path) -> None:
     "--log-root",
     type=click.Path(path_type=Path, exists=True, file_okay=False),
     required=True,
-    help="Directory containing historical *.out.log files.",
+    help="Directory containing historical stdout logs.",
 )
 def runs_backfill_tokens(db_path: Path, log_root: Path) -> None:
     """Backfill per-run token columns from historical stdout logs."""

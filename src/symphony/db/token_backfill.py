@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from symphony.agent.process import Usage, parse_event_line
 
+_LOG_SUFFIX = ".log"
 _OUT_LOG_SUFFIX = ".out.log"
 
 
@@ -45,7 +45,7 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
             """
         ).fetchall()
         run_ids = {str(row["id"]) for row in rows}
-        paths_by_run_id, local_review_paths_by_parent = _index_out_logs(
+        paths_by_run_id, local_review_paths_by_parent = _index_logs(
             log_root=log_root,
             run_ids=run_ids,
         )
@@ -65,7 +65,7 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
                     skipped += 1
                     continue
 
-                usage = _read_result_usage(paths)
+                usage = _read_usage(paths)
                 if usage is None:
                     skipped += 1
                     continue
@@ -94,12 +94,12 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
     return BackfillResult(updated=updated, skipped=skipped)
 
 
-def _index_out_logs(
+def _index_logs(
     *, log_root: Path, run_ids: set[str]
 ) -> tuple[dict[str, tuple[Path, ...]], dict[str, tuple[Path, ...]]]:
     by_run: dict[str, list[Path]] = {}
     local_review_by_parent: dict[str, list[Path]] = {}
-    for path in sorted(log_root.rglob(f"*{_OUT_LOG_SUFFIX}")):
+    for path in sorted(log_root.rglob(f"*{_LOG_SUFFIX}")):
         if not path.is_file():
             continue
         relative_parts = path.relative_to(log_root).parts
@@ -108,7 +108,8 @@ def _index_out_logs(
             and relative_parts[0] == "local_review"
             and relative_parts[1]
         ):
-            local_review_by_parent.setdefault(relative_parts[1], []).append(path)
+            if path.name.endswith(_OUT_LOG_SUFFIX):
+                local_review_by_parent.setdefault(relative_parts[1], []).append(path)
             continue
 
         for candidate in _candidate_run_ids(path):
@@ -127,6 +128,8 @@ def _candidate_run_ids(path: Path) -> tuple[str, ...]:
     name = path.name
     if name.endswith(_OUT_LOG_SUFFIX):
         candidates.append(name[: -len(_OUT_LOG_SUFFIX)])
+    if name.endswith(_LOG_SUFFIX):
+        candidates.append(name[: -len(_LOG_SUFFIX)])
     if path.parent.name and path.parent.name != "logs":
         candidates.append(path.parent.name)
     return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
@@ -169,7 +172,7 @@ def _local_review_parent_run_id(
     return str(parent["id"])
 
 
-def _read_result_usage(paths: tuple[Path, ...]) -> TokenUsage | None:
+def _read_usage(paths: tuple[Path, ...]) -> TokenUsage | None:
     total = TokenUsage()
     found = False
     for path in paths:
@@ -178,7 +181,7 @@ def _read_result_usage(paths: tuple[Path, ...]) -> TokenUsage | None:
         except OSError:
             return None
         for line in lines:
-            usage = _result_usage_from_line(line)
+            usage = _usage_from_line(line)
             if usage is None:
                 continue
             total = _sum_usage(total, usage)
@@ -188,15 +191,9 @@ def _read_result_usage(paths: tuple[Path, ...]) -> TokenUsage | None:
     return total
 
 
-def _result_usage_from_line(line: str) -> Usage | None:
+def _usage_from_line(line: str) -> Usage | None:
     text = line.strip()
     if not text.startswith("{"):
-        return None
-    try:
-        event = json.loads(text)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(event, dict) or event.get("type") != "result":
         return None
     return parse_event_line(text)
 

@@ -63,7 +63,7 @@ async def _seed_run(
         await conn.close()
 
 
-def _write_out_log(path: Path, *events: object) -> None:
+def _write_log(path: Path, *events: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         event if isinstance(event, str) else json.dumps(event, separators=(",", ":"))
@@ -121,9 +121,10 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
     )
     await _seed_run(db_path, run_id="missing-log")
     await _seed_run(db_path, run_id="bad-log", tokens=(7, 7, 7, 7))
+    await _seed_run(db_path, run_id="codex-run", tokens=(2, 2, 2, 2))
 
-    _write_out_log(
-        log_root / "implement-parent.out.log",
+    _write_log(
+        log_root / "implement-parent.log",
         "not json",
         {
             "type": "result",
@@ -136,7 +137,7 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
             },
         },
     )
-    _write_out_log(
+    _write_log(
         log_root / "local_review" / "implement-parent" / "review-0.out.log",
         {
             "type": "result",
@@ -149,20 +150,32 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
             },
         },
     )
-    _write_out_log(
+    _write_log(
         log_root / "local_review" / "implement-parent" / "fix-0.out.log",
         {
-            "type": "result",
-            "total_cost_usd": 0.30,
+            "type": "turn.completed",
             "usage": {
                 "input_tokens": 300,
                 "output_tokens": 40,
                 "cache_write_tokens": 11,
-                "cache_read_tokens": 13,
+                "cached_input_tokens": 13,
             },
         },
     )
-    _write_out_log(log_root / "bad-log.out.log", "not json", {"type": "system"})
+    _write_log(
+        log_root / "codex-run.log",
+        {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": {
+                    "input_tokens": 700,
+                    "output_tokens": 90,
+                    "cached_input_tokens": 60,
+                }
+            },
+        },
+    )
+    _write_log(log_root / "bad-log.out.log", "not json", {"type": "system"})
 
     first = CliRunner().invoke(
         main,
@@ -176,12 +189,13 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
         ],
     )
     assert first.exit_code == 0, first.output
-    assert "updated: 2" in first.output
+    assert "updated: 3" in first.output
     assert "skipped: 2" in first.output
 
     rows = _token_rows(db_path)
     assert rows["implement-parent"] == (100, 50, 30, 20)
     assert rows["local-review-row"] == (500, 70, 16, 20)
+    assert rows["codex-run"] == (700, 90, 0, 60)
     assert rows["bad-log"] == (7, 7, 7, 7)
     assert rows["missing-log"] == (0, 0, 0, 0)
 
@@ -197,6 +211,6 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
         ],
     )
     assert second.exit_code == 0, second.output
-    assert "updated: 2" in second.output
+    assert "updated: 3" in second.output
     assert "skipped: 2" in second.output
     assert _token_rows(db_path) == rows
