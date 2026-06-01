@@ -25,6 +25,10 @@ export interface IssueSummary {
   identifier: string;
   title: string;
   team_key: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
   latest_activity_ts: string | null;
   latest_activity_age_secs: number | null;
   canonical_status: CanonicalStatus;
