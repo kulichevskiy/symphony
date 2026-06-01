@@ -614,6 +614,32 @@ async def _runs_local_review_stats(db_path: Path) -> None:
         click.echo("(no finished local-review sessions yet)")
 
 
+@runs.command("backfill-tokens")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Path to the symphony SQLite file.",
+)
+@click.option(
+    "--log-root",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    required=True,
+    help="Directory containing historical stdout logs.",
+)
+def runs_backfill_tokens(db_path: Path, log_root: Path) -> None:
+    """Backfill per-run token columns from historical stdout logs."""
+    from .db.token_backfill import run_backfill
+
+    try:
+        result = run_backfill(db_path=db_path, log_root=log_root)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"updated: {result.updated}")
+    click.echo(f"skipped: {result.skipped}")
+
+
 @main.command("local-review-dry-run")
 @click.option(
     "--workspace",
