@@ -28,6 +28,14 @@ WEBHOOK_PORT="${WEBHOOK_PORT:-8787}"
 
 START_TUNNEL="${SYMPHONY_TUNNEL:-1}"
 
+# symphony only mounts /linear/webhook when LINEAR_WEBHOOK_SECRET is set (env
+# or .env). Without it the tunnel would just advertise a 404, so detect the
+# secret and skip the tunnel with a hint when the receiver is disabled.
+LINEAR_SECRET="${LINEAR_WEBHOOK_SECRET:-}"
+if [[ -z "$LINEAR_SECRET" && -f .env ]]; then
+  LINEAR_SECRET="$(grep -E '^[[:space:]]*LINEAR_WEBHOOK_SECRET=' .env | tail -1 | cut -d= -f2- | tr -d "\"'" || true)"
+fi
+
 VITE_PID=""
 TUNNEL_PID=""
 cleanup() {
@@ -64,7 +72,9 @@ if [[ ! -f "$DIST" ]]; then
   exit 1
 fi
 
-if [[ "$START_TUNNEL" != "0" ]]; then
+if [[ "$START_TUNNEL" != "0" && -z "$LINEAR_SECRET" ]]; then
+  echo "› LINEAR_WEBHOOK_SECRET unset — symphony won't serve /linear/webhook; skipping tunnel (set the secret to enable, or SYMPHONY_TUNNEL=0 to silence)" >&2
+elif [[ "$START_TUNNEL" != "0" ]]; then
   if command -v cloudflared >/dev/null 2>&1; then
     mkdir -p logs
     TUNNEL_LOG="logs/cloudflared.log"
