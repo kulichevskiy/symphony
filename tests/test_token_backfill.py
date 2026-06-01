@@ -223,3 +223,45 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
     assert "updated: 3" in second.output
     assert "skipped: 2" in second.output
     assert _token_rows(db_path) == rows
+
+
+@pytest.mark.asyncio
+async def test_runs_backfill_tokens_skips_running_runs(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    await _seed_run(
+        db_path,
+        run_id="live-run",
+        status="running",
+        tokens=(9, 8, 7, 6),
+    )
+    _write_log(
+        log_root / "live-run.out.log",
+        {
+            "type": "result",
+            "total_cost_usd": 0.10,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_write_tokens": 30,
+                "cached_input_tokens": 20,
+            },
+        },
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "runs",
+            "backfill-tokens",
+            "--db",
+            str(db_path),
+            "--log-root",
+            str(log_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "updated: 0" in result.output
+    assert "skipped: 1" in result.output
+    assert _token_rows(db_path)["live-run"] == (9, 8, 7, 6)

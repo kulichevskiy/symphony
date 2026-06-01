@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from symphony.agent.process import Usage, parse_event_line
+from symphony.db.runs import LIVE_STATUSES
 
 _LOG_SUFFIX = ".log"
 _OUT_LOG_SUFFIX = ".out.log"
@@ -37,13 +38,27 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        live_statuses = tuple(LIVE_STATUSES)
+        live_placeholders = ",".join("?" * len(live_statuses))
         rows = conn.execute(
-            """
+            f"""
             SELECT id, issue_id, stage, started_at
             FROM runs
+            WHERE status NOT IN ({live_placeholders})
             ORDER BY started_at ASC, id ASC
-            """
+            """,
+            live_statuses,
         ).fetchall()
+        skipped = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM runs
+                WHERE status IN ({live_placeholders})
+                """,
+                live_statuses,
+            ).fetchone()[0]
+        )
         run_ids = {str(row["id"]) for row in rows}
         paths_by_run_id, local_review_paths_by_parent = _index_logs(
             log_root=log_root,
@@ -51,7 +66,6 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
         )
 
         updated = 0
-        skipped = 0
         with conn:
             for row in rows:
                 run_id = str(row["id"])
@@ -71,13 +85,14 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
                     continue
 
                 cur = conn.execute(
-                    """
+                    f"""
                     UPDATE runs
                        SET input_tokens = ?,
                            output_tokens = ?,
                            cache_write_tokens = ?,
                            cache_read_tokens = ?
                      WHERE id = ?
+                       AND status NOT IN ({live_placeholders})
                     """,
                     (
                         usage.input_tokens,
@@ -85,9 +100,13 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
                         usage.cache_write_tokens,
                         usage.cache_read_tokens,
                         run_id,
+                        *live_statuses,
                     ),
                 )
-                updated += cur.rowcount
+                if cur.rowcount == 0:
+                    skipped += 1
+                else:
+                    updated += cur.rowcount
     finally:
         conn.close()
 
