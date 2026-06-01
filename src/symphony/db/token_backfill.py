@@ -11,6 +11,12 @@ from symphony.db.runs import LIVE_STATUSES
 
 _LOG_SUFFIX = ".log"
 _OUT_LOG_SUFFIX = ".out.log"
+_TOKEN_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_write_tokens",
+    "cache_read_tokens",
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
+        _migrate_token_columns(conn)
         live_statuses = tuple(LIVE_STATUSES)
         live_placeholders = ",".join("?" * len(live_statuses))
         rows = conn.execute(
@@ -114,6 +121,16 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
         conn.close()
 
     return BackfillResult(updated=updated, skipped=skipped)
+
+
+def _migrate_token_columns(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(runs)")
+    run_cols = {str(row[1]) for row in cur.fetchall()}
+    missing_cols = [col for col in _TOKEN_COLUMNS if col not in run_cols]
+    for col in missing_cols:
+        conn.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+    if missing_cols:
+        conn.commit()
 
 
 def _index_logs(

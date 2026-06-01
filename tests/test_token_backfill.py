@@ -97,6 +97,70 @@ def _token_rows(db_path: Path) -> dict[str, tuple[int, int, int, int]]:
     }
 
 
+def test_runs_backfill_tokens_migrates_legacy_database_before_update(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy.sqlite"
+    log_root = tmp_path / "logs"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE runs (
+                id          TEXT PRIMARY KEY,
+                issue_id    TEXT NOT NULL,
+                stage       TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                pid         INTEGER,
+                started_at  TEXT NOT NULL,
+                ended_at    TEXT,
+                cost_usd    REAL NOT NULL DEFAULT 0
+            );
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, ended_at, cost_usd
+            ) VALUES (
+                'legacy-run', 'iss-legacy', 'implement', 'completed', NULL,
+                '2026-05-31T00:00:00+00:00',
+                '2026-05-31T00:01:00+00:00', 0
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _write_log(
+        log_root / "legacy-run.out.log",
+        {
+            "type": "result",
+            "total_cost_usd": 0.10,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_write_tokens": 30,
+                "cached_input_tokens": 20,
+            },
+        },
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "runs",
+            "backfill-tokens",
+            "--db",
+            str(db_path),
+            "--log-root",
+            str(log_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "updated: 1" in result.output
+    assert "skipped: 0" in result.output
+    assert _token_rows(db_path)["legacy-run"] == (100, 50, 30, 20)
+
+
 @pytest.mark.asyncio
 async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
     tmp_path: Path,
