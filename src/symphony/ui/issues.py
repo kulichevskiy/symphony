@@ -291,6 +291,8 @@ def create_issue_detail_router(
             conn,
             """
             SELECT id, stage, status, pid, started_at, ended_at, cost_usd,
+                   input_tokens, output_tokens, cache_write_tokens,
+                   cache_read_tokens,
                    termination_kind, termination_detail, exit_returncode
             FROM runs
             WHERE issue_id = ?

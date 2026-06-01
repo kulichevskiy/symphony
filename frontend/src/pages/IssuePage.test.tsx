@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import type { DriftFlag } from "@/lib/api";
 
-import { ExternalTruthSection, GithubCard, RunStatusCell } from "./IssuePage";
+import { ExternalTruthSection, GithubCard, RunsSection, RunStatusCell } from "./IssuePage";
 
 describe("GithubCard", () => {
   it("surfaces partial review-comment fetch failures", () => {
@@ -59,6 +59,60 @@ describe("RunStatusCell", () => {
     expect(markup).toContain("completed");
     expect(markup).not.toContain("should_not_render");
     expect(markup).not.toContain("success detail should stay hidden");
+  });
+});
+
+describe("RunsSection", () => {
+  it("renders per-run token usage and issue totals next to cost", () => {
+    const markup = renderToStaticMarkup(
+      <RunsSection
+        runs={[
+          {
+            id: "run-a",
+            stage: "implement",
+            status: "completed",
+            pid: 123,
+            started_at: "2026-05-17T10:00:00Z",
+            ended_at: "2026-05-17T10:10:00Z",
+            cost_usd: 1.25,
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_write_tokens: 30,
+            cache_read_tokens: 40,
+            termination_kind: "",
+            termination_detail: "",
+            exit_returncode: null,
+          },
+          {
+            id: "run-b",
+            stage: "review",
+            status: "running",
+            pid: null,
+            started_at: "2026-05-17T10:20:00Z",
+            ended_at: null,
+            cost_usd: 0.5,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_write_tokens: 0,
+            cache_read_tokens: 0,
+            termination_kind: "",
+            termination_detail: "",
+            exit_returncode: null,
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("total cost $1.75");
+    expect(markup).toContain("in 100");
+    expect(markup).toContain("out 20");
+    expect(markup).toContain("cache-write 30");
+    expect(markup).toContain("cache-read 40");
+    expect(markup).toContain(">in</th>");
+    expect(markup).toContain(">out</th>");
+    expect(markup).toContain(">cache-write</th>");
+    expect(markup).toContain(">cache-read</th>");
+    expect(markup).toContain(">0</td>");
   });
 });
 

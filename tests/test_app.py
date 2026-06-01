@@ -62,6 +62,14 @@ async def _seed_issue_detail(conn: aiosqlite.Connection) -> None:
     )
     await conn.execute(
         """
+        UPDATE runs
+        SET input_tokens = 100, output_tokens = 20,
+            cache_write_tokens = 30, cache_read_tokens = 40
+        WHERE id = 'run-1'
+        """
+    )
+    await conn.execute(
+        """
         INSERT INTO issue_prs (
             issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
         )
@@ -1017,6 +1025,10 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "started_at": "2026-05-17T10:20:00Z",
                 "ended_at": None,
                 "cost_usd": 0.5,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
                 "termination_kind": "",
                 "termination_detail": "",
                 "exit_returncode": None,
@@ -1029,6 +1041,10 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "started_at": "2026-05-17T10:00:00Z",
                 "ended_at": "2026-05-17T10:10:00Z",
                 "cost_usd": 1.25,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_write_tokens": 30,
+                "cache_read_tokens": 40,
                 "termination_kind": "",
                 "termination_detail": "",
                 "exit_returncode": None,
@@ -1140,6 +1156,10 @@ async def test_issue_detail_api_serializes_run_termination_fields(
             "started_at": "2026-05-17T10:00:00Z",
             "ended_at": "2026-05-17T10:05:00Z",
             "cost_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_read_tokens": 0,
             "termination_kind": "agent_nonzero_exit",
             "termination_detail": "[backfill] return code 2",
             "exit_returncode": 2,
