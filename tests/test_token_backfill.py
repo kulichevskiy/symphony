@@ -226,6 +226,94 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_runs_backfill_tokens_uses_codex_deltas_for_local_review_logs(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    issue_id = "iss-local-review-deltas"
+    await _seed_run(
+        db_path,
+        run_id="implement-parent",
+        issue_id=issue_id,
+        started_at="2026-05-31T00:00:00+00:00",
+    )
+    await _seed_run(
+        db_path,
+        run_id="local-review-row",
+        issue_id=issue_id,
+        stage="local_review",
+        started_at="2026-05-31T00:02:00+00:00",
+    )
+
+    _write_log(
+        log_root / "local_review" / "implement-parent" / "review-0.out.log",
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 200,
+                "output_tokens": 30,
+                "cache_write_tokens": 5,
+                "cached_input_tokens": 7,
+            },
+        },
+    )
+    _write_log(
+        log_root / "local_review" / "implement-parent" / "review-1.out.log",
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 250,
+                "output_tokens": 45,
+                "cache_write_tokens": 9,
+                "cached_input_tokens": 10,
+            },
+        },
+    )
+    _write_log(
+        log_root / "local_review" / "implement-parent" / "fix-0.out.log",
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 300,
+                "output_tokens": 40,
+                "cache_write_tokens": 11,
+                "cached_input_tokens": 13,
+            },
+        },
+    )
+    _write_log(
+        log_root / "local_review" / "implement-parent" / "fix-1.out.log",
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 350,
+                "output_tokens": 60,
+                "cache_write_tokens": 20,
+                "cached_input_tokens": 18,
+            },
+        },
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "runs",
+            "backfill-tokens",
+            "--db",
+            str(db_path),
+            "--log-root",
+            str(log_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "updated: 1" in result.output
+    assert "skipped: 1" in result.output
+    assert _token_rows(db_path)["local-review-row"] == (600, 105, 29, 28)
+
+
+@pytest.mark.asyncio
 async def test_runs_backfill_tokens_skips_running_runs(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     log_root = tmp_path / "logs"
