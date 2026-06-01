@@ -46,16 +46,21 @@ function SectionTable<T extends object>({
   title,
   rows,
   columns,
+  headerAside,
   rowClassName,
 }: {
   title: string;
   rows: T[];
   columns: Column<T>[];
+  headerAside?: ReactNode;
   rowClassName?: (row: T) => string | undefined;
 }) {
   return (
     <section className="border-t py-5">
-      <h2 className="mb-3 text-base font-semibold tracking-normal">{title}</h2>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <h2 className="text-base font-semibold tracking-normal">{title}</h2>
+        {headerAside ? <div>{headerAside}</div> : null}
+      </div>
       {rows.length === 0 ? (
         <p className="text-sm text-muted-foreground">(none)</p>
       ) : (
@@ -129,6 +134,52 @@ function RunStatusBadge({ status }: { status: string | null | undefined }) {
 
 const SUCCESS_RUN_STATUSES = new Set(["completed", "done"]);
 
+function tokenCount(value: number | null | undefined) {
+  return String(value ?? 0);
+}
+
+function formatCost(value: number) {
+  return `$${value.toFixed(2)}`;
+}
+
+export function RunUsageSummary({
+  runs,
+}: {
+  runs: Array<
+    Pick<
+      RunRow,
+      "cost_usd" | "input_tokens" | "output_tokens" | "cache_write_tokens" | "cache_read_tokens"
+    >
+  >;
+}) {
+  const total = runs.reduce(
+    (acc, run) => ({
+      cost_usd: acc.cost_usd + (run.cost_usd ?? 0),
+      input_tokens: acc.input_tokens + (run.input_tokens ?? 0),
+      output_tokens: acc.output_tokens + (run.output_tokens ?? 0),
+      cache_write_tokens: acc.cache_write_tokens + (run.cache_write_tokens ?? 0),
+      cache_read_tokens: acc.cache_read_tokens + (run.cache_read_tokens ?? 0),
+    }),
+    {
+      cost_usd: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+    },
+  );
+
+  return (
+    <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 font-mono text-xs text-muted-foreground">
+      <span>total cost {formatCost(total.cost_usd)}</span>
+      <span>in {tokenCount(total.input_tokens)}</span>
+      <span>out {tokenCount(total.output_tokens)}</span>
+      <span>cache-write {tokenCount(total.cache_write_tokens)}</span>
+      <span>cache-read {tokenCount(total.cache_read_tokens)}</span>
+    </div>
+  );
+}
+
 function terminationTitle(run: Pick<RunRow, "termination_detail" | "exit_returncode">) {
   const parts: string[] = [];
   const detail = run.termination_detail.trim();
@@ -171,6 +222,50 @@ export function RunStatusCell({
       <RunStatusBadge status={run.status} />
       <RunTerminationBadge run={run} />
     </div>
+  );
+}
+
+export function RunsSection({ runs }: { runs: RunRow[] }) {
+  return (
+    <SectionTable
+      title="Runs"
+      rows={runs}
+      rowClassName={runRowClassName}
+      headerAside={<RunUsageSummary runs={runs} />}
+      columns={[
+        { key: "id", label: "id" },
+        { key: "stage", label: "stage" },
+        {
+          key: "status",
+          label: "status",
+          render: (row) => <RunStatusCell run={row} />,
+        },
+        { key: "pid", label: "pid" },
+        { key: "started_at", label: "started_at" },
+        { key: "ended_at", label: "ended_at" },
+        { key: "cost_usd", label: "cost_usd" },
+        {
+          key: "input_tokens",
+          label: "in",
+          render: (row) => tokenCount(row.input_tokens),
+        },
+        {
+          key: "output_tokens",
+          label: "out",
+          render: (row) => tokenCount(row.output_tokens),
+        },
+        {
+          key: "cache_write_tokens",
+          label: "cache-write",
+          render: (row) => tokenCount(row.cache_write_tokens),
+        },
+        {
+          key: "cache_read_tokens",
+          label: "cache-read",
+          render: (row) => tokenCount(row.cache_read_tokens),
+        },
+      ]}
+    />
   );
 }
 
@@ -648,24 +743,7 @@ export function IssuePage() {
               ]}
             />
             <IssueTimeline issueId={data.issue.id} />
-            <SectionTable
-              title="Runs"
-              rows={data.runs}
-              rowClassName={runRowClassName}
-              columns={[
-                { key: "id", label: "id" },
-                { key: "stage", label: "stage" },
-                {
-                  key: "status",
-                  label: "status",
-                  render: (row) => <RunStatusCell run={row} />,
-                },
-                { key: "pid", label: "pid" },
-                { key: "started_at", label: "started_at" },
-                { key: "ended_at", label: "ended_at" },
-                { key: "cost_usd", label: "cost_usd" },
-              ]}
-            />
+            <RunsSection runs={data.runs} />
             <SectionTable
               title="PRs"
               rows={data.issue_prs}

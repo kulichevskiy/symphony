@@ -478,6 +478,10 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
     click.echo(f"started_at:     {run.started_at}")
     click.echo(f"ended_at:       {run.ended_at or '-'}")
     click.echo(f"cost_usd:       {run.cost_usd}")
+    click.echo(f"input_tokens:   {run.input_tokens}")
+    click.echo(f"output_tokens:  {run.output_tokens}")
+    click.echo(f"cache_write:    {run.cache_write_tokens}")
+    click.echo(f"cache_read:     {run.cache_read_tokens}")
     if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
         click.echo(f"termination_kind:   {run.termination_kind or '-'}")
         returncode = run.exit_returncode if run.exit_returncode is not None else "-"

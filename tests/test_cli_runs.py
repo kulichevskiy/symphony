@@ -96,6 +96,15 @@ def _populate(p: Path) -> None:
                 cost_usd=0.25,
             )
             await db.comment_cursors.set(conn, "iss-1", "2026-05-10T00:30:00+00:00")
+            await db.runs.add_usage(
+                conn,
+                "run-a",
+                cost_usd=0.0,
+                input_tokens=100,
+                output_tokens=20,
+                cache_write_tokens=30,
+                cache_read_tokens=40,
+            )
         finally:
             await conn.close()
 
@@ -174,6 +183,10 @@ def test_runs_show_displays_full_detail(tmp_path: Path) -> None:
     assert "implement" in out
     assert "running" in out
     assert "1.5" in out
+    assert "input_tokens:   100" in out
+    assert "output_tokens:  20" in out
+    assert "cache_write:    30" in out
+    assert "cache_read:     40" in out
     # The comment cursor for the issue is part of the detail surface.
     assert "2026-05-10T00:30:00+00:00" in out
 

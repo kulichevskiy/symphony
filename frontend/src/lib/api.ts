@@ -51,6 +51,10 @@ export type IssueDetail = {
     started_at: string;
     ended_at: string | null;
     cost_usd: number;
+    input_tokens: number;
+    output_tokens: number;
+    cache_write_tokens: number;
+    cache_read_tokens: number;
     termination_kind: string;
     termination_detail: string;
     exit_returncode: number | null;
