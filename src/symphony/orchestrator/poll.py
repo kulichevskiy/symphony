@@ -8781,13 +8781,22 @@ class Orchestrator:
 
             verdict = _with_acceptance_degrade_note(verdict, degrade_note)
 
+            verdict_usage = verdict.usage
+            if verdict_usage.has_usage():
+                verdict_usage = UsageDelta(
+                    cost_usd=verdict.cost,
+                    input_tokens=verdict_usage.input_tokens,
+                    output_tokens=verdict_usage.output_tokens,
+                    cache_write_tokens=verdict_usage.cache_write_tokens,
+                    cache_read_tokens=verdict_usage.cache_read_tokens,
+                )
+            elif verdict.cost > 0:
+                verdict_usage = UsageDelta(cost_usd=verdict.cost)
+            if verdict_usage.has_usage():
+                await _add_run_usage(self._conn, run_id, verdict_usage)
+
             cap_breached = False
             if verdict.cost > 0:
-                await _add_run_usage(
-                    self._conn,
-                    run_id,
-                    UsageDelta(cost_usd=verdict.cost),
-                )
                 new_total = prior_total + verdict.cost
                 decision = evaluate_cost(
                     previous_total=prior_total,

@@ -11,10 +11,10 @@ import socket
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from symphony.agent.process import parse_event_line
+from symphony.agent.process import Usage, parse_event_line
 from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_PASS,
@@ -23,6 +23,7 @@ from symphony.pipeline.acceptance_classifier import (
     AcceptanceVerdict,
     acceptance_classifier,
 )
+from symphony.pipeline.cost_guard import UsageDelta
 from symphony.pipeline.local_review_io import CollectedRunnerOutput
 
 _DIFF_LIMIT_CHARS = 60_000
@@ -263,22 +264,28 @@ async def run_acceptance(
     )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
+        usage = _usage_delta_with_cost(acceptance_run.usage, acceptance_run.cost)
         return AcceptanceVerdict(
             kind="infra_error",
             criteria=list(criteria or []),
-            cost=acceptance_run.cost,
+            cost=usage.cost_usd,
             hero_screenshot_url="",
             details=acceptance_run.abort_details,
+            usage=usage,
         )
     if not collected.ok_exit:
         parsed = acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
         )
+        usage = _usage_delta_with_cost(
+            acceptance_run.usage,
+            max(parsed.cost, acceptance_run.cost),
+        )
         return AcceptanceVerdict(
             kind="infra_error",
             criteria=list(criteria or []),
-            cost=max(parsed.cost, acceptance_run.cost),
+            cost=usage.cost_usd,
             hero_screenshot_url="",
             details=_failed_run_details(
                 collected,
@@ -287,10 +294,14 @@ async def run_acceptance(
                 ),
                 time_cap_secs=stall_secs,
             ),
+            usage=usage,
         )
-    return acceptance_classifier(
-        transcript=collected.stdout,
-        criteria=criteria,
+    return _with_usage(
+        acceptance_classifier(
+            transcript=collected.stdout,
+            criteria=criteria,
+        ),
+        acceptance_run.usage,
     )
 
 
@@ -452,23 +463,29 @@ async def _run_playwright_acceptance(
     )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
+        usage = _usage_delta_with_cost(acceptance_run.usage, acceptance_run.cost)
         return AcceptanceVerdict(
             kind="infra_error",
             criteria=list(criteria or []),
-            cost=acceptance_run.cost,
+            cost=usage.cost_usd,
             hero_screenshot_url="",
             details=acceptance_run.abort_details,
             preview_url=preview_url,
+            usage=usage,
         )
     if not collected.ok_exit:
         parsed = acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
         )
+        usage = _usage_delta_with_cost(
+            acceptance_run.usage,
+            max(parsed.cost, acceptance_run.cost),
+        )
         return AcceptanceVerdict(
             kind="infra_error",
             criteria=list(criteria or []),
-            cost=max(parsed.cost, acceptance_run.cost),
+            cost=usage.cost_usd,
             hero_screenshot_url="",
             details=_failed_run_details(
                 collected,
@@ -478,14 +495,18 @@ async def _run_playwright_acceptance(
                 time_cap_secs=stall_secs,
             ),
             preview_url=preview_url,
+            usage=usage,
         )
     verdict = acceptance_classifier(
         transcript=collected.stdout,
         criteria=criteria,
     )
-    return _validate_dev_artifacts(
-        verdict if verdict.preview_url else _with_preview_url(verdict, preview_url),
-        criteria=criteria,
+    return _with_usage(
+        _validate_dev_artifacts(
+            verdict if verdict.preview_url else _with_preview_url(verdict, preview_url),
+            criteria=criteria,
+        ),
+        acceptance_run.usage,
     )
 
 
@@ -494,6 +515,41 @@ class _AcceptanceRunOutput:
     output: CollectedRunnerOutput
     abort_details: str = ""
     cost: float = 0.0
+    usage: UsageDelta = field(default_factory=UsageDelta)
+
+
+def _usage_delta_from_usage(usage: Usage) -> UsageDelta:
+    return UsageDelta(
+        cost_usd=usage.cost_usd,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+    )
+
+
+def _sum_usage_delta(left: UsageDelta, right: UsageDelta) -> UsageDelta:
+    return UsageDelta(
+        cost_usd=left.cost_usd + right.cost_usd,
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        cache_write_tokens=left.cache_write_tokens + right.cache_write_tokens,
+        cache_read_tokens=left.cache_read_tokens + right.cache_read_tokens,
+    )
+
+
+def _usage_delta_with_cost(usage: UsageDelta, cost: float) -> UsageDelta:
+    return UsageDelta(
+        cost_usd=cost,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+    )
+
+
+def _with_usage(verdict: AcceptanceVerdict, usage: UsageDelta) -> AcceptanceVerdict:
+    return replace(verdict, usage=_usage_delta_with_cost(usage, verdict.cost))
 
 
 @dataclass
@@ -519,6 +575,7 @@ async def _collect_acceptance_output(
     spawn_error: str | None = None
     stall_timeout = False
     tracked_cost = 0.0
+    tracked_usage = UsageDelta()
     started_at = time.monotonic()
     iterator: AsyncIterator[RunnerEvent] = runner.run(spec).__aiter__()
 
@@ -536,6 +593,7 @@ async def _collect_acceptance_output(
             ),
             abort_details=details,
             cost=tracked_cost,
+            usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
         )
 
     while True:
@@ -564,6 +622,7 @@ async def _collect_acceptance_output(
                 ),
                 abort_details=_time_cap_exceeded_details(wall_clock_secs),
                 cost=tracked_cost,
+                usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
             )
 
         try:
@@ -575,6 +634,10 @@ async def _collect_acceptance_output(
             stdout_parts.append(event.line)
             usage = parse_event_line(event.line)
             if usage is not None:
+                tracked_usage = _sum_usage_delta(
+                    tracked_usage,
+                    _usage_delta_from_usage(usage),
+                )
                 tracked_cost = max(tracked_cost, usage.cost_usd)
                 if _cost_cap_reached(max_budget_usd, tracked_cost):
                     return await abort(
@@ -606,6 +669,7 @@ async def _collect_acceptance_output(
             stall_timeout=stall_timeout,
         ),
         cost=tracked_cost,
+        usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
     )
 
 
@@ -799,17 +863,7 @@ def _with_preview_url(
     verdict: AcceptanceVerdict,
     preview_url: str,
 ) -> AcceptanceVerdict:
-    return AcceptanceVerdict(
-        kind=verdict.kind,
-        criteria=verdict.criteria,
-        cost=verdict.cost,
-        hero_screenshot_url=verdict.hero_screenshot_url,
-        details=verdict.details,
-        reason=verdict.reason,
-        preview_url=preview_url,
-        screenshots=verdict.screenshots,
-        criterion_results=verdict.criterion_results,
-    )
+    return replace(verdict, preview_url=preview_url)
 
 
 def _validate_dev_artifacts(

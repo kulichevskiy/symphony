@@ -60,6 +60,7 @@ def _acceptance_events(
     verdict_footer: str = ACCEPTANCE_FOOTER_PASS,
     *,
     cost: float = 0.0,
+    usage: dict[str, int] | None = None,
 ) -> list[RunnerEvent]:
     return [
         RunnerEvent(kind="started", pid=2222),
@@ -71,7 +72,13 @@ def _acceptance_events(
                     "subtype": "success",
                     "result": f"Acceptance verdict.\n\n{verdict_footer}",
                     "total_cost_usd": cost,
-                    "usage": {"input_tokens": 100, "output_tokens": 20},
+                    "usage": usage
+                    or {
+                        "input_tokens": 100,
+                        "cache_creation_input_tokens": 30,
+                        "cache_read_input_tokens": 40,
+                        "output_tokens": 20,
+                    },
                 }
             ),
         ),
@@ -318,6 +325,10 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
             "merge",
         ]
         assert history[2].status == "completed"
+        assert history[2].input_tokens == 100
+        assert history[2].output_tokens == 20
+        assert history[2].cache_write_tokens == 30
+        assert history[2].cache_read_tokens == 40
         assert history[3].status == "done"
         assert await db.operator_waits.get(conn, "iss-1") is None
         assert [spec.stage for spec in runner.captured_specs] == [
