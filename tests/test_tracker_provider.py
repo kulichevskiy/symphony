@@ -10,6 +10,7 @@ from symphony.linear.client import Linear, LinearError
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import Reconciler
+from symphony.pipeline.cost_guard import UsageDelta
 from symphony.tracker import Comment, Issue, TrackerContext
 
 
@@ -530,7 +531,7 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
             push_fn=AsyncMock(),
         )
         orch._run_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
-            return_value=(0.25, "exit", 0, False)
+            return_value=(UsageDelta(cost_usd=0.25), "exit", 0, False)
         )
 
         run_id = await orch._dispatch_one(secondary_binding, issue)  # noqa: SLF001

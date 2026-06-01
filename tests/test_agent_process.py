@@ -19,11 +19,20 @@ def test_parses_claude_result_event() -> None:
             "type": "result",
             "subtype": "success",
             "total_cost_usd": 0.42,
-            "usage": {"input_tokens": 1000, "output_tokens": 200},
+            "usage": {
+                "input_tokens": 1000,
+                "cache_creation_input_tokens": 800,
+                "cache_read_input_tokens": 600,
+                "output_tokens": 200,
+            },
         }
     )
     assert parse_event_line(line) == Usage(
-        cost_usd=0.42, input_tokens=1000, output_tokens=200
+        cost_usd=0.42,
+        input_tokens=1000,
+        output_tokens=200,
+        cache_write_tokens=800,
+        cache_read_tokens=600,
     )
 
 
@@ -92,6 +101,7 @@ def test_parses_codex_token_count_event() -> None:
             "info": {
                 "total_token_usage": {
                     "input_tokens": 1500,
+                    "cached_input_tokens": 1200,
                     "output_tokens": 300,
                     "total_tokens": 1800,
                 }
@@ -101,6 +111,8 @@ def test_parses_codex_token_count_event() -> None:
     usage = parse_event_line(line)
     assert usage is not None
     assert usage.input_tokens == 1500
+    assert usage.cache_read_tokens == 1200
+    assert usage.cache_write_tokens == 0
     assert usage.output_tokens == 300
 
 
@@ -121,7 +133,7 @@ def test_parses_codex_turn_completed_usage() -> None:
         cost_usd=0.0,
         input_tokens=2100,
         output_tokens=550,
-        cached_input_tokens=400,
+        cache_read_tokens=400,
     )
 
 

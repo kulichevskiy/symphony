@@ -59,6 +59,16 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
 
     cur = await conn.execute("PRAGMA table_info(runs)")
     run_cols = {row[1] for row in await cur.fetchall()}
+    for col in (
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_read_tokens",
+    ):
+        if col not in run_cols:
+            await conn.execute(
+                f"ALTER TABLE runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
+            )
     if "termination_kind" not in run_cols:
         await conn.execute(
             "ALTER TABLE runs ADD COLUMN termination_kind TEXT NOT NULL DEFAULT ''"

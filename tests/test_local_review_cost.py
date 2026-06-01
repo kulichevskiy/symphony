@@ -32,13 +32,33 @@ from symphony.pipeline.local_review_session import run_local_review_session
 def test_usage_cost_estimator_claude_uses_reported_cost() -> None:
     est = UsageCostEstimator(agent="claude", codex_model="gpt-5.1-codex")
     delta1 = est.delta(
-        Usage(cost_usd=0.10, input_tokens=100, output_tokens=20)
+        Usage(
+            cost_usd=0.10,
+            input_tokens=100,
+            output_tokens=20,
+            cache_write_tokens=40,
+            cache_read_tokens=60,
+        )
     )
     delta2 = est.delta(
-        Usage(cost_usd=0.25, input_tokens=300, output_tokens=80)
+        Usage(
+            cost_usd=0.25,
+            input_tokens=300,
+            output_tokens=80,
+            cache_write_tokens=10,
+            cache_read_tokens=20,
+        )
     )
-    assert delta1 == pytest.approx(0.10)
-    assert delta2 == pytest.approx(0.25)
+    assert delta1.cost_usd == pytest.approx(0.10)
+    assert delta1.input_tokens == 100
+    assert delta1.output_tokens == 20
+    assert delta1.cache_write_tokens == 40
+    assert delta1.cache_read_tokens == 60
+    assert delta2.cost_usd == pytest.approx(0.25)
+    assert delta2.input_tokens == 300
+    assert delta2.output_tokens == 80
+    assert delta2.cache_write_tokens == 10
+    assert delta2.cache_read_tokens == 20
     assert est.total_cost_usd == pytest.approx(0.35)
 
 
@@ -52,7 +72,7 @@ def test_usage_cost_estimator_codex_charges_token_deltas_only() -> None:
             cost_usd=0.0,
             input_tokens=1000,
             output_tokens=200,
-            cached_input_tokens=0,
+            cache_read_tokens=100,
         )
     )
     delta2 = est.delta(
@@ -60,11 +80,19 @@ def test_usage_cost_estimator_codex_charges_token_deltas_only() -> None:
             cost_usd=0.0,
             input_tokens=1500,  # +500 new input
             output_tokens=350,  # +150 new output
-            cached_input_tokens=0,
+            cache_read_tokens=250,  # +150 new cached input
         )
     )
-    assert delta1 > 0
-    assert delta2 > 0
+    assert delta1.cost_usd > 0
+    assert delta1.input_tokens == 1000
+    assert delta1.output_tokens == 200
+    assert delta1.cache_write_tokens == 0
+    assert delta1.cache_read_tokens == 100
+    assert delta2.cost_usd > 0
+    assert delta2.input_tokens == 500
+    assert delta2.output_tokens == 150
+    assert delta2.cache_write_tokens == 0
+    assert delta2.cache_read_tokens == 150
     # Second call must price the delta, not the cumulative.
     full_run = UsageCostEstimator(agent="codex", codex_model="gpt-5.1-codex")
     delta_full = full_run.delta(
@@ -72,10 +100,10 @@ def test_usage_cost_estimator_codex_charges_token_deltas_only() -> None:
             cost_usd=0.0,
             input_tokens=1500,
             output_tokens=350,
-            cached_input_tokens=0,
+            cache_read_tokens=250,
         )
     )
-    assert est.total_cost_usd == pytest.approx(delta_full)
+    assert est.total_cost_usd == pytest.approx(delta_full.cost_usd)
 
 
 # --- collect_runner_output usage_handler ------------------------------

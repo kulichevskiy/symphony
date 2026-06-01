@@ -140,7 +140,12 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
                 "type": "result",
                 "subtype": "success",
                 "total_cost_usd": 0.42,
-                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 30,
+                    "cache_read_input_tokens": 40,
+                    "output_tokens": 50,
+                },
             }
         )
         events = [
@@ -223,6 +228,10 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert history[0].termination_kind == ""
         assert history[0].termination_detail == ""
         assert history[0].pid == 4242
+        assert history[0].input_tokens == 100
+        assert history[0].output_tokens == 50
+        assert history[0].cache_write_tokens == 30
+        assert history[0].cache_read_tokens == 40
         assert history[1].stage == "review"
         assert history[1].status == "running"
         assert await db.runs.has_running_or_completed(conn, "iss-1") is True

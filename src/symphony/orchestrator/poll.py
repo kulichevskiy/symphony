@@ -106,6 +106,7 @@ from ..pipeline.acceptance_classifier import (
 )
 from ..pipeline.cost_guard import (
     UsageCostEstimator,
+    UsageDelta,
     effective_cap,
     effective_warning_pct,
     evaluate_cost,
@@ -200,6 +201,32 @@ class SlashHandlerFailure(RuntimeError):
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
+
+
+async def _add_run_usage(
+    conn: aiosqlite.Connection, run_id: str, usage: UsageDelta
+) -> None:
+    if not usage.has_usage():
+        return
+    await db.runs.add_usage(
+        conn,
+        run_id,
+        cost_usd=usage.cost_usd,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+    )
+
+
+def _sum_usage(left: UsageDelta, right: UsageDelta) -> UsageDelta:
+    return UsageDelta(
+        cost_usd=left.cost_usd + right.cost_usd,
+        input_tokens=left.input_tokens + right.input_tokens,
+        output_tokens=left.output_tokens + right.output_tokens,
+        cache_write_tokens=left.cache_write_tokens + right.cache_write_tokens,
+        cache_read_tokens=left.cache_read_tokens + right.cache_read_tokens,
+    )
 
 
 def _acceptance_has_where_to_verify(description: str) -> bool:
@@ -4236,7 +4263,7 @@ class Orchestrator:
 
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-                cost, final_kind, final_returncode = await self._run_fix_agent(
+                usage_delta, final_kind, final_returncode = await self._run_fix_agent(
                     binding=binding,
                     issue=issue,
                     run_id=fix_run_id,
@@ -4270,8 +4297,7 @@ class Orchestrator:
                     self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
 
-            if cost > 0:
-                await db.runs.add_cost(self._conn, fix_run_id, cost)
+            await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
                 stage="review",
@@ -4664,7 +4690,7 @@ class Orchestrator:
 
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-                cost, final_kind, final_returncode = await self._run_fix_agent(
+                usage_delta, final_kind, final_returncode = await self._run_fix_agent(
                     binding=binding,
                     issue=issue,
                     run_id=fix_run_id,
@@ -4698,8 +4724,7 @@ class Orchestrator:
                     self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
 
-            if cost > 0:
-                await db.runs.add_cost(self._conn, fix_run_id, cost)
+            await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
                 stage="review",
@@ -5109,7 +5134,7 @@ class Orchestrator:
 
             try:
                 (
-                    cost,
+                    usage_delta,
                     final_kind,
                     final_returncode,
                     cap_breached,
@@ -5151,8 +5176,7 @@ class Orchestrator:
                     self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
 
-            if cost > 0:
-                await db.runs.add_cost(self._conn, fix_run_id, cost)
+            await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             if cap_breached:
                 await db.runs.update_status(
@@ -5165,7 +5189,7 @@ class Orchestrator:
                         cap_breached=True,
                         reason=(
                             "required-check cost cap reached: "
-                            f"${prior_total + cost:.4f}"
+                            f"${prior_total + usage_delta.cost_usd:.4f}"
                         ),
                     ),
                 )
@@ -5175,7 +5199,7 @@ class Orchestrator:
                     pr_url=pr_url,
                     reason=(
                         "required-check cost cap reached: "
-                        f"${prior_total + cost:.4f}"
+                        f"${prior_total + usage_delta.cost_usd:.4f}"
                     ),
                     merge_run_id=merge_run_id,
                 )
@@ -5301,7 +5325,7 @@ class Orchestrator:
         prompt: str,
         prior_total: float,
         cap_usd: float,
-    ) -> tuple[float, str, int | None, bool]:
+    ) -> tuple[UsageDelta, str, int | None, bool]:
         warning_pct = effective_warning_pct(
             global_pct=self.config.cost_warning_pct,
             binding_override=binding.cost_warning_pct,
@@ -5313,7 +5337,7 @@ class Orchestrator:
         if cap_usd > 0:
             max_budget_usd = cap_usd - prior_total
             if max_budget_usd <= 0:
-                return 0.0, "cost_cap", None, True
+                return UsageDelta(), "cost_cap", None, True
         command = build_fix_runner_command(
             binding.agent,
             prompt,
@@ -5450,7 +5474,7 @@ class Orchestrator:
                 await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
             )
             try:
-                cost, final_kind, final_returncode, cap_breached = (
+                usage_delta, final_kind, final_returncode, cap_breached = (
                     await self._run_stage_command(
                         binding=codex_binding,
                         issue=issue,
@@ -5493,10 +5517,9 @@ class Orchestrator:
                     self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
 
-            if cost > 0:
-                await db.runs.add_cost(self._conn, fix_run_id, cost)
+            await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
-            total_cost = prior_total + cost
+            total_cost = prior_total + usage_delta.cost_usd
             if cap_breached:
                 await db.runs.update_status(
                     self._conn,
@@ -5976,7 +5999,7 @@ class Orchestrator:
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
-                cost: float = 0.0
+                cumulative_usage = UsageDelta()
                 if rebase_clean:
                     # No conflicts: skip the agent entirely.
                     log.info(
@@ -5994,8 +6017,12 @@ class Orchestrator:
                     try:
                         prior_total = (
                             await db.runs.cost_for_issue(self._conn, issue.id)
-                        ) + cost
-                        run_cost, final_kind, final_returncode = await self._run_fix_agent(
+                        ) + cumulative_usage.cost_usd
+                        (
+                            run_usage,
+                            final_kind,
+                            final_returncode,
+                        ) = await self._run_fix_agent(
                             binding=binding,
                             issue=issue,
                             run_id=fix_run_id,
@@ -6032,7 +6059,7 @@ class Orchestrator:
                             last_log=str(e),
                         )
                         return False
-                    cost += run_cost
+                    cumulative_usage = _sum_usage(cumulative_usage, run_usage)
 
                     transition = on_runner_event(
                         stage="review",
@@ -6141,8 +6168,7 @@ class Orchestrator:
                     self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
 
-            if cost > 0:
-                await db.runs.add_cost(self._conn, fix_run_id, cost)
+            await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
 
             pushed_sha = await self._validate_review_fix_advanced(
                 run=run,
@@ -8757,7 +8783,11 @@ class Orchestrator:
 
             cap_breached = False
             if verdict.cost > 0:
-                await db.runs.add_cost(self._conn, run_id, verdict.cost)
+                await _add_run_usage(
+                    self._conn,
+                    run_id,
+                    UsageDelta(cost_usd=verdict.cost),
+                )
                 new_total = prior_total + verdict.cost
                 decision = evaluate_cost(
                     previous_total=prior_total,
@@ -8993,7 +9023,11 @@ class Orchestrator:
 
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-                cost, final_kind, final_returncode = await self._run_acceptance_fix_agent(
+                (
+                    usage_delta,
+                    final_kind,
+                    final_returncode,
+                ) = await self._run_acceptance_fix_agent(
                     binding=binding,
                     issue=issue,
                     run_id=fix_run_id,
@@ -9019,8 +9053,7 @@ class Orchestrator:
                 if self._dispatch_run_ids.get(issue.id) == fix_run_id:
                     self._dispatch_run_ids.pop(issue.id, None)
 
-            if cost > 0:
-                await db.runs.add_cost(self._conn, fix_run_id, cost)
+            await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
                 stage="acceptance_fix",
@@ -9688,7 +9721,7 @@ class Orchestrator:
         prior_total = await db.runs.cost_for_issue(self._conn, issue_id)
 
         try:
-            cumulative_cost, final_kind, final_returncode, cap_breached = (
+            cumulative_usage, final_kind, final_returncode, cap_breached = (
                 await self._run_agent(
                     binding=binding,
                     issue=issue,
@@ -9713,13 +9746,8 @@ class Orchestrator:
         finally:
             self._workspace.release(binding, issue)
 
-        # 4. Persist accumulated cost.
-        if cumulative_cost > 0:
-            await self._conn.execute(
-                "UPDATE runs SET cost_usd = ? WHERE id = ?",
-                (cumulative_cost, run_id),
-            )
-            await self._conn.commit()
+        # 4. Persist accumulated usage.
+        await _add_run_usage(self._conn, run_id, cumulative_usage)
 
         # Cost cap breach: park the issue for operator action; do not open a PR.
         if cap_breached:
@@ -9728,7 +9756,7 @@ class Orchestrator:
                 issue=issue,
                 storage_issue_id=issue_id,
                 run_id=run_id,
-                cumulative_total=prior_total + cumulative_cost,
+                cumulative_total=prior_total + cumulative_usage.cost_usd,
             )
             return run_id
 
@@ -9831,7 +9859,7 @@ class Orchestrator:
                     issue=0,
                     pr_url=pr_url or "(no PR)",
                     run_id=run_id,
-                    cost=f"${cumulative_cost:.4f}",
+                    cost=f"${cumulative_usage.cost_usd:.4f}",
                 )
             )
             await tracker.post_comment(issue.id, truncate_body(done_body))
@@ -9955,7 +9983,7 @@ class Orchestrator:
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
                 (
-                    cumulative_cost,
+                    cumulative_usage,
                     final_kind,
                     final_returncode,
                     cap_breached,
@@ -9979,12 +10007,7 @@ class Orchestrator:
                 )
                 return run_id
 
-            if cumulative_cost > 0:
-                await self._conn.execute(
-                    "UPDATE runs SET cost_usd = ? WHERE id = ?",
-                    (cumulative_cost, run_id),
-                )
-                await self._conn.commit()
+            await _add_run_usage(self._conn, run_id, cumulative_usage)
 
             if cap_breached:
                 await self._mark_merge_needs_approval(
@@ -9994,7 +10017,7 @@ class Orchestrator:
                     run_id=run_id,
                     reason=(
                         "cost cap reached: "
-                        f"${prior_total + cumulative_cost:.4f}"
+                        f"${prior_total + cumulative_usage.cost_usd:.4f}"
                     ),
                     cap_breached=True,
                 )
@@ -10609,13 +10632,22 @@ class Orchestrator:
         `LoopResult` (uncaught exception inside the session); mark the
         row failed with zero cost so the row reflects the abort.
         """
-        cost = result.total_cost_usd if result is not None else 0.0
-        if cost > 0:
+        if result is not None:
             try:
-                await db.runs.add_cost(self._conn, run_id, cost)
+                await _add_run_usage(
+                    self._conn,
+                    run_id,
+                    UsageDelta(
+                        cost_usd=result.total_cost_usd,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        cache_write_tokens=result.cache_write_tokens,
+                        cache_read_tokens=result.cache_read_tokens,
+                    ),
+                )
             except Exception:  # noqa: BLE001
                 log.warning(
-                    "could not persist local-review cost for run %s",
+                    "could not persist local-review usage for run %s",
                     run_id,
                 )
         status = _local_review_status_from_result(result)
@@ -11089,9 +11121,9 @@ class Orchestrator:
         run_id: str,
         workspace_path: Path,
         prior_total: float,
-    ) -> tuple[float, str, int | None, bool]:
+    ) -> tuple[UsageDelta, str, int | None, bool]:
         """Spawn the runner and consume events. Returns
-        (cumulative_cost, final_event_kind, final_returncode, cap_breached).
+        (cumulative_usage, final_event_kind, final_returncode, cap_breached).
 
         After every cost-emitting event the cumulative *issue* total
         (prior runs + this run so far) is checked against the cap and
@@ -11118,7 +11150,7 @@ class Orchestrator:
         if cap_usd > 0:
             max_budget_usd = cap_usd - prior_total
             if max_budget_usd <= 0:
-                return 0.0, "cost_cap", None, True
+                return UsageDelta(), "cost_cap", None, True
 
         prompt = implement_prompt(
             issue_title=issue.title,
@@ -11155,7 +11187,7 @@ class Orchestrator:
         workspace_path: Path,
         pr_url: str,
         prior_total: float,
-    ) -> tuple[float, str, int | None, bool]:
+    ) -> tuple[UsageDelta, str, int | None, bool]:
         cap_usd = effective_cap(
             global_cap_usd=self.config.cost_cap_per_issue_usd,
             binding_override=binding.cost_cap_usd,
@@ -11172,7 +11204,7 @@ class Orchestrator:
         if cap_usd > 0:
             max_budget_usd = cap_usd - prior_total
             if max_budget_usd <= 0:
-                return 0.0, "cost_cap", None, True
+                return UsageDelta(), "cost_cap", None, True
 
         prompt = merge_prompt(
             issue_title=issue.title,
@@ -11214,7 +11246,7 @@ class Orchestrator:
         cap_usd: float,
         warning_pct: int,
         warning_already_fired: bool,
-    ) -> tuple[float, str, int | None, bool]:
+    ) -> tuple[UsageDelta, str, int | None, bool]:
         storage_issue_id = storage_issue_id or issue.id
         spec = RunnerSpec(
             run_id=run_id,
@@ -11228,7 +11260,7 @@ class Orchestrator:
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cumulative_cost = 0.0
+        cumulative_usage = UsageDelta()
         final_kind = "exit"
         final_returncode: int | None = None
         cap_breached = False
@@ -11252,10 +11284,12 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
-                            cost_delta = cost_estimator.delta(usage)
-                            previous_total = prior_total + cumulative_cost
-                            cumulative_cost += cost_delta
-                            new_total = prior_total + cumulative_cost
+                            usage_delta = cost_estimator.delta(usage)
+                            previous_total = prior_total + cumulative_usage.cost_usd
+                            cumulative_usage = _sum_usage(
+                                cumulative_usage, usage_delta
+                            )
+                            new_total = prior_total + cumulative_usage.cost_usd
                             if cap_breached:
                                 continue
                             decision = evaluate_cost(
@@ -11283,7 +11317,7 @@ class Orchestrator:
                             binding=binding,
                             issue=issue,
                             line=ev.line,
-                            cumulative_total=prior_total + cumulative_cost,
+                            cumulative_total=prior_total + cumulative_usage.cost_usd,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
@@ -11292,21 +11326,21 @@ class Orchestrator:
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_cost,
+                            cumulative_total=prior_total + cumulative_usage.cost_usd,
                         )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_cost,
+                            cumulative_total=prior_total + cumulative_usage.cost_usd,
                         )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        return cumulative_cost, final_kind, final_returncode, cap_breached
+        return cumulative_usage, final_kind, final_returncode, cap_breached
 
     async def _run_fix_agent(
         self,
@@ -11317,7 +11351,7 @@ class Orchestrator:
         workspace_path: Path,
         prompt: str,
         prior_total: float,
-    ) -> tuple[float, str, int | None]:
+    ) -> tuple[UsageDelta, str, int | None]:
         command = build_fix_runner_command(
             binding.agent,
             prompt,
@@ -11346,7 +11380,7 @@ class Orchestrator:
         workspace_path: Path,
         prompt: str,
         prior_total: float,
-    ) -> tuple[float, str, int | None]:
+    ) -> tuple[UsageDelta, str, int | None]:
         command = build_fix_runner_command(
             binding.agent,
             prompt,
@@ -11380,7 +11414,7 @@ class Orchestrator:
         activity_stage: str | None = None,
         prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
-    ) -> tuple[float, str, int | None]:
+    ) -> tuple[UsageDelta, str, int | None]:
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
@@ -11393,7 +11427,7 @@ class Orchestrator:
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cumulative_cost = 0.0
+        cumulative_usage = UsageDelta()
         final_kind = "exit"
         final_returncode: int | None = None
         cost_estimator = _UsageCostEstimator(agent=agent, codex_model=codex_model)
@@ -11417,13 +11451,15 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
-                            cumulative_cost += cost_estimator.delta(usage)
+                            cumulative_usage = _sum_usage(
+                                cumulative_usage, cost_estimator.delta(usage)
+                            )
                         await self._record_activity_stdout(
                             session=activity,
                             binding=binding,
                             issue=issue,
                             line=ev.line,
-                            cumulative_total=prior_total + cumulative_cost,
+                            cumulative_total=prior_total + cumulative_usage.cost_usd,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
@@ -11432,14 +11468,14 @@ class Orchestrator:
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_cost,
+                            cumulative_total=prior_total + cumulative_usage.cost_usd,
                         )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_cost,
+                            cumulative_total=prior_total + cumulative_usage.cost_usd,
                         )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
@@ -11448,7 +11484,7 @@ class Orchestrator:
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
-        return cumulative_cost, final_kind, final_returncode
+        return cumulative_usage, final_kind, final_returncode
 
     async def _post_cost_warning(
         self,

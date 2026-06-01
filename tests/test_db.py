@@ -133,6 +133,133 @@ async def test_runs_schema_has_termination_columns(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_runs_schema_has_usage_columns_and_migrates_existing_rows(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "legacy.sqlite"
+    legacy = await aiosqlite.connect(p)
+    try:
+        await legacy.executescript(
+            """
+            CREATE TABLE issues (
+                id               TEXT PRIMARY KEY,
+                tracker_issue_id TEXT NOT NULL,
+                provider         TEXT NOT NULL DEFAULT 'linear',
+                site             TEXT NOT NULL DEFAULT 'default',
+                identifier       TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                team_key         TEXT NOT NULL
+            );
+            CREATE TABLE runs (
+                id          TEXT PRIMARY KEY,
+                issue_id    TEXT NOT NULL REFERENCES issues(id),
+                stage       TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                pid         INTEGER,
+                started_at  TEXT NOT NULL,
+                ended_at    TEXT,
+                cost_usd    REAL NOT NULL DEFAULT 0
+            );
+            INSERT INTO issues (
+                id, tracker_issue_id, identifier, title, team_key
+            ) VALUES (
+                'iss-1', 'ISS-1', 'ISS-1', 't', 'ISS'
+            );
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, cost_usd
+            ) VALUES (
+                'run-1', 'iss-1', 'implement', 'completed', NULL,
+                '2026-05-10T00:00:00+00:00', 1.25
+            );
+            """
+        )
+        await legacy.commit()
+    finally:
+        await legacy.close()
+
+    conn = await db.connect(p)
+    try:
+        cur = await conn.execute("PRAGMA table_info(runs)")
+        cols = {row[1]: row for row in await cur.fetchall()}
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "cache_write_tokens",
+            "cache_read_tokens",
+        ):
+            assert cols[name][2] == "INTEGER"
+            assert cols[name][3] == 1
+            assert cols[name][4] == "0"
+
+        cur = await conn.execute(
+            """
+            SELECT input_tokens, output_tokens, cache_write_tokens,
+                   cache_read_tokens
+            FROM runs
+            WHERE id = ?
+            """,
+            ("run-1",),
+        )
+        row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert row is not None
+    assert row["input_tokens"] == 0
+    assert row["output_tokens"] == 0
+    assert row["cache_write_tokens"] == 0
+    assert row["cache_read_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_runs_add_usage_accumulates_all_buckets(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="r1",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        await db.runs.add_usage(
+            conn,
+            "r1",
+            cost_usd=0.10,
+            input_tokens=100,
+            output_tokens=20,
+            cache_write_tokens=30,
+            cache_read_tokens=40,
+        )
+        await db.runs.add_usage(
+            conn,
+            "r1",
+            cost_usd=0.25,
+            input_tokens=5,
+            output_tokens=6,
+            cache_write_tokens=7,
+            cache_read_tokens=8,
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert len(history) == 1
+    assert history[0].cost_usd == pytest.approx(0.35)
+    assert history[0].input_tokens == 105
+    assert history[0].output_tokens == 26
+    assert history[0].cache_write_tokens == 37
+    assert history[0].cache_read_tokens == 48
+
+
+@pytest.mark.asyncio
 async def test_update_status_persists_unknown_for_unclassified_terminal_status(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
