@@ -180,11 +180,16 @@ def _read_usage(paths: tuple[Path, ...]) -> TokenUsage | None:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             return None
+        path_usage: TokenUsage | None = None
+        # Codex token events are cumulative within one process log; only sum
+        # across separate log files.
         for line in lines:
             usage = _usage_from_line(line)
             if usage is None:
                 continue
-            total = _sum_usage(total, usage)
+            path_usage = _token_usage_from_event(usage)
+        if path_usage is not None:
+            total = _sum_usage(total, path_usage)
             found = True
     if not found:
         return None
@@ -198,7 +203,16 @@ def _usage_from_line(line: str) -> Usage | None:
     return parse_event_line(text)
 
 
-def _sum_usage(left: TokenUsage, right: Usage) -> TokenUsage:
+def _token_usage_from_event(usage: Usage) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+    )
+
+
+def _sum_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
     return TokenUsage(
         input_tokens=left.input_tokens + right.input_tokens,
         output_tokens=left.output_tokens + right.output_tokens,

@@ -174,6 +174,15 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
                 }
             },
         },
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 120,
+                "cache_write_tokens": 4,
+                "cached_input_tokens": 80,
+            },
+        },
     )
     _write_log(log_root / "bad-log.out.log", "not json", {"type": "system"})
 
@@ -195,7 +204,7 @@ async def test_runs_backfill_tokens_from_out_logs_and_is_idempotent(
     rows = _token_rows(db_path)
     assert rows["implement-parent"] == (100, 50, 30, 20)
     assert rows["local-review-row"] == (500, 70, 16, 20)
-    assert rows["codex-run"] == (700, 90, 0, 60)
+    assert rows["codex-run"] == (900, 120, 4, 80)
     assert rows["bad-log"] == (7, 7, 7, 7)
     assert rows["missing-log"] == (0, 0, 0, 0)
 
