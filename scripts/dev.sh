@@ -21,7 +21,9 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 # Port the webhook receiver binds to — pulled from config, overridable.
-WEBHOOK_PORT="${SYMPHONY_WEBHOOK_PORT:-$(grep -E '^[[:space:]]*webhook_port:' "$CONFIG" | head -1 | awk '{print $2}')}"
+# `|| true` so a config that omits webhook_port (relying on the daemon's
+# built-in default) doesn't trip `set -euo pipefail` via grep's non-zero exit.
+WEBHOOK_PORT="${SYMPHONY_WEBHOOK_PORT:-$(grep -E '^[[:space:]]*webhook_port:' "$CONFIG" | head -1 | awk '{print $2}' || true)}"
 WEBHOOK_PORT="${WEBHOOK_PORT:-8787}"
 
 START_TUNNEL="${SYMPHONY_TUNNEL:-1}"
@@ -83,9 +85,11 @@ if [[ "$START_TUNNEL" != "0" ]]; then
       sleep 0.5
     done
     if [[ -n "$TUNNEL_URL" ]]; then
+      # The receiver registers POST /linear/webhook (no prefix), so the bare
+      # tunnel origin would 404 — paste the full path into Linear.
       echo
       echo "  ┌─ webhook tunnel ────────────────────────────────────────"
-      echo "  │  $TUNNEL_URL"
+      echo "  │  $TUNNEL_URL/linear/webhook"
       echo "  │  → paste into the Linear webhook URL (logs: $TUNNEL_LOG)"
       echo "  └─────────────────────────────────────────────────────────"
       echo
