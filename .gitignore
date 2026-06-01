@@ -37,9 +37,14 @@ frontend/vite.config.js
 # Local operator config / tool state
 config.local.yaml
 .claude/
+.agents/
+
+# Symphony runtime state — event log + checked-out worktrees
+.symphony/
 
 # Design notes / research — kept locally, not tracked
 docs/
+analysis/
 
 # OS
 .DS_Store
