@@ -75,8 +75,8 @@ describe("RunsSection", () => {
             started_at: "2026-05-17T10:00:00Z",
             ended_at: "2026-05-17T10:10:00Z",
             cost_usd: 1.25,
-            input_tokens: 100,
-            output_tokens: 20,
+            input_tokens: 1_234_000,
+            output_tokens: 340_000,
             cache_write_tokens: 30,
             cache_read_tokens: 40,
             termination_kind: "",
@@ -104,15 +104,15 @@ describe("RunsSection", () => {
     );
 
     expect(markup).toContain("total cost $1.75");
-    expect(markup).toContain("in 100");
-    expect(markup).toContain("out 20");
-    expect(markup).toContain("cache-write 30");
-    expect(markup).toContain("cache-read 40");
+    expect(markup).toContain('title="1234000">1.2M</span>');
+    expect(markup).toContain('title="340000">340k</span>');
+    expect(markup).toContain('title="30">30</span>');
+    expect(markup).toContain('title="40">40</span>');
     expect(markup).toContain(">in</th>");
     expect(markup).toContain(">out</th>");
     expect(markup).toContain(">cache-write</th>");
     expect(markup).toContain(">cache-read</th>");
-    expect(markup).toContain(">0</td>");
+    expect(markup).toContain('title="0">0</span>');
   });
 });
 

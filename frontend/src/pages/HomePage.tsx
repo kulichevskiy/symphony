@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/table";
 import { fetchIssues } from "@/lib/api";
 import type { IssueScope, IssueSummary } from "@/lib/api";
+import { formatTokens } from "@/lib/formatTokens";
 import { cn } from "@/lib/utils";
 
 import {
@@ -50,6 +51,51 @@ function useRelativeActivityClock() {
   }, []);
 
   return nowMs;
+}
+
+function tokenTitle(value: number | null | undefined): string {
+  return String(value ?? 0);
+}
+
+function TokenAmount({ value }: { value: number | null | undefined }) {
+  return <span title={tokenTitle(value)}>{formatTokens(value)}</span>;
+}
+
+export function IssueUsageTotals({ issues }: { issues: IssueSummary[] }) {
+  const total = issues.reduce(
+    (acc, issue) => ({
+      input_tokens: acc.input_tokens + issue.input_tokens,
+      output_tokens: acc.output_tokens + issue.output_tokens,
+      cache_write_tokens: acc.cache_write_tokens + issue.cache_write_tokens,
+      cache_read_tokens: acc.cache_read_tokens + issue.cache_read_tokens,
+    }),
+    {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+    },
+  );
+
+  return (
+    <div
+      aria-label="Visible token usage totals"
+      className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-xs text-muted-foreground"
+    >
+      <span>
+        in <TokenAmount value={total.input_tokens} />
+      </span>
+      <span>
+        out <TokenAmount value={total.output_tokens} />
+      </span>
+      <span>
+        cache-write <TokenAmount value={total.cache_write_tokens} />
+      </span>
+      <span>
+        cache-read <TokenAmount value={total.cache_read_tokens} />
+      </span>
+    </div>
+  );
 }
 
 export function IssueListRow({
@@ -93,6 +139,18 @@ export function IssueListRow({
           <span>No activity</span>
         )}
       </TableCell>
+      <TableCell className="w-24 whitespace-nowrap text-right font-mono text-xs">
+        <TokenAmount value={issue.input_tokens} />
+      </TableCell>
+      <TableCell className="w-24 whitespace-nowrap text-right font-mono text-xs">
+        <TokenAmount value={issue.output_tokens} />
+      </TableCell>
+      <TableCell className="w-28 whitespace-nowrap text-right font-mono text-xs">
+        <TokenAmount value={issue.cache_write_tokens} />
+      </TableCell>
+      <TableCell className="w-28 whitespace-nowrap text-right font-mono text-xs">
+        <TokenAmount value={issue.cache_read_tokens} />
+      </TableCell>
       <TableCell className="max-w-[48rem] whitespace-normal">
         <Link
           to={`/issue/${encodeURIComponent(issue.id)}`}
@@ -103,6 +161,37 @@ export function IssueListRow({
       </TableCell>
       <TableCell className="text-muted-foreground">{issue.team_key}</TableCell>
     </TableRow>
+  );
+}
+
+export function IssueListTable({
+  issues,
+  activityNowMs,
+}: {
+  issues: IssueSummary[];
+  activityNowMs: number;
+}) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-36">Identifier</TableHead>
+          <TableHead className="w-64">Status</TableHead>
+          <TableHead className="w-32">Last activity</TableHead>
+          <TableHead className="w-24 text-right">in</TableHead>
+          <TableHead className="w-24 text-right">out</TableHead>
+          <TableHead className="w-28 text-right">cache-write</TableHead>
+          <TableHead className="w-28 text-right">cache-read</TableHead>
+          <TableHead>Title</TableHead>
+          <TableHead className="w-28">Team</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {issues.map((issue) => (
+          <IssueListRow key={issue.id} issue={issue} activityNowMs={activityNowMs} />
+        ))}
+      </TableBody>
+    </Table>
   );
 }
 
@@ -182,6 +271,7 @@ export function HomePage() {
           <div>
             <h1 className="text-xl font-semibold tracking-normal">Issues</h1>
             <p className="mt-1 text-sm text-muted-foreground">{issues.length} visible</p>
+            <IssueUsageTotals issues={issues} />
           </div>
           <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
             <Input
@@ -237,22 +327,7 @@ export function HomePage() {
         ) : null}
 
         {!issuesQuery.isError && issues.length > 0 ? (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-36">Identifier</TableHead>
-                <TableHead className="w-64">Status</TableHead>
-                <TableHead className="w-32">Last activity</TableHead>
-                <TableHead>Title</TableHead>
-                <TableHead className="w-28">Team</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {issues.map((issue) => (
-                <IssueListRow key={issue.id} issue={issue} activityNowMs={activityNowMs} />
-              ))}
-            </TableBody>
-          </Table>
+          <IssueListTable issues={issues} activityNowMs={activityNowMs} />
         ) : null}
       </div>
     </main>

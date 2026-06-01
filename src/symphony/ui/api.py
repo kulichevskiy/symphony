@@ -34,6 +34,10 @@ class IssueSummary(BaseModel):
     identifier: str
     title: str
     team_key: str
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
     latest_activity_ts: str | None
     latest_activity_age_secs: int | None
     canonical_status: CanonicalStatusPayload
@@ -181,6 +185,10 @@ def _list_issues_query(
             i.identifier,
             i.title,
             i.team_key,
+            COALESCE(ru.input_tokens, 0) AS input_tokens,
+            COALESCE(ru.output_tokens, 0) AS output_tokens,
+            COALESCE(ru.cache_write_tokens, 0) AS cache_write_tokens,
+            COALESCE(ru.cache_read_tokens, 0) AS cache_read_tokens,
             la.latest_activity_ts,
             CASE
                 WHEN la.latest_activity_ts IS NULL THEN NULL
@@ -191,6 +199,16 @@ def _list_issues_query(
             END AS latest_activity_age_secs
         FROM issues i
         LEFT JOIN latest_activity la ON la.issue_id = i.id
+        LEFT JOIN (
+            SELECT
+                issue_id,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_write_tokens) AS cache_write_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens
+            FROM runs
+            GROUP BY issue_id
+        ) ru ON ru.issue_id = i.id
         {where_sql}
         """,
         tuple(params),

@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 import { fetchIssueDetail, fetchIssueExternal, fetchIssueObservations } from "@/lib/api";
+import { formatTokens } from "@/lib/formatTokens";
 import type {
   DriftFlag,
   ExternalObservation,
@@ -135,7 +136,8 @@ function RunStatusBadge({ status }: { status: string | null | undefined }) {
 const SUCCESS_RUN_STATUSES = new Set(["completed", "done"]);
 
 function tokenCount(value: number | null | undefined) {
-  return String(value ?? 0);
+  const exact = String(value ?? 0);
+  return <span title={exact}>{formatTokens(value)}</span>;
 }
 
 function formatCost(value: number) {

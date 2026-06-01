@@ -18,6 +18,20 @@ from .test_webhook import NOW, SECRET, _body, _Handler, _headers, _payload
 UI_NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 
 
+def _token_totals(
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> dict[str, int]:
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_read_tokens": cache_read_tokens,
+    }
+
+
 class _FakeExternalService:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
@@ -330,6 +344,7 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-1",
             "title": "Earlier issue",
             "team_key": "ADJ",
+            **_token_totals(),
             "latest_activity_ts": None,
             "latest_activity_age_secs": None,
             "canonical_status": {
@@ -344,6 +359,7 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-2",
             "title": "Known tracked issue",
             "team_key": "ADJ",
+            **_token_totals(),
             "latest_activity_ts": None,
             "latest_activity_age_secs": None,
             "canonical_status": {
@@ -358,6 +374,7 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "ADJ-10",
             "title": "Later issue",
             "team_key": "ADJ",
+            **_token_totals(),
             "latest_activity_ts": None,
             "latest_activity_age_secs": None,
             "canonical_status": {
@@ -372,6 +389,7 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             "identifier": "WEB-1",
             "title": "Other team issue",
             "team_key": "WEB",
+            **_token_totals(),
             "latest_activity_ts": None,
             "latest_activity_age_secs": None,
             "canonical_status": {
@@ -491,6 +509,7 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-1",
             "title": "Stuck PR issue",
             "team_key": "ENG",
+            **_token_totals(),
             "latest_activity_ts": "2026-05-16T11:00:00Z",
             "latest_activity_age_secs": 90000,
             "canonical_status": {
@@ -506,6 +525,7 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-2",
             "title": "Running issue",
             "team_key": "ENG",
+            **_token_totals(),
             "latest_activity_ts": "2026-05-17T11:45:00Z",
             "latest_activity_age_secs": 900,
             "canonical_status": {
@@ -520,6 +540,7 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-3",
             "title": "Awaiting review issue",
             "team_key": "ENG",
+            **_token_totals(),
             "latest_activity_ts": "2026-05-17T11:55:00Z",
             "latest_activity_age_secs": 300,
             "canonical_status": {
@@ -534,6 +555,7 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             "identifier": "ENG-4",
             "title": "Idle issue",
             "team_key": "ENG",
+            **_token_totals(),
             "latest_activity_ts": None,
             "latest_activity_age_secs": None,
             "canonical_status": {
@@ -544,6 +566,76 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             },
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_api_issues_returns_per_issue_token_aggregates(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="with-runs",
+            identifier="ENG-1",
+            title="Token-heavy issue",
+            team_key="ENG",
+        )
+        await db.issues.upsert(
+            conn,
+            id="without-runs",
+            identifier="ENG-2",
+            title="No runs yet",
+            team_key="ENG",
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens
+            )
+            VALUES
+                ('run-implement', 'with-runs', 'implement', 'completed', NULL,
+                 '2026-05-17T11:00:00Z', '2026-05-17T11:05:00Z', 0,
+                 100, 20, 30, 40),
+                ('run-review', 'with-runs', 'review', 'failed', NULL,
+                 '2026-05-17T11:10:00Z', '2026-05-17T11:15:00Z', 0,
+                 5, 6, 7, 8),
+                ('run-merge', 'with-runs', 'merge', 'running', NULL,
+                 '2026-05-17T11:20:00Z', NULL, 0,
+                 9, 10, 11, 12)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues?scope=all")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    rows = {row["id"]: row for row in response.json()}
+    with_runs_totals = _token_totals(
+        input_tokens=114,
+        output_tokens=36,
+        cache_write_tokens=48,
+        cache_read_tokens=60,
+    )
+    without_runs_totals = _token_totals()
+    assert {key: rows["with-runs"][key] for key in with_runs_totals} == with_runs_totals
+    assert {key: rows["without-runs"][key] for key in without_runs_totals} == without_runs_totals
 
 
 @pytest.mark.asyncio

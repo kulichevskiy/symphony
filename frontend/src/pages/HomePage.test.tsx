@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import type { IssueSummary } from "@/lib/api";
 
-import { IssueListRow } from "./HomePage";
+import { IssueListRow, IssueListTable, IssueUsageTotals } from "./HomePage";
 
 const NOW_MS = Date.UTC(2026, 4, 17, 12, 0, 0);
 
@@ -12,12 +12,19 @@ function timestampForAge(ageSecs: number): string {
   return new Date(NOW_MS - ageSecs * 1000).toISOString().replace(".000Z", "Z");
 }
 
-function issueWithAge(ageSecs: number | null): IssueSummary {
+function issueWithAge(
+  ageSecs: number | null,
+  overrides: Partial<IssueSummary> = {},
+): IssueSummary {
   return {
     id: `issue-${ageSecs ?? "none"}`,
     identifier: "VIB-16",
     title: "Stale issue",
     team_key: "VIB",
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_write_tokens: 0,
+    cache_read_tokens: 0,
     latest_activity_ts: ageSecs === null ? null : timestampForAge(ageSecs),
     latest_activity_age_secs: ageSecs,
     canonical_status: {
@@ -26,6 +33,7 @@ function issueWithAge(ageSecs: number | null): IssueSummary {
       subtitle: null,
       stuck_for: null,
     },
+    ...overrides,
   };
 }
 
@@ -39,6 +47,18 @@ function renderRow(issue: IssueSummary): string {
       </table>
     </MemoryRouter>,
   );
+}
+
+function renderTable(issues: IssueSummary[]): string {
+  return renderToStaticMarkup(
+    <MemoryRouter>
+      <IssueListTable issues={issues} activityNowMs={NOW_MS} />
+    </MemoryRouter>,
+  );
+}
+
+function renderTotals(issues: IssueSummary[]): string {
+  return renderToStaticMarkup(<IssueUsageTotals issues={issues} />);
 }
 
 describe("IssueListRow activity freshness", () => {
@@ -101,5 +121,60 @@ describe("IssueListRow activity freshness", () => {
     expect(markup).toContain("1 field(s) disagree");
     expect(markup).toContain("stuck 1h");
     expect(markup).toContain("bg-red-100");
+  });
+});
+
+describe("issue token usage", () => {
+  it("renders token columns with abbreviated values and exact titles", () => {
+    const markup = renderTable([
+      issueWithAge(30 * 60, {
+        input_tokens: 1_234_000,
+        output_tokens: 340_000,
+        cache_write_tokens: 999,
+        cache_read_tokens: 1_000,
+      }),
+    ]);
+
+    expect(markup).toContain(">in</th>");
+    expect(markup).toContain(">out</th>");
+    expect(markup).toContain(">cache-write</th>");
+    expect(markup).toContain(">cache-read</th>");
+    expect(markup).toContain('title="1234000">1.2M</span>');
+    expect(markup).toContain('title="340000">340k</span>');
+    expect(markup).toContain('title="999">999</span>');
+    expect(markup).toContain('title="1000">1k</span>');
+  });
+
+  it("summarizes the currently visible rows without a cost figure", () => {
+    const activeMarkup = renderTotals([
+      issueWithAge(30 * 60, {
+        input_tokens: 1_000,
+        output_tokens: 200,
+        cache_write_tokens: 30,
+        cache_read_tokens: 40,
+      }),
+    ]);
+    const allMarkup = renderTotals([
+      issueWithAge(30 * 60, {
+        input_tokens: 1_000,
+        output_tokens: 200,
+        cache_write_tokens: 30,
+        cache_read_tokens: 40,
+      }),
+      issueWithAge(60 * 60, {
+        id: "issue-extra",
+        input_tokens: 200,
+        output_tokens: 300,
+        cache_write_tokens: 70,
+        cache_read_tokens: 60,
+      }),
+    ]);
+
+    expect(activeMarkup).toContain('title="1000">1k</span>');
+    expect(activeMarkup).toContain('title="200">200</span>');
+    expect(allMarkup).toContain('title="1200">1.2k</span>');
+    expect(allMarkup).toContain('title="500">500</span>');
+    expect(allMarkup).toContain('title="100">100</span>');
+    expect(allMarkup).not.toContain("cost");
   });
 });
