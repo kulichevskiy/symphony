@@ -90,16 +90,59 @@ def _profile_uses_legacy_project_roots(profile: dict[str, object]) -> bool:
     )
 
 
+def _split_dotted_key(header: str) -> list[str] | None:
+    """Split a TOML table header into its key parts, honoring quotes.
+
+    Returns the unquoted components (e.g. `permissions."symphony-git".network`
+    -> `["permissions", "symphony-git", "network"]`), or `None` if the header is
+    malformed. Quoting matters: TOML treats `permissions.symphony-git` and
+    `permissions."symphony-git"` as the same table path, so prefix matching on
+    the raw text would miss a hand-written quoted profile and leave its tables in
+    place (which then collide with the unquoted block we append).
+    """
+    parts: list[str] = []
+    i, n = 0, len(header)
+    while i < n:
+        while i < n and header[i] in " \t":
+            i += 1
+        if i >= n:
+            break
+        if header[i] in "\"'":
+            quote = header[i]
+            i += 1
+            start = i
+            while i < n and header[i] != quote:
+                i += 1
+            if i >= n:
+                return None  # unterminated quote
+            parts.append(header[start:i])
+            i += 1
+        else:
+            start = i
+            while i < n and header[i] not in ".\"' \t":
+                i += 1
+            parts.append(header[start:i])
+        while i < n and header[i] in " \t":
+            i += 1
+        if i < n:
+            if header[i] == ".":
+                i += 1
+            else:
+                return None  # unexpected character after a key part
+    return parts
+
+
 def _strip_symphony_profile_tables(config_text: str) -> str:
     """Drop every `[permissions.<profile>...]` table for the managed profile."""
-    prefix = f"permissions.{SYMPHONY_PERMISSIONS_PROFILE}"
+    managed = ["permissions", SYMPHONY_PERMISSIONS_PROFILE]
     kept: list[str] = []
     skipping = False
     for raw_line in config_text.splitlines(keepends=True):
         stripped = raw_line.lstrip()
         if stripped.startswith("["):
             header = stripped[1:].split("]", 1)[0].strip()
-            skipping = header == prefix or header.startswith(f"{prefix}.")
+            parts = _split_dotted_key(header)
+            skipping = parts is not None and parts[:2] == managed
             if skipping:
                 continue
         if skipping:

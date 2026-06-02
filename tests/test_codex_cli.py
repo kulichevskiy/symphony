@@ -112,6 +112,40 @@ enabled = false
     assert profile["network"]["enabled"] is False
 
 
+def test_ensure_symphony_permissions_profile_migrates_quoted_legacy_header(
+    tmp_path: Path,
+) -> None:
+    # A hand-written legacy profile may quote the dotted key. TOML treats
+    # `permissions."symphony-git"` and `permissions.symphony-git` as the same
+    # path, so the stale tables must still be stripped before the unquoted
+    # replacement block is appended (otherwise tomllib rejects the duplicate).
+    config_path = tmp_path / "config.toml"
+    legacy = f"""
+[permissions."{SYMPHONY_PERMISSIONS_PROFILE}".filesystem]
+":root" = "read"
+
+[permissions."{SYMPHONY_PERMISSIONS_PROFILE}".filesystem.":project_roots"]
+"." = "write"
+".git" = "write"
+
+[permissions."{SYMPHONY_PERMISSIONS_PROFILE}".network]
+enabled = false
+""".lstrip()
+    config_path.write_text(legacy, encoding="utf-8")
+
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is True
+    updated = config_path.read_text(encoding="utf-8")
+    assert ":project_roots" not in updated
+    # Must parse cleanly — no duplicate-table collision.
+    parsed = tomllib.loads(updated)
+    profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
+    assert profile["filesystem"][":workspace_roots"]["."] == "write"
+    assert profile["filesystem"][":workspace_roots"][".git"] == "write"
+
+
 def test_ensure_symphony_permissions_profile_leaves_unrelated_profile_legacy_token(
     tmp_path: Path,
 ) -> None:
