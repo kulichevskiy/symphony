@@ -47,10 +47,11 @@ def test_ensure_symphony_permissions_profile_creates_missing_config(
     assert created is True
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
     profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
-    assert profile["filesystem"][":project_roots"][".git"] == "write"
-    assert profile["filesystem"][":project_roots"]["."] == "write"
-    assert profile["filesystem"][":project_roots"][".agents"] == "read"
-    assert profile["filesystem"][":project_roots"][".codex"] == "read"
+    # Codex >= 0.136 uses the `:workspace_roots` token; `:project_roots` is gone.
+    assert profile["filesystem"][":workspace_roots"] == "write"
+    assert profile["filesystem"][":root"] == "read"
+    assert profile["filesystem"]["/tmp"] == "write"
+    assert ":project_roots" not in profile["filesystem"]
     assert profile["network"]["enabled"] is False
 
 
@@ -61,6 +62,65 @@ def test_ensure_symphony_permissions_profile_preserves_existing_profile(
     existing = f"""
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
 enabled = true
+""".lstrip()
+    config_path.write_text(existing, encoding="utf-8")
+
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is False
+    assert config_path.read_text(encoding="utf-8") == existing
+
+
+def test_ensure_symphony_permissions_profile_migrates_legacy_project_roots(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    legacy = f"""
+model = "gpt-5.5"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem]
+":root" = "read"
+"/tmp" = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":project_roots"]
+"." = "write"
+".git" = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
+enabled = false
+""".lstrip()
+    config_path.write_text(legacy, encoding="utf-8")
+
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is True
+    updated = config_path.read_text(encoding="utf-8")
+    assert ":project_roots" not in updated
+    # Operator content outside the managed profile is preserved.
+    assert 'model = "gpt-5.5"' in updated
+    parsed = tomllib.loads(updated)
+    profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
+    assert profile["filesystem"][":workspace_roots"] == "write"
+    assert profile["network"]["enabled"] is False
+
+
+def test_ensure_symphony_permissions_profile_leaves_unrelated_profile_legacy_token(
+    tmp_path: Path,
+) -> None:
+    # A `:project_roots` token under a *different* profile is the operator's own
+    # config and must not be touched.
+    config_path = tmp_path / "config.toml"
+    existing = f"""
+[permissions.workspace.filesystem]
+":project_roots" = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem]
+":workspace_roots" = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
+enabled = false
 """.lstrip()
     config_path.write_text(existing, encoding="utf-8")
 
