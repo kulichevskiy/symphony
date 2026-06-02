@@ -30,7 +30,7 @@ watch comments and state transitions appear as the work progresses.
 | [`uv`](https://docs.astral.sh/uv/) | `uv --version` |
 | `git` | `git --version` |
 | GitHub CLI `gh` | `gh --version` |
-| One agent CLI: [`claude`](https://docs.claude.com/en/docs/claude-code) **or** [`codex`](https://github.com/openai/codex) | `claude --version` / `codex --version` |
+| One agent CLI: [`claude`](https://docs.claude.com/en/docs/claude-code) **or** [`codex`](https://github.com/openai/codex) **0.136+** | `claude --version` / `codex --version` |
 | A Linear API key (`lin_api_…`) | from Linear → Settings → API |
 | Write access to the GitHub repo(s) you target | `gh auth status` |
 
@@ -120,6 +120,11 @@ Notes:
 - Using `agent: codex`? Add `codex_model` to the binding (e.g.
   `codex_model: gpt-5.1-codex`). `preflight` will set up and verify the Codex
   permissions profile it needs for unattended commits — no manual TOML editing.
+  **Requires Codex CLI 0.136+:** the profile grants workspace + `.git` writes
+  via the `:workspace_roots` filesystem token. Older builds used `:project_roots`,
+  which current Codex silently ignores — leaving the workspace read-only so the
+  agent can't commit. `preflight` rewrites a stale `:project_roots` profile
+  automatically; re-run it after upgrading Codex.
 - Using the remote `@codex review` bot? Install the **Codex GitHub App** on the
   target repo.
 
@@ -210,6 +215,15 @@ Stop the process (Ctrl-C) and start it again.
 
 **`preflight` fails.** Fix `.env` or the YAML it complains about before starting
 the daemon — don't run with a bad config.
+
+**Codex runs halt with "review fix-run completed without advancing" /
+"Operation not permitted" on `.git`.** The Codex permissions profile is stale
+or Codex is too old. Current Codex (0.136+) drops the legacy `:project_roots`
+token the profile used to rely on, leaving the workspace read-only so the agent
+edits files but can't commit. Upgrade Codex (`codex --version` ≥ 0.136), then
+re-run `uv run symphony preflight` to rewrite the `symphony-git` profile to the
+`:workspace_roots` token. No daemon restart is needed — Codex re-reads
+`~/.codex/config.toml` on each run.
 
 **Agent process seems hung.** It's killed automatically after
 `stall_timeout_secs` of no output. Inspect with

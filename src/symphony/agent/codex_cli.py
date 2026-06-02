@@ -13,20 +13,37 @@ CODEX_DEFAULT_PERMISSIONS_CONFIG = (
 )
 CODEX_APPROVAL_POLICY_CONFIG = 'approval_policy="never"'
 
+# Grant write to the workspace via the `:workspace_roots` token. Codex >= 0.136
+# dropped the older `:project_roots` table (it logs "is not recognized by this
+# version" and silently ignores it, leaving the checkout and `.git` read-only so
+# the agent can edit nothing and every commit fails). `:workspace_roots` is the
+# current token for the agent's working root (`:cwd`/`:workspace` do not grant
+# the root). We scope it with per-subpath rules: `.` grants the project tree, and
+# `.git` is granted explicitly because once subpaths are listed, `.git` reverts
+# to read-only — verified under `codex exec`, where `.` alone leaves `.git`
+# read-only and every commit fails with "Unable to create .git/index.lock:
+# Operation not permitted". `.codex`/`.agents` are pinned read-only so an
+# unattended agent can't rewrite the control dirs (its own config/instructions)
+# that drive later runs in the same checkout.
 SYMPHONY_PERMISSIONS_PROFILE_TOML = f"""
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem]
 ":root" = "read"
 "/tmp" = "write"
 
-[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":project_roots"]
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":workspace_roots"]
 "." = "write"
 ".git" = "write"
-".agents" = "read"
 ".codex" = "read"
+".agents" = "read"
 
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
 enabled = false
 """.strip()
+
+# Legacy filesystem token that Codex < 0.136 used to scope writes to the project
+# roots. Profiles that still carry it are silently broken on current Codex and
+# must be rewritten (see `ensure_symphony_permissions_profile`).
+_LEGACY_PROJECT_ROOTS_TOKEN = ":project_roots"
 _EMPTY_INLINE_PERMISSIONS_RE = re.compile(
     r"""^\s*(?:"permissions"|'permissions'|permissions)\s*=\s*\{\s*\}\s*(?:#.*)?$"""
 )
@@ -59,13 +76,91 @@ def _drop_empty_inline_permissions_assignment(config_text: str) -> tuple[str, bo
     return "".join(lines), removed
 
 
+def _profile_uses_legacy_project_roots(profile: dict[str, object]) -> bool:
+    """True if the profile relies on the legacy `:project_roots` filesystem token.
+
+    Such a profile was written for Codex < 0.136 and is silently broken on
+    current Codex (the workspace and `.git` stay read-only), so it must be
+    rewritten rather than preserved.
+    """
+    filesystem = profile.get("filesystem")
+    return (
+        isinstance(filesystem, dict)
+        and _LEGACY_PROJECT_ROOTS_TOKEN in filesystem
+    )
+
+
+def _split_dotted_key(header: str) -> list[str] | None:
+    """Split a TOML table header into its key parts, honoring quotes.
+
+    Returns the unquoted components (e.g. `permissions."symphony-git".network`
+    -> `["permissions", "symphony-git", "network"]`), or `None` if the header is
+    malformed. Quoting matters: TOML treats `permissions.symphony-git` and
+    `permissions."symphony-git"` as the same table path, so prefix matching on
+    the raw text would miss a hand-written quoted profile and leave its tables in
+    place (which then collide with the unquoted block we append).
+    """
+    parts: list[str] = []
+    i, n = 0, len(header)
+    while i < n:
+        while i < n and header[i] in " \t":
+            i += 1
+        if i >= n:
+            break
+        if header[i] in "\"'":
+            quote = header[i]
+            i += 1
+            start = i
+            while i < n and header[i] != quote:
+                i += 1
+            if i >= n:
+                return None  # unterminated quote
+            parts.append(header[start:i])
+            i += 1
+        else:
+            start = i
+            while i < n and header[i] not in ".\"' \t":
+                i += 1
+            parts.append(header[start:i])
+        while i < n and header[i] in " \t":
+            i += 1
+        if i < n:
+            if header[i] == ".":
+                i += 1
+            else:
+                return None  # unexpected character after a key part
+    return parts
+
+
+def _strip_symphony_profile_tables(config_text: str) -> str:
+    """Drop every `[permissions.<profile>...]` table for the managed profile."""
+    managed = ["permissions", SYMPHONY_PERMISSIONS_PROFILE]
+    kept: list[str] = []
+    skipping = False
+    for raw_line in config_text.splitlines(keepends=True):
+        stripped = raw_line.lstrip()
+        if stripped.startswith("["):
+            header = stripped[1:].split("]", 1)[0].strip()
+            parts = _split_dotted_key(header)
+            skipping = parts is not None and parts[:2] == managed
+            if skipping:
+                continue
+        if skipping:
+            continue
+        kept.append(raw_line)
+    return "".join(kept)
+
+
 def ensure_symphony_permissions_profile(
     config_path: Path | None = None,
 ) -> tuple[Path, bool]:
     """Ensure Codex has the named profile that can write managed `.git` dirs.
 
-    Returns `(path, created)`. Existing profiles are treated as operator-owned:
-    if the profile is already present, this function does not rewrite it.
+    Returns `(path, created)`. Existing profiles are treated as operator-owned
+    and left untouched, with one exception: a profile still using the legacy
+    `:project_roots` filesystem token is silently broken on Codex >= 0.136, so
+    it is rewritten to the current `:workspace_roots`-based block (and `created`
+    is `True`).
     """
     path = config_path or codex_config_path()
     existing = ""
@@ -101,7 +196,29 @@ def ensure_symphony_permissions_profile(
                     "as a non-table value; add the permissions profile manually."
             )
             if isinstance(profile, dict):
-                return path, False
+                if not _profile_uses_legacy_project_roots(profile):
+                    return path, False
+                # Legacy profile written for an older Codex: strip its tables so
+                # the current `:workspace_roots`-based block is re-appended below.
+                stripped = _strip_symphony_profile_tables(existing)
+                # `_strip_symphony_profile_tables` only removes
+                # `[permissions.symphony-git...]` table sections. A profile
+                # written as an inline table (`permissions = { "symphony-git" =
+                # {...} }`) survives stripping, and re-appending the block would
+                # duplicate the table path and corrupt the file. Don't write a
+                # broken config — hand the operator the exact block to paste.
+                leftover = tomllib.loads(stripped).get("permissions")
+                if (
+                    isinstance(leftover, dict)
+                    and SYMPHONY_PERMISSIONS_PROFILE in leftover
+                ):
+                    raise CodexPermissionsProfileError(
+                        f"Codex config {path} defines a stale "
+                        f"{SYMPHONY_PERMISSIONS_PROFILE!r} profile as an inline "
+                        "table that cannot be rewritten automatically. Replace "
+                        f"it with this block:\n\n{SYMPHONY_PERMISSIONS_PROFILE_TOML}"
+                    )
+                existing = stripped
             if profile is None:
                 existing, _ = _drop_empty_inline_permissions_assignment(existing)
 
