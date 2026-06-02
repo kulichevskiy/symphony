@@ -171,6 +171,25 @@ enabled = false
     assert config_path.read_text(encoding="utf-8") == existing
 
 
+def test_ensure_symphony_permissions_profile_reports_inline_legacy_profile(
+    tmp_path: Path,
+) -> None:
+    # A stale profile written as an inline table can't be stripped by section,
+    # so rather than corrupting the file with a duplicate table the rewrite must
+    # surface a clear error carrying the exact block to paste.
+    config_path = tmp_path / "config.toml"
+    existing = (
+        f'permissions = {{ "{SYMPHONY_PERMISSIONS_PROFILE}" = '
+        '{ filesystem = { ":project_roots" = { "." = "write" } } } }\n'
+    )
+    config_path.write_text(existing, encoding="utf-8")
+
+    with pytest.raises(CodexPermissionsProfileError, match="inline table"):
+        ensure_symphony_permissions_profile(config_path)
+    # The broken config is left untouched, not half-rewritten.
+    assert config_path.read_text(encoding="utf-8") == existing
+
+
 def test_ensure_symphony_permissions_profile_reports_invalid_toml(
     tmp_path: Path,
 ) -> None:

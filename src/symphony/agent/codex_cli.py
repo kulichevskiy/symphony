@@ -200,7 +200,25 @@ def ensure_symphony_permissions_profile(
                     return path, False
                 # Legacy profile written for an older Codex: strip its tables so
                 # the current `:workspace_roots`-based block is re-appended below.
-                existing = _strip_symphony_profile_tables(existing)
+                stripped = _strip_symphony_profile_tables(existing)
+                # `_strip_symphony_profile_tables` only removes
+                # `[permissions.symphony-git...]` table sections. A profile
+                # written as an inline table (`permissions = { "symphony-git" =
+                # {...} }`) survives stripping, and re-appending the block would
+                # duplicate the table path and corrupt the file. Don't write a
+                # broken config — hand the operator the exact block to paste.
+                leftover = tomllib.loads(stripped).get("permissions")
+                if (
+                    isinstance(leftover, dict)
+                    and SYMPHONY_PERMISSIONS_PROFILE in leftover
+                ):
+                    raise CodexPermissionsProfileError(
+                        f"Codex config {path} defines a stale "
+                        f"{SYMPHONY_PERMISSIONS_PROFILE!r} profile as an inline "
+                        "table that cannot be rewritten automatically. Replace "
+                        f"it with this block:\n\n{SYMPHONY_PERMISSIONS_PROFILE_TOML}"
+                    )
+                existing = stripped
             if profile is None:
                 existing, _ = _drop_empty_inline_permissions_assignment(existing)
 
