@@ -17,18 +17,24 @@ CODEX_APPROVAL_POLICY_CONFIG = 'approval_policy="never"'
 # dropped the older `:project_roots` table (it logs "is not recognized by this
 # version" and silently ignores it, leaving the checkout and `.git` read-only so
 # the agent can edit nothing and every commit fails). `:workspace_roots` is the
-# current token for the agent's working root: under `codex exec` it grants write
-# to both the project tree and its `.git`, which is what agents need to commit.
-# (`:cwd`/`:workspace` do not grant the root; `:workspace_roots` is the one that
-# resolves to the materialized workspace.) The flat filesystem table only
-# accepts absolute / `~` / `:`-prefixed keys on 0.136, so per-subpath read-only
-# pins (e.g. `.agents`/`.codex`) can no longer be expressed here; any such edits
-# surface in the run's diff/review.
+# current token for the agent's working root (`:cwd`/`:workspace` do not grant
+# the root). We scope it with per-subpath rules: `.` grants the project tree, and
+# `.git` is granted explicitly because once subpaths are listed, `.git` reverts
+# to read-only — verified under `codex exec`, where `.` alone leaves `.git`
+# read-only and every commit fails with "Unable to create .git/index.lock:
+# Operation not permitted". `.codex`/`.agents` are pinned read-only so an
+# unattended agent can't rewrite the control dirs (its own config/instructions)
+# that drive later runs in the same checkout.
 SYMPHONY_PERMISSIONS_PROFILE_TOML = f"""
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem]
 ":root" = "read"
 "/tmp" = "write"
-":workspace_roots" = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":workspace_roots"]
+"." = "write"
+".git" = "write"
+".codex" = "read"
+".agents" = "read"
 
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
 enabled = false

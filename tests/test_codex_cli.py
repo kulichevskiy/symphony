@@ -48,7 +48,12 @@ def test_ensure_symphony_permissions_profile_creates_missing_config(
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
     profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
     # Codex >= 0.136 uses the `:workspace_roots` token; `:project_roots` is gone.
-    assert profile["filesystem"][":workspace_roots"] == "write"
+    # Subpaths scope it: `.`/`.git` writable, control dirs read-only.
+    workspace_roots = profile["filesystem"][":workspace_roots"]
+    assert workspace_roots["."] == "write"
+    assert workspace_roots[".git"] == "write"
+    assert workspace_roots[".codex"] == "read"
+    assert workspace_roots[".agents"] == "read"
     assert profile["filesystem"][":root"] == "read"
     assert profile["filesystem"]["/tmp"] == "write"
     assert ":project_roots" not in profile["filesystem"]
@@ -102,7 +107,8 @@ enabled = false
     assert 'model = "gpt-5.5"' in updated
     parsed = tomllib.loads(updated)
     profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
-    assert profile["filesystem"][":workspace_roots"] == "write"
+    assert profile["filesystem"][":workspace_roots"]["."] == "write"
+    assert profile["filesystem"][":workspace_roots"][".git"] == "write"
     assert profile["network"]["enabled"] is False
 
 
