@@ -250,7 +250,7 @@ async def run_local_review_loop(
         # Heartbeat: fire the callback once per iteration so the
         # orchestrator can post a Linear comment ("iteration N:
         # changes_requested"). Done after the parse so the callback sees
-        # the verdict, but before the cap/skip/fix checks so the signal
+        # the verdict, but before the cap/fix checks so the signal
         # reaches the operator even when the loop is about to exit.
         if on_iteration is not None:
             try:
