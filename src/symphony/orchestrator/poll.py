@@ -3984,13 +3984,15 @@ class Orchestrator:
                     mergeable=mergeable,
                 ),
             )
-            if remote_review and not should_dispatch_fix_run(
+            if not should_dispatch_fix_run(
                 prev_signature=state.last_trigger_signature,
                 new_signature=verdict.trigger_signature,
             ):
                 # Red CI normally pre-empts review signals, but once that exact
-                # CI failure has already dispatched a fix-run we still need to
-                # notice later Codex/human review comments on the same head.
+                # CI failure has already dispatched a fix-run we still need
+                # to notice later review comments on the same head. Local-only
+                # bindings still ignore Codex bot signals here; they only
+                # honor human review-state changes.
                 try:
                     raw_reviews = await self._gh.pr_reviews(
                         state.pr_number, repo=binding.github_repo
@@ -4005,33 +4007,44 @@ class Orchestrator:
                     )
                     review_signal_reviews = ()
 
-                try:
-                    raw_comments = await self._gh.pr_review_comments(
-                        state.pr_number, repo=binding.github_repo
-                    )
-                    review_signal_comments = _review_comments_from_github(raw_comments)
-                except GitHubError as e:
-                    log.warning(
-                        "could not fetch PR review comments for %s#%d: %s",
-                        binding.github_repo,
-                        state.pr_number,
-                        e,
-                    )
-                    review_signal_comments = []
+                review_signal_comments: list[ReviewComment] = []
+                review_signal_reactions: tuple[Reaction, ...] = ()
+                if remote_review:
+                    try:
+                        raw_comments = await self._gh.pr_review_comments(
+                            state.pr_number, repo=binding.github_repo
+                        )
+                        review_signal_comments = _review_comments_from_github(
+                            raw_comments
+                        )
+                    except GitHubError as e:
+                        log.warning(
+                            "could not fetch PR review comments for %s#%d: %s",
+                            binding.github_repo,
+                            state.pr_number,
+                            e,
+                        )
+                        review_signal_comments = []
 
-                try:
-                    raw_reactions = await self._gh.pr_reactions(
-                        state.pr_number, repo=binding.github_repo
+                    try:
+                        raw_reactions = await self._gh.pr_reactions(
+                            state.pr_number, repo=binding.github_repo
+                        )
+                        review_signal_reactions = _reactions_from_github(raw_reactions)
+                    except GitHubError as e:
+                        log.warning(
+                            "could not fetch PR reactions for %s#%d: %s",
+                            binding.github_repo,
+                            state.pr_number,
+                            e,
+                        )
+                        review_signal_reactions = ()
+                else:
+                    review_signal_reviews = tuple(
+                        r
+                        for r in review_signal_reviews
+                        if not is_codex_author(r.user_login)
                     )
-                    review_signal_reactions = _reactions_from_github(raw_reactions)
-                except GitHubError as e:
-                    log.warning(
-                        "could not fetch PR reactions for %s#%d: %s",
-                        binding.github_repo,
-                        state.pr_number,
-                        e,
-                    )
-                    review_signal_reactions = ()
 
                 review_verdict = review_classifier(
                     comments=review_signal_comments,
