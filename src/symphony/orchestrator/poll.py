@@ -4379,6 +4379,13 @@ class Orchestrator:
         Returns False only when the attempt was inconclusive and should be
         retried by a resurrection caller.
         """
+        if not binding.resolved_remote_review():
+            log.debug(
+                "skipping automatic @codex review re-trigger for %s: "
+                "remote_review disabled",
+                issue.identifier,
+            )
+            return True
         if state.pr_number is None:
             return True
         head_sha = ""
