@@ -2443,7 +2443,7 @@ async def test_review_verdict_ignores_codex_signals_when_remote_review_disabled(
         verdict = await orch._review_verdict_for_pr(  # noqa: SLF001
             binding=binding,
             pr_number=45,
-            view={"headRefOid": "abc123", "mergeable": "MERGEABLE"},
+            view={"headRefOid": "abc123", "mergeable": "CONFLICTING"},
         )
 
         assert verdict.kind == VerdictKind.PENDING

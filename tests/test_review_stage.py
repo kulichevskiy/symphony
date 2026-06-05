@@ -2897,7 +2897,7 @@ async def test_review_poll_ignores_codex_feedback_when_remote_review_disabled(
             )
         )
         gh.pr_view = AsyncMock(
-            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+            return_value={"headRefOid": "head-sha", "mergeable": "CONFLICTING"}
         )
         gh.commit_committed_at = AsyncMock(return_value="2026-05-20T12:00:00Z")
         gh.pr_reviews = AsyncMock(return_value=[_codex_review_entry()])

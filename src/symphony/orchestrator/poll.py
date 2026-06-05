@@ -4053,7 +4053,7 @@ class Orchestrator:
                 snapshot=ReviewSnapshot(
                     head_sha=head_sha,
                     head_committed_at=head_committed_at,
-                    mergeable=mergeable,
+                    mergeable=None,
                 ),
             )
         else:
@@ -9604,7 +9604,7 @@ class Orchestrator:
                     head_committed_at="",
                     reactions=(),
                     reviews=(),
-                    mergeable=str(view.get("mergeable") or ""),
+                    mergeable=None,
                 ),
             )
 
