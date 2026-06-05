@@ -166,9 +166,9 @@ async def test_zero_cap_returns_exhausted_immediately() -> None:
 async def test_stuck_loop_when_reviewer_repeats_same_signature() -> None:
     """If the reviewer fixates on the same bug after a fix-run, escalate.
 
-    Same head_sha + same findings → same signature; the dedup gate
-    short-circuits rather than burning another fix-run on the identical
-    trigger.
+    Same findings → same findings signature; the dedup gate
+    short-circuits rather than burning another fix-run on identical
+    findings.
     """
     message = f"## Findings\n- bug X\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     reviewer = _ReviewerScript(
@@ -188,12 +188,12 @@ async def test_stuck_loop_when_reviewer_repeats_same_signature() -> None:
 
 
 @pytest.mark.asyncio
-async def test_same_findings_but_new_head_sha_does_not_trigger_stuck() -> None:
-    """If the fix-run advanced HEAD, the signature changes — loop continues."""
+async def test_same_findings_but_new_head_sha_triggers_stuck() -> None:
+    """Same unresolved findings after a fix commit are non-convergence."""
     message = f"## Findings\n- bug Y\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     reviewer = _ReviewerScript(
-        messages=[message, message, f"good\n{VERDICT_APPROVED_MARKER}"],
-        head_shas=["sha-1", "sha-2", "sha-3"],
+        messages=[message, message],
+        head_shas=["sha-1", "sha-2"],
     )
     fixer = _FixerScript()
     result = await run_local_review_loop(
@@ -202,9 +202,11 @@ async def test_same_findings_but_new_head_sha_does_not_trigger_stuck() -> None:
         fixer=fixer,
         cap=5,
     )
-    assert result.outcome == LoopOutcome.APPROVED
-    assert result.iterations == 3
-    assert len(fixer.received) == 2
+    assert result.outcome == LoopOutcome.STUCK_LOOP
+    assert result.iterations == 2
+    assert len(fixer.received) == 1
+    assert result.verdicts[0].trigger_signature != result.verdicts[1].trigger_signature
+    assert result.verdicts[0].findings_signature == result.verdicts[1].findings_signature
 
 
 # --- failure modes ----------------------------------------------------

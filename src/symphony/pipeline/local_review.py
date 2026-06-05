@@ -82,6 +82,10 @@ class LocalVerdict:
     findings: str = ""
     trigger_signature: str = ""
     raw_message: str = ""
+    # Findings-only digest used by the local loop to detect non-convergence.
+    # This deliberately ignores HEAD so unresolved findings after a fix commit
+    # still trip STUCK_LOOP instead of burning another identical fix-run.
+    findings_signature: str = ""
 
 
 def local_review_prompt(
@@ -326,11 +330,9 @@ def parse_local_review_output(
 ) -> LocalVerdict:
     """Turn the reviewer's final message into a `LocalVerdict`.
 
-    `head_sha` ties the signature to the commit that was reviewed, so a
-    fresh commit after a fix-run produces a new signature even if the
-    findings text is identical. That keeps the existing
-    `should_dispatch_fix_run` dedup gate from suppressing legitimate
-    re-runs against new code.
+    `head_sha` ties the trigger signature to the commit that was reviewed.
+    Stuck-loop detection uses a separate findings-only signature so repeated
+    unresolved findings after a fix commit still terminate as STUCK_LOOP.
     """
     message = extract_last_agent_message(
         agent=agent, stdout=stdout, last_message_file=last_message_file
@@ -363,6 +365,7 @@ def _classify_message(*, message: str, head_sha: str) -> LocalVerdict:
         findings=findings,
         trigger_signature=f"local_review:{head_sha}:{digest}",
         raw_message=message,
+        findings_signature=f"local_review_findings:{digest}",
     )
 
 

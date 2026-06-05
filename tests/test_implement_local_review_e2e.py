@@ -4,8 +4,9 @@ A binding configured for local review must (a) run the in-workspace
 reviewer after the implementer succeeds and (b) skip the `@codex review`
 PR ping when the local pass approves. The remote review monitor row is
 still created for approved local-only PRs. When local-only review does
-not approve, the PR is parked on a failed review monitor instead of
-falling through silently.
+not converge, the PR is parked in Needs Approval without a remote bot ping.
+Reviewer/fix-run/cost-cap infrastructure failures block the issue like a
+failed implement run.
 """
 
 from __future__ import annotations
@@ -23,7 +24,11 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
-from symphony.pipeline.local_review import VERDICT_APPROVED_MARKER
+from symphony.pipeline.local_review import (
+    VERDICT_APPROVED_MARKER,
+    LocalVerdict,
+    LocalVerdictKind,
+)
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
 
@@ -500,25 +505,16 @@ async def test_binding_pr_summary_override_off_beats_global_on(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        LoopOutcome.EXHAUSTED,
-        LoopOutcome.REVIEWER_FAILED,
-        LoopOutcome.FIX_RUN_FAILED,
-        LoopOutcome.STUCK_LOOP,
-        LoopOutcome.COST_CAP_BREACHED,
-        LoopOutcome.SKIPPED,
-    ],
-)
-async def test_local_strategy_no_pr_summary_when_not_approved(
+@pytest.mark.parametrize("outcome", [LoopOutcome.EXHAUSTED, LoopOutcome.STUCK_LOOP])
+async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
     tmp_path: Path,
     outcome: LoopOutcome,
 ) -> None:
-    """When local-review fails / exhausts / etc., don't post the
-    summary. With `remote_review: false` there is no @codex fallback
-    for any non-approved loop outcome either — the PR is parked for
-    operator action."""
+    """EXHAUSTED/STUCK still pushes a PR but parks it for human approval.
+
+    The last unresolved local-review findings must be present on Linear, and
+    local-only mode must not fall back to `@codex review`.
+    """
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -578,7 +574,12 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
             return_value=LoopResult(
                 outcome=outcome,
                 iterations=1,
-                verdicts=(),
+                verdicts=(
+                    LocalVerdict(
+                        kind=LocalVerdictKind.CHANGES_REQUESTED,
+                        findings="src/auth.py:12 missing token validation",
+                    ),
+                ),
                 error=f"{outcome.value} test outcome",
             )
         )
@@ -599,14 +600,124 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
         ]
         assert codex_calls == []
         assert len(summary_calls) == 0
+        gh.pr_create.assert_awaited_once()
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert "state-na" in move_targets
+        assert "state-bl" not in move_targets
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("src/auth.py:12 missing token validation" in body for body in posted)
+
         history = await db.runs.history_for_issue(conn, "iss-1")
         review_rows = [h for h in history if h.stage == "review"]
         assert len(review_rows) == 1
-        assert review_rows[0].status == "failed"
-        assert "local-only review did not approve" in review_rows[0].termination_detail
+        assert review_rows[0].status == "needs_approval"
+        assert "src/auth.py:12 missing token validation" in review_rows[0].termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        LoopOutcome.REVIEWER_FAILED,
+        LoopOutcome.FIX_RUN_FAILED,
+        LoopOutcome.COST_CAP_BREACHED,
+    ],
+)
+async def test_local_strategy_infra_failures_block_without_pr(
+    tmp_path: Path,
+    outcome: LoopOutcome,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_local_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        runner = _StagedRunner(
+            {
+                "implement": [
+                    [
+                        RunnerEvent(kind="started", pid=4242),
+                        RunnerEvent(
+                            kind="stdout",
+                            line=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "total_cost_usd": 0.01,
+                                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                                }
+                            ),
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+            }
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=outcome,
+                iterations=1,
+                verdicts=(),
+                error=f"{outcome.value} test outcome",
+            )
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+
+        orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        push_fn.assert_not_awaited()
+        gh.pr_create.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert "state-bl" in move_targets
+        assert "state-na" not in move_targets
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        implement_rows = [h for h in history if h.stage == "implement"]
+        assert len(implement_rows) == 1
+        assert implement_rows[0].status == "failed"
+        assert outcome.value in implement_rows[0].termination_detail
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
 
@@ -620,10 +731,8 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
     Simulate an unexpected fault inside `run_local_review_session`
     (any non-LinearError / non-GitHubError exception). The phase
-    should return `None` and the PR must still be created. With
-    `remote_review: false` (local-only mode) the `@codex review` ping
-    stays suppressed even on the fault, and the PR is parked on a failed
-    review monitor.
+    should return `None`. With `remote_review: false` (local-only mode), that
+    is an infrastructure failure: no PR is opened and the issue is blocked.
     """
     import symphony.orchestrator.poll as poll_mod
 
@@ -695,28 +804,19 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # PR created despite the local-review fault.
-        gh.pr_create.assert_awaited_once()
-        # `remote_review: false` → no @codex ping, even on the fault.
-        codex_calls = [
-            c for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
-        ]
-        assert codex_calls == [], (
-            "local-only mode must not post @codex even when the phase raised"
-        )
-        # Implement run still recorded.
+        gh.pr_create.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert "state-bl" in move_targets
+
         history = await db.runs.history_for_issue(conn, "iss-1")
-        stages = {h.stage for h in history}
-        assert "implement" in stages
-        review_rows = [h for h in history if h.stage == "review"]
-        assert len(review_rows) == 1
-        assert review_rows[0].status == "failed"
-        assert "local-review session failed" in review_rows[0].termination_detail
+        implement_rows = [h for h in history if h.stage == "implement"]
+        assert len(implement_rows) == 1
+        assert implement_rows[0].status == "failed"
+        assert "local-review session failed" in implement_rows[0].termination_detail
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
 
@@ -727,8 +827,8 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
 ) -> None:
     """`remote_review: false` never pings `@codex`, even when the local
     reviewer subprocess fails to spawn. The old remote fallback that
-    legacy `local` strategy used to fire here is gone — the PR is parked
-    for operator action, not the remote bot."""
+    legacy `local` strategy used to fire here is gone — the issue blocks
+    without opening a PR."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -798,7 +898,7 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # Reviewer crashed, but remote_review is off → no @codex ping.
+        # Reviewer crashed, but remote_review is off → no @codex ping or PR.
         codex_pings = [
             c
             for c in gh.pr_comment.await_args_list
@@ -808,8 +908,11 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
         assert codex_pings == [], (
             "local-only mode must not post @codex when the reviewer fails"
         )
+        gh.pr_create.assert_not_awaited()
+        move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert "state-bl" in move_targets
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
