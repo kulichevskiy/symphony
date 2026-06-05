@@ -10130,6 +10130,14 @@ class Orchestrator:
             and not binding.resolved_remote_review()
         ):
             pr_number = pr_number_from_url(pr_url)
+            await db.review_state.begin_review(
+                self._conn,
+                issue_id,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label,
+            )
             if pr_number is None:
                 log.warning(
                     "could not parse PR number from %r for no-review %s",

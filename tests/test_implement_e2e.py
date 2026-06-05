@@ -300,6 +300,26 @@ async def test_false_false_review_binding_opens_pr_without_review_stage(
             ]
         )
 
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=41,
+            pr_url="https://github.com/org/repo/pull/41",
+            github_repo="org/repo",
+            issue_label="feature",
+        )
+        await db.review_state.set_signature(conn, "iss-1", "codex_inline:stale")
+        await db.review_state.bump_iteration(conn, "iss-1")
+        await db.review_state.bump_ci_fetch_failures(conn, "iss-1")
+        await db.review_state.set_codex_lgtm_comment_id(conn, "iss-1", "comment-41")
+
         orch = Orchestrator(
             cfg,
             linear,
@@ -326,6 +346,16 @@ async def test_false_false_review_binding_opens_pr_without_review_stage(
         assert candidates[0].pr_number == 42
         assert candidates[0].github_repo == "org/repo"
         assert candidates[0].binding_key
+
+        review = await db.review_state.get(conn, "iss-1")
+        assert review.pr_number == 42
+        assert review.pr_url == "https://github.com/org/repo/pull/42"
+        assert review.github_repo == "org/repo"
+        assert review.issue_label == ""
+        assert review.iteration == 0
+        assert review.last_trigger_signature == ""
+        assert review.ci_fetch_failures == 0
+        assert review.codex_lgtm_comment_id == ""
     finally:
         await conn.close()
 
