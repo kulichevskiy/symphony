@@ -365,6 +365,76 @@ def test_preflight_allows_omitted_review_lanes_when_both_reviews_disabled(
     assert "ENG → org/api-svc: states ok" in result.output
 
 
+def test_preflight_allows_local_only_without_code_review_lane(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    fake = _FakeLinear(
+        viewer_keys=["ENG"],
+        states={
+            "ENG": {
+                "Todo": "id1",
+                "In Progress": "id2",
+                "Local Review": "id3",
+                "Manual Approval": "id4",
+                "Blocked": "id5",
+                "Done": "id6",
+            }
+        },
+    )
+    _install_fake(monkeypatch, fake)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        _yaml_with_review_lanes(
+            local_review=True,
+            remote_review=False,
+            code_review='""',
+            local_code_review="Local Review",
+        )
+    )
+
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert "ENG → org/api-svc: states ok" in result.output
+
+
+def test_preflight_allows_remote_only_without_local_code_review_lane(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    fake = _FakeLinear(
+        viewer_keys=["ENG"],
+        states={
+            "ENG": {
+                "Todo": "id1",
+                "In Progress": "id2",
+                "In Review": "id3",
+                "Manual Approval": "id4",
+                "Blocked": "id5",
+                "Done": "id6",
+            }
+        },
+    )
+    _install_fake(monkeypatch, fake)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        _yaml_with_review_lanes(
+            local_review=False,
+            remote_review=True,
+            code_review="In Review",
+            local_code_review='""',
+        )
+    )
+
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert "ENG → org/api-svc: states ok" in result.output
+
+
 def test_preflight_requires_code_review_when_remote_review_enabled(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
