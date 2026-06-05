@@ -6525,25 +6525,44 @@ class Orchestrator:
                     workspace_path=workspace_path,
                     parent_run_id=new_run_id,
                 )
+                if (
+                    local_review_result is None
+                    or local_review_result.outcome != LoopOutcome.APPROVED
+                ):
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=(
+                            "local-only review did not approve: "
+                            f"{_local_review_termination_reason(local_review_result)}"
+                        ),
+                        last_log=_local_review_failure_log(local_review_result),
+                        auto_retry=False,
+                        operator_wait=True,
+                    )
+                    return
+                branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+                try:
+                    await self._push_fn(workspace_path, branch)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "git push failed after local review retry %s: %s",
+                        issue.identifier,
+                        e,
+                    )
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=f"local review retry push failed: {e}",
+                        last_log=str(e),
+                        auto_retry=False,
+                        operator_wait=True,
+                    )
+                    return
             finally:
                 self._workspace.release(binding, issue)
-            if (
-                local_review_result is None
-                or local_review_result.outcome != LoopOutcome.APPROVED
-            ):
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=(
-                        "local-only review did not approve: "
-                        f"{_local_review_termination_reason(local_review_result)}"
-                    ),
-                    last_log=_local_review_failure_log(local_review_result),
-                    auto_retry=False,
-                    operator_wait=True,
-                )
-                return
         elif state.pr_number is not None and binding.resolved_remote_review():
             try:
                 await self._gh.pr_comment(

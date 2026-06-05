@@ -1455,6 +1455,9 @@ async def test_review_failed_retry_skips_codex_when_remote_review_disabled(
 
         orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+            Path("/dev/null"), "symphony/eng-1"
+        )
         # The monitor restarts only after the local reviewer approves.
         orch._schedule_review_poll.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
         history = await db.runs.history_for_issue(conn, "iss-1")
@@ -1465,6 +1468,59 @@ async def test_review_failed_retry_skips_codex_when_remote_review_disabled(
             for run in history
         )
         assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_failed_retry_reparks_when_local_only_push_fails(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        cfg = Config(repos=[binding])
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_comment = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._push_fn.side_effect = RuntimeError("non-fast-forward")  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=LoopOutcome.APPROVED,
+                iterations=1,
+                verdicts=(),
+            )
+        )
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            stage="implement",
+            status="failed",
+        )
+        await _seed_review_state(conn)
+
+        await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+            "iss-1", "run-1", _intent(SlashKind.RETRY)
+        )
+
+        orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+            Path("/dev/null"), "symphony/eng-1"
+        )
+        orch._schedule_review_poll.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.run_id != "run-1"
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any("local review retry push failed" in body for body in bodies)
     finally:
         await conn.close()
 
@@ -1509,6 +1565,7 @@ async def test_review_failed_retry_reparks_when_local_only_review_fails(
 
         orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._schedule_review_poll.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
