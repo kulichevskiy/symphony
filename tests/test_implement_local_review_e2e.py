@@ -24,6 +24,7 @@ from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.pipeline.local_review import VERDICT_APPROVED_MARKER
+from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
 
 class _StagedRunner:
@@ -496,12 +497,25 @@ async def test_binding_pr_summary_override_off_beats_global_on(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        LoopOutcome.EXHAUSTED,
+        LoopOutcome.REVIEWER_FAILED,
+        LoopOutcome.FIX_RUN_FAILED,
+        LoopOutcome.STUCK_LOOP,
+        LoopOutcome.COST_CAP_BREACHED,
+        LoopOutcome.SKIPPED,
+    ],
+)
 async def test_local_strategy_no_pr_summary_when_not_approved(
     tmp_path: Path,
+    outcome: LoopOutcome,
 ) -> None:
     """When local-review fails / exhausts / etc., don't post the
     summary. With `remote_review: false` there is no @codex fallback
-    either — the PR is parked for operator action."""
+    for any non-approved loop outcome either — the PR is parked for
+    operator action."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -550,9 +564,6 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
                         RunnerEvent(kind="exit", returncode=0),
                     ]
                 ],
-                "local_review": [
-                    [RunnerEvent(kind="spawn_failed", error="codex missing")],
-                ],
             }
         )
 
@@ -560,9 +571,18 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
             cfg, linear, conn, runner=runner, gh=gh,
             workspace=workspace, push_fn=push_fn,
         )
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=outcome,
+                iterations=1,
+                verdicts=(),
+                error=f"{outcome.value} test outcome",
+            )
+        )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
         await _scan_and_wait(orch, cfg.repos[0])
+        orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
 
         # Neither the @codex ping nor the local-review summary should fire.
         codex_calls = [
