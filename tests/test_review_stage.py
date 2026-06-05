@@ -2867,6 +2867,169 @@ async def test_review_poll_does_not_rearm_no_signal_for_local_approval(
 
 
 @pytest.mark.asyncio
+async def test_review_poll_ignores_codex_feedback_when_remote_review_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding(local_review=True, remote_review=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "CONFLICTING"}
+        )
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-20T12:00:00Z")
+        gh.pr_reviews = AsyncMock(return_value=[_codex_review_entry()])
+        gh.pr_review_comments = AsyncMock(return_value=[_codex_inline_comment()])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(
+            return_value=[
+                {
+                    "id": 123,
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Didn't find any major issues.",
+                    "created_at": "2026-05-20T12:01:00Z",
+                }
+            ]
+        )
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is None
+        workspace.acquire.assert_not_awaited()
+        push_fn.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        gh.pr_reviews.assert_awaited_once_with(42, repo="org/repo")
+        gh.pr_review_comments.assert_not_awaited()
+        gh.pr_reactions.assert_not_awaited()
+        gh.pr_issue_comments.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_poll_honors_human_changes_requested_when_remote_review_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding(local_review=True, remote_review=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        human_review = {
+            "user": {"login": "human-reviewer"},
+            "state": "CHANGES_REQUESTED",
+            "commit_id": "head-sha",
+            "submitted_at": "2026-05-20T12:02:00Z",
+            "body": "Please fix the persisted handoff before merge.",
+        }
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="unit", state="SUCCESS", bucket="pass", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-20T12:00:00Z")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(), human_review]
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[_codex_inline_comment()])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is not None
+        prompt = runner.captured_spec.command[-1]
+        assert "Please fix the persisted handoff before merge." in prompt
+        gh.pr_reviews.assert_awaited_once_with(42, repo="org/repo")
+        gh.pr_review_comments.assert_not_awaited()
+        gh.pr_reactions.assert_not_awaited()
+        gh.pr_issue_comments.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 1
+        assert state.last_trigger_signature == "human_cr:head-sha:human-reviewer"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_poll_rearms_missing_codex_signal_after_head_changes(
     tmp_path: Path,
 ) -> None:
@@ -4667,6 +4830,91 @@ async def test_deduped_failing_ci_still_dispatches_fresh_codex_inline_feedback(
         fix_runs = [r for r in history if r.stage == "review_fix"]
         assert len(fix_runs) == 1
         assert fix_runs[0].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_deduped_failing_ci_still_dispatches_human_review_when_remote_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn, signature="ci:head-sha:lint")
+        cfg = Config(
+            repos=[_binding(local_review=True, remote_review=False)],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        human_review = {
+            "user": {"login": "human-reviewer"},
+            "state": "CHANGES_REQUESTED",
+            "commit_id": "head-sha",
+            "submitted_at": "2026-05-20T12:02:00Z",
+            "body": "Please fix the persisted handoff before merge.",
+        }
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                [CheckRun(name="lint", state="FAILURE", bucket="fail", link=None)]
+            )
+        )
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+        )
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-20T12:00:00Z")
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_reviews = AsyncMock(
+            return_value=[_codex_review_entry(), human_review]
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[_codex_inline_comment()])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        runner = _FakeRunner(
+            [RunnerEvent(kind="started", pid=999), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        assert runner.captured_spec is not None
+        prompt = runner.captured_spec.command[-1]
+        assert "Please fix the persisted handoff before merge." in prompt
+        gh.check_log_tail.assert_not_awaited()
+        gh.pr_reviews.assert_awaited_once_with(42, repo="org/repo")
+        gh.pr_review_comments.assert_not_awaited()
+        gh.pr_reactions.assert_not_awaited()
+        gh.pr_issue_comments.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 1
+        assert state.last_trigger_signature == "human_cr:head-sha:human-reviewer"
     finally:
         await conn.close()
 
