@@ -25,6 +25,7 @@ from symphony.orchestrator.poll import (
     _status_check_run_id,
 )
 from symphony.pipeline.cost_guard import UsageDelta
+from symphony.pipeline.local_review import LocalVerdict, LocalVerdictKind
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 from symphony.pipeline.review_classifier import CODEX_BOT_LOGIN, Verdict, VerdictKind
 
@@ -5196,10 +5197,50 @@ async def test_required_check_fix_reruns_local_review_before_push_for_local_only
         await conn.close()
 
 
+@pytest.mark.parametrize(
+    (
+        "outcome",
+        "expected_state",
+        "expected_wait_kind",
+        "expects_findings",
+        "expected_dispatched",
+    ),
+    [
+        (
+            LoopOutcome.REVIEWER_FAILED,
+            "state-bl",
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+            False,
+            False,
+        ),
+        (
+            LoopOutcome.FIX_RUN_FAILED,
+            "state-bl",
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+            False,
+            False,
+        ),
+        (
+            LoopOutcome.COST_CAP_BREACHED,
+            "state-bl",
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+            False,
+            False,
+        ),
+        (LoopOutcome.EXHAUSTED, "state-na", None, True, True),
+        (LoopOutcome.STUCK_LOOP, "state-na", None, True, True),
+    ],
+    ids=lambda value: value.value if isinstance(value, LoopOutcome) else str(value),
+)
 @pytest.mark.asyncio
-async def test_required_check_fix_parks_when_post_fix_local_review_fails(
+async def test_required_check_fix_handles_post_fix_local_review_terminals(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    outcome: LoopOutcome,
+    expected_state: str,
+    expected_wait_kind: str | None,
+    expects_findings: bool,
+    expected_dispatched: bool,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -5253,12 +5294,24 @@ async def test_required_check_fix_parks_when_post_fix_local_review_fails(
         orch._run_required_check_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             return_value=(UsageDelta(cost_usd=0.01), "exit", 0, False)
         )
+        unresolved_findings = "Fix the retry loop before merge."
+        verdicts = (
+            (
+                LocalVerdict(
+                    kind=LocalVerdictKind.CHANGES_REQUESTED,
+                    findings=unresolved_findings,
+                    trigger_signature="same-findings",
+                ),
+            )
+            if expects_findings
+            else ()
+        )
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             return_value=LoopResult(
-                outcome=LoopOutcome.REVIEWER_FAILED,
+                outcome=outcome,
                 iterations=1,
-                verdicts=(),
-                error="reviewer still found issues",
+                verdicts=verdicts,
+                error=None if expects_findings else f"{outcome.value} during review",
             )
         )
 
@@ -5280,16 +5333,25 @@ async def test_required_check_fix_parks_when_post_fix_local_review_fails(
             iteration=1,
         )
 
-        assert dispatched is False
+        assert dispatched is expected_dispatched
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
         push_fn.assert_not_awaited()
         gh.pr_comment.assert_not_awaited()
-        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        linear.move_issue.assert_awaited_once_with("iss-1", expected_state)
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_MERGE
-        assert "post-required-check local-only review did not approve" in (
-            linear.post_comment.await_args.args[1]
+        if expected_wait_kind is None:
+            assert wait is None
+        else:
+            assert wait is not None
+            assert wait.kind == expected_wait_kind
+        comment = linear.post_comment.await_args.args[1]
+        if expects_findings:
+            assert "Last unresolved findings" in comment
+            assert unresolved_findings in comment
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].stage == "merge"
+        assert history[-1].status == (
+            "needs_approval" if expected_wait_kind is None else "failed"
         )
     finally:
         await conn.close()

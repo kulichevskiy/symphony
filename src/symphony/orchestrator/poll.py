@@ -5131,6 +5131,32 @@ class Orchestrator:
             create_run=merge_run_id is None,
         )
 
+    async def _merge_required_check_terminal_run(
+        self, *, issue: LinearIssue, merge_run_id: str | None
+    ) -> db.runs.Run:
+        run_id = merge_run_id or str(uuid.uuid4())
+        started_at = datetime.now(UTC).isoformat()
+        if merge_run_id is None:
+            await db.runs.create(
+                self._conn,
+                id=run_id,
+                issue_id=issue.id,
+                stage="merge",
+                status="running",
+                pid=None,
+                started_at=started_at,
+            )
+        return db.runs.Run(
+            id=run_id,
+            issue_id=issue.id,
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at=started_at,
+            ended_at=None,
+            cost_usd=0.0,
+        )
+
     async def _dispatch_merge_required_check_fix_if_allowed(
         self,
         *,
@@ -5442,24 +5468,47 @@ class Orchestrator:
                     workspace_path=workspace_path,
                     parent_run_id=fix_run_id,
                 )
-                if (
-                    not binding.resolved_remote_review()
-                    and (
-                        local_review_result is None
-                        or local_review_result.outcome != LoopOutcome.APPROVED
-                    )
-                ):
-                    await self._mark_merge_required_check_fix_needs_approval(
-                        binding=binding,
-                        issue=issue,
-                        pr_url=pr_url,
-                        reason=(
-                            "post-required-check local-only review did not approve: "
-                            f"{_local_review_termination_reason(local_review_result)}"
-                        ),
-                        merge_run_id=merge_run_id,
-                    )
-                    return False
+                if not binding.resolved_remote_review():
+                    if _local_review_infra_failed(local_review_result):
+                        run = await self._merge_required_check_terminal_run(
+                            issue=issue,
+                            merge_run_id=merge_run_id,
+                        )
+                        await self._block_local_only_review_infra_failure(
+                            binding=binding,
+                            issue=issue,
+                            storage_issue_id=issue.id,
+                            run_id=run.id,
+                            result=local_review_result,
+                        )
+                        return False
+                    assert local_review_result is not None
+                    if _local_review_needs_approval(local_review_result):
+                        run = await self._merge_required_check_terminal_run(
+                            issue=issue,
+                            merge_run_id=merge_run_id,
+                        )
+                        await self._park_local_only_review_needs_approval(
+                            run=run,
+                            binding=binding,
+                            issue=issue,
+                            pr_url=pr_url,
+                            result=local_review_result,
+                        )
+                        return True
+                    if local_review_result.outcome != LoopOutcome.APPROVED:
+                        await self._mark_merge_required_check_fix_needs_approval(
+                            binding=binding,
+                            issue=issue,
+                            pr_url=pr_url,
+                            reason=(
+                                "post-required-check local-only review did not "
+                                "approve: "
+                                f"{_local_review_termination_reason(local_review_result)}"
+                            ),
+                            merge_run_id=merge_run_id,
+                        )
+                        return False
 
             try:
                 await self._push_fn(workspace_path, branch)
