@@ -9770,13 +9770,13 @@ class Orchestrator:
             )
             return run_id
 
-        # 4.5. Local-review pre-flight. When `binding.review_strategy` is
-        # `local` or `hybrid`, run the reviewer in-workspace before pushing.
-        # This shortens the iteration loop dramatically: the slow part of
-        # the existing flow is round-tripping each fix through GitHub for
-        # the remote `@codex` bot. See `docs/local-review-flow.md`.
+        # 4.5. Local-review pre-flight. When `binding.local_review` is set,
+        # run the reviewer in-workspace before pushing. This shortens the
+        # iteration loop dramatically: the slow part of the existing flow is
+        # round-tripping each fix through GitHub for the remote `@codex` bot.
+        # See `docs/local-review-flow.md`.
         local_review_result: LoopResult | None = None
-        if binding.review_strategy != "remote":
+        if binding.resolved_local_review():
             local_review_result = await self._run_local_review_phase(
                 binding=binding,
                 issue=issue,

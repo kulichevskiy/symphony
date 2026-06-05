@@ -168,7 +168,9 @@ def test_preflight_creates_codex_profile_when_local_reviewer_uses_codex(
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
     p.write_text(
-        _yaml_with_ready("Todo").replace("review_strategy: remote", "review_strategy: local")
+        _yaml_with_ready("Todo").replace(
+            "review_strategy: remote", "local_review: true"
+        )
     )
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output

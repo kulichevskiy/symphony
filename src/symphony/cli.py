@@ -164,7 +164,7 @@ def _binding_can_run_codex_cli(binding: RepoBinding) -> bool:
     if binding.agent == "codex":
         return True
     return (
-        binding.review_strategy != "remote"
+        binding.resolved_local_review()
         and binding.resolved_reviewer_agent() == "codex"
     )
 

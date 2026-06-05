@@ -16,7 +16,6 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -86,7 +85,8 @@ def _binding(
     agent: str = "claude",
     codex_model: str = "gpt-5.1-codex",
     issue_label: str | None = None,
-    review_strategy: Literal["remote", "local", "hybrid"] = "remote",
+    local_review: bool = False,
+    remote_review: bool = True,
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
@@ -95,7 +95,8 @@ def _binding(
         codex_model=codex_model,
         issue_label=issue_label,
         branch_prefix="symphony",
-        review_strategy=review_strategy,
+        local_review=local_review,
+        remote_review=remote_review,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
@@ -2761,15 +2762,15 @@ async def test_review_poll_rearms_missing_codex_signal_once_per_head(
 async def test_review_poll_does_not_rearm_no_signal_for_local_only(
     tmp_path: Path,
 ) -> None:
-    # local-only bindings (review_strategy="local" → local_review=True,
-    # remote_review=False) drop the legacy @codex fallback: no-signal must
-    # never re-trigger a remote review, even when the local reviewer failed.
+    # local-only bindings (local_review=True, remote_review=False) drop the
+    # legacy @codex fallback: no-signal must never re-trigger a remote review,
+    # even when the local reviewer failed.
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_active_review(conn)
         await _seed_local_review_cycle(conn, local_review_status="failed")
         cfg = Config(
-            repos=[_binding(review_strategy="local")],
+            repos=[_binding(local_review=True, remote_review=False)],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -2821,7 +2822,7 @@ async def test_review_poll_does_not_rearm_no_signal_for_local_approval(
         await _seed_active_review(conn)
         await _seed_local_review_cycle(conn, local_review_status="completed")
         cfg = Config(
-            repos=[_binding(review_strategy="local")],
+            repos=[_binding(local_review=True, remote_review=False)],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -4194,7 +4195,7 @@ async def test_retrigger_is_noop_when_remote_review_disabled(
     # resurrection retry).
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding(review_strategy="local")
+        binding = _binding(local_review=True, remote_review=False)
         cfg = Config(
             repos=[binding],
             log_root=tmp_path / "logs",
