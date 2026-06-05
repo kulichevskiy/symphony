@@ -53,6 +53,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 -- until Review + CI are green, then Merge marks it merged.
 -- `parked_at` records the auto_merge=false handoff where Review passed and
 -- Symphony is waiting for a human to merge from GitHub.
+-- `review_bypassed` records false/false bindings, which skip Review but still
+-- enter CI-gated Merge polling.
 CREATE TABLE IF NOT EXISTS issue_prs (
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     github_repo TEXT NOT NULL,
@@ -62,6 +64,7 @@ CREATE TABLE IF NOT EXISTS issue_prs (
     created_at  TEXT NOT NULL,
     merged_at   TEXT,
     parked_at   TEXT,
+    review_bypassed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (issue_id, github_repo)
 );
 

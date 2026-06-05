@@ -51,22 +51,33 @@ async def upsert(
     pr_url: str,
     created_at: str,
     binding_key: str = "",
+    review_bypassed: bool = False,
 ) -> None:
     await conn.execute(
         """
         INSERT INTO issue_prs (
-            issue_id, github_repo, binding_key, pr_number, pr_url, created_at
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at,
+            review_bypassed
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id, github_repo) DO UPDATE SET
             binding_key = excluded.binding_key,
             pr_number  = excluded.pr_number,
             pr_url     = excluded.pr_url,
             created_at = excluded.created_at,
             merged_at  = NULL,
-            parked_at  = NULL
+            parked_at  = NULL,
+            review_bypassed = excluded.review_bypassed
         """,
-        (issue_id, github_repo, binding_key, pr_number, pr_url, created_at),
+        (
+            issue_id,
+            github_repo,
+            binding_key,
+            pr_number,
+            pr_url,
+            created_at,
+            1 if review_bypassed else 0,
+        ),
     )
     await conn.execute(
         """
@@ -529,6 +540,9 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     The Review stage records a completed handoff row immediately after
     pinging `@codex review`; later ticks keep re-checking the linked PR until
     the review classifier says it is approved and mergeable.
+    No-review PRs (`local_review=false`, `remote_review=false`) bypass that
+    handoff with `review_bypassed=1` and still flow through the same CI/Merge
+    polling.
     Parked manual-merge PRs stay eligible so the poller can reconcile an
     external close or merge before skipping normal merge work.
     """
@@ -540,12 +554,15 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL
-          AND EXISTS (
+          AND (
+            EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
                 AND r.stage = 'review'
                 AND r.status IN ('running', 'completed')
                 AND r.started_at >= p.created_at
+            )
+            OR p.review_bypassed = 1
           )
           AND NOT EXISTS (
               SELECT 1 FROM runs r

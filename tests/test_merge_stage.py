@@ -276,6 +276,38 @@ async def _seed_review_candidate(
     )
 
 
+async def _seed_no_review_candidate(
+    conn, *, binding_key: str = ""
+) -> None:  # type: ignore[no-untyped-def]
+    await db.issues.upsert(
+        conn,
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        team_key="ENG",
+    )
+    await db.runs.create(
+        conn,
+        id="implement",
+        issue_id="iss-1",
+        stage="implement",
+        status="completed",
+        pid=None,
+        started_at="2026-05-10T00:00:00+00:00",
+        cost_usd=0.50,
+    )
+    await db.issue_prs.upsert(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        binding_key=binding_key,
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        created_at="2026-05-10T00:01:00+00:00",
+        review_bypassed=True,
+    )
+
+
 async def _seed_merged_pr(
     conn, *, merged_at: str, binding_key: str = ""
 ) -> None:  # type: ignore[no-untyped-def]
@@ -5346,7 +5378,7 @@ async def test_no_review_binding_merges_clean_ci_no_signal(tmp_path: Path) -> No
     """false/false: clean CI + mergeable no_signal merges without any review."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await _seed_review_candidate(conn)
+        await _seed_no_review_candidate(conn)
         binding = _binding().model_copy(
             update={"local_review": False, "remote_review": False}
         )
@@ -5365,6 +5397,118 @@ async def test_no_review_binding_merges_clean_ci_no_signal(tmp_path: Path) -> No
         assert kwargs["pr_number"] == 42
         # Not an @codex approval, so the merge run skips the review gate.
         assert kwargs["skip_review"] is True
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert {run.stage for run in history} == {"implement"}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_review_binding_auto_merge_false_parks_clean_ci_no_signal(
+    tmp_path: Path,
+) -> None:
+    """false/false + auto_merge:false: clean CI parks directly for approval."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding(auto_merge=False).model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        linear = orch.tracker(binding)
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        linear.post_comment.assert_awaited_once_with(
+            "iss-1",
+            "✅ review passed, ready for manual merge: "
+            "https://github.com/org/repo/pull/42",
+        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        assert pr is not None
+        assert pr.parked_at is not None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert {run.stage for run in history} == {"implement"}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_review_binding_red_ci_dispatches_required_check_fix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """false/false: red required CI dispatches a builder fix before merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+                "baseRefName": "main",
+                "state": "OPEN",
+                "mergedAt": None,
+                "statusCheckRollup": [
+                    {
+                        "__typename": "StatusContext",
+                        "context": "Vercel",
+                        "state": "FAILURE",
+                        "targetUrl": "https://vercel.com/org/repo/deployments/123",
+                        "description": "Deployment failed.",
+                    }
+                ],
+            }
+        )
+        orch = Orchestrator(
+            Config(repos=[binding]),
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.PENDING, rule="no_signal")
+        )
+        orch._dispatch_merge_required_check_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        required_contexts = AsyncMock(return_value=("Vercel",))
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll.get_required_contexts",
+            required_contexts,
+            raising=False,
+        )
+
+        await _poll_and_wait(orch)
+
+        orch._dispatch_merge_required_check_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._dispatch_merge_required_check_fix_run.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        assert kwargs["pr_url"] == "https://github.com/org/repo/pull/42"
+        assert kwargs["head_sha"] == "abc123"
+        assert kwargs["merge_error"] == "required status check failed before merge"
+        assert [check["context"] for check in kwargs["failing_checks"]] == ["Vercel"]
+        orch._review_verdict_for_pr.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
 
