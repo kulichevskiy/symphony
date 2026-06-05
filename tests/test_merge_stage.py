@@ -5255,12 +5255,20 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
         workspace.acquire = AsyncMock(return_value=workspace_path)
         workspace.release = MagicMock()
 
+        events: list[str] = []
+
+        async def record_move_issue(_issue_id: str, _state_id: str) -> None:
+            events.append("move")
+
+        async def record_push(_workspace_path: Path, _branch: str) -> None:
+            events.append("push")
+
         linear = AsyncMock()
-        linear.move_issue = AsyncMock()
+        linear.move_issue = AsyncMock(side_effect=record_move_issue)
         linear.post_comment = AsyncMock(return_value="cmt-1")
         gh = MagicMock()
         gh.pr_comment = AsyncMock()
-        push_fn = AsyncMock()
+        push_fn = AsyncMock(side_effect=record_push)
 
         cfg = Config(
             repos=[binding],
@@ -5335,7 +5343,12 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
 
         assert dispatched is expected_dispatched
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
-        push_fn.assert_not_awaited()
+        if expected_wait_kind is None:
+            push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+            assert events == ["push", "move"]
+        else:
+            push_fn.assert_not_awaited()
+            assert events == ["move"]
         gh.pr_comment.assert_not_awaited()
         linear.move_issue.assert_awaited_once_with("iss-1", expected_state)
         wait = await db.operator_waits.get(conn, "iss-1")

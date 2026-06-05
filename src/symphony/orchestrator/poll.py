@@ -5460,6 +5460,7 @@ class Orchestrator:
             )
 
             local_review_result: LoopResult | None = None
+            pending_local_only_needs_approval: LoopResult | None = None
             if binding.resolved_local_review():
                 local_review_result = await self._run_local_review_phase(
                     binding=binding,
@@ -5484,19 +5485,8 @@ class Orchestrator:
                         return False
                     assert local_review_result is not None
                     if _local_review_needs_approval(local_review_result):
-                        run = await self._merge_required_check_terminal_run(
-                            issue=issue,
-                            merge_run_id=merge_run_id,
-                        )
-                        await self._park_local_only_review_needs_approval(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            pr_url=pr_url,
-                            result=local_review_result,
-                        )
-                        return True
-                    if local_review_result.outcome != LoopOutcome.APPROVED:
+                        pending_local_only_needs_approval = local_review_result
+                    elif local_review_result.outcome != LoopOutcome.APPROVED:
                         await self._mark_merge_required_check_fix_needs_approval(
                             binding=binding,
                             issue=issue,
@@ -5526,6 +5516,20 @@ class Orchestrator:
                     merge_run_id=merge_run_id,
                 )
                 return False
+
+            if pending_local_only_needs_approval is not None:
+                run = await self._merge_required_check_terminal_run(
+                    issue=issue,
+                    merge_run_id=merge_run_id,
+                )
+                await self._park_local_only_review_needs_approval(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    result=pending_local_only_needs_approval,
+                )
+                return True
 
             state = await db.review_state.get(self._conn, issue.id)
             if state.pr_number is None:
