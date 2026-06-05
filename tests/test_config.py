@@ -591,6 +591,91 @@ repos:
         Config.load(p)
 
 
+def _review_binding(**overrides) -> RepoBinding:  # type: ignore[no-untyped-def]
+    kwargs = dict(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo", code_review="In Review"),
+    )
+    kwargs.update(overrides)
+    return RepoBinding(**kwargs)  # type: ignore[arg-type]
+
+
+def test_review_booleans_default_to_remote_only() -> None:
+    """No fields set → remote-only (false/true), today's default."""
+    binding = _review_binding()
+    assert binding.local_review is False
+    assert binding.remote_review is True
+    assert binding.resolved_local_review() is False
+    assert binding.resolved_remote_review() is True
+
+
+@pytest.mark.parametrize(
+    "local, remote",
+    [(False, True), (True, False), (True, True), (False, False)],
+)
+def test_review_booleans_truth_table(local: bool, remote: bool) -> None:
+    binding = _review_binding(local_review=local, remote_review=remote)
+    assert binding.local_review is local
+    assert binding.remote_review is remote
+    assert binding.resolved_local_review() is local
+    assert binding.resolved_remote_review() is remote
+
+
+@pytest.mark.parametrize(
+    "strategy, exp_local, exp_remote",
+    [
+        ("remote", False, True),
+        ("hybrid", True, True),
+        ("local", True, False),
+    ],
+)
+def test_legacy_review_strategy_maps_to_booleans(
+    strategy: str, exp_local: bool, exp_remote: bool
+) -> None:
+    with pytest.warns(DeprecationWarning, match="review_strategy"):
+        binding = _review_binding(review_strategy=strategy)
+    assert binding.local_review is exp_local
+    assert binding.remote_review is exp_remote
+    assert binding.resolved_local_review() is exp_local
+    assert binding.resolved_remote_review() is exp_remote
+
+
+def test_legacy_review_strategy_booleans_win_on_conflict() -> None:
+    """Conflicting legacy + boolean config: booleans win, with a warning."""
+    with pytest.warns(DeprecationWarning, match="ignored"):
+        binding = _review_binding(
+            review_strategy="remote", local_review=True, remote_review=False
+        )
+    assert binding.resolved_local_review() is True
+    assert binding.resolved_remote_review() is False
+
+
+def test_legacy_review_strategy_partial_boolean_wins_on_conflict() -> None:
+    """A single boolean alongside legacy still suppresses the mapping."""
+    with pytest.warns(DeprecationWarning, match="ignored"):
+        binding = _review_binding(review_strategy="hybrid", remote_review=False)
+    # local_review is left at its default (not derived from `hybrid`).
+    assert binding.local_review is False
+    assert binding.remote_review is False
+
+
+@pytest.mark.parametrize(
+    "local, remote, expected",
+    [
+        (False, True, "remote"),
+        (True, False, "local"),
+        (True, True, "hybrid"),
+    ],
+)
+def test_review_strategy_property_bridges_booleans(
+    local: bool, remote: bool, expected: str
+) -> None:
+    """The deprecated `review_strategy` view round-trips the legacy values."""
+    binding = _review_binding(local_review=local, remote_review=remote)
+    assert binding.review_strategy == expected
+
+
 def test_local_review_iteration_cap_default_global_is_6(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Global default cap is 6 — well below remote's 12 because the
     local loop should converge fast or not at all."""

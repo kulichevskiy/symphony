@@ -13,10 +13,11 @@ provides at boot.
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, ClassVar, Literal, Self
 
 import yaml
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -122,11 +123,15 @@ class RepoBinding(BaseModel):
     auto_merge: bool = True
     max_concurrent: int = 2
     runner: Literal["local", "e2b", "daytona"] = "local"
-    # Review strategy controls who reviews the PR. `remote` keeps today's
-    # @codex-bot loop. `local` runs the reviewer in-workspace before opening
-    # the PR. `hybrid` does the local loop first, then one final @codex
-    # check before merge. See `docs/local-review-flow.md`.
-    review_strategy: Literal["remote", "local", "hybrid"] = "remote"
+    # Where review happens — two orthogonal switches. `local_review` runs the
+    # in-workspace reviewer loop before opening the PR; `remote_review` runs
+    # the `@codex` GitHub-bot review on the PR. The default false/true is
+    # remote-only (today's behavior). Both true is sequential (local → PR →
+    # remote); both false skips review entirely (implement → PR → CI → merge).
+    # The legacy `review_strategy` enum maps onto these via a root validator.
+    # See `docs/local-review-flow.md`.
+    local_review: bool = False
+    remote_review: bool = True
     # Reviewer agent for local/hybrid strategies. `None` picks the opposite
     # family of `agent` (claude ↔ codex) so the reviewer has independent
     # blind spots from the implementer.
@@ -182,10 +187,65 @@ class RepoBinding(BaseModel):
     def apply_tracker_secret_defaults(self, *, jira_base_url: str | None = None) -> None:
         self._apply_tracker_context_defaults(jira_base_url=jira_base_url)
 
+    # Legacy `review_strategy` → boolean mapping. The old enum dropped the
+    # remote fallback that `local` once carried; the booleans are now the
+    # source of truth.
+    _LEGACY_REVIEW_STRATEGY: ClassVar[dict[str, tuple[bool, bool]]] = {
+        "remote": (False, True),
+        "hybrid": (True, True),
+        "local": (True, False),
+    }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_legacy_review_strategy(cls, data: Any) -> Any:
+        if not isinstance(data, dict) or "review_strategy" not in data:
+            return data
+        data = dict(data)
+        strategy = data.pop("review_strategy")
+        if "local_review" in data or "remote_review" in data:
+            warnings.warn(
+                "Both `review_strategy` and `local_review`/`remote_review` are "
+                "set; `review_strategy` is ignored and the booleans win.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return data
+        if strategy not in cls._LEGACY_REVIEW_STRATEGY:
+            supported = ", ".join(sorted(cls._LEGACY_REVIEW_STRATEGY))
+            raise ValueError(
+                f"unknown review_strategy {strategy!r}; supported: {supported}"
+            )
+        warnings.warn(
+            "`review_strategy` is deprecated; use the `local_review` and "
+            "`remote_review` booleans instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        local, remote = cls._LEGACY_REVIEW_STRATEGY[strategy]
+        data["local_review"] = local
+        data["remote_review"] = remote
+        return data
+
     @model_validator(mode="after")
     def _derive_tracker_context(self) -> Self:
         self._apply_tracker_context_defaults()
         return self
+
+    @property
+    def review_strategy(self) -> Literal["remote", "local", "hybrid"]:
+        """Deprecated legacy view of the review booleans.
+
+        Bridges call-sites not yet migrated to `resolved_local_review` /
+        `resolved_remote_review`. The new "no review" combination
+        (`local_review=False, remote_review=False`) has no legacy equivalent
+        and reports as `remote`.
+        """
+        if self.local_review and self.remote_review:
+            return "hybrid"
+        if self.local_review:
+            return "local"
+        return "remote"
 
     @property
     def linear_team_key(self) -> str:
@@ -236,6 +296,14 @@ class RepoBinding(BaseModel):
                 f"unknown reviewer Codex model {value!r}; supported: {supported}"
             )
         return value
+
+    def resolved_local_review(self) -> bool:
+        """Whether the in-workspace reviewer loop runs before the PR opens."""
+        return self.local_review
+
+    def resolved_remote_review(self) -> bool:
+        """Whether the `@codex` GitHub-bot review runs on the PR."""
+        return self.remote_review
 
     def resolved_reviewer_agent(self) -> Literal["claude", "codex"]:
         """Reviewer agent after applying the implementer-opposite default."""
