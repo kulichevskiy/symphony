@@ -5023,6 +5023,40 @@ async def test_local_only_binding_merges_after_local_review_completed(
 
 
 @pytest.mark.asyncio
+async def test_local_only_binding_waits_when_local_review_predates_pr_cycle(
+    tmp_path: Path,
+) -> None:
+    """true/false: a local review from a prior PR cycle cannot approve this PR."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.create(
+            conn,
+            id="stale-local-review",
+            issue_id="iss-1",
+            stage="local_review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T23:59:00+00:00",
+        )
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_local_only_binding_waits_without_completed_local_review(
     tmp_path: Path,
 ) -> None:

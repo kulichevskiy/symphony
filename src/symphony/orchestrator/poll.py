@@ -3633,33 +3633,48 @@ class Orchestrator:
             run.started_at
         )
 
-    async def _local_review_completed_for_issue(self, issue_id: str) -> bool:
+    async def _local_review_completed_for_issue(
+        self, candidate: db.issue_prs.IssuePR
+    ) -> bool:
         """Whether a completed local-review run covers the current PR HEAD.
 
         Used by the merge scheduler to gate the `remote_review: false`
         review bypass: local-only bindings must have a finished local-review
         run before clean CI is treated as a merge signal.
 
-        The local-review loop only runs in-workspace before the PR is
-        opened (see `_run_local_review_phase`); it never re-runs on a
-        post-PR HEAD. Merge-conflict and required-check fix-runs (`stage =
-        "review_fix"`) push commits the reviewer never saw, so a local
-        review that predates the latest fix-run is stale and must not
+        The local-review loop only runs in-workspace after the implement run
+        and before the PR is opened (see `_run_local_review_phase`). A
+        completed local review from a previous PR cycle must not green-light a
+        later PR for the same issue. Merge-conflict and required-check fix-runs
+        (`stage = "review_fix"`) push commits the reviewer never saw, so a
+        local review that predates the latest fix-run is stale and must not
         green-light the post-fix HEAD — otherwise unreviewed code merges.
         """
+        latest_implement = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=candidate.issue_id,
+            stage="implement",
+        )
+        if latest_implement is None or _parse_rfc3339(
+            latest_implement.started_at
+        ) > _parse_rfc3339(candidate.created_at):
+            return False
         latest_local_review = await db.runs.latest_for_issue_stage(
             self._conn,
-            issue_id=issue_id,
+            issue_id=candidate.issue_id,
             stage="local_review",
+            started_at_gte=latest_implement.started_at,
         )
         if (
             latest_local_review is None
             or latest_local_review.status != "completed"
+            or _parse_rfc3339(latest_local_review.started_at)
+            > _parse_rfc3339(candidate.created_at)
         ):
             return False
         latest_fix = await db.runs.latest_for_issue_stage(
             self._conn,
-            issue_id=issue_id,
+            issue_id=candidate.issue_id,
             stage="review_fix",
         )
         if latest_fix is not None and _parse_rfc3339(
@@ -8241,7 +8256,7 @@ class Orchestrator:
                 review_bypass_ready = (
                     not binding.resolved_local_review()
                     or await self._local_review_completed_for_issue(
-                        candidate.issue_id
+                        candidate
                     )
                 )
 
