@@ -2451,7 +2451,89 @@ async def test_review_verdict_preserves_mergeability_when_remote_review_disabled
         assert verdict.merge_conflict is True
         gh.pr_checks.assert_awaited_once_with(45, repo="org/repo")
         gh.pr_review_comments.assert_not_awaited()
-        gh.pr_reviews.assert_not_awaited()
+        gh.pr_reviews.assert_awaited_once_with(45, repo="org/repo")
+        gh.pr_reactions.assert_not_awaited()
+        gh.pr_issue_comments.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_verdict_honors_human_changes_requested_when_remote_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude").model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
+            )
+        )
+        gh.pr_review_comments = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": CODEX_BOT_LOGIN},
+                    "body": "Fresh remote bot feedback must be ignored.",
+                    "commit_id": "abc123",
+                    "original_commit_id": "abc123",
+                    "created_at": "2026-05-10T00:03:00Z",
+                    "path": "src/app.py",
+                    "line": 12,
+                }
+            ]
+        )
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": CODEX_BOT_LOGIN},
+                    "state": "COMMENTED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:04:00Z",
+                    "body": "Remote bot review " * 80,
+                },
+                {
+                    "user": {"login": "human-reviewer"},
+                    "state": "CHANGES_REQUESTED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:05:00Z",
+                    "body": "Block merge until the handoff is persisted.",
+                },
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+
+        orch = Orchestrator(
+            cfg,
+            MagicMock(),
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+        )
+        verdict = await orch._review_verdict_for_pr(  # noqa: SLF001
+            binding=binding,
+            pr_number=45,
+            view={"headRefOid": "abc123", "mergeable": "MERGEABLE"},
+        )
+
+        assert verdict.kind == VerdictKind.CHANGES_REQUESTED
+        assert verdict.rule == "human_changes_requested"
+        assert verdict.trigger_signature == "human_cr:abc123:human-reviewer"
+        assert verdict.last_review_body == "Block merge until the handoff is persisted."
+        gh.pr_checks.assert_awaited_once_with(45, repo="org/repo")
+        gh.pr_reviews.assert_awaited_once_with(45, repo="org/repo")
+        gh.pr_review_comments.assert_not_awaited()
         gh.pr_reactions.assert_not_awaited()
         gh.pr_issue_comments.assert_not_awaited()
     finally:

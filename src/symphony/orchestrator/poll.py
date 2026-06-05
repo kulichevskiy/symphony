@@ -4047,12 +4047,31 @@ class Orchestrator:
                 if review_verdict.kind is VerdictKind.CHANGES_REQUESTED:
                     verdict = review_verdict
         elif not remote_review:
+            try:
+                raw_reviews = await self._gh.pr_reviews(
+                    state.pr_number, repo=binding.github_repo
+                )
+                human_reviews = tuple(
+                    r
+                    for r in _reviews_from_github(raw_reviews)
+                    if not is_codex_author(r.user_login)
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not fetch PR reviews for %s#%d: %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    e,
+                )
+                human_reviews = ()
+
             verdict = review_classifier(
                 comments=[],
                 ci=ci_runs,
                 snapshot=ReviewSnapshot(
                     head_sha=head_sha,
                     head_committed_at=head_committed_at,
+                    reviews=human_reviews,
                     mergeable=None,
                 ),
             )
@@ -9596,14 +9615,21 @@ class Orchestrator:
         checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
         ci = [_review_check_from_github(run) for run in checks.runs]
         if not binding.resolved_remote_review():
+            human_reviews = tuple(
+                r
+                for r in _reviews_from_github(
+                    await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+                )
+                if not is_codex_author(r.user_login)
+            )
             return review_classifier(
                 comments=[],
                 ci=ci,
                 snapshot=ReviewSnapshot(
                     head_sha=head_sha,
                     head_committed_at="",
+                    reviews=human_reviews,
                     reactions=(),
-                    reviews=(),
                     mergeable=str(view.get("mergeable") or ""),
                 ),
             )
