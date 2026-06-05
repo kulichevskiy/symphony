@@ -3964,6 +3964,7 @@ class Orchestrator:
         )
         ci_runs = [_review_check_from_gh(c) for c in checks.runs]
         issue_comments: list[dict[str, object]] | None = None
+        remote_review = binding.resolved_remote_review()
 
         # Only fetch review signals when CI is clean — Rule 1 (failing CI)
         # pre-empts all comment/review rules, so avoid the extra API calls.
@@ -3983,7 +3984,7 @@ class Orchestrator:
                     mergeable=mergeable,
                 ),
             )
-            if not should_dispatch_fix_run(
+            if remote_review and not should_dispatch_fix_run(
                 prev_signature=state.last_trigger_signature,
                 new_signature=verdict.trigger_signature,
             ):
@@ -4045,6 +4046,16 @@ class Orchestrator:
                 )
                 if review_verdict.kind is VerdictKind.CHANGES_REQUESTED:
                     verdict = review_verdict
+        elif not remote_review:
+            verdict = review_classifier(
+                comments=[],
+                ci=ci_runs,
+                snapshot=ReviewSnapshot(
+                    head_sha=head_sha,
+                    head_committed_at=head_committed_at,
+                    mergeable=mergeable,
+                ),
+            )
         else:
             try:
                 raw_reviews = await self._gh.pr_reviews(
@@ -4064,7 +4075,9 @@ class Orchestrator:
                 raw_comments = await self._gh.pr_review_comments(
                     state.pr_number, repo=binding.github_repo
                 )
-                comments: list[ReviewComment] = _review_comments_from_github(raw_comments)
+                comments: list[ReviewComment] = _review_comments_from_github(
+                    raw_comments
+                )
             except GitHubError as e:
                 log.warning(
                     "could not fetch PR review comments for %s#%d: %s",
@@ -4116,17 +4129,22 @@ class Orchestrator:
                 ),
             )
 
-        await self._maybe_post_codex_lgtm(
-            run=run,
-            binding=binding,
-            issue=issue,
-            state=state,
-            pr_number=state.pr_number,
-            head_committed_at=head_committed_at,
-            issue_comments=issue_comments,
-        )
+        if remote_review:
+            await self._maybe_post_codex_lgtm(
+                run=run,
+                binding=binding,
+                issue=issue,
+                state=state,
+                pr_number=state.pr_number,
+                head_committed_at=head_committed_at,
+                issue_comments=issue_comments,
+            )
 
-        if verdict.kind is VerdictKind.PENDING and verdict.rule == "no_signal":
+        if (
+            remote_review
+            and verdict.kind is VerdictKind.PENDING
+            and verdict.rule == "no_signal"
+        ):
             await self._maybe_rearm_codex_review_for_no_signal(
                 run=run,
                 binding=binding,
@@ -9576,6 +9594,20 @@ class Orchestrator:
             raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
 
         checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
+        ci = [_review_check_from_github(run) for run in checks.runs]
+        if not binding.resolved_remote_review():
+            return review_classifier(
+                comments=[],
+                ci=ci,
+                snapshot=ReviewSnapshot(
+                    head_sha=head_sha,
+                    head_committed_at="",
+                    reactions=(),
+                    reviews=(),
+                    mergeable=str(view.get("mergeable") or ""),
+                ),
+            )
+
         comments = await self._gh.pr_review_comments(
             pr_number,
             repo=binding.github_repo,
@@ -9597,7 +9629,6 @@ class Orchestrator:
             issue_comments = []
         committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
 
-        ci = [_review_check_from_github(run) for run in checks.runs]
         snapshot = ReviewSnapshot(
             head_sha=head_sha,
             head_committed_at=committed_at,
@@ -10071,9 +10102,9 @@ class Orchestrator:
             return run_id
         # 7. Surface the local-review verdict on the GitHub PR thread
         #    (not just on Linear) so human reviewers see the audit
-        #    trail. Only fires when local-review APPROVED — failures
-        #    are already covered by the @codex fallback ping. The
-        #    binding-level override wins over the global config so an
+        #    trail. Only fires when local-review APPROVED; local-only
+        #    failures are parked for operator action. The binding-level
+        #    override wins over the global config so an
         #    operator can keep one repo's PR thread quiet without
         #    disabling the feature everywhere.
         if (
