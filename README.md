@@ -11,8 +11,9 @@ What you see from the outside:
 ```text
 Linear issue (ready state + label)
   → agent edits code in a private git workspace
+  → optional local review / fix loop (local_code_review)
   → GitHub PR opened
-  → review / fix loop (local reviewer and/or @codex review + CI)
+  → CI and optional remote @codex review / fix loop
   → PR merged
   → Linear issue moved to Done
 ```
@@ -179,8 +180,9 @@ If `preflight` fails, fix `.env` / YAML before starting the daemon.
 1. Add the configured `issue_label` to a Linear issue in a configured team.
 2. Move it to the `ready` state (e.g. `Todo`).
 3. Wait for the next poll tick (or webhook). The daemon comments "implement
-   starting", moves the issue to `in_progress`, opens a PR, and takes it from
-   there.
+   starting", moves the issue to `in_progress`, runs the optional
+   `local_review` lane in `local_code_review`, opens a PR, and takes it
+   through CI and optional remote review from there.
 
 ### Watch progress
 
