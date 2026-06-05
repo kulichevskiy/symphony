@@ -3588,6 +3588,140 @@ async def test_retry_slash_command_restarts_review_monitor(tmp_path: Path) -> No
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_retry_slash_reruns_hybrid_local_gate_before_remote_review(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(local_review=True, remote_review=True)
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add auth",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id="implement-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="local-review-run",
+            issue_id="iss-1",
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "local-review-run",
+            "failed",
+            ended_at="2026-05-10T00:02:00+00:00",
+            kind="stuck_loop",
+            detail="local review stuck loop",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:03:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "review-run",
+            "needs_approval",
+            ended_at="2026-05-10T00:04:00+00:00",
+            kind="stuck_loop",
+            detail="local review stuck loop",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        schedule_mock = MagicMock()
+        orch._schedule_review_poll = schedule_mock  # type: ignore[method-assign]  # noqa: SLF001
+        local_review_phase = AsyncMock(
+            return_value=LoopResult(
+                outcome=LoopOutcome.APPROVED,
+                iterations=1,
+                verdicts=(
+                    LocalVerdict(
+                        kind=LocalVerdictKind.APPROVED,
+                        findings="",
+                    ),
+                ),
+            )
+        )
+        orch._run_local_review_phase = local_review_phase  # type: ignore[method-assign]  # noqa: SLF001
+        await orch._track_review_failed_wait(  # noqa: SLF001
+            "iss-1", "review-run", binding
+        )
+
+        await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+            "iss-1",
+            "review-run",
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        local_review_phase.assert_awaited_once()
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert linear.move_issue.await_args_list == [call("iss-1", "state-na")]
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize(
     "kind",
     [SlashKind.APPROVE, SlashKind.REJECT, SlashKind.STOP],
