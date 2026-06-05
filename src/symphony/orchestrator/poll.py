@@ -392,17 +392,12 @@ def build_pr_body(issue: LinearIssue) -> str:
 def _local_review_status_from_result(result: LoopResult | None) -> str:
     """Map a `LoopResult` to a `runs.status` literal.
 
-    Symmetric with how Implement uses `completed` / `failed`; SKIPPED
-    maps to `interrupted` so it stands out from genuine model failures
-    in run-history queries (and matches `$skip-review`, which also
-    leaves a row with `status='interrupted'`).
+    Symmetric with how Implement uses `completed` / `failed`.
     """
     if result is None:
         return "failed"
     if result.outcome == LoopOutcome.APPROVED:
         return "completed"
-    if result.outcome == LoopOutcome.SKIPPED:
-        return "interrupted"
     return "failed"
 
 
@@ -444,8 +439,6 @@ def _termination_kwargs(
 def _local_review_termination_reason(result: LoopResult | None) -> str:
     if result is None:
         return "local-review session failed"
-    if result.outcome == LoopOutcome.SKIPPED:
-        return "local-review skipped by operator"
     if result.error:
         return result.error
     return f"local-review ended with {result.outcome.value}"
@@ -1355,15 +1348,6 @@ class Orchestrator:
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
         self._acceptance_rejected_run_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
-        # `$skip-local-review` toggles the issue's flag here. The
-        # local-review loop reads it between iterations and exits with
-        # `SKIPPED`. Removed after the local-review phase returns.
-        self._local_review_skip_flags: dict[str, bool] = {}
-        # The session updates this with the run_id of the in-flight
-        # reviewer/fixer subprocess so the slash handler can kill it
-        # immediately (otherwise an operator has to wait up to
-        # `stall_secs` for the current subprocess to finish naturally).
-        self._local_review_active_run_ids: dict[str, str] = {}
         self._review_poll_tasks: set[asyncio.Task[None]] = set()
         self._review_poll_run_ids: set[str] = set()
         # Maps issue_id → review poll run_id for issues in active review monitoring.
@@ -2303,9 +2287,6 @@ class Orchestrator:
         if intent.kind is SlashKind.SKIP_REVIEW:
             await self._handle_skip_review_intent(issue_id, run_id)
             return
-        if intent.kind is SlashKind.SKIP_LOCAL_REVIEW:
-            await self._handle_skip_local_review_intent(issue_id)
-            return
         if intent.kind in (
             SlashKind.RETRY_ACCEPTANCE,
             SlashKind.SKIP_ACCEPTANCE,
@@ -2480,63 +2461,6 @@ class Orchestrator:
             await tracker.post_comment(issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("active review retry comment failed for %s: %s", issue_id, e)
-
-    async def _handle_skip_local_review_intent(self, issue_id: str) -> None:
-        """Handle `$skip-local-review`: kill the in-flight subprocess
-        and ask the loop to exit.
-
-        Order matters: set the flag first so the loop classifies the
-        ensuing killed-subprocess failure as `SKIPPED` rather than
-        `REVIEWER_FAILED` / `FIX_RUN_FAILED`. Then kill the active
-        subprocess so the operator doesn't wait `stall_secs` for it to
-        finish naturally. If no local-review is in flight, the slash
-        is a no-op.
-        """
-        if issue_id not in self._local_review_skip_flags:
-            log.info(
-                "$skip-local-review for %s: no active local-review phase; "
-                "ignoring",
-                issue_id,
-            )
-            try:
-                tracker = await self._tracker_for_issue_id(issue_id)
-                await tracker.post_comment(
-                    issue_id,
-                    truncate_body(
-                        command_rejected(
-                            "$skip-local-review",
-                            "no active local-review phase",
-                        )
-                    ),
-                )
-            except LinearError as e:
-                log.warning(
-                    "could not post skip-local-review rejection for %s: %s",
-                    issue_id,
-                    e,
-                )
-            return
-        log.info("$skip-local-review for %s: setting skip flag", issue_id)
-        self._local_review_skip_flags[issue_id] = True
-        active_run_id = self._local_review_active_run_ids.get(issue_id)
-        if active_run_id is not None:
-            log.info(
-                "$skip-local-review for %s: killing active subprocess %s",
-                issue_id,
-                active_run_id,
-            )
-            try:
-                await self._runner.kill(active_run_id)
-            except Exception:  # noqa: BLE001
-                # A kill failure shouldn't dead-end the slash: the loop
-                # will still exit at the next iteration boundary via
-                # the skip flag. The runner's kill is best-effort by
-                # design (`runner.py` docstring).
-                log.exception(
-                    "could not kill local-review subprocess %s for %s",
-                    active_run_id,
-                    issue_id,
-                )
 
     async def _stop_review_monitor(self, issue_id: str, run_id: str) -> None:
         log.info("$stop received for review monitor %s (issue %s)", run_id, issue_id)
@@ -10986,18 +10910,6 @@ class Orchestrator:
                 started_at=datetime.now(UTC).isoformat(),
             )
 
-            # Keep the implement run_id slash-eligible during the
-            # local-review phase so `$skip-local-review` posted on the
-            # Linear issue is picked up by `_poll_slash_commands`. The
-            # `_active_run_ids` set was discarded when the implement
-            # subprocess exited; we re-add it for the duration of the
-            # local-review phase and clean up in `finally`.
-            self._local_review_skip_flags[storage_issue_id] = False
-            self._active_run_ids.add(parent_run_id)
-
-            def _should_skip() -> bool:
-                return bool(self._local_review_skip_flags.get(storage_issue_id))
-
             async def _on_iteration(
                 i: int, verdict: LocalVerdict, cost_so_far: float
             ) -> None:
@@ -11008,12 +10920,6 @@ class Orchestrator:
                     verdict=verdict,
                     cost_so_far=cost_so_far,
                 )
-
-            async def _report_active(run_id: str | None) -> None:
-                if run_id is None:
-                    self._local_review_active_run_ids.pop(storage_issue_id, None)
-                else:
-                    self._local_review_active_run_ids[storage_issue_id] = run_id
 
             result: LoopResult | None = None
             try:
@@ -11036,14 +10942,9 @@ class Orchestrator:
                     head_sha_provider=_workspace_head_sha,
                     cost_cap_usd=cost_cap_usd,
                     prior_cost_usd=prior_cost_usd,
-                    should_skip=_should_skip,
                     on_iteration=_on_iteration,
-                    report_active_run_id=_report_active,
                 )
             finally:
-                self._active_run_ids.discard(parent_run_id)
-                self._local_review_skip_flags.pop(storage_issue_id, None)
-                self._local_review_active_run_ids.pop(storage_issue_id, None)
                 await self._finalize_local_review_run(
                     run_id=local_review_run_id,
                     result=result,

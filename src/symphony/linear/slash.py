@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 _PATTERN = re.compile(
     r"^\s*\$("
     r"approve|approved|reject|retry-acceptance|skip-acceptance|retry|stop|"
-    r"skip-local-review|skip-review"
+    r"skip-review"
     r")\b",
     re.IGNORECASE,
 )
@@ -44,7 +44,6 @@ class SlashKind(StrEnum):
     RETRY_ACCEPTANCE = "retry-acceptance"
     SKIP_ACCEPTANCE = "skip-acceptance"
     SKIP_REVIEW = "skip-review"
-    SKIP_LOCAL_REVIEW = "skip-local-review"
 
 
 @dataclass

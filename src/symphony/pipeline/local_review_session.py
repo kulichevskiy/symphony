@@ -54,20 +54,12 @@ from .local_review_loop import (
     IterationCallback,
     LoopResult,
     ReviewerOutput,
-    SkipPredicate,
     run_local_review_loop,
 )
 
 ImplementerAgent = Literal["claude", "codex"]
 
 HeadShaProvider = Callable[[Path], Awaitable[str]]
-
-# Notified with the active subprocess run_id before each reviewer / fixer
-# call, and with `None` once that subprocess returns. The orchestrator
-# uses this to track the kill target for `$skip-local-review` — calling
-# `runner.kill(run_id)` from the slash handler interrupts a long-running
-# reviewer immediately instead of waiting for it to finish naturally.
-ActiveRunIdReporter = Callable[[str | None], Awaitable[None]]
 
 # Run IDs must survive becoming git refs / log filenames. The orchestrator
 # already uses UUIDs, but if a caller passes something weirder we still
@@ -140,9 +132,7 @@ async def run_local_review_session(
     head_sha_provider: HeadShaProvider,
     cost_cap_usd: float = 0.0,
     prior_cost_usd: float = 0.0,
-    should_skip: SkipPredicate | None = None,
     on_iteration: IterationCallback | None = None,
-    report_active_run_id: ActiveRunIdReporter | None = None,
 ) -> LoopResult:
     """Run the review→fix loop in-workspace; return the loop's outcome.
 
@@ -207,15 +197,9 @@ async def run_local_review_session(
         output_before = reviewer_estimator.total_output_tokens
         cache_write_before = reviewer_estimator.total_cache_write_tokens
         cache_read_before = reviewer_estimator.total_cache_read_tokens
-        if report_active_run_id is not None:
-            await report_active_run_id(spec.run_id)
-        try:
-            collected = await collect_runner_output(
-                runner, spec, usage_handler=reviewer_estimator.delta
-            )
-        finally:
-            if report_active_run_id is not None:
-                await report_active_run_id(None)
+        collected = await collect_runner_output(
+            runner, spec, usage_handler=reviewer_estimator.delta
+        )
         _persist_runner_transcript(
             last_message_dir, f"review-{iteration}", collected
         )
@@ -305,15 +289,9 @@ async def run_local_review_session(
         output_before = fixer_estimator.total_output_tokens
         cache_write_before = fixer_estimator.total_cache_write_tokens
         cache_read_before = fixer_estimator.total_cache_read_tokens
-        if report_active_run_id is not None:
-            await report_active_run_id(spec.run_id)
-        try:
-            collected = await collect_runner_output(
-                runner, spec, usage_handler=fixer_estimator.delta
-            )
-        finally:
-            if report_active_run_id is not None:
-                await report_active_run_id(None)
+        collected = await collect_runner_output(
+            runner, spec, usage_handler=fixer_estimator.delta
+        )
         _persist_runner_transcript(
             last_message_dir, f"fix-{iteration}", collected
         )
@@ -370,7 +348,6 @@ async def run_local_review_session(
         cap=cap,
         cost_cap_usd=cost_cap_usd,
         prior_cost_usd=prior_cost_usd,
-        should_skip=should_skip,
         on_iteration=on_iteration,
     )
 

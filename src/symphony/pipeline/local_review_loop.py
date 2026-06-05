@@ -6,13 +6,6 @@ identical verdicts, when to escalate. Keeping the policy here behind an
 async callback contract makes it unit-testable without a runner, a
 workspace, or a fake `gh`.
 
-An optional `skip_event` callback gives the orchestrator a non-blocking
-escape hatch: when the operator posts `$skip-local-review` on the
-Linear issue, the slash handler sets the event, and the loop exits
-with `SKIPPED` at the next iteration boundary. The in-flight subprocess
-is allowed to finish naturally (bounded by `stall_secs`); mid-
-subprocess kill is a separate concern owned by the orchestrator.
-
 Contract
 --------
 Callers inject two async callbacks:
@@ -63,7 +56,6 @@ class LoopOutcome(StrEnum):
     FIX_RUN_FAILED = "fix_run_failed"
     STUCK_LOOP = "stuck_loop"
     COST_CAP_BREACHED = "cost_cap_breached"
-    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -116,7 +108,6 @@ FixerCallable = Callable[[int, LocalVerdict], Awaitable[FixerOutput]]
 
 
 REVIEWER_FAILURE_RETRIES = 1
-SkipPredicate = Callable[[], bool]
 
 # Fired after each reviewer's verdict is parsed but before any fix-run is
 # dispatched. Lets the orchestrator post a heartbeat Linear comment so a
@@ -134,7 +125,6 @@ async def run_local_review_loop(
     cap: int,
     cost_cap_usd: float = 0.0,
     prior_cost_usd: float = 0.0,
-    should_skip: SkipPredicate | None = None,
     on_iteration: IterationCallback | None = None,
 ) -> LoopResult:
     """Drive the review/fix iteration until approved, capped, or stuck.
@@ -205,16 +195,6 @@ async def run_local_review_loop(
     def _cap_breached() -> bool:
         return cost_cap_usd > 0 and (prior_cost_usd + total_cost) >= cost_cap_usd
 
-    def _skip() -> bool:
-        return should_skip is not None and should_skip()
-
-    def _skipped_result(iterations: int) -> LoopResult:
-        return _result(
-            outcome=LoopOutcome.SKIPPED,
-            iterations=iterations,
-            error="operator requested $skip-local-review",
-        )
-
     def _cost_cap_breached_result(iterations: int, *, phase: str) -> LoopResult:
         return _result(
             outcome=LoopOutcome.COST_CAP_BREACHED,
@@ -226,23 +206,11 @@ async def run_local_review_loop(
         )
 
     for i in range(cap):
-        # Skip-event check at iteration boundaries. An operator who posts
-        # `$skip-local-review` mid-loop will see at most one extra
-        # subprocess complete before the loop exits — bounded by
-        # `stall_secs`, not by `cap × stall_secs`.
-        if _skip():
-            return _skipped_result(i)
         verdict: LocalVerdict | None = None
         reviewer_error: str | None = None
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
             _record_usage(out)
-            # If the orchestrator killed the reviewer mid-subprocess via
-            # `$skip-local-review`, the runner will emit a failure terminal.
-            # Prefer SKIPPED over REVIEWER_FAILED so the audit trail reflects
-            # operator intent, not "the reviewer crashed".
-            if _skip():
-                return _skipped_result(i + 1)
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
                 if _cap_breached():
@@ -329,10 +297,6 @@ async def run_local_review_loop(
 
         fix = await fixer(i, verdict)
         _record_usage(fix)
-        # Same priority as the reviewer side: an operator-killed fix-run
-        # surfaces as SKIPPED, not FIX_RUN_FAILED.
-        if _skip():
-            return _skipped_result(i + 1)
         if not fix.ok:
             return _result(
                 outcome=LoopOutcome.FIX_RUN_FAILED,

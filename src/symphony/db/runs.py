@@ -766,13 +766,12 @@ class LocalReviewStats:
     """
 
     completed_count: int  # APPROVED — the local pass converged
-    interrupted_count: int  # SKIPPED — operator hit $skip-local-review
     failed_count: int  # everything else (exhaust, stuck, cost-cap, err)
     running_count: int  # status='running' (in-flight when query ran)
     total_cost_usd: float
     avg_cost_usd: float  # over rows with ended_at
     avg_duration_secs: float  # over rows with ended_at AND started_at
-    approval_rate: float  # completed / (completed + interrupted + failed)
+    approval_rate: float  # completed / (completed + failed)
 
 
 async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
@@ -787,8 +786,7 @@ async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
         """
         SELECT
             COALESCE(SUM(status = 'completed'), 0) AS completed,
-            COALESCE(SUM(status = 'interrupted'), 0) AS interrupted,
-            COALESCE(SUM(status = 'failed'), 0) AS failed,
+            COALESCE(SUM(status NOT IN ('completed', 'running')), 0) AS failed,
             COALESCE(SUM(status = 'running'), 0) AS running,
             COALESCE(SUM(cost_usd), 0.0) AS total_cost,
             COALESCE(
@@ -810,15 +808,13 @@ async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
     )
     row = await cur.fetchone()
     if row is None:
-        return LocalReviewStats(0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0)
+        return LocalReviewStats(0, 0, 0, 0.0, 0.0, 0.0, 0.0)
     completed = int(row["completed"])
-    interrupted = int(row["interrupted"])
     failed = int(row["failed"])
-    finished = completed + interrupted + failed
+    finished = completed + failed
     approval_rate = (completed / finished) if finished > 0 else 0.0
     return LocalReviewStats(
         completed_count=completed,
-        interrupted_count=interrupted,
         failed_count=failed,
         running_count=int(row["running"]),
         total_cost_usd=float(row["total_cost"]),

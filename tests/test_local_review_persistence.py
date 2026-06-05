@@ -18,30 +18,15 @@ from symphony.orchestrator.poll import (
     Orchestrator,
     _local_review_status_from_result,
 )
-from symphony.pipeline.local_review import VERDICT_APPROVED_MARKER, LocalVerdict
+from symphony.pipeline.local_review import VERDICT_APPROVED_MARKER
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
 # --- pure status mapper -----------------------------------------------
 
 
-def _result(outcome: LoopOutcome) -> LoopResult:
-    return LoopResult(
-        outcome=outcome,
-        iterations=1,
-        verdicts=(LocalVerdict(kind=LocalVerdict.__dataclass_fields__["kind"].type.__args__[0]("approved")),),  # type: ignore[index]
-    )
-
-
 def test_status_mapper_completed_for_approved() -> None:
     r = LoopResult(outcome=LoopOutcome.APPROVED, iterations=1, verdicts=())
     assert _local_review_status_from_result(r) == "completed"
-
-
-def test_status_mapper_interrupted_for_skipped() -> None:
-    """SKIPPED → 'interrupted' so it stands out from genuine failures
-    in run-history queries (matches the convention `$skip-review` uses)."""
-    r = LoopResult(outcome=LoopOutcome.SKIPPED, iterations=1, verdicts=())
-    assert _local_review_status_from_result(r) == "interrupted"
 
 
 def test_status_mapper_failed_for_non_approval_outcomes() -> None:
