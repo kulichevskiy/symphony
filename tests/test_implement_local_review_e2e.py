@@ -15,7 +15,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -30,6 +30,7 @@ from symphony.pipeline.local_review import (
     LocalVerdictKind,
 )
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
+from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
 
 class _StagedRunner:
@@ -76,6 +77,25 @@ def _local_binding() -> RepoBinding:
     )
 
 
+def _hybrid_binding(*, local_cap: int | None = None) -> RepoBinding:
+    return RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        agent="claude",
+        branch_prefix="symphony",
+        local_review=True,
+        remote_review=True,
+        reviewer_agent="codex",
+        local_review_iteration_cap=local_cap,
+        linear_states=LinearStates(
+            ready="Todo",
+            local_code_review="Local Code Review",
+            code_review="In Review",
+            needs_approval="Needs Approval",
+        ),
+    )
+
+
 def _issue() -> LinearIssue:
     return LinearIssue(
         id="iss-1",
@@ -91,11 +111,20 @@ def _issue() -> LinearIssue:
     )
 
 
+def _issue_in_review() -> LinearIssue:
+    issue = _issue()
+    issue.state_id = "state-review"
+    issue.state_name = "In Review"
+    issue.state_type = "started"
+    return issue
+
+
 def _states() -> dict[str, str]:
     return {
         "Todo": "state-todo",
         "In Progress": "state-progress",
         "Local Code Review": "state-local-review",
+        "In Review": "state-review",
         "Needs Approval": "state-na",
         "Blocked": "state-bl",
         "Done": "state-done",
@@ -118,6 +147,265 @@ def _codex_agent_message(text: str) -> RunnerEvent:
             }
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_hybrid_strategy_runs_local_then_remote_then_merge(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _hybrid_binding(local_cap=2)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            local_review_iteration_cap=9,
+            review_iteration_cap=4,
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(
+            side_effect=[_issue(), _issue_in_review(), _issue_in_review()]
+        )
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock(
+            return_value="https://github.com/org/repo/pull/42"
+        )
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        gh.pr_view = AsyncMock(
+            side_effect=[
+                {
+                    "headRefOid": "head-sha",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "state": "OPEN",
+                    "mergedAt": None,
+                },
+                {
+                    "headRefOid": "head-sha",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "state": "OPEN",
+                    "mergedAt": None,
+                },
+                {
+                    "headRefOid": "head-sha",
+                    "mergeable": "MERGEABLE",
+                    "mergeStateStatus": "CLEAN",
+                    "state": "MERGED",
+                    "mergedAt": "2026-06-05T10:00:00Z",
+                },
+            ]
+        )
+        gh.pr_merge = AsyncMock()
+        push_fn = AsyncMock()
+
+        runner = _StagedRunner(
+            {
+                "implement": [
+                    [
+                        RunnerEvent(kind="started", pid=4242),
+                        RunnerEvent(
+                            kind="stdout",
+                            line=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "total_cost_usd": 0.01,
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "output_tokens": 1,
+                                    },
+                                }
+                            ),
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+                "local_review": [
+                    [
+                        _codex_agent_message(f"ok\n{VERDICT_APPROVED_MARKER}"),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+                "merge": [[RunnerEvent(kind="exit", returncode=0)]],
+            }
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+
+        await _scan_and_wait(orch, binding)
+        merge_tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if merge_tasks:
+            await asyncio.gather(*merge_tasks)
+
+        assert [spec.stage for spec in runner.captured] == [
+            "implement",
+            "local_review",
+            "merge",
+        ]
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-local-review"),
+            call("iss-1", "state-review"),
+            call("iss-1", "state-done"),
+        ]
+        assert any(
+            "cap=2" in c.args[1] for c in linear.post_comment.await_args_list
+        )
+        gh.pr_comment.assert_any_await(42, "@codex review", repo="org/repo")
+        gh.pr_merge.assert_awaited_once_with(
+            42,
+            strategy=binding.merge_strategy,
+            auto=binding.allow_auto_merge,
+            repo="org/repo",
+        )
+        assert push_fn.await_count == 2
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        statuses = {run.stage: run.status for run in history}
+        assert statuses["implement"] == "completed"
+        assert statuses["local_review"] == "completed"
+        assert statuses["review"] == "completed"
+        assert statuses["merge"] == "done"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _hybrid_binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock(
+            return_value="https://github.com/org/repo/pull/42"
+        )
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        runner = _StagedRunner(
+            {
+                "implement": [
+                    [
+                        RunnerEvent(kind="started", pid=4242),
+                        RunnerEvent(
+                            kind="stdout",
+                            line=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "total_cost_usd": 0.01,
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "output_tokens": 1,
+                                    },
+                                }
+                            ),
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+            }
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=LoopOutcome.EXHAUSTED,
+                iterations=2,
+                verdicts=(
+                    LocalVerdict(
+                        kind=LocalVerdictKind.CHANGES_REQUESTED,
+                        findings="src/auth.py:12 missing token validation",
+                    ),
+                ),
+                error="local review exhausted",
+            )
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        gh.pr_create.assert_awaited_once()
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        codex_calls = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
+            == "@codex review"
+        ]
+        assert codex_calls == []
+        move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert "state-na" in move_targets
+        assert "state-review" not in move_targets
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_rows = [h for h in history if h.stage == "review"]
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "needs_approval"
+        assert "src/auth.py:12 missing token validation" in (
+            review_rows[0].termination_detail
+        )
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio

@@ -10165,10 +10165,7 @@ class Orchestrator:
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
             )
-            if (
-                not binding.resolved_remote_review()
-                and _local_review_infra_failed(local_review_result)
-            ):
+            if _local_review_infra_failed(local_review_result):
                 await self._block_local_only_review_infra_failure(
                     binding=binding,
                     issue=issue,
@@ -10291,10 +10288,20 @@ class Orchestrator:
                 )
             return run_id
 
-        # 6. Start the Review stage. The remote `@codex review` ping fires
-        #    exactly when `remote_review` is enabled. Local-only failures
-        #    are parked below instead of falling back to the remote bot.
-        post_codex_review = binding.resolved_remote_review()
+        # 6. Start the Review stage. A local loop is a hard pre-PR gate:
+        #    true/true runs remote review only after local APPROVED. Local
+        #    terminals are parked below instead of falling through to the
+        #    GitHub bot.
+        local_review_blocks_remote = (
+            binding.resolved_local_review()
+            and (
+                local_review_result is None
+                or local_review_result.outcome != LoopOutcome.APPROVED
+            )
+        )
+        post_codex_review = (
+            binding.resolved_remote_review() and not local_review_blocks_remote
+        )
         review_run = await self._start_review_stage(
             binding=binding,
             issue=issue,
@@ -10304,7 +10311,6 @@ class Orchestrator:
         )
         if (
             binding.resolved_local_review()
-            and not binding.resolved_remote_review()
             and _local_review_needs_approval(local_review_result)
         ):
             await self._park_local_only_review_needs_approval(
@@ -10317,7 +10323,6 @@ class Orchestrator:
             return run_id
         if (
             binding.resolved_local_review()
-            and not binding.resolved_remote_review()
             and (
                 local_review_result is None
                 or local_review_result.outcome != LoopOutcome.APPROVED
@@ -11421,9 +11426,9 @@ class Orchestrator:
     ) -> db.runs.Run:
         """Persist the review state row, optionally ping `@codex review`.
 
-        `post_codex_review=False` is the local-only / no-review entry point:
-        state tracking, PR persistence, and the Linear state move still happen,
-        but the remote bot ping is suppressed.
+        `post_codex_review=False` is the local-only / no-review / local-terminal
+        entry point: state tracking and PR persistence still happen, but the
+        remote bot ping and remote review lane move are suppressed.
 
         Idempotent in spirit: failure to post the bot ping does not block
         the run row from being created, but is logged loudly so an
@@ -11470,7 +11475,7 @@ class Orchestrator:
                         e,
                     )
 
-        if binding.resolved_remote_review():
+        if post_codex_review and binding.resolved_remote_review():
             await self._move_issue_to_review_state(binding=binding, issue=issue)
 
         review_run_id = str(uuid.uuid4())
