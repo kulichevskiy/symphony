@@ -602,18 +602,23 @@ def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
 
 
 def _review_issue_is_active(issue: LinearIssue, binding: RepoBinding) -> bool:
-    return issue.state_name in {
-        binding.linear_states.in_progress,
-        binding.linear_states.code_review,
-    }
+    active_states = {binding.linear_states.in_progress}
+    if binding.resolved_local_review() and binding.linear_states.local_code_review:
+        active_states.add(binding.linear_states.local_code_review)
+    if binding.resolved_remote_review() and binding.linear_states.code_review:
+        active_states.add(binding.linear_states.code_review)
+    return issue.state_name in active_states
 
 
 def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bool:
     active_states = {
         binding.linear_states.in_progress,
-        binding.linear_states.code_review,
         binding.linear_states.needs_approval,
     }
+    if binding.resolved_local_review() and binding.linear_states.local_code_review:
+        active_states.add(binding.linear_states.local_code_review)
+    if binding.resolved_remote_review() and binding.linear_states.code_review:
+        active_states.add(binding.linear_states.code_review)
     if binding.acceptance.mode != "off":
         active_states.add(binding.linear_states.in_acceptance)
     return (
@@ -3792,7 +3797,10 @@ class Orchestrator:
             )
             await self._close_review_run(run)
             return None
-        if current.state_name == current_binding.linear_states.in_progress:
+        if (
+            current.state_name == current_binding.linear_states.in_progress
+            and current_binding.resolved_remote_review()
+        ):
             await self._move_issue_to_review_state(
                 binding=current_binding, issue=current
             )
@@ -6575,7 +6583,8 @@ class Orchestrator:
                     state.pr_number,
                     e,
                 )
-        await self._move_issue_to_review_state(binding=binding, issue=issue)
+        if binding.resolved_remote_review():
+            await self._move_issue_to_review_state(binding=binding, issue=issue)
         self._schedule_review_poll(run, binding, issue)
         log.info("restarted review monitor for %s via $retry", issue.identifier)
         body = resumed(
@@ -7054,7 +7063,8 @@ class Orchestrator:
                 ended_at=None,
                 cost_usd=0.0,
             )
-            await self._move_issue_to_review_state(binding=binding, issue=issue)
+            if binding.resolved_remote_review():
+                await self._move_issue_to_review_state(binding=binding, issue=issue)
             scheduled.append(self._schedule_review_poll(run, binding, issue))
             rearm_done = await self._retrigger_codex_review_unless_approved(
                 binding=binding,
@@ -10680,6 +10690,9 @@ class Orchestrator:
                 self.config.local_review_iteration_cap
             )
 
+            await self._move_issue_to_local_code_review_state(
+                binding=binding, issue=issue
+            )
             await self._post_local_review_starting_comment(
                 binding=binding,
                 issue=issue,
@@ -11048,7 +11061,8 @@ class Orchestrator:
                         e,
                     )
 
-        await self._move_issue_to_review_state(binding=binding, issue=issue)
+        if binding.resolved_remote_review():
+            await self._move_issue_to_review_state(binding=binding, issue=issue)
 
         review_run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC).isoformat()
@@ -11071,6 +11085,36 @@ class Orchestrator:
             ended_at=None,
             cost_usd=0.0,
         )
+
+    async def _move_issue_to_local_code_review_state(
+        self, *, binding: RepoBinding, issue: LinearIssue
+    ) -> None:
+        try:
+            states = await self._states_for_binding(binding)
+            review_state_id = states.get(binding.linear_states.local_code_review)
+        except LinearError as e:
+            log.warning(
+                "could not load states while moving %s to local review: %s",
+                issue.identifier,
+                e,
+            )
+            return
+        if review_state_id is None:
+            log.warning(
+                "missing Linear local review state %r for %s",
+                binding.linear_states.local_code_review,
+                issue.identifier,
+            )
+            return
+        try:
+            await self.tracker(binding).move_issue(issue.id, review_state_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s to local review state %r: %s",
+                issue.identifier,
+                binding.linear_states.local_code_review,
+                e,
+            )
 
     async def _move_issue_to_review_state(
         self, *, binding: RepoBinding, issue: LinearIssue

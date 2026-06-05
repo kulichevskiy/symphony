@@ -343,21 +343,28 @@ async def _preflight_configured_bindings(
             )
             ok = False
             continue
-        missing = [
-            name
-            for name in (
-                binding.states.in_progress,
-                binding.states.code_review,
-                binding.states.needs_approval,
-                binding.states.blocked,
-                binding.states.waiting,
-                binding.states.done,
+        required_states: list[tuple[str, str | None]] = [
+            ("in_progress", binding.states.in_progress),
+            ("needs_approval", binding.states.needs_approval),
+            ("blocked", binding.states.blocked),
+            ("waiting", binding.states.waiting),
+            ("done", binding.states.done),
+        ]
+        if binding.resolved_local_review():
+            required_states.append(
+                ("local_code_review", binding.states.local_code_review)
             )
-            if name is not None and name not in states
+        if binding.resolved_remote_review():
+            required_states.append(("code_review", binding.states.code_review))
+        missing = [
+            (role, name)
+            for role, name in required_states
+            if name is not None and (not name or name not in states)
         ]
         if missing:
+            labels = [f"{role} state {name!r}" for role, name in missing]
             click.echo(
-                f"  ✗ {binding.project_key}: missing states {missing}; "
+                f"  ✗ {binding.project_key}: missing states {labels}; "
                 f"available: {sorted(states.keys())}"
             )
             ok = False

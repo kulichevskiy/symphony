@@ -430,6 +430,14 @@ def test_linear_states_ready_has_no_default() -> None:
         LinearStates()  # type: ignore[call-arg]
 
 
+def test_linear_states_review_lane_defaults() -> None:
+    """Review lanes keep legacy defaults while adding a local-review lane."""
+    states = LinearStates(ready="Todo")
+
+    assert states.local_code_review == "Local Code Review"
+    assert states.code_review == "Needs Approval"
+
+
 def test_per_binding_linear_states(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Each binding declares its own LinearStates block."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
