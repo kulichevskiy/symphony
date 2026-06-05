@@ -89,6 +89,7 @@ def _states() -> dict[str, str]:
     return {
         "Todo": "state-todo",
         "In Progress": "state-progress",
+        "Local Code Review": "state-local-review",
         "Needs Approval": "state-na",
         "Blocked": "state-bl",
         "Done": "state-done",
@@ -215,9 +216,11 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
                 f"after APPROVED verdict, but got: {call_obj}"
             )
 
-        # Issue still moved into the review state so CI/operator can act.
+        # The in-workspace reviewer gets its own pre-PR Linear lane. Local-only
+        # mode must not require or move into the remote PR-review lane.
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
-        assert "state-na" in move_targets
+        assert "state-local-review" in move_targets
+        assert "state-na" not in move_targets
 
         # Review monitor row was created so post-merge logic still works.
         history = await db.runs.history_for_issue(conn, "iss-1")

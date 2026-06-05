@@ -61,18 +61,20 @@ class TrackerStates(BaseModel):
     declare which state the orchestrator picks issues up from, since teams
     rename or replace it (Backlog, Todo, Up Next, …).
 
-    `code_review` is the automated PR-review lane; `needs_approval` is the
-    human-input lane for failed merges and stage-failure parking. Legacy
-    configs without `code_review` inherit their old `needs_approval` lane,
-    including that field's legacy default, so existing deployments keep loading
-    during the schema split. `blocked` is the agent-error parking lane for cost
-    caps, failed merges, and rejected work. `waiting` is a separate optional
+    `local_code_review` is the in-workspace pre-PR review lane; `code_review`
+    is the automated PR-review lane; `needs_approval` is the human-input lane
+    for failed merges and stage-failure parking. Legacy configs without
+    `code_review` inherit their old `needs_approval` lane, including that
+    field's legacy default, so existing deployments keep loading during the
+    schema split. `blocked` is the agent-error parking lane for cost caps,
+    failed merges, and rejected work. `waiting` is a separate optional
     dependency-waiting lane used only when pickup should bounce tickets blocked
     by other Linear issues.
     """
 
     ready: str = Field(min_length=1)
-    code_review: str = Field(min_length=1)
+    local_code_review: str = "Local Code Review"
+    code_review: str = ""
     in_progress: str = "In Progress"
     needs_approval: str = "Needs Approval"
     in_acceptance: str = "In Acceptance"
