@@ -1,7 +1,7 @@
 """End-to-end local-review session: build callbacks, run the loop.
 
 This is the single entry point the orchestrator calls once the
-Implement stage succeeds and `review_strategy != "remote"`. It wires
+Implement stage succeeds and `local_review` is enabled. It wires
 together the four building blocks:
 
   prompt + command (local_review.py)
@@ -20,8 +20,8 @@ Caller responsibilities outside this module:
   caller's existing helper (the orchestrator already has
   `_workspace_head_sha`).
 - After the session returns:
-  - `APPROVED`            push and proceed (skip `@codex` if `local` mode,
-                          post `@codex review` once if `hybrid`).
+  - `APPROVED`            push and proceed (skip `@codex` when `remote_review`
+                          is false, post `@codex review` once when true).
   - `EXHAUSTED|STUCK_LOOP|FIX_RUN_FAILED`
                           push and escalate to `needs_approval`. The
                           branch has the best-effort fix already.

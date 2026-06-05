@@ -712,7 +712,7 @@ def local_review_dry_run(
 ) -> None:
     """Run the local reviewer on a workspace without touching Linear/GitHub.
 
-    Use this before flipping a binding to `review_strategy: local` in
+    Use this before enabling `local_review: true` on a binding in
     production: point at a real branch in a real workspace, supply the
     issue context, and eyeball the verdict + findings the reviewer
     produces. Nothing is written to SQLite, no Linear comments are
