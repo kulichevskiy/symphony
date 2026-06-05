@@ -25,6 +25,7 @@ from symphony.orchestrator.poll import (
     _status_check_run_id,
 )
 from symphony.pipeline.cost_guard import UsageDelta
+from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
 
@@ -4970,7 +4971,7 @@ async def test_required_check_fix_reruns_local_review_before_push_for_local_only
             return_value=(UsageDelta(cost_usd=0.01), "exit", 0, False)
         )
 
-        async def rerun_local_review(**kwargs: object) -> None:
+        async def rerun_local_review(**kwargs: object) -> LoopResult:
             assert kwargs["parent_run_id"] != "implement"
             assert push_fn.await_count == 0
             await db.runs.create(
@@ -4981,6 +4982,11 @@ async def test_required_check_fix_reruns_local_review_before_push_for_local_only
                 status="completed",
                 pid=None,
                 started_at=datetime.now(UTC).isoformat(),
+            )
+            return LoopResult(
+                outcome=LoopOutcome.APPROVED,
+                iterations=1,
+                verdicts=(),
             )
 
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
@@ -5014,6 +5020,105 @@ async def test_required_check_fix_reruns_local_review_before_push_for_local_only
             "review_fix",
             "local_review",
         ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_required_check_fix_parks_when_post_fix_local_review_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        binding = _binding(agent="claude").model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        push_fn = AsyncMock()
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._git_fetch_branch",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._workspace_ref_sha",
+            AsyncMock(return_value="start-sha"),
+        )
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._workspace_head_sha",
+            AsyncMock(return_value="fixed-sha"),
+        )
+        orch._run_required_check_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(UsageDelta(cost_usd=0.01), "exit", 0, False)
+        )
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=LoopOutcome.REVIEWER_FAILED,
+                iterations=1,
+                verdicts=(),
+                error="reviewer still found issues",
+            )
+        )
+
+        dispatched = await orch._dispatch_merge_required_check_fix_run(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            head_sha="abc123",
+            failing_checks=[
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "FAILURE",
+                }
+            ],
+            merge_error="required status check failed before merge",
+            trigger_signature="required_check_failure:abc123:vercel",
+            iteration=1,
+        )
+
+        assert dispatched is False
+        orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        push_fn.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        assert "post-required-check local-only review did not approve" in (
+            linear.post_comment.await_args.args[1]
+        )
     finally:
         await conn.close()
 

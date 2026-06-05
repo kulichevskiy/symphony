@@ -5306,14 +5306,33 @@ class Orchestrator:
                 ended_at=datetime.now(UTC).isoformat(),
             )
 
+            local_review_result: LoopResult | None = None
             if binding.resolved_local_review():
-                await self._run_local_review_phase(
+                local_review_result = await self._run_local_review_phase(
                     binding=binding,
                     issue=issue,
                     storage_issue_id=issue.id,
                     workspace_path=workspace_path,
                     parent_run_id=fix_run_id,
                 )
+                if (
+                    not binding.resolved_remote_review()
+                    and (
+                        local_review_result is None
+                        or local_review_result.outcome != LoopOutcome.APPROVED
+                    )
+                ):
+                    await self._mark_merge_required_check_fix_needs_approval(
+                        binding=binding,
+                        issue=issue,
+                        pr_url=pr_url,
+                        reason=(
+                            "post-required-check local-only review did not approve: "
+                            f"{_local_review_termination_reason(local_review_result)}"
+                        ),
+                        merge_run_id=merge_run_id,
+                    )
+                    return False
 
             try:
                 await self._push_fn(workspace_path, branch)
@@ -6440,7 +6459,8 @@ class Orchestrator:
                 log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
             return
 
-        # $retry or $approve: restart the review monitor.
+        # $retry or $approve: restart review. Local-only retries must produce
+        # a fresh local-review approval before the passive monitor can help.
         # Look up the issue BEFORE clearing the operator wait — if lookup
         # fails we want the wait (and its `_dispatch_run_ids` entry) to
         # survive so the next poll tick can retry. Clearing first would
@@ -6465,10 +6485,66 @@ class Orchestrator:
             pid=None,
             started_at=now,
         )
+        run = db.runs.Run(
+            id=new_run_id,
+            issue_id=issue_id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at=now,
+            ended_at=None,
+            cost_usd=0.0,
+        )
         state = await db.review_state.get(self._conn, issue_id)
         # Local-only / no-review bindings must never fire the remote bot, even
         # when recovering from a failed review wait.
-        if state.pr_number is not None and binding.resolved_remote_review():
+        if binding.resolved_local_review() and not binding.resolved_remote_review():
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "workspace acquire failed for local review retry %s: %s",
+                    issue.identifier,
+                    e,
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"workspace acquire failed for local review retry: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return
+            try:
+                local_review_result = await self._run_local_review_phase(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    workspace_path=workspace_path,
+                    parent_run_id=new_run_id,
+                )
+            finally:
+                self._workspace.release(binding, issue)
+            if (
+                local_review_result is None
+                or local_review_result.outcome != LoopOutcome.APPROVED
+            ):
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=(
+                        "local-only review did not approve: "
+                        f"{_local_review_termination_reason(local_review_result)}"
+                    ),
+                    last_log=_local_review_failure_log(local_review_result),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return
+        elif state.pr_number is not None and binding.resolved_remote_review():
             try:
                 await self._gh.pr_comment(
                     state.pr_number, "@codex review", repo=binding.github_repo
@@ -6480,16 +6556,6 @@ class Orchestrator:
                     state.pr_number,
                     e,
                 )
-        run = db.runs.Run(
-            id=new_run_id,
-            issue_id=issue_id,
-            stage="review",
-            status="running",
-            pid=None,
-            started_at=now,
-            ended_at=None,
-            cost_usd=0.0,
-        )
         await self._move_issue_to_review_state(binding=binding, issue=issue)
         self._schedule_review_poll(run, binding, issue)
         log.info("restarted review monitor for %s via $retry", issue.identifier)
