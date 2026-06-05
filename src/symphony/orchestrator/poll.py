@@ -10095,10 +10095,18 @@ class Orchestrator:
             return run_id
 
         try:
+            next_stage = (
+                "merge"
+                if (
+                    not binding.resolved_local_review()
+                    and not binding.resolved_remote_review()
+                )
+                else "review"
+            )
             done_body = stage_done(
                 CommentVars(
                     stage="implement",
-                    next_stage="review",
+                    next_stage=next_stage,
                     repo=binding.github_repo,
                     issue=0,
                     pr_url=pr_url or "(no PR)",
@@ -10116,6 +10124,38 @@ class Orchestrator:
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+
+        if (
+            not binding.resolved_local_review()
+            and not binding.resolved_remote_review()
+        ):
+            pr_number = pr_number_from_url(pr_url)
+            await db.review_state.begin_review(
+                self._conn,
+                issue_id,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label,
+            )
+            if pr_number is None:
+                log.warning(
+                    "could not parse PR number from %r for no-review %s",
+                    pr_url,
+                    issue.identifier,
+                )
+            else:
+                await db.issue_prs.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    github_repo=binding.github_repo,
+                    binding_key=_binding_storage_key(binding),
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    created_at=datetime.now(UTC).isoformat(),
+                    review_bypassed=True,
+                )
+            return run_id
 
         # 6. Start the Review stage. The remote `@codex review` ping fires
         #    exactly when `remote_review` is enabled. Local-only failures

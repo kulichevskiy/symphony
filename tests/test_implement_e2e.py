@@ -68,6 +68,24 @@ def _binding() -> RepoBinding:
     )
 
 
+def _no_review_binding(*, auto_merge: bool) -> RepoBinding:
+    return RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        agent="claude",
+        branch_prefix="symphony",
+        local_review=False,
+        remote_review=False,
+        auto_merge=auto_merge,
+        linear_states=LinearStates(
+            ready="Todo",
+            local_code_review="",
+            code_review="",
+            needs_approval="Needs Approval",
+        ),
+    )
+
+
 def _issue(
     *,
     state_id: str = "state-todo",
@@ -236,6 +254,108 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert history[1].status == "running"
         assert await db.runs.has_running_or_completed(conn, "iss-1") is True
         gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize("auto_merge", [True, False])
+@pytest.mark.asyncio
+async def test_false_false_review_binding_opens_pr_without_review_stage(
+    tmp_path: Path,
+    auto_merge: bool,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=auto_merge)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _FakeRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=41,
+            pr_url="https://github.com/org/repo/pull/41",
+            github_repo="org/repo",
+            issue_label="feature",
+        )
+        await db.review_state.set_signature(conn, "iss-1", "codex_inline:stale")
+        await db.review_state.bump_iteration(conn, "iss-1")
+        await db.review_state.bump_ci_fetch_failures(conn, "iss-1")
+        await db.review_state.set_codex_lgtm_comment_id(conn, "iss-1", "comment-41")
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        gh.pr_create.assert_awaited_once()
+        gh.pr_comment.assert_not_awaited()
+        assert linear.move_issue.await_args_list == [call("iss-1", "state-progress")]
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == ["implement"]
+        assert history[0].status == "completed"
+
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 42
+        assert candidates[0].github_repo == "org/repo"
+        assert candidates[0].binding_key
+
+        review = await db.review_state.get(conn, "iss-1")
+        assert review.pr_number == 42
+        assert review.pr_url == "https://github.com/org/repo/pull/42"
+        assert review.github_repo == "org/repo"
+        assert review.issue_label == ""
+        assert review.iteration == 0
+        assert review.last_trigger_signature == ""
+        assert review.ci_fetch_failures == 0
+        assert review.codex_lgtm_comment_id == ""
     finally:
         await conn.close()
 

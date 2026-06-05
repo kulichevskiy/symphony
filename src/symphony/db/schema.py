@@ -132,6 +132,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         )
     if "parked_at" not in cols:
         await conn.execute("ALTER TABLE issue_prs ADD COLUMN parked_at TEXT")
+    if "review_bypassed" not in cols:
+        await conn.execute(
+            "ALTER TABLE issue_prs "
+            "ADD COLUMN review_bypassed INTEGER NOT NULL DEFAULT 0"
+        )
 
     cur = await conn.execute("PRAGMA table_info(acceptance_state)")
     cols = {row[1] for row in await cur.fetchall()}
