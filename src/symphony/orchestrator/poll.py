@@ -406,6 +406,21 @@ def _local_review_status_from_result(result: LoopResult | None) -> str:
     return "failed"
 
 
+def _local_review_needs_approval(result: LoopResult | None) -> bool:
+    return result is not None and result.outcome in {
+        LoopOutcome.EXHAUSTED,
+        LoopOutcome.STUCK_LOOP,
+    }
+
+
+def _local_review_infra_failed(result: LoopResult | None) -> bool:
+    return result is None or result.outcome in {
+        LoopOutcome.REVIEWER_FAILED,
+        LoopOutcome.FIX_RUN_FAILED,
+        LoopOutcome.COST_CAP_BREACHED,
+    }
+
+
 def _termination_kwargs(
     *,
     status: str,
@@ -10043,6 +10058,18 @@ class Orchestrator:
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
             )
+            if (
+                not binding.resolved_remote_review()
+                and _local_review_infra_failed(local_review_result)
+            ):
+                await self._block_local_only_review_infra_failure(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    run_id=run_id,
+                    result=local_review_result,
+                )
+                return run_id
 
         # 5. Push branch, open PR, post stage-transition comment.
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
@@ -10128,6 +10155,19 @@ class Orchestrator:
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
+        if (
+            binding.resolved_local_review()
+            and not binding.resolved_remote_review()
+            and _local_review_needs_approval(local_review_result)
+        ):
+            await self._park_local_only_review_needs_approval(
+                run=review_run,
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                result=local_review_result,
+            )
+            return run_id
         if (
             binding.resolved_local_review()
             and not binding.resolved_remote_review()
@@ -11070,6 +11110,158 @@ class Orchestrator:
             log.warning(
                 "local-review comment post failed on %s: %s", issue.identifier, e
             )
+
+    async def _block_local_only_review_infra_failure(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        result: LoopResult | None,
+    ) -> None:
+        reason = _local_review_termination_reason(result)
+        await self._fail_run(
+            run_id,
+            reason,
+            cap_breached=(
+                result is not None and result.outcome == LoopOutcome.COST_CAP_BREACHED
+            ),
+        )
+
+        tracker = self.tracker(binding)
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while blocking %s after local review: %s",
+                issue.identifier,
+                e,
+            )
+            states = {}
+
+        blocked_id = states.get(binding.linear_states.blocked)
+        if blocked_id is not None:
+            try:
+                await tracker.move_issue(issue.id, blocked_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to blocked after local-review failure: %s",
+                    issue.identifier,
+                    e,
+                )
+        else:
+            log.warning(
+                "missing Linear blocked state %r for %s after local-review failure",
+                binding.linear_states.blocked,
+                issue.identifier,
+            )
+
+        await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        cost = await db.runs.cost_for_issue(self._conn, storage_issue_id)
+        body = failed(
+            CommentVars(
+                stage="local review",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                cost=f"${cost:.4f}",
+                error=reason,
+                last_log=_local_review_failure_log(result),
+                auto_retry=False,
+            )
+        )
+        body += (
+            "\nReply with `$retry` or `$approve` to requeue this issue. "
+            "Reply with `$reject` or `$stop` to leave it halted.\n"
+        )
+        try:
+            await tracker.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "local-review blocked comment post failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
+    async def _park_local_only_review_needs_approval(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        result: LoopResult | None,
+    ) -> None:
+        reason = _local_review_termination_reason(result)
+        findings = ""
+        if result is not None and result.last_verdict is not None:
+            findings = result.last_verdict.findings.strip()
+        detail_parts = [reason]
+        if findings:
+            detail_parts.append("Last unresolved findings:\n\n" + findings)
+        detail = "\n\n".join(detail_parts)
+
+        tracker = self.tracker(binding)
+        try:
+            states = await self._states_for_binding(binding)
+            needs_approval_id = states.get(binding.linear_states.needs_approval)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking %s after local review: %s",
+                issue.identifier,
+                e,
+            )
+            needs_approval_id = None
+
+        if needs_approval_id is not None:
+            try:
+                await tracker.move_issue(issue.id, needs_approval_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to needs_approval after local review: %s",
+                    issue.identifier,
+                    e,
+                )
+        else:
+            log.warning(
+                "missing Linear needs_approval state %r for %s after local review",
+                binding.linear_states.needs_approval,
+                issue.identifier,
+            )
+
+        total_cost = await db.runs.cost_for_issue(self._conn, run.issue_id)
+        body = awaiting_approval(
+            CommentVars(
+                stage="local review",
+                next_stage="done",
+                repo=binding.github_repo,
+                issue=pr_number_from_url(pr_url) or 0,
+                pr_url=pr_url,
+                run_id=run.id,
+                cost=f"${total_cost:.4f}",
+                error=reason,
+            )
+        )
+        if findings:
+            body += "\nLast unresolved findings:\n\n" + findings + "\n"
+        try:
+            await tracker.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "local-review needs_approval comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            "needs_approval",
+            ended_at=datetime.now(UTC).isoformat(),
+            **_termination_kwargs(status="needs_approval", reason=detail),
+        )
+        await self._clear_review_rearm_retry(run.id)
 
     async def _start_review_stage(
         self,
