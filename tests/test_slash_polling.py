@@ -1355,3 +1355,85 @@ async def test_implement_failed_retry_failure_posts_rejection_and_retries_next_t
         assert any("Resumed" in body for body in bodies)
     finally:
         await conn.close()
+
+
+# --- remote_review: false suppresses $retry @codex pings ----------------
+#
+# Local-only / no-review bindings must never fire the `@codex` bot. A manual
+# `$retry` on an active review monitor or after a failed review wait re-arms
+# the monitor without posting `@codex review`.
+
+
+@pytest.mark.asyncio
+async def test_active_review_retry_skips_codex_when_remote_review_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        cfg = Config(repos=[binding])
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_comment = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
+
+        await db.issues.upsert(
+            conn,  # type: ignore[arg-type]
+            id="iss-1",
+            identifier="ENG-1",
+            title="t",
+            team_key="ENG",
+        )
+        await _seed_review_state(conn)
+
+        await orch._handle_active_review_retry_intent(  # noqa: SLF001
+            "iss-1", "run-1", _intent(SlashKind.RETRY)
+        )
+
+        orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        # The monitor is still re-armed: signature recorded + comment posted.
+        state = await db.review_state.get(conn, "iss-1")  # type: ignore[arg-type]
+        assert state.last_trigger_signature == "manual_retry:run-1:c-command"
+        linear.post_comment.assert_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_failed_retry_skips_codex_when_remote_review_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        cfg = Config(repos=[binding])
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_comment = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            stage="implement",
+            status="failed",
+        )
+        await _seed_review_state(conn)
+
+        await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+            "iss-1", "run-1", _intent(SlashKind.RETRY)
+        )
+
+        orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        # The monitor still restarts and the wait is cleared.
+        orch._schedule_review_poll.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()

@@ -4910,3 +4910,138 @@ async def test_required_status_failure_cost_cap_parks_merge_needs_approval(
         )
     finally:
         await conn.close()
+
+
+# --- remote_review: false merge bypass ----------------------------------
+#
+# `remote_review: false` bindings never receive an `@codex` approval, so the
+# merge scheduler must treat a clean no_signal verdict (after CI + mergeability
+# pass) as the merge signal. Local-only bindings additionally require a
+# completed local-review loop; no-review bindings gate on CI alone.
+
+
+def _no_signal_view() -> dict[str, object]:
+    return {
+        "headRefOid": "abc123",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "state": "OPEN",
+        "mergedAt": None,
+    }
+
+
+def _make_poll_merge_orchestrator(
+    conn,  # type: ignore[no-untyped-def]
+    *,
+    binding: RepoBinding,
+    verdict: Verdict,
+) -> Orchestrator:
+    gh = MagicMock()
+    gh.pr_view = AsyncMock(return_value=_no_signal_view())
+    linear = AsyncMock()
+    linear.lookup_issue = AsyncMock(return_value=_issue())
+    linear.move_issue = AsyncMock(return_value=None)
+    linear.post_comment = AsyncMock(return_value="cmt-1")
+    orch = Orchestrator(
+        Config(repos=[binding]),
+        linear,
+        conn,
+        runner=MagicMock(),
+        gh=gh,
+        workspace=MagicMock(),
+        push_fn=AsyncMock(),
+    )
+    orch._states = {"ENG": _states()}  # noqa: SLF001
+    orch._finalize_pr_if_closed = AsyncMock(return_value=False)  # type: ignore[method-assign]  # noqa: SLF001
+    orch._required_check_failures_for_view = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+    orch._review_verdict_for_pr = AsyncMock(return_value=verdict)  # type: ignore[method-assign]  # noqa: SLF001
+    return orch
+
+
+@pytest.mark.asyncio
+async def test_no_review_binding_merges_clean_ci_no_signal(tmp_path: Path) -> None:
+    """false/false: clean CI + mergeable no_signal merges without any review."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        # Not an @codex approval, so the merge run skips the review gate.
+        assert kwargs["skip_review"] is True
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_only_binding_merges_after_local_review_completed(
+    tmp_path: Path,
+) -> None:
+    """true/false: a completed local-review loop unblocks the no_signal merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.create(
+            conn,
+            id="local-review",
+            issue_id="iss-1",
+            stage="local_review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert orch._schedule_merge.call_args.kwargs["pr_number"] == 42  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_only_binding_waits_without_completed_local_review(
+    tmp_path: Path,
+) -> None:
+    """true/false: no completed local review means no_signal stays unmerged."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()

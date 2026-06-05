@@ -2405,23 +2405,27 @@ class Orchestrator:
             pr_number=state.pr_number,
             pr_url=state.pr_url,
         )
-        try:
-            await self._gh.pr_comment(
-                state.pr_number, "@codex review", repo=binding.github_repo
-            )
-        except GitHubError as e:
-            log.warning(
-                "could not re-post @codex review for active monitor %s#%d: %s",
-                binding.github_repo,
-                state.pr_number,
-                e,
-            )
-            await self._post_command_rejected(
-                issue_id,
-                "$retry",
-                f"could not re-post @codex review: {e}",
-            )
-            return
+        # Only ping the remote bot when `remote_review` is enabled. Local-only
+        # and no-review bindings must never fire `@codex review` — the manual
+        # retry just re-arms the monitor without a remote ping.
+        if binding.resolved_remote_review():
+            try:
+                await self._gh.pr_comment(
+                    state.pr_number, "@codex review", repo=binding.github_repo
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not re-post @codex review for active monitor %s#%d: %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    e,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    "$retry",
+                    f"could not re-post @codex review: {e}",
+                )
+                return
 
         signature = f"manual_retry:{run_id}:{intent.comment_id}"
         await db.review_state.set_signature(self._conn, issue_id, signature)
@@ -3627,6 +3631,23 @@ class Orchestrator:
             return False
         return _parse_rfc3339(latest_local_review.started_at) <= _parse_rfc3339(
             run.started_at
+        )
+
+    async def _local_review_completed_for_issue(self, issue_id: str) -> bool:
+        """Whether the in-workspace reviewer loop has completed for the issue.
+
+        Used by the merge scheduler to gate the `remote_review: false`
+        review bypass: local-only bindings must have a finished local-review
+        run before clean CI is treated as a merge signal.
+        """
+        latest_local_review = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="local_review",
+        )
+        return (
+            latest_local_review is not None
+            and latest_local_review.status == "completed"
         )
 
     async def _poll_review_run_with_limits(
@@ -6394,7 +6415,9 @@ class Orchestrator:
             started_at=now,
         )
         state = await db.review_state.get(self._conn, issue_id)
-        if state.pr_number is not None:
+        # Local-only / no-review bindings must never fire the remote bot, even
+        # when recovering from a failed review wait.
+        if state.pr_number is not None and binding.resolved_remote_review():
             try:
                 await self._gh.pr_comment(
                     state.pr_number, "@codex review", repo=binding.github_repo
@@ -8173,12 +8196,13 @@ class Orchestrator:
                 continue
 
             head_sha = str(view.get("headRefOid") or "")
-            conflict_fix_ready = False
-            if (
+            no_signal_mergeable = (
                 verdict.kind is VerdictKind.PENDING
                 and verdict.rule == "no_signal"
                 and str(view.get("mergeable") or "").upper() == "MERGEABLE"
-            ):
+            )
+            conflict_fix_ready = False
+            if no_signal_mergeable:
                 conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
                     self._conn,
                     issue_id=candidate.issue_id,
@@ -8188,7 +8212,26 @@ class Orchestrator:
                     head_sha=head_sha,
                 )
 
-            if verdict.kind is VerdictKind.APPROVED or conflict_fix_ready:
+            # `remote_review: false` is an intentional review bypass: no
+            # `@codex` approval will ever land, so once CI and mergeability
+            # pass we treat the clean no_signal state as the merge signal.
+            # Local-only bindings (local_review: true) additionally require a
+            # completed local-review loop; no-review bindings (false/false)
+            # gate on CI alone.
+            review_bypass_ready = False
+            if no_signal_mergeable and not binding.resolved_remote_review():
+                review_bypass_ready = (
+                    not binding.resolved_local_review()
+                    or await self._local_review_completed_for_issue(
+                        candidate.issue_id
+                    )
+                )
+
+            if (
+                verdict.kind is VerdictKind.APPROVED
+                or conflict_fix_ready
+                or review_bypass_ready
+            ):
                 if (
                     binding.acceptance.mode != "off"
                     and not await self._acceptance_passed_for_candidate(
