@@ -3652,24 +3652,50 @@ class Orchestrator:
     async def _local_review_approved_for_current_review(
         self, run: db.runs.Run
     ) -> bool:
+        latest_local_review = await self._latest_local_review_for_current_review(run)
+        return (
+            latest_local_review is not None
+            and latest_local_review.status == "completed"
+        )
+
+    async def _latest_local_review_for_current_review(
+        self, run: db.runs.Run
+    ) -> db.runs.Run | None:
         latest_implement = await db.runs.latest_for_issue_stage(
             self._conn,
             issue_id=run.issue_id,
             stage="implement",
         )
         if latest_implement is None:
-            return False
+            return None
         latest_local_review = await db.runs.latest_for_issue_stage(
             self._conn,
             issue_id=run.issue_id,
             stage="local_review",
             started_at_gte=latest_implement.started_at,
         )
-        if latest_local_review is None or latest_local_review.status != "completed":
-            return False
-        return _parse_rfc3339(latest_local_review.started_at) <= _parse_rfc3339(
+        if latest_local_review is None:
+            return None
+        if _parse_rfc3339(latest_local_review.started_at) > _parse_rfc3339(
             run.started_at
-        )
+        ):
+            return None
+        return latest_local_review
+
+    async def _local_review_permits_current_review(self, run: db.runs.Run) -> bool:
+        latest_local_review = await self._latest_local_review_for_current_review(run)
+        if latest_local_review is None:
+            return False
+        return latest_local_review.status in {"completed", "interrupted"}
+
+    async def _review_retry_needs_local_gate(
+        self, *, binding: RepoBinding, run: db.runs.Run
+    ) -> bool:
+        if not binding.resolved_local_review():
+            return False
+        if not binding.resolved_remote_review():
+            return True
+        return not await self._local_review_permits_current_review(run)
 
     async def _local_review_completed_for_issue(
         self, candidate: db.issue_prs.IssuePR
@@ -6683,9 +6709,11 @@ class Orchestrator:
             cost_usd=0.0,
         )
         state = await db.review_state.get(self._conn, issue_id)
-        # Local-only / no-review bindings must never fire the remote bot, even
-        # when recovering from a failed review wait.
-        if binding.resolved_local_review() and not binding.resolved_remote_review():
+        retry_local_gate = await self._review_retry_needs_local_gate(
+            binding=binding,
+            run=run,
+        )
+        if retry_local_gate:
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
             except Exception as e:  # noqa: BLE001
@@ -6712,9 +6740,16 @@ class Orchestrator:
                     workspace_path=workspace_path,
                     parent_run_id=new_run_id,
                 )
-                if (
-                    local_review_result is None
-                    or local_review_result.outcome != LoopOutcome.APPROVED
+                local_review_permits_retry = (
+                    binding.resolved_remote_review()
+                    and _local_review_permits_remote(local_review_result)
+                )
+                if not (
+                    local_review_permits_retry
+                    or (
+                        local_review_result is not None
+                        and local_review_result.outcome == LoopOutcome.APPROVED
+                    )
                 ):
                     await self._fail_review_run(
                         run=run,
@@ -6750,7 +6785,7 @@ class Orchestrator:
                     return
             finally:
                 self._workspace.release(binding, issue)
-        elif state.pr_number is not None and binding.resolved_remote_review():
+        if state.pr_number is not None and binding.resolved_remote_review():
             try:
                 await self._gh.pr_comment(
                     state.pr_number, "@codex review", repo=binding.github_repo
