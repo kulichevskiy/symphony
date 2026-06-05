@@ -436,6 +436,17 @@ def _local_review_termination_reason(result: LoopResult | None) -> str:
     return f"local-review ended with {result.outcome.value}"
 
 
+def _local_review_failure_log(result: LoopResult | None) -> str:
+    if result is None:
+        return ""
+    parts: list[str] = []
+    if result.error:
+        parts.append(result.error)
+    if result.last_verdict is not None and result.last_verdict.findings:
+        parts.append(result.last_verdict.findings)
+    return "\n\n".join(parts)
+
+
 def build_runner_command(
     agent: str,
     prompt: str,
@@ -9942,19 +9953,37 @@ class Orchestrator:
         )
 
         # 6. Start the Review stage. The remote `@codex review` ping fires
-        #    exactly when `remote_review` is enabled — orthogonal to the
-        #    local-review outcome. `remote_review: false` (local-only or
-        #    no-review modes) never pings the bot; this intentionally drops
-        #    the old `local`-strategy remote fallback that fired on a
-        #    failed / exhausted local loop.
+        #    exactly when `remote_review` is enabled. Local-only failures
+        #    are parked below instead of falling back to the remote bot.
         post_codex_review = binding.resolved_remote_review()
-        await self._start_review_stage(
+        review_run = await self._start_review_stage(
             binding=binding,
             issue=issue,
             storage_issue_id=issue_id,
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
+        if (
+            binding.resolved_local_review()
+            and not binding.resolved_remote_review()
+            and (
+                local_review_result is None
+                or local_review_result.outcome != LoopOutcome.APPROVED
+            )
+        ):
+            await self._fail_review_run(
+                run=review_run,
+                binding=binding,
+                issue=issue,
+                error=(
+                    "local-only review did not approve: "
+                    f"{_local_review_termination_reason(local_review_result)}"
+                ),
+                last_log=_local_review_failure_log(local_review_result),
+                auto_retry=False,
+                operator_wait=True,
+            )
+            return run_id
         # 7. Surface the local-review verdict on the GitHub PR thread
         #    (not just on Linear) so human reviewers see the audit
         #    trail. Only fires when local-review APPROVED — failures
@@ -10532,8 +10561,8 @@ class Orchestrator:
         before letting it drive the PR.
 
         Errors here are caught and logged: a broken local-review path
-        must never dead-end an issue. The remote `@codex` flow runs
-        afterwards regardless.
+        returns `None` so the caller can either continue to remote review
+        or park a local-only PR for operator action.
         """
         storage_issue_id = storage_issue_id or issue.id
         try:
@@ -10882,15 +10911,12 @@ class Orchestrator:
         storage_issue_id: str | None = None,
         pr_url: str,
         post_codex_review: bool = True,
-    ) -> str | None:
+    ) -> db.runs.Run:
         """Persist the review state row, optionally ping `@codex review`.
 
-        `post_codex_review=False` is the local-review-mode entry point: the
-        in-workspace reviewer already produced an `APPROVED` verdict, so
-        sending the remote bot another pass would just burn cost and
-        latency. State tracking, PR persistence, and the Linear state
-        move still happen — the review monitor still polls CI and human
-        approvals; only the bot ping is suppressed.
+        `post_codex_review=False` is the local-only / no-review entry point:
+        state tracking, PR persistence, and the Linear state move still happen,
+        but the remote bot ping is suppressed.
 
         Idempotent in spirit: failure to post the bot ping does not block
         the run row from being created, but is logged loudly so an
@@ -10940,6 +10966,7 @@ class Orchestrator:
         await self._move_issue_to_review_state(binding=binding, issue=issue)
 
         review_run_id = str(uuid.uuid4())
+        started_at = datetime.now(UTC).isoformat()
         await db.runs.create(
             self._conn,
             id=review_run_id,
@@ -10947,9 +10974,18 @@ class Orchestrator:
             stage="review",
             status="running",
             pid=None,
-            started_at=datetime.now(UTC).isoformat(),
+            started_at=started_at,
         )
-        return review_run_id
+        return db.runs.Run(
+            id=review_run_id,
+            issue_id=storage_issue_id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at=started_at,
+            ended_at=None,
+            cost_usd=0.0,
+        )
 
     async def _move_issue_to_review_state(
         self, *, binding: RepoBinding, issue: LinearIssue
