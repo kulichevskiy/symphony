@@ -5229,3 +5229,48 @@ async def test_local_only_binding_waits_when_local_review_predates_fix(
         orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_only_binding_merges_when_local_review_follows_fix(
+    tmp_path: Path,
+) -> None:
+    """true/false: post-fix local review covers the clean no_signal PR."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:05:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="post-fix-local-review",
+            issue_id="iss-1",
+            stage="local_review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:06:00+00:00",
+        )
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert orch._schedule_merge.call_args.kwargs["pr_number"] == 42  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()

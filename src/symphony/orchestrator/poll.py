@@ -3642,13 +3642,13 @@ class Orchestrator:
         review bypass: local-only bindings must have a finished local-review
         run before clean CI is treated as a merge signal.
 
-        The local-review loop only runs in-workspace after the implement run
-        and before the PR is opened (see `_run_local_review_phase`). A
-        completed local review from a previous PR cycle must not green-light a
-        later PR for the same issue. Merge-conflict and required-check fix-runs
-        (`stage = "review_fix"`) push commits the reviewer never saw, so a
-        local review that predates the latest fix-run is stale and must not
-        green-light the post-fix HEAD — otherwise unreviewed code merges.
+        A completed local review from a previous PR cycle must not green-light
+        a later PR for the same issue. Merge-conflict and required-check
+        fix-runs (`stage = "review_fix"`) push commits the reviewer never saw,
+        so a local review that predates the latest fix-run is stale and must
+        not green-light the post-fix HEAD — otherwise unreviewed code merges.
+        A local review after the PR was opened is valid when it is the post-fix
+        rerun for the current PR.
         """
         latest_implement = await db.runs.latest_for_issue_stage(
             self._conn,
@@ -3668,8 +3668,6 @@ class Orchestrator:
         if (
             latest_local_review is None
             or latest_local_review.status != "completed"
-            or _parse_rfc3339(latest_local_review.started_at)
-            > _parse_rfc3339(candidate.created_at)
         ):
             return False
         latest_fix = await db.runs.latest_for_issue_stage(
