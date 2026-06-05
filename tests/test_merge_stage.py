@@ -2369,7 +2369,7 @@ async def test_review_verdict_treats_issue_comment_fetch_failure_as_empty(
 
 
 @pytest.mark.asyncio
-async def test_review_verdict_ignores_codex_signals_when_remote_review_disabled(
+async def test_review_verdict_preserves_mergeability_when_remote_review_disabled(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -2446,8 +2446,9 @@ async def test_review_verdict_ignores_codex_signals_when_remote_review_disabled(
             view={"headRefOid": "abc123", "mergeable": "CONFLICTING"},
         )
 
-        assert verdict.kind == VerdictKind.PENDING
-        assert verdict.rule == "no_signal"
+        assert verdict.kind == VerdictKind.CHANGES_REQUESTED
+        assert verdict.rule == "merge_conflict"
+        assert verdict.merge_conflict is True
         gh.pr_checks.assert_awaited_once_with(45, repo="org/repo")
         gh.pr_review_comments.assert_not_awaited()
         gh.pr_reviews.assert_not_awaited()

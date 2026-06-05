@@ -9604,7 +9604,7 @@ class Orchestrator:
                     head_committed_at="",
                     reactions=(),
                     reviews=(),
-                    mergeable=None,
+                    mergeable=str(view.get("mergeable") or ""),
                 ),
             )
 
