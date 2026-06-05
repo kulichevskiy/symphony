@@ -30,7 +30,10 @@ ui:
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
-    agent: claude
+    agent: claude        # builder: implement stage + local-review fix rounds
+    reviewer_agent: codex  # optional local reviewer; default is opposite of `agent`
+    local_review: true
+    remote_review: true
     issue_label: symphony
     branch_prefix: symphony
     webhook_enabled: true
@@ -41,6 +44,7 @@ repos:
     linear_states:
       ready: Todo            # source state — orchestrator picks up issues here
       in_progress: In Progress
+      local_code_review: Local Code Review
       code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
@@ -54,6 +58,7 @@ repos:
     linear_states:
       ready: Backlog
       in_progress: In Progress
+      local_code_review: Local Code Review
       code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
@@ -69,16 +74,22 @@ local_review_iteration_cap: 6
 cost_cap_per_issue_usd: 100.0
 
 # Review notes (per-binding `local_review` / `remote_review` booleans):
-#   local_review:  run the in-workspace reviewer loop before opening the PR.
-#   remote_review: run the `@codex` GitHub-bot review on the PR.
+#   local_review:  run the in-workspace reviewer loop before opening the PR;
+#                  the issue moves through `linear_states.local_code_review`.
+#   remote_review: run the `@codex` GitHub-bot review on the PR;
+#                  the issue moves through `linear_states.code_review`.
 # Defaults when neither is set: local_review=false, remote_review=true.
 # Truth table:
-#   local=false remote=true  -> remote-only (default): `@codex review` on every PR.
-#   local=true  remote=false -> local-only: in-workspace reviewer is authoritative;
-#                               `@codex` never fires (no remote fallback).
-#   local=true  remote=true  -> sequential: local loop, then PR, then remote loop.
-#   local=false remote=false -> no review: implement -> PR -> CI gate -> merge.
-# Pair `local_review: true` with `reviewer_agent` for a second opinion
-# (defaults to the opposite family of `agent`).
+#   local_review=false remote_review=true  -> remote-only (default): `@codex review`.
+#   local_review=true  remote_review=false -> local-only: in-workspace reviewer
+#                                             is authoritative; no remote fallback.
+#   local_review=true  remote_review=true  -> sequential: local loop, PR, remote loop.
+#   local_review=false remote_review=false -> no review: implement -> PR -> CI -> merge.
+# The legacy `review_strategy` is deprecated. It is still accepted via shim,
+# but new configs should use `local_review` / `remote_review`.
+# Role knobs:
+#   agent:          builder for implementation and local-review fix rounds.
+#   reviewer_agent: local reviewer; defaults to the opposite family of `agent`.
+#   remote review:  always the `@codex` GitHub bot, not `reviewer_agent`.
 # Example: set `agent: claude` + `local_review: true` on a low-risk binding to
 # tighten the fix loop; add `remote_review: true` to also keep the bot check.

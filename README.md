@@ -11,8 +11,9 @@ What you see from the outside:
 ```text
 Linear issue (ready state + label)
   → agent edits code in a private git workspace
+  → optional local review / fix loop (local_code_review)
   → GitHub PR opened
-  → review / fix loop (CI + @codex review)
+  → CI and optional remote @codex review / fix loop
   → PR merged
   → Linear issue moved to Done
 ```
@@ -95,7 +96,10 @@ db_path: ~/symphony/state.sqlite
 repos:
   - linear_team_key: YOUR_TEAM_KEY     # e.g. ENG
     github_repo: owner/repo            # where PRs are opened
-    agent: claude                      # claude | codex
+    agent: claude                      # builder: implement + local-review fixes
+    # reviewer_agent: codex            # local reviewer; default is opposite agent
+    local_review: false                # in-workspace pre-PR reviewer loop
+    remote_review: true                # @codex GitHub-bot PR review
     issue_label: symphony              # only issues with this label are picked up
     branch_prefix: symphony
     max_concurrent: 2
@@ -103,6 +107,7 @@ repos:
     linear_states:
       ready: Todo                      # SOURCE state — no default, you MUST set it
       in_progress: In Progress
+      local_code_review: Local Code Review
       code_review: In Review
       needs_approval: Needs Approval
       blocked: Blocked
@@ -115,7 +120,7 @@ Notes:
   default — every binding must declare which state issues are picked up from.
   `preflight` (below) verifies team keys and state names before anything runs.
 - The full, line-commented reference for every field (cost caps, review
-  strategy, multiple bindings, webhook tuning, the optional dependency-wait
+  booleans, multiple bindings, webhook tuning, the optional dependency-wait
   lane) lives in **[`examples/config.yaml`](examples/config.yaml)**.
 - Using `agent: codex`? Add `codex_model` to the binding (e.g.
   `codex_model: gpt-5.1-codex`). `preflight` will set up and verify the Codex
@@ -127,6 +132,25 @@ Notes:
   automatically; re-run it after upgrading Codex.
 - Using the remote `@codex review` bot? Install the **Codex GitHub App** on the
   target repo.
+
+### Review configuration
+
+Review is controlled per binding with two booleans:
+
+| `local_review` | `remote_review` | Behavior |
+| --- | --- | --- |
+| `false` | `true` | Remote-only default: open the PR and run `@codex review`. |
+| `true` | `false` | Local-only: run the in-workspace reviewer before PR/CI/merge. |
+| `true` | `true` | Sequential: local reviewer first, then PR and `@codex review`. |
+| `false` | `false` | No review: implement, open PR, pass CI, merge. |
+
+`agent` is the builder: it handles implementation and any fix rounds requested
+by the local reviewer. `reviewer_agent` selects that local reviewer; if omitted,
+it defaults to the opposite agent family from `agent`.
+
+The remote reviewer is the `@codex` GitHub bot. It uses the PR `code_review`
+lane, while local review uses the `local_code_review` lane
+(`linear_states.local_code_review`).
 
 ---
 
@@ -156,8 +180,9 @@ If `preflight` fails, fix `.env` / YAML before starting the daemon.
 1. Add the configured `issue_label` to a Linear issue in a configured team.
 2. Move it to the `ready` state (e.g. `Todo`).
 3. Wait for the next poll tick (or webhook). The daemon comments "implement
-   starting", moves the issue to `in_progress`, opens a PR, and takes it from
-   there.
+   starting", moves the issue to `in_progress`, runs the optional
+   `local_review` lane in `local_code_review`, opens a PR, and takes it
+   through CI and optional remote review from there.
 
 ### Watch progress
 
