@@ -5045,3 +5045,50 @@ async def test_local_only_binding_waits_without_completed_local_review(
         orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_only_binding_waits_when_local_review_predates_fix(
+    tmp_path: Path,
+) -> None:
+    """true/false: a fix-run after the local review leaves the post-fix HEAD
+    unreviewed, so the no_signal merge must wait rather than bypass on a
+    stale local-review run."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.create(
+            conn,
+            id="local-review",
+            issue_id="iss-1",
+            stage="local_review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        # Merge-conflict / required-check fix pushed a new HEAD the
+        # in-workspace reviewer never saw.
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:05:00+00:00",
+        )
+        binding = _binding().model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()

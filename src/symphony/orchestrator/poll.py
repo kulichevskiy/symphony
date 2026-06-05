@@ -3634,21 +3634,39 @@ class Orchestrator:
         )
 
     async def _local_review_completed_for_issue(self, issue_id: str) -> bool:
-        """Whether the in-workspace reviewer loop has completed for the issue.
+        """Whether a completed local-review run covers the current PR HEAD.
 
         Used by the merge scheduler to gate the `remote_review: false`
         review bypass: local-only bindings must have a finished local-review
         run before clean CI is treated as a merge signal.
+
+        The local-review loop only runs in-workspace before the PR is
+        opened (see `_run_local_review_phase`); it never re-runs on a
+        post-PR HEAD. Merge-conflict and required-check fix-runs (`stage =
+        "review_fix"`) push commits the reviewer never saw, so a local
+        review that predates the latest fix-run is stale and must not
+        green-light the post-fix HEAD — otherwise unreviewed code merges.
         """
         latest_local_review = await db.runs.latest_for_issue_stage(
             self._conn,
             issue_id=issue_id,
             stage="local_review",
         )
-        return (
-            latest_local_review is not None
-            and latest_local_review.status == "completed"
+        if (
+            latest_local_review is None
+            or latest_local_review.status != "completed"
+        ):
+            return False
+        latest_fix = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="review_fix",
         )
+        if latest_fix is not None and _parse_rfc3339(
+            latest_fix.started_at
+        ) > _parse_rfc3339(latest_local_review.started_at):
+            return False
+        return True
 
     async def _poll_review_run_with_limits(
         self,
