@@ -404,6 +404,11 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
         assert "src/auth.py:12 missing token validation" in (
             review_rows[0].termination_detail
         )
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == review_rows[0].id
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert review_rows[0].id in orch._operator_wait_run_ids  # noqa: SLF001
     finally:
         await conn.close()
 

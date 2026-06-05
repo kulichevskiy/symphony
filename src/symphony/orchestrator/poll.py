@@ -10319,6 +10319,7 @@ class Orchestrator:
                 issue=issue,
                 pr_url=pr_url,
                 result=local_review_result,
+                operator_wait=binding.resolved_remote_review(),
             )
             return run_id
         if (
@@ -11344,6 +11345,7 @@ class Orchestrator:
         issue: LinearIssue,
         pr_url: str,
         result: LoopResult | None,
+        operator_wait: bool = False,
     ) -> None:
         reason = _local_review_termination_reason(result)
         findings = ""
@@ -11414,6 +11416,8 @@ class Orchestrator:
             **_termination_kwargs(status="needs_approval", reason=detail),
         )
         await self._clear_review_rearm_retry(run.id)
+        if operator_wait:
+            await self._track_review_failed_wait(issue.id, run.id, binding)
 
     async def _start_review_stage(
         self,
