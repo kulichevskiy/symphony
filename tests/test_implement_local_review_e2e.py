@@ -498,7 +498,8 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
     tmp_path: Path,
 ) -> None:
     """When local-review fails / exhausts / etc., don't post the
-    summary — the @codex fallback ping is enough audit trail."""
+    summary. With `remote_review: false` there is no @codex fallback
+    either — the PR falls through to the CI + human gate."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -561,7 +562,7 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # @codex fallback ping should fire; local-review summary should not.
+        # Neither the @codex ping nor the local-review summary should fire.
         codex_calls = [
             c for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
@@ -571,7 +572,7 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
             c for c in gh.pr_comment.await_args_list
             if "local reviewer" in str(c).lower()
         ]
-        assert len(codex_calls) == 1
+        assert codex_calls == []
         assert len(summary_calls) == 0
     finally:
         await conn.close()
@@ -586,8 +587,10 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
     Simulate an unexpected fault inside `run_local_review_session`
     (any non-LinearError / non-GitHubError exception). The phase
-    should return `None`, the gate function should fall back to the
-    remote `@codex` ping, and the PR must still be created.
+    should return `None` and the PR must still be created. With
+    `remote_review: false` (local-only mode) the `@codex review` ping
+    stays suppressed even on the fault — the old remote fallback is
+    gone — but the review monitor is still created.
     """
     import symphony.orchestrator.poll as poll_mod
 
@@ -661,29 +664,32 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
         # PR created despite the local-review fault.
         gh.pr_create.assert_awaited_once()
-        # Remote @codex review fired as the safety net.
+        # `remote_review: false` → no @codex ping, even on the fault.
         codex_calls = [
             c for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
             == "@codex review"
         ]
-        assert len(codex_calls) == 1, (
-            "expected @codex fallback when local-review phase raised"
+        assert codex_calls == [], (
+            "local-only mode must not post @codex even when the phase raised"
         )
         # Implement run still recorded.
         history = await db.runs.history_for_issue(conn, "iss-1")
         stages = {h.stage for h in history}
         assert "implement" in stages
-        assert "review" in stages  # remote review monitor created
+        assert "review" in stages  # review monitor created (CI + human gate)
     finally:
         await conn.close()
 
 
 @pytest.mark.asyncio
-async def test_local_strategy_falls_back_to_codex_when_reviewer_fails(
+async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
     tmp_path: Path,
 ) -> None:
-    """The reviewer subprocess fails to spawn → safety net kicks in."""
+    """`remote_review: false` never pings `@codex`, even when the local
+    reviewer subprocess fails to spawn. The old remote fallback that
+    legacy `local` strategy used to fire here is gone — the PR falls
+    through to the CI + human gate, not the remote bot."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -753,15 +759,15 @@ async def test_local_strategy_falls_back_to_codex_when_reviewer_fails(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # Reviewer crashed → remote @codex review must be posted as the safety net.
+        # Reviewer crashed, but remote_review is off → no @codex ping.
         codex_pings = [
             c
             for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
             == "@codex review"
         ]
-        assert len(codex_pings) == 1, (
-            "expected remote @codex fallback when local reviewer fails"
+        assert codex_pings == [], (
+            "local-only mode must not post @codex when the reviewer fails"
         )
     finally:
         await conn.close()

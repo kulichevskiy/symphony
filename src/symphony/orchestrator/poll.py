@@ -436,37 +436,6 @@ def _local_review_termination_reason(result: LoopResult | None) -> str:
     return f"local-review ended with {result.outcome.value}"
 
 
-def _should_post_codex_review(
-    *,
-    review_strategy: str,
-    local_review_result: LoopResult | None,
-) -> bool:
-    """Decide whether to ping `@codex review` after opening the PR.
-
-    Rules:
-      - `remote`              → always post (legacy behavior).
-      - `hybrid`              → always post (defense in depth: the
-                                remote bot is the second pair of eyes
-                                regardless of the local outcome).
-      - `local` + APPROVED    → suppress; the local pre-flight already
-                                approved the diff and the operator
-                                opted in to single-reviewer mode.
-      - `local` + anything else → post (safety net for failures,
-                                exhaustion, stuck loops, cost-cap
-                                breach, and operator-issued
-                                `$skip-local-review`).
-    """
-    if review_strategy == "remote" or review_strategy == "hybrid":
-        return True
-    # local strategy
-    if (
-        local_review_result is not None
-        and local_review_result.outcome == LoopOutcome.APPROVED
-    ):
-        return False
-    return True
-
-
 def build_runner_command(
     agent: str,
     prompt: str,
@@ -9882,16 +9851,13 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
 
-        # 6. Start the Review stage. In `local` mode, when the in-workspace
-        #    reviewer already APPROVED, suppress the `@codex review` ping —
-        #    the local pass has done the work. Any other outcome (hybrid
-        #    strategy, local-reviewer failed / exhausted / stuck, or no
-        #    local pre-flight at all) still pings the remote bot as a
-        #    safety net so a flaky reviewer can't dead-end the PR.
-        post_codex_review = _should_post_codex_review(
-            review_strategy=binding.review_strategy,
-            local_review_result=local_review_result,
-        )
+        # 6. Start the Review stage. The remote `@codex review` ping fires
+        #    exactly when `remote_review` is enabled — orthogonal to the
+        #    local-review outcome. `remote_review: false` (local-only or
+        #    no-review modes) never pings the bot; this intentionally drops
+        #    the old `local`-strategy remote fallback that fired on a
+        #    failed / exhausted local loop.
+        post_codex_review = binding.resolved_remote_review()
         await self._start_review_stage(
             binding=binding,
             issue=issue,
@@ -11729,7 +11695,6 @@ __all__ = [
     "Orchestrator",
     "WebhookDispatchResult",
     "_local_review_status_from_result",
-    "_should_post_codex_review",
     "build_fix_runner_command",
     "build_merge_runner_command",
     "build_pr_body",
