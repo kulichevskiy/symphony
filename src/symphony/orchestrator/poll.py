@@ -5297,6 +5297,15 @@ class Orchestrator:
                 ended_at=datetime.now(UTC).isoformat(),
             )
 
+            if binding.resolved_local_review():
+                await self._run_local_review_phase(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue.id,
+                    workspace_path=workspace_path,
+                    parent_run_id=fix_run_id,
+                )
+
             try:
                 await self._push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001

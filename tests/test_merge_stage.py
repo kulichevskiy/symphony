@@ -24,6 +24,7 @@ from symphony.orchestrator.poll import (
     _status_check_failed,
     _status_check_run_id,
 )
+from symphony.pipeline.cost_guard import UsageDelta
 from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
 
@@ -4912,6 +4913,111 @@ async def test_required_status_failure_cost_cap_parks_merge_needs_approval(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_required_check_fix_reruns_local_review_before_push_for_local_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        binding = _binding(agent="claude").model_copy(
+            update={"local_review": True, "remote_review": False}
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        push_fn = AsyncMock()
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._git_fetch_branch",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._workspace_ref_sha",
+            AsyncMock(return_value="start-sha"),
+        )
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._workspace_head_sha",
+            AsyncMock(return_value="fixed-sha"),
+        )
+        orch._run_required_check_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(UsageDelta(cost_usd=0.01), "exit", 0, False)
+        )
+
+        async def rerun_local_review(**kwargs: object) -> None:
+            assert kwargs["parent_run_id"] != "implement"
+            assert push_fn.await_count == 0
+            await db.runs.create(
+                conn,
+                id="post-required-check-local-review",
+                issue_id="iss-1",
+                stage="local_review",
+                status="completed",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=rerun_local_review
+        )
+
+        dispatched = await orch._dispatch_merge_required_check_fix_run(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            head_sha="abc123",
+            failing_checks=[
+                {
+                    "__typename": "StatusContext",
+                    "context": "Vercel",
+                    "state": "FAILURE",
+                }
+            ],
+            merge_error="required status check failed before merge",
+            trigger_signature="required_check_failure:abc123:vercel",
+            iteration=1,
+        )
+
+        assert dispatched is True
+        orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_comment.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history][-2:] == [
+            "review_fix",
+            "local_review",
+        ]
+    finally:
+        await conn.close()
+
+
 # --- remote_review: false merge bypass ----------------------------------
 #
 # `remote_review: false` bindings never receive an `@codex` approval, so the
@@ -5085,9 +5191,7 @@ async def test_local_only_binding_waits_without_completed_local_review(
 async def test_local_only_binding_waits_when_local_review_predates_fix(
     tmp_path: Path,
 ) -> None:
-    """true/false: a fix-run after the local review leaves the post-fix HEAD
-    unreviewed, so the no_signal merge must wait rather than bypass on a
-    stale local-review run."""
+    """true/false: no_signal must wait when a fix-run has no fresh local review."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_review_candidate(conn)
@@ -5100,8 +5204,7 @@ async def test_local_only_binding_waits_when_local_review_predates_fix(
             pid=None,
             started_at="2026-05-10T00:00:30+00:00",
         )
-        # Merge-conflict / required-check fix pushed a new HEAD the
-        # in-workspace reviewer never saw.
+        # A fix-run pushed a new HEAD the in-workspace reviewer never saw.
         await db.runs.create(
             conn,
             id="review-fix",
