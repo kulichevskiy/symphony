@@ -68,13 +68,17 @@ review_iteration_cap: 6
 local_review_iteration_cap: 6
 cost_cap_per_issue_usd: 100.0
 
-# Review-strategy notes (per-binding `review_strategy`):
-#   remote (default): post `@codex review` on every PR. Today's behavior.
-#   hybrid: run the in-workspace reviewer first (tightens fix loop), then
-#           still ping `@codex review` for the final pass.
-#   local:  in-workspace reviewer is authoritative. `@codex review` is
-#           only pinged as a safety net when the local pass exhausts,
-#           stalls, or fails. Pair with `reviewer_agent` for a second
-#           opinion (defaults to the opposite family of `agent`).
-# Example: change `agent: claude` + `review_strategy: hybrid` on a low-risk
-# binding to halve typical review wall time without losing the bot check.
+# Review notes (per-binding `local_review` / `remote_review` booleans):
+#   local_review:  run the in-workspace reviewer loop before opening the PR.
+#   remote_review: run the `@codex` GitHub-bot review on the PR.
+# Defaults when neither is set: local_review=false, remote_review=true.
+# Truth table:
+#   local=false remote=true  -> remote-only (default): `@codex review` on every PR.
+#   local=true  remote=false -> local-only: in-workspace reviewer is authoritative;
+#                               `@codex` never fires (no remote fallback).
+#   local=true  remote=true  -> sequential: local loop, then PR, then remote loop.
+#   local=false remote=false -> no review: implement -> PR -> CI gate -> merge.
+# Pair `local_review: true` with `reviewer_agent` for a second opinion
+# (defaults to the opposite family of `agent`).
+# Example: set `agent: claude` + `local_review: true` on a low-risk binding to
+# tighten the fix loop; add `remote_review: true` to also keep the bot check.

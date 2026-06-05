@@ -3,7 +3,9 @@
 A binding configured for local review must (a) run the in-workspace
 reviewer after the implementer succeeds and (b) skip the `@codex review`
 PR ping when the local pass approves. The remote review monitor row is
-still created — CI checks and human approvals still drive merge.
+still created for approved local-only PRs. When local-only review does
+not approve, the PR is parked on a failed review monitor instead of
+falling through silently.
 """
 
 from __future__ import annotations
@@ -498,7 +500,8 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
     tmp_path: Path,
 ) -> None:
     """When local-review fails / exhausts / etc., don't post the
-    summary — the @codex fallback ping is enough audit trail."""
+    summary. With `remote_review: false` there is no @codex fallback
+    either — the PR is parked for operator action."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -561,7 +564,7 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # @codex fallback ping should fire; local-review summary should not.
+        # Neither the @codex ping nor the local-review summary should fire.
         codex_calls = [
             c for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
@@ -571,8 +574,16 @@ async def test_local_strategy_no_pr_summary_when_not_approved(
             c for c in gh.pr_comment.await_args_list
             if "local reviewer" in str(c).lower()
         ]
-        assert len(codex_calls) == 1
+        assert codex_calls == []
         assert len(summary_calls) == 0
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_rows = [h for h in history if h.stage == "review"]
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "failed"
+        assert "local-only review did not approve" in review_rows[0].termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
     finally:
         await conn.close()
 
@@ -586,8 +597,10 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
     Simulate an unexpected fault inside `run_local_review_session`
     (any non-LinearError / non-GitHubError exception). The phase
-    should return `None`, the gate function should fall back to the
-    remote `@codex` ping, and the PR must still be created.
+    should return `None` and the PR must still be created. With
+    `remote_review: false` (local-only mode) the `@codex review` ping
+    stays suppressed even on the fault, and the PR is parked on a failed
+    review monitor.
     """
     import symphony.orchestrator.poll as poll_mod
 
@@ -661,29 +674,38 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
         # PR created despite the local-review fault.
         gh.pr_create.assert_awaited_once()
-        # Remote @codex review fired as the safety net.
+        # `remote_review: false` → no @codex ping, even on the fault.
         codex_calls = [
             c for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
             == "@codex review"
         ]
-        assert len(codex_calls) == 1, (
-            "expected @codex fallback when local-review phase raised"
+        assert codex_calls == [], (
+            "local-only mode must not post @codex even when the phase raised"
         )
         # Implement run still recorded.
         history = await db.runs.history_for_issue(conn, "iss-1")
         stages = {h.stage for h in history}
         assert "implement" in stages
-        assert "review" in stages  # remote review monitor created
+        review_rows = [h for h in history if h.stage == "review"]
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "failed"
+        assert "local-review session failed" in review_rows[0].termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
     finally:
         await conn.close()
 
 
 @pytest.mark.asyncio
-async def test_local_strategy_falls_back_to_codex_when_reviewer_fails(
+async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
     tmp_path: Path,
 ) -> None:
-    """The reviewer subprocess fails to spawn → safety net kicks in."""
+    """`remote_review: false` never pings `@codex`, even when the local
+    reviewer subprocess fails to spawn. The old remote fallback that
+    legacy `local` strategy used to fire here is gone — the PR is parked
+    for operator action, not the remote bot."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(
@@ -753,15 +775,18 @@ async def test_local_strategy_falls_back_to_codex_when_reviewer_fails(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # Reviewer crashed → remote @codex review must be posted as the safety net.
+        # Reviewer crashed, but remote_review is off → no @codex ping.
         codex_pings = [
             c
             for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
             == "@codex review"
         ]
-        assert len(codex_pings) == 1, (
-            "expected remote @codex fallback when local reviewer fails"
+        assert codex_pings == [], (
+            "local-only mode must not post @codex when the reviewer fails"
         )
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
     finally:
         await conn.close()

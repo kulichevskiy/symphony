@@ -436,35 +436,15 @@ def _local_review_termination_reason(result: LoopResult | None) -> str:
     return f"local-review ended with {result.outcome.value}"
 
 
-def _should_post_codex_review(
-    *,
-    review_strategy: str,
-    local_review_result: LoopResult | None,
-) -> bool:
-    """Decide whether to ping `@codex review` after opening the PR.
-
-    Rules:
-      - `remote`              → always post (legacy behavior).
-      - `hybrid`              → always post (defense in depth: the
-                                remote bot is the second pair of eyes
-                                regardless of the local outcome).
-      - `local` + APPROVED    → suppress; the local pre-flight already
-                                approved the diff and the operator
-                                opted in to single-reviewer mode.
-      - `local` + anything else → post (safety net for failures,
-                                exhaustion, stuck loops, cost-cap
-                                breach, and operator-issued
-                                `$skip-local-review`).
-    """
-    if review_strategy == "remote" or review_strategy == "hybrid":
-        return True
-    # local strategy
-    if (
-        local_review_result is not None
-        and local_review_result.outcome == LoopOutcome.APPROVED
-    ):
-        return False
-    return True
+def _local_review_failure_log(result: LoopResult | None) -> str:
+    if result is None:
+        return ""
+    parts: list[str] = []
+    if result.error:
+        parts.append(result.error)
+    if result.last_verdict is not None and result.last_verdict.findings:
+        parts.append(result.last_verdict.findings)
+    return "\n\n".join(parts)
 
 
 def build_runner_command(
@@ -2436,23 +2416,27 @@ class Orchestrator:
             pr_number=state.pr_number,
             pr_url=state.pr_url,
         )
-        try:
-            await self._gh.pr_comment(
-                state.pr_number, "@codex review", repo=binding.github_repo
-            )
-        except GitHubError as e:
-            log.warning(
-                "could not re-post @codex review for active monitor %s#%d: %s",
-                binding.github_repo,
-                state.pr_number,
-                e,
-            )
-            await self._post_command_rejected(
-                issue_id,
-                "$retry",
-                f"could not re-post @codex review: {e}",
-            )
-            return
+        # Only ping the remote bot when `remote_review` is enabled. Local-only
+        # and no-review bindings must never fire `@codex review` — the manual
+        # retry just re-arms the monitor without a remote ping.
+        if binding.resolved_remote_review():
+            try:
+                await self._gh.pr_comment(
+                    state.pr_number, "@codex review", repo=binding.github_repo
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not re-post @codex review for active monitor %s#%d: %s",
+                    binding.github_repo,
+                    state.pr_number,
+                    e,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    "$retry",
+                    f"could not re-post @codex review: {e}",
+                )
+                return
 
         signature = f"manual_retry:{run_id}:{intent.comment_id}"
         await db.review_state.set_signature(self._conn, issue_id, signature)
@@ -3660,6 +3644,54 @@ class Orchestrator:
             run.started_at
         )
 
+    async def _local_review_completed_for_issue(
+        self, candidate: db.issue_prs.IssuePR
+    ) -> bool:
+        """Whether a completed local-review run covers the current PR HEAD.
+
+        Used by the merge scheduler to gate the `remote_review: false`
+        review bypass: local-only bindings must have a finished local-review
+        run before clean CI is treated as a merge signal.
+
+        A completed local review from a previous PR cycle must not green-light
+        a later PR for the same issue. Merge-conflict and required-check
+        fix-runs (`stage = "review_fix"`) push commits the reviewer never saw,
+        so a local review that predates the latest fix-run is stale and must
+        not green-light the post-fix HEAD — otherwise unreviewed code merges.
+        A local review after the PR was opened is valid when it is the post-fix
+        rerun for the current PR.
+        """
+        latest_implement = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=candidate.issue_id,
+            stage="implement",
+        )
+        if latest_implement is None or _parse_rfc3339(
+            latest_implement.started_at
+        ) > _parse_rfc3339(candidate.created_at):
+            return False
+        latest_local_review = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=candidate.issue_id,
+            stage="local_review",
+            started_at_gte=latest_implement.started_at,
+        )
+        if (
+            latest_local_review is None
+            or latest_local_review.status != "completed"
+        ):
+            return False
+        latest_fix = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=candidate.issue_id,
+            stage="review_fix",
+        )
+        if latest_fix is not None and _parse_rfc3339(
+            latest_fix.started_at
+        ) > _parse_rfc3339(latest_local_review.started_at):
+            return False
+        return True
+
     async def _poll_review_run_with_limits(
         self,
         run: db.runs.Run,
@@ -4410,6 +4442,13 @@ class Orchestrator:
         Returns False only when the attempt was inconclusive and should be
         retried by a resurrection caller.
         """
+        if not binding.resolved_remote_review():
+            log.debug(
+                "skipping automatic @codex review re-trigger for %s: "
+                "remote_review disabled",
+                issue.identifier,
+            )
+            return True
         if state.pr_number is None:
             return True
         head_sha = ""
@@ -5266,6 +5305,34 @@ class Orchestrator:
                 "completed",
                 ended_at=datetime.now(UTC).isoformat(),
             )
+
+            local_review_result: LoopResult | None = None
+            if binding.resolved_local_review():
+                local_review_result = await self._run_local_review_phase(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue.id,
+                    workspace_path=workspace_path,
+                    parent_run_id=fix_run_id,
+                )
+                if (
+                    not binding.resolved_remote_review()
+                    and (
+                        local_review_result is None
+                        or local_review_result.outcome != LoopOutcome.APPROVED
+                    )
+                ):
+                    await self._mark_merge_required_check_fix_needs_approval(
+                        binding=binding,
+                        issue=issue,
+                        pr_url=pr_url,
+                        reason=(
+                            "post-required-check local-only review did not approve: "
+                            f"{_local_review_termination_reason(local_review_result)}"
+                        ),
+                        merge_run_id=merge_run_id,
+                    )
+                    return False
 
             try:
                 await self._push_fn(workspace_path, branch)
@@ -6392,7 +6459,8 @@ class Orchestrator:
                 log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
             return
 
-        # $retry or $approve: restart the review monitor.
+        # $retry or $approve: restart review. Local-only retries must produce
+        # a fresh local-review approval before the passive monitor can help.
         # Look up the issue BEFORE clearing the operator wait — if lookup
         # fails we want the wait (and its `_dispatch_run_ids` entry) to
         # survive so the next poll tick can retry. Clearing first would
@@ -6417,8 +6485,85 @@ class Orchestrator:
             pid=None,
             started_at=now,
         )
+        run = db.runs.Run(
+            id=new_run_id,
+            issue_id=issue_id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at=now,
+            ended_at=None,
+            cost_usd=0.0,
+        )
         state = await db.review_state.get(self._conn, issue_id)
-        if state.pr_number is not None:
+        # Local-only / no-review bindings must never fire the remote bot, even
+        # when recovering from a failed review wait.
+        if binding.resolved_local_review() and not binding.resolved_remote_review():
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "workspace acquire failed for local review retry %s: %s",
+                    issue.identifier,
+                    e,
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"workspace acquire failed for local review retry: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return
+            try:
+                local_review_result = await self._run_local_review_phase(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    workspace_path=workspace_path,
+                    parent_run_id=new_run_id,
+                )
+                if (
+                    local_review_result is None
+                    or local_review_result.outcome != LoopOutcome.APPROVED
+                ):
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=(
+                            "local-only review did not approve: "
+                            f"{_local_review_termination_reason(local_review_result)}"
+                        ),
+                        last_log=_local_review_failure_log(local_review_result),
+                        auto_retry=False,
+                        operator_wait=True,
+                    )
+                    return
+                branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+                try:
+                    await self._push_fn(workspace_path, branch)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "git push failed after local review retry %s: %s",
+                        issue.identifier,
+                        e,
+                    )
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=f"local review retry push failed: {e}",
+                        last_log=str(e),
+                        auto_retry=False,
+                        operator_wait=True,
+                    )
+                    return
+            finally:
+                self._workspace.release(binding, issue)
+        elif state.pr_number is not None and binding.resolved_remote_review():
             try:
                 await self._gh.pr_comment(
                     state.pr_number, "@codex review", repo=binding.github_repo
@@ -6430,16 +6575,6 @@ class Orchestrator:
                     state.pr_number,
                     e,
                 )
-        run = db.runs.Run(
-            id=new_run_id,
-            issue_id=issue_id,
-            stage="review",
-            status="running",
-            pid=None,
-            started_at=now,
-            ended_at=None,
-            cost_usd=0.0,
-        )
         await self._move_issue_to_review_state(binding=binding, issue=issue)
         self._schedule_review_poll(run, binding, issue)
         log.info("restarted review monitor for %s via $retry", issue.identifier)
@@ -8197,12 +8332,13 @@ class Orchestrator:
                 continue
 
             head_sha = str(view.get("headRefOid") or "")
-            conflict_fix_ready = False
-            if (
+            no_signal_mergeable = (
                 verdict.kind is VerdictKind.PENDING
                 and verdict.rule == "no_signal"
                 and str(view.get("mergeable") or "").upper() == "MERGEABLE"
-            ):
+            )
+            conflict_fix_ready = False
+            if no_signal_mergeable:
                 conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
                     self._conn,
                     issue_id=candidate.issue_id,
@@ -8212,7 +8348,26 @@ class Orchestrator:
                     head_sha=head_sha,
                 )
 
-            if verdict.kind is VerdictKind.APPROVED or conflict_fix_ready:
+            # `remote_review: false` is an intentional review bypass: no
+            # `@codex` approval will ever land, so once CI and mergeability
+            # pass we treat the clean no_signal state as the merge signal.
+            # Local-only bindings (local_review: true) additionally require a
+            # completed local-review loop; no-review bindings (false/false)
+            # gate on CI alone.
+            review_bypass_ready = False
+            if no_signal_mergeable and not binding.resolved_remote_review():
+                review_bypass_ready = (
+                    not binding.resolved_local_review()
+                    or await self._local_review_completed_for_issue(
+                        candidate
+                    )
+                )
+
+            if (
+                verdict.kind is VerdictKind.APPROVED
+                or conflict_fix_ready
+                or review_bypass_ready
+            ):
                 if (
                     binding.acceptance.mode != "off"
                     and not await self._acceptance_passed_for_candidate(
@@ -9794,13 +9949,13 @@ class Orchestrator:
             )
             return run_id
 
-        # 4.5. Local-review pre-flight. When `binding.review_strategy` is
-        # `local` or `hybrid`, run the reviewer in-workspace before pushing.
-        # This shortens the iteration loop dramatically: the slow part of
-        # the existing flow is round-tripping each fix through GitHub for
-        # the remote `@codex` bot. See `docs/local-review-flow.md`.
+        # 4.5. Local-review pre-flight. When `binding.local_review` is set,
+        # run the reviewer in-workspace before pushing. This shortens the
+        # iteration loop dramatically: the slow part of the existing flow is
+        # round-tripping each fix through GitHub for the remote `@codex` bot.
+        # See `docs/local-review-flow.md`.
         local_review_result: LoopResult | None = None
-        if binding.review_strategy != "remote":
+        if binding.resolved_local_review():
             local_review_result = await self._run_local_review_phase(
                 binding=binding,
                 issue=issue,
@@ -9882,23 +10037,38 @@ class Orchestrator:
             ended_at=datetime.now(UTC).isoformat(),
         )
 
-        # 6. Start the Review stage. In `local` mode, when the in-workspace
-        #    reviewer already APPROVED, suppress the `@codex review` ping —
-        #    the local pass has done the work. Any other outcome (hybrid
-        #    strategy, local-reviewer failed / exhausted / stuck, or no
-        #    local pre-flight at all) still pings the remote bot as a
-        #    safety net so a flaky reviewer can't dead-end the PR.
-        post_codex_review = _should_post_codex_review(
-            review_strategy=binding.review_strategy,
-            local_review_result=local_review_result,
-        )
-        await self._start_review_stage(
+        # 6. Start the Review stage. The remote `@codex review` ping fires
+        #    exactly when `remote_review` is enabled. Local-only failures
+        #    are parked below instead of falling back to the remote bot.
+        post_codex_review = binding.resolved_remote_review()
+        review_run = await self._start_review_stage(
             binding=binding,
             issue=issue,
             storage_issue_id=issue_id,
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
+        if (
+            binding.resolved_local_review()
+            and not binding.resolved_remote_review()
+            and (
+                local_review_result is None
+                or local_review_result.outcome != LoopOutcome.APPROVED
+            )
+        ):
+            await self._fail_review_run(
+                run=review_run,
+                binding=binding,
+                issue=issue,
+                error=(
+                    "local-only review did not approve: "
+                    f"{_local_review_termination_reason(local_review_result)}"
+                ),
+                last_log=_local_review_failure_log(local_review_result),
+                auto_retry=False,
+                operator_wait=True,
+            )
+            return run_id
         # 7. Surface the local-review verdict on the GitHub PR thread
         #    (not just on Linear) so human reviewers see the audit
         #    trail. Only fires when local-review APPROVED — failures
@@ -10476,8 +10646,8 @@ class Orchestrator:
         before letting it drive the PR.
 
         Errors here are caught and logged: a broken local-review path
-        must never dead-end an issue. The remote `@codex` flow runs
-        afterwards regardless.
+        returns `None` so the caller can either continue to remote review
+        or park a local-only PR for operator action.
         """
         storage_issue_id = storage_issue_id or issue.id
         try:
@@ -10826,15 +10996,12 @@ class Orchestrator:
         storage_issue_id: str | None = None,
         pr_url: str,
         post_codex_review: bool = True,
-    ) -> str | None:
+    ) -> db.runs.Run:
         """Persist the review state row, optionally ping `@codex review`.
 
-        `post_codex_review=False` is the local-review-mode entry point: the
-        in-workspace reviewer already produced an `APPROVED` verdict, so
-        sending the remote bot another pass would just burn cost and
-        latency. State tracking, PR persistence, and the Linear state
-        move still happen — the review monitor still polls CI and human
-        approvals; only the bot ping is suppressed.
+        `post_codex_review=False` is the local-only / no-review entry point:
+        state tracking, PR persistence, and the Linear state move still happen,
+        but the remote bot ping is suppressed.
 
         Idempotent in spirit: failure to post the bot ping does not block
         the run row from being created, but is logged loudly so an
@@ -10884,6 +11051,7 @@ class Orchestrator:
         await self._move_issue_to_review_state(binding=binding, issue=issue)
 
         review_run_id = str(uuid.uuid4())
+        started_at = datetime.now(UTC).isoformat()
         await db.runs.create(
             self._conn,
             id=review_run_id,
@@ -10891,9 +11059,18 @@ class Orchestrator:
             stage="review",
             status="running",
             pid=None,
-            started_at=datetime.now(UTC).isoformat(),
+            started_at=started_at,
         )
-        return review_run_id
+        return db.runs.Run(
+            id=review_run_id,
+            issue_id=storage_issue_id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at=started_at,
+            ended_at=None,
+            cost_usd=0.0,
+        )
 
     async def _move_issue_to_review_state(
         self, *, binding: RepoBinding, issue: LinearIssue
@@ -11729,7 +11906,6 @@ __all__ = [
     "Orchestrator",
     "WebhookDispatchResult",
     "_local_review_status_from_result",
-    "_should_post_codex_review",
     "build_fix_runner_command",
     "build_merge_runner_command",
     "build_pr_body",

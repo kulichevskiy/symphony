@@ -16,7 +16,6 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Literal
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -86,7 +85,8 @@ def _binding(
     agent: str = "claude",
     codex_model: str = "gpt-5.1-codex",
     issue_label: str | None = None,
-    review_strategy: Literal["remote", "local", "hybrid"] = "remote",
+    local_review: bool = False,
+    remote_review: bool = True,
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
@@ -95,7 +95,8 @@ def _binding(
         codex_model=codex_model,
         issue_label=issue_label,
         branch_prefix="symphony",
-        review_strategy=review_strategy,
+        local_review=local_review,
+        remote_review=remote_review,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
 
@@ -2758,15 +2759,18 @@ async def test_review_poll_rearms_missing_codex_signal_once_per_head(
 
 
 @pytest.mark.asyncio
-async def test_review_poll_rearms_no_signal_for_local_fallback_strategy(
+async def test_review_poll_does_not_rearm_no_signal_for_local_only(
     tmp_path: Path,
 ) -> None:
+    # local-only bindings (local_review=True, remote_review=False) drop the
+    # legacy @codex fallback: no-signal must never re-trigger a remote review,
+    # even when the local reviewer failed.
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_active_review(conn)
         await _seed_local_review_cycle(conn, local_review_status="failed")
         cfg = Config(
-            repos=[_binding(review_strategy="local")],
+            repos=[_binding(local_review=True, remote_review=False)],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -2804,8 +2808,7 @@ async def test_review_poll_rearms_no_signal_for_local_fallback_strategy(
 
         await _poll_review_and_wait(orch)
 
-        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
-        assert ("review-run", "head-sha") in orch._review_no_signal_rearm_heads  # noqa: SLF001
+        gh.pr_comment.assert_not_awaited()
     finally:
         await conn.close()
 
@@ -2819,7 +2822,7 @@ async def test_review_poll_does_not_rearm_no_signal_for_local_approval(
         await _seed_active_review(conn)
         await _seed_local_review_cycle(conn, local_review_status="completed")
         cfg = Config(
-            repos=[_binding(review_strategy="local")],
+            repos=[_binding(local_review=True, remote_review=False)],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -4177,6 +4180,46 @@ async def test_review_fix_skips_retrigger_when_pr_is_already_approved(
             state=state,
         )
 
+        gh.pr_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_retrigger_is_noop_when_remote_review_disabled(
+    tmp_path: Path,
+) -> None:
+    # A local-only binding (remote_review=False) must never re-trigger @codex,
+    # even when the PR has no approval. The guard short-circuits before any
+    # GitHub lookup, so the call is a clean no-op that reports success (no
+    # resurrection retry).
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(local_review=True, remote_review=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        await _seed_active_review(conn)
+
+        gh = MagicMock()
+        gh.pr_view = AsyncMock()
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=gh)
+        state = await db.review_state.get(conn, "iss-1")
+
+        result = await orch._retrigger_codex_review_unless_approved(  # noqa: SLF001
+            binding=binding,
+            issue=_issue_in_progress(),
+            state=state,
+            require_no_signal=True,
+        )
+
+        assert result is True
+        gh.pr_view.assert_not_awaited()
         gh.pr_comment.assert_not_awaited()
     finally:
         await conn.close()
