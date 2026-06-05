@@ -37,7 +37,6 @@ def test_parses_known_commands() -> None:
             _c("$retry-acceptance"),
             _c("$skip-acceptance"),
             _c("$skip-review"),
-            _c("$skip-local-review"),
             _c("$skip-acceptance"),
             _c("$retry-acceptance"),
         ]
@@ -50,23 +49,13 @@ def test_parses_known_commands() -> None:
         SlashKind.RETRY_ACCEPTANCE,
         SlashKind.SKIP_ACCEPTANCE,
         SlashKind.SKIP_REVIEW,
-        SlashKind.SKIP_LOCAL_REVIEW,
         SlashKind.SKIP_ACCEPTANCE,
         SlashKind.RETRY_ACCEPTANCE,
     ]
 
 
-def test_skip_local_review_does_not_collide_with_skip_review() -> None:
-    """`$skip-review` and `$skip-local-review` are distinct: the parser
-    must pick the longer literal first or `$skip-local-review` would
-    silently map to `SKIP_REVIEW`."""
-    intents = parse([_c("$skip-local-review", cid="a")])
-    assert len(intents) == 1
-    assert intents[0].kind == SlashKind.SKIP_LOCAL_REVIEW
-
-    intents = parse([_c("$skip-review", cid="b")])
-    assert len(intents) == 1
-    assert intents[0].kind == SlashKind.SKIP_REVIEW
+def test_skip_local_review_is_unknown_command() -> None:
+    assert parse([_c("$skip-local-review", cid="a")]) == []
 
 
 def test_parses_markdown_wrapped_commands_and_approved_alias() -> None:

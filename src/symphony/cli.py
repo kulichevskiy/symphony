@@ -606,11 +606,8 @@ async def _runs_local_review_stats(db_path: Path) -> None:
         stats = await db.runs.local_review_stats(conn)
     finally:
         await conn.close()
-    finished = (
-        stats.completed_count + stats.interrupted_count + stats.failed_count
-    )
+    finished = stats.completed_count + stats.failed_count
     click.echo(f"completed (APPROVED):    {stats.completed_count}")
-    click.echo(f"interrupted (SKIPPED):   {stats.interrupted_count}")
     click.echo(f"failed (other):          {stats.failed_count}")
     click.echo(f"running (in-flight):     {stats.running_count}")
     click.echo(f"approval rate:           {stats.approval_rate:.1%}")

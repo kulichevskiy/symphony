@@ -1314,7 +1314,7 @@ const MODULES = {
     role: "Чистый парсер slash-команд из Linear-комментариев. Игнорирует mirrored из GitHub и собственные сообщения symphony.",
     entrypoints: [
       ["parse", 82, "list[LinearComment] → list[SlashIntent]"],
-      ["SlashKind", 38, "Enum: approve/reject/retry/stop/retry-acceptance/skip-acceptance/skip-review/skip-local-review."],
+      ["SlashKind", 38, "Enum: approve/reject/retry/stop/retry-acceptance/skip-acceptance/skip-review."],
       ["_is_thumbs_up", 56, "Standalone 👍 эквивалентен $approve."],
     ],
   },
@@ -1422,8 +1422,6 @@ const SLASH = [
     purpose: "Пропустить acceptance — issue идёт в Done." },
   { cmd: "$skip-review", kind: "skip-review",
     purpose: "Закрыть review monitor досрочно и сразу запустить merge (skip_review=True)." },
-  { cmd: "$skip-local-review", kind: "skip-local-review",
-    purpose: "Пропустить local review loop и сразу открыть PR." },
   { cmd: "$stop", kind: "stop",
     purpose: "Остановить активный runner (kill PID). Если review-monitor — мягко остановить мониторинг." },
 ];
@@ -1593,7 +1591,6 @@ const SCENARIOS = [
             <li>Точка входа — <code>_run_local_review_phase</code> в <code>poll.py:8146</code>. Запускается перед push'ем, ошибки ловит наружу.</li>
             <li>Сам цикл — <code>run_local_review_loop</code> в <code>pipeline/local_review_loop.py</code>. Cap по итерациям задаётся в config'е.</li>
             <li>Одна сессия (reviewer-codex) — <code>pipeline/local_review.py</code>, обёртка над codex CLI с reviewer-prompt'ом.</li>
-            <li>Можно полностью пропустить slash-командой <code>$skip-local-review</code> до запуска (см. сценарий 2).</li>
           </ul>
         </details>`,
         refs: [
@@ -1760,18 +1757,16 @@ const SCENARIOS = [
         title: "Implement закончился — проверяем, нужен ли local review",
         active: ["implement", "local_review"],
         activeEdge: "e-impl-local",
-        narrative: `<p>Codex закончил implement (exit 0). Прежде чем пушить ветку и открывать PR, symphony проверяет: включён ли для этого binding'а локальный ревью? И не приходил ли в Linear-комментариях <code>$skip-local-review</code> от нас?</p>
-        <p>Если оба условия дают «да, ревью нужен» — symphony остаётся в workspace и запускает следующий проход уже как локальный ревьюер.</p>
+        narrative: `<p>Codex закончил implement (exit 0). Прежде чем пушить ветку и открывать PR, symphony проверяет: включён ли для этого binding'а локальный ревью.</p>
+        <p>Если ревью нужен — symphony остаётся в workspace и запускает следующий проход уже как локальный ревьюер.</p>
         <details><summary>Технически</summary>
           <ul>
             <li>Запуск фазы — <code>_run_local_review_phase</code> в <code>poll.py:8146</code>.</li>
-            <li>Skip-intent — <code>_handle_skip_local_review_intent</code> в <code>poll.py:1745</code>. Если мы поставили <code>$skip-local-review</code> в комментарий ДО запуска implement'а — фаза просто не стартует.</li>
             <li>Режим читается из <code>binding.local_review.mode</code> в config'е (<code>off</code> / <code>review_only</code> / <code>review_and_fix</code>).</li>
           </ul>
         </details>`,
         refs: [
           {file: "src/symphony/orchestrator/poll.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push."},
-          {file: "src/symphony/orchestrator/poll.py", line: 1745, fn: "_handle_skip_local_review_intent", desc: "Если оператор послал $skip-local-review — local review пропускается."},
         ],
         db: [],
       },

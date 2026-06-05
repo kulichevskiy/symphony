@@ -421,8 +421,8 @@ class Config(BaseModel):
     review_iteration_cap: int = 12
     # Local-review converges fast or it doesn't. The right cap is well
     # below `review_iteration_cap`: more rounds means the in-workspace
-    # reviewer is stuck and the cost cap (or `$skip-local-review`)
-    # should take over. Per-binding overrides live on `RepoBinding`.
+    # reviewer is stuck or the cost cap should take over. Per-binding
+    # overrides live on `RepoBinding`.
     local_review_iteration_cap: int = Field(default=6, ge=1)
     # When the local-review APPROVES, post a summary PR comment with
     # the iteration count + cost so human reviewers visiting GitHub

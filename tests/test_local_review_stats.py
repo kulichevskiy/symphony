@@ -47,7 +47,6 @@ async def test_stats_empty_db_returns_all_zeros(tmp_path: Path) -> None:
     finally:
         await conn.close()
     assert stats.completed_count == 0
-    assert stats.interrupted_count == 0
     assert stats.failed_count == 0
     assert stats.running_count == 0
     assert stats.total_cost_usd == 0.0
@@ -68,7 +67,8 @@ async def test_stats_counts_by_status_and_skips_other_stages(
             conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
         )
 
-        # 2 approved, 1 skipped, 1 failed, 1 running (local_review).
+        # 2 approved, 2 non-approved, 1 running (local_review). The
+        # legacy interrupted row is no longer a first-class outcome.
         await _seed_run(
             conn,
             run_id="lr-1",
@@ -136,8 +136,7 @@ async def test_stats_counts_by_status_and_skips_other_stages(
         await conn.close()
 
     assert stats.completed_count == 2
-    assert stats.interrupted_count == 1
-    assert stats.failed_count == 1
+    assert stats.failed_count == 2
     assert stats.running_count == 1
     # total includes the running row's $0 — that's fine, it's $0.
     assert stats.total_cost_usd == pytest.approx(0.12 + 0.34 + 0.05 + 0.50)
@@ -195,6 +194,7 @@ def test_cli_local_review_stats_empty_db(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "completed (APPROVED):    0" in result.output
+    assert "interrupted" not in result.output
     assert "approval rate:           0.0%" in result.output
     assert "no finished local-review sessions yet" in result.output
 
@@ -371,6 +371,7 @@ def test_cli_local_review_stats_with_seeded_rows(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "completed (APPROVED):    1" in result.output
+    assert "interrupted" not in result.output
     assert "failed (other):          1" in result.output
     assert "approval rate:           50.0%" in result.output
     assert "total cost:              $1.0000" in result.output
