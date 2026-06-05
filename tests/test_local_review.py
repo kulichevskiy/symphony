@@ -292,6 +292,7 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
     assert "a.py:42" in verdict.findings
     assert "empty-input" in verdict.findings
     assert verdict.trigger_signature.startswith("local_review:abc123:")
+    assert verdict.findings_signature.startswith("local_review_findings:")
 
 
 def test_changes_requested_signature_changes_with_head_sha() -> None:
@@ -319,6 +320,7 @@ def test_changes_requested_signature_changes_with_findings() -> None:
         head_sha=head,
     )
     assert a.trigger_signature != b.trigger_signature
+    assert a.findings_signature != b.findings_signature
 
 
 def test_parse_local_review_output_unparseable_when_no_marker() -> None:

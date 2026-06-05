@@ -19,8 +19,7 @@ Callers inject two async callbacks:
 
 - `reviewer(prompt) -> ReviewerOutput` — runs the reviewer agent in the
   workspace and returns its stdout, an optional `last_message_file`
-  payload, and the HEAD SHA the reviewer saw. The head SHA must reflect
-  the commit being reviewed (so signatures change after each fix-run).
+  payload, and the HEAD SHA the reviewer saw.
 - `fixer(findings) -> FixerOutput` — runs a fix-run that produces a new
   commit addressing `findings`. Returns whether the fix-run succeeded.
 
@@ -32,7 +31,7 @@ The loop:
       verdict = parse(out)
       if UNPARSEABLE                  → retry once, then reviewer_failed
       if APPROVED                     → approved
-      if verdict identical to prev    → stuck_loop  (dedup gate)
+      if findings identical to prev   → stuck_loop  (dedup gate)
       fix_ok = await fixer(findings)
       if not fix_ok                   → fix_run_failed
   → exhausted (cap hit)
@@ -166,7 +165,7 @@ async def run_local_review_loop(
         )
 
     verdicts: list[LocalVerdict] = []
-    prev_signature = ""
+    prev_findings_signature = ""
     total_cost = 0.0
     total_input_tokens = 0
     total_output_tokens = 0
@@ -314,17 +313,19 @@ async def run_local_review_loop(
                 error="reviewer emitted no verdict marker",
             )
 
-        # CHANGES_REQUESTED — gate on the dedup signature before paying
-        # for another fix-run. Same trigger twice in a row is the
-        # stuck-loop pattern the broader pipeline already avoids in the
-        # remote case (see review_classifier.should_dispatch_fix_run).
-        if verdict.trigger_signature == prev_signature:
+        # CHANGES_REQUESTED — gate on the merged-findings digest before paying
+        # for another fix-run. Same unresolved findings twice in a row is the
+        # local non-convergence signal even when the fix-run advanced HEAD.
+        findings_signature = (
+            verdict.findings_signature or verdict.trigger_signature
+        )
+        if findings_signature == prev_findings_signature:
             return _result(
                 outcome=LoopOutcome.STUCK_LOOP,
                 iterations=i + 1,
-                error="reviewer produced the same trigger twice in a row",
+                error="reviewer produced the same findings twice in a row",
             )
-        prev_signature = verdict.trigger_signature
+        prev_findings_signature = findings_signature
 
         fix = await fixer(i, verdict)
         _record_usage(fix)
