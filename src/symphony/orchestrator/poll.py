@@ -421,6 +421,13 @@ def _local_review_infra_failed(result: LoopResult | None) -> bool:
     }
 
 
+def _local_review_permits_remote(result: LoopResult | None) -> bool:
+    return result is not None and result.outcome in {
+        LoopOutcome.APPROVED,
+        LoopOutcome.SKIPPED,
+    }
+
+
 def _termination_kwargs(
     *,
     status: str,
@@ -10289,15 +10296,13 @@ class Orchestrator:
             return run_id
 
         # 6. Start the Review stage. A local loop is a hard pre-PR gate:
-        #    true/true runs remote review only after local APPROVED. Local
-        #    terminals are parked below instead of falling through to the
-        #    GitHub bot.
+        #    true/true runs remote review after local APPROVED, or after an
+        #    operator explicitly bypasses the local gate with $skip-local-review.
+        #    Other local terminals are parked below instead of falling through
+        #    to the GitHub bot.
         local_review_blocks_remote = (
             binding.resolved_local_review()
-            and (
-                local_review_result is None
-                or local_review_result.outcome != LoopOutcome.APPROVED
-            )
+            and not _local_review_permits_remote(local_review_result)
         )
         post_codex_review = (
             binding.resolved_remote_review() and not local_review_blocks_remote
@@ -10324,6 +10329,10 @@ class Orchestrator:
             return run_id
         if (
             binding.resolved_local_review()
+            and not (
+                binding.resolved_remote_review()
+                and _local_review_permits_remote(local_review_result)
+            )
             and (
                 local_review_result is None
                 or local_review_result.outcome != LoopOutcome.APPROVED
