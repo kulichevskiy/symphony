@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -39,6 +40,10 @@ from symphony.orchestrator.poll import (
     pr_number_from_url,
 )
 from symphony.orchestrator.reconcile import reconcile
+from symphony.pipeline.cost_guard import UsageDelta
+from symphony.pipeline.local_review import LocalVerdict, LocalVerdictKind
+from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
+from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
 
 class _FakeRunner:
@@ -494,6 +499,51 @@ async def _poll_review_and_wait(orch: Orchestrator) -> list[asyncio.Task[None]]:
     return tasks
 
 
+async def _seed_active_local_only_pr_with_stale_local_review(conn) -> None:  # type: ignore[no-untyped-def]
+    await _seed_active_review(conn)
+    await db.runs.create(
+        conn,
+        id="implement-run",
+        issue_id="iss-1",
+        stage="implement",
+        status="completed",
+        pid=None,
+        started_at="2026-05-10T00:00:00+00:00",
+    )
+    await db.issue_prs.upsert(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        created_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.runs.create(
+        conn,
+        id="pre-ci-local-review",
+        issue_id="iss-1",
+        stage="local_review",
+        status="completed",
+        pid=None,
+        started_at="2026-05-10T00:02:00+00:00",
+    )
+
+
+def _failing_ci_verdict() -> Verdict:
+    return Verdict(
+        kind=VerdictKind.CHANGES_REQUESTED,
+        rule="failing_ci",
+        trigger_signature="ci:head-sha:lint",
+        failing_checks=("lint",),
+    )
+
+
+def _failing_ci_checks() -> PRChecks:
+    return PRChecks(
+        [CheckRun(name="lint", state="FAILURE", bucket="fail", link=None)]
+    )
+
+
 @pytest.mark.asyncio
 async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
     tmp_path: Path,
@@ -626,6 +676,311 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert fix_runs[0].status == "completed"
         assert fix_runs[0].pid == 999
         assert fix_runs[0].cost_usd == pytest.approx(0.011025)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_local_only_reruns_local_review_before_push(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_local_only_pr_with_stale_local_review(conn)
+        binding = _binding(local_review=True, remote_review=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_comment = AsyncMock()
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._run_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(UsageDelta(cost_usd=0.01), "exit", 0)
+        )
+
+        async def approve_local_review(**kwargs: object) -> LoopResult:
+            assert kwargs["parent_run_id"] != "review-run"
+            assert push_fn.await_count == 0
+            candidate = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
+            assert candidate is not None
+            assert not await orch._local_review_completed_for_issue(candidate)  # noqa: SLF001
+            await db.runs.create(
+                conn,
+                id="post-ci-local-review",
+                issue_id="iss-1",
+                stage="local_review",
+                status="completed",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            return LoopResult(
+                outcome=LoopOutcome.APPROVED,
+                iterations=1,
+                verdicts=(),
+            )
+
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=approve_local_review
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+
+        dispatched = await orch._dispatch_ci_fix_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_progress(),
+            checks=_failing_ci_checks(),
+            verdict=_failing_ci_verdict(),
+            iteration=1,
+        )
+
+        assert dispatched is True
+        orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_comment.assert_not_awaited()
+
+        candidate = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
+        assert candidate is not None
+        assert await orch._local_review_completed_for_issue(candidate)  # noqa: SLF001
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history][-2:] == [
+            "review_fix",
+            "local_review",
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [LoopOutcome.EXHAUSTED, LoopOutcome.STUCK_LOOP],
+)
+async def test_red_ci_local_only_parks_non_converged_local_review(
+    tmp_path: Path,
+    outcome: LoopOutcome,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_local_only_pr_with_stale_local_review(conn)
+        binding = _binding(local_review=True, remote_review=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_comment = AsyncMock()
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._run_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(UsageDelta(cost_usd=0.01), "exit", 0)
+        )
+        findings = "src/auth.py:12 missing token validation"
+
+        async def non_converged_local_review(**_: object) -> LoopResult:
+            await db.runs.create(
+                conn,
+                id="post-ci-local-review",
+                issue_id="iss-1",
+                stage="local_review",
+                status="failed",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            return LoopResult(
+                outcome=outcome,
+                iterations=2,
+                verdicts=(
+                    LocalVerdict(
+                        kind=LocalVerdictKind.CHANGES_REQUESTED,
+                        findings=findings,
+                    ),
+                ),
+                error=f"{outcome.value} test outcome",
+            )
+
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=non_converged_local_review
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+
+        dispatched = await orch._dispatch_ci_fix_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_progress(),
+            checks=_failing_ci_checks(),
+            verdict=_failing_ci_verdict(),
+            iteration=1,
+        )
+
+        assert dispatched is True
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_comment.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+        posted = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any(findings in body for body in posted), posted
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        assert monitor.status == "needs_approval"
+        assert findings in monitor.termination_detail
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        LoopOutcome.REVIEWER_FAILED,
+        LoopOutcome.FIX_RUN_FAILED,
+        LoopOutcome.COST_CAP_BREACHED,
+    ],
+)
+async def test_red_ci_local_only_blocks_local_review_infra_failure(
+    tmp_path: Path,
+    outcome: LoopOutcome,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_local_only_pr_with_stale_local_review(conn)
+        binding = _binding(local_review=True, remote_review=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        gh.pr_comment = AsyncMock()
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._run_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(UsageDelta(cost_usd=0.01), "exit", 0)
+        )
+
+        async def failed_local_review(**_: object) -> LoopResult:
+            await db.runs.create(
+                conn,
+                id="post-ci-local-review",
+                issue_id="iss-1",
+                stage="local_review",
+                status="failed",
+                pid=None,
+                started_at=datetime.now(UTC).isoformat(),
+            )
+            return LoopResult(
+                outcome=outcome,
+                iterations=1,
+                verdicts=(),
+                error=f"{outcome.value} test outcome",
+            )
+
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=failed_local_review
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+
+        dispatched = await orch._dispatch_ci_fix_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_progress(),
+            checks=_failing_ci_checks(),
+            verdict=_failing_ci_verdict(),
+            iteration=1,
+        )
+
+        assert dispatched is False
+        push_fn.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-bl")
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        monitor = next(r for r in history if r.id == "review-run")
+        fix_run = next(r for r in history if r.stage == "review_fix")
+        assert monitor.status == "failed"
+        assert fix_run.status == "completed"
     finally:
         await conn.close()
 

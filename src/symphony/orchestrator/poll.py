@@ -4450,6 +4450,29 @@ class Orchestrator:
                 ended_at=datetime.now(UTC).isoformat(),
             )
 
+            local_review_result: LoopResult | None = None
+            local_only_review = (
+                binding.resolved_local_review()
+                and not binding.resolved_remote_review()
+            )
+            if local_only_review:
+                local_review_result = await self._run_local_review_phase(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=run.issue_id,
+                    workspace_path=workspace_path,
+                    parent_run_id=fix_run_id,
+                )
+                if _local_review_infra_failed(local_review_result):
+                    await self._block_local_only_review_infra_failure(
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=run.issue_id,
+                        run_id=run.id,
+                        result=local_review_result,
+                    )
+                    return False
+
             try:
                 await self._push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
@@ -4466,6 +4489,37 @@ class Orchestrator:
                 return False
 
             state = await db.review_state.get(self._conn, issue.id)
+            if local_only_review:
+                if _local_review_needs_approval(local_review_result):
+                    await self._park_local_only_review_needs_approval(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        pr_url=_pr_url_for_state(
+                            repo=binding.github_repo,
+                            pr_number=state.pr_number,
+                            pr_url=state.pr_url,
+                        ),
+                        result=local_review_result,
+                    )
+                    return True
+                if (
+                    local_review_result is None
+                    or local_review_result.outcome != LoopOutcome.APPROVED
+                ):
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=(
+                            "local-only review did not approve: "
+                            f"{_local_review_termination_reason(local_review_result)}"
+                        ),
+                        last_log=_local_review_failure_log(local_review_result),
+                        auto_retry=False,
+                        operator_wait=True,
+                    )
+                    return False
             await self._retrigger_codex_review_unless_approved(
                 binding=binding,
                 issue=issue,
