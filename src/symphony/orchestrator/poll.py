@@ -419,7 +419,6 @@ def _local_review_infra_failed(result: LoopResult | None) -> bool:
 def _local_review_permits_remote(result: LoopResult | None) -> bool:
     return result is not None and result.outcome in {
         LoopOutcome.APPROVED,
-        LoopOutcome.SKIPPED,
     }
 
 
@@ -5665,11 +5664,12 @@ class Orchestrator:
                 pr_number=pr_number,
                 base_ref=base_ref,
             )
-            command = build_codex_workspace_write_command(
-                prompt=prompt,
+            command = build_fix_runner_command(
+                binding.agent,
+                prompt,
                 codex_model=binding.codex_model,
+                workspace_path=workspace_path,
             )
-            codex_binding = binding.model_copy(update={"agent": "codex"})
             warning_pct = effective_warning_pct(
                 global_pct=self.config.cost_warning_pct,
                 binding_override=binding.cost_warning_pct,
@@ -5680,7 +5680,7 @@ class Orchestrator:
             try:
                 usage_delta, final_kind, final_returncode, cap_breached = (
                     await self._run_stage_command(
-                        binding=codex_binding,
+                        binding=binding,
                         issue=issue,
                         command=command,
                         run_id=fix_run_id,

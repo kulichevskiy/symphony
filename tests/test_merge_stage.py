@@ -3713,7 +3713,9 @@ async def test_conflicting_pr_precheck_dispatches_rebase_fix_not_needs_approval(
 
         assert runner.captured_spec is not None
         assert runner.captured_spec.stage == "review_fix"
-        assert runner.captured_spec.command[0] == "codex"
+        # Rebase fix-runs honor the binding's configured agent (here: claude),
+        # not a hardcoded codex.
+        assert runner.captured_spec.command[0] == "claude"
         prompt = runner.captured_spec.command[-1]
         assert "PR #42 has merge conflicts against `release/1.2`" in prompt
         assert "Rebase the branch onto `origin/release/1.2`" in prompt
@@ -4199,7 +4201,9 @@ async def test_merge_conflict_exception_dispatches_rebase_fix_not_needs_approval
         gh.pr_merge.assert_awaited_once()
         assert runner.captured_spec is not None
         assert runner.captured_spec.stage == "review_fix"
-        assert runner.captured_spec.command[0] == "codex"
+        # Rebase fix-runs honor the binding's configured agent (here: claude),
+        # not a hardcoded codex.
+        assert runner.captured_spec.command[0] == "claude"
         prompt = runner.captured_spec.command[-1]
         assert "PR #42 has merge conflicts against `release/1.2`" in prompt
         linear.move_issue.assert_not_awaited()
