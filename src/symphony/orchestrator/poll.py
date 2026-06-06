@@ -419,7 +419,6 @@ def _local_review_infra_failed(result: LoopResult | None) -> bool:
 def _local_review_permits_remote(result: LoopResult | None) -> bool:
     return result is not None and result.outcome in {
         LoopOutcome.APPROVED,
-        LoopOutcome.SKIPPED,
     }
 
 
