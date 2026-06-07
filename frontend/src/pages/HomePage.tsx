@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
-import { Tk } from "@/components/dashboard/atoms";
+import { MixBar, Tk, TokenFigures } from "@/components/dashboard/atoms";
 import { Heatmap } from "@/components/dashboard/Heatmap";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
@@ -93,19 +93,18 @@ export function PerTeam({
   teams: TeamSpend[];
   onPick?: (key: string) => void;
 }) {
-  const sorted = [...teams].sort((a, b) => b.total_tokens - a.total_tokens);
+  const sorted = [...teams].sort((a, b) => b.output_tokens - a.output_tokens);
   return (
     <div className="divide-y divide-border/70 overflow-hidden rounded-md border border-border">
-      <div className="grid grid-cols-[1fr_auto] items-center gap-4 bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        <span>Team</span>
-        <span className="w-24 text-right">Tokens</span>
+      <div className="bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        Team
       </div>
       {sorted.map((t) => (
         <button
           key={t.key}
           type="button"
           onClick={() => onPick?.(t.key)}
-          className="grid w-full grid-cols-[1fr_auto] items-center gap-4 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
+          className="flex w-full flex-col gap-1.5 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
         >
           <span className="flex items-center gap-2">
             <span
@@ -119,9 +118,8 @@ export function PerTeam({
               {t.issues} issues
             </span>
           </span>
-          <span className="w-24 text-right font-mono text-sm tabular-nums">
-            <Tk value={t.total_tokens} />
-          </span>
+          <MixBar split={t} />
+          <TokenFigures split={t} />
         </button>
       ))}
     </div>
@@ -134,7 +132,7 @@ const PROVIDER_TINT: Record<string, string> = {
 };
 
 export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
-  const sorted = [...providers].sort((a, b) => b.total_tokens - a.total_tokens);
+  const sorted = [...providers].sort((a, b) => b.output_tokens - a.output_tokens);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggle = (provider: string) =>
     setExpanded((prev) => {
@@ -146,14 +144,13 @@ export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
 
   return (
     <div className="divide-y divide-border/70 overflow-hidden rounded-md border border-border">
-      <div className="grid grid-cols-[1fr_auto] items-center gap-4 bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        <span>Provider / model</span>
-        <span className="w-24 text-right">Tokens</span>
+      <div className="bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        Provider / model
       </div>
       {sorted.map((p) => {
         const open = expanded.has(p.provider);
         const models = [...p.per_model].sort(
-          (a, b) => b.total_tokens - a.total_tokens,
+          (a, b) => b.output_tokens - a.output_tokens,
         );
         return (
           <div key={p.provider}>
@@ -161,7 +158,7 @@ export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
               type="button"
               onClick={() => toggle(p.provider)}
               aria-expanded={open}
-              className="grid w-full grid-cols-[1fr_auto] items-center gap-4 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
+              className="flex w-full flex-col gap-1.5 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
             >
               <span className="flex items-center gap-2">
                 <Icon
@@ -183,23 +180,21 @@ export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
                   {p.issues} issues
                 </span>
               </span>
-              <span className="w-24 text-right font-mono text-sm tabular-nums">
-                <Tk value={p.total_tokens} />
-              </span>
+              <MixBar split={p} />
+              <TokenFigures split={p} />
             </button>
             {open && (
               <div className="divide-y divide-border/50 bg-secondary/20">
                 {models.map((m) => (
                   <div
                     key={m.model}
-                    className="grid grid-cols-[1fr_auto] items-center gap-4 py-1.5 pl-9 pr-3"
+                    className="flex flex-col gap-1.5 py-1.5 pl-9 pr-3"
                   >
                     <span className="truncate text-xs text-muted-foreground">
                       {m.model}
                     </span>
-                    <span className="w-24 text-right font-mono text-xs tabular-nums text-muted-foreground">
-                      <Tk value={m.total_tokens} />
-                    </span>
+                    <MixBar split={m} />
+                    <TokenFigures split={m} />
                   </div>
                 ))}
               </div>
@@ -255,7 +250,7 @@ function SpendOverview({
               <div className="mt-5">
                 <div className="mb-2.5 flex items-center justify-between">
                   <h2 className="text-sm font-semibold">Tokens by team</h2>
-                  <span className="text-xs text-muted-foreground">by tokens</span>
+                  <span className="text-xs text-muted-foreground">by output</span>
                 </div>
                 <PerTeam teams={summary.per_team} onPick={onPickTeam} />
               </div>
@@ -265,7 +260,7 @@ function SpendOverview({
                     <h2 className="text-sm font-semibold">
                       Tokens by provider / model
                     </h2>
-                    <span className="text-xs text-muted-foreground">by tokens</span>
+                    <span className="text-xs text-muted-foreground">by output</span>
                   </div>
                   <PerProvider providers={summary.per_provider} />
                 </div>

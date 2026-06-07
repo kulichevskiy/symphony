@@ -1119,7 +1119,7 @@ async def test_issue_detail_api_returns_tokens_by_provider_model(
 
     assert response.status_code == 200
     breakdown = response.json()["tokens_by_model"]
-    # Sorted by total desc: claude (190) before codex (15).
+    # Sorted by output desc: claude (20) before codex (2).
     assert breakdown == [
         {
             "provider": "claude",
@@ -1128,7 +1128,6 @@ async def test_issue_detail_api_returns_tokens_by_provider_model(
             "output_tokens": 20,
             "cache_write_tokens": 30,
             "cache_read_tokens": 40,
-            "total_tokens": 190,
         },
         {
             "provider": "codex",
@@ -1137,11 +1136,8 @@ async def test_issue_detail_api_returns_tokens_by_provider_model(
             "output_tokens": 2,
             "cache_write_tokens": 0,
             "cache_read_tokens": 3,
-            "total_tokens": 15,
         },
     ]
-    # Per-model token sums reconcile with the issue's run-level totals.
-    assert sum(m["total_tokens"] for m in breakdown) == 100 + 20 + 30 + 40 + 15
 
 
 @pytest.mark.asyncio
@@ -1815,11 +1811,12 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
         "cache_read_tokens": 129,
         "issues": 3,
     }
-    # Sorted by total tokens desc: WEB (380) before ENG (274).
+    # Sorted by output tokens desc: WEB (40) before ENG (27).
     assert [t["key"] for t in body["per_team"]] == ["WEB", "ENG"]
     eng = next(t for t in body["per_team"] if t["key"] == "ENG")
-    assert eng["total_tokens"] == 100 + 20 + 30 + 40 + 10 + 2 + 3 + 4 + 50 + 5 + 5 + 5
+    assert eng["output_tokens"] == 20 + 2 + 5
     assert eng["issues"] == 2
+    assert "total_tokens" not in eng
     assert "cost_usd" not in body["totals"]
     assert "cost_usd" not in eng
     # No run_model_usage rows seeded → empty provider breakdown.
@@ -1870,22 +1867,23 @@ async def test_api_spend_summary_per_provider_nested_per_model(
     providers = {p["provider"]: p for p in body["per_provider"]}
     assert set(providers) == {"claude", "codex"}
 
-    # claude sums its two runs and counts both issues; sorted first (larger).
+    # claude sums its two runs and counts both issues; sorted first by output.
     assert [p["provider"] for p in body["per_provider"]] == ["claude", "codex"]
     claude = providers["claude"]
     assert claude["input_tokens"] == 150
     assert claude["output_tokens"] == 25
     assert claude["cache_write_tokens"] == 35
     assert claude["cache_read_tokens"] == 45
-    assert claude["total_tokens"] == 150 + 25 + 35 + 45
+    assert "total_tokens" not in claude
     assert claude["issues"] == 2
     assert len(claude["per_model"]) == 1
     assert claude["per_model"][0]["model"] == "claude-opus-4-8"
-    assert claude["per_model"][0]["total_tokens"] == 150 + 25 + 35 + 45
+    assert "total_tokens" not in claude["per_model"][0]
+    assert claude["per_model"][0]["output_tokens"] == 25
     assert claude["per_model"][0]["issues"] == 2
 
     codex = providers["codex"]
-    assert codex["total_tokens"] == 10 + 2 + 0 + 3
+    assert codex["output_tokens"] == 2
     assert codex["issues"] == 1
     assert codex["per_model"][0]["model"] == "gpt-5.5"
 
