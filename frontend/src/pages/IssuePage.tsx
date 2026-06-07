@@ -1,836 +1,744 @@
-import { useQuery } from "@tanstack/react-query";
-import { useRef, useState, type ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
-import { StatusCluster, StatusSinceLine } from "@/components/CanonicalStatus";
+import { CapBar, type Checks, CheckSummary, Tk } from "@/components/dashboard/atoms";
+import { LiveDot, StatusBadge } from "@/components/dashboard/StatusBadge";
 import { IssueTimeline } from "@/components/IssueTimeline";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Icon } from "@/components/ui/icon";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { cn } from "@/lib/utils";
-import { fetchIssueDetail, fetchIssueExternal, fetchIssueObservations } from "@/lib/api";
-import { formatTokens } from "@/lib/formatTokens";
-import type {
-  DriftFlag,
-  ExternalObservation,
-  ExternalComment,
-  GithubPrSnapshot,
-  IssueDetail,
-  IssueExternalSnapshot,
-  LinearSnapshot,
+  fetchIssueDetail,
+  fetchIssueExternal,
+  postIssueCommand,
+  type IssueDetail,
+  type IssueExternalSnapshot,
 } from "@/lib/api";
+import { formatCost, formatRelative, formatTokens, formatUtc } from "@/lib/format";
+import { cn } from "@/lib/utils";
 
-type CellValue = string | number | null;
-type RunRow = IssueDetail["runs"][number];
+import {
+  applicability,
+  COMMANDS,
+  type CommandId,
+  GROUPS,
+  waitLabel,
+} from "./issueControls";
 
-type Column<T extends object> = {
-  key: Extract<keyof T, string>;
-  label: string;
-  render?: (row: T) => ReactNode;
+// Mirrors config `cost_cap_per_issue_usd` (default). Surfaced as the per-issue
+// "credits" budget; there is no per-issue cap endpoint yet.
+const DEFAULT_CAP_USD = 100;
+
+type Cockpit = {
+  status: string;
+  stage: string;
+  runState: "running" | "failed" | "waiting" | "completed" | "idle";
+  since: string | null;
+  activity: string | null;
+  reason: string | null;
+  cost_usd: number;
+  tokens: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_write_tokens: number;
+    cache_read_tokens: number;
+  };
+  pr: {
+    number: number;
+    repo: string;
+    url: string;
+    state: string;
+    mergeable: string;
+    merged: boolean;
+    checks: Checks | null;
+  } | null;
+  waitingOn: string | null;
 };
 
-function formatCell(value: CellValue) {
-  if (value === null || value === "") {
-    return <span className="text-muted-foreground">null</span>;
-  }
-  return String(value);
+function runStateFor(status: string): Cockpit["runState"] {
+  if (status === "running") return "running";
+  if (status === "failed" || status === "halted") return "failed";
+  if (status === "done") return "completed";
+  if (status === "idle") return "idle";
+  return "waiting";
 }
 
-function SectionTable<T extends object>({
+function deriveCockpit(
+  detail: IssueDetail,
+  external: IssueExternalSnapshot | undefined,
+): Cockpit {
+  const status = detail.canonical_status.state;
+  const runs = [...detail.runs].sort(
+    (a, b) => Date.parse(b.started_at) - Date.parse(a.started_at),
+  );
+  const latest = runs[0];
+  const failed = runs.find((r) => r.status === "failed" && r.termination_detail);
+  let reason: string | null = null;
+  if (failed) {
+    reason = failed.termination_detail;
+  } else if (status === "drift_detected" || status === "paused") {
+    reason = detail.canonical_status.subtitle;
+  }
+
+  const tokens = detail.runs.reduce(
+    (a, r) => ({
+      input_tokens: a.input_tokens + r.input_tokens,
+      output_tokens: a.output_tokens + r.output_tokens,
+      cache_write_tokens: a.cache_write_tokens + r.cache_write_tokens,
+      cache_read_tokens: a.cache_read_tokens + r.cache_read_tokens,
+    }),
+    { input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0 },
+  );
+  const cost_usd = detail.runs.reduce((a, r) => a + r.cost_usd, 0);
+
+  const gh = external?.github;
+  const dbPr = detail.issue_prs[0];
+  let pr: Cockpit["pr"] = null;
+  if (gh?.pr_number) {
+    const cs = gh.check_summary;
+    pr = {
+      number: gh.pr_number,
+      repo: gh.github_repo ?? dbPr?.github_repo ?? "",
+      url: gh.url ?? dbPr?.pr_url ?? "",
+      state: String(gh.state ?? "open").toLowerCase(),
+      mergeable:
+        typeof gh.mergeable === "string"
+          ? gh.mergeable.toLowerCase()
+          : gh.mergeable
+            ? "mergeable"
+            : "unknown",
+      merged: Boolean(gh.merged_at),
+      checks: cs
+        ? { passing: cs.passing, failing: cs.failing, pending: cs.pending }
+        : null,
+    };
+  } else if (dbPr) {
+    pr = {
+      number: dbPr.pr_number,
+      repo: dbPr.github_repo,
+      url: dbPr.pr_url,
+      state: dbPr.merged_at ? "merged" : "open",
+      mergeable: "unknown",
+      merged: Boolean(dbPr.merged_at),
+      checks: null,
+    };
+  }
+
+  return {
+    status,
+    stage: latest?.stage ?? "—",
+    runState: runStateFor(status),
+    since: detail.canonical_status.since,
+    activity: detail.latest_activity_ts ?? null,
+    reason,
+    cost_usd,
+    tokens,
+    pr,
+    waitingOn: detail.operator_waits[0]?.kind ?? null,
+  };
+}
+
+function CockpitCard({
   title,
-  rows,
-  columns,
-  headerAside,
-  rowClassName,
+  aside,
+  children,
+  className = "",
 }: {
   title: string;
-  rows: T[];
-  columns: Column<T>[];
-  headerAside?: ReactNode;
-  rowClassName?: (row: T) => string | undefined;
+  aside?: ReactNode;
+  children: ReactNode;
+  className?: string;
 }) {
   return (
-    <section className="border-t py-5">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-base font-semibold tracking-normal">{title}</h2>
-        {headerAside ? <div>{headerAside}</div> : null}
+    <Card className={cn("p-4", className)}>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h3 className="whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          {title}
+        </h3>
+        {aside}
       </div>
-      {rows.length === 0 ? (
-        <p className="text-sm text-muted-foreground">(none)</p>
-      ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              {columns.map((column) => (
-                <TableHead key={column.key}>{column.label}</TableHead>
-              ))}
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((row, index) => (
-              <TableRow
-                key={Object.values(row).join(":") || index}
-                className={rowClassName?.(row)}
-              >
-                {columns.map((column) => (
-                  <TableCell key={column.key} className="max-w-[360px] break-words font-mono text-xs">
-                    {column.render ? column.render(row) : formatCell(row[column.key] as CellValue)}
-                  </TableCell>
-                ))}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      )}
-    </section>
+      {children}
+    </Card>
   );
 }
 
-const RUN_STATUS_ROW_CLASS: Record<string, string> = {
-  running: "bg-blue-50 dark:bg-blue-950/30",
-  failed: "bg-red-50 dark:bg-red-950/30",
-  interrupted: "bg-red-50 dark:bg-red-950/30",
-  completed: "bg-green-50/50 dark:bg-green-950/20",
-  done: "bg-green-50/50 dark:bg-green-950/20",
-};
-
-const RUN_STATUS_BADGE_CLASS: Record<string, string> = {
-  running:
-    "border-blue-300 bg-blue-100 text-blue-900 dark:border-blue-700 dark:bg-blue-950/50 dark:text-blue-200",
-  failed:
-    "border-red-300 bg-red-100 text-red-900 dark:border-red-700 dark:bg-red-950/50 dark:text-red-200",
-  interrupted:
-    "border-red-400 bg-red-100 text-red-950 dark:border-red-600 dark:bg-red-950/60 dark:text-red-100",
-  completed:
-    "border-green-300 bg-green-100 text-green-900 dark:border-green-700 dark:bg-green-950/50 dark:text-green-200",
-  done:
-    "border-green-300 bg-green-100 text-green-900 dark:border-green-700 dark:bg-green-950/50 dark:text-green-200",
-  needs_approval:
-    "border-amber-300 bg-amber-100 text-amber-900 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-200",
-};
-
-function runRowClassName(row: { status?: string | null }) {
-  if (!row.status) {
-    return undefined;
-  }
-  return RUN_STATUS_ROW_CLASS[row.status];
-}
-
-function RunStatusBadge({ status }: { status: string | null | undefined }) {
-  if (!status) {
-    return <span className="text-muted-foreground">null</span>;
-  }
-  const cls =
-    RUN_STATUS_BADGE_CLASS[status] ??
-    "border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300";
-  return <Badge className={cn("font-mono", cls)}>{status}</Badge>;
-}
-
-const SUCCESS_RUN_STATUSES = new Set(["completed", "done"]);
-
-function tokenCount(value: number | null | undefined) {
-  const exact = String(value ?? 0);
-  return <span title={exact}>{formatTokens(value)}</span>;
-}
-
-function formatCost(value: number) {
-  return `$${value.toFixed(2)}`;
-}
-
-export function RunUsageSummary({
-  runs,
-}: {
-  runs: Array<
-    Pick<
-      RunRow,
-      "cost_usd" | "input_tokens" | "output_tokens" | "cache_write_tokens" | "cache_read_tokens"
-    >
-  >;
-}) {
-  const total = runs.reduce(
-    (acc, run) => ({
-      cost_usd: acc.cost_usd + (run.cost_usd ?? 0),
-      input_tokens: acc.input_tokens + (run.input_tokens ?? 0),
-      output_tokens: acc.output_tokens + (run.output_tokens ?? 0),
-      cache_write_tokens: acc.cache_write_tokens + (run.cache_write_tokens ?? 0),
-      cache_read_tokens: acc.cache_read_tokens + (run.cache_read_tokens ?? 0),
-    }),
+function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
+  const tone =
     {
-      cost_usd: 0,
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_write_tokens: 0,
-      cache_read_tokens: 0,
-    },
-  );
-
+      running: "text-blue-600 dark:text-blue-400",
+      failed: "text-red-600 dark:text-red-400",
+      waiting: "text-amber-600 dark:text-amber-400",
+      completed: "text-green-600 dark:text-green-400",
+      idle: "text-foreground",
+    }[c.runState] ?? "text-foreground";
   return (
-    <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 font-mono text-xs text-muted-foreground">
-      <span>total cost {formatCost(total.cost_usd)}</span>
-      <span>in {tokenCount(total.input_tokens)}</span>
-      <span>out {tokenCount(total.output_tokens)}</span>
-      <span>cache-write {tokenCount(total.cache_write_tokens)}</span>
-      <span>cache-read {tokenCount(total.cache_read_tokens)}</span>
-    </div>
-  );
-}
-
-function terminationTitle(run: Pick<RunRow, "termination_detail" | "exit_returncode">) {
-  const parts: string[] = [];
-  const detail = run.termination_detail.trim();
-  if (detail) {
-    parts.push(detail);
-  }
-  if (run.exit_returncode !== null) {
-    parts.push(`exit_returncode=${run.exit_returncode}`);
-  }
-  return parts.join("\n") || undefined;
-}
-
-function RunTerminationBadge({
-  run,
-}: {
-  run: Pick<RunRow, "status" | "termination_kind" | "termination_detail" | "exit_returncode">;
-}) {
-  const kind = run.termination_kind.trim();
-  if (!kind || SUCCESS_RUN_STATUSES.has(run.status)) {
-    return null;
-  }
-  const title = terminationTitle(run);
-  return (
-    <Badge
-      className="max-w-[220px] truncate border-amber-300 bg-amber-100 font-mono text-amber-950 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-100"
-      title={title}
+    <CockpitCard
+      title="What's happening now"
+      aside={
+        c.status === "running" ? (
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400">
+            <LiveDot tone="bg-blue-500" /> live
+          </span>
+        ) : null
+      }
     >
-      {kind}
-    </Badge>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span className="text-lg font-semibold capitalize">{c.stage}</span>
+        <span className="text-muted-foreground">·</span>
+        <span className={cn("text-lg font-semibold capitalize", tone)}>
+          {c.runState}
+        </span>
+      </div>
+      <p className="mt-1 text-sm text-muted-foreground">
+        since{" "}
+        <span className="font-mono" title={formatUtc(c.since)}>
+          {formatRelative(c.since, nowMs)}
+        </span>
+        {" · last activity "}
+        <span className="font-mono">{formatRelative(c.activity, nowMs)}</span>
+      </p>
+      {c.reason ? (
+        <div className="mt-3 flex items-start gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200">
+          <Icon name="alert" size={15} strokeWidth={2} className="mt-0.5 shrink-0" />
+          <span className="font-mono text-xs leading-relaxed">{c.reason}</span>
+        </div>
+      ) : null}
+    </CockpitCard>
   );
 }
 
-export function RunStatusCell({
-  run,
+export function SpendCard({ c }: { c: Cockpit }) {
+  const pct = Math.min(100, (c.cost_usd / DEFAULT_CAP_USD) * 100);
+  const tone =
+    pct >= 90
+      ? "text-red-600 dark:text-red-400"
+      : pct >= 70
+        ? "text-amber-600 dark:text-amber-400"
+        : "text-foreground";
+  return (
+    <CockpitCard title="Spend & cap">
+      <div className="flex items-end justify-between">
+        <div className={cn("font-mono text-2xl font-semibold tracking-tight", tone)}>
+          {formatCost(c.cost_usd)}
+        </div>
+        <div className="whitespace-nowrap font-mono text-xs text-muted-foreground">
+          of {formatCost(DEFAULT_CAP_USD)} cap
+        </div>
+      </div>
+      <div className="mt-2">
+        <CapBar cost={c.cost_usd} cap={DEFAULT_CAP_USD} />
+      </div>
+      <div className="mt-1 text-right font-mono text-[11px] text-muted-foreground">
+        {pct.toFixed(0)}%
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 font-mono text-xs text-muted-foreground">
+        <span>in <Tk value={c.tokens.input_tokens} /></span>
+        <span>out <Tk value={c.tokens.output_tokens} /></span>
+        <span>cache-write <Tk value={c.tokens.cache_write_tokens} /></span>
+        <span>cache-read <Tk value={c.tokens.cache_read_tokens} /></span>
+      </div>
+    </CockpitCard>
+  );
+}
+
+const MERGE_TONES: Record<string, string> = {
+  mergeable:
+    "border-green-300 bg-green-50 text-green-900 dark:border-green-700 dark:bg-green-950/40 dark:text-green-200",
+  conflicting:
+    "border-red-300 bg-red-50 text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200",
+  merged:
+    "border-violet-300 bg-violet-50 text-violet-900 dark:border-violet-700 dark:bg-violet-950/40 dark:text-violet-200",
+  unknown:
+    "border-slate-300 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300",
+};
+
+export function PrCard({ pr }: { pr: Cockpit["pr"] }) {
+  if (!pr) {
+    return (
+      <CockpitCard title="Pull request">
+        <p className="text-sm text-muted-foreground">No PR opened yet</p>
+      </CockpitCard>
+    );
+  }
+  const badge = pr.merged ? "merged" : pr.mergeable;
+  const tone = MERGE_TONES[badge] ?? MERGE_TONES.unknown;
+  return (
+    <CockpitCard title="Pull request" aside={<CheckSummary checks={pr.checks} />}>
+      <div className="flex flex-wrap items-center gap-2">
+        <a
+          href={pr.url || `https://github.com/${pr.repo}/pull/${pr.number}`}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1.5 text-sm font-medium text-primary underline-offset-4 hover:underline"
+        >
+          <Icon name="gitPr" size={15} /> #{pr.number}
+          <Icon name="external" size={12} className="text-muted-foreground" />
+        </a>
+        <Badge className={cn("capitalize", tone)}>{badge}</Badge>
+      </div>
+      <p className="mt-2 truncate font-mono text-xs text-muted-foreground">{pr.repo}</p>
+    </CockpitCard>
+  );
+}
+
+function WaitCard({ waitingOn }: { waitingOn: string | null }) {
+  if (!waitingOn) return null;
+  return (
+    <Card className="border-amber-300 bg-amber-50 p-4 dark:border-amber-700/70 dark:bg-amber-950/30">
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/60 dark:text-amber-300">
+          <Icon name="clock" size={16} strokeWidth={2} />
+        </span>
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-400">
+            Waiting on operator
+          </div>
+          <p className="mt-0.5 text-sm font-medium text-amber-950 dark:text-amber-100">
+            This issue is waiting for {waitLabel(waitingOn)}.
+          </p>
+          <p className="mt-0.5 text-xs text-amber-800/80 dark:text-amber-200/70">
+            Use the controls below to unblock it.
+          </p>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+export function CmdButton({
+  id,
+  enabled,
+  why,
+  applied,
+  busy,
+  onClick,
 }: {
-  run: Pick<RunRow, "status" | "termination_kind" | "termination_detail" | "exit_returncode">;
+  id: CommandId;
+  enabled: boolean;
+  why: string;
+  applied: boolean;
+  busy: boolean;
+  onClick: (id: CommandId) => void;
 }) {
+  const c = COMMANDS[id];
+  let cls = "border border-border bg-background hover:bg-secondary text-foreground";
+  if (c.primary) cls = "bg-blue-600 text-white hover:bg-blue-700 border border-blue-600";
+  if (c.destructive)
+    cls =
+      "border border-red-300 bg-background text-red-700 hover:bg-red-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40";
+  if (applied)
+    cls =
+      "border border-green-400 bg-green-50 text-green-800 dark:border-green-700 dark:bg-green-950/50 dark:text-green-200";
   return (
-    <div className="flex max-w-full flex-wrap items-center gap-1.5">
-      <RunStatusBadge status={run.status} />
-      <RunTerminationBadge run={run} />
-    </div>
+    <button
+      type="button"
+      disabled={!enabled || busy}
+      title={enabled ? c.cmd : why}
+      onClick={() => onClick(id)}
+      className={cn(
+        "group relative inline-flex h-9 items-center justify-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45",
+        cls,
+      )}
+    >
+      <Icon
+        name={applied ? "check" : c.icon}
+        size={15}
+        strokeWidth={applied || c.primary ? 2 : 1.5}
+      />
+      {applied ? "Applied" : c.label}
+      {id === "approve" ? <span className="text-xs opacity-70">👍</span> : null}
+    </button>
   );
 }
 
-export function RunsSection({ runs }: { runs: RunRow[] }) {
-  return (
-    <SectionTable
-      title="Runs"
-      rows={runs}
-      rowClassName={runRowClassName}
-      headerAside={<RunUsageSummary runs={runs} />}
-      columns={[
-        { key: "id", label: "id" },
-        { key: "stage", label: "stage" },
-        {
-          key: "status",
-          label: "status",
-          render: (row) => <RunStatusCell run={row} />,
-        },
-        { key: "pid", label: "pid" },
-        { key: "started_at", label: "started_at" },
-        { key: "ended_at", label: "ended_at" },
-        { key: "cost_usd", label: "cost_usd" },
-        {
-          key: "input_tokens",
-          label: "in",
-          render: (row) => tokenCount(row.input_tokens),
-        },
-        {
-          key: "output_tokens",
-          label: "out",
-          render: (row) => tokenCount(row.output_tokens),
-        },
-        {
-          key: "cache_write_tokens",
-          label: "cache-write",
-          render: (row) => tokenCount(row.cache_write_tokens),
-        },
-        {
-          key: "cache_read_tokens",
-          label: "cache-read",
-          render: (row) => tokenCount(row.cache_read_tokens),
-        },
-      ]}
-    />
-  );
-}
+function Controls({
+  status,
+  applied,
+  busy,
+  onRun,
+}: {
+  status: string;
+  applied: CommandId | null;
+  busy: boolean;
+  onRun: (id: CommandId) => void;
+}) {
+  const [confirm, setConfirm] = useState<CommandId | null>(null);
+  const { en, why } = applicability(status);
 
-function formatUtc(ts?: string | null) {
-  if (!ts) {
-    return "null";
-  }
-  const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) {
-    return ts;
-  }
-  return `${date.toISOString().slice(0, 19)}Z`;
-}
-
-function formatRelative(ts?: string | null) {
-  if (!ts) {
-    return "unknown";
-  }
-  const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) {
-    return ts;
-  }
-  const diffSeconds = Math.round((Date.now() - date.getTime()) / 1000);
-  const absSeconds = Math.abs(diffSeconds);
-  const units: Array<[number, string]> = [
-    [60 * 60 * 24, "d"],
-    [60 * 60, "h"],
-    [60, "m"],
-  ];
-  let value = absSeconds;
-  let unit = "s";
-  for (const [seconds, label] of units) {
-    if (absSeconds >= seconds) {
-      value = Math.floor(absSeconds / seconds);
-      unit = label;
-      break;
+  function handle(id: CommandId) {
+    if (COMMANDS[id].destructive) {
+      setConfirm(id);
+    } else {
+      onRun(id);
     }
   }
-  if (value < 10 && unit === "s") {
-    return "now";
+
+  if (confirm) {
+    const c = COMMANDS[confirm];
+    return (
+      <div className="flex flex-wrap items-center gap-3 rounded-md border border-red-300 bg-red-50 px-4 py-3 dark:border-red-800 dark:bg-red-950/30">
+        <Icon name="alert" size={16} strokeWidth={2} className="text-red-600 dark:text-red-400" />
+        <span className="text-sm text-red-900 dark:text-red-200">
+          Run <span className="font-mono font-semibold">{c.cmd}</span>? This is
+          destructive.
+        </span>
+        <div className="ml-auto flex gap-2">
+          <Button variant="ghost" onClick={() => setConfirm(null)}>
+            Cancel
+          </Button>
+          <button
+            type="button"
+            onClick={() => {
+              onRun(confirm);
+              setConfirm(null);
+            }}
+            className="inline-flex h-9 items-center gap-1.5 rounded-md bg-red-600 px-3 text-sm font-medium text-white transition-colors hover:bg-red-700"
+          >
+            <Icon name={c.icon} size={14} strokeWidth={2} /> Confirm {c.cmd}
+          </button>
+        </div>
+      </div>
+    );
   }
-  return diffSeconds < 0 ? `in ${value}${unit}` : `${value}${unit} ago`;
-}
 
-function flagsByField(flags: DriftFlag[]) {
-  return new Map(flags.map((flag) => [flag.field, flag]));
-}
-
-function fieldTitle(flag?: DriftFlag) {
-  if (!flag) {
-    return undefined;
-  }
-  return `SQLite: ${flag.sqlite_value ?? "null"}; ${flag.source_name}: ${
-    flag.source_value ?? "null"
-  }`;
-}
-
-function FieldRow({
-  label,
-  value,
-  flag,
-}: {
-  label: string;
-  value: ReactNode;
-  flag?: DriftFlag;
-}) {
-  const isWarning = flag?.severity === "warning";
   return (
-    <div
-      className={cn(
-        "grid min-h-9 grid-cols-[9rem_minmax(0,1fr)] items-center gap-3 border-t px-3 py-2 text-sm first:border-t-0",
-        flag && !isWarning ? "bg-red-50 text-red-950 dark:bg-red-950/40 dark:text-red-100" : null,
-        isWarning ? "bg-amber-50 text-amber-950 dark:bg-amber-950/40 dark:text-amber-100" : null,
-      )}
-      title={fieldTitle(flag)}
-    >
-      <span className="text-muted-foreground">{label}</span>
-      <span className="min-w-0 break-words font-mono text-xs">
-        {flag ? <span className="mr-2 font-sans text-sm">⚠</span> : null}
-        {value}
-      </span>
+    <div className="grid gap-3 sm:grid-cols-3">
+      {GROUPS.map((g) => (
+        <div key={g.key} className="rounded-md border border-border bg-secondary/20 p-3">
+          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            {g.label}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {g.cmds.map((id) => (
+              <CmdButton
+                key={id}
+                id={id}
+                enabled={en[id]}
+                why={why[id]}
+                applied={applied === id}
+                busy={busy}
+                onClick={handle}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
 
-function SourceAlert({
-  source,
-  snapshot,
-}: {
-  source: "Linear" | "GitHub";
-  snapshot: LinearSnapshot | GithubPrSnapshot;
-}) {
-  if (!snapshot.error) {
-    return null;
-  }
-  const stale = snapshot.stale_fetched_at
-    ? ` — showing data from ${formatUtc(snapshot.stale_fetched_at)}`
-    : "";
+function ActionLog({ entries }: { entries: Array<{ cmd: string; time: string }> }) {
+  if (!entries.length) return null;
   return (
-    <div className="border-b border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200">
-      {source} returned {snapshot.error}
-      {stale}
+    <div className="mt-3 rounded-md border border-border bg-secondary/20 px-3 py-2">
+      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+        Action log
+      </div>
+      <ul className="space-y-1">
+        {entries.map((e, i) => (
+          <li key={i} className="flex items-center gap-2 font-mono text-xs">
+            <Icon
+              name="check"
+              size={12}
+              strokeWidth={2}
+              className="text-green-600 dark:text-green-400"
+            />
+            <span className="text-foreground">{e.cmd}</span>
+            <span className="text-muted-foreground">· applied {e.time}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
 
-function LinearCard({
-  snapshot,
-  flags,
+function MiniTable({
+  columns,
+  rows,
 }: {
-  snapshot: LinearSnapshot;
-  flags: Map<string, DriftFlag>;
+  columns: string[];
+  rows: Array<Record<string, ReactNode>>;
 }) {
+  if (!rows.length) return <p className="text-sm text-muted-foreground">(none)</p>;
   return (
-    <section className="overflow-hidden rounded-md border border-border">
-      <div className="border-b bg-secondary px-3 py-2 text-sm font-semibold">Linear</div>
-      <SourceAlert source="Linear" snapshot={snapshot} />
-      <FieldRow label="state" value={snapshot.state ?? "null"} flag={flags.get("linear.state")} />
-      <FieldRow label="updatedAt" value={formatUtc(snapshot.updated_at)} />
-      <div className="grid min-h-9 grid-cols-[9rem_minmax(0,1fr)] items-center gap-3 border-t px-3 py-2 text-sm">
-        <span className="text-muted-foreground">labels</span>
-        <div className="flex min-w-0 flex-wrap gap-1">
-          {(snapshot.labels ?? []).length > 0 ? (
-            (snapshot.labels ?? []).map((label) => (
-              <Badge
-                key={label}
-                className="border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300"
+    <div className="w-full overflow-x-auto rounded-md border border-border">
+      <table className="w-full text-left text-xs">
+        <thead>
+          <tr className="border-b border-border bg-secondary/30">
+            {columns.map((c) => (
+              <th
+                key={c}
+                className="px-3 py-1.5 font-medium uppercase tracking-wide text-muted-foreground"
               >
-                {label}
-              </Badge>
-            ))
-          ) : (
-            <span className="font-mono text-xs text-muted-foreground">none</span>
-          )}
-        </div>
-      </div>
-    </section>
+                {c}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i} className="border-b border-border/60 last:border-0">
+              {columns.map((c) => (
+                <td
+                  key={c}
+                  className="max-w-[280px] truncate px-3 py-1.5 font-mono text-muted-foreground"
+                >
+                  {r[c] === null || r[c] === undefined || r[c] === "" ? (
+                    <span className="opacity-50">null</span>
+                  ) : (
+                    r[c]
+                  )}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
-export function GithubCard({
-  snapshot,
-  flags,
-}: {
-  snapshot: GithubPrSnapshot;
-  flags: Map<string, DriftFlag>;
-}) {
-  const checks = snapshot.check_summary;
-  const checksText = checks
-    ? `${checks.passing} passing / ${checks.failing} failing / ${checks.pending} pending`
-    : "null";
-  return (
-    <section className="overflow-hidden rounded-md border border-border">
-      <div className="border-b bg-secondary px-3 py-2 text-sm font-semibold">
-        GitHub PR {snapshot.pr_number ? `#${snapshot.pr_number}` : ""}
-      </div>
-      <SourceAlert source="GitHub" snapshot={snapshot} />
-      {snapshot.comments_error ? (
-        <div className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
-          GitHub review comments unavailable: {snapshot.comments_error}
-        </div>
-      ) : null}
-      <FieldRow label="state" value={snapshot.state ?? "null"} flag={flags.get("github.state")} />
-      <FieldRow
-        label="mergedAt"
-        value={formatUtc(snapshot.merged_at)}
-        flag={flags.get("github.merged_at")}
-      />
-      <FieldRow label="mergedBy" value={snapshot.merged_by ?? "null"} />
-      <FieldRow label="mergeable" value={String(snapshot.mergeable ?? "null")} />
-      <FieldRow label="mergeState" value={snapshot.merge_state_status ?? "null"} />
-      <FieldRow label="checks" value={checksText} flag={flags.get("github.checks")} />
-    </section>
-  );
-}
-
-function CommentList({
+function DebugSection({
   title,
-  comments,
+  children,
+  defaultOpen,
 }: {
   title: string;
-  comments: ExternalComment[];
+  children: ReactNode;
+  defaultOpen?: boolean;
 }) {
-  const [expanded, setExpanded] = useState<Set<string | number>>(() => new Set());
   return (
-    <section>
-      <h3 className="mb-2 text-sm font-semibold tracking-normal">{title}</h3>
-      {comments.length === 0 ? (
-        <p className="text-sm text-muted-foreground">(none)</p>
-      ) : (
-        <ul className="space-y-2">
-          {comments.map((comment) => {
-            const isExpanded = expanded.has(comment.comment_id);
-            const needsTrim = comment.body.length > 120;
-            const body = needsTrim && !isExpanded ? `${comment.body.slice(0, 120)} […]` : comment.body;
-            return (
-              <li key={comment.comment_id} className="rounded-md border border-border p-3">
-                <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <time className="font-mono" dateTime={comment.ts} title={formatRelative(comment.ts)}>
-                    {formatUtc(comment.ts)}
-                  </time>
-                  <span className="font-mono">{comment.author || "unknown"}</span>
-                  {comment.url ? (
-                    <a
-                      className="text-primary underline-offset-4 hover:underline"
-                      href={comment.url}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      anchor
-                    </a>
-                  ) : null}
-                </div>
-                <p className="whitespace-pre-wrap break-words text-sm">{body}</p>
-                {needsTrim ? (
-                  <button
-                    type="button"
-                    className="mt-1 text-xs font-medium text-primary underline-offset-4 hover:underline"
-                    onClick={() =>
-                      setExpanded((current) => {
-                        const next = new Set(current);
-                        if (next.has(comment.comment_id)) {
-                          next.delete(comment.comment_id);
-                        } else {
-                          next.add(comment.comment_id);
-                        }
-                        return next;
-                      })
-                    }
-                  >
-                    {isExpanded ? "collapse" : "expand"}
-                  </button>
-                ) : null}
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </section>
+    <details className="border-t border-border py-3" open={defaultOpen}>
+      <summary className="cursor-pointer select-none text-sm font-medium text-muted-foreground hover:text-foreground">
+        {title}
+      </summary>
+      <div className="mt-3">{children}</div>
+    </details>
   );
 }
 
-export function ExternalTruthSection({
-  snapshot,
-  isFetching,
-  onRefresh,
-}: {
-  snapshot?: IssueExternalSnapshot;
-  isFetching: boolean;
-  onRefresh: () => void;
-}) {
-  const flags = flagsByField(snapshot?.drift_flags ?? []);
-  const driftCount = snapshot?.drift_flags.filter((flag) => flag.severity !== "warning").length ?? 0;
-  const hasSourceError = Boolean(snapshot?.linear.error || snapshot?.github.error);
-  const statusClass =
-    driftCount > 0
-      ? "border-red-300 bg-red-50 text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200"
-      : hasSourceError
-        ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
-        : "border-green-300 bg-green-50 text-green-900 dark:border-green-700 dark:bg-green-950/40 dark:text-green-200";
-  const statusLabel =
-    driftCount > 0
-      ? `Drift detected ⚠ (${driftCount})`
-      : hasSourceError
-        ? "Source unavailable"
-        : "In sync ✓";
-  return (
-    <section className="border-t py-5">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 className="text-base font-semibold tracking-normal">
-            External truth
-            {snapshot ? (
-              <span
-                className="ml-2 font-mono text-sm font-normal text-muted-foreground"
-                title={formatRelative(snapshot.fetched_at)}
-              >
-                fetched {formatUtc(snapshot.fetched_at)}
-              </span>
-            ) : null}
-          </h2>
-          {snapshot ? (
-            <Badge className={statusClass}>{statusLabel}</Badge>
-          ) : null}
-        </div>
-        <Button type="button" variant="secondary" disabled={isFetching} onClick={onRefresh}>
-          Refresh now
-        </Button>
-      </div>
-      {snapshot ? (
-        <div className="space-y-5">
-          <div className="grid gap-4 md:grid-cols-2">
-            <LinearCard snapshot={snapshot.linear} flags={flags} />
-            <GithubCard snapshot={snapshot.github} flags={flags} />
-          </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <CommentList title="Recent Linear comments" comments={snapshot.linear.comments ?? []} />
-            <CommentList title="Recent PR review comments" comments={snapshot.github.comments ?? []} />
-          </div>
-        </div>
-      ) : (
-        <p className="text-sm text-muted-foreground">Loading external state</p>
-      )}
-    </section>
-  );
-}
-
-function prettyPayload(raw: string): string {
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch {
-    return raw;
-  }
-}
-
-function ObservationsPanel({
-  rows,
-  isLoading,
-  error,
-}: {
-  rows: ExternalObservation[];
-  isLoading: boolean;
-  error: unknown;
-}) {
-  return (
-    <section className="border-t py-5">
-      <h2 className="mb-3 text-base font-semibold tracking-normal">Recent observations</h2>
-      {isLoading ? <p className="text-sm text-muted-foreground">Loading</p> : null}
-      {error ? (
-        <p className="text-sm text-red-600 dark:text-red-400">{(error as Error).message}</p>
-      ) : null}
-      {!isLoading && !error && rows.length === 0 ? (
-        <p className="text-sm text-muted-foreground">(none)</p>
-      ) : null}
-      {rows.length > 0 ? (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-52">observed_at</TableHead>
-              <TableHead className="w-24">source</TableHead>
-              <TableHead className="w-44">drift_kind</TableHead>
-              <TableHead className="w-36">action_taken</TableHead>
-              <TableHead>payload</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((row) => (
-              <TableRow key={row.id}>
-                <TableCell className="font-mono text-xs">{row.observed_at}</TableCell>
-                <TableCell className="font-mono text-xs">{row.source}</TableCell>
-                <TableCell className="font-mono text-xs">
-                  {row.drift_kind ? (
-                    <span className="text-red-700 dark:text-red-300">{row.drift_kind}</span>
-                  ) : (
-                    <span className="text-muted-foreground">null</span>
-                  )}
-                </TableCell>
-                <TableCell className="font-mono text-xs">{row.action_taken}</TableCell>
-                <TableCell className="max-w-[520px] align-top font-mono text-xs">
-                  <details>
-                    <summary className="cursor-pointer text-primary underline-offset-4 hover:underline">
-                      payload
-                    </summary>
-                    <pre className="mt-2 max-h-60 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-3 leading-relaxed">
-                      {prettyPayload(row.payload_json)}
-                    </pre>
-                  </details>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      ) : null}
-    </section>
-  );
+function useNowMs(): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 10_000);
+    return () => window.clearInterval(id);
+  }, []);
+  return nowMs;
 }
 
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
-  const forceExternalRefresh = useRef(false);
-  const { data, error, isLoading, isFetching } = useQuery({
+  const nowMs = useNowMs();
+  const queryClient = useQueryClient();
+  const [applied, setApplied] = useState<CommandId | null>(null);
+  const [log, setLog] = useState<Array<{ cmd: string; time: string }>>([]);
+  const [error, setError] = useState<string | null>(null);
+  const appliedTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    setApplied(null);
+    setLog([]);
+    setError(null);
+  }, [issueId]);
+
+  const detailQuery = useQuery({
     queryKey: ["issue-detail", issueId],
     queryFn: () => fetchIssueDetail(issueId, { includeExternal: true }),
     enabled: issueId.length > 0,
     refetchInterval: 5000,
-    refetchOnWindowFocus: true,
-    staleTime: 0,
   });
   const externalQuery = useQuery({
     queryKey: ["external", issueId],
-    queryFn: () => {
-      const refresh = forceExternalRefresh.current;
-      forceExternalRefresh.current = false;
-      return fetchIssueExternal(issueId, { refresh });
-    },
+    queryFn: () => fetchIssueExternal(issueId),
     enabled: issueId.length > 0,
     refetchInterval: 60_000,
-    refetchOnWindowFocus: true,
-    staleTime: 60_000,
   });
-  const observationsQuery = useQuery({
-    queryKey: ["issue-observations", issueId],
-    queryFn: () => fetchIssueObservations(issueId),
-    enabled: issueId.length > 0,
-    refetchInterval: 10_000,
-    refetchOnWindowFocus: true,
-    staleTime: 0,
+
+  const mutation = useMutation({
+    mutationFn: (cmd: CommandId) => postIssueCommand(issueId, COMMANDS[cmd].cmd.slice(1)),
+    onSuccess: (_data, cmd) => {
+      setError(null);
+      setApplied(cmd);
+      const time = new Date(nowMs).toISOString().slice(11, 16);
+      setLog((l) => [{ cmd: COMMANDS[cmd].cmd, time }, ...l].slice(0, 6));
+      window.clearTimeout(appliedTimer.current);
+      appliedTimer.current = window.setTimeout(() => setApplied(null), 2200);
+      window.setTimeout(() => {
+        void queryClient.invalidateQueries({ queryKey: ["issue-detail", issueId] });
+        void queryClient.invalidateQueries({ queryKey: ["external", issueId] });
+      }, 1500);
+    },
+    onError: (err: Error) => setError(err.message),
   });
+
+  const detail = detailQuery.data;
+  const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
 
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <header className="border-b px-6 py-4">
-        <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4">
-          <div className="min-w-0">
-            <Link to="/" className="text-sm font-medium text-muted-foreground hover:text-foreground">
-              Back
-            </Link>
-            <div className="mt-2 flex flex-wrap items-center gap-3">
-              <h1 className="text-2xl font-semibold tracking-normal">
-                {data?.issue.identifier ?? `Issue ${issueId}`}
-              </h1>
-              {data ? (
-                <StatusCluster
-                  status={data.canonical_status}
-                  warnings={data.warnings}
-                  latestActivityAgeSecs={data.latest_activity_age_secs}
-                />
-              ) : null}
-            </div>
-            {data ? (
-              <>
-                <p className="mt-1 text-sm text-muted-foreground">{data.issue.title}</p>
-                <StatusSinceLine status={data.canonical_status} />
-              </>
-            ) : null}
-          </div>
-          <div className="text-sm text-muted-foreground">{isFetching ? "Refreshing" : "Live"}</div>
+    <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
+      <div className="mb-5">
+        <Link
+          to="/"
+          className="inline-flex items-center gap-1 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <Icon name="arrowLeft" size={15} /> Dashboard
+        </Link>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {detail?.issue.identifier ?? `Issue ${issueId}`}
+          </h1>
+          {detail ? (
+            <StatusBadge status={detail.canonical_status.state} live />
+          ) : null}
+          {detail ? (
+            <a
+              href={`https://linear.app/issue/${detail.issue.identifier}`}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Linear <Icon name="external" size={12} />
+            </a>
+          ) : null}
         </div>
-      </header>
-
-      <div className="mx-auto w-full max-w-6xl px-6 py-2">
-        {isLoading ? <p className="py-5 text-sm text-muted-foreground">Loading</p> : null}
-        {error ? (
-          <p className="py-5 text-sm text-red-600 dark:text-red-400">{(error as Error).message}</p>
-        ) : null}
-        {data ? (
+        {detail ? (
           <>
-            <ExternalTruthSection
-              snapshot={externalQuery.data}
-              isFetching={externalQuery.isFetching}
-              onRefresh={() => {
-                forceExternalRefresh.current = true;
-                void externalQuery.refetch();
-              }}
-            />
-            {externalQuery.error ? (
-              <p className="border-t py-3 text-sm text-red-600 dark:text-red-400">
-                {(externalQuery.error as Error).message}
-              </p>
-            ) : null}
-            <ObservationsPanel
-              rows={observationsQuery.data ?? []}
-              isLoading={observationsQuery.isLoading}
-              error={observationsQuery.error}
-            />
-            <SectionTable
-              title="Issue"
-              rows={[data.issue]}
-              columns={[
-                { key: "id", label: "id" },
-                { key: "identifier", label: "identifier" },
-                { key: "title", label: "title" },
-                { key: "team_key", label: "team_key" },
-              ]}
-            />
-            <IssueTimeline issueId={data.issue.id} />
-            <RunsSection runs={data.runs} />
-            <SectionTable
-              title="PRs"
-              rows={data.issue_prs}
-              columns={[
-                { key: "github_repo", label: "github_repo" },
-                { key: "binding_key", label: "binding_key" },
-                {
-                  key: "pr_number",
-                  label: "pr_number",
-                  render: (row) => (
-                    <a
-                      className="font-medium text-primary underline-offset-4 hover:underline"
-                      href={row.pr_url}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {row.pr_number}
-                    </a>
-                  ),
-                },
-                { key: "pr_url", label: "pr_url" },
-                { key: "created_at", label: "created_at" },
-                { key: "merged_at", label: "merged_at" },
-              ]}
-            />
-            <SectionTable
-              title="Operator Waits"
-              rows={data.operator_waits}
-              columns={[
-                { key: "run_id", label: "run_id" },
-                { key: "kind", label: "kind" },
-                { key: "linear_team_key", label: "linear_team_key" },
-                { key: "github_repo", label: "github_repo" },
-                { key: "issue_label", label: "issue_label" },
-                { key: "created_at", label: "created_at" },
-              ]}
-            />
-            <SectionTable
-              title="Review State"
-              rows={data.review_state ? [data.review_state] : []}
-              columns={[
-                { key: "iteration", label: "iteration" },
-                { key: "last_trigger_signature", label: "last_trigger_signature" },
-                { key: "ci_fetch_failures", label: "ci_fetch_failures" },
-                { key: "pr_number", label: "pr_number" },
-                { key: "pr_url", label: "pr_url" },
-                { key: "github_repo", label: "github_repo" },
-                { key: "issue_label", label: "issue_label" },
-                { key: "codex_lgtm_comment_id", label: "codex_lgtm_comment_id" },
-              ]}
-            />
-            <SectionTable
-              title="Comment Events"
-              rows={data.comment_events}
-              columns={[
-                { key: "comment_id", label: "comment_id" },
-                { key: "seen_at", label: "seen_at" },
-              ]}
-            />
-            <SectionTable
-              title="Activity Comment Marks"
-              rows={data.activity_comment_marks}
-              columns={[
-                { key: "run_id", label: "run_id" },
-                { key: "first_unpublished_at", label: "first_unpublished_at" },
-                { key: "last_event_at", label: "last_event_at" },
-                { key: "event_count_since_post", label: "event_count_since_post" },
-                { key: "last_posted_at", label: "last_posted_at" },
-                { key: "last_fingerprint", label: "last_fingerprint" },
-              ]}
-            />
-            <SectionTable
-              title="Issue Cost Marks"
-              rows={data.issue_cost_marks ? [data.issue_cost_marks] : []}
-              columns={[{ key: "warning_posted_at", label: "warning_posted_at" }]}
-            />
-            <details className="border-t py-5">
-              <summary className="cursor-pointer text-base font-semibold tracking-normal">Raw JSON</summary>
-              <pre className="mt-3 max-h-[520px] overflow-auto rounded-md bg-secondary p-4 text-xs leading-relaxed">
-                {JSON.stringify(data, null, 2)}
-              </pre>
-            </details>
+            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+              {detail.issue.title}
+            </p>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              since{" "}
+              <span className="font-mono" title={formatUtc(detail.canonical_status.since)}>
+                {formatUtc(detail.canonical_status.since)}
+              </span>{" "}
+              · {detail.issue.team_key}
+            </p>
           </>
         ) : null}
       </div>
+
+      {detailQuery.isLoading ? (
+        <p className="py-5 text-sm text-muted-foreground">Loading</p>
+      ) : null}
+      {detailQuery.isError ? (
+        <p className="py-5 text-sm text-red-600 dark:text-red-400">
+          {(detailQuery.error as Error).message}
+        </p>
+      ) : null}
+
+      {detail && cockpit ? (
+        <>
+          <WaitCard waitingOn={cockpit.waitingOn} />
+
+          <div className="mt-4 space-y-4">
+            <NowCard c={cockpit} nowMs={nowMs} />
+            <div className="grid gap-4 sm:grid-cols-2">
+              <SpendCard c={cockpit} />
+              <PrCard pr={cockpit.pr} />
+            </div>
+            <CockpitCard
+              title="Controls"
+              aside={
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  writes apply instantly
+                </span>
+              }
+            >
+              <Controls
+                status={cockpit.status}
+                applied={applied}
+                busy={mutation.isPending}
+                onRun={(cmd) => mutation.mutate(cmd)}
+              />
+              {error ? (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">{error}</p>
+              ) : null}
+              <ActionLog entries={log} />
+            </CockpitCard>
+            <CockpitCard title="Timeline">
+              <IssueTimeline issueId={detail.issue.id} />
+            </CockpitCard>
+          </div>
+
+          <section className="mt-8">
+            <details className="rounded-lg border border-border bg-secondary/20 px-4">
+              <summary className="flex cursor-pointer select-none items-center gap-2 py-3 text-sm font-semibold">
+                <Icon name="chevronRight" size={15} className="chev transition-transform" />
+                Advanced / Debug
+                <span className="font-normal text-muted-foreground">
+                  — raw daemon state
+                </span>
+              </summary>
+              <div className="pb-3">
+                <DebugSection title="Runs" defaultOpen>
+                  <MiniTable
+                    columns={["id", "stage", "status", "started_at", "ended_at", "cost_usd", "in", "out", "cache-read"]}
+                    rows={detail.runs.map((r) => ({
+                      id: r.id,
+                      stage: r.stage,
+                      status: r.status,
+                      started_at: formatUtc(r.started_at),
+                      ended_at: r.ended_at ? formatUtc(r.ended_at) : null,
+                      cost_usd: formatCost(r.cost_usd),
+                      in: formatTokens(r.input_tokens),
+                      out: formatTokens(r.output_tokens),
+                      "cache-read": formatTokens(r.cache_read_tokens),
+                    }))}
+                  />
+                </DebugSection>
+                <DebugSection title="PRs">
+                  <MiniTable
+                    columns={["github_repo", "pr_number", "created_at", "merged_at"]}
+                    rows={detail.issue_prs.map((p) => ({
+                      github_repo: p.github_repo,
+                      pr_number: p.pr_number,
+                      created_at: formatUtc(p.created_at),
+                      merged_at: p.merged_at ? formatUtc(p.merged_at) : null,
+                    }))}
+                  />
+                </DebugSection>
+                <DebugSection title="Operator Waits">
+                  <MiniTable
+                    columns={["run_id", "kind", "linear_team_key", "github_repo", "created_at"]}
+                    rows={detail.operator_waits.map((w) => ({
+                      run_id: w.run_id,
+                      kind: w.kind,
+                      linear_team_key: w.linear_team_key,
+                      github_repo: w.github_repo,
+                      created_at: formatUtc(w.created_at),
+                    }))}
+                  />
+                </DebugSection>
+                <DebugSection title="Review State">
+                  <MiniTable
+                    columns={["iteration", "pr_number", "ci_fetch_failures", "github_repo"]}
+                    rows={
+                      detail.review_state
+                        ? [
+                            {
+                              iteration: detail.review_state.iteration,
+                              pr_number: detail.review_state.pr_number,
+                              ci_fetch_failures: detail.review_state.ci_fetch_failures,
+                              github_repo: detail.review_state.github_repo,
+                            },
+                          ]
+                        : []
+                    }
+                  />
+                </DebugSection>
+                <DebugSection title="Raw JSON">
+                  <pre className="max-h-[420px] overflow-auto rounded-md border border-border bg-background p-3 text-xs leading-relaxed">
+                    {JSON.stringify(detail, null, 2)}
+                  </pre>
+                </DebugSection>
+              </div>
+            </details>
+          </section>
+        </>
+      ) : null}
     </main>
   );
 }

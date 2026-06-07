@@ -15,6 +15,8 @@
     --secondary-foreground: 222.2 47.4% 11.2%;
     --muted: 210 40% 96.1%;
     --muted-foreground: 215.4 16.3% 46.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
     --radius: 0.5rem;
   }
 
@@ -30,6 +32,8 @@
     --secondary-foreground: 210 40% 96%;
     --muted: 217 19% 14%;
     --muted-foreground: 215 16% 65%;
+    --popover: 217 19% 11%;
+    --popover-foreground: 210 40% 96%;
   }
 
   * {
@@ -40,5 +44,10 @@
     @apply bg-background text-foreground antialiased;
     margin: 0;
     min-width: 320px;
+  }
+
+  /* Rotate the disclosure chevron when an Advanced/Debug section is open. */
+  details[open] > summary .chev {
+    transform: rotate(90deg);
   }
 }
