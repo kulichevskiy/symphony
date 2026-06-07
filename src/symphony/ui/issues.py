@@ -175,7 +175,6 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
             "run_id": row["run_id"],
             "stage": row["stage"],
             "status": row["status"],
-            "cost_usd": row["cost_usd"],
         }
     elif kind == "pr_opened":
         payload = {
@@ -288,7 +287,7 @@ def create_issue_detail_router(
         runs = await _fetch_all(
             conn,
             """
-            SELECT id, stage, status, pid, started_at, ended_at, cost_usd,
+            SELECT id, stage, status, pid, started_at, ended_at,
                    input_tokens, output_tokens, cache_write_tokens,
                    cache_read_tokens,
                    termination_kind, termination_detail, exit_returncode
@@ -440,7 +439,7 @@ def create_issue_detail_router(
             SELECT *
             FROM (
                 SELECT started_at AS ts, 'run_started' AS kind,
-                       id AS run_id, stage, pid, NULL AS status, NULL AS cost_usd,
+                       id AS run_id, stage, pid, NULL AS status,
                        NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
@@ -452,7 +451,7 @@ def create_issue_detail_router(
                 UNION ALL
 
                 SELECT ended_at AS ts, 'run_ended' AS kind,
-                       id AS run_id, stage, NULL AS pid, status, cost_usd,
+                       id AS run_id, stage, NULL AS pid, status,
                        NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
@@ -465,7 +464,7 @@ def create_issue_detail_router(
 
                 SELECT created_at AS ts, 'pr_opened' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, github_repo, pr_number, pr_url,
+                       github_repo, pr_number, pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        NULL AS wait_kind, NULL AS external_source,
@@ -477,7 +476,7 @@ def create_issue_detail_router(
 
                 SELECT merged_at AS ts, 'pr_merged' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, github_repo, pr_number, NULL AS pr_url,
+                       github_repo, pr_number, NULL AS pr_url,
                        NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        NULL AS wait_kind, NULL AS external_source,
@@ -489,7 +488,7 @@ def create_issue_detail_router(
 
                 SELECT seen_at AS ts, 'comment_seen' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        NULL AS wait_kind, NULL AS external_source,
@@ -501,7 +500,7 @@ def create_issue_detail_router(
 
                 SELECT m.last_posted_at AS ts, 'activity_comment_posted' AS kind,
                        m.run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, m.last_fingerprint AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        NULL AS wait_kind, NULL AS external_source,
@@ -514,7 +513,7 @@ def create_issue_detail_router(
 
                 SELECT ts, 'review_state_changed' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        field, old_value, new_value, NULL AS wait_kind,
                        NULL AS external_source, NULL AS drift_kind,
@@ -526,7 +525,7 @@ def create_issue_detail_router(
 
                 SELECT ts, 'operator_wait_ended' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        old_value AS wait_kind, NULL AS external_source,
@@ -541,7 +540,7 @@ def create_issue_detail_router(
 
                 SELECT ts, 'operator_wait_started' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        new_value AS wait_kind, NULL AS external_source,
@@ -560,7 +559,7 @@ def create_issue_detail_router(
                            ELSE 'external_observed'
                        END AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        NULL AS field, NULL AS old_value, NULL AS new_value,
                        NULL AS wait_kind, source AS external_source,
@@ -572,7 +571,7 @@ def create_issue_detail_router(
 
                 SELECT ts, 'external_state_change' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
+                       NULL AS github_repo, NULL AS pr_number,
                        NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
                        field, old_value, new_value, NULL AS wait_kind,
                        old_value AS external_source, NULL AS drift_kind,

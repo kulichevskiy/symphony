@@ -35,7 +35,6 @@ class IssueSummary(BaseModel):
     identifier: str
     title: str
     team_key: str
-    cost_usd: float
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -56,7 +55,6 @@ class IssueScope(StrEnum):
 
 class TeamSpend(BaseModel):
     key: str
-    cost_usd: float
     total_tokens: int
     input_tokens: int
     output_tokens: int
@@ -66,7 +64,6 @@ class TeamSpend(BaseModel):
 
 
 class SpendTotals(BaseModel):
-    cost_usd: float
     total_tokens: int
     input_tokens: int
     output_tokens: int
@@ -82,7 +79,6 @@ class SpendSummary(BaseModel):
 
 class HeatmapDay(BaseModel):
     date: str
-    cost_usd: float
     tokens: int
     input_tokens: int
     output_tokens: int
@@ -190,7 +186,6 @@ def _parse_iso(value: object) -> datetime | None:
 _SPEND_SUMMARY_QUERY = """
 SELECT
     i.team_key AS team_key,
-    COALESCE(SUM(r.cost_usd), 0) AS cost_usd,
     COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
     COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
     COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
@@ -215,7 +210,6 @@ SELECT
     COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
     COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
     COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
-    COALESCE(SUM(r.cost_usd), 0) AS cost_usd,
     COUNT(DISTINCT r.issue_id) AS issues
 FROM runs r
 WHERE substr(r.started_at, 1, 10) >= ?
@@ -227,7 +221,6 @@ ORDER BY day
 def _build_spend_summary(rows: list[dict[str, object]]) -> SpendSummary:
     per_team: list[TeamSpend] = []
     acc = {
-        "cost_usd": 0.0,
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_write_tokens": 0,
@@ -239,12 +232,10 @@ def _build_spend_summary(rows: list[dict[str, object]]) -> SpendSummary:
         out = int(row["output_tokens"] or 0)
         cw = int(row["cache_write_tokens"] or 0)
         cr = int(row["cache_read_tokens"] or 0)
-        cost = float(row["cost_usd"] or 0)
         issues = int(row["issues"] or 0)
         per_team.append(
             TeamSpend(
                 key=str(row["team_key"]),
-                cost_usd=cost,
                 total_tokens=inp + out + cw + cr,
                 input_tokens=inp,
                 output_tokens=out,
@@ -253,15 +244,13 @@ def _build_spend_summary(rows: list[dict[str, object]]) -> SpendSummary:
                 issues=issues,
             )
         )
-        acc["cost_usd"] += cost
         acc["input_tokens"] += inp
         acc["output_tokens"] += out
         acc["cache_write_tokens"] += cw
         acc["cache_read_tokens"] += cr
         acc["issues"] += issues
-    per_team.sort(key=lambda t: t.cost_usd, reverse=True)
+    per_team.sort(key=lambda t: t.total_tokens, reverse=True)
     totals = SpendTotals(
-        cost_usd=acc["cost_usd"],
         total_tokens=(
             acc["input_tokens"]
             + acc["output_tokens"]
@@ -316,7 +305,6 @@ def _list_issues_query(
             i.identifier,
             i.title,
             i.team_key,
-            COALESCE(ru.cost_usd, 0) AS cost_usd,
             COALESCE(ru.input_tokens, 0) AS input_tokens,
             COALESCE(ru.output_tokens, 0) AS output_tokens,
             COALESCE(ru.cache_write_tokens, 0) AS cache_write_tokens,
@@ -340,7 +328,6 @@ def _list_issues_query(
         LEFT JOIN (
             SELECT
                 issue_id,
-                SUM(cost_usd) AS cost_usd,
                 SUM(input_tokens) AS input_tokens,
                 SUM(output_tokens) AS output_tokens,
                 SUM(cache_write_tokens) AS cache_write_tokens,
@@ -504,7 +491,6 @@ def create_api_router(
             days=[
                 HeatmapDay(
                     date=str(r["day"]),
-                    cost_usd=float(r["cost_usd"] or 0),
                     tokens=int(r["tokens"] or 0),
                     input_tokens=int(r["input_tokens"] or 0),
                     output_tokens=int(r["output_tokens"] or 0),

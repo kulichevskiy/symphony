@@ -7,21 +7,6 @@ export function Tk({ value }: { value: number | null | undefined }) {
   return <span title={exactInt(value)}>{formatTokens(value)}</span>;
 }
 
-export function CapBar({ cost, cap }: { cost: number; cap: number }) {
-  const pct = cap > 0 ? Math.min(100, (cost / cap) * 100) : 0;
-  const warn = pct >= 90;
-  const caution = pct >= 70 && pct < 90;
-  const fill = warn ? "bg-red-500" : caution ? "bg-amber-500" : "bg-blue-600";
-  return (
-    <div className="h-2 w-full overflow-hidden rounded-full bg-secondary">
-      <div
-        className={cn("h-full rounded-full transition-all", fill)}
-        style={{ width: `${pct}%` }}
-      />
-    </div>
-  );
-}
-
 export type Checks = { passing: number; failing: number; pending: number };
 
 export function CheckSummary({ checks }: { checks?: Checks | null }) {

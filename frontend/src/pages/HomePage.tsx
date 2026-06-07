@@ -17,7 +17,6 @@ import {
   type SpendSummary,
   type TeamSpend,
 } from "@/lib/api";
-import { formatCost } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import { formatRelativeTimestamp, formatUtcTimestamp } from "./activityFreshness";
@@ -64,15 +63,7 @@ export function HeadlineTotals({
     >
       <div>
         <div className="whitespace-nowrap text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Total spend · all-time
-        </div>
-        <div className="mt-1 font-mono text-3xl font-semibold tracking-tight text-foreground">
-          {formatCost(totals.cost_usd)}
-        </div>
-      </div>
-      <div>
-        <div className="whitespace-nowrap text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Total tokens
+          Total tokens · all-time
         </div>
         <div className="mt-1 font-mono text-3xl font-semibold tracking-tight text-foreground">
           <Tk value={totals.total_tokens} />
@@ -95,20 +86,19 @@ export function PerTeam({
   teams: TeamSpend[];
   onPick?: (key: string) => void;
 }) {
-  const sorted = [...teams].sort((a, b) => b.cost_usd - a.cost_usd);
+  const sorted = [...teams].sort((a, b) => b.total_tokens - a.total_tokens);
   return (
     <div className="divide-y divide-border/70 overflow-hidden rounded-md border border-border">
-      <div className="grid grid-cols-[1fr_auto_auto] items-center gap-4 bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+      <div className="grid grid-cols-[1fr_auto] items-center gap-4 bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         <span>Team</span>
-        <span className="text-right">Spend</span>
-        <span className="w-20 text-right">Tokens</span>
+        <span className="w-24 text-right">Tokens</span>
       </div>
       {sorted.map((t) => (
         <button
           key={t.key}
           type="button"
           onClick={() => onPick?.(t.key)}
-          className="grid w-full grid-cols-[1fr_auto_auto] items-center gap-4 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
+          className="grid w-full grid-cols-[1fr_auto] items-center gap-4 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
         >
           <span className="flex items-center gap-2">
             <span
@@ -122,10 +112,7 @@ export function PerTeam({
               {t.issues} issues
             </span>
           </span>
-          <span className="text-right font-mono text-sm tabular-nums">
-            {formatCost(t.cost_usd)}
-          </span>
-          <span className="w-20 text-right font-mono text-xs text-muted-foreground">
+          <span className="w-24 text-right font-mono text-sm tabular-nums">
             <Tk value={t.total_tokens} />
           </span>
         </button>
@@ -165,8 +152,8 @@ function SpendOverview({
               <HeadlineTotals totals={summary.totals} compact />
               <div className="mt-5">
                 <div className="mb-2.5 flex items-center justify-between">
-                  <h2 className="text-sm font-semibold">Spend by team</h2>
-                  <span className="text-xs text-muted-foreground">by spend</span>
+                  <h2 className="text-sm font-semibold">Tokens by team</h2>
+                  <span className="text-xs text-muted-foreground">by tokens</span>
                 </div>
                 <PerTeam teams={summary.per_team} onPick={onPickTeam} />
               </div>
@@ -183,17 +170,17 @@ function SpendOverview({
 export function SectionTotals({ issues }: { issues: IssueSummary[] }) {
   const tot = issues.reduce(
     (a, i) => ({
-      cost: a.cost + i.cost_usd,
+      total: a.total + i.input_tokens + i.output_tokens + i.cache_write_tokens + i.cache_read_tokens,
       inp: a.inp + i.input_tokens,
       out: a.out + i.output_tokens,
       cw: a.cw + i.cache_write_tokens,
       cr: a.cr + i.cache_read_tokens,
     }),
-    { cost: 0, inp: 0, out: 0, cw: 0, cr: 0 },
+    { total: 0, inp: 0, out: 0, cw: 0, cr: 0 },
   );
   return (
     <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs text-muted-foreground">
-      <span className="text-foreground">{formatCost(tot.cost)}</span>
+      <span className="text-foreground">total <Tk value={tot.total} /></span>
       <span>in <Tk value={tot.inp} /></span>
       <span>out <Tk value={tot.out} /></span>
       <span>cache-write <Tk value={tot.cw} /></span>
@@ -217,7 +204,6 @@ export function IssueTable({
     "Identifier",
     "Status",
     mode === "done" ? "Completed" : "Last activity",
-    "$",
     "in",
     "out",
     "cache-write",
@@ -235,7 +221,7 @@ export function IssueTable({
                 key={h}
                 className={cn(
                   "h-9 px-3 align-middle text-xs font-medium uppercase tracking-wide text-muted-foreground",
-                  i >= 3 && i <= 7 ? "text-right" : "text-left",
+                  i >= 3 && i <= 6 ? "text-right" : "text-left",
                 )}
               >
                 {h}
@@ -271,9 +257,6 @@ export function IssueTable({
                   title={ts ? formatUtcTimestamp(ts) : undefined}
                 >
                   {ts ? formatRelativeTimestamp(ts, nowMs) : "—"}
-                </td>
-                <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs tabular-nums">
-                  {formatCost(issue.cost_usd)}
                 </td>
                 <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
                   <Tk value={issue.input_tokens} />

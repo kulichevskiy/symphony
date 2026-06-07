@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { HeatmapDay } from "@/lib/api";
-import { formatCost, formatLongDate } from "@/lib/format";
+import { formatLongDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import { Tk } from "./atoms";
@@ -31,7 +31,6 @@ type Cell = {
   iso: string;
   date: Date;
   tokens: number;
-  cost: number;
   issues: number;
   input: number;
   output: number;
@@ -73,7 +72,6 @@ function buildGrid(days: HeatmapDay[], start: string, end: string): {
       iso,
       date: new Date(d),
       tokens: hit?.tokens ?? 0,
-      cost: hit?.cost_usd ?? 0,
       issues: hit?.issues ?? 0,
       input: hit?.input_tokens ?? 0,
       output: hit?.output_tokens ?? 0,
@@ -211,7 +209,7 @@ export function Heatmap({
             {formatLongDate(hover.cell.iso)}
           </div>
           <div className="mt-0.5 font-mono text-muted-foreground">
-            <Tk value={hover.cell.tokens} /> tokens · {formatCost(hover.cell.cost)} ·{" "}
+            <Tk value={hover.cell.tokens} /> tokens ·{" "}
             {hover.cell.issues} {hover.cell.issues === 1 ? "issue" : "issues"}
           </div>
           <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 border-t border-border pt-1 font-mono text-[11px] text-muted-foreground">
