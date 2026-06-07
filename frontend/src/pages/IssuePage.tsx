@@ -2,7 +2,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
-import { type Checks, CheckSummary, Tk } from "@/components/dashboard/atoms";
+import {
+  type Checks,
+  CheckSummary,
+  MixBar,
+  Tk,
+  TokenFigures,
+} from "@/components/dashboard/atoms";
 import { LiveDot, StatusBadge } from "@/components/dashboard/StatusBadge";
 import { IssueTimeline } from "@/components/IssueTimeline";
 import { Badge } from "@/components/ui/badge";
@@ -16,6 +22,7 @@ import {
   type IssueDetail,
   type IssueExternalSnapshot,
   type TokenModelUsage,
+  type TokenSplit,
 } from "@/lib/api";
 import { formatRelative, formatTokens, formatUtc } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -210,9 +217,8 @@ const PROVIDER_TINT: Record<string, string> = {
   codex: "bg-sky-500",
 };
 
-type ProviderGroup = {
+type ProviderGroup = TokenSplit & {
   provider: string;
-  total_tokens: number;
   models: TokenModelUsage[];
 };
 
@@ -221,18 +227,24 @@ function groupByProvider(rows: TokenModelUsage[]): ProviderGroup[] {
   for (const row of rows) {
     const g = groups.get(row.provider) ?? {
       provider: row.provider,
-      total_tokens: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
       models: [],
     };
-    g.total_tokens += row.total_tokens;
+    g.input_tokens += row.input_tokens;
+    g.output_tokens += row.output_tokens;
+    g.cache_write_tokens += row.cache_write_tokens;
+    g.cache_read_tokens += row.cache_read_tokens;
     g.models.push(row);
     groups.set(row.provider, g);
   }
   const result = [...groups.values()];
   for (const g of result) {
-    g.models.sort((a, b) => b.total_tokens - a.total_tokens);
+    g.models.sort((a, b) => b.output_tokens - a.output_tokens);
   }
-  result.sort((a, b) => b.total_tokens - a.total_tokens);
+  result.sort((a, b) => b.output_tokens - a.output_tokens);
   return result;
 }
 
@@ -244,37 +256,27 @@ function TokensByModel({ rows }: { rows: TokenModelUsage[] }) {
       <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
         by provider / model
       </div>
-      <div className="space-y-2">
+      <div className="space-y-3">
         {groups.map((g) => (
-          <div key={g.provider}>
-            <div className="flex items-center justify-between gap-2 font-mono text-xs">
-              <span className="flex items-center gap-1.5">
-                <span
-                  className={cn(
-                    "h-2 w-2 shrink-0 rounded-full",
-                    PROVIDER_TINT[g.provider] ?? "bg-slate-400",
-                  )}
-                />
-                <span className="font-medium text-foreground">{g.provider}</span>
-              </span>
-              <span className="tabular-nums text-muted-foreground">
-                <Tk value={g.total_tokens} />
-              </span>
+          <div key={g.provider} className="space-y-1.5">
+            <div className="flex items-center gap-1.5 font-mono text-xs">
+              <span
+                className={cn(
+                  "h-2 w-2 shrink-0 rounded-full",
+                  PROVIDER_TINT[g.provider] ?? "bg-slate-400",
+                )}
+              />
+              <span className="font-medium text-foreground">{g.provider}</span>
             </div>
+            <MixBar split={g} />
+            <TokenFigures split={g} />
             {g.models.map((m) => (
-              <div key={m.model} className="mt-1 pl-3.5">
-                <div className="flex items-center justify-between gap-2 font-mono text-xs text-muted-foreground">
-                  <span className="truncate">{m.model}</span>
-                  <span className="tabular-nums">
-                    <Tk value={m.total_tokens} />
-                  </span>
+              <div key={m.model} className="mt-1 space-y-1 pl-3.5">
+                <div className="truncate font-mono text-xs text-muted-foreground">
+                  {m.model}
                 </div>
-                <div className="flex flex-wrap gap-x-3 pl-0 font-mono text-[11px] text-muted-foreground/80">
-                  <span>in <Tk value={m.input_tokens} /></span>
-                  <span>out <Tk value={m.output_tokens} /></span>
-                  <span>cache-w <Tk value={m.cache_write_tokens} /></span>
-                  <span>cache-r <Tk value={m.cache_read_tokens} /></span>
-                </div>
+                <MixBar split={m} />
+                <TokenFigures split={m} />
               </div>
             ))}
           </div>
@@ -284,27 +286,30 @@ function TokensByModel({ rows }: { rows: TokenModelUsage[] }) {
   );
 }
 
+const TOKENS_STATS = [
+  { key: "input_tokens", label: "in" },
+  { key: "output_tokens", label: "out" },
+  { key: "cache_write_tokens", label: "cache-write" },
+  { key: "cache_read_tokens", label: "cache-read" },
+] as const;
+
 export function TokensCard({ c }: { c: Cockpit }) {
-  const total =
-    c.tokens.input_tokens +
-    c.tokens.output_tokens +
-    c.tokens.cache_write_tokens +
-    c.tokens.cache_read_tokens;
   return (
     <CockpitCard title="Tokens">
-      <div className="flex items-end justify-between">
-        <div className="font-mono text-2xl font-semibold tracking-tight text-foreground">
-          <Tk value={total} />
-        </div>
-        <div className="whitespace-nowrap font-mono text-xs text-muted-foreground">
-          total
-        </div>
-      </div>
-      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 font-mono text-xs text-muted-foreground">
-        <span>in <Tk value={c.tokens.input_tokens} /></span>
-        <span>out <Tk value={c.tokens.output_tokens} /></span>
-        <span>cache-write <Tk value={c.tokens.cache_write_tokens} /></span>
-        <span>cache-read <Tk value={c.tokens.cache_read_tokens} /></span>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {TOKENS_STATS.map((s) => (
+          <div
+            key={s.key}
+            className="rounded-md border border-border bg-secondary/20 px-3 py-2"
+          >
+            <div className="font-mono text-lg font-semibold tracking-tight text-foreground">
+              <Tk value={c.tokens[s.key]} />
+            </div>
+            <div className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              {s.label}
+            </div>
+          </div>
+        ))}
       </div>
       <TokensByModel rows={c.byModel} />
     </CockpitCard>

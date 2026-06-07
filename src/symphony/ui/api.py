@@ -55,7 +55,6 @@ class IssueScope(StrEnum):
 
 class TeamSpend(BaseModel):
     key: str
-    total_tokens: int
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -74,7 +73,6 @@ class SpendTotals(BaseModel):
 
 class ModelSpend(BaseModel):
     model: str
-    total_tokens: int
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -84,7 +82,6 @@ class ModelSpend(BaseModel):
 
 class ProviderSpend(BaseModel):
     provider: str
-    total_tokens: int
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -309,7 +306,6 @@ def _build_per_provider(
         models_by_provider.setdefault(provider, []).append(
             ModelSpend(
                 model=str(row["model"]),
-                total_tokens=inp + out + cw + cr,
                 input_tokens=inp,
                 output_tokens=out,
                 cache_write_tokens=cw,
@@ -335,18 +331,12 @@ def _build_per_provider(
     for provider, acc in acc_by_provider.items():
         models = sorted(
             models_by_provider[provider],
-            key=lambda m: m.total_tokens,
+            key=lambda m: m.output_tokens,
             reverse=True,
         )
         per_provider.append(
             ProviderSpend(
                 provider=provider,
-                total_tokens=(
-                    acc["input_tokens"]
-                    + acc["output_tokens"]
-                    + acc["cache_write_tokens"]
-                    + acc["cache_read_tokens"]
-                ),
                 input_tokens=acc["input_tokens"],
                 output_tokens=acc["output_tokens"],
                 cache_write_tokens=acc["cache_write_tokens"],
@@ -355,7 +345,7 @@ def _build_per_provider(
                 per_model=models,
             )
         )
-    per_provider.sort(key=lambda p: p.total_tokens, reverse=True)
+    per_provider.sort(key=lambda p: p.output_tokens, reverse=True)
     return per_provider
 
 
@@ -381,7 +371,6 @@ def _build_spend_summary(
         per_team.append(
             TeamSpend(
                 key=str(row["team_key"]),
-                total_tokens=inp + out + cw + cr,
                 input_tokens=inp,
                 output_tokens=out,
                 cache_write_tokens=cw,
@@ -394,7 +383,7 @@ def _build_spend_summary(
         acc["cache_write_tokens"] += cw
         acc["cache_read_tokens"] += cr
         acc["issues"] += issues
-    per_team.sort(key=lambda t: t.total_tokens, reverse=True)
+    per_team.sort(key=lambda t: t.output_tokens, reverse=True)
     totals = SpendTotals(
         total_tokens=(
             acc["input_tokens"]

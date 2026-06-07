@@ -36,25 +36,31 @@ export interface IssueSummary {
   completed_at?: string | null;
 }
 
-export interface SpendTotals {
-  total_tokens: number;
+export interface TokenSplit {
   input_tokens: number;
   output_tokens: number;
   cache_write_tokens: number;
   cache_read_tokens: number;
+}
+
+export interface SpendTotals extends TokenSplit {
+  total_tokens: number;
   issues: number;
 }
 
-export interface TeamSpend extends SpendTotals {
+export interface TeamSpend extends TokenSplit {
   key: string;
+  issues: number;
 }
 
-export interface ModelSpend extends SpendTotals {
+export interface ModelSpend extends TokenSplit {
   model: string;
+  issues: number;
 }
 
-export interface ProviderSpend extends SpendTotals {
+export interface ProviderSpend extends TokenSplit {
   provider: string;
+  issues: number;
   per_model: ModelSpend[];
 }
 
@@ -86,14 +92,9 @@ export interface CommandAccepted {
   command: string;
 }
 
-export interface TokenModelUsage {
+export interface TokenModelUsage extends TokenSplit {
   provider: string;
   model: string;
-  input_tokens: number;
-  output_tokens: number;
-  cache_write_tokens: number;
-  cache_read_tokens: number;
-  total_tokens: number;
 }
 
 export type IssueDetail = {

@@ -162,7 +162,7 @@ def _external_status_snapshot(payload: dict[str, Any]) -> ExternalStatusSnapshot
 
 
 def _tokens_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Per-(provider, model) token aggregates for one issue, total desc."""
+    """Per-(provider, model) token aggregates for one issue, output desc."""
     breakdown: list[dict[str, Any]] = []
     for row in rows:
         inp = int(row["input_tokens"] or 0)
@@ -177,11 +177,10 @@ def _tokens_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "output_tokens": out,
                 "cache_write_tokens": cw,
                 "cache_read_tokens": cr,
-                "total_tokens": inp + out + cw + cr,
             }
         )
     breakdown.sort(
-        key=lambda m: (-m["total_tokens"], m["provider"], m["model"]),
+        key=lambda m: (-m["output_tokens"], m["provider"], m["model"]),
     )
     return breakdown
 
