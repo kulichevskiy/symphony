@@ -326,10 +326,19 @@ def format_acceptance_verdict_comment(
         and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL
     ):
         prefix = "**Acceptance: skipped - trivial change.**\n\n"
+    usage = verdict.usage
+    total_tokens = (
+        usage.input_tokens
+        + usage.output_tokens
+        + usage.cache_write_tokens
+        + usage.cache_read_tokens
+    )
     body = (
         f"**Acceptance verdict:** `{verdict.kind}`\n\n"
         f"- PR: {pr_url}\n"
-        f"- Cost: ${verdict.cost:.4f}\n"
+        f"- Tokens: in {usage.input_tokens} · out {usage.output_tokens} · "
+        f"cache w {usage.cache_write_tokens} / r {usage.cache_read_tokens} "
+        f"· total {total_tokens}\n"
     )
     if verdict.preview_url:
         body += f"- Dev URL: {verdict.preview_url}\n"

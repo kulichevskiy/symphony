@@ -65,7 +65,10 @@ class CommentVars:
     issue: int
     pr_url: str = "(no PR yet)"
     run_id: str = ""
-    cost: str = "$0.00"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
     review_iter: int = 0
     trigger: str = ""
     error: str = ""
@@ -74,6 +77,26 @@ class CommentVars:
     linear_identifier: str = ""
     commit_url: str = ""
     auto_retry: bool = False
+
+
+def token_block(v: CommentVars) -> str:
+    """Render the per-issue token breakdown shown in outbound comments.
+
+    Replaces the former dollar `cost` line: input / output / cache write /
+    cache read deltas plus their sum, so operators can gauge spend without a
+    pricing model baked into the comment.
+    """
+    total = (
+        v.input_tokens
+        + v.output_tokens
+        + v.cache_write_tokens
+        + v.cache_read_tokens
+    )
+    return (
+        f"Tokens: in {v.input_tokens} · out {v.output_tokens} · "
+        f"cache w {v.cache_write_tokens} / r {v.cache_read_tokens} · "
+        f"total {total}"
+    )
 
 
 def run_started(v: CommentVars) -> str:
@@ -100,7 +123,7 @@ def stage_done(v: CommentVars) -> str:
     return (
         f"✓ **{v.stage.title()} → {v.next_stage.title()}**\n\n"
         f"- PR: {v.pr_url}\n"
-        f"- Cost so far: **{v.cost}**\n"
+        f"- {token_block(v)}\n"
         f"- Run ID: `{v.run_id}`\n"
     )
 
@@ -110,7 +133,7 @@ def awaiting_approval(v: CommentVars) -> str:
         f"🟡 **Awaiting approval — {v.stage} → next stage**\n\n"
         f"Symphony has paused on `{v.repo}#{v.issue}` after **{v.stage}**.\n\n"
         f"- PR: {v.pr_url}\n"
-        f"- Cost so far: **{v.cost}**\n"
+        f"- {token_block(v)}\n"
         f"- Run ID: `{v.run_id}`\n\n"
     )
     if v.error:
@@ -130,7 +153,7 @@ def stuck_loop_escape(v: CommentVars) -> str:
         f"Symphony has parked `{v.repo}#{v.issue}` because:\n\n"
         f"- Review iterations: **{v.review_iter}** (cap reached)\n"
         f"- Last trigger: **{v.trigger}**\n"
-        f"- Cumulative cost: **{v.cost}**\n\n"
+        f"- {token_block(v)}\n\n"
         f"PR: {v.pr_url}\n\n"
         f"Reply with `$approve` to force-advance, `$reject` to stop, or "
         f"free-form steering for one more attempt.\n"
@@ -190,7 +213,7 @@ def failed(v: CommentVars) -> str:
         f"- Error: `{v.error}`\n"
         f"- PR: {v.pr_url}\n"
         f"- Run ID: `{v.run_id}`\n"
-        f"- Cost: **{v.cost}**\n"
+        f"- {token_block(v)}\n"
     )
     if v.last_log:
         body += f"\nLast log lines:\n\n```\n{v.last_log}\n```\n"
@@ -242,7 +265,7 @@ def fix_pushed(v: CommentVars) -> str:
         f"- PR: {v.pr_url}\n"
         f"{commit_line}"
         f"- Re-triggered `@codex review` — waiting for re-review.\n"
-        f"- Cost so far: **{v.cost}**\n"
+        f"- {token_block(v)}\n"
     )
 
 

@@ -4680,7 +4680,6 @@ class Orchestrator:
         async with self._review_fix_dispatch_slot(binding, issue):
             # Post the "starting" comment once we have a slot — this ensures
             # the message is accurate ("dispatching now", not "queued").
-            prior_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
@@ -4688,7 +4687,6 @@ class Orchestrator:
                 pr_url=pr_url,
                 review_iter=iteration,
                 trigger=verdict.trigger_signature[:80],
-                cost=f"${prior_cost:.2f}",
             )
             try:
                 await tracker.post_comment(
@@ -4857,14 +4855,17 @@ class Orchestrator:
                 )
                 return False
 
-            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
             v_done = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
                 issue=state.pr_number or 0,
                 pr_url=pr_url,
                 review_iter=iteration,
-                cost=f"${total_cost:.2f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
@@ -5899,14 +5900,12 @@ class Orchestrator:
 
         async with self._review_fix_dispatch_slot(binding, issue):
             # Post the "fixing" comment once we have a slot.
-            prior_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v_start = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
                 issue=state.pr_number or 0,
                 pr_url=pr_url,
                 review_iter=iteration,
-                cost=f"${prior_cost:.2f}",
             )
             try:
                 await tracker.post_comment(
@@ -6249,14 +6248,17 @@ class Orchestrator:
                 )
                 return False
 
-            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
             v_done = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
                 issue=state.pr_number or 0,
                 pr_url=pr_url,
                 review_iter=iteration,
-                cost=f"${total_cost:.2f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
@@ -7007,7 +7009,6 @@ class Orchestrator:
                 started_at=now,
             )
             state = await db.review_state.get(self._conn, issue.id)
-            cost = await db.runs.cost_for_issue(self._conn, issue.id)
             body = resumed(
                 CommentVars(
                     stage="review",
@@ -7019,7 +7020,6 @@ class Orchestrator:
                         pr_number=state.pr_number,
                         pr_url=state.pr_url,
                     ),
-                    cost=f"${cost:.4f}",
                     next_stage="review",
                 )
             )
@@ -7093,7 +7093,7 @@ class Orchestrator:
                     e,
                 )
         state = await db.review_state.get(self._conn, issue.id)
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = failed(
             CommentVars(
                 stage="review",
@@ -7105,7 +7105,10 @@ class Orchestrator:
                     pr_url=state.pr_url,
                 ),
                 run_id=run.id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=error,
                 last_log=last_log,
                 auto_retry=auto_retry,
@@ -7139,7 +7142,7 @@ class Orchestrator:
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
         repo = state.github_repo or "(unknown repo)"
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = failed(
             CommentVars(
                 stage="review",
@@ -7151,7 +7154,10 @@ class Orchestrator:
                     pr_url=state.pr_url,
                 ),
                 run_id=run.id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=error,
                 last_log="",
                 auto_retry=True,
@@ -7176,7 +7182,7 @@ class Orchestrator:
         trigger: str,
     ) -> None:
         state = await db.review_state.get(self._conn, issue.id)
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = stuck_loop_escape(
             CommentVars(
                 stage="review",
@@ -7188,7 +7194,10 @@ class Orchestrator:
                     pr_url=state.pr_url,
                 ),
                 run_id=run.id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 review_iter=state.iteration,
                 trigger=trigger,
             )
@@ -9972,7 +9981,10 @@ class Orchestrator:
                     issue=0,
                     pr_url=pr_url or "(no PR)",
                     run_id=run_id,
-                    cost=f"${cumulative_usage.cost_usd:.4f}",
+                    input_tokens=cumulative_usage.input_tokens,
+                    output_tokens=cumulative_usage.output_tokens,
+                    cache_write_tokens=cumulative_usage.cache_write_tokens,
+                    cache_read_tokens=cumulative_usage.cache_read_tokens,
                 )
             )
             await tracker.post_comment(issue.id, truncate_body(done_body))
@@ -10464,7 +10476,7 @@ class Orchestrator:
             )
             return
 
-        total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         tracker = self.tracker(binding)
         await tracker.move_issue(issue.id, done_id)
         final_body = stage_done(
@@ -10475,7 +10487,10 @@ class Orchestrator:
                 issue=0,
                 pr_url=pr_url,
                 run_id=run_id,
-                cost=f"${total_cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
             )
         )
         try:
@@ -10544,7 +10559,7 @@ class Orchestrator:
                     e,
                 )
 
-            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
             body = awaiting_approval(
                 CommentVars(
                     stage="merge",
@@ -10553,7 +10568,10 @@ class Orchestrator:
                     issue=0,
                     pr_url=pr_url,
                     run_id=run_id,
-                    cost=f"${total_cost:.4f}",
+                    input_tokens=tokens.input_tokens,
+                    output_tokens=tokens.output_tokens,
+                    cache_write_tokens=tokens.cache_write_tokens,
+                    cache_read_tokens=tokens.cache_read_tokens,
                     error=reason,
                 )
             )
@@ -10696,14 +10714,13 @@ class Orchestrator:
             )
 
             async def _on_iteration(
-                i: int, verdict: LocalVerdict, cost_so_far: float
+                i: int, verdict: LocalVerdict, _cost_so_far: float
             ) -> None:
                 await self._post_local_review_iteration_comment(
                     binding=binding,
                     issue=issue,
                     iteration=i,
                     verdict=verdict,
-                    cost_so_far=cost_so_far,
                 )
 
             result: LoopResult | None = None
@@ -10884,7 +10901,6 @@ class Orchestrator:
         issue: LinearIssue,
         iteration: int,
         verdict: LocalVerdict,
-        cost_so_far: float,
     ) -> None:
         """Per-iteration heartbeat so a 5-minute review doesn't look dead.
 
@@ -10892,13 +10908,17 @@ class Orchestrator:
         dispatch), so operators can see "iteration 1: changes_requested
         — first finding…" while the fix-run is still running. Short
         snippets keep the issue thread readable.
+
+        Per-iteration token deltas aren't plumbed into this callback
+        (only a cumulative cost was, which we no longer render), so the
+        heartbeat omits a spend figure entirely; the final outcome
+        comment carries the token breakdown.
         """
         snippet = ""
         if verdict.findings:
             snippet = verdict.findings.strip().splitlines()[0][:280]
         body_parts = [
-            f"**Local review iter {iteration}:** "
-            f"`{verdict.kind.value}` (cost so far ${cost_so_far:.4f})",
+            f"**Local review iter {iteration}:** `{verdict.kind.value}`",
         ]
         if snippet:
             body_parts.append(f"> {snippet}")
@@ -10920,10 +10940,18 @@ class Orchestrator:
         last_findings = ""
         if result.last_verdict is not None and result.last_verdict.findings:
             last_findings = result.last_verdict.findings
+        total_tokens = (
+            result.input_tokens
+            + result.output_tokens
+            + result.cache_write_tokens
+            + result.cache_read_tokens
+        )
         body_parts = [
             f"**Local-review outcome:** `{outcome}` "
             f"(iterations={result.iterations}, "
-            f"cost=${result.total_cost_usd:.4f})",
+            f"tokens: in {result.input_tokens} · out {result.output_tokens} · "
+            f"cache w {result.cache_write_tokens} / r {result.cache_read_tokens} "
+            f"· total {total_tokens})",
         ]
         if result.error:
             body_parts.append(f"_Error:_ {result.error}")
@@ -10979,14 +11007,17 @@ class Orchestrator:
             )
 
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
-        cost = await db.runs.cost_for_issue(self._conn, storage_issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
                 stage="local review",
                 repo=binding.github_repo,
                 issue=0,
                 run_id=run_id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=reason,
                 last_log=_local_review_failure_log(result),
                 auto_retry=False,
@@ -11052,7 +11083,7 @@ class Orchestrator:
                 issue.identifier,
             )
 
-        total_cost = await db.runs.cost_for_issue(self._conn, run.issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, run.issue_id)
         body = awaiting_approval(
             CommentVars(
                 stage="local review",
@@ -11061,7 +11092,10 @@ class Orchestrator:
                 issue=pr_number_from_url(pr_url) or 0,
                 pr_url=pr_url,
                 run_id=run.id,
-                cost=f"${total_cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=reason,
             )
         )
@@ -11289,7 +11323,7 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         line: str,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
     ) -> None:
         if session is None:
             return
@@ -11315,7 +11349,7 @@ class Orchestrator:
                 issue=issue,
                 reason=reason,
                 now=now,
-                cumulative_total=cumulative_total,
+                cumulative_usage=cumulative_usage,
             )
 
     async def _record_activity_tick(
@@ -11324,7 +11358,7 @@ class Orchestrator:
         session: ActivitySession | None,
         binding: RepoBinding,
         issue: LinearIssue,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
     ) -> None:
         if session is None:
             return
@@ -11352,7 +11386,7 @@ class Orchestrator:
             issue=issue,
             reason="heartbeat",
             now=now,
-            cumulative_total=cumulative_total,
+            cumulative_usage=cumulative_usage,
             heartbeat_item_ids=due_item_ids,
         )
 
@@ -11362,7 +11396,7 @@ class Orchestrator:
         session: ActivitySession | None,
         binding: RepoBinding,
         issue: LinearIssue,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
     ) -> None:
         if session is None or not session.has_unpublished_events():
             return
@@ -11372,7 +11406,7 @@ class Orchestrator:
             issue=issue,
             reason="final",
             now=self._now(),
-            cumulative_total=cumulative_total,
+            cumulative_usage=cumulative_usage,
         )
 
     async def _publish_activity_digest(
@@ -11383,13 +11417,16 @@ class Orchestrator:
         issue: LinearIssue,
         reason: ActivityPublishReason,
         now: datetime,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
         heartbeat_item_ids: tuple[str, ...] = (),
     ) -> bool:
         digest = session.build_digest(
             reason=reason,
             now=now,
-            cumulative_cost_usd=cumulative_total,
+            input_tokens=cumulative_usage.input_tokens,
+            output_tokens=cumulative_usage.output_tokens,
+            cache_write_tokens=cumulative_usage.cache_write_tokens,
+            cache_read_tokens=cumulative_usage.cache_read_tokens,
         )
         body = truncate_body(format_activity_digest(digest))
         fingerprint = digest_fingerprint(body)
@@ -11441,8 +11478,10 @@ class Orchestrator:
         """Spawn the runner and consume events. Returns
         (cumulative_usage, final_event_kind, final_returncode).
 
-        `prior_total` is the issue's cost so far; it is threaded through
-        only so activity comments can show a cumulative running total.
+        `prior_total` is the issue's cost so far. It is passed through to
+        `_run_stage_command` but is no longer consumed anywhere: activity
+        digests now report per-run token counts rather than a cumulative
+        dollar total, so it is currently unused.
         """
         storage_issue_id = storage_issue_id or issue.id
         prompt = implement_prompt(
@@ -11555,7 +11594,7 @@ class Orchestrator:
                             binding=binding,
                             issue=issue,
                             line=ev.line,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
@@ -11564,14 +11603,14 @@ class Orchestrator:
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
@@ -11697,7 +11736,7 @@ class Orchestrator:
                             binding=binding,
                             issue=issue,
                             line=ev.line,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
@@ -11706,14 +11745,14 @@ class Orchestrator:
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
@@ -11802,14 +11841,17 @@ class Orchestrator:
         if binding is None:
             return
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
-        cost = await db.runs.cost_for_issue(self._conn, storage_issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
                 stage="implement",
                 repo=binding.github_repo,
                 issue=0,
                 run_id=run_id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=reason,
             )
         )

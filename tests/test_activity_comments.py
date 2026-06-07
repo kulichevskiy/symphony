@@ -20,6 +20,7 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
+from symphony.pipeline.cost_guard import UsageDelta
 
 
 class _FakeRunner:
@@ -350,7 +351,10 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
         session.build_digest(
             reason="final",
             now=now + timedelta(seconds=12),
-            cumulative_cost_usd=1.2345,
+            input_tokens=1200,
+            output_tokens=340,
+            cache_write_tokens=50,
+            cache_read_tokens=10,
         )
     )
 
@@ -365,7 +369,8 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
     assert "tests/test_app.py" in body
     assert str(workspace) not in body
     assert "supersecret" not in body
-    assert "$1.2345" in body
+    assert "$" not in body
+    assert "Tokens: in 1200 · out 340 · cache w 50 / r 10 · total 1600" in body
 
 
 @pytest.mark.asyncio
@@ -643,7 +648,7 @@ async def test_orchestrator_tick_skips_heartbeat_db_before_candidate(
             session=session,
             binding=_binding(),
             issue=_issue(),
-            cumulative_total=0.0,
+            cumulative_usage=UsageDelta(),
         )
         heartbeat_marks.assert_not_awaited()
 
@@ -655,7 +660,7 @@ async def test_orchestrator_tick_skips_heartbeat_db_before_candidate(
             session=session,
             binding=_binding(),
             issue=_issue(),
-            cumulative_total=0.0,
+            cumulative_usage=UsageDelta(),
         )
         heartbeat_marks.assert_not_awaited()
     finally:
@@ -703,13 +708,13 @@ async def test_orchestrator_tick_caches_heartbeat_marks_between_repeats(
             session=session,
             binding=_binding(),
             issue=_issue(),
-            cumulative_total=0.0,
+            cumulative_usage=UsageDelta(),
         )
         await orch._record_activity_tick(  # noqa: SLF001
             session=session,
             binding=_binding(),
             issue=_issue(),
-            cumulative_total=0.0,
+            cumulative_usage=UsageDelta(),
         )
 
         heartbeat_marks.assert_awaited_once()

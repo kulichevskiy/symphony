@@ -754,6 +754,40 @@ async def cost_for_issue(conn: aiosqlite.Connection, issue_id: str) -> float:
 
 
 @dataclass
+class IssueTokens:
+    """Cumulative token usage summed across all of an issue's runs."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
+
+
+async def tokens_for_issue(
+    conn: aiosqlite.Connection, issue_id: str
+) -> IssueTokens:
+    cur = await conn.execute(
+        """
+        SELECT COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(cache_write_tokens), 0),
+               COALESCE(SUM(cache_read_tokens), 0)
+        FROM runs WHERE issue_id = ?
+        """,
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return IssueTokens()
+    return IssueTokens(
+        input_tokens=int(row[0]),
+        output_tokens=int(row[1]),
+        cache_write_tokens=int(row[2]),
+        cache_read_tokens=int(row[3]),
+    )
+
+
+@dataclass
 class LocalReviewStats:
     """Aggregate telemetry over `runs` rows with `stage='local_review'`.
 
