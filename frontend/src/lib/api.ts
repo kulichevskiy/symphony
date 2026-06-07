@@ -86,6 +86,16 @@ export interface CommandAccepted {
   command: string;
 }
 
+export interface TokenModelUsage {
+  provider: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  total_tokens: number;
+}
+
 export type IssueDetail = {
   issue: {
     id: string;
@@ -93,6 +103,7 @@ export type IssueDetail = {
     title: string;
     team_key: string;
   };
+  tokens_by_model: TokenModelUsage[];
   canonical_status: CanonicalStatus;
   latest_activity_ts?: string | null;
   latest_activity_age_secs?: number | null;

@@ -1085,7 +1085,63 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "last_fingerprint": "fp",
             }
         ],
+        "tokens_by_model": [],
     }
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_api_returns_tokens_by_provider_model(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_issue_detail(conn)
+        # Implement on claude, review on codex — the issue spans two providers.
+        await db.run_model_usage.replace_for_run(
+            conn, "run-1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "run-2", [ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            response = await client.get("/api/issues/iss-1")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    breakdown = response.json()["tokens_by_model"]
+    # Sorted by total desc: claude (190) before codex (15).
+    assert breakdown == [
+        {
+            "provider": "claude",
+            "model": "claude-opus-4-8",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_write_tokens": 30,
+            "cache_read_tokens": 40,
+            "total_tokens": 190,
+        },
+        {
+            "provider": "codex",
+            "model": "gpt-5.5",
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "cache_write_tokens": 0,
+            "cache_read_tokens": 3,
+            "total_tokens": 15,
+        },
+    ]
+    # Per-model token sums reconcile with the issue's run-level totals.
+    assert sum(m["total_tokens"] for m in breakdown) == 100 + 20 + 30 + 40 + 15
 
 
 @pytest.mark.asyncio

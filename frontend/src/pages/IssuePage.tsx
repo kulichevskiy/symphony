@@ -15,6 +15,7 @@ import {
   postIssueCommand,
   type IssueDetail,
   type IssueExternalSnapshot,
+  type TokenModelUsage,
 } from "@/lib/api";
 import { formatRelative, formatTokens, formatUtc } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -40,6 +41,7 @@ type Cockpit = {
     cache_write_tokens: number;
     cache_read_tokens: number;
   };
+  byModel: TokenModelUsage[];
   pr: {
     number: number;
     repo: string;
@@ -128,6 +130,7 @@ function deriveCockpit(
     activity: detail.latest_activity_ts ?? null,
     reason,
     tokens,
+    byModel: detail.tokens_by_model ?? [],
     pr,
     waitingOn: detail.operator_waits[0]?.kind ?? null,
   };
@@ -202,6 +205,85 @@ function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
   );
 }
 
+const PROVIDER_TINT: Record<string, string> = {
+  claude: "bg-orange-500",
+  codex: "bg-sky-500",
+};
+
+type ProviderGroup = {
+  provider: string;
+  total_tokens: number;
+  models: TokenModelUsage[];
+};
+
+function groupByProvider(rows: TokenModelUsage[]): ProviderGroup[] {
+  const groups = new Map<string, ProviderGroup>();
+  for (const row of rows) {
+    const g = groups.get(row.provider) ?? {
+      provider: row.provider,
+      total_tokens: 0,
+      models: [],
+    };
+    g.total_tokens += row.total_tokens;
+    g.models.push(row);
+    groups.set(row.provider, g);
+  }
+  const result = [...groups.values()];
+  for (const g of result) {
+    g.models.sort((a, b) => b.total_tokens - a.total_tokens);
+  }
+  result.sort((a, b) => b.total_tokens - a.total_tokens);
+  return result;
+}
+
+function TokensByModel({ rows }: { rows: TokenModelUsage[] }) {
+  if (!rows.length) return null;
+  const groups = groupByProvider(rows);
+  return (
+    <div className="mt-3 border-t border-border pt-3">
+      <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        by provider / model
+      </div>
+      <div className="space-y-2">
+        {groups.map((g) => (
+          <div key={g.provider}>
+            <div className="flex items-center justify-between gap-2 font-mono text-xs">
+              <span className="flex items-center gap-1.5">
+                <span
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    PROVIDER_TINT[g.provider] ?? "bg-slate-400",
+                  )}
+                />
+                <span className="font-medium text-foreground">{g.provider}</span>
+              </span>
+              <span className="tabular-nums text-muted-foreground">
+                <Tk value={g.total_tokens} />
+              </span>
+            </div>
+            {g.models.map((m) => (
+              <div key={m.model} className="mt-1 pl-3.5">
+                <div className="flex items-center justify-between gap-2 font-mono text-xs text-muted-foreground">
+                  <span className="truncate">{m.model}</span>
+                  <span className="tabular-nums">
+                    <Tk value={m.total_tokens} />
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-x-3 pl-0 font-mono text-[11px] text-muted-foreground/80">
+                  <span>in <Tk value={m.input_tokens} /></span>
+                  <span>out <Tk value={m.output_tokens} /></span>
+                  <span>cache-w <Tk value={m.cache_write_tokens} /></span>
+                  <span>cache-r <Tk value={m.cache_read_tokens} /></span>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function TokensCard({ c }: { c: Cockpit }) {
   const total =
     c.tokens.input_tokens +
@@ -224,6 +306,7 @@ export function TokensCard({ c }: { c: Cockpit }) {
         <span>cache-write <Tk value={c.tokens.cache_write_tokens} /></span>
         <span>cache-read <Tk value={c.tokens.cache_read_tokens} /></span>
       </div>
+      <TokensByModel rows={c.byModel} />
     </CockpitCard>
   );
 }

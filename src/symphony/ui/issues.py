@@ -161,6 +161,31 @@ def _external_status_snapshot(payload: dict[str, Any]) -> ExternalStatusSnapshot
     return ExternalStatusSnapshot(drift_flags=tuple(flags))
 
 
+def _tokens_by_model(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-(provider, model) token aggregates for one issue, total desc."""
+    breakdown: list[dict[str, Any]] = []
+    for row in rows:
+        inp = int(row["input_tokens"] or 0)
+        out = int(row["output_tokens"] or 0)
+        cw = int(row["cache_write_tokens"] or 0)
+        cr = int(row["cache_read_tokens"] or 0)
+        breakdown.append(
+            {
+                "provider": str(row["provider"]),
+                "model": str(row["model"]),
+                "input_tokens": inp,
+                "output_tokens": out,
+                "cache_write_tokens": cw,
+                "cache_read_tokens": cr,
+                "total_tokens": inp + out + cw + cr,
+            }
+        )
+    breakdown.sort(
+        key=lambda m: (-m["total_tokens"], m["provider"], m["model"]),
+    )
+    return breakdown
+
+
 def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
     kind = row["kind"]
     payload: dict[str, Any]
@@ -338,6 +363,24 @@ def create_issue_detail_router(
             """,
             (issue_id,),
         )
+        tokens_by_model_rows = await _fetch_all(
+            conn,
+            """
+            SELECT
+                u.provider AS provider,
+                u.model AS model,
+                COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens
+            FROM run_model_usage u
+            JOIN runs r ON r.id = u.run_id
+            WHERE r.issue_id = ?
+            GROUP BY u.provider, u.model
+            """,
+            (issue_id,),
+        )
+        tokens_by_model = _tokens_by_model(tokens_by_model_rows)
         activity_comment_marks = await _fetch_all(
             conn,
             """
@@ -365,6 +408,7 @@ def create_issue_detail_router(
             "review_state": review_state,
             "comment_events": comment_events,
             "activity_comment_marks": activity_comment_marks,
+            "tokens_by_model": tokens_by_model,
         }
         if warnings:
             payload["warnings"] = warnings
