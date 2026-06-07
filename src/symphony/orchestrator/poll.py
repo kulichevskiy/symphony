@@ -10714,14 +10714,13 @@ class Orchestrator:
             )
 
             async def _on_iteration(
-                i: int, verdict: LocalVerdict, cost_so_far: float
+                i: int, verdict: LocalVerdict, _cost_so_far: float
             ) -> None:
                 await self._post_local_review_iteration_comment(
                     binding=binding,
                     issue=issue,
                     iteration=i,
                     verdict=verdict,
-                    cost_so_far=cost_so_far,
                 )
 
             result: LoopResult | None = None
@@ -10902,7 +10901,6 @@ class Orchestrator:
         issue: LinearIssue,
         iteration: int,
         verdict: LocalVerdict,
-        cost_so_far: float,
     ) -> None:
         """Per-iteration heartbeat so a 5-minute review doesn't look dead.
 
@@ -10910,13 +10908,17 @@ class Orchestrator:
         dispatch), so operators can see "iteration 1: changes_requested
         — first finding…" while the fix-run is still running. Short
         snippets keep the issue thread readable.
+
+        Per-iteration token deltas aren't plumbed into this callback
+        (only a cumulative cost was, which we no longer render), so the
+        heartbeat omits a spend figure entirely; the final outcome
+        comment carries the token breakdown.
         """
         snippet = ""
         if verdict.findings:
             snippet = verdict.findings.strip().splitlines()[0][:280]
         body_parts = [
-            f"**Local review iter {iteration}:** "
-            f"`{verdict.kind.value}` (cost so far ${cost_so_far:.4f})",
+            f"**Local review iter {iteration}:** `{verdict.kind.value}`",
         ]
         if snippet:
             body_parts.append(f"> {snippet}")
@@ -10938,10 +10940,18 @@ class Orchestrator:
         last_findings = ""
         if result.last_verdict is not None and result.last_verdict.findings:
             last_findings = result.last_verdict.findings
+        total_tokens = (
+            result.input_tokens
+            + result.output_tokens
+            + result.cache_write_tokens
+            + result.cache_read_tokens
+        )
         body_parts = [
             f"**Local-review outcome:** `{outcome}` "
             f"(iterations={result.iterations}, "
-            f"cost=${result.total_cost_usd:.4f})",
+            f"tokens: in {result.input_tokens} · out {result.output_tokens} · "
+            f"cache w {result.cache_write_tokens} / r {result.cache_read_tokens} "
+            f"· total {total_tokens})",
         ]
         if result.error:
             body_parts.append(f"_Error:_ {result.error}")
@@ -11468,9 +11478,10 @@ class Orchestrator:
         """Spawn the runner and consume events. Returns
         (cumulative_usage, final_event_kind, final_returncode).
 
-        `prior_total` is the issue's cost so far, still threaded for callers'
-        cost bookkeeping. Activity digests now report per-run token counts
-        rather than a cumulative dollar total, so it is no longer rendered.
+        `prior_total` is the issue's cost so far. It is passed through to
+        `_run_stage_command` but is no longer consumed anywhere: activity
+        digests now report per-run token counts rather than a cumulative
+        dollar total, so it is currently unused.
         """
         storage_issue_id = storage_issue_id or issue.id
         prompt = implement_prompt(
