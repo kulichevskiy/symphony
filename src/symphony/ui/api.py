@@ -268,6 +268,29 @@ ORDER BY day
 """
 
 
+# Same daily buckets, but scoped to a single provider via the run_model_usage
+# child table. Tokens come from the per-(provider, model) rows so a run that
+# spans providers contributes only its share of the selected provider.
+_SPEND_HEATMAP_BY_PROVIDER_QUERY = """
+SELECT
+    substr(r.started_at, 1, 10) AS day,
+    COALESCE(SUM(
+        u.input_tokens + u.output_tokens
+        + u.cache_write_tokens + u.cache_read_tokens
+    ), 0) AS tokens,
+    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+    COUNT(DISTINCT r.issue_id) AS issues
+FROM run_model_usage u
+JOIN runs r ON r.id = u.run_id
+WHERE substr(r.started_at, 1, 10) >= ? AND u.provider = ?
+GROUP BY day
+ORDER BY day
+"""
+
+
 def _build_per_provider(
     model_rows: list[dict[str, object]],
     provider_issue_rows: list[dict[str, object]],
@@ -605,14 +628,20 @@ def create_api_router(
     @router.get("/spend/heatmap", response_model=SpendHeatmap)
     async def spend_heatmap(
         days: Annotated[int, Query(ge=1, le=400)] = 371,
+        provider: Annotated[str | None, Query()] = None,
     ) -> SpendHeatmap:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
         request_now = now()
         start = (request_now - timedelta(days=days - 1)).date()
+        if provider is None:
+            query, params = _SPEND_HEATMAP_QUERY, (start.isoformat(),)
+        else:
+            query = _SPEND_HEATMAP_BY_PROVIDER_QUERY
+            params = (start.isoformat(), provider)
         try:
             conn = await ui_db_pool.connection()
-            cur = await conn.execute(_SPEND_HEATMAP_QUERY, (start.isoformat(),))
+            cur = await conn.execute(query, params)
             rows = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
             raise HTTPException(

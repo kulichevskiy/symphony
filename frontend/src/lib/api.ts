@@ -271,9 +271,15 @@ export function fetchSpendSummary(): Promise<SpendSummary> {
   );
 }
 
-export function fetchSpendHeatmap(days = 371): Promise<SpendHeatmap> {
+export function fetchSpendHeatmap(
+  days = 371,
+  provider?: string,
+): Promise<SpendHeatmap> {
+  const query = provider
+    ? `/api/spend/heatmap?days=${days}&provider=${encodeURIComponent(provider)}`
+    : `/api/spend/heatmap?days=${days}`;
   return fetchJson<SpendHeatmap>(
-    `/api/spend/heatmap?days=${days}`,
+    query,
     "Spend heatmap not found",
     "Failed to load spend heatmap",
   );

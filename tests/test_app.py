@@ -1889,6 +1889,71 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="b", identifier="ENG-2", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r3', 'a', 'review', 'completed', NULL, '2026-05-16T09:00:00Z')
+            """
+        )
+        await conn.commit()
+        # Day 05-17: claude on two issues, codex on one. Day 05-16: codex only.
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5.5", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            claude_resp = await client.get("/api/spend/heatmap?days=60&provider=claude")
+            codex_resp = await client.get("/api/spend/heatmap?days=60&provider=codex")
+    finally:
+        await conn.close()
+
+    assert claude_resp.status_code == 200
+    claude_days = {d["date"]: d for d in claude_resp.json()["days"]}
+    # Only claude's single run on 05-17; 05-16 has no claude rows.
+    assert claude_days["2026-05-17"] == {
+        "date": "2026-05-17", "tokens": 190,
+        "input_tokens": 100, "output_tokens": 20,
+        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+    }
+    assert "2026-05-16" not in claude_days
+
+    assert codex_resp.status_code == 200
+    codex_days = {d["date"]: d for d in codex_resp.json()["days"]}
+    assert codex_days["2026-05-17"] == {
+        "date": "2026-05-17", "tokens": 65,
+        "input_tokens": 50, "output_tokens": 5,
+        "cache_write_tokens": 5, "cache_read_tokens": 5, "issues": 1,
+    }
+    assert codex_days["2026-05-16"] == {
+        "date": "2026-05-16", "tokens": 15,
+        "input_tokens": 10, "output_tokens": 2,
+        "cache_write_tokens": 0, "cache_read_tokens": 3, "issues": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
