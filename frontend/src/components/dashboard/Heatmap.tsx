@@ -27,7 +27,17 @@ const MONTHS = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-type Cell = { iso: string; date: Date; tokens: number; cost: number; issues: number };
+type Cell = {
+  iso: string;
+  date: Date;
+  tokens: number;
+  cost: number;
+  issues: number;
+  input: number;
+  output: number;
+  cacheWrite: number;
+  cacheRead: number;
+};
 
 /**
  * Build a dense Sun..Sat-aligned grid of weeks ending on the Saturday of the
@@ -65,6 +75,10 @@ function buildGrid(days: HeatmapDay[], start: string, end: string): {
       tokens: hit?.tokens ?? 0,
       cost: hit?.cost_usd ?? 0,
       issues: hit?.issues ?? 0,
+      input: hit?.input_tokens ?? 0,
+      output: hit?.output_tokens ?? 0,
+      cacheWrite: hit?.cache_write_tokens ?? 0,
+      cacheRead: hit?.cache_read_tokens ?? 0,
     });
   }
 
@@ -199,6 +213,12 @@ export function Heatmap({
           <div className="mt-0.5 font-mono text-muted-foreground">
             <Tk value={hover.cell.tokens} /> tokens · {formatCost(hover.cell.cost)} ·{" "}
             {hover.cell.issues} {hover.cell.issues === 1 ? "issue" : "issues"}
+          </div>
+          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 border-t border-border pt-1 font-mono text-[11px] text-muted-foreground">
+            <span>in <Tk value={hover.cell.input} /></span>
+            <span>out <Tk value={hover.cell.output} /></span>
+            <span>cache-write <Tk value={hover.cell.cacheWrite} /></span>
+            <span>cache-read <Tk value={hover.cell.cacheRead} /></span>
           </div>
         </div>
       ) : null}
