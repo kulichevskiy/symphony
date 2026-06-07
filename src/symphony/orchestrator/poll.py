@@ -4680,7 +4680,6 @@ class Orchestrator:
         async with self._review_fix_dispatch_slot(binding, issue):
             # Post the "starting" comment once we have a slot — this ensures
             # the message is accurate ("dispatching now", not "queued").
-            prior_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
@@ -4688,7 +4687,6 @@ class Orchestrator:
                 pr_url=pr_url,
                 review_iter=iteration,
                 trigger=verdict.trigger_signature[:80],
-                cost=f"${prior_cost:.2f}",
             )
             try:
                 await tracker.post_comment(
@@ -4857,14 +4855,17 @@ class Orchestrator:
                 )
                 return False
 
-            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
             v_done = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
                 issue=state.pr_number or 0,
                 pr_url=pr_url,
                 review_iter=iteration,
-                cost=f"${total_cost:.2f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
@@ -5899,14 +5900,12 @@ class Orchestrator:
 
         async with self._review_fix_dispatch_slot(binding, issue):
             # Post the "fixing" comment once we have a slot.
-            prior_cost = await db.runs.cost_for_issue(self._conn, issue.id)
             v_start = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
                 issue=state.pr_number or 0,
                 pr_url=pr_url,
                 review_iter=iteration,
-                cost=f"${prior_cost:.2f}",
             )
             try:
                 await tracker.post_comment(
@@ -6249,14 +6248,17 @@ class Orchestrator:
                 )
                 return False
 
-            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
             v_done = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
                 issue=state.pr_number or 0,
                 pr_url=pr_url,
                 review_iter=iteration,
-                cost=f"${total_cost:.2f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
@@ -7007,7 +7009,6 @@ class Orchestrator:
                 started_at=now,
             )
             state = await db.review_state.get(self._conn, issue.id)
-            cost = await db.runs.cost_for_issue(self._conn, issue.id)
             body = resumed(
                 CommentVars(
                     stage="review",
@@ -7019,7 +7020,6 @@ class Orchestrator:
                         pr_number=state.pr_number,
                         pr_url=state.pr_url,
                     ),
-                    cost=f"${cost:.4f}",
                     next_stage="review",
                 )
             )
@@ -7093,7 +7093,7 @@ class Orchestrator:
                     e,
                 )
         state = await db.review_state.get(self._conn, issue.id)
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = failed(
             CommentVars(
                 stage="review",
@@ -7105,7 +7105,10 @@ class Orchestrator:
                     pr_url=state.pr_url,
                 ),
                 run_id=run.id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=error,
                 last_log=last_log,
                 auto_retry=auto_retry,
@@ -7139,7 +7142,7 @@ class Orchestrator:
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
         repo = state.github_repo or "(unknown repo)"
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = failed(
             CommentVars(
                 stage="review",
@@ -7151,7 +7154,10 @@ class Orchestrator:
                     pr_url=state.pr_url,
                 ),
                 run_id=run.id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=error,
                 last_log="",
                 auto_retry=True,
@@ -7176,7 +7182,7 @@ class Orchestrator:
         trigger: str,
     ) -> None:
         state = await db.review_state.get(self._conn, issue.id)
-        cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = stuck_loop_escape(
             CommentVars(
                 stage="review",
@@ -7188,7 +7194,10 @@ class Orchestrator:
                     pr_url=state.pr_url,
                 ),
                 run_id=run.id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 review_iter=state.iteration,
                 trigger=trigger,
             )
@@ -9972,7 +9981,10 @@ class Orchestrator:
                     issue=0,
                     pr_url=pr_url or "(no PR)",
                     run_id=run_id,
-                    cost=f"${cumulative_usage.cost_usd:.4f}",
+                    input_tokens=cumulative_usage.input_tokens,
+                    output_tokens=cumulative_usage.output_tokens,
+                    cache_write_tokens=cumulative_usage.cache_write_tokens,
+                    cache_read_tokens=cumulative_usage.cache_read_tokens,
                 )
             )
             await tracker.post_comment(issue.id, truncate_body(done_body))
@@ -10464,7 +10476,7 @@ class Orchestrator:
             )
             return
 
-        total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         tracker = self.tracker(binding)
         await tracker.move_issue(issue.id, done_id)
         final_body = stage_done(
@@ -10475,7 +10487,10 @@ class Orchestrator:
                 issue=0,
                 pr_url=pr_url,
                 run_id=run_id,
-                cost=f"${total_cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
             )
         )
         try:
@@ -10544,7 +10559,7 @@ class Orchestrator:
                     e,
                 )
 
-            total_cost = await db.runs.cost_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
             body = awaiting_approval(
                 CommentVars(
                     stage="merge",
@@ -10553,7 +10568,10 @@ class Orchestrator:
                     issue=0,
                     pr_url=pr_url,
                     run_id=run_id,
-                    cost=f"${total_cost:.4f}",
+                    input_tokens=tokens.input_tokens,
+                    output_tokens=tokens.output_tokens,
+                    cache_write_tokens=tokens.cache_write_tokens,
+                    cache_read_tokens=tokens.cache_read_tokens,
                     error=reason,
                 )
             )
@@ -10979,14 +10997,17 @@ class Orchestrator:
             )
 
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
-        cost = await db.runs.cost_for_issue(self._conn, storage_issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
                 stage="local review",
                 repo=binding.github_repo,
                 issue=0,
                 run_id=run_id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=reason,
                 last_log=_local_review_failure_log(result),
                 auto_retry=False,
@@ -11052,7 +11073,7 @@ class Orchestrator:
                 issue.identifier,
             )
 
-        total_cost = await db.runs.cost_for_issue(self._conn, run.issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, run.issue_id)
         body = awaiting_approval(
             CommentVars(
                 stage="local review",
@@ -11061,7 +11082,10 @@ class Orchestrator:
                 issue=pr_number_from_url(pr_url) or 0,
                 pr_url=pr_url,
                 run_id=run.id,
-                cost=f"${total_cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=reason,
             )
         )
@@ -11802,14 +11826,17 @@ class Orchestrator:
         if binding is None:
             return
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
-        cost = await db.runs.cost_for_issue(self._conn, storage_issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
                 stage="implement",
                 repo=binding.github_repo,
                 issue=0,
                 run_id=run_id,
-                cost=f"${cost:.4f}",
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
                 error=reason,
             )
         )
