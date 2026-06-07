@@ -49,7 +49,6 @@ class AcceptanceConfig(BaseModel):
     dev_command: str | None = None
     dev_port: int | None = Field(default=None, ge=1, le=65535)
     taste_guide: str | None = None
-    cost_cap_usd: float = Field(default=10.0, ge=0)
     time_cap_minutes: float = Field(default=15.0, gt=0)
 
 
@@ -66,8 +65,8 @@ class TrackerStates(BaseModel):
     for failed merges and stage-failure parking. Legacy configs without
     `code_review` inherit their old `needs_approval` lane, including that
     field's legacy default, so existing deployments keep loading during the
-    schema split. `blocked` is the agent-error parking lane for cost caps,
-    failed merges, and rejected work. `waiting` is a separate optional
+    schema split. `blocked` is the agent-error parking lane for
+    failed merges and rejected work. `waiting` is a separate optional
     dependency-waiting lane used only when pickup should bounce tickets blocked
     by other Linear issues.
     """
@@ -144,9 +143,8 @@ class RepoBinding(BaseModel):
     # Per-binding override for the local-review iteration cap. The
     # right number is usually smaller than the remote `review_iteration_cap`
     # because the local loop converges fast or it isn't going to — many
-    # rounds usually means the reviewer is stuck on a pathological case,
-    # and the cost cap should catch that anyway. `None` falls back to
-    # `Config.local_review_iteration_cap`.
+    # rounds usually means the reviewer is stuck on a pathological case.
+    # `None` falls back to `Config.local_review_iteration_cap`.
     local_review_iteration_cap: int | None = Field(default=None, ge=1)
     # Per-binding override for the GitHub PR summary comment posted on
     # local-review APPROVED. `None` falls back to
@@ -155,10 +153,6 @@ class RepoBinding(BaseModel):
     # want every verdict surfaced for human reviewers.
     post_local_review_pr_summary: bool | None = None
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
-    # Per-binding cost knobs. `None` falls back to the global default; an
-    # explicit `0` disables the cap (useful when one team is exempt).
-    cost_cap_usd: float | None = None
-    cost_warning_pct: int | None = None
     activity_comments_enabled: bool | None = None
     activity_comment_interval_secs: int | None = Field(default=None, ge=1)
     activity_comment_min_interval_secs: int | None = Field(default=None, ge=1)
@@ -421,16 +415,13 @@ class Config(BaseModel):
     review_iteration_cap: int = 12
     # Local-review converges fast or it doesn't. The right cap is well
     # below `review_iteration_cap`: more rounds means the in-workspace
-    # reviewer is stuck or the cost cap should take over. Per-binding
-    # overrides live on `RepoBinding`.
+    # reviewer is stuck. Per-binding overrides live on `RepoBinding`.
     local_review_iteration_cap: int = Field(default=6, ge=1)
     # When the local-review APPROVES, post a summary PR comment with
     # the iteration count + cost so human reviewers visiting GitHub
     # see the verdict trail (not just the Linear thread). Set to false
     # on bindings where the PR thread should stay quiet.
     post_local_review_pr_summary: bool = True
-    cost_cap_per_issue_usd: float = 100.0
-    cost_warning_pct: int = 75
     stall_timeout_secs: int = 300
     # Outer cap for a single agent tool call (command_execution). While the
     # agent has a command in flight, the stall watchdog measures against this

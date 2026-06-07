@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS runs (
 -- (status='running' AND pid IS NOT NULL).
 CREATE INDEX IF NOT EXISTS idx_runs_status_pid ON runs(status, pid);
 
--- Per-issue cost aggregation (cost_cap_per_issue_usd enforcement).
+-- Per-issue cost aggregation. Cost is internal-only (Codex token deltas,
+-- runs.cost_usd); it no longer gates runs.
 CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 
 -- PR opened for an issue. The row bridges the async Review/Merge ticks:
@@ -158,16 +159,6 @@ CREATE TABLE IF NOT EXISTS acceptance_state (
 -- re-arm was inconclusive and must be retried by the live monitor task.
 CREATE TABLE IF NOT EXISTS review_rearm_retries (
     run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE
-);
-
--- Per-issue cost-warning idempotency. The cost warning template fires
--- exactly once per issue — when the cumulative cost first crosses the
--- configured threshold. Persisting the post timestamp lets a restarted
--- orchestrator skip the warning even if cumulative cost is already past
--- threshold from prior runs.
-CREATE TABLE IF NOT EXISTS issue_cost_marks (
-    issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
-    warning_posted_at   TEXT
 );
 
 -- Rate-limit/dedupe state for Codex activity comments. The full activity

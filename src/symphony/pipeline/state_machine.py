@@ -43,7 +43,6 @@ def classify_termination(
     status: str,
     final_kind: str | None = None,
     returncode: int | None = None,
-    cap_breached: bool = False,
     exc: BaseException | str | None = None,
     reason: str | None = None,
 ) -> tuple[str, str]:
@@ -74,13 +73,6 @@ def classify_termination(
         if part
     ).casefold()
 
-    if (
-        cap_breached
-        or final_kind == "cost_cap"
-        or "cost cap" in text
-        or "cost_cap" in text
-    ):
-        return "cost_cap", detail
     if final_kind == "stall_timeout":
         return "stall_timeout", detail
     if final_kind == "spawn_failed":
@@ -162,8 +154,6 @@ def _termination_detail(
             text = str(exc)
             return text or type(exc).__name__
         return str(exc)
-    if final_kind == "cost_cap":
-        return "cost cap reached"
     if final_kind:
         return f"runner ended with {final_kind}"
     return status

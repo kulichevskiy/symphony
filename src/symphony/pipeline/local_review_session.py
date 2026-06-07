@@ -130,8 +130,6 @@ async def run_local_review_session(
     command_secs: int = 1800,
     last_message_dir: Path,
     head_sha_provider: HeadShaProvider,
-    cost_cap_usd: float = 0.0,
-    prior_cost_usd: float = 0.0,
     on_iteration: IterationCallback | None = None,
 ) -> LoopResult:
     """Run the review→fix loop in-workspace; return the loop's outcome.
@@ -346,8 +344,6 @@ async def run_local_review_session(
         reviewer=_reviewer,
         fixer=_fixer,
         cap=cap,
-        cost_cap_usd=cost_cap_usd,
-        prior_cost_usd=prior_cost_usd,
         on_iteration=on_iteration,
     )
 

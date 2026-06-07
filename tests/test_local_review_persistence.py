@@ -35,7 +35,6 @@ def test_status_mapper_failed_for_non_approval_outcomes() -> None:
         LoopOutcome.STUCK_LOOP,
         LoopOutcome.REVIEWER_FAILED,
         LoopOutcome.FIX_RUN_FAILED,
-        LoopOutcome.COST_CAP_BREACHED,
     ):
         r = LoopResult(outcome=outcome, iterations=1, verdicts=())
         assert _local_review_status_from_result(r) == "failed", outcome

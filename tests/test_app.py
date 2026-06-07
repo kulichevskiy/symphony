@@ -131,12 +131,6 @@ async def _seed_issue_detail(conn: aiosqlite.Connection) -> None:
         )
         """
     )
-    await conn.execute(
-        """
-        INSERT INTO issue_cost_marks (issue_id, warning_posted_at)
-        VALUES ('iss-1', '2026-05-17T10:40:00Z')
-        """
-    )
     for idx in range(55):
         await conn.execute(
             """
@@ -193,12 +187,6 @@ async def _seed_issue_timeline(conn: aiosqlite.Connection) -> None:
             'run-timeline', '2026-05-17T10:02:30Z', '2026-05-17T10:03:00Z', 2,
             '2026-05-17T10:03:00Z', 'fp-timeline'
         )
-        """
-    )
-    await conn.execute(
-        """
-        INSERT INTO issue_cost_marks (issue_id, warning_posted_at)
-        VALUES ('iss-timeline', '2026-05-17T10:04:00Z')
         """
     )
     await conn.execute(
@@ -1100,7 +1088,6 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "last_fingerprint": "fp",
             }
         ],
-        "issue_cost_marks": {"warning_posted_at": "2026-05-17T10:40:00Z"},
     }
 
 
@@ -1604,11 +1591,6 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
             "ts": "2026-05-17T10:03:30Z",
             "kind": "review_state_changed",
             "payload": {"field": "iteration", "old": "1", "new": "2"},
-        },
-        {
-            "ts": "2026-05-17T10:04:00Z",
-            "kind": "cost_warning_posted",
-            "payload": {},
         },
         {
             "ts": "2026-05-17T10:04:20Z",

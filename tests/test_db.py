@@ -1045,7 +1045,7 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
             conn,
             issue_id="iss-1",
             run_id="run-1",
-            kind=db.operator_waits.KIND_COST_CAP,
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
             linear_team_key="ENG",
             github_repo="org/repo",
             issue_label="ready",
@@ -1055,14 +1055,14 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
         got = await db.operator_waits.get(conn, "iss-1")
         assert got is not None
         assert got.run_id == "run-1"
-        assert got.kind == db.operator_waits.KIND_COST_CAP
+        assert got.kind == db.operator_waits.KIND_REVIEW_FAILED
         assert got.provider == "linear"
         assert got.issue_label == "ready"
         assert await db.operator_waits.list_all(conn) == [got]
         transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
         assert [(t.field, t.old_value, t.new_value) for t in transitions] == [
             ("__row__", None, "created"),
-            ("kind", None, db.operator_waits.KIND_COST_CAP),
+            ("kind", None, db.operator_waits.KIND_REVIEW_FAILED),
         ]
 
         await db.operator_waits.delete(conn, "iss-1", "run-1")
@@ -1070,9 +1070,9 @@ async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
         transitions = await db.state_transitions.list_for_issue(conn, "iss-1")
         assert [(t.field, t.old_value, t.new_value) for t in transitions] == [
             ("__row__", None, "created"),
-            ("kind", None, db.operator_waits.KIND_COST_CAP),
+            ("kind", None, db.operator_waits.KIND_REVIEW_FAILED),
             ("__row__", "removed", None),
-            ("kind", db.operator_waits.KIND_COST_CAP, None),
+            ("kind", db.operator_waits.KIND_REVIEW_FAILED, None),
         ]
     finally:
         await conn.close()

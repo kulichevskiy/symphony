@@ -78,8 +78,6 @@ from ..linear.templates import (
     awaiting_approval,
     codex_lgtm,
     command_rejected,
-    cost_cap_reached,
-    cost_warning,
     failed,
     fix_pushed,
     fixing_merge_conflict,
@@ -107,9 +105,6 @@ from ..pipeline.acceptance_classifier import (
 from ..pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
-    effective_cap,
-    effective_warning_pct,
-    evaluate_cost,
 )
 from ..pipeline.local_review import LocalVerdict
 from ..pipeline.local_review_loop import LoopOutcome, LoopResult
@@ -412,7 +407,6 @@ def _local_review_infra_failed(result: LoopResult | None) -> bool:
     return result is None or result.outcome in {
         LoopOutcome.REVIEWER_FAILED,
         LoopOutcome.FIX_RUN_FAILED,
-        LoopOutcome.COST_CAP_BREACHED,
     }
 
 
@@ -427,7 +421,6 @@ def _termination_kwargs(
     status: str,
     final_kind: str | None = None,
     returncode: int | None = None,
-    cap_breached: bool = False,
     exc: BaseException | str | None = None,
     reason: str | None = None,
 ) -> _TerminationKwargs:
@@ -435,7 +428,6 @@ def _termination_kwargs(
         status=status,
         final_kind=final_kind,
         returncode=returncode,
-        cap_breached=cap_breached,
         exc=exc,
         reason=reason,
     )
@@ -465,7 +457,6 @@ def build_runner_command(
     agent: str,
     prompt: str,
     *,
-    max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
 ) -> list[str]:
@@ -478,8 +469,6 @@ def build_runner_command(
             "stream-json",
             "--verbose",
         ]
-        if max_budget_usd is not None:
-            command.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
         command.append(prompt)
         return command
     if agent == "codex":
@@ -496,7 +485,6 @@ def build_fix_runner_command(
     agent: str,
     prompt: str,
     *,
-    max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
 ) -> list[str]:
@@ -510,7 +498,6 @@ def build_fix_runner_command(
     return build_runner_command(
         agent,
         prompt,
-        max_budget_usd=max_budget_usd,
         codex_model=codex_model,
         workspace_path=workspace_path,
     )
@@ -520,7 +507,6 @@ def build_merge_runner_command(
     agent: str,
     prompt: str,
     *,
-    max_budget_usd: float | None = None,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
 ) -> list[str]:
@@ -528,7 +514,6 @@ def build_merge_runner_command(
     return build_runner_command(
         agent,
         prompt,
-        max_budget_usd=max_budget_usd,
         codex_model=codex_model,
         workspace_path=workspace_path,
     )
@@ -1356,7 +1341,6 @@ class Orchestrator:
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
-        self._cost_cap_run_bindings: dict[str, RepoBinding] = {}
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
@@ -2281,9 +2265,6 @@ class Orchestrator:
         if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
             await self._handle_parked_manual_merge_slash_intent(issue_id, intent)
             return
-        if run_id in self._cost_cap_run_bindings:
-            await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
-            return
         if run_id in self._implement_failed_run_bindings:
             await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
             return
@@ -2298,9 +2279,6 @@ class Orchestrator:
             return
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if wait is not None:
-            if wait.kind == db.operator_waits.KIND_COST_CAP:
-                await self._handle_cost_cap_slash_intent(issue_id, run_id, intent)
-                return
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
                 await self._handle_implement_failed_slash_intent(
                     issue_id, run_id, intent
@@ -2629,85 +2607,6 @@ class Orchestrator:
         except LinearError as e:
             log.warning("review stop confirmation failed for %s: %s", issue_id, e)
 
-    async def _handle_cost_cap_slash_intent(
-        self, issue_id: str, run_id: str, intent: SlashIntent
-    ) -> None:
-        binding = self._cost_cap_run_bindings.get(run_id)
-        if binding is None:
-            binding = await self._restore_operator_wait_binding(
-                issue_id,
-                run_id,
-                intent,
-                expected_kinds=(db.operator_waits.KIND_COST_CAP,),
-            )
-            if binding is None:
-                return
-
-        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
-        tracker = self.tracker(binding)
-        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
-            states = await self._states_for_binding(binding)
-            ready_id = states.get(binding.linear_states.ready)
-            if ready_id is None:
-                log.warning(
-                    "could not resume cost-capped run %s: missing ready state %r",
-                    run_id,
-                    binding.linear_states.ready,
-                )
-                return
-            try:
-                await tracker.move_issue(tracker_issue_id, ready_id)
-            except LinearError as e:
-                log.warning(
-                    "could not move %s to ready for cost-cap resume: %s", issue_id, e
-                )
-                raise SlashHandlerFailure(
-                    slash_text=self._slash_text(intent),
-                    reason=f"could not move issue to ready state for resume: {e}",
-                ) from e
-            body = resumed(
-                CommentVars(
-                    stage="implement",
-                    repo=binding.github_repo,
-                    issue=0,
-                    run_id=run_id,
-                    next_stage=binding.linear_states.ready,
-                )
-            )
-            try:
-                await tracker.post_comment(tracker_issue_id, truncate_body(body))
-            except LinearError as e:
-                log.warning(
-                    "cost-cap resume comment failed for issue %s: %s", issue_id, e
-                )
-            await self._clear_operator_wait(issue_id, run_id)
-            return
-
-        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
-            states = await self._states_for_binding(binding)
-            blocked_id = states.get(binding.linear_states.blocked)
-            if blocked_id is not None:
-                try:
-                    await tracker.move_issue(tracker_issue_id, blocked_id)
-                except LinearError as e:
-                    log.warning(
-                        "could not move %s to blocked after cost-cap stop: %s",
-                        issue_id,
-                        e,
-                    )
-                    raise SlashHandlerFailure(
-                        slash_text=self._slash_text(intent),
-                        reason=f"could not move issue to blocked state: {e}",
-                    ) from e
-            await self._clear_operator_wait(issue_id, run_id)
-            return
-
-        log.info(
-            "slash %s received for cost-capped run %s (ignored)",
-            intent.kind,
-            run_id,
-        )
-
     async def _track_implement_failed_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding
     ) -> None:
@@ -2826,7 +2725,6 @@ class Orchestrator:
         waits = await db.operator_waits.list_all(self._conn)
         for wait in waits:
             if wait.kind not in (
-                db.operator_waits.KIND_COST_CAP,
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
@@ -2860,9 +2758,7 @@ class Orchestrator:
     ) -> None:
         self._dispatch_run_ids[wait.issue_id] = wait.run_id
         self._operator_wait_run_ids.add(wait.run_id)
-        if wait.kind == db.operator_waits.KIND_COST_CAP:
-            self._cost_cap_run_bindings[wait.run_id] = binding
-        elif wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
             self._implement_failed_run_bindings[wait.run_id] = binding
         elif wait.kind in (
             db.operator_waits.KIND_REVIEW_FAILED,
@@ -2970,26 +2866,6 @@ class Orchestrator:
             ):
                 return binding
         return None
-
-    async def _track_operator_wait(
-        self, issue_id: str, run_id: str, binding: RepoBinding
-    ) -> None:
-        self._dispatch_run_ids[issue_id] = run_id
-        self._operator_wait_run_ids.add(run_id)
-        self._cost_cap_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
-            kind=db.operator_waits.KIND_COST_CAP,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
-        )
 
     async def _track_acceptance_blocked_wait(
         self,
@@ -3221,7 +3097,6 @@ class Orchestrator:
         if self._dispatch_run_ids.get(issue_id) == run_id:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
-        self._cost_cap_run_bindings.pop(run_id, None)
         self._implement_failed_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
@@ -5279,19 +5154,6 @@ class Orchestrator:
             dispatch_capacity_held=dispatch_capacity_held,
         ):
             prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-            cap_usd = effective_cap(
-                global_cap_usd=self.config.cost_cap_per_issue_usd,
-                binding_override=binding.cost_cap_usd,
-            )
-            if cap_usd > 0 and prior_total >= cap_usd:
-                await self._mark_merge_required_check_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=f"required-check cost cap reached: ${prior_total:.4f}",
-                    merge_run_id=merge_run_id,
-                )
-                return False
 
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
@@ -5358,7 +5220,6 @@ class Orchestrator:
                     usage_delta,
                     final_kind,
                     final_returncode,
-                    cap_breached,
                 ) = await self._run_required_check_fix_agent(
                     binding=binding,
                     issue=issue,
@@ -5366,7 +5227,6 @@ class Orchestrator:
                     workspace_path=workspace_path,
                     prompt=prompt,
                     prior_total=prior_total,
-                    cap_usd=cap_usd,
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception(
@@ -5398,33 +5258,6 @@ class Orchestrator:
                 self._workspace.release(binding, issue)
 
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
-
-            if cap_breached:
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        cap_breached=True,
-                        reason=(
-                            "required-check cost cap reached: "
-                            f"${prior_total + usage_delta.cost_usd:.4f}"
-                        ),
-                    ),
-                )
-                await self._mark_merge_required_check_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=(
-                        "required-check cost cap reached: "
-                        f"${prior_total + usage_delta.cost_usd:.4f}"
-                    ),
-                    merge_run_id=merge_run_id,
-                )
-                return False
 
             transition = on_runner_event(
                 stage="review",
@@ -5600,24 +5433,10 @@ class Orchestrator:
         workspace_path: Path,
         prompt: str,
         prior_total: float,
-        cap_usd: float,
-    ) -> tuple[UsageDelta, str, int | None, bool]:
-        warning_pct = effective_warning_pct(
-            global_pct=self.config.cost_warning_pct,
-            binding_override=binding.cost_warning_pct,
-        )
-        warning_already_fired = (
-            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
-        )
-        max_budget_usd: float | None = None
-        if cap_usd > 0:
-            max_budget_usd = cap_usd - prior_total
-            if max_budget_usd <= 0:
-                return UsageDelta(), "cost_cap", None, True
+    ) -> tuple[UsageDelta, str, int | None]:
         command = build_fix_runner_command(
             binding.agent,
             prompt,
-            max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
         )
@@ -5629,9 +5448,6 @@ class Orchestrator:
             workspace_path=workspace_path,
             stage="review_fix",
             prior_total=prior_total,
-            cap_usd=cap_usd,
-            warning_pct=warning_pct,
-            warning_already_fired=warning_already_fired,
         )
 
     async def _mark_merge_conflict_fix_needs_approval(
@@ -5675,22 +5491,6 @@ class Orchestrator:
             dispatch_capacity_held=dispatch_capacity_held,
         ):
             prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-            cap_usd = effective_cap(
-                global_cap_usd=self.config.cost_cap_per_issue_usd,
-                binding_override=binding.cost_cap_usd,
-            )
-            if cap_usd > 0 and prior_total >= cap_usd:
-                await self._mark_merge_conflict_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=(
-                        "merge-conflict cost cap reached: "
-                        f"${prior_total:.4f}"
-                    ),
-                    merge_run_id=merge_run_id,
-                )
-                return False
 
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
@@ -5743,15 +5543,8 @@ class Orchestrator:
                 codex_model=binding.codex_model,
                 workspace_path=workspace_path,
             )
-            warning_pct = effective_warning_pct(
-                global_pct=self.config.cost_warning_pct,
-                binding_override=binding.cost_warning_pct,
-            )
-            warning_already_fired = (
-                await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
-            )
             try:
-                usage_delta, final_kind, final_returncode, cap_breached = (
+                usage_delta, final_kind, final_returncode = (
                     await self._run_stage_command(
                         binding=binding,
                         issue=issue,
@@ -5760,9 +5553,6 @@ class Orchestrator:
                         workspace_path=workspace_path,
                         stage="review_fix",
                         prior_total=prior_total,
-                        cap_usd=cap_usd,
-                        warning_pct=warning_pct,
-                        warning_already_fired=warning_already_fired,
                     )
                 )
             except Exception as e:  # noqa: BLE001
@@ -5795,31 +5585,6 @@ class Orchestrator:
                 self._workspace.release(binding, issue)
 
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
-
-            total_cost = prior_total + usage_delta.cost_usd
-            if cap_breached:
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        cap_breached=True,
-                        reason=f"merge-conflict cost cap reached: ${total_cost:.4f}",
-                    ),
-                )
-                await self._mark_merge_conflict_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=(
-                        "merge-conflict cost cap reached: "
-                        f"${total_cost:.4f}"
-                    ),
-                    merge_run_id=merge_run_id,
-                )
-                return False
 
             transition = on_runner_event(
                 stage="review",
@@ -9019,38 +8784,6 @@ class Orchestrator:
             )
             await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
 
-            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-            cap_usd = effective_cap(
-                global_cap_usd=self.config.cost_cap_per_issue_usd,
-                binding_override=binding.cost_cap_usd,
-            )
-            warning_pct = effective_warning_pct(
-                global_pct=self.config.cost_warning_pct,
-                binding_override=binding.cost_warning_pct,
-            )
-            warning_already_fired = (
-                await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
-            )
-
-            max_budget_usd: float | None = None
-            budget_limits: list[float] = []
-            if cap_usd > 0:
-                issue_remaining_budget_usd = cap_usd - prior_total
-                if issue_remaining_budget_usd <= 0:
-                    await self._handle_cap_breach(
-                        binding=binding,
-                        issue=issue,
-                        run_id=run_id,
-                        cumulative_total=prior_total,
-                        stage="acceptance",
-                    )
-                    return run_id
-                budget_limits.append(issue_remaining_budget_usd)
-            if binding.acceptance.cost_cap_usd > 0:
-                budget_limits.append(binding.acceptance.cost_cap_usd)
-            if budget_limits:
-                max_budget_usd = min(budget_limits)
-
             verdict: AcceptanceVerdict | None = None
             if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev", "preview"}:
                 verdict = AcceptanceVerdict(
@@ -9135,7 +8868,6 @@ class Orchestrator:
                                 ),
                                 criteria=criteria_predicates,
                                 stall_secs=binding.acceptance.time_cap_minutes * 60,
-                                max_budget_usd=max_budget_usd,
                                 preview_url=preview_url,
                                 dev_command=binding.acceptance.dev_command,
                                 dev_port=binding.acceptance.dev_port,
@@ -9171,26 +8903,6 @@ class Orchestrator:
             if verdict_usage.has_usage():
                 await _add_run_usage(self._conn, run_id, verdict_usage)
 
-            cap_breached = False
-            if verdict.cost > 0:
-                new_total = prior_total + verdict.cost
-                decision = evaluate_cost(
-                    previous_total=prior_total,
-                    new_total=new_total,
-                    cap_usd=cap_usd,
-                    warning_pct=warning_pct,
-                    warning_already_fired=warning_already_fired,
-                )
-                if decision.fire_warning:
-                    await self._post_cost_warning(
-                        binding=binding,
-                        issue=issue,
-                        run_id=run_id,
-                        stage="acceptance",
-                        cumulative_total=new_total,
-                        cap_usd=cap_usd,
-                    )
-                cap_breached = decision.cap_breached
             comment_url = await self._post_acceptance_verdict_comment(
                 binding=binding,
                 issue=issue,
@@ -9204,16 +8916,6 @@ class Orchestrator:
                 artifacts_url=comment_url or verdict.hero_screenshot_url,
                 preview_url=verdict.preview_url,
             )
-
-            if cap_breached:
-                await self._handle_cap_breach(
-                    binding=binding,
-                    issue=issue,
-                    run_id=run_id,
-                    cumulative_total=prior_total + verdict.cost,
-                    stage="acceptance",
-                )
-                return run_id
 
             ended_at = datetime.now(UTC).isoformat()
             if verdict.kind == "pass":
@@ -10126,7 +9828,7 @@ class Orchestrator:
         prior_total = await db.runs.cost_for_issue(self._conn, issue_id)
 
         try:
-            cumulative_usage, final_kind, final_returncode, cap_breached = (
+            cumulative_usage, final_kind, final_returncode = (
                 await self._run_agent(
                     binding=binding,
                     issue=issue,
@@ -10153,17 +9855,6 @@ class Orchestrator:
 
         # 4. Persist accumulated usage.
         await _add_run_usage(self._conn, run_id, cumulative_usage)
-
-        # Cost cap breach: park the issue for operator action; do not open a PR.
-        if cap_breached:
-            await self._handle_cap_breach(
-                binding=binding,
-                issue=issue,
-                storage_issue_id=issue_id,
-                run_id=run_id,
-                cumulative_total=prior_total + cumulative_usage.cost_usd,
-            )
-            return run_id
 
         transition = on_runner_event(
             stage="implement",
@@ -10479,7 +10170,6 @@ class Orchestrator:
                     cumulative_usage,
                     final_kind,
                     final_returncode,
-                    cap_breached,
                 ) = await self._run_merge_agent(
                     binding=binding,
                     issue=issue,
@@ -10501,20 +10191,6 @@ class Orchestrator:
                 return run_id
 
             await _add_run_usage(self._conn, run_id, cumulative_usage)
-
-            if cap_breached:
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=(
-                        "cost cap reached: "
-                        f"${prior_total + cumulative_usage.cost_usd:.4f}"
-                    ),
-                    cap_breached=True,
-                )
-                return run_id
 
             transition = on_runner_event(
                 stage="merge",
@@ -10839,7 +10515,6 @@ class Orchestrator:
         create_run: bool = False,
         final_kind: str | None = None,
         returncode: int | None = None,
-        cap_breached: bool = False,
         exc: BaseException | str | None = None,
     ) -> None:
         if create_run:
@@ -10911,7 +10586,6 @@ class Orchestrator:
                     status="needs_approval",
                     final_kind=final_kind,
                     returncode=returncode,
-                    cap_breached=cap_breached,
                     exc=exc,
                     reason=reason,
                 ),
@@ -11005,18 +10679,6 @@ class Orchestrator:
                 cap=cap,
             )
 
-            cost_cap_usd = effective_cap(
-                global_cap_usd=self.config.cost_cap_per_issue_usd,
-                binding_override=binding.cost_cap_usd,
-            )
-            # Read prior cost BEFORE creating the local_review row so
-            # the local-review cost-cap check uses the implement cost
-            # alone — the new row would otherwise contribute $0 and
-            # noisy up the trace.
-            prior_cost_usd = await db.runs.cost_for_issue(
-                self._conn, storage_issue_id
-            )
-
             # Create a `runs` row so the local-review cost participates
             # in `cost_for_issue` going forward (re-dispatches see the
             # full historical cost) and so the runs-history audit trail
@@ -11063,8 +10725,6 @@ class Orchestrator:
                     command_secs=self.config.command_timeout_secs,
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
-                    cost_cap_usd=cost_cap_usd,
-                    prior_cost_usd=prior_cost_usd,
                     on_iteration=_on_iteration,
                 )
             finally:
@@ -11140,10 +10800,6 @@ class Orchestrator:
                     ended_at=datetime.now(UTC).isoformat(),
                     **_termination_kwargs(
                         status=status,
-                        cap_breached=(
-                            result is not None
-                            and result.outcome == LoopOutcome.COST_CAP_BREACHED
-                        ),
                         reason=_local_review_termination_reason(result),
                     ),
                 )
@@ -11292,13 +10948,7 @@ class Orchestrator:
         result: LoopResult | None,
     ) -> None:
         reason = _local_review_termination_reason(result)
-        await self._fail_run(
-            run_id,
-            reason,
-            cap_breached=(
-                result is not None and result.outcome == LoopOutcome.COST_CAP_BREACHED
-            ),
-        )
+        await self._fail_run(run_id, reason)
 
         tracker = self.tracker(binding)
         try:
@@ -11787,37 +11437,14 @@ class Orchestrator:
         run_id: str,
         workspace_path: Path,
         prior_total: float,
-    ) -> tuple[UsageDelta, str, int | None, bool]:
+    ) -> tuple[UsageDelta, str, int | None]:
         """Spawn the runner and consume events. Returns
-        (cumulative_usage, final_event_kind, final_returncode, cap_breached).
+        (cumulative_usage, final_event_kind, final_returncode).
 
-        After every cost-emitting event the cumulative *issue* total
-        (prior runs + this run so far) is checked against the cap and
-        warning threshold. The once-per-issue cost-warning comment is
-        posted the first time the threshold is crossed; on cap breach the
-        runner is killed and the loop exits with `cap_breached=True` so
-        the caller can park the issue at `needs_approval`.
+        `prior_total` is the issue's cost so far; it is threaded through
+        only so activity comments can show a cumulative running total.
         """
         storage_issue_id = storage_issue_id or issue.id
-        cap_usd = effective_cap(
-            global_cap_usd=self.config.cost_cap_per_issue_usd,
-            binding_override=binding.cost_cap_usd,
-        )
-        warning_pct = effective_warning_pct(
-            global_pct=self.config.cost_warning_pct,
-            binding_override=binding.cost_warning_pct,
-        )
-        warning_already_fired = (
-            await db.cost_marks.warning_posted_at(self._conn, storage_issue_id)
-            is not None
-        )
-
-        max_budget_usd: float | None = None
-        if cap_usd > 0:
-            max_budget_usd = cap_usd - prior_total
-            if max_budget_usd <= 0:
-                return UsageDelta(), "cost_cap", None, True
-
         prompt = implement_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
@@ -11826,7 +11453,6 @@ class Orchestrator:
         command = build_runner_command(
             binding.agent,
             prompt,
-            max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
         )
@@ -11839,9 +11465,6 @@ class Orchestrator:
             workspace_path=workspace_path,
             stage="implement",
             prior_total=prior_total,
-            cap_usd=cap_usd,
-            warning_pct=warning_pct,
-            warning_already_fired=warning_already_fired,
         )
 
     async def _run_merge_agent(
@@ -11853,25 +11476,7 @@ class Orchestrator:
         workspace_path: Path,
         pr_url: str,
         prior_total: float,
-    ) -> tuple[UsageDelta, str, int | None, bool]:
-        cap_usd = effective_cap(
-            global_cap_usd=self.config.cost_cap_per_issue_usd,
-            binding_override=binding.cost_cap_usd,
-        )
-        warning_pct = effective_warning_pct(
-            global_pct=self.config.cost_warning_pct,
-            binding_override=binding.cost_warning_pct,
-        )
-        warning_already_fired = (
-            await db.cost_marks.warning_posted_at(self._conn, issue.id) is not None
-        )
-
-        max_budget_usd: float | None = None
-        if cap_usd > 0:
-            max_budget_usd = cap_usd - prior_total
-            if max_budget_usd <= 0:
-                return UsageDelta(), "cost_cap", None, True
-
+    ) -> tuple[UsageDelta, str, int | None]:
         prompt = merge_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
@@ -11881,7 +11486,6 @@ class Orchestrator:
         command = build_merge_runner_command(
             binding.agent,
             prompt,
-            max_budget_usd=max_budget_usd,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
         )
@@ -11893,9 +11497,6 @@ class Orchestrator:
             workspace_path=workspace_path,
             stage="merge",
             prior_total=prior_total,
-            cap_usd=cap_usd,
-            warning_pct=warning_pct,
-            warning_already_fired=warning_already_fired,
         )
 
     async def _run_stage_command(
@@ -11909,10 +11510,7 @@ class Orchestrator:
         workspace_path: Path,
         stage: str,
         prior_total: float,
-        cap_usd: float,
-        warning_pct: int,
-        warning_already_fired: bool,
-    ) -> tuple[UsageDelta, str, int | None, bool]:
+    ) -> tuple[UsageDelta, str, int | None]:
         storage_issue_id = storage_issue_id or issue.id
         spec = RunnerSpec(
             run_id=run_id,
@@ -11929,7 +11527,6 @@ class Orchestrator:
         cumulative_usage = UsageDelta()
         final_kind = "exit"
         final_returncode: int | None = None
-        cap_breached = False
         cost_estimator = _UsageCostEstimator(
             agent=binding.agent,
             codex_model=binding.codex_model,
@@ -11950,34 +11547,9 @@ class Orchestrator:
                         logf.write(ev.line + "\n")
                         usage = parse_event_line(ev.line)
                         if usage is not None:
-                            usage_delta = cost_estimator.delta(usage)
-                            previous_total = prior_total + cumulative_usage.cost_usd
                             cumulative_usage = _sum_usage(
-                                cumulative_usage, usage_delta
+                                cumulative_usage, cost_estimator.delta(usage)
                             )
-                            new_total = prior_total + cumulative_usage.cost_usd
-                            if cap_breached:
-                                continue
-                            decision = evaluate_cost(
-                                previous_total=previous_total,
-                                new_total=new_total,
-                                cap_usd=cap_usd,
-                                warning_pct=warning_pct,
-                                warning_already_fired=warning_already_fired,
-                            )
-                            if decision.fire_warning:
-                                warning_already_fired = await self._post_cost_warning(
-                                    binding=binding,
-                                    issue=issue,
-                                    storage_issue_id=storage_issue_id,
-                                    run_id=run_id,
-                                    stage=stage,
-                                    cumulative_total=new_total,
-                                    cap_usd=cap_usd,
-                                )
-                            if decision.cap_breached:
-                                cap_breached = True
-                                await self._kill_active_runner(run_id)
                         await self._record_activity_stdout(
                             session=activity,
                             binding=binding,
@@ -12006,7 +11578,7 @@ class Orchestrator:
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        return cumulative_usage, final_kind, final_returncode, cap_breached
+        return cumulative_usage, final_kind, final_returncode
 
     async def _run_fix_agent(
         self,
@@ -12152,132 +11724,6 @@ class Orchestrator:
                 await db.runs.update_pid(self._conn, run_id, None)
         return cumulative_usage, final_kind, final_returncode
 
-    async def _post_cost_warning(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        storage_issue_id: str | None = None,
-        run_id: str,
-        stage: str,
-        cumulative_total: float,
-        cap_usd: float,
-    ) -> bool:
-        storage_issue_id = storage_issue_id or issue.id
-        pct = int(round(cumulative_total / cap_usd * 100)) if cap_usd > 0 else 0
-        body = cost_warning(
-            CommentVars(
-                stage=stage,
-                repo=binding.github_repo,
-                issue=0,
-                run_id=run_id,
-                cost=f"${cumulative_total:.4f}",
-                pct=pct,
-            )
-        )
-        tracker = self.tracker(binding)
-        try:
-            await tracker.post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning("cost_warning comment failed on %s: %s", issue.identifier, e)
-            return False
-        await db.cost_marks.mark_warning_posted(
-            self._conn, storage_issue_id, datetime.now(UTC).isoformat()
-        )
-        return True
-
-    async def _handle_cap_breach(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        storage_issue_id: str | None = None,
-        run_id: str,
-        cumulative_total: float,
-        stage: str = "implement",
-    ) -> None:
-        """Park a cost-capped issue and post a cost-cap escalation."""
-        storage_issue_id = storage_issue_id or issue.id
-        try:
-            tracker = self.tracker(binding)
-            try:
-                states = await self._states_for_binding(binding)
-            except LinearError as e:
-                log.warning(
-                    "could not load states for %s after cap breach on %s: %s",
-                    binding.linear_team_key,
-                    issue.identifier,
-                    e,
-                )
-                states = {}
-            needs_approval_id = states.get(binding.linear_states.needs_approval)
-            blocked_id = states.get(binding.linear_states.blocked)
-            parked = False
-            if needs_approval_id is not None:
-                try:
-                    await tracker.move_issue(issue.id, needs_approval_id)
-                except LinearError as e:
-                    log.warning(
-                        "could not move %s to needs_approval after cap breach: %s",
-                        issue.identifier,
-                        e,
-                    )
-                else:
-                    parked = True
-            else:
-                log.warning(
-                    "no needs_approval state for team %s; cannot park %s",
-                    binding.linear_team_key,
-                    issue.identifier,
-                )
-            if not parked and blocked_id is not None:
-                try:
-                    await tracker.move_issue(issue.id, blocked_id)
-                except LinearError as e:
-                    log.warning(
-                        "could not move %s to blocked after cap breach: %s",
-                        issue.identifier,
-                        e,
-                    )
-                else:
-                    parked = True
-            if not parked and blocked_id is None:
-                log.warning(
-                    "no blocked state for team %s; leaving %s out of the ready queue "
-                    "after cap breach",
-                    binding.linear_team_key,
-                    issue.identifier,
-                )
-            body = cost_cap_reached(
-                CommentVars(
-                    stage=stage,
-                    repo=binding.github_repo,
-                    issue=0,
-                    run_id=run_id,
-                    cost=f"${cumulative_total:.4f}",
-                    trigger="cost_cap",
-                )
-            )
-            try:
-                await tracker.post_comment(issue.id, truncate_body(body))
-            except LinearError as e:
-                log.warning(
-                    "cost_cap_reached comment failed on %s: %s", issue.identifier, e
-                )
-            await self._track_operator_wait(storage_issue_id, run_id, binding)
-        finally:
-            await db.runs.update_status(
-                self._conn,
-                run_id,
-                "failed",
-                ended_at=datetime.now(UTC).isoformat(),
-                **_termination_kwargs(
-                    status="failed",
-                    cap_breached=True,
-                    reason=f"cost cap reached: ${cumulative_total:.4f}",
-                ),
-            )
-
     async def _fail_run(
         self,
         run_id: str,
@@ -12285,7 +11731,6 @@ class Orchestrator:
         *,
         final_kind: str | None = None,
         returncode: int | None = None,
-        cap_breached: bool = False,
         exc: BaseException | str | None = None,
     ) -> None:
         await db.runs.update_status(
@@ -12297,7 +11742,6 @@ class Orchestrator:
                 status="failed",
                 final_kind=final_kind,
                 returncode=returncode,
-                cap_breached=cap_breached,
                 exc=exc,
                 reason=reason,
             ),
@@ -12314,7 +11758,6 @@ class Orchestrator:
         binding: RepoBinding | None = None,
         final_kind: str | None = None,
         returncode: int | None = None,
-        cap_breached: bool = False,
         exc: BaseException | str | None = None,
     ) -> None:
         storage_issue_id = storage_issue_id or issue.id
@@ -12323,7 +11766,6 @@ class Orchestrator:
             reason,
             final_kind=final_kind,
             returncode=returncode,
-            cap_breached=cap_breached,
             exc=exc,
         )
         target_state_id = rollback_state_id

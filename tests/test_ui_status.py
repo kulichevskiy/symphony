@@ -122,7 +122,6 @@ async def test_canonical_status_prefers_operator_wait_and_keeps_kind_subtitle(
         (db.operator_waits.KIND_IMPLEMENT_FAILED, "halted"),
         (db.operator_waits.KIND_REVIEW_FAILED, "halted"),
         (db.operator_waits.KIND_REVIEW_STOPPED, "paused"),
-        (db.operator_waits.KIND_COST_CAP, "paused"),
         (db.operator_waits.KIND_MERGE, "awaiting_merge"),
     ],
 )

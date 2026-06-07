@@ -888,7 +888,6 @@ async def test_red_ci_local_only_parks_non_converged_local_review(
     [
         LoopOutcome.REVIEWER_FAILED,
         LoopOutcome.FIX_RUN_FAILED,
-        LoopOutcome.COST_CAP_BREACHED,
     ],
 )
 async def test_red_ci_local_only_blocks_local_review_infra_failure(

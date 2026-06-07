@@ -1,7 +1,7 @@
 """DAO for the `operator_waits` table.
 
 Rows represent stopped runs that are still waiting for an operator slash
-command, such as cost-cap approval/rejection or a manually stopped review
+command, such as a failed implement run or a manually stopped review
 monitor that can later resume via `$retry` or `$approve`.
 """
 
@@ -13,7 +13,6 @@ import aiosqlite
 
 from . import state_transitions
 
-KIND_COST_CAP = "cost_cap"
 KIND_IMPLEMENT_FAILED = "implement_failed"
 KIND_REVIEW_FAILED = "review_failed"
 KIND_REVIEW_STOPPED = "review_stopped"
@@ -246,7 +245,6 @@ async def delete(
 __all__ = [
     "KIND_ACCEPTANCE_BLOCKED",
     "KIND_ACCEPTANCE_REJECTED",
-    "KIND_COST_CAP",
     "KIND_IMPLEMENT_FAILED",
     "KIND_MERGE",
     "KIND_REVIEW_FAILED",

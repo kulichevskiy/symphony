@@ -71,7 +71,6 @@ review_iteration_cap: 6
 # the remote @codex bot; set higher for finicky codebases where
 # the reviewer needs more rounds.
 local_review_iteration_cap: 6
-cost_cap_per_issue_usd: 100.0
 
 # Review notes (per-binding `local_review` / `remote_review` booleans):
 #   local_review:  run the in-workspace reviewer loop before opening the PR;
