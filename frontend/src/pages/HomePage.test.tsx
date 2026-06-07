@@ -16,6 +16,7 @@ import {
   PerProvider,
   PerTeam,
   SectionTotals,
+  sortTeams,
   SpendOverview,
 } from "./HomePage";
 
@@ -101,22 +102,61 @@ describe("SectionTotals", () => {
   });
 });
 
+describe("sortTeams", () => {
+  const teams: TeamSpend[] = [
+    { key: "VIB", input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 30, cache_read_tokens: 9, issues: 4 },
+    { key: "ADJ", input_tokens: 1_000_000, output_tokens: 8_000_000, cache_write_tokens: 10, cache_read_tokens: 7, issues: 9 },
+    { key: "SYM", input_tokens: 2_000_000, output_tokens: 3_000_000, cache_write_tokens: 20, cache_read_tokens: 8, issues: 1 },
+  ];
+  const keys = (rows: TeamSpend[]) => rows.map((t) => t.key);
+
+  it("does not mutate the input array", () => {
+    const before = keys(teams);
+    sortTeams(teams, "output_tokens", "desc");
+    expect(keys(teams)).toEqual(before);
+  });
+
+  it("sorts numeric columns ascending and descending", () => {
+    expect(keys(sortTeams(teams, "output_tokens", "desc"))).toEqual(["ADJ", "SYM", "VIB"]);
+    expect(keys(sortTeams(teams, "output_tokens", "asc"))).toEqual(["VIB", "SYM", "ADJ"]);
+    expect(keys(sortTeams(teams, "input_tokens", "desc"))).toEqual(["VIB", "SYM", "ADJ"]);
+    expect(keys(sortTeams(teams, "issues", "asc"))).toEqual(["SYM", "VIB", "ADJ"]);
+    expect(keys(sortTeams(teams, "cache_write_tokens", "desc"))).toEqual(["VIB", "SYM", "ADJ"]);
+    expect(keys(sortTeams(teams, "cache_read_tokens", "asc"))).toEqual(["ADJ", "SYM", "VIB"]);
+  });
+
+  it("sorts the team column alphabetically", () => {
+    expect(keys(sortTeams(teams, "key", "asc"))).toEqual(["ADJ", "SYM", "VIB"]);
+    expect(keys(sortTeams(teams, "key", "desc"))).toEqual(["VIB", "SYM", "ADJ"]);
+  });
+});
+
 describe("PerTeam", () => {
-  it("sorts teams by output and shows a mix-bar plus the four figures", () => {
-    const teams: TeamSpend[] = [
-      { key: "VIB", input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 4 },
-      { key: "ADJ", input_tokens: 1_000_000, output_tokens: 8_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 9 },
-    ];
+  const teams: TeamSpend[] = [
+    { key: "VIB", input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 4 },
+    { key: "ADJ", input_tokens: 1_000_000, output_tokens: 8_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 9 },
+  ];
+
+  it("renders a table with the team breakdown columns", () => {
     const markup = renderToStaticMarkup(<PerTeam teams={teams} />);
-    // ADJ wins on output even though VIB has more input → no summed total decides order.
+    expect(markup).toContain("<table");
+    for (const header of [">Team", ">Issues", ">mix", ">in", ">out", ">cache-write", ">cache-read"]) {
+      expect(markup).toContain(header);
+    }
+    // Numeric columns are right-aligned like IssueTable.
+    expect(markup).toContain("text-right");
+    // mix column keeps the proportional bar with its tooltip.
+    expect(markup).toContain("width:");
+  });
+
+  it("defaults to output descending with a direction arrow", () => {
+    const markup = renderToStaticMarkup(<PerTeam teams={teams} />);
+    // ADJ wins on output even though VIB has more input → output, not a summed total, decides order.
     expect(markup.indexOf("ADJ")).toBeLessThan(markup.indexOf("VIB"));
     expect(markup).not.toContain("$");
-    expect(markup).toContain("9 issues");
-    // The four explicit figures (output shown), and a proportional mix-bar.
     expect(markup).toContain('title="8000000">8M</span>');
-    expect(markup).toContain("cache-w");
-    expect(markup).toContain("cache-r");
-    expect(markup).toContain("width:");
+    // Active-column descending indicator.
+    expect(markup).toContain("↓");
   });
 });
 
