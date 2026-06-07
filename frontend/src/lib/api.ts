@@ -17,7 +17,7 @@ export type CanonicalStatus = {
   stuck_for: number | null;
 };
 
-export type IssueScope = "active" | "recent" | "all" | "done";
+export type IssueScope = "active" | "done";
 export type IssueWarning = "no_progress";
 
 export interface IssueSummary {
