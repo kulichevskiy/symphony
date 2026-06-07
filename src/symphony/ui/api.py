@@ -51,7 +51,6 @@ class IssueSummary(BaseModel):
 
 class IssueScope(StrEnum):
     ACTIVE = "active"
-    RECENT = "recent"
     ALL = "all"
     DONE = "done"
 
@@ -131,35 +130,6 @@ WITH active_issue_ids(issue_id) AS (
           WHERE ip.issue_id = rs.issue_id
       )
 ),
-latest_events(issue_id, ts) AS (
-    SELECT issue_id, started_at FROM runs
-    UNION ALL
-    SELECT issue_id, ended_at FROM runs WHERE ended_at IS NOT NULL
-    UNION ALL
-    SELECT issue_id, created_at FROM issue_prs
-    UNION ALL
-    SELECT issue_id, merged_at FROM issue_prs WHERE merged_at IS NOT NULL
-    UNION ALL
-    SELECT issue_id, seen_at FROM comment_events
-    UNION ALL
-    SELECT r.issue_id, m.last_event_at
-    FROM activity_comment_marks m
-    JOIN runs r ON r.id = m.run_id
-    WHERE m.last_event_at IS NOT NULL
-    UNION ALL
-    SELECT r.issue_id, m.last_posted_at
-    FROM activity_comment_marks m
-    JOIN runs r ON r.id = m.run_id
-    WHERE m.last_posted_at IS NOT NULL
-    UNION ALL
-    SELECT issue_id, warning_posted_at
-    FROM issue_cost_marks
-    WHERE warning_posted_at IS NOT NULL
-    UNION ALL
-    SELECT issue_id, created_at FROM operator_waits
-    UNION ALL
-    SELECT issue_id, ts FROM state_transitions
-),
 latest_activity_sources(issue_id, ts) AS (
     SELECT issue_id, COALESCE(ended_at, started_at) FROM runs
     UNION ALL
@@ -181,13 +151,6 @@ latest_activity(issue_id, latest_activity_ts) AS (
     FROM latest_activity_sources
     WHERE ts IS NOT NULL
     GROUP BY issue_id
-),
-recent_issue_ids(issue_id) AS (
-    SELECT issue_id
-    FROM latest_events
-    GROUP BY issue_id
-    ORDER BY MAX(ts) DESC, issue_id ASC
-    LIMIT 50
 )
 """
 
@@ -327,13 +290,6 @@ def _list_issues_query(
 
     if scope is IssueScope.ACTIVE:
         where.append("i.id IN (SELECT issue_id FROM active_issue_ids)")
-    elif scope is IssueScope.RECENT:
-        where.append(
-            "("
-            "i.id IN (SELECT issue_id FROM active_issue_ids) "
-            "OR i.id IN (SELECT issue_id FROM recent_issue_ids)"
-            ")"
-        )
     elif scope is IssueScope.DONE:
         # Candidate prefilter: completion plausibly within the window — either a
         # PR merged since the cutoff, or activity since the cutoff. The precise
