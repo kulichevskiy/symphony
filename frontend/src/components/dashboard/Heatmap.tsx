@@ -14,11 +14,41 @@ const HEAT_LEVELS = [
   "bg-blue-700 dark:bg-blue-400",
 ];
 
-export function heatLevel(tokens: number): number {
+/**
+ * Color thresholds for levels 1..4, derived from the distribution of
+ * non-zero days rather than fixed absolute token counts. Daily burn is
+ * highly skewed and its magnitude drifts over time, so static cutoffs
+ * saturate every active day into the top bucket (everything looks the
+ * same). Quartiles of the observed non-zero values spread active days
+ * evenly across the four shades, like GitHub's contribution graph.
+ */
+export type HeatThresholds = [number, number, number];
+
+function quantile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+}
+
+export function buildHeatThresholds(days: HeatmapDay[]): HeatThresholds {
+  const nz = days
+    .map((d) => d.tokens)
+    .filter((t) => t > 0)
+    .sort((a, b) => a - b);
+  if (nz.length === 0) {
+    return [Infinity, Infinity, Infinity];
+  }
+  return [quantile(nz, 0.25), quantile(nz, 0.5), quantile(nz, 0.75)];
+}
+
+export function heatLevel(tokens: number, [t1, t2, t3]: HeatThresholds): number {
   if (!tokens) return 0;
-  if (tokens < 3_000_000) return 1;
-  if (tokens < 8_000_000) return 2;
-  if (tokens < 16_000_000) return 3;
+  if (tokens <= t1) return 1;
+  if (tokens <= t2) return 2;
+  if (tokens <= t3) return 3;
   return 4;
 }
 
@@ -117,6 +147,7 @@ export function Heatmap({
   const wrapRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const { weeks, monthMarks } = buildGrid(days, start, end);
+  const thresholds = buildHeatThresholds(days);
 
   // The 53-week grid overflows its column; the newest weeks (where activity
   // lives) are on the right, so start scrolled to the end like GitHub does.
@@ -180,7 +211,7 @@ export function Heatmap({
                       key={di}
                       className={cn(
                         "rounded-sm ring-1 ring-inset ring-black/[0.04] transition-colors dark:ring-white/[0.04]",
-                        HEAT_LEVELS[heatLevel(cell.tokens)],
+                        HEAT_LEVELS[heatLevel(cell.tokens, thresholds)],
                       )}
                       style={{ width: CELL, height: CELL }}
                       onMouseEnter={(e) => onEnter(e, cell)}
