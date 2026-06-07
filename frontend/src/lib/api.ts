@@ -66,7 +66,6 @@ export interface SpendSummary {
 
 export interface HeatmapDay {
   date: string;
-  tokens: number;
   input_tokens: number;
   output_tokens: number;
   cache_write_tokens: number;

@@ -101,7 +101,6 @@ class SpendSummary(BaseModel):
 
 class HeatmapDay(BaseModel):
     date: str
-    tokens: int
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -252,10 +251,6 @@ GROUP BY u.provider
 _SPEND_HEATMAP_QUERY = """
 SELECT
     substr(r.started_at, 1, 10) AS day,
-    COALESCE(SUM(
-        r.input_tokens + r.output_tokens
-        + r.cache_write_tokens + r.cache_read_tokens
-    ), 0) AS tokens,
     COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
     COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
     COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
@@ -274,10 +269,6 @@ ORDER BY day
 _SPEND_HEATMAP_BY_PROVIDER_QUERY = """
 SELECT
     substr(r.started_at, 1, 10) AS day,
-    COALESCE(SUM(
-        u.input_tokens + u.output_tokens
-        + u.cache_write_tokens + u.cache_read_tokens
-    ), 0) AS tokens,
     COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
     COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
     COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
@@ -651,7 +642,6 @@ def create_api_router(
             days=[
                 HeatmapDay(
                     date=str(r["day"]),
-                    tokens=int(r["tokens"] or 0),
                     input_tokens=int(r["input_tokens"] or 0),
                     output_tokens=int(r["output_tokens"] or 0),
                     cache_write_tokens=int(r["cache_write_tokens"] or 0),

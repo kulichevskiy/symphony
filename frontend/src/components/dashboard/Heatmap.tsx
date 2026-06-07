@@ -16,13 +16,14 @@ const HEAT_LEVELS = [
 
 /**
  * Quantile cut points for the four shaded levels, derived from the non-zero
- * days in the current slice so the gradation stays readable whatever provider
- * is selected. Returns three ascending thresholds; an all-zero slice yields a
- * trivial scale where every positive day lands in the top level.
+ * output of the days in the current slice so the gradation scales to the max
+ * daily output in the visible range whatever provider is selected. Returns
+ * three ascending thresholds; an all-zero slice yields a trivial scale where
+ * every positive day lands in the top level.
  */
-export function buildHeatThresholds(days: { tokens: number }[]): number[] {
+export function buildHeatThresholds(days: { output_tokens: number }[]): number[] {
   const vals = days
-    .map((d) => d.tokens)
+    .map((d) => d.output_tokens)
     .filter((t) => t > 0)
     .sort((a, b) => a - b);
   if (vals.length === 0) return [1, 1, 1];
@@ -31,11 +32,11 @@ export function buildHeatThresholds(days: { tokens: number }[]): number[] {
   return [q(0.25), q(0.5), q(0.75)];
 }
 
-export function heatLevel(tokens: number, thresholds: number[]): number {
-  if (!tokens) return 0;
-  if (tokens < thresholds[0]) return 1;
-  if (tokens < thresholds[1]) return 2;
-  if (tokens < thresholds[2]) return 3;
+export function heatLevel(output: number, thresholds: number[]): number {
+  if (!output) return 0;
+  if (output < thresholds[0]) return 1;
+  if (output < thresholds[1]) return 2;
+  if (output < thresholds[2]) return 3;
   return 4;
 }
 
@@ -47,7 +48,6 @@ const MONTHS = [
 type Cell = {
   iso: string;
   date: Date;
-  tokens: number;
   issues: number;
   input: number;
   output: number;
@@ -88,7 +88,6 @@ function buildGrid(days: HeatmapDay[], start: string, end: string): {
     cells.push({
       iso,
       date: new Date(d),
-      tokens: hit?.tokens ?? 0,
       issues: hit?.issues ?? 0,
       input: hit?.input_tokens ?? 0,
       output: hit?.output_tokens ?? 0,
@@ -198,7 +197,7 @@ export function Heatmap({
                       key={di}
                       className={cn(
                         "rounded-sm ring-1 ring-inset ring-black/[0.04] transition-colors dark:ring-white/[0.04]",
-                        HEAT_LEVELS[heatLevel(cell.tokens, thresholds)],
+                        HEAT_LEVELS[heatLevel(cell.output, thresholds)],
                       )}
                       style={{ width: CELL, height: CELL }}
                       onMouseEnter={(e) => onEnter(e, cell)}
@@ -227,7 +226,6 @@ export function Heatmap({
             {formatLongDate(hover.cell.iso)}
           </div>
           <div className="mt-0.5 font-mono text-muted-foreground">
-            <Tk value={hover.cell.tokens} /> tokens ·{" "}
             {hover.cell.issues} {hover.cell.issues === 1 ? "issue" : "issues"}
           </div>
           <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 border-t border-border pt-1 font-mono text-[11px] text-muted-foreground">

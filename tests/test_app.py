@@ -1932,12 +1932,12 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     # The 2024 run is outside the 60-day window.
     assert "2024-01-01" not in by_day
     assert by_day["2026-05-17"] == {
-        "date": "2026-05-17", "tokens": 150,
+        "date": "2026-05-17",
         "input_tokens": 150, "output_tokens": 0,
         "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 2,
     }
     assert by_day["2026-05-16"] == {
-        "date": "2026-05-16", "tokens": 10,
+        "date": "2026-05-16",
         "input_tokens": 10, "output_tokens": 0,
         "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 1,
     }
@@ -1989,7 +1989,7 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
     claude_days = {d["date"]: d for d in claude_resp.json()["days"]}
     # Only claude's single run on 05-17; 05-16 has no claude rows.
     assert claude_days["2026-05-17"] == {
-        "date": "2026-05-17", "tokens": 190,
+        "date": "2026-05-17",
         "input_tokens": 100, "output_tokens": 20,
         "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
     }
@@ -1998,12 +1998,12 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
     assert codex_resp.status_code == 200
     codex_days = {d["date"]: d for d in codex_resp.json()["days"]}
     assert codex_days["2026-05-17"] == {
-        "date": "2026-05-17", "tokens": 65,
+        "date": "2026-05-17",
         "input_tokens": 50, "output_tokens": 5,
         "cache_write_tokens": 5, "cache_read_tokens": 5, "issues": 1,
     }
     assert codex_days["2026-05-16"] == {
-        "date": "2026-05-16", "tokens": 15,
+        "date": "2026-05-16",
         "input_tokens": 10, "output_tokens": 2,
         "cache_write_tokens": 0, "cache_read_tokens": 3, "issues": 1,
     }

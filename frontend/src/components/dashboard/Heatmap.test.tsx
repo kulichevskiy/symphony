@@ -4,7 +4,9 @@ import { buildHeatThresholds, heatLevel } from "./Heatmap";
 
 describe("buildHeatThresholds", () => {
   it("derives quantile cut points from non-zero days only", () => {
-    const days = [0, 0, 100, 200, 300, 400].map((tokens) => ({ tokens }));
+    const days = [0, 0, 100, 200, 300, 400].map((output_tokens) => ({
+      output_tokens,
+    }));
     const thresholds = buildHeatThresholds(days);
     // Three ascending cut points splitting the four positive values.
     expect(thresholds).toHaveLength(3);
@@ -15,16 +17,23 @@ describe("buildHeatThresholds", () => {
 
   it("recomputes a smaller scale for a quieter slice", () => {
     const big = buildHeatThresholds(
-      [1_000_000, 5_000_000, 12_000_000, 20_000_000].map((tokens) => ({ tokens })),
+      [1_000_000, 5_000_000, 12_000_000, 20_000_000].map((output_tokens) => ({
+        output_tokens,
+      })),
     );
     const small = buildHeatThresholds(
-      [10_000, 50_000, 120_000, 200_000].map((tokens) => ({ tokens })),
+      [10_000, 50_000, 120_000, 200_000].map((output_tokens) => ({
+        output_tokens,
+      })),
     );
     expect(small[2]).toBeLessThan(big[2]);
   });
 
   it("stays usable when there is no activity", () => {
-    const thresholds = buildHeatThresholds([{ tokens: 0 }, { tokens: 0 }]);
+    const thresholds = buildHeatThresholds([
+      { output_tokens: 0 },
+      { output_tokens: 0 },
+    ]);
     expect(heatLevel(0, thresholds)).toBe(0);
   });
 });
