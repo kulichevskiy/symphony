@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { HeatmapDay } from "@/lib/api";
 import { formatCost, formatLongDate } from "@/lib/format";
@@ -103,7 +103,17 @@ export function Heatmap({
     null,
   );
   const wrapRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const { weeks, monthMarks } = buildGrid(days, start, end);
+
+  // The 53-week grid overflows its column; the newest weeks (where activity
+  // lives) are on the right, so start scrolled to the end like GitHub does.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollLeft = el.scrollWidth;
+    }
+  }, [weeks.length]);
 
   function onEnter(e: React.MouseEvent<HTMLDivElement>, cell: Cell) {
     const wrap = wrapRef.current?.getBoundingClientRect();
@@ -133,7 +143,7 @@ export function Heatmap({
             </div>
           ))}
         </div>
-        <div className="min-w-0 overflow-x-auto pb-1">
+        <div ref={scrollRef} className="min-w-0 overflow-x-auto pb-1">
           <div className="relative mb-1 h-3" style={{ width: weeks.length * COL_W }}>
             {monthMarks.map((m) => (
               <span
