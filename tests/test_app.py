@@ -1804,13 +1804,13 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
     assert response.status_code == 200
     body = response.json()
     assert body["totals"] == {
-        "total_tokens": 100 + 20 + 30 + 40 + 10 + 2 + 3 + 4 + 50 + 5 + 5 + 5 + 200 + 40 + 60 + 80,
         "input_tokens": 360,
         "output_tokens": 67,
         "cache_write_tokens": 98,
         "cache_read_tokens": 129,
         "issues": 3,
     }
+    assert "total_tokens" not in body["totals"]
     # Sorted by output tokens desc: WEB (40) before ENG (27).
     assert [t["key"] for t in body["per_team"]] == ["WEB", "ENG"]
     eng = next(t for t in body["per_team"] if t["key"] == "ENG")

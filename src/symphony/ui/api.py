@@ -63,7 +63,6 @@ class TeamSpend(BaseModel):
 
 
 class SpendTotals(BaseModel):
-    total_tokens: int
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -376,12 +375,6 @@ def _build_spend_summary(
         acc["issues"] += issues
     per_team.sort(key=lambda t: t.output_tokens, reverse=True)
     totals = SpendTotals(
-        total_tokens=(
-            acc["input_tokens"]
-            + acc["output_tokens"]
-            + acc["cache_write_tokens"]
-            + acc["cache_read_tokens"]
-        ),
         input_tokens=acc["input_tokens"],
         output_tokens=acc["output_tokens"],
         cache_write_tokens=acc["cache_write_tokens"],

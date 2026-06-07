@@ -44,7 +44,6 @@ export interface TokenSplit {
 }
 
 export interface SpendTotals extends TokenSplit {
-  total_tokens: number;
   issues: number;
 }
 
