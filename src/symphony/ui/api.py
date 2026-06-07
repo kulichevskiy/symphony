@@ -72,9 +72,31 @@ class SpendTotals(BaseModel):
     issues: int
 
 
+class ModelSpend(BaseModel):
+    model: str
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
+    issues: int
+
+
+class ProviderSpend(BaseModel):
+    provider: str
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
+    issues: int
+    per_model: list[ModelSpend]
+
+
 class SpendSummary(BaseModel):
     totals: SpendTotals
     per_team: list[TeamSpend]
+    per_provider: list[ProviderSpend]
 
 
 class HeatmapDay(BaseModel):
@@ -197,6 +219,34 @@ GROUP BY i.team_key
 """
 
 
+# Token attribution by (provider, model), aggregated from the run_model_usage
+# child table. Issue counts are DISTINCT per group so a model used across many
+# issues counts each once.
+_SPEND_PER_MODEL_QUERY = """
+SELECT
+    u.provider AS provider,
+    u.model AS model,
+    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+    COUNT(DISTINCT r.issue_id) AS issues
+FROM run_model_usage u
+JOIN runs r ON r.id = u.run_id
+GROUP BY u.provider, u.model
+"""
+
+
+# Provider-level distinct issue counts, computed separately because summing
+# the per-model issue counts would double-count issues spanning two models.
+_SPEND_PER_PROVIDER_ISSUES_QUERY = """
+SELECT u.provider AS provider, COUNT(DISTINCT r.issue_id) AS issues
+FROM run_model_usage u
+JOIN runs r ON r.id = u.run_id
+GROUP BY u.provider
+"""
+
+
 # Bucket spend by UTC day. Timestamps are stored as UTC ISO strings, so the
 # first 10 chars are the calendar day and lexicographic compare is date-correct.
 _SPEND_HEATMAP_QUERY = """
@@ -218,7 +268,79 @@ ORDER BY day
 """
 
 
-def _build_spend_summary(rows: list[dict[str, object]]) -> SpendSummary:
+def _build_per_provider(
+    model_rows: list[dict[str, object]],
+    provider_issue_rows: list[dict[str, object]],
+) -> list[ProviderSpend]:
+    provider_issues = {
+        str(row["provider"]): int(row["issues"] or 0) for row in provider_issue_rows
+    }
+    models_by_provider: dict[str, list[ModelSpend]] = {}
+    acc_by_provider: dict[str, dict[str, int]] = {}
+    for row in model_rows:
+        provider = str(row["provider"])
+        inp = int(row["input_tokens"] or 0)
+        out = int(row["output_tokens"] or 0)
+        cw = int(row["cache_write_tokens"] or 0)
+        cr = int(row["cache_read_tokens"] or 0)
+        models_by_provider.setdefault(provider, []).append(
+            ModelSpend(
+                model=str(row["model"]),
+                total_tokens=inp + out + cw + cr,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_write_tokens=cw,
+                cache_read_tokens=cr,
+                issues=int(row["issues"] or 0),
+            )
+        )
+        acc = acc_by_provider.setdefault(
+            provider,
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_read_tokens": 0,
+            },
+        )
+        acc["input_tokens"] += inp
+        acc["output_tokens"] += out
+        acc["cache_write_tokens"] += cw
+        acc["cache_read_tokens"] += cr
+
+    per_provider: list[ProviderSpend] = []
+    for provider, acc in acc_by_provider.items():
+        models = sorted(
+            models_by_provider[provider],
+            key=lambda m: m.total_tokens,
+            reverse=True,
+        )
+        per_provider.append(
+            ProviderSpend(
+                provider=provider,
+                total_tokens=(
+                    acc["input_tokens"]
+                    + acc["output_tokens"]
+                    + acc["cache_write_tokens"]
+                    + acc["cache_read_tokens"]
+                ),
+                input_tokens=acc["input_tokens"],
+                output_tokens=acc["output_tokens"],
+                cache_write_tokens=acc["cache_write_tokens"],
+                cache_read_tokens=acc["cache_read_tokens"],
+                issues=provider_issues.get(provider, 0),
+                per_model=models,
+            )
+        )
+    per_provider.sort(key=lambda p: p.total_tokens, reverse=True)
+    return per_provider
+
+
+def _build_spend_summary(
+    rows: list[dict[str, object]],
+    model_rows: list[dict[str, object]] | None = None,
+    provider_issue_rows: list[dict[str, object]] | None = None,
+) -> SpendSummary:
     per_team: list[TeamSpend] = []
     acc = {
         "input_tokens": 0,
@@ -263,7 +385,12 @@ def _build_spend_summary(rows: list[dict[str, object]]) -> SpendSummary:
         cache_read_tokens=acc["cache_read_tokens"],
         issues=acc["issues"],
     )
-    return SpendSummary(totals=totals, per_team=per_team)
+    per_provider = _build_per_provider(
+        model_rows or [], provider_issue_rows or []
+    )
+    return SpendSummary(
+        totals=totals, per_team=per_team, per_provider=per_provider
+    )
 
 
 def _list_issues_query(
@@ -465,11 +592,15 @@ def create_api_router(
             conn = await ui_db_pool.connection()
             cur = await conn.execute(_SPEND_SUMMARY_QUERY)
             rows = [dict(row) for row in await cur.fetchall()]
+            cur = await conn.execute(_SPEND_PER_MODEL_QUERY)
+            model_rows = [dict(row) for row in await cur.fetchall()]
+            cur = await conn.execute(_SPEND_PER_PROVIDER_ISSUES_QUERY)
+            provider_issue_rows = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503, detail="UI database is not available"
             ) from exc
-        return _build_spend_summary(rows)
+        return _build_spend_summary(rows, model_rows, provider_issue_rows)
 
     @router.get("/spend/heatmap", response_model=SpendHeatmap)
     async def spend_heatmap(

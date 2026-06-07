@@ -49,9 +49,19 @@ export interface TeamSpend extends SpendTotals {
   key: string;
 }
 
+export interface ModelSpend extends SpendTotals {
+  model: string;
+}
+
+export interface ProviderSpend extends SpendTotals {
+  provider: string;
+  per_model: ModelSpend[];
+}
+
 export interface SpendSummary {
   totals: SpendTotals;
   per_team: TeamSpend[];
+  per_provider: ProviderSpend[];
 }
 
 export interface HeatmapDay {

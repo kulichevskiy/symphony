@@ -2,9 +2,20 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
-import type { IssueSummary, SpendSummary, TeamSpend } from "@/lib/api";
+import type {
+  IssueSummary,
+  ProviderSpend,
+  SpendSummary,
+  TeamSpend,
+} from "@/lib/api";
 
-import { HeadlineTotals, IssueTable, PerTeam, SectionTotals } from "./HomePage";
+import {
+  HeadlineTotals,
+  IssueTable,
+  PerProvider,
+  PerTeam,
+  SectionTotals,
+} from "./HomePage";
 
 const NOW_MS = Date.UTC(2026, 4, 17, 12, 0, 0);
 
@@ -88,6 +99,49 @@ describe("PerTeam", () => {
     expect(markup).not.toContain("$");
     expect(markup).toContain('title="9000000">9M</span>');
     expect(markup).toContain("9 issues");
+  });
+});
+
+describe("PerProvider", () => {
+  const providers: ProviderSpend[] = [
+    {
+      provider: "codex",
+      total_tokens: 2_000_000,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+      issues: 2,
+      per_model: [
+        { model: "gpt-5.5", total_tokens: 2_000_000, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 2 },
+      ],
+    },
+    {
+      provider: "claude",
+      total_tokens: 9_000_000,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+      issues: 7,
+      per_model: [
+        { model: "claude-opus-4-8", total_tokens: 9_000_000, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 7 },
+      ],
+    },
+  ];
+
+  it("sorts providers by total tokens and shows issue counts", () => {
+    const markup = renderToStaticMarkup(<PerProvider providers={providers} />);
+    expect(markup.indexOf("claude")).toBeLessThan(markup.indexOf("codex"));
+    expect(markup).not.toContain("$");
+    expect(markup).toContain('title="9000000">9M</span>');
+    expect(markup).toContain("7 issues");
+  });
+
+  it("keeps model rows collapsed until the provider is expanded", () => {
+    const markup = renderToStaticMarkup(<PerProvider providers={providers} />);
+    expect(markup).not.toContain("claude-opus-4-8");
+    expect(markup).not.toContain("gpt-5.5");
   });
 });
 
