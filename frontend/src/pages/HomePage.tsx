@@ -30,6 +30,12 @@ const TEAM_TINT: Record<string, string> = {
   HQ: "bg-amber-500",
 };
 
+const HEATMAP_PROVIDERS: SegmentedOption[] = [
+  { value: "all", label: "All" },
+  { value: "claude", label: "claude" },
+  { value: "codex", label: "codex" },
+];
+
 const DONE_WINDOWS: Array<SegmentedOption & { secs: number }> = [
   { value: "24h", label: "24h", secs: 86_400 },
   { value: "7d", label: "7d", secs: 7 * 86_400 },
@@ -208,21 +214,33 @@ export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
 function SpendOverview({
   summary,
   heatmap,
+  heatProvider,
+  onChangeHeatProvider,
   onPickTeam,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
+  heatProvider: string;
+  onChangeHeatProvider: (value: string) => void;
   onPickTeam: (key: string) => void;
 }) {
   return (
     <Card className="p-5">
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <div className="min-w-0">
-          <div className="mb-3 flex items-baseline justify-between">
+          <div className="mb-3 flex items-baseline justify-between gap-3">
             <h2 className="text-sm font-semibold">Daily token burn</h2>
-            <span className="font-mono text-xs text-muted-foreground">
-              last 12 months
-            </span>
+            <div className="flex items-center gap-3">
+              <Segmented
+                ariaLabel="Heatmap provider"
+                options={HEATMAP_PROVIDERS}
+                value={heatProvider}
+                onChange={onChangeHeatProvider}
+              />
+              <span className="font-mono text-xs text-muted-foreground">
+                last 12 months
+              </span>
+            </div>
           </div>
           {heatmap ? (
             <Heatmap days={heatmap.days} start={heatmap.start} end={heatmap.end} />
@@ -389,6 +407,7 @@ export function HomePage() {
   const nowMs = useNowMs();
   const [query, setQuery] = useState("");
   const [doneWindow, setDoneWindow] = useState("7d");
+  const [heatProvider, setHeatProvider] = useState("all");
   const win = DONE_WINDOWS.find((w) => w.value === doneWindow) ?? DONE_WINDOWS[1];
 
   const summaryQuery = useQuery({
@@ -397,9 +416,11 @@ export function HomePage() {
     refetchInterval: 30_000,
   });
   const heatmapQuery = useQuery({
-    queryKey: ["spend-heatmap"],
-    queryFn: () => fetchSpendHeatmap(371),
+    queryKey: ["spend-heatmap", heatProvider],
+    queryFn: () =>
+      fetchSpendHeatmap(371, heatProvider === "all" ? undefined : heatProvider),
     refetchInterval: 60_000,
+    placeholderData: (prev) => prev,
   });
   const activeQuery = useQuery({
     queryKey: ["issues", "active"],
@@ -456,6 +477,8 @@ export function HomePage() {
       <SpendOverview
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
+        heatProvider={heatProvider}
+        onChangeHeatProvider={setHeatProvider}
         onPickTeam={(k) => setQuery(k)}
       />
 

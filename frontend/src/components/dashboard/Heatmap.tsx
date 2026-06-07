@@ -14,11 +14,28 @@ const HEAT_LEVELS = [
   "bg-blue-700 dark:bg-blue-400",
 ];
 
-export function heatLevel(tokens: number): number {
+/**
+ * Quantile cut points for the four shaded levels, derived from the non-zero
+ * days in the current slice so the gradation stays readable whatever provider
+ * is selected. Returns three ascending thresholds; an all-zero slice yields a
+ * trivial scale where every positive day lands in the top level.
+ */
+export function buildHeatThresholds(days: { tokens: number }[]): number[] {
+  const vals = days
+    .map((d) => d.tokens)
+    .filter((t) => t > 0)
+    .sort((a, b) => a - b);
+  if (vals.length === 0) return [1, 1, 1];
+  const q = (p: number) =>
+    vals[Math.min(vals.length - 1, Math.floor(p * vals.length))];
+  return [q(0.25), q(0.5), q(0.75)];
+}
+
+export function heatLevel(tokens: number, thresholds: number[]): number {
   if (!tokens) return 0;
-  if (tokens < 3_000_000) return 1;
-  if (tokens < 8_000_000) return 2;
-  if (tokens < 16_000_000) return 3;
+  if (tokens < thresholds[0]) return 1;
+  if (tokens < thresholds[1]) return 2;
+  if (tokens < thresholds[2]) return 3;
   return 4;
 }
 
@@ -117,6 +134,7 @@ export function Heatmap({
   const wrapRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const { weeks, monthMarks } = buildGrid(days, start, end);
+  const thresholds = buildHeatThresholds(days);
 
   // The 53-week grid overflows its column; the newest weeks (where activity
   // lives) are on the right, so start scrolled to the end like GitHub does.
@@ -180,7 +198,7 @@ export function Heatmap({
                       key={di}
                       className={cn(
                         "rounded-sm ring-1 ring-inset ring-black/[0.04] transition-colors dark:ring-white/[0.04]",
-                        HEAT_LEVELS[heatLevel(cell.tokens)],
+                        HEAT_LEVELS[heatLevel(cell.tokens, thresholds)],
                       )}
                       style={{ width: CELL, height: CELL }}
                       onMouseEnter={(e) => onEnter(e, cell)}
