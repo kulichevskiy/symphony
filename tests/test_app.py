@@ -324,6 +324,23 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             title="Other team issue",
             team_key="WEB",
         )
+        # Make each issue active (a running run) so it lists under `active`;
+        # this test only asserts the identifier sort within a single status.
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r-first', 'issue-first', 'implement', 'running', NULL,
+                 '2026-05-17T10:00:00Z'),
+                ('r-known', 'issue-known', 'implement', 'running', NULL,
+                 '2026-05-17T10:00:00Z'),
+                ('r-ten', 'issue-ten', 'implement', 'running', NULL,
+                 '2026-05-17T10:00:00Z'),
+                ('r-web', 'issue-web', 'implement', 'running', NULL,
+                 '2026-05-17T10:00:00Z')
+            """
+        )
+        await conn.commit()
         app = create_app(
             _Handler(),
             conn,
@@ -336,72 +353,16 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues?scope=all")
+            response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
     assert response.status_code == 200
-    assert response.json() == [
-        {
-            "id": "issue-first",
-            "identifier": "ADJ-1",
-            "title": "Earlier issue",
-            "team_key": "ADJ",
-            **_token_totals(),
-            "latest_activity_ts": None,
-            "latest_activity_age_secs": None,
-            "canonical_status": {
-                "state": "idle",
-                "since": None,
-                "subtitle": None,
-                "stuck_for": None,
-            },
-        },
-        {
-            "id": "issue-known",
-            "identifier": "ADJ-2",
-            "title": "Known tracked issue",
-            "team_key": "ADJ",
-            **_token_totals(),
-            "latest_activity_ts": None,
-            "latest_activity_age_secs": None,
-            "canonical_status": {
-                "state": "idle",
-                "since": None,
-                "subtitle": None,
-                "stuck_for": None,
-            },
-        },
-        {
-            "id": "issue-ten",
-            "identifier": "ADJ-10",
-            "title": "Later issue",
-            "team_key": "ADJ",
-            **_token_totals(),
-            "latest_activity_ts": None,
-            "latest_activity_age_secs": None,
-            "canonical_status": {
-                "state": "idle",
-                "since": None,
-                "subtitle": None,
-                "stuck_for": None,
-            },
-        },
-        {
-            "id": "issue-web",
-            "identifier": "WEB-1",
-            "title": "Other team issue",
-            "team_key": "WEB",
-            **_token_totals(),
-            "latest_activity_ts": None,
-            "latest_activity_age_secs": None,
-            "canonical_status": {
-                "state": "idle",
-                "since": None,
-                "subtitle": None,
-                "stuck_for": None,
-            },
-        },
+    assert [issue["identifier"] for issue in response.json()] == [
+        "ADJ-1",
+        "ADJ-2",
+        "ADJ-10",
+        "WEB-1",
     ]
 
 
@@ -426,19 +387,12 @@ async def test_api_namespace_keeps_placeholder_404(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
+async def test_api_issues_active_scope_returns_canonical_statuses_sorted(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn,
-            id="idle",
-            identifier="ENG-4",
-            title="Idle issue",
-            team_key="ENG",
-        )
         await db.issues.upsert(
             conn,
             id="running",
@@ -501,7 +455,7 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues?scope=all")
+            response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
@@ -553,21 +507,6 @@ async def test_api_issues_all_scope_returns_canonical_statuses_sorted(
                 "stuck_for": None,
             },
         },
-        {
-            "id": "idle",
-            "identifier": "ENG-4",
-            "title": "Idle issue",
-            "team_key": "ENG",
-            **_token_totals(),
-            "latest_activity_ts": None,
-            "latest_activity_age_secs": None,
-            "canonical_status": {
-                "state": "idle",
-                "since": None,
-                "subtitle": None,
-                "stuck_for": None,
-            },
-        },
     ]
 
 
@@ -610,6 +549,11 @@ async def test_api_issues_returns_per_issue_token_aggregates(
                  9, 10, 11, 12)
             """
         )
+        # `without-runs` has no runs; a review_state row makes it active (so it
+        # lists under `active`) without contributing any tokens.
+        await conn.execute(
+            "INSERT INTO review_state (issue_id, iteration) VALUES ('without-runs', 1)"
+        )
         await conn.commit()
         app = create_app(
             _Handler(),
@@ -624,7 +568,7 @@ async def test_api_issues_returns_per_issue_token_aggregates(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues?scope=all")
+            response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
@@ -654,7 +598,6 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
             ("comment-activity", "ENG-3", "Comment and activity mark"),
             ("merged-pr", "ENG-4", "Merged PR"),
             ("operator-wait", "ENG-5", "Operator wait"),
-            ("idle", "ENG-6", "No activity"),
         ]:
             await db.issues.upsert(
                 conn,
@@ -732,6 +675,23 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
             )
             """
         )
+        # Active markers so every issue lists under `active`. review_state is a
+        # neutral marker (no activity timestamp) for the PR-less issues;
+        # merged-pr already has a PR, so a stale running run keeps it active
+        # without out-ranking its merge timestamp.
+        await conn.execute(
+            """
+            INSERT INTO review_state (issue_id, iteration) VALUES
+                ('run-ended', 1), ('comment-activity', 1)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES ('run-merged-keepalive', 'merged-pr', 'merge', 'running', NULL,
+                    '2020-01-01T00:00:00Z')
+            """
+        )
         await conn.commit()
         app = create_app(
             _Handler(),
@@ -746,7 +706,7 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues?scope=all")
+            response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
@@ -762,8 +722,6 @@ async def test_api_issues_includes_latest_activity_from_existing_timestamps(
     assert rows["merged-pr"]["latest_activity_age_secs"] == 300
     assert rows["operator-wait"]["latest_activity_ts"] == "2026-05-17T11:52:00Z"
     assert rows["operator-wait"]["latest_activity_age_secs"] == 480
-    assert rows["idle"]["latest_activity_ts"] is None
-    assert rows["idle"]["latest_activity_age_secs"] is None
 
 
 @pytest.mark.asyncio
@@ -894,6 +852,15 @@ async def test_api_issues_q_filters_identifier_and_title_case_insensitively(
             title="Unrelated work",
             team_key="ADJ",
         )
+        # review_state makes each active (so they list under `active`) without
+        # adding tokens or activity.
+        await conn.execute(
+            """
+            INSERT INTO review_state (issue_id, iteration) VALUES
+                ('adj-12', 1), ('web-8', 1), ('adj-99', 1)
+            """
+        )
+        await conn.commit()
         app = create_app(
             _Handler(),
             conn,
@@ -906,8 +873,8 @@ async def test_api_issues_q_filters_identifier_and_title_case_insensitively(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            by_identifier = await client.get("/api/issues?scope=all&q=adj-12")
-            by_title = await client.get("/api/issues?scope=all&q=PAYMENTS")
+            by_identifier = await client.get("/api/issues?scope=active&q=adj-12")
+            by_title = await client.get("/api/issues?scope=active&q=PAYMENTS")
     finally:
         await conn.close()
 
@@ -945,6 +912,10 @@ async def test_api_issues_uses_one_clock_value_for_all_canonical_statuses(
             title="Second issue",
             team_key="ENG",
         )
+        await conn.execute(
+            "INSERT INTO review_state (issue_id, iteration) VALUES ('issue-a', 1), ('issue-b', 1)"
+        )
+        await conn.commit()
         app = create_app(
             _Handler(),
             conn,
@@ -958,7 +929,7 @@ async def test_api_issues_uses_one_clock_value_for_all_canonical_statuses(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues?scope=all")
+            response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
@@ -986,6 +957,10 @@ async def test_api_issues_maps_canonical_status_db_errors_to_503(
             title="First issue",
             team_key="ENG",
         )
+        await conn.execute(
+            "INSERT INTO review_state (issue_id, iteration) VALUES ('issue-a', 1)"
+        )
+        await conn.commit()
         app = create_app(
             _Handler(),
             conn,
@@ -999,7 +974,7 @@ async def test_api_issues_maps_canonical_status_db_errors_to_503(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get("/api/issues?scope=all")
+            response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
@@ -1272,7 +1247,7 @@ async def test_issue_detail_include_external_promotes_latest_drift(
                 "/api/issues/iss-drift?include_external=1"
             )
             plain_response = await client.get("/api/issues/iss-drift")
-            list_response = await client.get("/api/issues?scope=all")
+            list_response = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
 
@@ -1405,7 +1380,7 @@ async def test_no_progress_warning_surfaces_on_list_and_detail(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            list_response = await client.get("/api/issues?scope=all")
+            list_response = await client.get("/api/issues?scope=active")
             detail_response = await client.get("/api/issues/iss-no-progress")
     finally:
         await conn.close()
@@ -1463,7 +1438,7 @@ async def test_zero_no_progress_threshold_is_preserved(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            list_response = await client.get("/api/issues?scope=all")
+            list_response = await client.get("/api/issues?scope=active")
             detail_response = await client.get("/api/issues/iss-zero-threshold")
     finally:
         await conn.close()

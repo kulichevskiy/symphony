@@ -51,7 +51,6 @@ class IssueSummary(BaseModel):
 
 class IssueScope(StrEnum):
     ACTIVE = "active"
-    ALL = "all"
     DONE = "done"
 
 
