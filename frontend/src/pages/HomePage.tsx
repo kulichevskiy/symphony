@@ -95,6 +95,44 @@ export function HeadlineTotals({
   );
 }
 
+export type TeamSortKey =
+  | "key"
+  | "issues"
+  | "input_tokens"
+  | "output_tokens"
+  | "cache_write_tokens"
+  | "cache_read_tokens";
+
+type SortDir = "asc" | "desc";
+
+/** Sort teams by a column without mutating the input. `key` sorts alphabetically. */
+export function sortTeams(
+  teams: TeamSpend[],
+  key: TeamSortKey,
+  dir: SortDir,
+): TeamSpend[] {
+  const factor = dir === "asc" ? 1 : -1;
+  return [...teams].sort((a, b) => {
+    const cmp = key === "key" ? a.key.localeCompare(b.key) : a[key] - b[key];
+    return cmp * factor;
+  });
+}
+
+const TEAM_COLUMNS: Array<{
+  key: TeamSortKey;
+  label: string;
+  numeric: boolean;
+  sortable: boolean;
+}> = [
+  { key: "key", label: "Team", numeric: false, sortable: true },
+  { key: "issues", label: "Issues", numeric: true, sortable: true },
+  { key: "output_tokens", label: "mix", numeric: false, sortable: false },
+  { key: "input_tokens", label: "in", numeric: true, sortable: true },
+  { key: "output_tokens", label: "out", numeric: true, sortable: true },
+  { key: "cache_write_tokens", label: "cache-write", numeric: true, sortable: true },
+  { key: "cache_read_tokens", label: "cache-read", numeric: true, sortable: true },
+];
+
 export function PerTeam({
   teams,
   onPick,
@@ -102,35 +140,90 @@ export function PerTeam({
   teams: TeamSpend[];
   onPick?: (key: string) => void;
 }) {
-  const sorted = [...teams].sort((a, b) => b.output_tokens - a.output_tokens);
+  const [sort, setSort] = useState<{ key: TeamSortKey; dir: SortDir }>({
+    key: "output_tokens",
+    dir: "desc",
+  });
+  const sorted = sortTeams(teams, sort.key, sort.dir);
+  const toggle = (key: TeamSortKey) =>
+    setSort((prev) =>
+      prev.key === key
+        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: key === "key" ? "asc" : "desc" },
+    );
+
   return (
-    <div className="divide-y divide-border/70 overflow-hidden rounded-md border border-border">
-      <div className="bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        Team
-      </div>
-      {sorted.map((t) => (
-        <button
-          key={t.key}
-          type="button"
-          onClick={() => onPick?.(t.key)}
-          className="flex w-full flex-col gap-1.5 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
-        >
-          <span className="flex items-center gap-2">
-            <span
-              className={cn(
-                "h-2 w-2 shrink-0 rounded-full",
-                TEAM_TINT[t.key] ?? "bg-slate-400",
-              )}
-            />
-            <span className="text-sm font-medium">{t.key}</span>
-            <span className="whitespace-nowrap text-xs text-muted-foreground">
-              {t.issues} issues
-            </span>
-          </span>
-          <MixBar split={t} />
-          <TokenFigures split={t} />
-        </button>
-      ))}
+    <div className="w-full overflow-x-auto rounded-md border border-border">
+      <table className="w-full caption-bottom text-sm">
+        <thead>
+          <tr className="border-b border-border bg-secondary/30">
+            {TEAM_COLUMNS.map((c) => {
+              const active = c.sortable && sort.key === c.key;
+              return (
+                <th
+                  key={c.label}
+                  scope="col"
+                  aria-sort={
+                    active ? (sort.dir === "asc" ? "ascending" : "descending") : undefined
+                  }
+                  onClick={c.sortable ? () => toggle(c.key) : undefined}
+                  className={cn(
+                    "h-9 px-3 align-middle text-xs font-medium uppercase tracking-wide text-muted-foreground",
+                    c.numeric ? "text-right" : "text-left",
+                    c.sortable && "cursor-pointer select-none hover:text-foreground",
+                  )}
+                >
+                  {c.label}
+                  {active && (
+                    <span aria-hidden className="ml-1">
+                      {sort.dir === "asc" ? "↑" : "↓"}
+                    </span>
+                  )}
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {sorted.map((t) => (
+            <tr
+              key={t.key}
+              className="cursor-pointer border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
+              onClick={() => onPick?.(t.key)}
+            >
+              <td className="whitespace-nowrap px-3 py-2.5">
+                <span className="flex items-center gap-2">
+                  <span
+                    className={cn(
+                      "h-2 w-2 shrink-0 rounded-full",
+                      TEAM_TINT[t.key] ?? "bg-slate-400",
+                    )}
+                  />
+                  <span className="text-sm font-medium">{t.key}</span>
+                </span>
+              </td>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
+                {t.issues}
+              </td>
+              <td className="w-full min-w-[6rem] px-3 py-2.5">
+                <MixBar split={t} />
+              </td>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
+                <Tk value={t.input_tokens} />
+              </td>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
+                <Tk value={t.output_tokens} />
+              </td>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
+                <Tk value={t.cache_write_tokens} />
+              </td>
+              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
+                <Tk value={t.cache_read_tokens} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
