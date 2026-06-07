@@ -51,8 +51,9 @@ def test_token_block_replaces_cost(template, stage) -> None:
     assert "Cost" not in body
     assert "cost" not in body
     assert "$0" not in body
-    # Token breakdown block: in/out/cache w/r + total (10+20+5+3=38).
-    assert "Tokens: in 10 · out 20 · cache w 5 / r 3 · total 38" in body
+    # Token breakdown block: in/out/cache w/r — no total clause.
+    assert "Tokens: in 10 · out 20 · cache w 5 / r 3" in body
+    assert "total" not in body
 
 
 def test_failed_comment_only_promises_retry_when_enabled() -> None:

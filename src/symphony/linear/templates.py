@@ -83,19 +83,13 @@ def token_block(v: CommentVars) -> str:
     """Render the per-issue token breakdown shown in outbound comments.
 
     Replaces the former dollar `cost` line: input / output / cache write /
-    cache read deltas plus their sum, so operators can gauge spend without a
-    pricing model baked into the comment.
+    cache read deltas as a 4-way inline split, so operators can gauge spend
+    without a pricing model baked into the comment. No total clause —
+    consistent with the "no total anywhere" rule applied across the UI.
     """
-    total = (
-        v.input_tokens
-        + v.output_tokens
-        + v.cache_write_tokens
-        + v.cache_read_tokens
-    )
     return (
         f"Tokens: in {v.input_tokens} · out {v.output_tokens} · "
-        f"cache w {v.cache_write_tokens} / r {v.cache_read_tokens} · "
-        f"total {total}"
+        f"cache w {v.cache_write_tokens} / r {v.cache_read_tokens}"
     )
 
 
