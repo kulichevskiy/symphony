@@ -36,7 +36,9 @@ frontend/vite.config.js
 
 # Local operator config / tool state
 config.local.yaml
-.claude/
+.claude/*
+# …except shared project skills, which are version-controlled
+!.claude/skills/
 .agents/
 
 # Symphony runtime state — event log + checked-out worktrees
