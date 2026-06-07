@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
-import { CapBar, type Checks, CheckSummary, Tk } from "@/components/dashboard/atoms";
+import { type Checks, CheckSummary, Tk } from "@/components/dashboard/atoms";
 import { LiveDot, StatusBadge } from "@/components/dashboard/StatusBadge";
 import { IssueTimeline } from "@/components/IssueTimeline";
 import { Badge } from "@/components/ui/badge";
@@ -16,7 +16,7 @@ import {
   type IssueDetail,
   type IssueExternalSnapshot,
 } from "@/lib/api";
-import { formatCost, formatRelative, formatTokens, formatUtc } from "@/lib/format";
+import { formatRelative, formatTokens, formatUtc } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import {
@@ -27,10 +27,6 @@ import {
   waitLabel,
 } from "./issueControls";
 
-// Mirrors config `cost_cap_per_issue_usd` (default). Surfaced as the per-issue
-// "credits" budget; there is no per-issue cap endpoint yet.
-const DEFAULT_CAP_USD = 100;
-
 type Cockpit = {
   status: string;
   stage: string;
@@ -38,7 +34,6 @@ type Cockpit = {
   since: string | null;
   activity: string | null;
   reason: string | null;
-  cost_usd: number;
   tokens: {
     input_tokens: number;
     output_tokens: number;
@@ -91,7 +86,6 @@ function deriveCockpit(
     }),
     { input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0 },
   );
-  const cost_usd = detail.runs.reduce((a, r) => a + r.cost_usd, 0);
 
   const gh = external?.github;
   const dbPr = detail.issue_prs[0];
@@ -133,7 +127,6 @@ function deriveCockpit(
     since: detail.canonical_status.since,
     activity: detail.latest_activity_ts ?? null,
     reason,
-    cost_usd,
     tokens,
     pr,
     waitingOn: detail.operator_waits[0]?.kind ?? null,
@@ -209,29 +202,21 @@ function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
   );
 }
 
-export function SpendCard({ c }: { c: Cockpit }) {
-  const pct = Math.min(100, (c.cost_usd / DEFAULT_CAP_USD) * 100);
-  const tone =
-    pct >= 90
-      ? "text-red-600 dark:text-red-400"
-      : pct >= 70
-        ? "text-amber-600 dark:text-amber-400"
-        : "text-foreground";
+export function TokensCard({ c }: { c: Cockpit }) {
+  const total =
+    c.tokens.input_tokens +
+    c.tokens.output_tokens +
+    c.tokens.cache_write_tokens +
+    c.tokens.cache_read_tokens;
   return (
-    <CockpitCard title="Spend & cap">
+    <CockpitCard title="Tokens">
       <div className="flex items-end justify-between">
-        <div className={cn("font-mono text-2xl font-semibold tracking-tight", tone)}>
-          {formatCost(c.cost_usd)}
+        <div className="font-mono text-2xl font-semibold tracking-tight text-foreground">
+          <Tk value={total} />
         </div>
         <div className="whitespace-nowrap font-mono text-xs text-muted-foreground">
-          of {formatCost(DEFAULT_CAP_USD)} cap
+          total
         </div>
-      </div>
-      <div className="mt-2">
-        <CapBar cost={c.cost_usd} cap={DEFAULT_CAP_USD} />
-      </div>
-      <div className="mt-1 text-right font-mono text-[11px] text-muted-foreground">
-        {pct.toFixed(0)}%
       </div>
       <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-border pt-3 font-mono text-xs text-muted-foreground">
         <span>in <Tk value={c.tokens.input_tokens} /></span>
@@ -636,7 +621,7 @@ export function IssuePage() {
           <div className="mt-4 space-y-4">
             <NowCard c={cockpit} nowMs={nowMs} />
             <div className="grid gap-4 sm:grid-cols-2">
-              <SpendCard c={cockpit} />
+              <TokensCard c={cockpit} />
               <PrCard pr={cockpit.pr} />
             </div>
             <CockpitCard
@@ -675,14 +660,13 @@ export function IssuePage() {
               <div className="pb-3">
                 <DebugSection title="Runs" defaultOpen>
                   <MiniTable
-                    columns={["id", "stage", "status", "started_at", "ended_at", "cost_usd", "in", "out", "cache-read"]}
+                    columns={["id", "stage", "status", "started_at", "ended_at", "in", "out", "cache-read"]}
                     rows={detail.runs.map((r) => ({
                       id: r.id,
                       stage: r.stage,
                       status: r.status,
                       started_at: formatUtc(r.started_at),
                       ended_at: r.ended_at ? formatUtc(r.ended_at) : null,
-                      cost_usd: formatCost(r.cost_usd),
                       in: formatTokens(r.input_tokens),
                       out: formatTokens(r.output_tokens),
                       "cache-read": formatTokens(r.cache_read_tokens),

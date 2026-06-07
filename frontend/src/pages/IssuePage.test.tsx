@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { CmdButton, PrCard, SpendCard } from "./IssuePage";
+import { CmdButton, PrCard, TokensCard } from "./IssuePage";
 import { applicability } from "./issueControls";
 
 describe("applicability", () => {
@@ -71,7 +71,6 @@ const cockpit = {
   since: "2026-06-07T15:28:00Z",
   activity: "2026-06-07T16:34:00Z",
   reason: null,
-  cost_usd: 13.09,
   tokens: {
     input_tokens: 2_100_000,
     output_tokens: 184_000,
@@ -90,12 +89,16 @@ const cockpit = {
   waitingOn: "review",
 };
 
-describe("SpendCard", () => {
-  it("shows spend, the $100 cap and percentage", () => {
-    const markup = renderToStaticMarkup(<SpendCard c={cockpit} />);
-    expect(markup).toContain("$13.09");
-    expect(markup).toContain("of $100.00 cap");
-    expect(markup).toContain("13%");
+describe("TokensCard", () => {
+  it("shows the token total and in/out/cache breakdown, no dollars", () => {
+    const markup = renderToStaticMarkup(<TokensCard c={cockpit} />);
+    expect(markup).not.toContain("$");
+    expect(markup).not.toContain("cap");
+    expect(markup).toContain("Tokens");
+    // total = 2.1M + 184k + 412k + 7.9M = 10.6M
+    expect(markup).toContain('title="10596000">10.6M</span>');
+    expect(markup).toContain('title="2100000">2.1M</span>');
+    expect(markup).toContain('title="7900000">7.9M</span>');
   });
 });
 

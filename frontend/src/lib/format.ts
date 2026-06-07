@@ -1,13 +1,5 @@
 export { formatTokens } from "./formatTokens";
 
-export function formatCost(value: number | null | undefined): string {
-  const v = value ?? 0;
-  if (Math.abs(v) >= 1000) {
-    return `$${Math.round(v).toLocaleString("en-US")}`;
-  }
-  return `$${v.toFixed(2)}`;
-}
-
 export function exactInt(value: number | null | undefined): string {
   return String(Math.round(value ?? 0));
 }

@@ -25,7 +25,6 @@ export interface IssueSummary {
   identifier: string;
   title: string;
   team_key: string;
-  cost_usd: number;
   input_tokens: number;
   output_tokens: number;
   cache_write_tokens: number;
@@ -38,7 +37,6 @@ export interface IssueSummary {
 }
 
 export interface SpendTotals {
-  cost_usd: number;
   total_tokens: number;
   input_tokens: number;
   output_tokens: number;
@@ -58,7 +56,6 @@ export interface SpendSummary {
 
 export interface HeatmapDay {
   date: string;
-  cost_usd: number;
   tokens: number;
   input_tokens: number;
   output_tokens: number;
@@ -98,7 +95,6 @@ export type IssueDetail = {
     pid: number | null;
     started_at: string;
     ended_at: string | null;
-    cost_usd: number;
     input_tokens: number;
     output_tokens: number;
     cache_write_tokens: number;
@@ -145,9 +141,6 @@ export type IssueDetail = {
     last_posted_at: string | null;
     last_fingerprint: string;
   }>;
-  issue_cost_marks: {
-    warning_posted_at: string | null;
-  } | null;
 };
 
 export type DriftSeverity = "drift" | "warning";

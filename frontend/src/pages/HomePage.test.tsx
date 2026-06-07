@@ -14,7 +14,6 @@ function issue(overrides: Partial<IssueSummary> = {}): IssueSummary {
     identifier: "VIB-16",
     title: "Stale issue",
     team_key: "VIB",
-    cost_usd: 0,
     input_tokens: 0,
     output_tokens: 0,
     cache_write_tokens: 0,
@@ -35,11 +34,10 @@ function renderTable(issues: IssueSummary[], mode: "active" | "done"): string {
 }
 
 describe("IssueTable", () => {
-  it("renders a cost column alongside abbreviated tokens", () => {
+  it("renders abbreviated token columns and no dollar column", () => {
     const markup = renderTable(
       [
         issue({
-          cost_usd: 13.09,
           input_tokens: 1_234_000,
           output_tokens: 340_000,
           cache_write_tokens: 999,
@@ -48,8 +46,8 @@ describe("IssueTable", () => {
       ],
       "active",
     );
-    expect(markup).toContain(">$</th>");
-    expect(markup).toContain("$13.09");
+    expect(markup).not.toContain(">$</th>");
+    expect(markup).not.toContain("$");
     expect(markup).toContain('title="1234000">1.2M</span>');
     expect(markup).toContain(">Last activity</th>");
   });
@@ -65,37 +63,37 @@ describe("IssueTable", () => {
 });
 
 describe("SectionTotals", () => {
-  it("sums cost and tokens for the visible rows", () => {
+  it("sums tokens for the visible rows", () => {
     const markup = renderToStaticMarkup(
       <SectionTotals
         issues={[
-          issue({ cost_usd: 1.5, input_tokens: 1000 }),
-          issue({ id: "iss-2", cost_usd: 2.5, input_tokens: 200 }),
+          issue({ input_tokens: 1000 }),
+          issue({ id: "iss-2", input_tokens: 200 }),
         ]}
       />,
     );
-    expect(markup).toContain("$4.00");
+    expect(markup).not.toContain("$");
     expect(markup).toContain('title="1200">1.2k</span>');
   });
 });
 
 describe("PerTeam", () => {
-  it("sorts teams by spend and shows issue counts", () => {
+  it("sorts teams by total tokens and shows issue counts", () => {
     const teams: TeamSpend[] = [
-      { key: "VIB", cost_usd: 100, total_tokens: 5_000_000, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 4 },
-      { key: "ADJ", cost_usd: 500, total_tokens: 9_000_000, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 9 },
+      { key: "VIB", total_tokens: 5_000_000, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 4 },
+      { key: "ADJ", total_tokens: 9_000_000, input_tokens: 0, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 9 },
     ];
     const markup = renderToStaticMarkup(<PerTeam teams={teams} />);
     expect(markup.indexOf("ADJ")).toBeLessThan(markup.indexOf("VIB"));
-    expect(markup).toContain("$500");
+    expect(markup).not.toContain("$");
+    expect(markup).toContain('title="9000000">9M</span>');
     expect(markup).toContain("9 issues");
   });
 });
 
 describe("HeadlineTotals", () => {
-  it("renders all-time spend and token total", () => {
+  it("renders the all-time token total and no dollars", () => {
     const totals: SpendSummary["totals"] = {
-      cost_usd: 8425,
       total_tokens: 1_200_000_000,
       input_tokens: 0,
       output_tokens: 0,
@@ -104,8 +102,8 @@ describe("HeadlineTotals", () => {
       issues: 172,
     };
     const markup = renderToStaticMarkup(<HeadlineTotals totals={totals} />);
-    expect(markup).toContain("Total spend");
-    expect(markup).toContain("$8,425");
+    expect(markup).toContain("Total tokens");
+    expect(markup).not.toContain("$");
     expect(markup).toContain("1.2B");
   });
 });

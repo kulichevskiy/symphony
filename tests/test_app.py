@@ -24,10 +24,8 @@ def _token_totals(
     output_tokens: int = 0,
     cache_write_tokens: int = 0,
     cache_read_tokens: int = 0,
-    cost_usd: float = 0.0,
-) -> dict[str, float]:
+) -> dict[str, int]:
     return {
-        "cost_usd": cost_usd,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_write_tokens": cache_write_tokens,
@@ -1015,7 +1013,6 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "pid": None,
                 "started_at": "2026-05-17T10:20:00Z",
                 "ended_at": None,
-                "cost_usd": 0.5,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "cache_write_tokens": 0,
@@ -1031,7 +1028,6 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "pid": 123,
                 "started_at": "2026-05-17T10:00:00Z",
                 "ended_at": "2026-05-17T10:10:00Z",
-                "cost_usd": 1.25,
                 "input_tokens": 100,
                 "output_tokens": 20,
                 "cache_write_tokens": 30,
@@ -1145,7 +1141,6 @@ async def test_issue_detail_api_serializes_run_termination_fields(
             "pid": None,
             "started_at": "2026-05-17T10:00:00Z",
             "ended_at": "2026-05-17T10:05:00Z",
-            "cost_usd": 0.0,
             "input_tokens": 0,
             "output_tokens": 0,
             "cache_write_tokens": 0,
@@ -1628,7 +1623,6 @@ async def test_issue_timeline_api_returns_merged_sorted_events(tmp_path: Path) -
                 "run_id": "run-timeline",
                 "stage": "implement",
                 "status": "completed",
-                "cost_usd": 2.5,
             },
         },
         {
@@ -1757,7 +1751,6 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
     assert response.status_code == 200
     body = response.json()
     assert body["totals"] == {
-        "cost_usd": 8.75,
         "total_tokens": 100 + 20 + 30 + 40 + 10 + 2 + 3 + 4 + 50 + 5 + 5 + 5 + 200 + 40 + 60 + 80,
         "input_tokens": 360,
         "output_tokens": 67,
@@ -1765,11 +1758,13 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
         "cache_read_tokens": 129,
         "issues": 3,
     }
-    # Sorted by spend desc: WEB ($5) before ENG ($3.75).
+    # Sorted by total tokens desc: WEB (380) before ENG (274).
     assert [t["key"] for t in body["per_team"]] == ["WEB", "ENG"]
     eng = next(t for t in body["per_team"] if t["key"] == "ENG")
-    assert eng["cost_usd"] == 3.75
+    assert eng["total_tokens"] == 100 + 20 + 30 + 40 + 10 + 2 + 3 + 4 + 50 + 5 + 5 + 5
     assert eng["issues"] == 2
+    assert "cost_usd" not in body["totals"]
+    assert "cost_usd" not in eng
 
 
 @pytest.mark.asyncio
@@ -1814,12 +1809,12 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     # The 2024 run is outside the 60-day window.
     assert "2024-01-01" not in by_day
     assert by_day["2026-05-17"] == {
-        "date": "2026-05-17", "cost_usd": 3.0, "tokens": 150,
+        "date": "2026-05-17", "tokens": 150,
         "input_tokens": 150, "output_tokens": 0,
         "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 2,
     }
     assert by_day["2026-05-16"] == {
-        "date": "2026-05-16", "cost_usd": 0.5, "tokens": 10,
+        "date": "2026-05-16", "tokens": 10,
         "input_tokens": 10, "output_tokens": 0,
         "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 1,
     }
@@ -1882,7 +1877,7 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
     week = wk.json()
     assert [i["identifier"] for i in week] == ["ENG-1"]
     assert week[0]["completed_at"] == "2026-05-16T10:00:00Z"
-    assert week[0]["cost_usd"] == 3.0
+    assert "cost_usd" not in week[0]
     assert week[0]["canonical_status"]["state"] == "done"
 
     # 30-day window includes both, newest first.

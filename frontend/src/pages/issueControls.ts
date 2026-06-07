@@ -138,7 +138,6 @@ export function waitLabel(kind: string): string {
   if (kind === "merge") return "merge approval";
   if (kind.startsWith("acceptance")) return "acceptance sign-off";
   if (kind.startsWith("review")) return "your review";
-  if (kind === "cost_cap") return "a cost-cap decision";
   if (kind === "implement_failed") return "a failed run decision";
   return kind.replace(/_/g, " ");
 }
