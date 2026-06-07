@@ -264,6 +264,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
                     ),
+                    ui_command_sink=orch,
                 )
                 server = uvicorn.Server(
                     build_server_config(

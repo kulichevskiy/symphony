@@ -1323,6 +1323,14 @@ class Orchestrator:
             _register_configured_trackers(self._trackers, config, tracker_or_registry)
         self._conn = conn
         self._shutdown = asyncio.Event()
+        # Operator commands submitted from the web UI. Enqueued by the HTTP
+        # handler, drained by the poll loop so they apply on the loop's turn
+        # (never concurrently with `_tick` on the shared connection). `_wake`
+        # interrupts the inter-tick sleep so a command applies near-instantly.
+        self._wake = asyncio.Event()
+        self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = (
+            asyncio.Queue()
+        )
         self._gh: GitHub = gh if gh is not None else GitHub()
         self._runner: Runner = runner if runner is not None else LocalRunner()
         self._workspace: Workspace = (
@@ -1604,6 +1612,64 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         self._shutdown.set()
+        self._wake.set()
+
+    def enqueue_web_command(self, issue_id: str, kind: SlashKind) -> str:
+        """Submit an operator command from the web UI.
+
+        Returns a command id and wakes the poll loop so the command is drained
+        and applied on the loop's next turn. Validation of issue existence and
+        command name happens in the HTTP handler; run eligibility is resolved
+        at drain time (mirrors the Linear slash-comment path).
+        """
+        command_id = uuid.uuid4().hex
+        self._web_commands.put_nowait((issue_id, kind, command_id))
+        self._wake.set()
+        return command_id
+
+    async def _drain_web_commands(self) -> None:
+        while True:
+            try:
+                issue_id, kind, command_id = self._web_commands.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                await self._apply_web_command(issue_id, kind, command_id)
+            except Exception:  # noqa: BLE001 — a bad command must not kill the loop
+                log.exception(
+                    "web command failed (issue=%s kind=%s)", issue_id, kind
+                )
+
+    async def _apply_web_command(
+        self, issue_id: str, kind: SlashKind, command_id: str
+    ) -> None:
+        run_id = await self._web_command_run_id(issue_id)
+        if run_id is None:
+            log.warning(
+                "web command $%s for issue %s has no eligible run; dropping",
+                kind.value,
+                issue_id,
+            )
+            return
+        intent = SlashIntent(
+            kind=kind,
+            comment_id=f"web-{command_id}",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        await self._handle_slash_intent(issue_id, run_id, intent)
+
+    async def _web_command_run_id(self, issue_id: str) -> str | None:
+        run_id = self._dispatch_run_ids.get(
+            issue_id
+        ) or self._review_poll_issue_ids.get(issue_id)
+        if run_id is None:
+            for iid, rid in await self._parked_manual_merge_slash_pairs():
+                if iid == issue_id:
+                    run_id = rid
+                    break
+        if run_id is None or not self._slash_command_run_eligible(run_id):
+            return None
+        return run_id
 
     async def _states_for_binding(self, binding: RepoBinding) -> dict[str, str]:
         state_key = _state_cache_key(binding)
@@ -1636,13 +1702,20 @@ class Orchestrator:
         log.info("orchestrator entering poll loop (interval=%ds)", self.config.poll_interval_secs)
         try:
             while not self._shutdown.is_set():
+                # Clear before draining so a command enqueued during this
+                # iteration re-sets `_wake` and is picked up immediately rather
+                # than waiting out the full poll interval.
+                self._wake.clear()
+                await self._drain_web_commands()
                 try:
                     await self._tick()
                 except Exception:  # noqa: BLE001 — must not kill the loop
                     log.exception("poll cycle failed")
+                if self._shutdown.is_set():
+                    break
                 try:
                     await asyncio.wait_for(
-                        self._shutdown.wait(), timeout=self.config.poll_interval_secs
+                        self._wake.wait(), timeout=self.config.poll_interval_secs
                     )
                 except TimeoutError:
                     pass

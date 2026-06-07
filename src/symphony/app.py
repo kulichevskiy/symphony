@@ -23,7 +23,7 @@ from .github.webhook import (
     create_github_webhook_router,
 )
 from .linear.client import Linear
-from .ui.api import create_api_router
+from .ui.api import CommandSink, create_api_router
 from .ui.db import ReadOnlyDbPool
 from .ui.external import ExternalSnapshotService
 from .ui.issues import create_issue_detail_router
@@ -67,6 +67,7 @@ def create_app(
     ui_external_github: GitHub | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
+    ui_command_sink: CommandSink | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     ui_pool = (
@@ -148,6 +149,7 @@ def create_app(
                 clock=clock,
                 status_thresholds=ui_status_thresholds,
                 no_progress_threshold=ui_pr_no_progress_threshold,
+                command_sink=ui_command_sink,
             )
         )
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST
