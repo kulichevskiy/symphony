@@ -190,7 +190,7 @@ export function Heatmap({
       </div>
       {hover ? (
         <div
-          className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-full rounded-md border border-border bg-popover px-2.5 py-1.5 text-xs shadow-lg"
+          className="pointer-events-none absolute z-30 -translate-x-1/2 -translate-y-full whitespace-nowrap rounded-md border border-border bg-popover px-2.5 py-1.5 text-xs shadow-lg"
           style={{ left: hover.left, top: hover.top - 6 }}
         >
           <div className="font-medium text-foreground">
