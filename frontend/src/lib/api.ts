@@ -17,7 +17,7 @@ export type CanonicalStatus = {
   stuck_for: number | null;
 };
 
-export type IssueScope = "active" | "recent" | "all";
+export type IssueScope = "active" | "recent" | "all" | "done";
 export type IssueWarning = "no_progress";
 
 export interface IssueSummary {
@@ -25,6 +25,7 @@ export interface IssueSummary {
   identifier: string;
   title: string;
   team_key: string;
+  cost_usd: number;
   input_tokens: number;
   output_tokens: number;
   cache_write_tokens: number;
@@ -33,6 +34,49 @@ export interface IssueSummary {
   latest_activity_age_secs: number | null;
   canonical_status: CanonicalStatus;
   warnings?: IssueWarning[];
+  completed_at?: string | null;
+}
+
+export interface SpendTotals {
+  cost_usd: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  issues: number;
+}
+
+export interface TeamSpend extends SpendTotals {
+  key: string;
+}
+
+export interface SpendSummary {
+  totals: SpendTotals;
+  per_team: TeamSpend[];
+}
+
+export interface HeatmapDay {
+  date: string;
+  cost_usd: number;
+  tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+  issues: number;
+}
+
+export interface SpendHeatmap {
+  days: HeatmapDay[];
+  start: string;
+  end: string;
+}
+
+export interface CommandAccepted {
+  status: string;
+  command_id: string;
+  command: string;
 }
 
 export type IssueDetail = {
@@ -194,14 +238,19 @@ async function fetchJson<T>(
 export function fetchIssues({
   q,
   scope = "active",
+  withinSecs,
 }: {
   q?: string;
   scope?: IssueScope;
+  withinSecs?: number;
 } = {}): Promise<IssueSummary[]> {
   const params = new URLSearchParams({ scope });
   const normalizedQ = q?.trim();
   if (normalizedQ) {
     params.set("q", normalizedQ);
+  }
+  if (withinSecs != null) {
+    params.set("within_secs", String(withinSecs));
   }
 
   return fetchJson<IssueSummary[]>(
@@ -209,6 +258,46 @@ export function fetchIssues({
     "Issue list not found",
     "Failed to load issues",
   );
+}
+
+export function fetchSpendSummary(): Promise<SpendSummary> {
+  return fetchJson<SpendSummary>(
+    "/api/spend/summary",
+    "Spend summary not found",
+    "Failed to load spend summary",
+  );
+}
+
+export function fetchSpendHeatmap(days = 371): Promise<SpendHeatmap> {
+  return fetchJson<SpendHeatmap>(
+    `/api/spend/heatmap?days=${days}`,
+    "Spend heatmap not found",
+    "Failed to load spend heatmap",
+  );
+}
+
+export async function postIssueCommand(
+  id: string,
+  command: string,
+): Promise<CommandAccepted> {
+  const response = await fetch(`/api/issues/${encodeURIComponent(id)}/command`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ command }),
+  });
+  if (!response.ok) {
+    let detail = "Failed to apply command";
+    try {
+      const body = (await response.json()) as { detail?: string };
+      if (body?.detail) {
+        detail = body.detail;
+      }
+    } catch {
+      // keep fallback
+    }
+    throw new Error(detail);
+  }
+  return (await response.json()) as CommandAccepted;
 }
 
 export function fetchIssueDetail(

@@ -2,6 +2,9 @@ export function formatTokens(value: number | null | undefined): string {
   const count = value ?? 0;
   const absCount = Math.abs(count);
 
+  if (absCount >= 1_000_000_000) {
+    return `${formatCompact(count / 1_000_000_000)}B`;
+  }
   if (absCount >= 1_000_000) {
     return `${formatCompact(count / 1_000_000)}M`;
   }

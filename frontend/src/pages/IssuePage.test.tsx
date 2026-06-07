@@ -1,138 +1,114 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import type { DriftFlag } from "@/lib/api";
+import { CmdButton, PrCard, SpendCard } from "./IssuePage";
+import { applicability } from "./issueControls";
 
-import { ExternalTruthSection, GithubCard, RunsSection, RunStatusCell } from "./IssuePage";
+describe("applicability", () => {
+  it("enables only Stop while a run is in progress", () => {
+    const { en } = applicability("running");
+    expect(en.stop).toBe(true);
+    expect(en.approve).toBe(false);
+    expect(en.retry).toBe(false);
+  });
 
-describe("GithubCard", () => {
-  it("surfaces partial review-comment fetch failures", () => {
-    const markup = renderToStaticMarkup(
-      <GithubCard
-        snapshot={{
-          pr_number: 42,
-          state: "OPEN",
-          comments: [],
-          comments_error: "missing scope",
-        }}
-        flags={new Map<string, DriftFlag>()}
-      />,
-    );
+  it("enables Retry / Retry-acceptance on failure", () => {
+    const { en } = applicability("failed");
+    expect(en.retry).toBe(true);
+    expect(en["retry-acceptance"]).toBe(true);
+    expect(en.stop).toBe(false);
+  });
 
-    expect(markup).toContain("GitHub review comments unavailable");
-    expect(markup).toContain("missing scope");
-    expect(markup).toContain("border-amber-200");
+  it("enables review actions while awaiting review", () => {
+    const { en } = applicability("awaiting_review_trigger");
+    expect(en.approve).toBe(true);
+    expect(en.reject).toBe(true);
+    expect(en["skip-review"]).toBe(true);
+  });
+
+  it("disables everything once done", () => {
+    const { en } = applicability("done");
+    expect(Object.values(en).every((v) => v === false)).toBe(true);
   });
 });
 
-describe("RunStatusCell", () => {
-  it("shows termination detail for non-success runs", () => {
+describe("CmdButton", () => {
+  it("greys out and exposes the reason when not applicable", () => {
     const markup = renderToStaticMarkup(
-      <RunStatusCell
-        run={{
-          status: "failed",
-          termination_kind: "agent_nonzero_exit",
-          termination_detail: "[backfill] return code 2",
-          exit_returncode: 2,
-        }}
+      <CmdButton
+        id="approve"
+        enabled={false}
+        why="Nothing to approve — run failed"
+        applied={false}
+        busy={false}
+        onClick={() => {}}
       />,
     );
-
-    expect(markup).toContain("failed");
-    expect(markup).toContain("agent_nonzero_exit");
-    expect(markup).toContain("[backfill] return code 2");
-    expect(markup).toContain("exit_returncode=2");
+    expect(markup).toContain("disabled");
+    expect(markup).toContain("Nothing to approve");
   });
 
-  it("does not show termination badges for success runs", () => {
+  it("shows the applied state", () => {
     const markup = renderToStaticMarkup(
-      <RunStatusCell
-        run={{
-          status: "completed",
-          termination_kind: "should_not_render",
-          termination_detail: "success detail should stay hidden",
-          exit_returncode: 0,
-        }}
+      <CmdButton
+        id="approve"
+        enabled
+        why=""
+        applied
+        busy={false}
+        onClick={() => {}}
       />,
     );
-
-    expect(markup).toContain("completed");
-    expect(markup).not.toContain("should_not_render");
-    expect(markup).not.toContain("success detail should stay hidden");
+    expect(markup).toContain("Applied");
+    expect(markup).toContain("bg-green-50");
   });
 });
 
-describe("RunsSection", () => {
-  it("renders per-run token usage and issue totals next to cost", () => {
-    const markup = renderToStaticMarkup(
-      <RunsSection
-        runs={[
-          {
-            id: "run-a",
-            stage: "implement",
-            status: "completed",
-            pid: 123,
-            started_at: "2026-05-17T10:00:00Z",
-            ended_at: "2026-05-17T10:10:00Z",
-            cost_usd: 1.25,
-            input_tokens: 1_234_000,
-            output_tokens: 340_000,
-            cache_write_tokens: 30,
-            cache_read_tokens: 40,
-            termination_kind: "",
-            termination_detail: "",
-            exit_returncode: null,
-          },
-          {
-            id: "run-b",
-            stage: "review",
-            status: "running",
-            pid: null,
-            started_at: "2026-05-17T10:20:00Z",
-            ended_at: null,
-            cost_usd: 0.5,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_write_tokens: 0,
-            cache_read_tokens: 0,
-            termination_kind: "",
-            termination_detail: "",
-            exit_returncode: null,
-          },
-        ]}
-      />,
-    );
+const cockpit = {
+  status: "awaiting_review_trigger",
+  stage: "review",
+  runState: "waiting" as const,
+  since: "2026-06-07T15:28:00Z",
+  activity: "2026-06-07T16:34:00Z",
+  reason: null,
+  cost_usd: 13.09,
+  tokens: {
+    input_tokens: 2_100_000,
+    output_tokens: 184_000,
+    cache_write_tokens: 412_000,
+    cache_read_tokens: 7_900_000,
+  },
+  pr: {
+    number: 412,
+    repo: "kulichevskiy/adjust_os",
+    url: "https://github.com/kulichevskiy/adjust_os/pull/412",
+    state: "open",
+    mergeable: "mergeable",
+    merged: false,
+    checks: { passing: 11, failing: 0, pending: 1 },
+  },
+  waitingOn: "review",
+};
 
-    expect(markup).toContain("total cost $1.75");
-    expect(markup).toContain('title="1234000">1.2M</span>');
-    expect(markup).toContain('title="340000">340k</span>');
-    expect(markup).toContain('title="30">30</span>');
-    expect(markup).toContain('title="40">40</span>');
-    expect(markup).toContain(">in</th>");
-    expect(markup).toContain(">out</th>");
-    expect(markup).toContain(">cache-write</th>");
-    expect(markup).toContain(">cache-read</th>");
-    expect(markup).toContain('title="0">0</span>');
+describe("SpendCard", () => {
+  it("shows spend, the $100 cap and percentage", () => {
+    const markup = renderToStaticMarkup(<SpendCard c={cockpit} />);
+    expect(markup).toContain("$13.09");
+    expect(markup).toContain("of $100.00 cap");
+    expect(markup).toContain("13%");
   });
 });
 
-describe("ExternalTruthSection", () => {
-  it("does not report in sync when an external source failed", () => {
-    const markup = renderToStaticMarkup(
-      <ExternalTruthSection
-        snapshot={{
-          fetched_at: "2026-05-17T12:00:00Z",
-          linear: { error: "Linear returned 500" },
-          github: { state: "OPEN", comments: [] },
-          drift_flags: [],
-        }}
-        isFetching={false}
-        onRefresh={() => undefined}
-      />,
-    );
+describe("PrCard", () => {
+  it("renders the PR link, mergeable badge and check summary", () => {
+    const markup = renderToStaticMarkup(<PrCard pr={cockpit.pr} />);
+    expect(markup).toContain("#412");
+    expect(markup).toContain("mergeable");
+    expect(markup).toContain("11✓ 0✕ 1⋯");
+  });
 
-    expect(markup).toContain("Source unavailable");
-    expect(markup).toContain("border-amber-300");
-    expect(markup).not.toContain("In sync");
+  it("handles the no-PR state", () => {
+    const markup = renderToStaticMarkup(<PrCard pr={null} />);
+    expect(markup).toContain("No PR opened yet");
   });
 });
