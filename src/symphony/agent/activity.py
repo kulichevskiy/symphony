@@ -75,7 +75,10 @@ class ActivityDigest:
     run_id: str
     stage: str
     reason: ActivityPublishReason
-    cumulative_cost_usd: float
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_write_tokens: int = 0
+    cache_read_tokens: int = 0
     running_commands: tuple[RunningCommandDigest, ...] = ()
     completed_command_count: int = 0
     completed_command_examples: tuple[str, ...] = ()
@@ -232,7 +235,10 @@ class ActivitySession:
         *,
         reason: ActivityPublishReason,
         now: datetime,
-        cumulative_cost_usd: float,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        cache_read_tokens: int = 0,
     ) -> ActivityDigest:
         running = sorted(
             self.active_commands.values(),
@@ -250,7 +256,10 @@ class ActivitySession:
             run_id=self.run_id,
             stage=self.stage,
             reason=reason,
-            cumulative_cost_usd=cumulative_cost_usd,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
             running_commands=running_digest,
             completed_command_count=self.completed_command_count,
             completed_command_examples=tuple(self.completed_command_examples[:3]),
@@ -299,11 +308,21 @@ def parse_codex_activity_line(line: str, workspace_path: Path) -> ActivityEvent 
 
 def format_activity_digest(digest: ActivityDigest) -> str:
     title_stage = digest.stage.replace("_", " ").title()
+    total_tokens = (
+        digest.input_tokens
+        + digest.output_tokens
+        + digest.cache_write_tokens
+        + digest.cache_read_tokens
+    )
     lines = [
         f"📡 **Activity digest — {title_stage}**",
         "",
         f"- Run ID: `{digest.run_id}`",
-        f"- Cumulative cost: **${digest.cumulative_cost_usd:.4f}**",
+        (
+            f"- Tokens: in {digest.input_tokens} · out {digest.output_tokens} · "
+            f"cache w {digest.cache_write_tokens} / r {digest.cache_read_tokens} · "
+            f"total {total_tokens}"
+        ),
     ]
     if digest.running_commands:
         running = ", ".join(

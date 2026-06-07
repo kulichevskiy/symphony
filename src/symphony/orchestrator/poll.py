@@ -11313,7 +11313,7 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         line: str,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
     ) -> None:
         if session is None:
             return
@@ -11339,7 +11339,7 @@ class Orchestrator:
                 issue=issue,
                 reason=reason,
                 now=now,
-                cumulative_total=cumulative_total,
+                cumulative_usage=cumulative_usage,
             )
 
     async def _record_activity_tick(
@@ -11348,7 +11348,7 @@ class Orchestrator:
         session: ActivitySession | None,
         binding: RepoBinding,
         issue: LinearIssue,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
     ) -> None:
         if session is None:
             return
@@ -11376,7 +11376,7 @@ class Orchestrator:
             issue=issue,
             reason="heartbeat",
             now=now,
-            cumulative_total=cumulative_total,
+            cumulative_usage=cumulative_usage,
             heartbeat_item_ids=due_item_ids,
         )
 
@@ -11386,7 +11386,7 @@ class Orchestrator:
         session: ActivitySession | None,
         binding: RepoBinding,
         issue: LinearIssue,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
     ) -> None:
         if session is None or not session.has_unpublished_events():
             return
@@ -11396,7 +11396,7 @@ class Orchestrator:
             issue=issue,
             reason="final",
             now=self._now(),
-            cumulative_total=cumulative_total,
+            cumulative_usage=cumulative_usage,
         )
 
     async def _publish_activity_digest(
@@ -11407,13 +11407,16 @@ class Orchestrator:
         issue: LinearIssue,
         reason: ActivityPublishReason,
         now: datetime,
-        cumulative_total: float,
+        cumulative_usage: UsageDelta,
         heartbeat_item_ids: tuple[str, ...] = (),
     ) -> bool:
         digest = session.build_digest(
             reason=reason,
             now=now,
-            cumulative_cost_usd=cumulative_total,
+            input_tokens=cumulative_usage.input_tokens,
+            output_tokens=cumulative_usage.output_tokens,
+            cache_write_tokens=cumulative_usage.cache_write_tokens,
+            cache_read_tokens=cumulative_usage.cache_read_tokens,
         )
         body = truncate_body(format_activity_digest(digest))
         fingerprint = digest_fingerprint(body)
@@ -11465,8 +11468,9 @@ class Orchestrator:
         """Spawn the runner and consume events. Returns
         (cumulative_usage, final_event_kind, final_returncode).
 
-        `prior_total` is the issue's cost so far; it is threaded through
-        only so activity comments can show a cumulative running total.
+        `prior_total` is the issue's cost so far, still threaded for callers'
+        cost bookkeeping. Activity digests now report per-run token counts
+        rather than a cumulative dollar total, so it is no longer rendered.
         """
         storage_issue_id = storage_issue_id or issue.id
         prompt = implement_prompt(
@@ -11579,7 +11583,7 @@ class Orchestrator:
                             binding=binding,
                             issue=issue,
                             line=ev.line,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
@@ -11588,14 +11592,14 @@ class Orchestrator:
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
@@ -11721,7 +11725,7 @@ class Orchestrator:
                             binding=binding,
                             issue=issue,
                             line=ev.line,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
@@ -11730,14 +11734,14 @@ class Orchestrator:
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
-                            cumulative_total=prior_total + cumulative_usage.cost_usd,
+                            cumulative_usage=cumulative_usage,
                         )
                         final_kind = ev.kind
                         final_returncode = ev.returncode
