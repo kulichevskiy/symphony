@@ -85,6 +85,10 @@ class HeatmapDay(BaseModel):
     date: str
     cost_usd: float
     tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
     issues: int
 
 
@@ -228,6 +232,10 @@ SELECT
         r.input_tokens + r.output_tokens
         + r.cache_write_tokens + r.cache_read_tokens
     ), 0) AS tokens,
+    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
     COALESCE(SUM(r.cost_usd), 0) AS cost_usd,
     COUNT(DISTINCT r.issue_id) AS issues
 FROM runs r
@@ -525,6 +533,10 @@ def create_api_router(
                     date=str(r["day"]),
                     cost_usd=float(r["cost_usd"] or 0),
                     tokens=int(r["tokens"] or 0),
+                    input_tokens=int(r["input_tokens"] or 0),
+                    output_tokens=int(r["output_tokens"] or 0),
+                    cache_write_tokens=int(r["cache_write_tokens"] or 0),
+                    cache_read_tokens=int(r["cache_read_tokens"] or 0),
                     issues=int(r["issues"] or 0),
                 )
                 for r in rows

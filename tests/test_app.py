@@ -1923,10 +1923,14 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     # The 2024 run is outside the 60-day window.
     assert "2024-01-01" not in by_day
     assert by_day["2026-05-17"] == {
-        "date": "2026-05-17", "cost_usd": 3.0, "tokens": 150, "issues": 2,
+        "date": "2026-05-17", "cost_usd": 3.0, "tokens": 150,
+        "input_tokens": 150, "output_tokens": 0,
+        "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 2,
     }
     assert by_day["2026-05-16"] == {
-        "date": "2026-05-16", "cost_usd": 0.5, "tokens": 10, "issues": 1,
+        "date": "2026-05-16", "cost_usd": 0.5, "tokens": 10,
+        "input_tokens": 10, "output_tokens": 0,
+        "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 1,
     }
     assert body["end"] == "2026-05-17"
 
