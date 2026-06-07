@@ -34,6 +34,7 @@ class IssueSummary(BaseModel):
     identifier: str
     title: str
     team_key: str
+    cost_usd: float
     input_tokens: int
     output_tokens: int
     cache_write_tokens: int
@@ -42,12 +43,59 @@ class IssueSummary(BaseModel):
     latest_activity_age_secs: int | None
     canonical_status: CanonicalStatusPayload
     warnings: list[str] = Field(default_factory=list)
+    # Set only on the `done` scope — the time the issue completed (latest PR
+    # merge, else latest activity). Excluded from active/recent/all responses.
+    completed_at: str | None = None
 
 
 class IssueScope(StrEnum):
     ACTIVE = "active"
     RECENT = "recent"
     ALL = "all"
+    DONE = "done"
+
+
+class TeamSpend(BaseModel):
+    key: str
+    cost_usd: float
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
+    issues: int
+
+
+class SpendTotals(BaseModel):
+    cost_usd: float
+    total_tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
+    issues: int
+
+
+class SpendSummary(BaseModel):
+    totals: SpendTotals
+    per_team: list[TeamSpend]
+
+
+class HeatmapDay(BaseModel):
+    date: str
+    cost_usd: float
+    tokens: int
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
+    issues: int
+
+
+class SpendHeatmap(BaseModel):
+    days: list[HeatmapDay]
+    start: str
+    end: str
 
 
 _ISSUE_SCOPE_CTES = """
@@ -150,11 +198,112 @@ def _optional_int(value: object) -> int | None:
     return int(str(value))
 
 
+def _parse_iso(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+_SPEND_SUMMARY_QUERY = """
+SELECT
+    i.team_key AS team_key,
+    COALESCE(SUM(r.cost_usd), 0) AS cost_usd,
+    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+    COUNT(DISTINCT r.issue_id) AS issues
+FROM runs r
+JOIN issues i ON i.id = r.issue_id
+GROUP BY i.team_key
+"""
+
+
+# Bucket spend by UTC day. Timestamps are stored as UTC ISO strings, so the
+# first 10 chars are the calendar day and lexicographic compare is date-correct.
+_SPEND_HEATMAP_QUERY = """
+SELECT
+    substr(r.started_at, 1, 10) AS day,
+    COALESCE(SUM(
+        r.input_tokens + r.output_tokens
+        + r.cache_write_tokens + r.cache_read_tokens
+    ), 0) AS tokens,
+    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+    COALESCE(SUM(r.cost_usd), 0) AS cost_usd,
+    COUNT(DISTINCT r.issue_id) AS issues
+FROM runs r
+WHERE substr(r.started_at, 1, 10) >= ?
+GROUP BY day
+ORDER BY day
+"""
+
+
+def _build_spend_summary(rows: list[dict[str, object]]) -> SpendSummary:
+    per_team: list[TeamSpend] = []
+    acc = {
+        "cost_usd": 0.0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "issues": 0,
+    }
+    for row in rows:
+        inp = int(row["input_tokens"] or 0)
+        out = int(row["output_tokens"] or 0)
+        cw = int(row["cache_write_tokens"] or 0)
+        cr = int(row["cache_read_tokens"] or 0)
+        cost = float(row["cost_usd"] or 0)
+        issues = int(row["issues"] or 0)
+        per_team.append(
+            TeamSpend(
+                key=str(row["team_key"]),
+                cost_usd=cost,
+                total_tokens=inp + out + cw + cr,
+                input_tokens=inp,
+                output_tokens=out,
+                cache_write_tokens=cw,
+                cache_read_tokens=cr,
+                issues=issues,
+            )
+        )
+        acc["cost_usd"] += cost
+        acc["input_tokens"] += inp
+        acc["output_tokens"] += out
+        acc["cache_write_tokens"] += cw
+        acc["cache_read_tokens"] += cr
+        acc["issues"] += issues
+    per_team.sort(key=lambda t: t.cost_usd, reverse=True)
+    totals = SpendTotals(
+        cost_usd=acc["cost_usd"],
+        total_tokens=(
+            acc["input_tokens"]
+            + acc["output_tokens"]
+            + acc["cache_write_tokens"]
+            + acc["cache_read_tokens"]
+        ),
+        input_tokens=acc["input_tokens"],
+        output_tokens=acc["output_tokens"],
+        cache_write_tokens=acc["cache_write_tokens"],
+        cache_read_tokens=acc["cache_read_tokens"],
+        issues=acc["issues"],
+    )
+    return SpendSummary(totals=totals, per_team=per_team)
+
+
 def _list_issues_query(
     scope: IssueScope,
     q: str | None,
     *,
     now: datetime,
+    cutoff: datetime | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     where: list[str] = []
     params: list[str] = [_utc_iso(now)]
@@ -168,6 +317,16 @@ def _list_issues_query(
             "OR i.id IN (SELECT issue_id FROM recent_issue_ids)"
             ")"
         )
+    elif scope is IssueScope.DONE:
+        # Candidate prefilter: completion plausibly within the window — either a
+        # PR merged since the cutoff, or activity since the cutoff. The precise
+        # "is this canonically done?" check runs in Python on this small set.
+        cutoff_iso = _utc_iso(cutoff if cutoff is not None else now)
+        where.append(
+            "((pr.max_merged_at IS NOT NULL AND pr.max_merged_at >= ?) "
+            "OR (la.latest_activity_ts IS NOT NULL AND la.latest_activity_ts >= ?))"
+        )
+        params.extend([cutoff_iso, cutoff_iso])
 
     normalized_q = q.strip().lower() if q is not None else ""
     if normalized_q:
@@ -185,11 +344,13 @@ def _list_issues_query(
             i.identifier,
             i.title,
             i.team_key,
+            COALESCE(ru.cost_usd, 0) AS cost_usd,
             COALESCE(ru.input_tokens, 0) AS input_tokens,
             COALESCE(ru.output_tokens, 0) AS output_tokens,
             COALESCE(ru.cache_write_tokens, 0) AS cache_write_tokens,
             COALESCE(ru.cache_read_tokens, 0) AS cache_read_tokens,
             la.latest_activity_ts,
+            pr.max_merged_at AS max_merged_at,
             CASE
                 WHEN la.latest_activity_ts IS NULL THEN NULL
                 ELSE CAST(
@@ -200,8 +361,14 @@ def _list_issues_query(
         FROM issues i
         LEFT JOIN latest_activity la ON la.issue_id = i.id
         LEFT JOIN (
+            SELECT issue_id, MAX(merged_at) AS max_merged_at
+            FROM issue_prs
+            GROUP BY issue_id
+        ) pr ON pr.issue_id = i.id
+        LEFT JOIN (
             SELECT
                 issue_id,
+                SUM(cost_usd) AS cost_usd,
                 SUM(input_tokens) AS input_tokens,
                 SUM(output_tokens) AS output_tokens,
                 SUM(cache_write_tokens) AS cache_write_tokens,
@@ -241,14 +408,21 @@ def create_api_router(
     async def list_issues(
         q: Annotated[str | None, Query()] = None,
         scope: Annotated[IssueScope, Query()] = IssueScope.ACTIVE,
+        within_secs: Annotated[int, Query(ge=1)] = 7 * 86_400,
     ) -> list[IssueSummary]:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
 
+        is_done = scope is IssueScope.DONE
         try:
             conn = await ui_db_pool.connection()
             request_now = now()
-            query, params = _list_issues_query(scope, q, now=request_now)
+            cutoff = (
+                request_now - timedelta(seconds=within_secs) if is_done else None
+            )
+            query, params = _list_issues_query(
+                scope, q, now=request_now, cutoff=cutoff
+            )
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             issues = [dict(row) for row in rows]
@@ -270,14 +444,40 @@ def create_api_router(
                 detail="UI database is not available",
             ) from exc
 
-        statuses.sort(
-            key=lambda item: (
-                *canonical_status_sort_key(item[1]),
-                _identifier_sort_key(str(item[0]["identifier"])),
+        if is_done:
+            # Keep only canonically-done issues whose completion lands inside the
+            # window, newest first.
+            kept: list[tuple[dict[str, object], object, str]] = []
+            for issue, status in statuses:
+                if status.state != "done":
+                    continue
+                completed_at = issue.get("max_merged_at") or issue.get(
+                    "latest_activity_ts"
+                )
+                completed_dt = _parse_iso(completed_at)
+                if (
+                    completed_dt is None
+                    or cutoff is None
+                    or completed_dt < cutoff
+                ):
+                    continue
+                kept.append((issue, status, str(completed_at)))
+            kept.sort(
+                key=lambda item: (item[2], _identifier_sort_key(str(item[0]["identifier"]))),
+                reverse=True,
             )
-        )
+            triples = kept
+        else:
+            statuses.sort(
+                key=lambda item: (
+                    *canonical_status_sort_key(item[1]),
+                    _identifier_sort_key(str(item[0]["identifier"])),
+                )
+            )
+            triples = [(issue, status, None) for issue, status in statuses]
+
         payloads: list[IssueSummary] = []
-        for issue, status in statuses:
+        for issue, status, completed_at in triples:
             warnings = issue_warnings(
                 status,
                 latest_activity_age_secs=_optional_int(
@@ -289,10 +489,61 @@ def create_api_router(
                 **issue,
                 "canonical_status": status.to_dict(),
             }
+            payload.pop("max_merged_at", None)
+            if completed_at is not None:
+                payload["completed_at"] = completed_at
             if warnings:
                 payload["warnings"] = warnings
             payloads.append(IssueSummary.model_validate(payload))
         return payloads
+
+    @router.get("/spend/summary", response_model=SpendSummary)
+    async def spend_summary() -> SpendSummary:
+        if ui_db_pool is None:
+            raise HTTPException(status_code=503, detail="UI database is not configured")
+        try:
+            conn = await ui_db_pool.connection()
+            cur = await conn.execute(_SPEND_SUMMARY_QUERY)
+            rows = [dict(row) for row in await cur.fetchall()]
+        except aiosqlite.Error as exc:
+            raise HTTPException(
+                status_code=503, detail="UI database is not available"
+            ) from exc
+        return _build_spend_summary(rows)
+
+    @router.get("/spend/heatmap", response_model=SpendHeatmap)
+    async def spend_heatmap(
+        days: Annotated[int, Query(ge=1, le=400)] = 371,
+    ) -> SpendHeatmap:
+        if ui_db_pool is None:
+            raise HTTPException(status_code=503, detail="UI database is not configured")
+        request_now = now()
+        start = (request_now - timedelta(days=days - 1)).date()
+        try:
+            conn = await ui_db_pool.connection()
+            cur = await conn.execute(_SPEND_HEATMAP_QUERY, (start.isoformat(),))
+            rows = [dict(row) for row in await cur.fetchall()]
+        except aiosqlite.Error as exc:
+            raise HTTPException(
+                status_code=503, detail="UI database is not available"
+            ) from exc
+        return SpendHeatmap(
+            days=[
+                HeatmapDay(
+                    date=str(r["day"]),
+                    cost_usd=float(r["cost_usd"] or 0),
+                    tokens=int(r["tokens"] or 0),
+                    input_tokens=int(r["input_tokens"] or 0),
+                    output_tokens=int(r["output_tokens"] or 0),
+                    cache_write_tokens=int(r["cache_write_tokens"] or 0),
+                    cache_read_tokens=int(r["cache_read_tokens"] or 0),
+                    issues=int(r["issues"] or 0),
+                )
+                for r in rows
+            ],
+            start=start.isoformat(),
+            end=request_now.date().isoformat(),
+        )
 
     @router.api_route(
         "/{path:path}",

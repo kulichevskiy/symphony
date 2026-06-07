@@ -23,8 +23,10 @@ def _token_totals(
     output_tokens: int = 0,
     cache_write_tokens: int = 0,
     cache_read_tokens: int = 0,
-) -> dict[str, int]:
+    cost_usd: float = 0.0,
+) -> dict[str, float]:
     return {
+        "cost_usd": cost_usd,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cache_write_tokens": cache_write_tokens,
@@ -1814,3 +1816,183 @@ async def test_shared_app_preserves_linear_webhook_route(tmp_path: Path) -> None
     assert response.status_code == 200
     assert response.json()["handled"] is True
     assert len(handler.payloads) == 1
+
+
+async def _client(app: Any):
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "ENG-1", "ENG"),
+            ("b", "ENG-2", "ENG"),
+            ("c", "WEB-1", "WEB"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 1.25, 100, 20, 30, 40),
+                ('r2', 'a', 'review', 'completed', NULL, '2026-05-17T10:20:00Z',
+                 0.50, 10, 2, 3, 4),
+                ('r3', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z',
+                 2.00, 50, 5, 5, 5),
+                ('r4', 'c', 'implement', 'completed', NULL, '2026-05-17T12:00:00Z',
+                 5.00, 200, 40, 60, 80)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            response = await client.get("/api/spend/summary")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["totals"] == {
+        "cost_usd": 8.75,
+        "total_tokens": 100 + 20 + 30 + 40 + 10 + 2 + 3 + 4 + 50 + 5 + 5 + 5 + 200 + 40 + 60 + 80,
+        "input_tokens": 360,
+        "output_tokens": 67,
+        "cache_write_tokens": 98,
+        "cache_read_tokens": 129,
+        "issues": 3,
+    }
+    # Sorted by spend desc: WEB ($5) before ENG ($3.75).
+    assert [t["key"] for t in body["per_team"]] == ["WEB", "ENG"]
+    eng = next(t for t in body["per_team"] if t["key"] == "ENG")
+    assert eng["cost_usd"] == 3.75
+    assert eng["issues"] == 2
+
+
+@pytest.mark.asyncio
+async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="b", identifier="ENG-2", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 1.0, 100, 0, 0, 0),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z',
+                 2.0, 50, 0, 0, 0),
+                ('r3', 'a', 'review', 'completed', NULL, '2026-05-16T09:00:00Z',
+                 0.5, 10, 0, 0, 0),
+                ('r-old', 'a', 'implement', 'completed', NULL, '2024-01-01T00:00:00Z',
+                 9.0, 9, 0, 0, 0)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            response = await client.get("/api/spend/heatmap?days=60")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    body = response.json()
+    by_day = {d["date"]: d for d in body["days"]}
+    # The 2024 run is outside the 60-day window.
+    assert "2024-01-01" not in by_day
+    assert by_day["2026-05-17"] == {
+        "date": "2026-05-17", "cost_usd": 3.0, "tokens": 150,
+        "input_tokens": 150, "output_tokens": 0,
+        "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 2,
+    }
+    assert by_day["2026-05-16"] == {
+        "date": "2026-05-16", "cost_usd": 0.5, "tokens": 10,
+        "input_tokens": 10, "output_tokens": 0,
+        "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 1,
+    }
+    assert body["end"] == "2026-05-17"
+
+
+@pytest.mark.asyncio
+async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        # Recently-merged (1 day ago) -> done, inside 7d window.
+        await db.issues.upsert(
+            conn, id="done-recent", identifier="ENG-1", title="recent", team_key="ENG"
+        )
+        # Merged 16 days ago -> done, outside 7d window.
+        await db.issues.upsert(
+            conn, id="done-old", identifier="ENG-2", title="old", team_key="ENG"
+        )
+        # Running -> not done.
+        await db.issues.upsert(
+            conn, id="active", identifier="ENG-3", title="active", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+            VALUES
+                ('r1', 'done-recent', 'merge', 'completed', NULL,
+                 '2026-05-16T09:00:00Z', '2026-05-16T09:30:00Z', 3.0),
+                ('r2', 'done-old', 'merge', 'completed', NULL,
+                 '2026-05-01T09:00:00Z', '2026-05-01T09:30:00Z', 1.0),
+                ('r3', 'active', 'implement', 'running', 999,
+                 '2026-05-17T11:00:00Z', NULL, 0.5)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (issue_id, github_repo, binding_key, pr_number,
+                pr_url, created_at, merged_at)
+            VALUES
+                ('done-recent', 'o/r', 'k', 1, 'u', '2026-05-16T08:00:00Z',
+                 '2026-05-16T10:00:00Z'),
+                ('done-old', 'o/r', 'k', 2, 'u', '2026-05-01T08:00:00Z',
+                 '2026-05-01T10:00:00Z'),
+                ('active', 'o/r', 'k', 3, 'u', '2026-05-17T10:00:00Z', NULL)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            wk = await client.get("/api/issues?scope=done&within_secs=604800")
+            mo = await client.get("/api/issues?scope=done&within_secs=2592000")
+    finally:
+        await conn.close()
+
+    assert wk.status_code == 200
+    week = wk.json()
+    assert [i["identifier"] for i in week] == ["ENG-1"]
+    assert week[0]["completed_at"] == "2026-05-16T10:00:00Z"
+    assert week[0]["cost_usd"] == 3.0
+    assert week[0]["canonical_status"]["state"] == "done"
+
+    # 30-day window includes both, newest first.
+    assert [i["identifier"] for i in mo.json()] == ["ENG-1", "ENG-2"]
