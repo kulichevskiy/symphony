@@ -74,17 +74,28 @@ describe("IssueTable", () => {
 });
 
 describe("SectionTotals", () => {
-  it("sums tokens for the visible rows", () => {
+  it("sums the four categories for the visible rows without a total", () => {
     const markup = renderToStaticMarkup(
       <SectionTotals
         issues={[
-          issue({ input_tokens: 1000 }),
+          issue({
+            input_tokens: 1000,
+            output_tokens: 2000,
+            cache_write_tokens: 3000,
+            cache_read_tokens: 4000,
+          }),
           issue({ id: "iss-2", input_tokens: 200 }),
         ]}
       />,
     );
     expect(markup).not.toContain("$");
+    expect(markup).not.toContain("total");
     expect(markup).toContain('title="1200">1.2k</span>');
+    expect(markup).toContain('title="2000">2k</span>');
+    expect(markup).toContain('title="3000">3k</span>');
+    expect(markup).toContain('title="4000">4k</span>');
+    // No summed total (1000+2000+3000+4000+200 = 10200).
+    expect(markup).not.toContain("10.2k");
   });
 });
 
@@ -150,18 +161,23 @@ describe("PerProvider", () => {
 });
 
 describe("HeadlineTotals", () => {
-  it("renders the all-time token total and no dollars", () => {
+  it("renders four token stat blocks under a context label and no summed total", () => {
     const totals: SpendSummary["totals"] = {
-      total_tokens: 1_200_000_000,
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_write_tokens: 0,
-      cache_read_tokens: 0,
+      input_tokens: 1_000,
+      output_tokens: 2_000,
+      cache_write_tokens: 3_000,
+      cache_read_tokens: 4_000,
       issues: 172,
     };
     const markup = renderToStaticMarkup(<HeadlineTotals totals={totals} />);
-    expect(markup).toContain("Total tokens");
+    expect(markup).toContain("Tokens");
+    expect(markup).not.toContain("Total tokens");
     expect(markup).not.toContain("$");
-    expect(markup).toContain("1.2B");
+    expect(markup).toContain('title="1000">1k</span>');
+    expect(markup).toContain('title="2000">2k</span>');
+    expect(markup).toContain('title="3000">3k</span>');
+    expect(markup).toContain('title="4000">4k</span>');
+    // No summed hero number (1000+2000+3000+4000 = 10000).
+    expect(markup).not.toContain("10k");
   });
 });

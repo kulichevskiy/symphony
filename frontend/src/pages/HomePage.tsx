@@ -62,25 +62,34 @@ export function HeadlineTotals({
   totals: SpendSummary["totals"];
   compact?: boolean;
 }) {
+  const blocks: { label: string; value: number }[] = [
+    { label: "input", value: totals.input_tokens },
+    { label: "output", value: totals.output_tokens },
+    { label: "cache-write", value: totals.cache_write_tokens },
+    { label: "cache-read", value: totals.cache_read_tokens },
+  ];
   return (
-    <div
-      className={
-        compact ? "flex flex-wrap items-end gap-x-8 gap-y-3" : "flex flex-col gap-1"
-      }
-    >
-      <div>
-        <div className="whitespace-nowrap text-xs font-medium uppercase tracking-wide text-muted-foreground">
-          Total tokens · all-time
-        </div>
-        <div className="mt-1 font-mono text-3xl font-semibold tracking-tight text-foreground">
-          <Tk value={totals.total_tokens} />
-        </div>
+    <div className="flex flex-col gap-2">
+      <div className="whitespace-nowrap text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Tokens · all-time
       </div>
-      <div className="flex basis-full flex-wrap gap-x-4 gap-y-1 font-mono text-xs text-muted-foreground">
-        <span>in <Tk value={totals.input_tokens} /></span>
-        <span>out <Tk value={totals.output_tokens} /></span>
-        <span>cache-write <Tk value={totals.cache_write_tokens} /></span>
-        <span>cache-read <Tk value={totals.cache_read_tokens} /></span>
+      <div
+        className={
+          compact
+            ? "flex flex-wrap gap-x-8 gap-y-3"
+            : "grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4"
+        }
+      >
+        {blocks.map((b) => (
+          <div key={b.label}>
+            <div className="whitespace-nowrap text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              {b.label}
+            </div>
+            <div className="mt-0.5 font-mono text-xl font-semibold tracking-tight text-foreground">
+              <Tk value={b.value} />
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -278,17 +287,15 @@ function SpendOverview({
 export function SectionTotals({ issues }: { issues: IssueSummary[] }) {
   const tot = issues.reduce(
     (a, i) => ({
-      total: a.total + i.input_tokens + i.output_tokens + i.cache_write_tokens + i.cache_read_tokens,
       inp: a.inp + i.input_tokens,
       out: a.out + i.output_tokens,
       cw: a.cw + i.cache_write_tokens,
       cr: a.cr + i.cache_read_tokens,
     }),
-    { total: 0, inp: 0, out: 0, cw: 0, cr: 0 },
+    { inp: 0, out: 0, cw: 0, cr: 0 },
   );
   return (
     <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs text-muted-foreground">
-      <span className="text-foreground">total <Tk value={tot.total} /></span>
       <span>in <Tk value={tot.inp} /></span>
       <span>out <Tk value={tot.out} /></span>
       <span>cache-write <Tk value={tot.cw} /></span>
