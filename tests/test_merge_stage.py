@@ -1175,7 +1175,8 @@ async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> N
         assert "Done" in comment_body
         assert "https://github.com/org/repo/pull/42" in comment_body
         assert "$" not in comment_body
-        assert "Tokens: in 0 · out 0 · cache w 0 / r 0 · total 0" in comment_body
+        assert "Tokens: in 0 · out 0 · cache w 0 / r 0" in comment_body
+        assert "total" not in comment_body
 
         calls = _read_calls(calls_log)
         merge_call = next(c for c in calls if c["argv"][:3] == ["pr", "merge", "42"])
