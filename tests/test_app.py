@@ -10,6 +10,7 @@ import pytest
 
 from symphony import db
 from symphony.app import create_app
+from symphony.linear.slash import SlashKind
 from symphony.ui import api as ui_api
 from symphony.webhook import WebhookSettings
 
@@ -1996,3 +1997,69 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
 
     # 30-day window includes both, newest first.
     assert [i["identifier"] for i in mo.json()] == ["ENG-1", "ENG-2"]
+
+
+class _FakeCommandSink:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, SlashKind]] = []
+
+    def enqueue_web_command(self, issue_id: str, kind: SlashKind) -> str:
+        self.calls.append((issue_id, kind))
+        return "cmd-123"
+
+
+@pytest.mark.asyncio
+async def test_api_issue_command_accepts_and_enqueues(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    sink = _FakeCommandSink()
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), ui_command_sink=sink,
+        )
+        async with await _client(app) as client:
+            ok = await client.post(
+                "/api/issues/iss-1/command", json={"command": "approve"}
+            )
+            bad = await client.post(
+                "/api/issues/iss-1/command", json={"command": "nope"}
+            )
+            missing = await client.post(
+                "/api/issues/ghost/command", json={"command": "approve"}
+            )
+    finally:
+        await conn.close()
+
+    assert ok.status_code == 200
+    assert ok.json() == {
+        "status": "accepted", "command_id": "cmd-123", "command": "$approve"
+    }
+    assert sink.calls == [("iss-1", SlashKind.APPROVE)]
+    assert bad.status_code == 400
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_api_issue_command_503_without_sink(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+        async with await _client(app) as client:
+            response = await client.post(
+                "/api/issues/iss-1/command", json={"command": "approve"}
+            )
+    finally:
+        await conn.close()
+
+    assert response.status_code == 503

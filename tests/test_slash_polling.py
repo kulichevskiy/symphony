@@ -1575,3 +1575,42 @@ async def test_review_failed_retry_reparks_when_local_only_review_fails(
         assert any("local-only review did not approve" in body for body in bodies)
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_web_command_applies_via_drain(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        orch._active_run_ids.add("run-1")  # noqa: SLF001
+        orch._dispatch_run_ids["iss-1"] = "run-1"  # noqa: SLF001
+
+        command_id = orch.enqueue_web_command("iss-1", SlashKind.STOP)
+        assert command_id
+        await orch._drain_web_commands()  # noqa: SLF001
+
+        # $stop on an active run kills the runner — same path as a Linear command.
+        orch._runner.kill.assert_awaited_once_with("run-1")  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_web_command_no_eligible_run_is_dropped(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        orch = _make_orch(cfg, linear, conn)
+        await _seed_active_run(conn, issue_id="iss-1", run_id="run-1")
+        # No dispatch / review mapping for the issue → not eligible.
+        orch.enqueue_web_command("iss-1", SlashKind.STOP)
+        await orch._drain_web_commands()  # noqa: SLF001
+
+        orch._runner.kill.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()

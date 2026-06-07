@@ -5,13 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Protocol
 
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ..linear.slash import SlashKind
 from .db import ReadOnlyDbPool
 from .status import (
     DEFAULT_STUCK_THRESHOLDS,
@@ -96,6 +97,22 @@ class SpendHeatmap(BaseModel):
     days: list[HeatmapDay]
     start: str
     end: str
+
+
+class CommandRequest(BaseModel):
+    command: str
+
+
+class CommandAccepted(BaseModel):
+    status: str
+    command_id: str
+    command: str
+
+
+class CommandSink(Protocol):
+    """The orchestrator surface the web UI uses to submit operator commands."""
+
+    def enqueue_web_command(self, issue_id: str, kind: SlashKind) -> str: ...
 
 
 _ISSUE_SCOPE_CTES = """
@@ -388,6 +405,7 @@ def create_api_router(
     clock: Callable[[], datetime] | None = None,
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     no_progress_threshold: timedelta | None = None,
+    command_sink: CommandSink | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
@@ -543,6 +561,37 @@ def create_api_router(
             ],
             start=start.isoformat(),
             end=request_now.date().isoformat(),
+        )
+
+    @router.post("/issues/{issue_id}/command", response_model=CommandAccepted)
+    async def issue_command(issue_id: str, body: CommandRequest) -> CommandAccepted:
+        if command_sink is None:
+            raise HTTPException(
+                status_code=503, detail="commands are not available"
+            )
+        if ui_db_pool is None:
+            raise HTTPException(status_code=503, detail="UI database is not configured")
+        try:
+            kind = SlashKind(body.command)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"unknown command: {body.command}"
+            ) from exc
+        try:
+            conn = await ui_db_pool.connection()
+            cur = await conn.execute(
+                "SELECT 1 FROM issues WHERE id = ?", (issue_id,)
+            )
+            exists = await cur.fetchone() is not None
+        except aiosqlite.Error as exc:
+            raise HTTPException(
+                status_code=503, detail="UI database is not available"
+            ) from exc
+        if not exists:
+            raise HTTPException(status_code=404, detail="issue not found")
+        command_id = command_sink.enqueue_web_command(issue_id, kind)
+        return CommandAccepted(
+            status="accepted", command_id=command_id, command=f"${kind.value}"
         )
 
     @router.api_route(
