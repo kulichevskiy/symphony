@@ -645,6 +645,58 @@ def runs_backfill_tokens(db_path: Path, log_root: Path) -> None:
     click.echo(f"skipped: {result.skipped}")
 
 
+@runs.command("backfill-model-usage")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="Path to the symphony SQLite file.",
+)
+@click.option(
+    "--log-root",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    required=True,
+    help="Directory containing historical stdout logs.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=False,
+    help="Config file used to resolve Codex models per team binding. "
+    "Without it, Codex usage is attributed to `unknown`.",
+)
+def runs_backfill_model_usage(
+    db_path: Path, log_root: Path, config_path: Path | None
+) -> None:
+    """Backfill per-(provider, model) token attribution from historical logs."""
+    from .db.token_backfill import CodexModels, run_model_usage_backfill
+
+    codex_models_by_team: dict[str, CodexModels] = {}
+    if config_path is not None:
+        cfg = Config.load(config_path)
+        for binding in cfg.repos:
+            codex_models_by_team.setdefault(
+                binding.linear_team_key,
+                CodexModels(
+                    implementer=binding.codex_model,
+                    reviewer=binding.resolved_reviewer_codex_model(),
+                ),
+            )
+
+    try:
+        result = run_model_usage_backfill(
+            db_path=db_path,
+            log_root=log_root,
+            codex_models_by_team=codex_models_by_team or None,
+        )
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"updated: {result.updated}")
+    click.echo(f"skipped: {result.skipped}")
+
+
 @main.command("local-review-dry-run")
 @click.option(
     "--workspace",

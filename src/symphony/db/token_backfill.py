@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from symphony.agent.model_usage import ModelUsage, parse_model_usage
 from symphony.agent.process import Usage, parse_event_line
 from symphony.db.runs import LIVE_STATUSES
 
@@ -121,6 +122,195 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
         conn.close()
 
     return BackfillResult(updated=updated, skipped=skipped)
+
+
+@dataclass(frozen=True)
+class CodexModels:
+    """Codex models a team's binding would have used per role.
+
+    `implementer` drives implement / review-fix / merge runs and the
+    local-review `fix-*` transcripts; `reviewer` drives the local-review
+    `review-*` transcripts. Either may be `None` when the binding can't be
+    resolved, in which case Codex usage falls back to `unknown`.
+    """
+
+    implementer: str | None = None
+    reviewer: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelUsageBackfillResult:
+    updated: int
+    skipped: int
+
+
+_RUN_MODEL_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS run_model_usage (
+    run_id             TEXT NOT NULL REFERENCES runs(id),
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, provider, model)
+)
+"""
+
+
+def run_model_usage_backfill(
+    *,
+    db_path: Path,
+    log_root: Path,
+    codex_models_by_team: dict[str, CodexModels] | None = None,
+) -> ModelUsageBackfillResult:
+    """Backfill per-(provider, model) token attribution from `./logs`.
+
+    Mirrors the orchestrator's live-write: each terminal run's stream-json
+    log is re-parsed with the shared `parse_model_usage` parser and its
+    `run_model_usage` rows are rewritten wholesale, so a repeated run is
+    idempotent (no double-counting). Claude models come exactly from the
+    log; Codex usage is attributed to the model from the run's team binding
+    (`fix-*` → implementer, `review-*` → reviewer) or `unknown` when the
+    binding can't be resolved.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(f"database not found: {db_path}")
+    if not log_root.exists():
+        raise FileNotFoundError(f"log root not found: {log_root}")
+    if not log_root.is_dir():
+        raise NotADirectoryError(f"log root is not a directory: {log_root}")
+
+    by_team = codex_models_by_team or {}
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(_RUN_MODEL_USAGE_DDL)
+        conn.commit()
+        live_statuses = tuple(LIVE_STATUSES)
+        live_placeholders = ",".join("?" * len(live_statuses))
+        rows = conn.execute(
+            f"""
+            SELECT r.id, r.issue_id, r.stage, r.started_at, i.team_key
+            FROM runs r
+            JOIN issues i ON i.id = r.issue_id
+            WHERE r.status NOT IN ({live_placeholders})
+            ORDER BY r.started_at ASC, r.id ASC
+            """,
+            live_statuses,
+        ).fetchall()
+        run_ids = {str(row["id"]) for row in rows}
+        paths_by_run_id, local_review_paths_by_parent = _index_logs(
+            log_root=log_root,
+            run_ids=run_ids,
+        )
+
+        updated = 0
+        skipped = 0
+        with conn:
+            for row in rows:
+                run_id = str(row["id"])
+                codex = by_team.get(str(row["team_key"]), CodexModels())
+                usages = _model_usages_for_row(
+                    conn=conn,
+                    row=row,
+                    codex=codex,
+                    paths_by_run_id=paths_by_run_id,
+                    local_review_paths_by_parent=local_review_paths_by_parent,
+                )
+                if not usages:
+                    skipped += 1
+                    continue
+                _replace_model_usage(conn, run_id, usages)
+                updated += 1
+    finally:
+        conn.close()
+
+    return ModelUsageBackfillResult(updated=updated, skipped=skipped)
+
+
+def _model_usages_for_row(
+    *,
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    codex: CodexModels,
+    paths_by_run_id: dict[str, tuple[Path, ...]],
+    local_review_paths_by_parent: dict[str, tuple[Path, ...]],
+) -> list[ModelUsage]:
+    if str(row["stage"]) == "local_review":
+        parent_run_id = _local_review_parent_run_id(conn=conn, row=row)
+        if parent_run_id is None:
+            return []
+        paths = local_review_paths_by_parent.get(parent_run_id, ())
+        return _local_review_model_usages(paths, codex=codex)
+
+    usages: list[ModelUsage] = []
+    for path in paths_by_run_id.get(str(row["id"]), ()):
+        lines = _read_lines(path)
+        if lines is None:
+            continue
+        usages.extend(parse_model_usage(lines, codex_model=codex.implementer))
+    return usages
+
+
+def _local_review_model_usages(
+    paths: tuple[Path, ...], *, codex: CodexModels
+) -> list[ModelUsage]:
+    """Parse local-review role transcripts into per-(provider, model) usage.
+
+    `fix-*.out.log` are implementer turns, `review-*.out.log` reviewer
+    turns; each file is one process, so it is parsed independently with the
+    codex model of its role (Claude ignores it — its `modelUsage` carries
+    the exact model).
+    """
+    usages: list[ModelUsage] = []
+    for path in sorted(paths):
+        if path.name.startswith("fix-"):
+            codex_model = codex.implementer
+        elif path.name.startswith("review-"):
+            codex_model = codex.reviewer
+        else:
+            continue
+        lines = _read_lines(path)
+        if lines is None:
+            continue
+        usages.extend(parse_model_usage(lines, codex_model=codex_model))
+    return usages
+
+
+def _read_lines(path: Path) -> list[str] | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+
+def _replace_model_usage(
+    conn: sqlite3.Connection, run_id: str, usages: list[ModelUsage]
+) -> None:
+    """Rewrite all `run_model_usage` rows for `run_id` (same-key rows merged)."""
+    merged: dict[tuple[str, str], list[int]] = {}
+    for usage in usages:
+        acc = merged.setdefault((usage.provider, usage.model), [0, 0, 0, 0])
+        acc[0] += usage.input_tokens
+        acc[1] += usage.output_tokens
+        acc[2] += usage.cache_write_tokens
+        acc[3] += usage.cache_read_tokens
+
+    conn.execute("DELETE FROM run_model_usage WHERE run_id = ?", (run_id,))
+    if merged:
+        conn.executemany(
+            """
+            INSERT INTO run_model_usage (
+                run_id, provider, model,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (run_id, provider, model, acc[0], acc[1], acc[2], acc[3])
+                for (provider, model), acc in merged.items()
+            ],
+        )
 
 
 def _migrate_token_columns(conn: sqlite3.Connection) -> None:
