@@ -13,6 +13,7 @@ import {
   fetchSpendHeatmap,
   fetchSpendSummary,
   type IssueSummary,
+  type ProviderSpend,
   type SpendHeatmap,
   type SpendSummary,
   type TeamSpend,
@@ -121,6 +122,89 @@ export function PerTeam({
   );
 }
 
+const PROVIDER_TINT: Record<string, string> = {
+  claude: "bg-orange-500",
+  codex: "bg-sky-500",
+};
+
+export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
+  const sorted = [...providers].sort((a, b) => b.total_tokens - a.total_tokens);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (provider: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(provider)) next.delete(provider);
+      else next.add(provider);
+      return next;
+    });
+
+  return (
+    <div className="divide-y divide-border/70 overflow-hidden rounded-md border border-border">
+      <div className="grid grid-cols-[1fr_auto] items-center gap-4 bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        <span>Provider / model</span>
+        <span className="w-24 text-right">Tokens</span>
+      </div>
+      {sorted.map((p) => {
+        const open = expanded.has(p.provider);
+        const models = [...p.per_model].sort(
+          (a, b) => b.total_tokens - a.total_tokens,
+        );
+        return (
+          <div key={p.provider}>
+            <button
+              type="button"
+              onClick={() => toggle(p.provider)}
+              aria-expanded={open}
+              className="grid w-full grid-cols-[1fr_auto] items-center gap-4 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
+            >
+              <span className="flex items-center gap-2">
+                <Icon
+                  name="chevronRight"
+                  size={14}
+                  className={cn(
+                    "shrink-0 text-muted-foreground transition-transform",
+                    open && "rotate-90",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    PROVIDER_TINT[p.provider] ?? "bg-slate-400",
+                  )}
+                />
+                <span className="text-sm font-medium">{p.provider}</span>
+                <span className="whitespace-nowrap text-xs text-muted-foreground">
+                  {p.issues} issues
+                </span>
+              </span>
+              <span className="w-24 text-right font-mono text-sm tabular-nums">
+                <Tk value={p.total_tokens} />
+              </span>
+            </button>
+            {open && (
+              <div className="divide-y divide-border/50 bg-secondary/20">
+                {models.map((m) => (
+                  <div
+                    key={m.model}
+                    className="grid grid-cols-[1fr_auto] items-center gap-4 py-1.5 pl-9 pr-3"
+                  >
+                    <span className="truncate text-xs text-muted-foreground">
+                      {m.model}
+                    </span>
+                    <span className="w-24 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                      <Tk value={m.total_tokens} />
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function SpendOverview({
   summary,
   heatmap,
@@ -157,6 +241,17 @@ function SpendOverview({
                 </div>
                 <PerTeam teams={summary.per_team} onPick={onPickTeam} />
               </div>
+              {summary.per_provider.length > 0 && (
+                <div className="mt-5">
+                  <div className="mb-2.5 flex items-center justify-between">
+                    <h2 className="text-sm font-semibold">
+                      Tokens by provider / model
+                    </h2>
+                    <span className="text-xs text-muted-foreground">by tokens</span>
+                  </div>
+                  <PerProvider providers={summary.per_provider} />
+                </div>
+              )}
             </>
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>

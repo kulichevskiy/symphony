@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from symphony import db
+from symphony.agent.model_usage import ModelUsage
 from symphony.app import create_app
 from symphony.linear.slash import SlashKind
 from symphony.ui import api as ui_api
@@ -1765,6 +1766,72 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
     assert eng["issues"] == 2
     assert "cost_usd" not in body["totals"]
     assert "cost_usd" not in eng
+    # No run_model_usage rows seeded → empty provider breakdown.
+    assert body["per_provider"] == []
+
+
+async def test_api_spend_summary_per_provider_nested_per_model(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (("a", "ENG-1", "ENG"), ("b", "ENG-2", "ENG")):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r3', 'a', 'review', 'completed', NULL, '2026-05-17T12:00:00Z')
+            """
+        )
+        await conn.commit()
+        # claude on two issues (one model), codex on one issue (one model).
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            response = await client.get("/api/spend/summary")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    body = response.json()
+    providers = {p["provider"]: p for p in body["per_provider"]}
+    assert set(providers) == {"claude", "codex"}
+
+    # claude sums its two runs and counts both issues; sorted first (larger).
+    assert [p["provider"] for p in body["per_provider"]] == ["claude", "codex"]
+    claude = providers["claude"]
+    assert claude["input_tokens"] == 150
+    assert claude["output_tokens"] == 25
+    assert claude["cache_write_tokens"] == 35
+    assert claude["cache_read_tokens"] == 45
+    assert claude["total_tokens"] == 150 + 25 + 35 + 45
+    assert claude["issues"] == 2
+    assert len(claude["per_model"]) == 1
+    assert claude["per_model"][0]["model"] == "claude-opus-4-8"
+    assert claude["per_model"][0]["total_tokens"] == 150 + 25 + 35 + 45
+    assert claude["per_model"][0]["issues"] == 2
+
+    codex = providers["codex"]
+    assert codex["total_tokens"] == 10 + 2 + 0 + 3
+    assert codex["issues"] == 1
+    assert codex["per_model"][0]["model"] == "gpt-5.5"
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,25 @@ CREATE INDEX IF NOT EXISTS idx_runs_status_pid ON runs(status, pid);
 -- runs.cost_usd); it no longer gates runs.
 CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 
+-- Per-(provider, model) token attribution for a run. A child of `runs`:
+-- the run-level token columns stay authoritative and the rows here sum
+-- back to them (±0 for Claude's exact `modelUsage` split; within the
+-- token-delta estimate for Codex). Rewritten wholesale per run at run
+-- end, so a re-parse of a growing log never double-counts.
+CREATE TABLE IF NOT EXISTS run_model_usage (
+    run_id             TEXT NOT NULL REFERENCES runs(id),
+    provider           TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, provider, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_model_usage_provider_model
+    ON run_model_usage(provider, model);
+
 -- PR opened for an issue. The row bridges the async Review/Merge ticks:
 -- Implement creates the PR and Review handoff, later ticks poll the same PR
 -- until Review + CI are green, then Merge marks it merged.

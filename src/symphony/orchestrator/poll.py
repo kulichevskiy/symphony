@@ -46,6 +46,7 @@ from ..agent.activity import (
 )
 from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
+from ..agent.model_usage import ModelUsage, parse_model_usage
 from ..agent.process import parse_event_line
 from ..agent.prompt import (
     acceptance_fix_prompt,
@@ -212,6 +213,67 @@ async def _add_run_usage(
         cache_write_tokens=usage.cache_write_tokens,
         cache_read_tokens=usage.cache_read_tokens,
     )
+
+
+async def _record_run_model_usage(
+    conn: aiosqlite.Connection,
+    run_id: str,
+    log_path: Path,
+    *,
+    codex_model: str | None,
+) -> None:
+    """Attribute a finished run's tokens to (provider, model) from its log.
+
+    Re-parses the full run log with the reusable `parse_model_usage` parser
+    and rewrites `run_model_usage` wholesale, so calling it repeatedly as a
+    multi-subprocess run's log grows stays idempotent. Best-effort: a read
+    or DB error must never fail the run itself.
+    """
+    try:
+        text = await asyncio.to_thread(
+            log_path.read_text, encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return
+    usages = parse_model_usage(text.splitlines(), codex_model=codex_model)
+    if not usages:
+        return
+    try:
+        await db.run_model_usage.replace_for_run(conn, run_id, usages)
+    except aiosqlite.Error:
+        log.warning("could not persist per-model usage for run %s", run_id)
+
+
+def _parse_local_review_model_usage(
+    log_dir: Path,
+    *,
+    implementer_codex_model: str | None,
+    reviewer_codex_model: str | None,
+) -> list[ModelUsage]:
+    """Parse local-review role transcripts into per-(provider, model) usage.
+
+    `fix-*.out.log` are implementer turns, `review-*.out.log` reviewer
+    turns; each file is one process, so it is parsed independently and the
+    rows are merged downstream. Sync (file IO) — call via `to_thread`.
+    """
+    usages: list[ModelUsage] = []
+    try:
+        paths = sorted(log_dir.glob("*.out.log"))
+    except OSError:
+        return usages
+    for path in paths:
+        if path.name.startswith("fix-"):
+            codex_model = implementer_codex_model
+        elif path.name.startswith("review-"):
+            codex_model = reviewer_codex_model
+        else:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        usages.extend(parse_model_usage(text.splitlines(), codex_model=codex_model))
+    return usages
 
 
 def _sum_usage(left: UsageDelta, right: UsageDelta) -> UsageDelta:
@@ -10748,6 +10810,9 @@ class Orchestrator:
                 await self._finalize_local_review_run(
                     run_id=local_review_run_id,
                     result=result,
+                    log_dir=last_message_dir,
+                    implementer_codex_model=binding.codex_model,
+                    reviewer_codex_model=reviewer_codex_model,
                 )
 
             log.info(
@@ -10773,7 +10838,13 @@ class Orchestrator:
             return None
 
     async def _finalize_local_review_run(
-        self, *, run_id: str, result: LoopResult | None
+        self,
+        *,
+        run_id: str,
+        result: LoopResult | None,
+        log_dir: Path | None = None,
+        implementer_codex_model: str | None = None,
+        reviewer_codex_model: str | None = None,
     ) -> None:
         """Close the local-review `runs` row started by the phase.
 
@@ -10799,6 +10870,13 @@ class Orchestrator:
                 log.warning(
                     "could not persist local-review usage for run %s",
                     run_id,
+                )
+            if log_dir is not None:
+                await self._record_local_review_model_usage(
+                    run_id=run_id,
+                    log_dir=log_dir,
+                    implementer_codex_model=implementer_codex_model,
+                    reviewer_codex_model=reviewer_codex_model,
                 )
         status = _local_review_status_from_result(result)
         try:
@@ -10826,6 +10904,35 @@ class Orchestrator:
                 run_id,
                 status,
             )
+
+    async def _record_local_review_model_usage(
+        self,
+        *,
+        run_id: str,
+        log_dir: Path,
+        implementer_codex_model: str | None,
+        reviewer_codex_model: str | None,
+    ) -> None:
+        """Attribute a local-review run's tokens to (provider, model).
+
+        The phase writes one role transcript per iteration under
+        `log_dir`: `fix-*.out.log` (implementer) and `review-*.out.log`
+        (reviewer). Each file is parsed with the codex model of its role
+        (Claude ignores it — its `modelUsage` carries the exact model).
+        Best-effort; never fails the run.
+        """
+        usages = await asyncio.to_thread(
+            _parse_local_review_model_usage,
+            log_dir,
+            implementer_codex_model=implementer_codex_model,
+            reviewer_codex_model=reviewer_codex_model,
+        )
+        if not usages:
+            return
+        try:
+            await db.run_model_usage.replace_for_run(self._conn, run_id, usages)
+        except aiosqlite.Error:
+            log.warning("could not persist per-model usage for run %s", run_id)
 
     async def _post_local_review_pr_summary(
         self,
@@ -11617,6 +11724,9 @@ class Orchestrator:
                         break
         finally:
             self._active_run_ids.discard(run_id)
+        await _record_run_model_usage(
+            self._conn, run_id, log_path, codex_model=binding.codex_model
+        )
         return cumulative_usage, final_kind, final_returncode
 
     async def _run_fix_agent(
@@ -11761,6 +11871,9 @@ class Orchestrator:
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
+        await _record_run_model_usage(
+            self._conn, run_id, log_path, codex_model=codex_model
+        )
         return cumulative_usage, final_kind, final_returncode
 
     async def _fail_run(

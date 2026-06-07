@@ -164,6 +164,14 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
                     "cache_read_input_tokens": 40,
                     "output_tokens": 50,
                 },
+                "modelUsage": {
+                    "claude-opus-4-8[1m]": {
+                        "inputTokens": 100,
+                        "outputTokens": 50,
+                        "cacheCreationInputTokens": 30,
+                        "cacheReadInputTokens": 40,
+                    }
+                },
             }
         )
         events = [
@@ -250,6 +258,18 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert history[0].output_tokens == 50
         assert history[0].cache_write_tokens == 30
         assert history[0].cache_read_tokens == 40
+
+        # Per-(provider, model) attribution written at run end, summing back
+        # to the run-level token columns (±0 for Claude's exact split).
+        per_model = await db.run_model_usage.list_for_run(conn, history[0].id)
+        assert len(per_model) == 1
+        assert per_model[0].provider == "claude"
+        assert per_model[0].model == "claude-opus-4-8[1m]"
+        assert per_model[0].input_tokens == history[0].input_tokens
+        assert per_model[0].output_tokens == history[0].output_tokens
+        assert per_model[0].cache_write_tokens == history[0].cache_write_tokens
+        assert per_model[0].cache_read_tokens == history[0].cache_read_tokens
+
         assert history[1].stage == "review"
         assert history[1].status == "running"
         assert await db.runs.has_running_or_completed(conn, "iss-1") is True
