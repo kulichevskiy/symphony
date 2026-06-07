@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type {
   IssueSummary,
   ProviderSpend,
+  SpendHeatmap,
   SpendSummary,
   TeamSpend,
 } from "@/lib/api";
@@ -15,6 +16,7 @@ import {
   PerProvider,
   PerTeam,
   SectionTotals,
+  SpendOverview,
 } from "./HomePage";
 
 const NOW_MS = Date.UTC(2026, 4, 17, 12, 0, 0);
@@ -157,6 +159,74 @@ describe("PerProvider", () => {
     const markup = renderToStaticMarkup(<PerProvider providers={providers} />);
     expect(markup).not.toContain("claude-opus-4-8");
     expect(markup).not.toContain("gpt-5.5");
+  });
+});
+
+describe("SpendOverview", () => {
+  const summary: SpendSummary = {
+    totals: {
+      input_tokens: 1_000,
+      output_tokens: 2_000,
+      cache_write_tokens: 3_000,
+      cache_read_tokens: 4_000,
+      issues: 172,
+    },
+    per_team: [
+      { key: "VIB", input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 4 },
+    ],
+    per_provider: [
+      {
+        provider: "claude",
+        input_tokens: 2_000_000,
+        output_tokens: 7_000_000,
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
+        issues: 7,
+        per_model: [
+          { model: "claude-opus-4-8", input_tokens: 2_000_000, output_tokens: 7_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 7 },
+        ],
+      },
+    ],
+  };
+  const heatmap: SpendHeatmap = {
+    days: [
+      { date: "2026-06-01", input_tokens: 1, output_tokens: 1, cache_write_tokens: 0, cache_read_tokens: 0, issues: 1 },
+    ],
+    start: "2026-06-01",
+    end: "2026-06-01",
+  };
+
+  function render(): string {
+    return renderToStaticMarkup(
+      <SpendOverview
+        summary={summary}
+        heatmap={heatmap}
+        heatProvider="all"
+        onChangeHeatProvider={() => {}}
+        onPickTeam={() => {}}
+      />,
+    );
+  }
+
+  it("stacks heatmap + totals (row 1), team full-width (row 2), provider (row 3)", () => {
+    const markup = render();
+    // Row 1: the heatmap and the all-time totals both render.
+    expect(markup).toContain("Daily token burn");
+    expect(markup).toContain("Tokens · all-time");
+    // Top-down order: row-1 totals → row-2 team → row-3 provider.
+    expect(markup.indexOf("Tokens · all-time")).toBeLessThan(
+      markup.indexOf("Tokens by team"),
+    );
+    expect(markup.indexOf("Tokens by team")).toBeLessThan(
+      markup.indexOf("Tokens by provider / model"),
+    );
+  });
+
+  it("constrains the provider list width so it does not stretch across the card", () => {
+    const markup = render();
+    const providerIdx = markup.indexOf("Tokens by provider / model");
+    // The row-3 wrapper before the heading carries a max-width constraint.
+    expect(markup.slice(0, providerIdx)).toMatch(/max-w-/);
   });
 });
 

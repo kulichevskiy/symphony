@@ -215,7 +215,7 @@ export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
   );
 }
 
-function SpendOverview({
+export function SpendOverview({
   summary,
   heatmap,
   heatProvider,
@@ -230,6 +230,7 @@ function SpendOverview({
 }) {
   return (
     <Card className="p-5">
+      {/* Row 1: heatmap | all-time totals */}
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <div className="min-w-0">
           <div className="mb-3 flex items-baseline justify-between gap-3">
@@ -254,32 +255,38 @@ function SpendOverview({
         </div>
         <div className="lg:border-l lg:border-border lg:pl-6">
           {summary ? (
-            <>
-              <HeadlineTotals totals={summary.totals} compact />
-              <div className="mt-5">
-                <div className="mb-2.5 flex items-center justify-between">
-                  <h2 className="text-sm font-semibold">Tokens by team</h2>
-                  <span className="text-xs text-muted-foreground">by output</span>
-                </div>
-                <PerTeam teams={summary.per_team} onPick={onPickTeam} />
-              </div>
-              {summary.per_provider.length > 0 && (
-                <div className="mt-5">
-                  <div className="mb-2.5 flex items-center justify-between">
-                    <h2 className="text-sm font-semibold">
-                      Tokens by provider / model
-                    </h2>
-                    <span className="text-xs text-muted-foreground">by output</span>
-                  </div>
-                  <PerProvider providers={summary.per_provider} />
-                </div>
-              )}
-            </>
+            <HeadlineTotals totals={summary.totals} compact />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )}
         </div>
       </div>
+
+      {summary && (
+        <>
+          {/* Row 2: tokens by team, full width */}
+          <div className="mt-6">
+            <div className="mb-2.5 flex items-center justify-between">
+              <h2 className="text-sm font-semibold">Tokens by team</h2>
+              <span className="text-xs text-muted-foreground">by output</span>
+            </div>
+            <PerTeam teams={summary.per_team} onPick={onPickTeam} />
+          </div>
+
+          {/* Row 3: tokens by provider / model, width-constrained */}
+          {summary.per_provider.length > 0 && (
+            <div className="mt-6 max-w-xl">
+              <div className="mb-2.5 flex items-center justify-between">
+                <h2 className="text-sm font-semibold">
+                  Tokens by provider / model
+                </h2>
+                <span className="text-xs text-muted-foreground">by output</span>
+              </div>
+              <PerProvider providers={summary.per_provider} />
+            </div>
+          )}
+        </>
+      )}
     </Card>
   );
 }
