@@ -256,7 +256,6 @@ def test_acceptance_config_defaults() -> None:
     assert binding.acceptance.dev_command is None
     assert binding.acceptance.dev_port is None
     assert binding.acceptance.taste_guide is None
-    assert binding.acceptance.cost_cap_usd == 10
     assert binding.acceptance.time_cap_minutes == 15
     assert binding.linear_states.in_acceptance == "In Acceptance"
 
@@ -274,7 +273,6 @@ repos:
       dev_command: npm run dev
       dev_port: 3000
       taste_guide: docs/taste.md
-      cost_cap_usd: 3.5
       time_cap_minutes: 0.1
     linear_states:
       ready: Todo
@@ -291,7 +289,6 @@ repos:
     assert cfg.repos[0].acceptance.dev_command == "npm run dev"
     assert cfg.repos[0].acceptance.dev_port == 3000
     assert cfg.repos[0].acceptance.taste_guide == "docs/taste.md"
-    assert cfg.repos[0].acceptance.cost_cap_usd == 3.5
     assert cfg.repos[0].acceptance.time_cap_minutes == pytest.approx(0.1)
     assert cfg.repos[0].linear_states.in_acceptance == "QA Acceptance"
 

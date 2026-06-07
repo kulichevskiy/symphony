@@ -507,9 +507,6 @@ async def test_orchestrator_final_flushes_unpublished_activity_events(
             workspace_path=workspace,
             stage="implement",
             prior_total=1.0,
-            cap_usd=100.0,
-            warning_pct=75,
-            warning_already_fired=False,
         )
 
         linear.post_comment.assert_awaited_once()
@@ -597,9 +594,6 @@ async def test_orchestrator_posts_long_running_heartbeat_without_new_output(
             workspace_path=workspace,
             stage="implement",
             prior_total=0.0,
-            cap_usd=100.0,
-            warning_pct=75,
-            warning_already_fired=False,
         )
 
         linear.post_comment.assert_awaited_once()

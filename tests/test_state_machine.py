@@ -86,11 +86,6 @@ def test_transition_is_frozen_dataclass() -> None:
             "ENOENT",
         ),
         (
-            {"status": "failed", "final_kind": "cost_cap", "cap_breached": True},
-            "cost_cap",
-            "cost cap",
-        ),
-        (
             {"status": "failed", "exc": RuntimeError("agent stream exploded")},
             "execution_error",
             "agent stream exploded",
@@ -134,15 +129,6 @@ def test_transition_is_frozen_dataclass() -> None:
             {"status": "needs_approval", "reason": "manual merge required"},
             "awaiting_human_merge",
             "manual merge",
-        ),
-        (
-            {
-                "status": "needs_approval",
-                "cap_breached": True,
-                "reason": "cost cap reached: $1.2500",
-            },
-            "cost_cap",
-            "cost cap",
         ),
         (
             {

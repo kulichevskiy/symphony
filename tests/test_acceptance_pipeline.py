@@ -246,22 +246,12 @@ def test_acceptance_classifier_preserves_product_reject_after_noninfra_tool_erro
     assert "returns 500" in verdict.details
 
 
-@pytest.mark.parametrize(
-    ("subtype", "message"),
-    [
-        ("error_max_budget", "cost cap exceeded"),
-        ("error_timeout", "time cap exceeded"),
-    ],
-)
-def test_acceptance_classifier_treats_runner_cap_signals_as_infra_error(
-    subtype: str,
-    message: str,
-) -> None:
+def test_acceptance_classifier_treats_runner_cap_signals_as_infra_error() -> None:
     transcript = json.dumps(
         {
             "type": "result",
-            "subtype": subtype,
-            "result": message,
+            "subtype": "error_timeout",
+            "result": "time cap exceeded",
             "total_cost_usd": 0.12,
         }
     )
@@ -270,7 +260,7 @@ def test_acceptance_classifier_treats_runner_cap_signals_as_infra_error(
 
     assert verdict.kind == "infra_error"
     assert verdict.cost == pytest.approx(0.12)
-    assert message in verdict.details
+    assert "time cap exceeded" in verdict.details
 
 
 def test_acceptance_classifier_parses_pass_footer_and_cost() -> None:
@@ -728,7 +718,6 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
         stall_secs=15,
-        max_budget_usd=3.25,
     )
 
     assert verdict.kind == "pass"
@@ -754,9 +743,7 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
     disallowed_tools_idx = runner.captured_spec.command.index("--disallowedTools") + 1
     disallowed_tools = runner.captured_spec.command[disallowed_tools_idx].split(",")
     assert {"Bash", "Read", "Edit"}.issubset(disallowed_tools)
-    assert "--max-budget-usd" in runner.captured_spec.command
-    budget_idx = runner.captured_spec.command.index("--max-budget-usd") + 1
-    assert runner.captured_spec.command[budget_idx] == "3.2500"
+    assert "--max-budget-usd" not in runner.captured_spec.command
     prompt = runner.captured_spec.command[-1]
     assert "Add a settings icon to the toolbar." in prompt
     assert "diff --git a/ui.py b/ui.py" in prompt
@@ -814,9 +801,7 @@ async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
         linear_description="Add a settings icon to the toolbar.",
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
-        stall_secs=5,
-        max_budget_usd=3.25,
-        preview_url=preview_url,
+        stall_secs=5,        preview_url=preview_url,
         dev_command="npm run dev",
         dev_port=port,
         dev_startup_timeout_secs=5,
@@ -884,7 +869,6 @@ async def test_dev_acceptance_stops_dev_server_when_setup_fails(
             pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
             criteria=["toolbar has settings icon"],
             stall_secs=5,
-            max_budget_usd=3.25,
             preview_url=preview_url,
             dev_command="npm run dev",
             dev_port=port,
@@ -938,9 +922,7 @@ async def test_dev_acceptance_pass_requires_reported_criteria(
         linear_description="Add a settings icon to the toolbar.",
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
-        stall_secs=5,
-        max_budget_usd=3.25,
-        preview_url=preview_url,
+        stall_secs=5,        preview_url=preview_url,
         dev_command="npm run dev",
         dev_port=port,
         dev_startup_timeout_secs=5,
@@ -1183,9 +1165,7 @@ async def test_preview_acceptance_uses_playwright_without_dev_server(
         linear_description="Add a settings icon to the toolbar.",
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
-        stall_secs=5,
-        max_budget_usd=3.25,
-        preview_url=preview_url,
+        stall_secs=5,        preview_url=preview_url,
         dev_command="npm run dev",
         dev_port=3000,
         dev_startup_timeout_secs=5,
@@ -1231,9 +1211,7 @@ async def test_acceptance_runner_closes_event_stream_after_terminal_event(
         linear_description="Add a settings icon to the toolbar.",
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
-        stall_secs=15,
-        max_budget_usd=3.25,
-    )
+        stall_secs=15,    )
 
     assert verdict.kind == "pass"
     assert runner.iterator.closed is True
@@ -1269,9 +1247,7 @@ async def test_acceptance_runner_quick_skips_trivial_readme_typo_without_claude(
             "+This package runs Symphony.\n"
         ),
         criteria=[],
-        stall_secs=15,
-        max_budget_usd=3.25,
-    )
+        stall_secs=15,    )
 
     assert verdict == AcceptanceVerdict(
         kind="pass",
@@ -1337,46 +1313,6 @@ def test_acceptance_prompt_includes_first_phase_quick_skip_contract() -> None:
 
 
 @pytest.mark.asyncio
-async def test_acceptance_runner_aborts_with_infra_error_when_budget_reached(
-    tmp_path: Path,
-) -> None:
-    runner = _ScriptedRunner(
-        [
-            RunnerEvent(
-                kind="stdout",
-                line=_claude_result("Still evaluating.", cost=0.02),
-            ),
-            RunnerEvent(
-                kind="stdout",
-                line=_claude_result(
-                    f"Looks good.\n\n{ACCEPTANCE_FOOTER_PASS}",
-                    cost=0.03,
-                ),
-            ),
-            RunnerEvent(kind="exit", returncode=0),
-        ]
-    )
-
-    verdict = await run_acceptance(
-        runner=runner,
-        run_id="acceptance-1",
-        workspace_path=tmp_path,
-        mode="code_only",
-        linear_description="Add a settings icon to the toolbar.",
-        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
-        criteria=["toolbar has settings icon"],
-        stall_secs=15,
-        max_budget_usd=0.01,
-    )
-
-    assert verdict.kind == "infra_error"
-    assert verdict.criteria == ["toolbar has settings icon"]
-    assert verdict.cost == pytest.approx(0.02)
-    assert "cost_cap_exceeded" in verdict.details
-    assert runner.killed_run_ids == ["acceptance-1"]
-
-
-@pytest.mark.asyncio
 async def test_acceptance_runner_aborts_with_infra_error_when_time_cap_reached(
     tmp_path: Path,
 ) -> None:
@@ -1403,7 +1339,6 @@ async def test_acceptance_runner_aborts_with_infra_error_when_time_cap_reached(
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
         stall_secs=0.01,
-        max_budget_usd=10.0,
     )
 
     assert verdict.kind == "infra_error"
@@ -1452,9 +1387,7 @@ async def test_dev_acceptance_requires_dev_command_and_port_without_prompt_runne
         linear_description="Run the dev acceptance flow.",
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+run_dev_check()",
         criteria=["dev acceptance works"],
-        stall_secs=15,
-        max_budget_usd=3.25,
-    )
+        stall_secs=15,    )
 
     assert verdict.kind == "infra_error"
     assert verdict.criteria == ["dev acceptance works"]
@@ -1542,9 +1475,7 @@ async def test_acceptance_runner_fails_when_claude_does_not_complete_successfull
         linear_description="Add a settings icon to the toolbar.",
         pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
         criteria=["toolbar has settings icon"],
-        stall_secs=15,
-        max_budget_usd=3.25,
-    )
+        stall_secs=15,    )
 
     assert verdict.kind == "infra_error"
     assert verdict.criteria == ["toolbar has settings icon"]

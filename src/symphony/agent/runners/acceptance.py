@@ -187,7 +187,6 @@ async def run_acceptance(
     taste_guide: str = "",
     criteria: list[str] | None = None,
     stall_secs: float = 300,
-    max_budget_usd: float | None = None,
     preview_url: str = "",
     dev_command: str | None = None,
     dev_port: int | None = None,
@@ -203,7 +202,6 @@ async def run_acceptance(
             taste_guide=taste_guide,
             criteria=criteria,
             stall_secs=stall_secs,
-            max_budget_usd=max_budget_usd,
             preview_url=preview_url,
             dev_command=dev_command,
             dev_port=dev_port,
@@ -219,7 +217,6 @@ async def run_acceptance(
             taste_guide=taste_guide,
             criteria=criteria,
             stall_secs=stall_secs,
-            max_budget_usd=max_budget_usd,
             preview_url=preview_url,
         )
     if mode != _CODE_ONLY_MODE:
@@ -251,7 +248,6 @@ async def run_acceptance(
         workspace_path=workspace_path,
         command=build_acceptance_command(
             prompt=prompt,
-            max_budget_usd=max_budget_usd,
         ),
         stall_secs=stall_secs,
         stage="acceptance",
@@ -259,7 +255,6 @@ async def run_acceptance(
     acceptance_run = await _collect_acceptance_output(
         runner,
         spec,
-        max_budget_usd=max_budget_usd,
         wall_clock_secs=stall_secs,
     )
     collected = acceptance_run.output
@@ -315,7 +310,6 @@ async def _run_dev_acceptance(
     taste_guide: str,
     criteria: list[str] | None,
     stall_secs: float,
-    max_budget_usd: float | None,
     preview_url: str,
     dev_command: str | None,
     dev_port: int | None,
@@ -366,7 +360,6 @@ async def _run_dev_acceptance(
             taste_guide=taste_guide,
             criteria=criteria,
             stall_secs=stall_secs,
-            max_budget_usd=max_budget_usd,
             preview_url=resolved_preview_url,
         )
     finally:
@@ -383,7 +376,6 @@ async def _run_preview_acceptance(
     taste_guide: str,
     criteria: list[str] | None,
     stall_secs: float,
-    max_budget_usd: float | None,
     preview_url: str,
 ) -> AcceptanceVerdict:
     if not preview_url:
@@ -404,7 +396,6 @@ async def _run_preview_acceptance(
         taste_guide=taste_guide,
         criteria=criteria,
         stall_secs=stall_secs,
-        max_budget_usd=max_budget_usd,
         preview_url=preview_url,
     )
 
@@ -420,7 +411,6 @@ async def _run_playwright_acceptance(
     taste_guide: str,
     criteria: list[str] | None,
     stall_secs: float,
-    max_budget_usd: float | None,
     preview_url: str,
 ) -> AcceptanceVerdict:
     artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
@@ -444,7 +434,6 @@ async def _run_playwright_acceptance(
         workspace_path=workspace_path,
         command=build_acceptance_command(
             prompt=prompt,
-            max_budget_usd=max_budget_usd,
             mode=mode,
             mcp_config_path=mcp_config_path,
         ),
@@ -458,7 +447,6 @@ async def _run_playwright_acceptance(
     acceptance_run = await _collect_acceptance_output(
         runner,
         spec,
-        max_budget_usd=max_budget_usd,
         wall_clock_secs=stall_secs,
     )
     collected = acceptance_run.output
@@ -565,7 +553,6 @@ async def _collect_acceptance_output(
     runner: Runner,
     spec: RunnerSpec,
     *,
-    max_budget_usd: float | None,
     wall_clock_secs: float,
 ) -> _AcceptanceRunOutput:
     stdout_parts: list[str] = []
@@ -639,10 +626,6 @@ async def _collect_acceptance_output(
                     _usage_delta_from_usage(usage),
                 )
                 tracked_cost = max(tracked_cost, usage.cost_usd)
-                if _cost_cap_reached(max_budget_usd, tracked_cost):
-                    return await abort(
-                        _cost_cap_exceeded_details(max_budget_usd, tracked_cost)
-                    )
         elif event.kind == "stderr" and event.line is not None:
             stderr_parts.append(event.line)
         elif event.kind == "exit":
@@ -685,14 +668,6 @@ async def _next_runner_event(
     iterator: AsyncIterator[RunnerEvent],
 ) -> RunnerEvent:
     return await iterator.__anext__()
-
-
-def _cost_cap_reached(max_budget_usd: float | None, cost_usd: float) -> bool:
-    return (
-        max_budget_usd is not None
-        and max_budget_usd > 0
-        and cost_usd >= max_budget_usd
-    )
 
 
 async def _start_dev_server(
@@ -965,7 +940,6 @@ def _validate_dev_artifacts(
 def build_acceptance_command(
     *,
     prompt: str,
-    max_budget_usd: float | None = None,
     mode: str = _CODE_ONLY_MODE,
     mcp_config_path: Path | None = None,
 ) -> list[str]:
@@ -996,8 +970,6 @@ def build_acceptance_command(
                 "mcp__playwright__*",
             ]
         )
-    if max_budget_usd is not None:
-        command.extend(["--max-budget-usd", f"{max_budget_usd:.4f}"])
     command.append(prompt)
     return command
 
@@ -1332,14 +1304,6 @@ def _failed_run_details(
     return f"Acceptance runner exited rc={collected.returncode}."
 
 
-def _cost_cap_exceeded_details(max_budget_usd: float | None, cost_usd: float) -> str:
-    cap = 0.0 if max_budget_usd is None else max_budget_usd
-    return (
-        "cost_cap_exceeded: acceptance cost "
-        f"${cost_usd:.4f} reached cap ${cap:.4f}."
-    )
-
-
 def _time_cap_exceeded_details(time_cap_secs: float) -> str:
     minutes = time_cap_secs / 60.0
     return (
@@ -1350,10 +1314,8 @@ def _time_cap_exceeded_details(time_cap_secs: float) -> str:
 
 def _prefix_cap_details(details: str) -> str:
     lower = details.lower()
-    if "cost_cap_exceeded" in lower or "time_cap_exceeded" in lower:
+    if "time_cap_exceeded" in lower:
         return details
-    if "cost" in lower and ("cap" in lower or "budget" in lower):
-        return f"cost_cap_exceeded: {details}"
     if "timeout" in lower or "timed out" in lower or "time cap" in lower:
         return f"time_cap_exceeded: {details}"
     return details

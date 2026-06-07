@@ -195,8 +195,6 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
             "run_id": row["run_id"],
             "fingerprint": row["fingerprint"],
         }
-    elif kind == "cost_warning_posted":
-        payload = {}
     elif kind == "review_state_changed":
         payload = {
             "field": row["field"],
@@ -354,16 +352,6 @@ def create_issue_detail_router(
             """,
             (issue_id,),
         )
-        issue_cost_marks = await _fetch_one(
-            conn,
-            """
-            SELECT warning_posted_at
-            FROM issue_cost_marks
-            WHERE issue_id = ?
-            """,
-            (issue_id,),
-        )
-
         warnings = issue_warnings(
             canonical_status,
             latest_activity_age_secs=latest_activity_age_secs,
@@ -378,7 +366,6 @@ def create_issue_detail_router(
             "review_state": review_state,
             "comment_events": comment_events,
             "activity_comment_marks": activity_comment_marks,
-            "issue_cost_marks": issue_cost_marks,
         }
         if warnings:
             payload["warnings"] = warnings
@@ -525,18 +512,6 @@ def create_issue_detail_router(
 
                 UNION ALL
 
-                SELECT warning_posted_at AS ts, 'cost_warning_posted' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM issue_cost_marks
-                WHERE issue_id = ? AND warning_posted_at IS NOT NULL
-
-                UNION ALL
-
                 SELECT ts, 'review_state_changed' AS kind,
                        NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
                        NULL AS cost_usd, NULL AS github_repo, NULL AS pr_number,
@@ -610,7 +585,6 @@ def create_issue_detail_router(
             ORDER BY ts ASC, kind ASC
             """,
             (
-                issue_id,
                 issue_id,
                 issue_id,
                 issue_id,

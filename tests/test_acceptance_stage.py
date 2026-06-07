@@ -114,7 +114,6 @@ def _fix_events() -> list[RunnerEvent]:
 def _binding(
     mode: str = "off",
     *,
-    acceptance_cost_cap_usd: float = 10.0,
     acceptance_time_cap_minutes: float = 15.0,
 ) -> RepoBinding:
     return RepoBinding(
@@ -124,7 +123,6 @@ def _binding(
         branch_prefix="symphony",
         acceptance=AcceptanceConfig(  # type: ignore[arg-type]
             mode=mode,
-            cost_cap_usd=acceptance_cost_cap_usd,
             time_cap_minutes=acceptance_time_cap_minutes,
         ),
         linear_states=LinearStates(
@@ -609,7 +607,7 @@ async def test_acceptance_degrades_missing_where_to_verify_to_code_only(
 
 
 @pytest.mark.asyncio
-async def test_acceptance_runner_uses_acceptance_budget_and_time_caps(
+async def test_acceptance_runner_uses_acceptance_time_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
@@ -620,7 +618,6 @@ async def test_acceptance_runner_uses_acceptance_budget_and_time_caps(
     try:
         binding = _binding(
             "code_only",
-            acceptance_cost_cap_usd=3.5,
             acceptance_time_cap_minutes=7,
         )
         await _seed_review_candidate(conn, binding)
@@ -640,7 +637,6 @@ async def test_acceptance_runner_uses_acceptance_budget_and_time_caps(
                 log_root=tmp_path / "logs",
                 workspace_root=tmp_path / "ws",
                 db_path=tmp_path / "s.sqlite",
-                cost_cap_per_issue_usd=100.0,
                 stall_timeout_secs=30,
             ),
             linear,
@@ -659,8 +655,7 @@ async def test_acceptance_runner_uses_acceptance_budget_and_time_caps(
 
         acceptance_spec = runner.captured_specs[0]
         assert acceptance_spec.stall_secs == 7 * 60
-        budget_idx = acceptance_spec.command.index("--max-budget-usd") + 1
-        assert acceptance_spec.command[budget_idx] == "3.5000"
+        assert "--max-budget-usd" not in acceptance_spec.command
     finally:
         await conn.close()
 
@@ -742,73 +737,6 @@ async def test_acceptance_quick_skip_posts_distinct_pass_and_still_merges(
             for body in bodies
         )
         assert any("Reason: `quick_skip_trivial`" in body for body in bodies)
-    finally:
-        await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_acceptance_cost_cap_breach_records_single_infra_retry_and_comment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def no_sync(_workspace_path: Path, _branch: str) -> None:
-        return None
-
-    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    conn = await db.connect(tmp_path / "s.sqlite")
-    try:
-        binding = _binding("code_only", acceptance_cost_cap_usd=0.01)
-        await _seed_review_candidate(conn, binding)
-        runner = _FakeRunner([_acceptance_events(cost=0.02), _merge_events()])
-        workspace = MagicMock()
-        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
-        workspace.release = MagicMock()
-        workspace.cleanup = AsyncMock()
-        linear = AsyncMock()
-        linear.lookup_issue = AsyncMock(return_value=_issue())
-        linear.move_issue = AsyncMock()
-        linear.post_comment = AsyncMock(return_value="cmt-1")
-        gh = _github()
-
-        orch = Orchestrator(
-            Config(
-                repos=[binding],
-                log_root=tmp_path / "logs",
-                workspace_root=tmp_path / "ws",
-                db_path=tmp_path / "s.sqlite",
-                cost_cap_per_issue_usd=100.0,
-                stall_timeout_secs=30,
-            ),
-            linear,
-            conn,
-            runner=runner,
-            gh=gh,
-            workspace=workspace,
-            push_fn=AsyncMock(),
-        )
-        orch._states = {"ENG": _states()}  # noqa: SLF001
-
-        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
-        if tasks:
-            await asyncio.gather(*tasks)
-        await orch.drain_dispatch_tasks()
-
-        acceptance = await db.acceptance_state.get(conn, "iss-1")
-        assert acceptance.last_verdict == "infra_error"
-        assert acceptance.infra_retries == 1
-
-        history = await db.runs.history_for_issue(conn, "iss-1")
-        assert [run.stage for run in history] == [
-            "implement",
-            "review",
-            "acceptance",
-        ]
-        assert history[2].status == "failed"
-        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any(
-            "`infra_error`" in body and "cost_cap_exceeded" in body
-            for body in bodies
-        )
-        gh.pr_merge.assert_not_awaited()
     finally:
         await conn.close()
 
@@ -2015,60 +1943,6 @@ async def test_dev_acceptance_records_hero_upload_when_verdict_comment_fails(
         assert acceptance.last_artifacts_url == "https://uploads.linear.app/hero.png"
         linear.upload_issue_attachment.assert_awaited_once()
         gh.pr_merge.assert_awaited_once()
-    finally:
-        await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_acceptance_cost_counts_toward_issue_warning_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def no_sync(_workspace_path: Path, _branch: str) -> None:
-        return None
-
-    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    conn = await db.connect(tmp_path / "s.sqlite")
-    try:
-        binding = _binding("code_only")
-        await _seed_review_candidate(conn, binding)
-        await db.runs.add_cost(conn, "implement", 70.0)
-        runner = _FakeRunner([_acceptance_events(cost=10.0), _merge_events()])
-        workspace = MagicMock()
-        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
-        workspace.release = MagicMock()
-        workspace.cleanup = AsyncMock()
-        linear = AsyncMock()
-        linear.lookup_issue = AsyncMock(return_value=_issue())
-        linear.move_issue = AsyncMock()
-        linear.post_comment = AsyncMock(return_value="cmt-1")
-
-        orch = Orchestrator(
-            Config(
-                repos=[binding],
-                log_root=tmp_path / "logs",
-                workspace_root=tmp_path / "ws",
-                db_path=tmp_path / "s.sqlite",
-                cost_cap_per_issue_usd=100.0,
-                cost_warning_pct=75,
-            ),
-            linear,
-            conn,
-            runner=runner,
-            gh=_github(),
-            workspace=workspace,
-            push_fn=AsyncMock(),
-        )
-        orch._states = {"ENG": _states()}  # noqa: SLF001
-
-        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
-        if tasks:
-            await asyncio.gather(*tasks)
-        await orch.drain_dispatch_tasks()
-
-        assert await db.runs.cost_for_issue(conn, "iss-1") == pytest.approx(80.0)
-        assert await db.cost_marks.warning_posted_at(conn, "iss-1") is not None
-        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any("Cost notice" in body for body in bodies)
     finally:
         await conn.close()
 

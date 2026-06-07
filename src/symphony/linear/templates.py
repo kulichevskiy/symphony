@@ -72,7 +72,6 @@ class CommentVars:
     last_log: str = ""
     next_stage: str = ""
     linear_identifier: str = ""
-    pct: int = 0
     commit_url: str = ""
     auto_retry: bool = False
 
@@ -138,18 +137,6 @@ def stuck_loop_escape(v: CommentVars) -> str:
     )
 
 
-def cost_cap_reached(v: CommentVars) -> str:
-    return (
-        f"🟠 **Cost cap reached — pipeline paused**\n\n"
-        f"Symphony paused `{v.repo}#{v.issue}` because cumulative agent "
-        f"cost reached **{v.cost}** during **{v.stage}**.\n\n"
-        f"- Run ID: `{v.run_id}`\n"
-        f"- PR: {v.pr_url}\n\n"
-        f"After raising the cap, reply with `$approve` or `$retry` to requeue. "
-        f"Reply with `$reject` or `$stop` to leave the issue halted.\n"
-    )
-
-
 def acceptance_blocked(v: CommentVars) -> str:
     detail = f"\n\nLast infra error: {v.error}\n" if v.error else "\n"
     return (
@@ -210,14 +197,6 @@ def failed(v: CommentVars) -> str:
     if v.auto_retry:
         body += "\nWill auto-retry shortly.\n"
     return body
-
-
-def cost_warning(v: CommentVars) -> str:
-    return (
-        f"💸 Cost notice — `{v.repo}#{v.issue}` has used **{v.cost}** "
-        f"({v.pct}% of cap)\n\n"
-        f"Next stuck-loop escape will fire if cost reaches the cap. PR: {v.pr_url}\n"
-    )
 
 
 def resumed(v: CommentVars) -> str:

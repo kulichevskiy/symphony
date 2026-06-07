@@ -94,7 +94,6 @@ OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
     operator_waits.KIND_IMPLEMENT_FAILED: CanonicalState.HALTED,
     operator_waits.KIND_REVIEW_FAILED: CanonicalState.HALTED,
     operator_waits.KIND_REVIEW_STOPPED: CanonicalState.PAUSED,
-    operator_waits.KIND_COST_CAP: CanonicalState.PAUSED,
     operator_waits.KIND_MERGE: CanonicalState.AWAITING_MERGE,
 }
 
