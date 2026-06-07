@@ -77,6 +77,26 @@ const cockpit = {
     cache_write_tokens: 412_000,
     cache_read_tokens: 7_900_000,
   },
+  byModel: [
+    {
+      provider: "claude",
+      model: "claude-opus-4-8",
+      input_tokens: 2_000_000,
+      output_tokens: 180_000,
+      cache_write_tokens: 400_000,
+      cache_read_tokens: 7_800_000,
+      total_tokens: 10_380_000,
+    },
+    {
+      provider: "codex",
+      model: "gpt-5.5",
+      input_tokens: 100_000,
+      output_tokens: 4_000,
+      cache_write_tokens: 12_000,
+      cache_read_tokens: 100_000,
+      total_tokens: 216_000,
+    },
+  ],
   pr: {
     number: 412,
     repo: "kulichevskiy/adjust_os",
@@ -99,6 +119,17 @@ describe("TokensCard", () => {
     expect(markup).toContain('title="10596000">10.6M</span>');
     expect(markup).toContain('title="2100000">2.1M</span>');
     expect(markup).toContain('title="7900000">7.9M</span>');
+  });
+
+  it("breaks tokens down by provider and model", () => {
+    const markup = renderToStaticMarkup(<TokensCard c={cockpit} />);
+    expect(markup).toContain("by provider / model");
+    expect(markup).toContain("claude");
+    expect(markup).toContain("claude-opus-4-8");
+    expect(markup).toContain("codex");
+    expect(markup).toContain("gpt-5.5");
+    // claude provider total = 10.38M, rendered alongside the model.
+    expect(markup).toContain('title="10380000">10.4M</span>');
   });
 });
 
