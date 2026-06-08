@@ -51,6 +51,29 @@ def test_local_review_prompt_demands_actionable_findings() -> None:
     assert "junior engineer" in prompt.lower()
 
 
+def test_local_review_prompt_is_adversarial_and_lensed() -> None:
+    """SYM-89: the single reviewer must dig harder — adversarial stance,
+    explicit lenses applied to the touched files, and an asymmetric
+    approval bar that forbids a bare 'looks good'."""
+    prompt = local_review_prompt(
+        issue_title="t", issue_body="b", labels=[], base_branch="main"
+    )
+    lower = prompt.lower()
+    # 1. Adversarial stance: assume a bug exists; try to break it.
+    assert "assume a bug exists" in lower
+    assert "break it" in lower
+    # 2. The three lenses, applied per touched files.
+    assert "data" in lower and "sql" in lower
+    assert "run_model_usage" in prompt
+    assert "test quality" in lower
+    assert "querykey" in lower  # frontend data-flow lens
+    assert "relevant to the" in lower or "files the diff touches" in lower
+    # 3. Asymmetric approval bar: enumerate what you tried to break.
+    assert "tried to break" in lower
+    # 4. Style nits stay explicitly non-blocking.
+    assert "nit" in lower and "not blocking" in lower
+
+
 def test_local_review_prompt_handles_missing_origin_ref() -> None:
     """Iter 6 smoke: scratch repos without `origin` made the reviewer
     narrate "I used main...HEAD instead" in findings. The prompt now
