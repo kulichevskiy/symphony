@@ -213,6 +213,10 @@ describe("TokenOverview", () => {
       },
     ],
     teams: ["VIB", "ADJ"],
+    models: [
+      { provider: "claude", model: "claude-opus-4-8" },
+      { provider: "codex", model: "gpt-5-codex" },
+    ],
   };
   const heatmap: SpendHeatmap = {
     days: [

@@ -452,7 +452,7 @@ export function IssueTable({
 export function HomePage() {
   const navigate = useNavigate();
   const nowMs = useNowMs();
-  const { provider, teams, date } = useFilters();
+  const { provider, teams, models, date } = useFilters();
   // Day-granular bounds; the strings are stable across the 10s `nowMs` ticker,
   // so they don't churn the query keys.
   const { from, to } = resolveDateWindow(date, nowMs);
@@ -460,27 +460,29 @@ export function HomePage() {
   const dateTo = to ?? undefined;
 
   const providerFilter = provider === "all" ? undefined : provider;
-  // Stable cache key for the team selection (order-independent).
+  // Stable cache keys for the selections (order-independent).
   const teamsKey = [...teams].sort().join(",");
   const teamsFilter = teams.length ? teams : undefined;
+  const modelsKey = [...models].sort().join(",");
+  const modelsFilter = models.length ? models : undefined;
 
   const summaryQuery = useQuery({
-    queryKey: ["spend-summary", provider, teamsKey, from, to],
+    queryKey: ["spend-summary", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
-      fetchSpendSummary(providerFilter, teamsFilter, dateFrom, dateTo),
+      fetchSpendSummary(providerFilter, teamsFilter, modelsFilter, dateFrom, dateTo),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
   // The heatmap is the time axis itself — it stays a fixed 12-month canvas and
   // takes no date param; the window only highlights cells within it.
   const heatmapQuery = useQuery({
-    queryKey: ["spend-heatmap", provider, teamsKey],
-    queryFn: () => fetchSpendHeatmap(371, providerFilter, teamsFilter),
+    queryKey: ["spend-heatmap", provider, teamsKey, modelsKey],
+    queryFn: () => fetchSpendHeatmap(371, providerFilter, teamsFilter, modelsFilter),
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
   const activeQuery = useQuery({
-    queryKey: ["issues", "active", provider, teamsKey, from, to],
+    queryKey: ["issues", "active", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
       fetchIssues({
         scope: "active",
@@ -488,12 +490,13 @@ export function HomePage() {
         teams: teamsFilter,
         from: dateFrom,
         to: dateTo,
+        models: modelsFilter,
       }),
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", provider, teamsKey, from, to],
+    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
       fetchIssues({
         scope: "done",
@@ -501,6 +504,7 @@ export function HomePage() {
         teams: teamsFilter,
         from: dateFrom,
         to: dateTo,
+        models: modelsFilter,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,

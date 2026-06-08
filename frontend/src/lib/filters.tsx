@@ -155,6 +155,32 @@ export function isDefaultDate(date: DateFilter): boolean {
   return date.kind === "preset" && date.preset === "12mo";
 }
 
+/** Strip the `provider:` prefix off a qualified model for display. */
+function modelLabel(qualified: string): string {
+  const idx = qualified.indexOf(":");
+  return idx === -1 ? qualified : qualified.slice(idx + 1);
+}
+
+/** The Models filter chip summary: "All" when empty, bare model names when one
+ *  or two are picked, else a "N selected" count. Models are provider-qualified
+ *  (`provider:model`); the chip shows just the model part. */
+export function modelFilterSummary(selected: string[]): string {
+  if (selected.length === 0) return "All";
+  if (selected.length <= 2) return selected.map(modelLabel).join(", ");
+  return `${selected.length} selected`;
+}
+
+/** Drop selected models that don't belong to the active provider. Under "all"
+ *  every model is kept; otherwise only `${provider}:…` qualified models survive.
+ *  This is the provider→model dependency: switching provider prunes the rest. */
+export function pruneModelsForProvider(
+  models: string[],
+  provider: Provider,
+): string[] {
+  if (provider === "all") return models;
+  return models.filter((m) => m.split(":")[0] === provider);
+}
+
 /** The single source of truth for every dashboard filter. */
 export type Filters = {
   teams: string[];
@@ -268,16 +294,21 @@ export function resolveInitialFilters({
   stored: string | null;
 }): Filters {
   const blob = parseStored(stored);
+  const provider = params.has("provider")
+    ? normalizeProvider(params.get("provider"))
+    : normalizeProvider(blob.provider ?? DEFAULT_FILTERS.provider);
+  const models = params.has("models")
+    ? parseList(params.get("models"))
+    : (blob.models ?? DEFAULT_FILTERS.models);
   return {
     teams: params.has("teams")
       ? parseList(params.get("teams"))
       : (blob.teams ?? DEFAULT_FILTERS.teams),
-    provider: params.has("provider")
-      ? normalizeProvider(params.get("provider"))
-      : normalizeProvider(blob.provider ?? DEFAULT_FILTERS.provider),
-    models: params.has("models")
-      ? parseList(params.get("models"))
-      : (blob.models ?? DEFAULT_FILTERS.models),
+    provider,
+    // Provider→model dependency on load: a URL provider crossed with stored
+    // models (or vice versa) can be inconsistent; prune so resolved state and
+    // the mirrored URL never carry models the provider-scoped popover omits.
+    models: pruneModelsForProvider(models, provider),
     date: parseDate(params),
   };
 }
@@ -322,7 +353,11 @@ export function FiltersProvider({ children }: { children: ReactNode }) {
 
   const setProvider = useCallback(
     (value: string) =>
-      setFilters((f) => ({ ...f, provider: normalizeProvider(value) })),
+      setFilters((f) => {
+        const provider = normalizeProvider(value);
+        // Provider→model dependency: prune selections that no longer belong.
+        return { ...f, provider, models: pruneModelsForProvider(f.models, provider) };
+      }),
     [],
   );
   const setTeams = useCallback(
