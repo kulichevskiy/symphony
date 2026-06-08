@@ -140,17 +140,23 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert settings["disableAllHooks"] is True
     assert "--bare" not in argv
     assert "--tools" in argv
-    assert argv[argv.index("--tools") + 1] == "Bash,Read"
+    assert argv[argv.index("--tools") + 1] == "Bash,Read,Grep,Glob,LS"
     assert "--allowedTools" in argv
-    assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read"
+    assert (
+        argv[argv.index("--allowedTools") + 1]
+        == "Bash(git diff *),Read,Grep,Glob,LS"
+    )
     assert "--disallowedTools" in argv
     disallowed_tools = argv[argv.index("--disallowedTools") + 1].split(",")
-    assert {"Edit", "Write", "MultiEdit", "NotebookEdit"}.issubset(
+    assert {"Edit", "Write", "MultiEdit", "WebFetch", "Task"}.issubset(
         disallowed_tools
     )
-    assert {"Glob", "Grep", "LS", "NotebookRead", "WebFetch", "WebSearch"}.issubset(
-        disallowed_tools
-    )
+    # Read-only repo search is now part of the reviewer surface, not banned.
+    assert {"Grep", "Glob", "LS"}.isdisjoint(disallowed_tools)
+    tools = argv[argv.index("--tools") + 1].split(",")
+    allowed_tools = argv[argv.index("--allowedTools") + 1].split(",")
+    assert {"Grep", "Glob", "LS"}.issubset(tools)
+    assert {"Grep", "Glob", "LS"}.issubset(allowed_tools)
     assert "Bash" not in disallowed_tools
     assert "Read" not in disallowed_tools
     assert argv.index("--disallowedTools") < argv.index("--tools")

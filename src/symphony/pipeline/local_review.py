@@ -40,13 +40,13 @@ VERDICT_CHANGES_REQUESTED_MARKER = "<<<VERDICT:CHANGES_REQUESTED>>>"
 
 ReviewerAgent = Literal["claude", "codex"]
 
-_CLAUDE_REVIEWER_TOOLS = "Bash,Read"
-_CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read"
+# Read-only repo search (Grep/Glob/LS) is in-surface so the reviewer can find
+# callers, sibling implementations, and existing tests of changed code. Write
+# and exec tools stay forbidden; the reviewer remains single-pass and read-only.
+_CLAUDE_REVIEWER_TOOLS = "Bash,Read,Grep,Glob,LS"
+_CLAUDE_REVIEWER_ALLOWED_TOOLS = "Bash(git diff *),Read,Grep,Glob,LS"
 _CLAUDE_REVIEWER_DISALLOWED_TOOLS = ",".join(
     (
-        "Glob",
-        "Grep",
-        "LS",
         "Edit",
         "Write",
         "MultiEdit",
@@ -122,7 +122,13 @@ def local_review_prompt(
         "which ref you used — just review.)\n"
         "2. Read the changed files in context where the diff alone is "
         "ambiguous.\n"
-        "3. Re-read the Linear issue below and check that the change "
+        "3. For every changed symbol (function, class, constant), use "
+        "`Grep`/`Glob`/`LS` to read the surrounding repo: find the callers "
+        "of changed code, sibling implementations that should change in "
+        "lockstep, and the existing tests that cover the touched code. The "
+        "diff alone hides interaction bugs between changed and unchanged "
+        "code — go look.\n"
+        "4. Re-read the Linear issue below and check that the change "
         "actually satisfies it — not just that it compiles.\n\n"
         "# What to look for (in priority order)\n\n"
         "1. The change satisfies the stated issue, including any "
