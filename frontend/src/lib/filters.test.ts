@@ -292,10 +292,31 @@ describe("resolveInitialFilters (URL wins, then localStorage, then defaults)", (
   it("falls back to localStorage when the URL is empty", () => {
     const resolved = resolveInitialFilters({
       params: new URLSearchParams(),
-      stored: JSON.stringify({ provider: "claude", models: ["opus-4.1"] }),
+      stored: JSON.stringify({ provider: "claude", models: ["claude:opus-4.1"] }),
     });
     expect(resolved.provider).toBe("claude");
-    expect(resolved.models).toEqual(["opus-4.1"]);
+    expect(resolved.models).toEqual(["claude:opus-4.1"]);
+  });
+
+  it("prunes stored models incompatible with the URL provider on load", () => {
+    // A shared `?provider=codex` link crossed with a prior consistent
+    // localStorage blob must not resolve to an inconsistent state that the
+    // provider-scoped popover can't even show.
+    const resolved = resolveInitialFilters({
+      params: new URLSearchParams("provider=codex"),
+      stored: JSON.stringify({ provider: "claude", models: ["claude:opus-4.1"] }),
+    });
+    expect(resolved.provider).toBe("codex");
+    expect(resolved.models).toEqual([]);
+  });
+
+  it("prunes URL models incompatible with the stored provider on load", () => {
+    const resolved = resolveInitialFilters({
+      params: new URLSearchParams("models=claude:opus-4.1,codex:gpt-5-codex"),
+      stored: JSON.stringify({ provider: "codex" }),
+    });
+    expect(resolved.provider).toBe("codex");
+    expect(resolved.models).toEqual(["codex:gpt-5-codex"]);
   });
 
   it("falls back to defaults with no URL and no storage", () => {

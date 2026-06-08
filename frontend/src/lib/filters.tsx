@@ -294,16 +294,21 @@ export function resolveInitialFilters({
   stored: string | null;
 }): Filters {
   const blob = parseStored(stored);
+  const provider = params.has("provider")
+    ? normalizeProvider(params.get("provider"))
+    : normalizeProvider(blob.provider ?? DEFAULT_FILTERS.provider);
+  const models = params.has("models")
+    ? parseList(params.get("models"))
+    : (blob.models ?? DEFAULT_FILTERS.models);
   return {
     teams: params.has("teams")
       ? parseList(params.get("teams"))
       : (blob.teams ?? DEFAULT_FILTERS.teams),
-    provider: params.has("provider")
-      ? normalizeProvider(params.get("provider"))
-      : normalizeProvider(blob.provider ?? DEFAULT_FILTERS.provider),
-    models: params.has("models")
-      ? parseList(params.get("models"))
-      : (blob.models ?? DEFAULT_FILTERS.models),
+    provider,
+    // Provider→model dependency on load: a URL provider crossed with stored
+    // models (or vice versa) can be inconsistent; prune so resolved state and
+    // the mirrored URL never carry models the provider-scoped popover omits.
+    models: pruneModelsForProvider(models, provider),
     date: parseDate(params),
   };
 }
