@@ -132,6 +132,14 @@ export function BreakdownTable({
   const sorted = [...rows].sort((a, b) => b[sortKey] - a[sortKey]);
   const maxTotal = rows.length ? Math.max(...rows.map(rowTotal)) : 0;
 
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
+        No teams/models match the current filters
+      </div>
+    );
+  }
+
   return (
     <div className="overflow-x-auto rounded-md border border-border">
       <table className="w-full caption-bottom text-sm">
@@ -568,7 +576,7 @@ export function HomePage() {
           <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
         ) : (
           <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
-            Nothing completed in {dateWindowLabel(date)}
+            No completed issues match your filters
           </div>
         )}
       </section>

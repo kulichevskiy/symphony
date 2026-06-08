@@ -35,4 +35,14 @@ describe("FilterBar", () => {
     const codexButton = markup.slice(markup.indexOf(">codex<") - 200, markup.indexOf(">codex<"));
     expect(codexButton).toContain("bg-background");
   });
+
+  it("hides Clear all when every filter is at its default", () => {
+    expect(render("/")).not.toContain("Clear all");
+  });
+
+  it("shows Clear all when any filter is active", () => {
+    expect(render("/?teams=VIB")).toContain("Clear all");
+    expect(render("/?provider=codex")).toContain("Clear all");
+    expect(render("/?dates=7d")).toContain("Clear all");
+  });
 });
