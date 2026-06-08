@@ -52,6 +52,16 @@ function useNowMs(): number {
   return nowMs;
 }
 
+/** Debounce a value so the search box doesn't refetch the overview per keystroke. */
+function useDebounced<T>(value: T, ms: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(value), ms);
+    return () => window.clearTimeout(id);
+  }, [value, ms]);
+  return debounced;
+}
+
 function linearIssueUrl(identifier: string): string {
   return `https://linear.app/issue/${encodeURIComponent(identifier)}`;
 }
@@ -461,21 +471,35 @@ export function HomePage() {
   const { provider } = useProviderFilter();
   const win = DONE_WINDOWS.find((w) => w.value === doneWindow) ?? DONE_WINDOWS[1];
 
-  const summaryQuery = useQuery({
+  const providerFilter = provider === "all" ? undefined : provider;
+  // The trimmed search term scopes the overview (totals + breakdown + heatmap)
+  // to matching issues — debounced so typing doesn't refetch per keystroke.
+  const debouncedQuery = useDebounced(query.trim(), 250);
+  const overviewQuery = debouncedQuery || undefined;
+
+  // Unscoped (provider-only) summary: drives the stable "issues tracked" count
+  // and the overview when no search is active, so search never shrinks "tracked".
+  const baseSummaryQuery = useQuery({
     queryKey: ["spend-summary", provider],
-    queryFn: () =>
-      fetchSpendSummary(provider === "all" ? undefined : provider),
+    queryFn: () => fetchSpendSummary(providerFilter),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
+  // Search-scoped summary: only fetched while a query is active.
+  const scopedSummaryQuery = useQuery({
+    queryKey: ["spend-summary", provider, overviewQuery],
+    queryFn: () => fetchSpendSummary(providerFilter, overviewQuery),
+    enabled: overviewQuery != null,
+    refetchInterval: 30_000,
+    placeholderData: (prev) => prev,
+  });
+  const summaryQuery = overviewQuery != null ? scopedSummaryQuery : baseSummaryQuery;
   const heatmapQuery = useQuery({
-    queryKey: ["spend-heatmap", provider],
-    queryFn: () =>
-      fetchSpendHeatmap(371, provider === "all" ? undefined : provider),
+    queryKey: ["spend-heatmap", provider, overviewQuery],
+    queryFn: () => fetchSpendHeatmap(371, providerFilter, overviewQuery),
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
-  const providerFilter = provider === "all" ? undefined : provider;
   const activeQuery = useQuery({
     queryKey: ["issues", "active", provider],
     queryFn: () => fetchIssues({ scope: "active", provider: providerFilter }),
@@ -499,7 +523,7 @@ export function HomePage() {
 
   const active = (activeQuery.data ?? []).filter(matches);
   const done = (doneQuery.data ?? []).filter(matches);
-  const tracked = summaryQuery.data?.totals.issues ?? 0;
+  const tracked = baseSummaryQuery.data?.totals.issues ?? 0;
 
   const openIssue = (id: string) => navigate(`/issue/${encodeURIComponent(id)}`);
 

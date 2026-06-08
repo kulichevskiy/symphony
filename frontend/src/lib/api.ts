@@ -278,12 +278,20 @@ export function fetchIssues({
   );
 }
 
-export function fetchSpendSummary(provider?: string): Promise<SpendSummary> {
-  const query = provider
-    ? `/api/spend/summary?provider=${encodeURIComponent(provider)}`
-    : "/api/spend/summary";
+export function fetchSpendSummary(
+  provider?: string,
+  q?: string,
+): Promise<SpendSummary> {
+  const params = new URLSearchParams();
+  if (provider) {
+    params.set("provider", provider);
+  }
+  if (q) {
+    params.set("q", q);
+  }
+  const qs = params.toString();
   return fetchJson<SpendSummary>(
-    query,
+    qs ? `/api/spend/summary?${qs}` : "/api/spend/summary",
     "Spend summary not found",
     "Failed to load spend summary",
   );
@@ -292,12 +300,17 @@ export function fetchSpendSummary(provider?: string): Promise<SpendSummary> {
 export function fetchSpendHeatmap(
   days = 371,
   provider?: string,
+  q?: string,
 ): Promise<SpendHeatmap> {
-  const query = provider
-    ? `/api/spend/heatmap?days=${days}&provider=${encodeURIComponent(provider)}`
-    : `/api/spend/heatmap?days=${days}`;
+  const params = new URLSearchParams({ days: String(days) });
+  if (provider) {
+    params.set("provider", provider);
+  }
+  if (q) {
+    params.set("q", q);
+  }
   return fetchJson<SpendHeatmap>(
-    query,
+    `/api/spend/heatmap?${params.toString()}`,
     "Spend heatmap not found",
     "Failed to load spend heatmap",
   );

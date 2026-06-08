@@ -2237,6 +2237,80 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_spend_summary_and_heatmap_scoped_by_query(tmp_path: Path) -> None:
+    """A ?q= search recomputes the rail totals, per-team/model, and heatmap to
+    the matching issues — so a team search like "LP" drills the whole overview."""
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "LP-1", "LP"),
+            ("b", "LP-2", "LP"),
+            ("c", "ENG-1", "ENG"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 100, 20, 30, 40),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-16T11:00:00Z',
+                 50, 5, 5, 5),
+                ('r3', 'c', 'implement', 'completed', NULL, '2026-05-17T12:00:00Z',
+                 900, 90, 90, 90)
+            """
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5.5", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("claude", "claude-opus-4-8", 900, 90, 90, 90)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            summary = (await client.get("/api/spend/summary?q=LP")).json()
+            heatmap = (await client.get("/api/spend/heatmap?days=60&q=LP")).json()
+            # Case-insensitive, and composes with a provider filter.
+            scoped_provider = (
+                await client.get("/api/spend/summary?q=lp&provider=claude")
+            ).json()
+    finally:
+        await conn.close()
+
+    # Totals + per-team scope to LP only (ENG's 900/90/90/90 run excluded).
+    assert summary["totals"] == {
+        "input_tokens": 150, "output_tokens": 25,
+        "cache_write_tokens": 35, "cache_read_tokens": 45, "issues": 2,
+    }
+    assert [t["key"] for t in summary["per_team"]] == ["LP"]
+    # By-model is scoped too: both providers used on LP issues, no ENG-only model.
+    assert {p["provider"] for p in summary["per_provider"]} == {"claude", "codex"}
+
+    # Heatmap only carries LP's two days; ENG's 05-17 run does not inflate them.
+    by_day = {d["date"]: d for d in heatmap["days"]}
+    assert by_day["2026-05-17"]["input_tokens"] == 100
+    assert by_day["2026-05-16"]["input_tokens"] == 50
+    assert sum(d["input_tokens"] for d in heatmap["days"]) == 150
+
+    # q + provider compose: only LP's claude run remains.
+    assert scoped_provider["totals"] == {
+        "input_tokens": 100, "output_tokens": 20,
+        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
