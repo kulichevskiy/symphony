@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
-import { MixBar, Tk, TokenFigures } from "@/components/dashboard/atoms";
+import { MixBar, PROVIDER_TINT, Tk, TokenFigures } from "@/components/dashboard/atoms";
 import { Heatmap } from "@/components/dashboard/Heatmap";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
@@ -23,10 +23,12 @@ import { cn } from "@/lib/utils";
 
 import { formatRelativeTimestamp, formatUtcTimestamp } from "./activityFreshness";
 
+// Team tints deliberately avoid the token/provider palette hues (blue, violet,
+// cyan, slate) so team swatches never read as a token category or provider dot.
 const TEAM_TINT: Record<string, string> = {
-  VIB: "bg-blue-500",
-  ADJ: "bg-violet-500",
-  LP: "bg-cyan-500",
+  VIB: "bg-rose-500",
+  ADJ: "bg-fuchsia-500",
+  LP: "bg-teal-500",
   SYM: "bg-emerald-500",
   HQ: "bg-amber-500",
 };
@@ -222,11 +224,6 @@ export function PerTeam({
     </div>
   );
 }
-
-const PROVIDER_TINT: Record<string, string> = {
-  claude: "bg-orange-500",
-  codex: "bg-sky-500",
-};
 
 export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
   const sorted = [...providers].sort((a, b) => b.output_tokens - a.output_tokens);

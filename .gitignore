@@ -48,3 +48,6 @@ analysis/
 
 # OS
 .DS_Store
+
+# Project uses pnpm; npm lockfiles should never be tracked
+frontend/package-lock.json
