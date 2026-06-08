@@ -417,9 +417,10 @@ def _list_issues_query(
     *,
     now: datetime,
     cutoff: datetime | None = None,
+    provider: str | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     where: list[str] = []
-    params: list[str] = [_utc_iso(now)]
+    where_params: list[str] = []
 
     if scope is IssueScope.ACTIVE:
         where.append("i.id IN (SELECT issue_id FROM active_issue_ids)")
@@ -432,15 +433,51 @@ def _list_issues_query(
             "((pr.max_merged_at IS NOT NULL AND pr.max_merged_at >= ?) "
             "OR (la.latest_activity_ts IS NOT NULL AND la.latest_activity_ts >= ?))"
         )
-        params.extend([cutoff_iso, cutoff_iso])
+        where_params.extend([cutoff_iso, cutoff_iso])
 
     normalized_q = q.strip().lower() if q is not None else ""
     if normalized_q:
         where.append(
             "(instr(lower(i.identifier), ?) > 0 OR instr(lower(i.title), ?) > 0)"
         )
-        params.extend([normalized_q, normalized_q])
+        where_params.extend([normalized_q, normalized_q])
 
+    # Token columns: when a provider is selected, scope the per-issue sums to that
+    # provider's rows in the run_model_usage child table (joined to runs) and drop
+    # issues with no usage for it. Otherwise sum every run, all providers.
+    token_params: list[str] = []
+    if provider is not None:
+        token_join = """
+        LEFT JOIN (
+            SELECT
+                r.issue_id AS issue_id,
+                SUM(u.input_tokens) AS input_tokens,
+                SUM(u.output_tokens) AS output_tokens,
+                SUM(u.cache_write_tokens) AS cache_write_tokens,
+                SUM(u.cache_read_tokens) AS cache_read_tokens
+            FROM run_model_usage u
+            JOIN runs r ON r.id = u.run_id
+            WHERE u.provider = ?
+            GROUP BY r.issue_id
+        ) ru ON ru.issue_id = i.id
+        """
+        token_params.append(provider)
+        where.append("ru.issue_id IS NOT NULL")
+    else:
+        token_join = """
+        LEFT JOIN (
+            SELECT
+                issue_id,
+                SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,
+                SUM(cache_write_tokens) AS cache_write_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens
+            FROM runs
+            GROUP BY issue_id
+        ) ru ON ru.issue_id = i.id
+        """
+
+    params = [_utc_iso(now), *token_params, *where_params]
     where_sql = "" if not where else f"WHERE {' AND '.join(where)}"
     return (
         f"""
@@ -470,16 +507,7 @@ def _list_issues_query(
             FROM issue_prs
             GROUP BY issue_id
         ) pr ON pr.issue_id = i.id
-        LEFT JOIN (
-            SELECT
-                issue_id,
-                SUM(input_tokens) AS input_tokens,
-                SUM(output_tokens) AS output_tokens,
-                SUM(cache_write_tokens) AS cache_write_tokens,
-                SUM(cache_read_tokens) AS cache_read_tokens
-            FROM runs
-            GROUP BY issue_id
-        ) ru ON ru.issue_id = i.id
+        {token_join}
         {where_sql}
         """,
         tuple(params),
@@ -514,10 +542,13 @@ def create_api_router(
         q: Annotated[str | None, Query()] = None,
         scope: Annotated[IssueScope, Query()] = IssueScope.ACTIVE,
         within_secs: Annotated[int, Query(ge=1)] = 7 * 86_400,
+        provider: Annotated[str | None, Query()] = None,
     ) -> list[IssueSummary]:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
 
+        # "all" (and the omitted param) mean no provider scoping.
+        provider_filter = None if provider in (None, "all") else provider
         is_done = scope is IssueScope.DONE
         try:
             conn = await ui_db_pool.connection()
@@ -526,7 +557,7 @@ def create_api_router(
                 request_now - timedelta(seconds=within_secs) if is_done else None
             )
             query, params = _list_issues_query(
-                scope, q, now=request_now, cutoff=cutoff
+                scope, q, now=request_now, cutoff=cutoff, provider=provider_filter
             )
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
