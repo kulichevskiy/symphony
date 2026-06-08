@@ -68,22 +68,24 @@ type Cell = {
 };
 
 /**
- * Build a dense Sun..Sat-aligned grid of weeks ending on the Saturday of the
+ * Build a dense Mon..Sun-aligned grid of weeks ending on the Sunday of the
  * end date's week, zero-filling days with no recorded spend. Days after the
  * end date (trailing in the final week) are rendered as gaps.
  */
-function buildGrid(days: HeatmapDay[], start: string, end: string): {
+export function buildGrid(days: HeatmapDay[], start: string, end: string): {
   weeks: (Cell | null)[][];
   monthMarks: { wi: number; label: string }[];
 } {
   const byIso = new Map(days.map((d) => [d.date, d]));
   const startDate = new Date(`${start}T00:00:00Z`);
   const endDate = new Date(`${end}T00:00:00Z`);
-  // Pad to whole weeks: back to Sunday, forward to Saturday.
+  // Pad to whole weeks: back to Monday, forward to Sunday. Day-of-week is
+  // Monday-indexed (Mon=0 .. Sun=6) so the grid's top row is Monday.
+  const dow = (date: Date) => (date.getUTCDay() + 6) % 7;
   const gridStart = new Date(startDate);
-  gridStart.setUTCDate(gridStart.getUTCDate() - gridStart.getUTCDay());
+  gridStart.setUTCDate(gridStart.getUTCDate() - dow(gridStart));
   const gridEnd = new Date(endDate);
-  gridEnd.setUTCDate(gridEnd.getUTCDate() + (6 - gridEnd.getUTCDay()));
+  gridEnd.setUTCDate(gridEnd.getUTCDate() + (6 - dow(gridEnd)));
 
   const cells: (Cell | null)[] = [];
   for (
@@ -180,7 +182,7 @@ export function Heatmap({
           className="flex shrink-0 flex-col pt-[18px]"
           style={{ gap: `${GAP}px` }}
         >
-          {["", "Mon", "", "Wed", "", "Fri", ""].map((d, i) => (
+          {["Mon", "", "Wed", "", "Fri", "", ""].map((d, i) => (
             <div
               key={i}
               className="h-3 text-[9px] leading-3 text-muted-foreground"

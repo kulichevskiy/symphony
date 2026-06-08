@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildHeatThresholds, heatLevel, isInWindow } from "./Heatmap";
+import { buildGrid, buildHeatThresholds, heatLevel, isInWindow } from "./Heatmap";
 
 describe("buildHeatThresholds", () => {
   it("derives quantile cut points from non-zero days only", () => {
@@ -35,6 +35,19 @@ describe("buildHeatThresholds", () => {
       { output_tokens: 0 },
     ]);
     expect(heatLevel(0, thresholds)).toBe(0);
+  });
+});
+
+describe("buildGrid", () => {
+  it("aligns weeks Monday (top row) to Sunday (bottom row)", () => {
+    const { weeks } = buildGrid([], "2026-05-01", "2026-05-31");
+    // Row di maps to a Monday-indexed weekday: di=0 -> Mon (getUTCDay 1),
+    // di=6 -> Sun (getUTCDay 0).
+    for (const week of weeks) {
+      week.forEach((cell, di) => {
+        if (cell) expect(cell.date.getUTCDay()).toBe((di + 1) % 7);
+      });
+    }
   });
 });
 
