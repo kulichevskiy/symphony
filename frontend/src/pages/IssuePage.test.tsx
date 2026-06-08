@@ -122,6 +122,16 @@ describe("TokensCard", () => {
     expect(markup).toContain('title="7900000">7.9M</span>');
   });
 
+  it("labels each token stat with its shared-palette swatch", () => {
+    const markup = renderToStaticMarkup(<TokensCard c={cockpit} />);
+    // The four stat blocks carry the shared TOKEN_CATS swatches (square chips),
+    // so the token rail doubles as the colour key for the breakdown bars below.
+    expect(markup).toContain("rounded-sm bg-blue-500");
+    expect(markup).toContain("rounded-sm bg-violet-500");
+    expect(markup).toContain("rounded-sm bg-cyan-500");
+    expect(markup).toContain("rounded-sm bg-slate-300 dark:bg-slate-600");
+  });
+
   it("breaks tokens down by provider and model with a mix-bar", () => {
     const markup = renderToStaticMarkup(<TokensCard c={cockpit} />);
     expect(markup).toContain("by provider / model");
