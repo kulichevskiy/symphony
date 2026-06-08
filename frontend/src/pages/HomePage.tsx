@@ -2,7 +2,12 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
-import { MixBar, PROVIDER_TINT, Tk, TokenFigures } from "@/components/dashboard/atoms";
+import {
+  MixBar,
+  PROVIDER_TINT,
+  Tk,
+  TOKEN_CATS,
+} from "@/components/dashboard/atoms";
 import { Heatmap } from "@/components/dashboard/Heatmap";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
@@ -13,22 +18,21 @@ import {
   fetchSpendHeatmap,
   fetchSpendSummary,
   type IssueSummary,
-  type ProviderSpend,
   type SpendHeatmap,
   type SpendSummary,
-  type TeamSpend,
+  type SpendTotals,
+  type TokenSplit,
 } from "@/lib/api";
-import { useProviderFilter } from "@/lib/providerFilter";
+import { type Provider, useProviderFilter } from "@/lib/providerFilter";
 import { cn } from "@/lib/utils";
 
 import { formatRelativeTimestamp, formatUtcTimestamp } from "./activityFreshness";
 
-// Team tints deliberately avoid the token/provider palette hues (blue, violet,
-// cyan, slate) so team swatches never read as a token category or provider dot.
+// Team dot palette (Dashboard v2). Matches the design's team hues.
 const TEAM_TINT: Record<string, string> = {
-  VIB: "bg-rose-500",
-  ADJ: "bg-fuchsia-500",
-  LP: "bg-teal-500",
+  VIB: "bg-blue-500",
+  ADJ: "bg-violet-500",
+  LP: "bg-cyan-500",
   SYM: "bg-emerald-500",
   HQ: "bg-amber-500",
 };
@@ -52,267 +56,227 @@ function linearIssueUrl(identifier: string): string {
   return `https://linear.app/issue/${encodeURIComponent(identifier)}`;
 }
 
-export function HeadlineTotals({
-  totals,
-  compact = false,
-}: {
-  totals: SpendSummary["totals"];
-  compact?: boolean;
-}) {
-  const blocks: { label: string; value: number }[] = [
-    { label: "input", value: totals.input_tokens },
-    { label: "output", value: totals.output_tokens },
-    { label: "cache-write", value: totals.cache_write_tokens },
-    { label: "cache-read", value: totals.cache_read_tokens },
-  ];
+/** All-time token totals as a tidy 2×2 rail of the four categories, each with
+ *  its shared palette swatch. No summed grand total, no spend. */
+export function StatRail({ totals }: { totals: SpendTotals }) {
   return (
-    <div className="flex flex-col gap-2">
-      <div className="whitespace-nowrap text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Tokens · all-time
-      </div>
-      <div
-        className={
-          compact
-            ? "flex flex-wrap gap-x-8 gap-y-3"
-            : "grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4"
-        }
-      >
-        {blocks.map((b) => (
-          <div key={b.label}>
-            <div className="whitespace-nowrap text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-              {b.label}
-            </div>
-            <div className="mt-0.5 font-mono text-xl font-semibold tracking-tight text-foreground">
-              <Tk value={b.value} />
-            </div>
+    <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+      {TOKEN_CATS.map((c) => (
+        <div key={c.key}>
+          <div className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            <span className={cn("h-2 w-2 rounded-sm", c.swatch)} />
+            {c.label}
           </div>
-        ))}
-      </div>
+          <div className="mt-1 font-mono text-2xl font-semibold tracking-tight">
+            <Tk value={totals[c.key]} />
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
 
-export type TeamSortKey =
-  | "key"
-  | "issues"
-  | "input_tokens"
-  | "output_tokens"
-  | "cache_write_tokens"
-  | "cache_read_tokens";
-
-type SortDir = "asc" | "desc";
-
-/** Sort teams by a column without mutating the input. `key` sorts alphabetically. */
-export function sortTeams(
-  teams: TeamSpend[],
-  key: TeamSortKey,
-  dir: SortDir,
-): TeamSpend[] {
-  const factor = dir === "asc" ? 1 : -1;
-  return [...teams].sort((a, b) => {
-    const cmp = key === "key" ? a.key.localeCompare(b.key) : a[key] - b[key];
-    return cmp * factor;
-  });
+/** The shared in / out / cache-write / cache-read legend for the breakdown bars. */
+export function MixLegend() {
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      {TOKEN_CATS.map((c) => (
+        <span
+          key={c.key}
+          className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
+        >
+          <span className={cn("h-2 w-2 rounded-sm", c.swatch)} />
+          {c.label}
+        </span>
+      ))}
+    </div>
+  );
 }
 
-const TEAM_COLUMNS: Array<{
-  key: TeamSortKey;
-  label: string;
-  numeric: boolean;
-  sortable: boolean;
-}> = [
-  { key: "key", label: "Team", numeric: false, sortable: true },
-  { key: "issues", label: "Issues", numeric: true, sortable: true },
-  { key: "output_tokens", label: "mix", numeric: false, sortable: false },
-  { key: "input_tokens", label: "in", numeric: true, sortable: true },
-  { key: "output_tokens", label: "out", numeric: true, sortable: true },
-  { key: "cache_write_tokens", label: "cache-write", numeric: true, sortable: true },
-  { key: "cache_read_tokens", label: "cache-read", numeric: true, sortable: true },
+/** One unified breakdown row — a team or a provider/model — carrying the four
+ *  token figures plus enough identity to render its name cell. */
+type BreakdownRow = TokenSplit & {
+  rowKey: string;
+  issues: number;
+  teamKey?: string;
+  provider?: string;
+  model?: string;
+};
+
+const NUM_COLS: Array<{ key: keyof TokenSplit; head: string }> = [
+  { key: "input_tokens", head: "IN" },
+  { key: "output_tokens", head: "OUT" },
+  { key: "cache_write_tokens", head: "CACHE-WRITE" },
+  { key: "cache_read_tokens", head: "CACHE-READ" },
 ];
 
-export function PerTeam({
-  teams,
+function rowTotal(r: TokenSplit): number {
+  return (
+    r.input_tokens + r.output_tokens + r.cache_write_tokens + r.cache_read_tokens
+  );
+}
+
+/** The unified Breakdown table — renders team rows or provider/model rows with
+ *  the same columns, a magnitude mix bar (length = sum of tokens), and click-to-
+ *  sort on the four numeric columns (descending). */
+export function BreakdownTable({
+  rows,
+  kind,
+  barMode = "magnitude",
   onPick,
 }: {
-  teams: TeamSpend[];
+  rows: BreakdownRow[];
+  kind: "team" | "model";
+  barMode?: "composition" | "magnitude";
   onPick?: (key: string) => void;
 }) {
-  const [sort, setSort] = useState<{ key: TeamSortKey; dir: SortDir }>({
-    key: "output_tokens",
-    dir: "desc",
-  });
-  const sorted = sortTeams(teams, sort.key, sort.dir);
-  const toggle = (key: TeamSortKey) =>
-    setSort((prev) =>
-      prev.key === key
-        ? { key, dir: prev.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: key === "key" ? "asc" : "desc" },
-    );
+  const [sortKey, setSortKey] = useState<keyof TokenSplit>("output_tokens");
+  const sorted = [...rows].sort((a, b) => b[sortKey] - a[sortKey]);
+  const maxTotal = rows.length ? Math.max(...rows.map(rowTotal)) : 0;
 
   return (
-    <div className="w-full overflow-x-auto rounded-md border border-border">
+    <div className="overflow-x-auto rounded-md border border-border">
       <table className="w-full caption-bottom text-sm">
         <thead>
-          <tr className="border-b border-border bg-secondary/30">
-            {TEAM_COLUMNS.map((c) => {
-              const active = c.sortable && sort.key === c.key;
+          <tr className="border-b border-border bg-secondary/40 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            <th className="px-3 py-1.5 text-left font-medium">
+              {kind === "team" ? "Team" : "Provider / model"}
+            </th>
+            <th className="px-3 py-1.5 text-right font-medium">Issues</th>
+            <th className="w-[180px] px-3 py-1.5 text-left font-medium">Mix</th>
+            {NUM_COLS.map((c) => {
+              const active = sortKey === c.key;
               return (
                 <th
-                  key={c.label}
-                  scope="col"
-                  aria-sort={
-                    active ? (sort.dir === "asc" ? "ascending" : "descending") : undefined
-                  }
-                  onClick={c.sortable ? () => toggle(c.key) : undefined}
-                  className={cn(
-                    "h-9 px-3 align-middle text-xs font-medium uppercase tracking-wide text-muted-foreground",
-                    c.numeric ? "text-right" : "text-left",
-                    c.sortable && "cursor-pointer select-none hover:text-foreground",
-                  )}
+                  key={c.key}
+                  aria-sort={active ? "descending" : undefined}
+                  className="px-3 py-1.5 text-right font-medium"
                 >
-                  {c.label}
-                  {active && (
-                    <span aria-hidden className="ml-1">
-                      {sort.dir === "asc" ? "↑" : "↓"}
-                    </span>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => setSortKey(c.key)}
+                    className={cn(
+                      "inline-flex items-center gap-1 transition-colors hover:text-foreground",
+                      active && "text-foreground",
+                    )}
+                  >
+                    {c.head}
+                    {active && (
+                      <Icon name="chevronDown" size={11} strokeWidth={2} />
+                    )}
+                  </button>
                 </th>
               );
             })}
           </tr>
         </thead>
         <tbody>
-          {sorted.map((t) => (
-            <tr
-              key={t.key}
-              className="cursor-pointer border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
-              onClick={() => onPick?.(t.key)}
-            >
-              <td className="whitespace-nowrap px-3 py-2.5">
-                <span className="flex items-center gap-2">
-                  <span
-                    className={cn(
-                      "h-2 w-2 shrink-0 rounded-full",
-                      TEAM_TINT[t.key] ?? "bg-slate-400",
-                    )}
-                  />
-                  <span className="text-sm font-medium">{t.key}</span>
-                </span>
-              </td>
-              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
-                {t.issues}
-              </td>
-              <td className="w-full min-w-[6rem] px-3 py-2.5">
-                <MixBar split={t} />
-              </td>
-              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
-                <Tk value={t.input_tokens} />
-              </td>
-              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
-                <Tk value={t.output_tokens} />
-              </td>
-              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
-                <Tk value={t.cache_write_tokens} />
-              </td>
-              <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
-                <Tk value={t.cache_read_tokens} />
-              </td>
-            </tr>
-          ))}
+          {sorted.map((r) => {
+            const clickable = kind === "team" && onPick;
+            return (
+              <tr
+                key={r.rowKey}
+                className={cn(
+                  "border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50",
+                  clickable && "cursor-pointer",
+                )}
+                onClick={clickable ? () => onPick(r.teamKey ?? r.rowKey) : undefined}
+              >
+                <td className="whitespace-nowrap px-3 py-2.5">
+                  {kind === "team" ? (
+                    <span className="flex items-center gap-2">
+                      <span
+                        className={cn(
+                          "h-2 w-2 shrink-0 rounded-full",
+                          TEAM_TINT[r.teamKey ?? ""] ?? "bg-slate-400",
+                        )}
+                      />
+                      <span className="text-sm font-medium">{r.teamKey}</span>
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <span
+                        className={cn(
+                          "h-2 w-2 shrink-0 rounded-full",
+                          PROVIDER_TINT[r.provider ?? ""] ?? "bg-slate-400",
+                        )}
+                      />
+                      <span className="text-sm font-medium">{r.model}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {r.provider}
+                      </span>
+                    </span>
+                  )}
+                </td>
+                <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                  {r.issues}
+                </td>
+                <td className="px-3 py-2.5">
+                  <MixBar split={r} mode={barMode} maxTotal={maxTotal} />
+                </td>
+                {NUM_COLS.map((c) => (
+                  <td
+                    key={c.key}
+                    className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs tabular-nums"
+                  >
+                    <Tk value={r[c.key]} />
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
   );
 }
 
-export function PerProvider({ providers }: { providers: ProviderSpend[] }) {
-  const sorted = [...providers].sort((a, b) => b.output_tokens - a.output_tokens);
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const toggle = (provider: string) =>
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(provider)) next.delete(provider);
-      else next.add(provider);
-      return next;
-    });
-
-  return (
-    <div className="divide-y divide-border/70 overflow-hidden rounded-md border border-border">
-      <div className="bg-secondary/40 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-        Provider / model
-      </div>
-      {sorted.map((p) => {
-        const open = expanded.has(p.provider);
-        const models = [...p.per_model].sort(
-          (a, b) => b.output_tokens - a.output_tokens,
-        );
-        return (
-          <div key={p.provider}>
-            <button
-              type="button"
-              onClick={() => toggle(p.provider)}
-              aria-expanded={open}
-              className="flex w-full flex-col gap-1.5 px-3 py-2 text-left transition-colors hover:bg-secondary/60"
-            >
-              <span className="flex items-center gap-2">
-                <Icon
-                  name="chevronRight"
-                  size={14}
-                  className={cn(
-                    "shrink-0 text-muted-foreground transition-transform",
-                    open && "rotate-90",
-                  )}
-                />
-                <span
-                  className={cn(
-                    "h-2 w-2 shrink-0 rounded-full",
-                    PROVIDER_TINT[p.provider] ?? "bg-slate-400",
-                  )}
-                />
-                <span className="text-sm font-medium">{p.provider}</span>
-                <span className="whitespace-nowrap text-xs text-muted-foreground">
-                  {p.issues} issues
-                </span>
-              </span>
-              <MixBar split={p} />
-              <TokenFigures split={p} />
-            </button>
-            {open && (
-              <div className="divide-y divide-border/50 bg-secondary/20">
-                {models.map((m) => (
-                  <div
-                    key={m.model}
-                    className="flex flex-col gap-1.5 py-1.5 pl-9 pr-3"
-                  >
-                    <span className="truncate text-xs text-muted-foreground">
-                      {m.model}
-                    </span>
-                    <MixBar split={m} />
-                    <TokenFigures split={m} />
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-export function SpendOverview({
+/** The token overview card: heatmap + all-time stat rail on top, then a single
+ *  unified breakdown table toggled between By team / By model. */
+export function TokenOverview({
   summary,
   heatmap,
+  provider,
   onPickTeam,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
+  provider: Provider;
   onPickTeam: (key: string) => void;
 }) {
+  const [view, setView] = useState<"team" | "model">("team");
+
+  const teamRows: BreakdownRow[] = (summary?.per_team ?? []).map((t) => ({
+    rowKey: t.key,
+    teamKey: t.key,
+    issues: t.issues,
+    input_tokens: t.input_tokens,
+    output_tokens: t.output_tokens,
+    cache_write_tokens: t.cache_write_tokens,
+    cache_read_tokens: t.cache_read_tokens,
+  }));
+  // per_provider isn't provider-scoped server-side, so narrow to the active
+  // provider here — keeps "By model" reconciled with the rail + team rows.
+  const modelRows: BreakdownRow[] = (summary?.per_provider ?? [])
+    .filter((p) => provider === "all" || p.provider === provider)
+    .flatMap((p) =>
+      p.per_model.map((m) => ({
+        rowKey: `${p.provider}/${m.model}`,
+        provider: p.provider,
+        model: m.model,
+        issues: m.issues,
+        input_tokens: m.input_tokens,
+        output_tokens: m.output_tokens,
+        cache_write_tokens: m.cache_write_tokens,
+        cache_read_tokens: m.cache_read_tokens,
+      })),
+    );
+  const rows = view === "team" ? teamRows : modelRows;
+
   return (
     <Card className="p-5">
-      {/* Row 1: heatmap | all-time totals */}
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
+      {/* top: heatmap (anchor) + all-time stat rail */}
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)]">
         <div className="min-w-0">
           <div className="mb-3 flex items-baseline justify-between gap-3">
             <h2 className="text-sm font-semibold">Daily token burn</h2>
@@ -327,39 +291,44 @@ export function SpendOverview({
           )}
         </div>
         <div className="lg:border-l lg:border-border lg:pl-6">
+          <div className="mb-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            Tokens · all-time
+            {provider !== "all" ? (
+              <span className="text-foreground"> · {provider}</span>
+            ) : null}
+          </div>
           {summary ? (
-            <HeadlineTotals totals={summary.totals} compact />
+            <StatRail totals={summary.totals} />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )}
         </div>
       </div>
 
-      {summary && (
-        <>
-          {/* Row 2: tokens by team, full width */}
-          <div className="mt-6">
-            <div className="mb-2.5 flex items-center justify-between">
-              <h2 className="text-sm font-semibold">Tokens by team</h2>
-              <span className="text-xs text-muted-foreground">by output</span>
-            </div>
-            <PerTeam teams={summary.per_team} onPick={onPickTeam} />
+      {/* breakdown: one table, toggle team / model */}
+      <div className="mt-6 border-t border-border pt-5">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h2 className="text-sm font-semibold">Breakdown</h2>
+            <Segmented
+              ariaLabel="Breakdown grouping"
+              options={[
+                { value: "team", label: "By team" },
+                { value: "model", label: "By model" },
+              ]}
+              value={view}
+              onChange={(v) => setView(v as "team" | "model")}
+            />
           </div>
-
-          {/* Row 3: tokens by provider / model, width-constrained */}
-          {summary.per_provider.length > 0 && (
-            <div className="mt-6 max-w-xl">
-              <div className="mb-2.5 flex items-center justify-between">
-                <h2 className="text-sm font-semibold">
-                  Tokens by provider / model
-                </h2>
-                <span className="text-xs text-muted-foreground">by output</span>
-              </div>
-              <PerProvider providers={summary.per_provider} />
-            </div>
-          )}
-        </>
-      )}
+          <MixLegend />
+        </div>
+        <BreakdownTable
+          rows={rows}
+          kind={view}
+          barMode="magnitude"
+          onPick={view === "team" ? onPickTeam : undefined}
+        />
+      </div>
     </Card>
   );
 }
@@ -560,9 +529,10 @@ export function HomePage() {
         </div>
       </div>
 
-      <SpendOverview
+      <TokenOverview
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
+        provider={provider}
         onPickTeam={(k) => setQuery(k)}
       />
 
