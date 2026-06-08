@@ -787,6 +787,162 @@ async def test_no_diff_size_provider_defaults_to_single_pass(
     assert len(runner.specs) == 1
 
 
+@pytest.mark.parametrize(
+    "implementer_agent",
+    ["claude", "codex"],
+)
+@pytest.mark.asyncio
+async def test_pass_two_verifier_gets_tier_b_command(
+    tmp_path: Path, implementer_agent: str
+) -> None:
+    """The pass-2 verifier (implementer family) runs with Tier B exec/write
+    grants; pass-1 finder stays read-only."""
+    reviewer_agent = "codex" if implementer_agent == "claude" else "claude"
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    verifier_text = f"held\n{VERDICT_APPROVED_MARKER}"
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream(reviewer_agent, finder_text),
+            _message_stream(implementer_agent, verifier_text),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-tierb",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent=implementer_agent,
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent=reviewer_agent,
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    finder_argv = runner.specs[0].command
+    verifier_argv = runner.specs[1].command
+
+    # Pass 1 (finder, reviewer family) is read-only.
+    if reviewer_agent == "codex":
+        assert finder_argv[finder_argv.index("--sandbox") + 1] == "read-only"
+    else:
+        assert "Write" not in finder_argv[finder_argv.index("--tools") + 1]
+
+    # Pass 2 (verifier, implementer family) gets Tier B grants.
+    if implementer_agent == "codex":
+        assert verifier_argv[verifier_argv.index("--sandbox") + 1] == "workspace-write"
+    else:
+        assert "Write" in verifier_argv[verifier_argv.index("--tools") + 1]
+        assert "uv run pytest" in verifier_argv[verifier_argv.index("--allowedTools") + 1]
+
+
+@pytest.mark.asyncio
+async def test_workspace_scrubbed_after_pass_two_before_fixer(
+    tmp_path: Path,
+) -> None:
+    """A file the verifier writes during pass 2 must be scrubbed before the
+    fixer runs, so throwaway tests never reach the diff the fixer sees."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    throwaway = workspace / "throwaway_test.py"
+    events: list[tuple[str, object]] = []
+
+    finder_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {"id": "i", "type": "agent_message", "text": "## Findings\n- s"},
+        }
+    )
+    verifier_text = (
+        f"## Findings\n- confirmed bug at foo.py:1 (test failed)\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    verifier_line = json.dumps({"type": "result", "result": verifier_text})
+
+    class _Runner:
+        def __init__(self) -> None:
+            self.specs: list[RunnerSpec] = []
+
+        def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+            self.specs.append(spec)
+            stage, run_id = spec.stage, spec.run_id
+
+            async def gen() -> AsyncIterator[RunnerEvent]:
+                if stage == "local_review" and "verify" in run_id:
+                    throwaway.write_text("def test_x():\n    assert False\n")
+                    events.append(("verify_wrote", throwaway.exists()))
+                    yield RunnerEvent(kind="stdout", line=verifier_line)
+                elif stage == "local_review" and "find" in run_id:
+                    yield RunnerEvent(kind="stdout", line=finder_line)
+                elif stage == "local_review_fix":
+                    events.append(("fix_saw_throwaway", throwaway.exists()))
+                    yield RunnerEvent(
+                        kind="stdout", line='{"type":"turn.completed"}'
+                    )
+                yield RunnerEvent(kind="exit", returncode=0)
+
+            return gen()
+
+        async def kill(self, run_id: str) -> None:
+            pass
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    async def scrubber(ws: Path) -> None:
+        events.append(("scrub", ws))
+        if throwaway.exists():
+            throwaway.unlink()
+
+    result = await run_local_review_session(
+        runner=_Runner(),
+        workspace_path=workspace,
+        base_branch="main",
+        parent_run_id="run-scrub",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+        workspace_scrubber=scrubber,
+    )
+
+    assert result.outcome == LoopOutcome.EXHAUSTED  # cap=1, CHANGES_REQUESTED
+    kinds = [e[0] for e in events]
+    assert ("verify_wrote", True) in events
+    assert "scrub" in kinds
+    # The fixer must have observed a clean tree.
+    assert ("fix_saw_throwaway", False) in events
+    # Scrub strictly precedes the fixer.
+    assert kinds.index("scrub") < kinds.index("fix_saw_throwaway")
+    # Pass-2 evidence flows into the fixer trigger verbatim.
+    assert result.last_verdict is not None
+    assert "test failed" in result.last_verdict.findings
+
+
 @pytest.mark.asyncio
 async def test_safe_run_id_strips_unfriendly_chars(tmp_path: Path) -> None:
     runner = _ScriptedRunner(

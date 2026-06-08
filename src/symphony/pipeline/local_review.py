@@ -69,6 +69,38 @@ _CLAUDE_REVIEWER_SETTINGS = json.dumps(
 )
 _CLAUDE_REVIEWER_SETTING_SOURCES = ""
 
+# Tier B (pass-2 verifier only): on top of the read-only surface, the verifier
+# may PROVE a finding by writing a throwaway failing test and running it
+# targeted. Write/Edit join the in-surface tools, and a narrow set of
+# test-runner Bash commands join the allowlist. Pass 1 and the single-pass
+# fallback never see these — they stay strictly read-only.
+_CLAUDE_VERIFIER_TOOLS = "Bash,Read,Grep,Glob,LS,Write,Edit"
+_CLAUDE_VERIFIER_ALLOWED_TOOLS = ",".join(
+    (
+        "Bash(git diff *)",
+        "Bash(uv run pytest *)",
+        "Bash(npm test *)",
+        "Bash(tsc *)",
+        "Read",
+        "Grep",
+        "Glob",
+        "LS",
+        "Write",
+        "Edit",
+    )
+)
+_CLAUDE_VERIFIER_DISALLOWED_TOOLS = ",".join(
+    (
+        "MultiEdit",
+        "NotebookRead",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "TodoWrite",
+        "Task",
+    )
+)
+
 
 class LocalVerdictKind(StrEnum):
     APPROVED = "approved"
@@ -142,8 +174,9 @@ _LENSES_BLOCK = (
 
 # Final-message contract: enumerate-then-approve, or `## Findings` + marker.
 # Used by the single-pass reviewer and the two-pass verifier — the two roles
-# that own the verdict.
-_HOW_TO_RESPOND_VERDICT_BLOCK = (
+# that own the verdict. The trailing no-mutation line is appended only for the
+# read-only single-pass role; the pass-2 verifier swaps in an execution block.
+_VERDICT_CONTRACT_BLOCK = (
     "# How to respond\n\n"
     "End your final message with EXACTLY ONE of these markers on a "
     "line by itself:\n\n"
@@ -162,8 +195,38 @@ _HOW_TO_RESPOND_VERDICT_BLOCK = (
     "so vague findings produce vague fixes. Pretend you're writing a "
     "PR review for a junior engineer who will edit only the lines "
     "you cite.\n\n"
+)
+
+_NO_MUTATION_BLOCK = (
     "Do NOT modify any files. Do NOT run git commit, git push, or "
     "any command that mutates the working tree.\n\n"
+)
+
+_HOW_TO_RESPOND_VERDICT_BLOCK = _VERDICT_CONTRACT_BLOCK + _NO_MUTATION_BLOCK
+
+# Pass-2 only: the verifier may PROVE a finding by running code. This block
+# replaces the read-only no-mutation line. It is finding-triggered (only with
+# a concrete hypothesis), bounds itself to throwaway targeted tests, and caps
+# at three runs. The orchestrator scrubs the working tree after this pass, so
+# nothing the verifier writes here reaches the diff the fixer sees.
+_PASS_TWO_EXECUTION_BLOCK = (
+    "# Proving a finding by execution\n\n"
+    "You have write and test-run access this pass. Use it ONLY to prove a "
+    "concrete hypothesis — not to explore. When you have a concrete "
+    "hypothesis that a specific bug exists, write a throwaway failing test "
+    "that would pass if the code were correct, and run it TARGETED — a "
+    "single test, never the whole suite (e.g. `uv run pytest "
+    "path/to/test.py::test_name`, `npm test -- -t name`). Cap yourself at "
+    "THREE targeted test runs total for the whole pass.\n\n"
+    "If a run confirms the bug, the finding is a blocker: quote the failing "
+    "assertion / error output in that finding's `## Findings` bullet as "
+    "evidence. If you cannot reproduce it after a genuine attempt, drop the "
+    "finding or mark it explicitly unproven — do not pad findings with "
+    "hypotheses you could not confirm.\n\n"
+    "Your throwaway tests and any scratch edits are scrubbed from the working "
+    "tree after this pass — do NOT git commit/push them and do not rely on "
+    "them persisting. Cite real `file:line` locations in the production code, "
+    "not in your throwaway test.\n\n"
 )
 
 # Pass-1 contract: list every suspicion, emit NO verdict marker. The verifier
@@ -315,7 +378,8 @@ def local_review_verifier_prompt(
         + _WHAT_TO_LOOK_FOR_BLOCK
         + _LENSES_BLOCK
         + pass_one_block
-        + _HOW_TO_RESPOND_VERDICT_BLOCK
+        + _VERDICT_CONTRACT_BLOCK
+        + _PASS_TWO_EXECUTION_BLOCK
         + _issue_block(issue_title, issue_body, labels)
     )
 
@@ -327,8 +391,15 @@ def build_local_review_command(
     base_branch: str,
     codex_model: str = DEFAULT_CODEX_MODEL,
     last_message_path: str | None = None,
+    pass_two: bool = False,
 ) -> list[str]:
     """argv for the local reviewer subprocess.
+
+    `pass_two` grants Tier B execution/write so the verifier can prove a
+    finding by writing a throwaway test and running it: codex switches to
+    `--sandbox workspace-write`, and claude gains `Write`/`Edit` plus a
+    narrow set of test-runner Bash commands. Pass 1 and the single-pass
+    fallback (`pass_two=False`) stay strictly read-only.
 
     `codex` uses plain `codex exec --sandbox read-only [PROMPT]`. We
     intentionally do NOT use the `codex exec review` subcommand: it
@@ -354,7 +425,7 @@ def build_local_review_command(
             "codex",
             "exec",
             "--sandbox",
-            "read-only",
+            "workspace-write" if pass_two else "read-only",
             "--json",
             "--model",
             codex_model,
@@ -364,6 +435,14 @@ def build_local_review_command(
         command.append(prompt)
         return command
     if agent == "claude":
+        if pass_two:
+            disallowed = _CLAUDE_VERIFIER_DISALLOWED_TOOLS
+            tools = _CLAUDE_VERIFIER_TOOLS
+            allowed = _CLAUDE_VERIFIER_ALLOWED_TOOLS
+        else:
+            disallowed = _CLAUDE_REVIEWER_DISALLOWED_TOOLS
+            tools = _CLAUDE_REVIEWER_TOOLS
+            allowed = _CLAUDE_REVIEWER_ALLOWED_TOOLS
         return [
             "claude",
             "--print",
@@ -379,11 +458,11 @@ def build_local_review_command(
             "--settings",
             _CLAUDE_REVIEWER_SETTINGS,
             "--disallowedTools",
-            _CLAUDE_REVIEWER_DISALLOWED_TOOLS,
+            disallowed,
             "--tools",
-            _CLAUDE_REVIEWER_TOOLS,
+            tools,
             "--allowedTools",
-            _CLAUDE_REVIEWER_ALLOWED_TOOLS,
+            allowed,
             "--",
             prompt,
         ]

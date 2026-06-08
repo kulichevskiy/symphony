@@ -73,6 +73,13 @@ HeadShaProvider = Callable[[Path], Awaitable[str]]
 # size the diff and stays single-pass (cheaper, back-compat default).
 DiffSizeProvider = Callable[[Path], Awaitable[DiffSize]]
 
+# Scrubs the working tree after the pass-2 verifier returns, before verdict
+# parsing and before the fixer. The orchestrator implements this with
+# `git checkout -- . && git clean -fd` so the verifier's throwaway tests /
+# mutations never reach the diff the fixer sees. When None, no scrub runs
+# (back-compat: only relevant once pass 2 has Tier B write access).
+WorkspaceScrubber = Callable[[Path], Awaitable[None]]
+
 # Run IDs must survive becoming git refs / log filenames. The orchestrator
 # already uses UUIDs, but if a caller passes something weirder we still
 # want clean derived IDs.
@@ -143,6 +150,7 @@ async def run_local_review_session(
     last_message_dir: Path,
     head_sha_provider: HeadShaProvider,
     diff_size_provider: DiffSizeProvider | None = None,
+    workspace_scrubber: WorkspaceScrubber | None = None,
     on_iteration: IterationCallback | None = None,
 ) -> LoopResult:
     """Run the review→fix loop in-workspace; return the loop's outcome.
@@ -198,13 +206,16 @@ async def run_local_review_session(
         run_suffix: str,
         estimator: UsageCostEstimator,
         head_sha: str,
+        pass_two: bool = False,
     ) -> ReviewerOutput:
-        """Run one read-only reviewer subprocess and price its usage.
+        """Run one reviewer subprocess and price its usage.
 
         `stem` names the transcript / last-message files; `run_suffix`
         names the RunnerSpec id. Both single-pass and the two finder/
         verifier passes route through here so cost accounting, transcript
-        persistence, and failure handling stay identical.
+        persistence, and failure handling stay identical. `pass_two` grants
+        the Tier B exec/write surface (verifier only); pass 1 and the
+        single-pass fallback stay read-only.
         """
         last_message_path = last_message_dir / f"{stem}.last.txt"
         # Clear any previous iteration's leftover so a partial run
@@ -222,6 +233,7 @@ async def run_local_review_session(
             last_message_path=(
                 str(last_message_path) if agent == "codex" else None
             ),
+            pass_two=pass_two,
         )
         spec = RunnerSpec(
             run_id=_safe_run_id(parent_run_id, run_suffix),
@@ -360,7 +372,16 @@ async def run_local_review_session(
             run_suffix=f"rev-{iteration}-verify",
             estimator=verifier_estimator,
             head_sha=head_sha,
+            pass_two=True,
         )
+        # Pass 2 had Tier B write access: scrub the working tree before the
+        # verdict is parsed and before the fixer runs, so the verifier's
+        # throwaway tests / scratch edits never reach the diff the fixer
+        # sees. The verifier's final message is already captured below from
+        # stdout / the last-message file (outside the workspace), so the
+        # scrub can't lose the verdict.
+        if workspace_scrubber is not None:
+            await workspace_scrubber(workspace_path)
         # Merge: the loop parses pass-2's verdict (survivors + new
         # findings already merged in the verifier's message); fold in
         # pass-1's usage so the loop sees the full two-pass spend.
@@ -480,5 +501,6 @@ async def run_local_review_session(
 __all__ = [
     "HeadShaProvider",
     "ImplementerAgent",
+    "WorkspaceScrubber",
     "run_local_review_session",
 ]

@@ -1303,6 +1303,30 @@ async def _workspace_diff_size(
     return DiffSize(changed_lines=0, changed_files=0)
 
 
+async def _workspace_scrub(workspace_path: Path) -> None:
+    """Reset the working tree to HEAD and remove untracked files.
+
+    Runs `git checkout -- .` then `git clean -fd` so a pass-2 verifier's
+    throwaway tests / scratch edits never reach the diff the fixer sees or
+    the branch that gets pushed. Best-effort: failures are swallowed so a
+    scrub hiccup never breaks the local-review phase.
+    """
+    for argv in (
+        ["git", "checkout", "--", "."],
+        ["git", "clean", "-fd"],
+    ):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _github_commit_url(repo: str, sha: str) -> str:
     """Return a browser commit URL for *sha* in [HOST/]OWNER/REPO."""
     if not sha:
@@ -10836,6 +10860,7 @@ class Orchestrator:
                     diff_size_provider=partial(
                         _workspace_diff_size, base_branch=base_branch
                     ),
+                    workspace_scrubber=_workspace_scrub,
                     on_iteration=_on_iteration,
                 )
             finally:
