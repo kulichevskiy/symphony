@@ -238,13 +238,7 @@ describe("SpendOverview", () => {
 
   function render(): string {
     return renderToStaticMarkup(
-      <SpendOverview
-        summary={summary}
-        heatmap={heatmap}
-        heatProvider="all"
-        onChangeHeatProvider={() => {}}
-        onPickTeam={() => {}}
-      />,
+      <SpendOverview summary={summary} heatmap={heatmap} onPickTeam={() => {}} />,
     );
   }
 
@@ -260,6 +254,10 @@ describe("SpendOverview", () => {
     expect(markup.indexOf("Tokens by team")).toBeLessThan(
       markup.indexOf("Tokens by provider / model"),
     );
+  });
+
+  it("no longer renders its own provider toggle (the global header control replaces it)", () => {
+    expect(render()).not.toContain("Heatmap provider");
   });
 
   it("constrains the provider list width so it does not stretch across the card", () => {
