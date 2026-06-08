@@ -9,8 +9,24 @@ import {
   resolveInitialFilters,
   serializeFilters,
   serializePersisted,
+  teamFilterSummary,
   type Filters,
 } from "./filters";
+
+describe("teamFilterSummary", () => {
+  it("reads 'All' when nothing is selected", () => {
+    expect(teamFilterSummary([])).toBe("All");
+  });
+
+  it("lists the keys when one or two are selected", () => {
+    expect(teamFilterSummary(["VIB"])).toBe("VIB");
+    expect(teamFilterSummary(["VIB", "ADJ"])).toBe("VIB, ADJ");
+  });
+
+  it("collapses to a count beyond two", () => {
+    expect(teamFilterSummary(["VIB", "ADJ", "SYM"])).toBe("3 selected");
+  });
+});
 
 describe("normalizeProvider", () => {
   it("keeps the known providers", () => {

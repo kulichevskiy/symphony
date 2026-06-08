@@ -67,6 +67,8 @@ export interface SpendSummary {
   totals: SpendTotals;
   per_team: TeamSpend[];
   per_provider: ProviderSpend[];
+  /** Always-unscoped team keys from config, for the Teams filter popover. */
+  teams: string[];
 }
 
 export interface HeatmapDay {
@@ -248,16 +250,25 @@ async function fetchJson<T>(
   return (await response.json()) as T;
 }
 
+/** Join a team-key list into the comma-separated `teams` param; empty → omit. */
+function applyTeams(params: URLSearchParams, teams?: string[]): void {
+  if (teams && teams.length) {
+    params.set("teams", teams.join(","));
+  }
+}
+
 export function fetchIssues({
   q,
   scope = "active",
   withinSecs,
   provider,
+  teams,
 }: {
   q?: string;
   scope?: IssueScope;
   withinSecs?: number;
   provider?: string;
+  teams?: string[];
 } = {}): Promise<IssueSummary[]> {
   const params = new URLSearchParams({ scope });
   const normalizedQ = q?.trim();
@@ -270,6 +281,7 @@ export function fetchIssues({
   if (provider) {
     params.set("provider", provider);
   }
+  applyTeams(params, teams);
 
   return fetchJson<IssueSummary[]>(
     `/api/issues?${params.toString()}`,
@@ -278,12 +290,18 @@ export function fetchIssues({
   );
 }
 
-export function fetchSpendSummary(provider?: string): Promise<SpendSummary> {
-  const query = provider
-    ? `/api/spend/summary?provider=${encodeURIComponent(provider)}`
-    : "/api/spend/summary";
+export function fetchSpendSummary(
+  provider?: string,
+  teams?: string[],
+): Promise<SpendSummary> {
+  const params = new URLSearchParams();
+  if (provider) {
+    params.set("provider", provider);
+  }
+  applyTeams(params, teams);
+  const query = params.toString();
   return fetchJson<SpendSummary>(
-    query,
+    query ? `/api/spend/summary?${query}` : "/api/spend/summary",
     "Spend summary not found",
     "Failed to load spend summary",
   );
@@ -292,12 +310,15 @@ export function fetchSpendSummary(provider?: string): Promise<SpendSummary> {
 export function fetchSpendHeatmap(
   days = 371,
   provider?: string,
+  teams?: string[],
 ): Promise<SpendHeatmap> {
-  const query = provider
-    ? `/api/spend/heatmap?days=${days}&provider=${encodeURIComponent(provider)}`
-    : `/api/spend/heatmap?days=${days}`;
+  const params = new URLSearchParams({ days: String(days) });
+  if (provider) {
+    params.set("provider", provider);
+  }
+  applyTeams(params, teams);
   return fetchJson<SpendHeatmap>(
-    query,
+    `/api/spend/heatmap?${params.toString()}`,
     "Spend heatmap not found",
     "Failed to load spend heatmap",
   );

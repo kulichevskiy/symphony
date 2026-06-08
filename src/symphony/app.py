@@ -143,6 +143,11 @@ def create_app(
                 )
             )
 
+        ui_teams = (
+            sorted({b.linear_team_key for b in ui_external_config.repos})
+            if ui_external_config is not None
+            else None
+        )
         app.include_router(
             create_api_router(
                 ui_pool,
@@ -150,6 +155,7 @@ def create_app(
                 status_thresholds=ui_status_thresholds,
                 no_progress_threshold=ui_pr_no_progress_threshold,
                 command_sink=ui_command_sink,
+                teams=ui_teams,
             )
         )
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST

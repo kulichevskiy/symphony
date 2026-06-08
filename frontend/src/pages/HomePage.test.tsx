@@ -211,6 +211,7 @@ describe("TokenOverview", () => {
         ],
       },
     ],
+    teams: ["VIB", "ADJ"],
   };
   const heatmap: SpendHeatmap = {
     days: [

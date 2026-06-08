@@ -26,6 +26,14 @@ export function normalizeProvider(value: string | null | undefined): Provider {
   return PROVIDERS.includes(value as Provider) ? (value as Provider) : "all";
 }
 
+/** The Teams filter chip summary: "All" when empty, the keys when one or two
+ *  are picked, else a "N selected" count. */
+export function teamFilterSummary(selected: string[]): string {
+  if (selected.length === 0) return "All";
+  if (selected.length <= 2) return selected.join(", ");
+  return `${selected.length} selected`;
+}
+
 /** The single source of truth for every dashboard filter. */
 export type Filters = {
   teams: string[];

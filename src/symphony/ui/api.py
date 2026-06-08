@@ -93,6 +93,9 @@ class SpendSummary(BaseModel):
     totals: SpendTotals
     per_team: list[TeamSpend]
     per_provider: list[ProviderSpend]
+    # Always-unscoped list of team keys from config, populating the Teams
+    # filter popover. Never narrowed by an active filter.
+    teams: list[str] = Field(default_factory=list)
 
 
 class HeatmapDay(BaseModel):
@@ -200,104 +203,147 @@ def _parse_iso(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+def _parse_teams(value: str | None) -> list[str]:
+    """Split a comma-joined `teams` param into a deduped, order-preserving list.
+
+    Pass-through: unknown keys are kept verbatim so they reach the `IN (...)`
+    clause and self-correct to an empty view rather than erroring."""
+    if not value:
+        return []
+    seen: list[str] = []
+    for raw in value.split(","):
+        key = raw.strip()
+        if key and key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _team_in_clause(teams: list[str]) -> str:
+    return f"i.team_key IN ({','.join('?' for _ in teams)})"
+
+
 # Per-team spend, sourced from the run_model_usage child table so it carries a
-# provider dimension. With no provider filter (`all`) every provider's rows are
-# summed, so rail = sum of teams = codex + claude reconciles exactly. Issue
-# counts are DISTINCT issues touched by the (optionally provider-scoped) usage.
-_SPEND_SUMMARY_QUERY = """
-SELECT
-    i.team_key AS team_key,
-    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
-    COUNT(DISTINCT r.issue_id) AS issues
-FROM run_model_usage u
-JOIN runs r ON r.id = u.run_id
-JOIN issues i ON i.id = r.issue_id
-GROUP BY i.team_key
-"""
-
-
-# Same per-team aggregation scoped to a single provider.
-_SPEND_SUMMARY_BY_PROVIDER_QUERY = """
-SELECT
-    i.team_key AS team_key,
-    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
-    COUNT(DISTINCT r.issue_id) AS issues
-FROM run_model_usage u
-JOIN runs r ON r.id = u.run_id
-JOIN issues i ON i.id = r.issue_id
-WHERE u.provider = ?
-GROUP BY i.team_key
-"""
+# provider dimension. With no provider filter every provider's rows are summed,
+# so rail = sum of teams = codex + claude reconciles exactly. A provider and/or
+# `teams` filter AND together. Issue counts are DISTINCT issues touched by the
+# (optionally scoped) usage.
+def _spend_summary_query(
+    provider: str | None, teams: list[str]
+) -> tuple[str, tuple[str, ...]]:
+    where: list[str] = []
+    params: list[str] = []
+    if provider is not None:
+        where.append("u.provider = ?")
+        params.append(provider)
+    if teams:
+        where.append(_team_in_clause(teams))
+        params.extend(teams)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    return (
+        f"""
+        SELECT
+            i.team_key AS team_key,
+            COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+            COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+            COUNT(DISTINCT r.issue_id) AS issues
+        FROM run_model_usage u
+        JOIN runs r ON r.id = u.run_id
+        JOIN issues i ON i.id = r.issue_id
+        {where_sql}
+        GROUP BY i.team_key
+        """,
+        tuple(params),
+    )
 
 
 # Token attribution by (provider, model), aggregated from the run_model_usage
 # child table. Issue counts are DISTINCT per group so a model used across many
-# issues counts each once.
-_SPEND_PER_MODEL_QUERY = """
-SELECT
-    u.provider AS provider,
-    u.model AS model,
-    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
-    COUNT(DISTINCT r.issue_id) AS issues
-FROM run_model_usage u
-JOIN runs r ON r.id = u.run_id
-GROUP BY u.provider, u.model
-"""
+# issues counts each once. Joins `issues` only when scoping to teams.
+def _spend_per_model_query(teams: list[str]) -> tuple[str, tuple[str, ...]]:
+    join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
+    where_sql = f"WHERE {_team_in_clause(teams)}" if teams else ""
+    return (
+        f"""
+        SELECT
+            u.provider AS provider,
+            u.model AS model,
+            COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+            COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+            COUNT(DISTINCT r.issue_id) AS issues
+        FROM run_model_usage u
+        JOIN runs r ON r.id = u.run_id
+        {join}
+        {where_sql}
+        GROUP BY u.provider, u.model
+        """,
+        tuple(teams),
+    )
 
 
 # Provider-level distinct issue counts, computed separately because summing
 # the per-model issue counts would double-count issues spanning two models.
-_SPEND_PER_PROVIDER_ISSUES_QUERY = """
-SELECT u.provider AS provider, COUNT(DISTINCT r.issue_id) AS issues
-FROM run_model_usage u
-JOIN runs r ON r.id = u.run_id
-GROUP BY u.provider
-"""
+def _spend_per_provider_issues_query(
+    teams: list[str],
+) -> tuple[str, tuple[str, ...]]:
+    join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
+    where_sql = f"WHERE {_team_in_clause(teams)}" if teams else ""
+    return (
+        f"""
+        SELECT u.provider AS provider, COUNT(DISTINCT r.issue_id) AS issues
+        FROM run_model_usage u
+        JOIN runs r ON r.id = u.run_id
+        {join}
+        {where_sql}
+        GROUP BY u.provider
+        """,
+        tuple(teams),
+    )
 
 
 # Bucket spend by UTC day. Timestamps are stored as UTC ISO strings, so the
 # first 10 chars are the calendar day and lexicographic compare is date-correct.
-_SPEND_HEATMAP_QUERY = """
-SELECT
-    substr(r.started_at, 1, 10) AS day,
-    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
-    COUNT(DISTINCT r.issue_id) AS issues
-FROM runs r
-WHERE substr(r.started_at, 1, 10) >= ?
-GROUP BY day
-ORDER BY day
-"""
-
-
-# Same daily buckets, but scoped to a single provider via the run_model_usage
-# child table. Tokens come from the per-(provider, model) rows so a run that
-# spans providers contributes only its share of the selected provider.
-_SPEND_HEATMAP_BY_PROVIDER_QUERY = """
-SELECT
-    substr(r.started_at, 1, 10) AS day,
-    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
-    COUNT(DISTINCT r.issue_id) AS issues
-FROM run_model_usage u
-JOIN runs r ON r.id = u.run_id
-WHERE substr(r.started_at, 1, 10) >= ? AND u.provider = ?
-GROUP BY day
-ORDER BY day
-"""
+# With no provider the run-level token columns are summed; a provider filter
+# switches the source to the run_model_usage child table so a run that spans
+# providers contributes only its share. A `teams` filter ANDs onto either.
+def _spend_heatmap_query(
+    start: str, provider: str | None, teams: list[str]
+) -> tuple[str, tuple[str, ...]]:
+    token_alias = "r" if provider is None else "u"
+    from_sql = (
+        "FROM runs r"
+        if provider is None
+        else "FROM run_model_usage u\n        JOIN runs r ON r.id = u.run_id"
+    )
+    if teams:
+        from_sql += "\n        JOIN issues i ON i.id = r.issue_id"
+    cond = ["substr(r.started_at, 1, 10) >= ?"]
+    params: list[str] = [start]
+    if provider is not None:
+        cond.append("u.provider = ?")
+        params.append(provider)
+    if teams:
+        cond.append(_team_in_clause(teams))
+        params.extend(teams)
+    return (
+        f"""
+        SELECT
+            substr(r.started_at, 1, 10) AS day,
+            COALESCE(SUM({token_alias}.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM({token_alias}.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM({token_alias}.cache_write_tokens), 0) AS cache_write_tokens,
+            COALESCE(SUM({token_alias}.cache_read_tokens), 0) AS cache_read_tokens,
+            COUNT(DISTINCT r.issue_id) AS issues
+        {from_sql}
+        WHERE {' AND '.join(cond)}
+        GROUP BY day
+        ORDER BY day
+        """,
+        tuple(params),
+    )
 
 
 def _build_per_provider(
@@ -365,6 +411,7 @@ def _build_spend_summary(
     rows: list[dict[str, object]],
     model_rows: list[dict[str, object]] | None = None,
     provider_issue_rows: list[dict[str, object]] | None = None,
+    teams: list[str] | None = None,
 ) -> SpendSummary:
     per_team: list[TeamSpend] = []
     acc = {
@@ -407,7 +454,10 @@ def _build_spend_summary(
         model_rows or [], provider_issue_rows or []
     )
     return SpendSummary(
-        totals=totals, per_team=per_team, per_provider=per_provider
+        totals=totals,
+        per_team=per_team,
+        per_provider=per_provider,
+        teams=teams or [],
     )
 
 
@@ -418,6 +468,7 @@ def _list_issues_query(
     now: datetime,
     cutoff: datetime | None = None,
     provider: str | None = None,
+    teams: list[str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     where: list[str] = []
     where_params: list[str] = []
@@ -441,6 +492,10 @@ def _list_issues_query(
             "(instr(lower(i.identifier), ?) > 0 OR instr(lower(i.title), ?) > 0)"
         )
         where_params.extend([normalized_q, normalized_q])
+
+    if teams:
+        where.append(_team_in_clause(teams))
+        where_params.extend(teams)
 
     # Token columns: when a provider is selected, scope the per-issue sums to that
     # provider's rows in the run_model_usage child table (joined to runs) and drop
@@ -521,8 +576,12 @@ def create_api_router(
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     no_progress_threshold: timedelta | None = None,
     command_sink: CommandSink | None = None,
+    teams: list[str] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
+    # Always-unscoped team keys from config, surfaced in /spend/summary to
+    # populate the Teams filter popover. Sorted for a stable popover order.
+    config_teams = sorted(teams or [])
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
     pr_no_progress_threshold = (
         DEFAULT_PR_NO_PROGRESS_THRESHOLD
@@ -543,12 +602,14 @@ def create_api_router(
         scope: Annotated[IssueScope, Query()] = IssueScope.ACTIVE,
         within_secs: Annotated[int, Query(ge=1)] = 7 * 86_400,
         provider: Annotated[str | None, Query()] = None,
+        teams: Annotated[str | None, Query()] = None,
     ) -> list[IssueSummary]:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
 
         # "all" (and the omitted param) mean no provider scoping.
         provider_filter = None if provider in (None, "all") else provider
+        team_filter = _parse_teams(teams)
         is_done = scope is IssueScope.DONE
         try:
             conn = await ui_db_pool.connection()
@@ -557,7 +618,12 @@ def create_api_router(
                 request_now - timedelta(seconds=within_secs) if is_done else None
             )
             query, params = _list_issues_query(
-                scope, q, now=request_now, cutoff=cutoff, provider=provider_filter
+                scope,
+                q,
+                now=request_now,
+                cutoff=cutoff,
+                provider=provider_filter,
+                teams=team_filter,
             )
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
@@ -636,41 +702,46 @@ def create_api_router(
     @router.get("/spend/summary", response_model=SpendSummary)
     async def spend_summary(
         provider: Annotated[str | None, Query()] = None,
+        teams: Annotated[str | None, Query()] = None,
     ) -> SpendSummary:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
-        if provider is None or provider == "all":
-            team_query, team_params = _SPEND_SUMMARY_QUERY, ()
-        else:
-            team_query, team_params = _SPEND_SUMMARY_BY_PROVIDER_QUERY, (provider,)
+        provider_filter = None if provider in (None, "all") else provider
+        team_filter = _parse_teams(teams)
+        team_query, team_params = _spend_summary_query(provider_filter, team_filter)
+        model_query, model_params = _spend_per_model_query(team_filter)
+        issues_query, issues_params = _spend_per_provider_issues_query(team_filter)
         try:
             conn = await ui_db_pool.connection()
             cur = await conn.execute(team_query, team_params)
             rows = [dict(row) for row in await cur.fetchall()]
-            cur = await conn.execute(_SPEND_PER_MODEL_QUERY)
+            cur = await conn.execute(model_query, model_params)
             model_rows = [dict(row) for row in await cur.fetchall()]
-            cur = await conn.execute(_SPEND_PER_PROVIDER_ISSUES_QUERY)
+            cur = await conn.execute(issues_query, issues_params)
             provider_issue_rows = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503, detail="UI database is not available"
             ) from exc
-        return _build_spend_summary(rows, model_rows, provider_issue_rows)
+        return _build_spend_summary(
+            rows, model_rows, provider_issue_rows, teams=config_teams
+        )
 
     @router.get("/spend/heatmap", response_model=SpendHeatmap)
     async def spend_heatmap(
         days: Annotated[int, Query(ge=1, le=400)] = 371,
         provider: Annotated[str | None, Query()] = None,
+        teams: Annotated[str | None, Query()] = None,
     ) -> SpendHeatmap:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
         request_now = now()
         start = (request_now - timedelta(days=days - 1)).date()
-        if provider is None:
-            query, params = _SPEND_HEATMAP_QUERY, (start.isoformat(),)
-        else:
-            query = _SPEND_HEATMAP_BY_PROVIDER_QUERY
-            params = (start.isoformat(), provider)
+        provider_filter = None if provider in (None, "all") else provider
+        team_filter = _parse_teams(teams)
+        query, params = _spend_heatmap_query(
+            start.isoformat(), provider_filter, team_filter
+        )
         try:
             conn = await ui_db_pool.connection()
             cur = await conn.execute(query, params)
