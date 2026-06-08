@@ -21,9 +21,27 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
     VERDICT_CHANGES_REQUESTED_MARKER,
+    DiffSize,
 )
 from symphony.pipeline.local_review_loop import LoopOutcome
 from symphony.pipeline.local_review_session import run_local_review_session
+
+
+def _message_stream(agent: str, text: str) -> list[RunnerEvent]:
+    """A single-message reviewer stream in the given agent's JSONL form."""
+    if agent == "codex":
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "i", "type": "agent_message", "text": text},
+            }
+        )
+    else:
+        line = json.dumps({"type": "result", "result": text})
+    return [
+        RunnerEvent(kind="stdout", line=line),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
 
 
 class _ScriptedRunner:
@@ -560,6 +578,213 @@ async def test_stale_last_message_does_not_smuggle_into_next_iteration(
     assert result.outcome == LoopOutcome.EXHAUSTED
     assert result.last_verdict is not None
     assert "real-bug" in result.last_verdict.findings
+
+
+@pytest.mark.parametrize(
+    "implementer_agent,reviewer_agent",
+    [("claude", "codex"), ("codex", "claude")],
+)
+@pytest.mark.asyncio
+async def test_large_diff_runs_two_passes_with_per_pass_families(
+    tmp_path: Path, implementer_agent: str, reviewer_agent: str
+) -> None:
+    """A large diff spawns pass-1 finder (reviewer/opposite family, no
+    marker) then pass-2 verifier (implementer family, emits marker)."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    verifier_text = f"tried to break it, held\n{VERDICT_APPROVED_MARKER}"
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream(reviewer_agent, finder_text),
+            _message_stream(implementer_agent, verifier_text),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-2pass",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent=implementer_agent,
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent=reviewer_agent,
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    # Exactly two reviewer subprocesses; pass 2 approved so no fixer.
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(runner.specs) == 2
+    finder_spec, verifier_spec = runner.specs
+    assert finder_spec.stage == "local_review"
+    assert verifier_spec.stage == "local_review"
+    assert finder_spec.run_id == "run-2pass-rev-0-find"
+    assert verifier_spec.run_id == "run-2pass-rev-0-verify"
+    # Family per pass: finder = reviewer (opposite implementer), verifier
+    # = implementer family.
+    assert finder_spec.command[0] == reviewer_agent
+    assert verifier_spec.command[0] == implementer_agent
+    # Pass-1 findings are injected into the verifier's prompt.
+    assert "suspicion at foo.py:1" in verifier_spec.command[-1]
+
+
+@pytest.mark.asyncio
+async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
+    """The loop receives pass-2's merged findings, not pass-1's raw
+    suspicions. Pass 2 requests changes, so the loop dispatches a fixer
+    with pass-2's findings as the trigger."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    verifier_text = (
+        f"## Findings\n- confirmed bug at foo.py:1\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("codex", finder_text),  # pass 1 (reviewer)
+            _message_stream("claude", verifier_text),  # pass 2 (implementer)
+            _ok_fix_stream(),  # fixer dispatched on CHANGES_REQUESTED
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-merge",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.EXHAUSTED  # cap=1, CHANGES_REQUESTED
+    # First two specs are the reviewer passes; third is the fixer.
+    assert runner.specs[0].run_id == "run-merge-rev-0-find"
+    assert runner.specs[1].run_id == "run-merge-rev-0-verify"
+    assert runner.specs[2].stage == "local_review_fix"
+    # Merged verdict is pass-2's, not pass-1's.
+    assert result.last_verdict is not None
+    assert "confirmed bug at foo.py:1" in result.last_verdict.findings
+    assert "suspicion at foo.py:1" not in result.last_verdict.findings
+    # The fixer trigger is pass-2's findings.
+    assert "confirmed bug at foo.py:1" in runner.specs[2].command[-1]
+
+
+@pytest.mark.parametrize(
+    "lines,files,expected_specs",
+    [
+        (150, 3, 1),  # both at the inclusive boundary → single pass
+        (150, 1, 1),
+        (10, 3, 1),
+        (151, 3, 2),  # one line over → two passes
+        (150, 4, 2),  # one file over → two passes
+        (151, 4, 2),
+        (1000, 9, 2),
+    ],
+)
+@pytest.mark.asyncio
+async def test_small_diff_collapses_to_single_pass(
+    tmp_path: Path, lines: int, files: int, expected_specs: int
+) -> None:
+    if expected_specs == 1:
+        scripts = [_message_stream("codex", f"ok\n{VERDICT_APPROVED_MARKER}")]
+    else:
+        scripts = [
+            _message_stream("codex", "## Findings\n- s at a.py:1"),
+            _message_stream("claude", f"ok\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    runner = _ScriptedRunner(scripts=scripts)
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=lines, changed_files=files)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-thr",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(runner.specs) == expected_specs
+    if expected_specs == 1:
+        # Single pass uses the reviewer family directly.
+        assert runner.specs[0].command[0] == "codex"
+        assert runner.specs[0].run_id == "run-thr-rev-0"
+
+
+@pytest.mark.asyncio
+async def test_no_diff_size_provider_defaults_to_single_pass(
+    tmp_path: Path,
+) -> None:
+    """Without a measurement callback the session can't size the diff, so
+    it stays single-pass (back-compat / cheaper default)."""
+    runner = _ScriptedRunner(
+        scripts=[_message_stream("codex", f"ok\n{VERDICT_APPROVED_MARKER}")]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-none",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(runner.specs) == 1
 
 
 @pytest.mark.asyncio

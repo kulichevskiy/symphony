@@ -107,7 +107,7 @@ from ..pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
 )
-from ..pipeline.local_review import LocalVerdict
+from ..pipeline.local_review import DiffSize, LocalVerdict, parse_diff_numstat
 from ..pipeline.local_review_loop import LoopOutcome, LoopResult
 from ..pipeline.local_review_session import run_local_review_session
 from ..pipeline.preview_resolver import (
@@ -1272,6 +1272,35 @@ async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     return ""
+
+
+async def _workspace_diff_size(
+    workspace_path: Path, base_branch: str
+) -> DiffSize:
+    """Measure the branch's diff vs *base_branch* via `git diff --numstat`.
+
+    Mirrors the reviewer prompt's ref logic: prefer `origin/<base>...HEAD`,
+    fall back to `<base>...HEAD` when origin is absent. On any error,
+    report a small diff so the reviewer only escalates to the expensive
+    two-pass review when the diff is *provably* large — an unmeasurable
+    diff degrades to the cheaper single pass.
+    """
+    for ref in (f"origin/{base_branch}...HEAD", f"{base_branch}...HEAD"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "diff", "--numstat", ref,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                return parse_diff_numstat(stdout.decode(errors="replace"))
+        except Exception:  # noqa: BLE001
+            pass
+    # Neither ref resolved — treat as small so we don't pay for two passes
+    # on a diff we couldn't size.
+    return DiffSize(changed_lines=0, changed_files=0)
 
 
 def _github_commit_url(repo: str, sha: str) -> str:
@@ -10804,6 +10833,9 @@ class Orchestrator:
                     command_secs=self.config.command_timeout_secs,
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
+                    diff_size_provider=partial(
+                        _workspace_diff_size, base_branch=base_branch
+                    ),
                     on_iteration=_on_iteration,
                 )
             finally:

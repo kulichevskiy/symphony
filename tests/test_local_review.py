@@ -7,13 +7,20 @@ import json
 import pytest
 
 from symphony.pipeline.local_review import (
+    SMALL_DIFF_MAX_FILES,
+    SMALL_DIFF_MAX_LINES,
     VERDICT_APPROVED_MARKER,
     VERDICT_CHANGES_REQUESTED_MARKER,
+    DiffSize,
     LocalVerdictKind,
     build_local_review_command,
     default_reviewer_agent,
     extract_last_agent_message,
+    is_small_diff,
+    local_review_finder_prompt,
     local_review_prompt,
+    local_review_verifier_prompt,
+    parse_diff_numstat,
     parse_local_review_output,
 )
 
@@ -400,3 +407,102 @@ def test_parse_local_review_findings_falls_back_when_no_heading() -> None:
     )
     assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
     assert "timeout" in verdict.findings
+
+
+# --- two-pass prompts ----------------------------------------------------
+
+
+def test_finder_prompt_lists_findings_without_a_verdict_marker() -> None:
+    """Pass 1 enumerates suspicions but must not emit a verdict marker —
+    the verifier pass owns the verdict."""
+    prompt = local_review_finder_prompt(
+        issue_title="t", issue_body="b", labels=[], base_branch="main"
+    )
+    lower = prompt.lower()
+    # Shared adversarial stance + lenses are carried over.
+    assert "assume a bug exists" in lower
+    assert "run_model_usage" in prompt
+    # Findings section is requested...
+    assert "## Findings" in prompt
+    # ...but the literal verdict markers must NOT appear as a response
+    # instruction, and the model is told explicitly not to emit one.
+    assert VERDICT_APPROVED_MARKER not in prompt
+    assert VERDICT_CHANGES_REQUESTED_MARKER not in prompt
+    assert "do not emit" in lower and "verdict marker" in lower
+
+
+def test_verifier_prompt_injects_pass_one_findings_and_emits_marker() -> None:
+    """Pass 2 receives pass-1 findings, is told to refute them, and emits
+    the final verdict marker the parser reads."""
+    pass_one = "- suspicious null deref at src/foo.py:42"
+    prompt = local_review_verifier_prompt(
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        base_branch="main",
+        pass_one_findings=pass_one,
+    )
+    lower = prompt.lower()
+    # Pass-1 findings are injected verbatim for the verifier to check.
+    assert pass_one in prompt
+    # Adversarial refutation framing.
+    assert "refute" in lower
+    # Emits the same marker contract as the single-pass reviewer.
+    assert VERDICT_APPROVED_MARKER in prompt
+    assert VERDICT_CHANGES_REQUESTED_MARKER in prompt
+
+
+def test_verifier_prompt_handles_empty_pass_one_findings() -> None:
+    prompt = local_review_verifier_prompt(
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        base_branch="main",
+        pass_one_findings="   ",
+    )
+    assert VERDICT_APPROVED_MARKER in prompt
+    # No findings still produces a usable verifier prompt.
+    assert "no findings" in prompt.lower()
+
+
+# --- diff-size measurement -----------------------------------------------
+
+
+def test_parse_diff_numstat_sums_lines_and_counts_files() -> None:
+    out = "10\t5\tsrc/a.py\n3\t0\tsrc/b.py\n"
+    size = parse_diff_numstat(out)
+    assert size == DiffSize(changed_lines=18, changed_files=2)
+
+
+def test_parse_diff_numstat_handles_binary_and_blank_lines() -> None:
+    # Binary files report `-` for added/deleted; they still count as a
+    # changed file but contribute zero counted lines.
+    out = "-\t-\tassets/logo.png\n\n7\t2\tsrc/c.py\n"
+    size = parse_diff_numstat(out)
+    assert size == DiffSize(changed_lines=9, changed_files=2)
+
+
+def test_parse_diff_numstat_empty_is_zero() -> None:
+    assert parse_diff_numstat("") == DiffSize(changed_lines=0, changed_files=0)
+
+
+def test_small_diff_thresholds() -> None:
+    assert SMALL_DIFF_MAX_LINES == 150
+    assert SMALL_DIFF_MAX_FILES == 3
+
+
+@pytest.mark.parametrize(
+    "lines,files,small",
+    [
+        (150, 3, True),  # both at the inclusive boundary
+        (150, 1, True),
+        (1, 3, True),
+        (0, 0, True),
+        (151, 3, False),  # one line over
+        (150, 4, False),  # one file over
+        (151, 4, False),
+        (1000, 9, False),
+    ],
+)
+def test_is_small_diff_boundaries(lines: int, files: int, small: bool) -> None:
+    assert is_small_diff(DiffSize(changed_lines=lines, changed_files=files)) is small
