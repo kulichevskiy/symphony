@@ -507,15 +507,17 @@ export function HomePage() {
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
+  const providerFilter = provider === "all" ? undefined : provider;
   const activeQuery = useQuery({
-    queryKey: ["issues", "active"],
-    queryFn: () => fetchIssues({ scope: "active" }),
+    queryKey: ["issues", "active", provider],
+    queryFn: () => fetchIssues({ scope: "active", provider: providerFilter }),
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", win.secs],
-    queryFn: () => fetchIssues({ scope: "done", withinSecs: win.secs }),
+    queryKey: ["issues", "done", win.secs, provider],
+    queryFn: () =>
+      fetchIssues({ scope: "done", withinSecs: win.secs, provider: providerFilter }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });

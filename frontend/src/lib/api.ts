@@ -252,10 +252,12 @@ export function fetchIssues({
   q,
   scope = "active",
   withinSecs,
+  provider,
 }: {
   q?: string;
   scope?: IssueScope;
   withinSecs?: number;
+  provider?: string;
 } = {}): Promise<IssueSummary[]> {
   const params = new URLSearchParams({ scope });
   const normalizedQ = q?.trim();
@@ -264,6 +266,9 @@ export function fetchIssues({
   }
   if (withinSecs != null) {
     params.set("within_secs", String(withinSecs));
+  }
+  if (provider) {
+    params.set("provider", provider);
   }
 
   return fetchJson<IssueSummary[]>(

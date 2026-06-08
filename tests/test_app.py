@@ -573,6 +573,103 @@ async def test_api_issues_returns_per_issue_token_aggregates(
 
 
 @pytest.mark.asyncio
+async def test_api_issues_filters_by_provider(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="spans", identifier="ENG-1", title="spans both", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn,
+            id="codex-only",
+            identifier="ENG-2",
+            title="codex only",
+            team_key="ENG",
+        )
+        # Run-level token columns mirror the sum of each run's run_model_usage
+        # rows (the schema invariant), so provider=all reflects the run totals.
+        await conn.execute(
+            """
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, ended_at,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens
+            )
+            VALUES
+                ('r1', 'spans', 'implement', 'completed', NULL,
+                 '2026-05-17T10:00:00Z', '2026-05-17T10:05:00Z', 100, 20, 30, 40),
+                ('r2', 'spans', 'review', 'completed', NULL,
+                 '2026-05-17T10:10:00Z', '2026-05-17T10:15:00Z', 10, 2, 0, 3),
+                ('r3', 'codex-only', 'implement', 'completed', NULL,
+                 '2026-05-17T11:00:00Z', '2026-05-17T11:05:00Z', 50, 5, 5, 5)
+            """
+        )
+        # Both issues are active via review_state (iteration > 0, no PRs).
+        await conn.execute(
+            "INSERT INTO review_state (issue_id, iteration) "
+            "VALUES ('spans', 1), ('codex-only', 1)"
+        )
+        await conn.commit()
+        # spans: implement on claude, review on codex. codex-only: codex only.
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("codex", "gpt-5.5", 50, 5, 5, 5)]
+        )
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            claude_resp = await client.get("/api/issues?scope=active&provider=claude")
+            codex_resp = await client.get("/api/issues?scope=active&provider=codex")
+            all_resp = await client.get("/api/issues?scope=active&provider=all")
+    finally:
+        await conn.close()
+
+    # claude: codex-only issue is dropped (zero claude usage); spans is scoped to
+    # its claude tokens only.
+    assert claude_resp.status_code == 200
+    claude_rows = {r["id"]: r for r in claude_resp.json()}
+    assert set(claude_rows) == {"spans"}
+    assert {k: claude_rows["spans"][k] for k in _token_totals()} == _token_totals(
+        input_tokens=100, output_tokens=20, cache_write_tokens=30, cache_read_tokens=40
+    )
+
+    # codex: both issues present, each scoped to its codex tokens.
+    assert codex_resp.status_code == 200
+    codex_rows = {r["id"]: r for r in codex_resp.json()}
+    assert set(codex_rows) == {"spans", "codex-only"}
+    assert {k: codex_rows["spans"][k] for k in _token_totals()} == _token_totals(
+        input_tokens=10, output_tokens=2, cache_write_tokens=0, cache_read_tokens=3
+    )
+    assert {
+        k: codex_rows["codex-only"][k] for k in _token_totals()
+    } == _token_totals(
+        input_tokens=50, output_tokens=5, cache_write_tokens=5, cache_read_tokens=5
+    )
+
+    # provider=all: unchanged behavior — both issues, full per-issue sums.
+    assert all_resp.status_code == 200
+    all_rows = {r["id"]: r for r in all_resp.json()}
+    assert set(all_rows) == {"spans", "codex-only"}
+    assert {k: all_rows["spans"][k] for k in _token_totals()} == _token_totals(
+        input_tokens=110, output_tokens=22, cache_write_tokens=30, cache_read_tokens=43
+    )
+
+
+@pytest.mark.asyncio
 async def test_api_issues_includes_latest_activity_from_existing_timestamps(
     tmp_path: Path,
 ) -> None:
