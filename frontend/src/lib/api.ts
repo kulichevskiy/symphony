@@ -63,12 +63,21 @@ export interface ProviderSpend extends TokenSplit {
   per_model: ModelSpend[];
 }
 
+/** A provider-qualified model, as surfaced by the always-unscoped `models`
+ *  list on /spend/summary to populate the Models filter popover. */
+export interface ModelRef {
+  provider: string;
+  model: string;
+}
+
 export interface SpendSummary {
   totals: SpendTotals;
   per_team: TeamSpend[];
   per_provider: ProviderSpend[];
   /** Always-unscoped team keys from config, for the Teams filter popover. */
   teams: string[];
+  /** Always-unscoped (provider, model) pairs, for the Models filter popover. */
+  models: ModelRef[];
 }
 
 export interface HeatmapDay {
@@ -250,10 +259,11 @@ async function fetchJson<T>(
   return (await response.json()) as T;
 }
 
-/** Join a team-key list into the comma-separated `teams` param; empty → omit. */
-function applyTeams(params: URLSearchParams, teams?: string[]): void {
-  if (teams && teams.length) {
-    params.set("teams", teams.join(","));
+/** Join a key list into a comma-separated param; empty → omit. Shared by the
+ *  `teams` and (provider-qualified) `models` filters. */
+function applyList(params: URLSearchParams, key: string, values?: string[]): void {
+  if (values && values.length) {
+    params.set(key, values.join(","));
   }
 }
 
@@ -264,6 +274,7 @@ export function fetchIssues({
   to,
   provider,
   teams,
+  models,
 }: {
   q?: string;
   scope?: IssueScope;
@@ -273,6 +284,7 @@ export function fetchIssues({
   to?: string;
   provider?: string;
   teams?: string[];
+  models?: string[];
 } = {}): Promise<IssueSummary[]> {
   const params = new URLSearchParams({ scope });
   const normalizedQ = q?.trim();
@@ -288,7 +300,8 @@ export function fetchIssues({
   if (provider) {
     params.set("provider", provider);
   }
-  applyTeams(params, teams);
+  applyList(params, "teams", teams);
+  applyList(params, "models", models);
 
   return fetchJson<IssueSummary[]>(
     `/api/issues?${params.toString()}`,
@@ -300,6 +313,7 @@ export function fetchIssues({
 export function fetchSpendSummary(
   provider?: string,
   teams?: string[],
+  models?: string[],
   from?: string,
   to?: string,
 ): Promise<SpendSummary> {
@@ -307,7 +321,8 @@ export function fetchSpendSummary(
   if (provider) {
     params.set("provider", provider);
   }
-  applyTeams(params, teams);
+  applyList(params, "teams", teams);
+  applyList(params, "models", models);
   if (from) {
     params.set("from", from);
   }
@@ -326,12 +341,14 @@ export function fetchSpendHeatmap(
   days = 371,
   provider?: string,
   teams?: string[],
+  models?: string[],
 ): Promise<SpendHeatmap> {
   const params = new URLSearchParams({ days: String(days) });
   if (provider) {
     params.set("provider", provider);
   }
-  applyTeams(params, teams);
+  applyList(params, "teams", teams);
+  applyList(params, "models", models);
   return fetchJson<SpendHeatmap>(
     `/api/spend/heatmap?${params.toString()}`,
     "Spend heatmap not found",

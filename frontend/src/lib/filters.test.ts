@@ -11,6 +11,8 @@ import {
   parseDate,
   parseFilters,
   PROVIDERS,
+  modelFilterSummary,
+  pruneModelsForProvider,
   resolveDateWindow,
   resolveInitialFilters,
   serializeFilters,
@@ -32,6 +34,41 @@ describe("teamFilterSummary", () => {
 
   it("collapses to a count beyond two", () => {
     expect(teamFilterSummary(["VIB", "ADJ", "SYM"])).toBe("3 selected");
+  });
+});
+
+describe("modelFilterSummary", () => {
+  it("reads 'All' when nothing is selected", () => {
+    expect(modelFilterSummary([])).toBe("All");
+  });
+
+  it("lists the bare model names when one or two are selected", () => {
+    expect(modelFilterSummary(["claude:opus-4.1"])).toBe("opus-4.1");
+    expect(modelFilterSummary(["claude:opus-4.1", "codex:gpt-5-codex"])).toBe(
+      "opus-4.1, gpt-5-codex",
+    );
+  });
+
+  it("collapses to a count beyond two", () => {
+    expect(
+      modelFilterSummary(["claude:opus-4.1", "codex:gpt-5-codex", "claude:sonnet-4-6"]),
+    ).toBe("3 selected");
+  });
+});
+
+describe("pruneModelsForProvider", () => {
+  const models = ["claude:opus-4.1", "codex:gpt-5-codex", "claude:sonnet-4-6"];
+
+  it("keeps every model under 'all'", () => {
+    expect(pruneModelsForProvider(models, "all")).toEqual(models);
+  });
+
+  it("drops models that don't belong to the selected provider", () => {
+    expect(pruneModelsForProvider(models, "claude")).toEqual([
+      "claude:opus-4.1",
+      "claude:sonnet-4-6",
+    ]);
+    expect(pruneModelsForProvider(models, "codex")).toEqual(["codex:gpt-5-codex"]);
   });
 });
 

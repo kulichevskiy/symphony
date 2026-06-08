@@ -2465,6 +2465,252 @@ async def test_api_spend_heatmap_filters_by_teams(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_issues_filters_by_models(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("v", "VIB-1", "VIB"),
+            ("a", "ADJ-1", "ADJ"),
+            ("s", "SYM-1", "SYM"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+            VALUES
+                ('rv', 'v', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 100, 20, 30, 40),
+                ('ra', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 50, 5, 5, 5),
+                ('rs', 's', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 10, 2, 0, 3)
+            """
+        )
+        await conn.execute(
+            "INSERT INTO review_state (issue_id, iteration) "
+            "VALUES ('v', 1), ('a', 1), ('s', 1)"
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "rv", [ModelUsage("claude", "opus-4.1", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "ra", [ModelUsage("codex", "gpt-5-codex", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "rs", [ModelUsage("claude", "sonnet-4-6", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            one = await client.get("/api/issues?scope=active&models=claude:opus-4.1")
+            multi = await client.get(
+                "/api/issues?scope=active&models=claude:opus-4.1,codex:gpt-5-codex"
+            )
+            unknown = await client.get("/api/issues?scope=active&models=claude:nope")
+            none = await client.get("/api/issues?scope=active")
+            combo = await client.get(
+                "/api/issues?scope=active"
+                "&models=claude:opus-4.1,codex:gpt-5-codex&teams=VIB"
+            )
+    finally:
+        await conn.close()
+
+    assert one.status_code == 200
+    assert {r["id"] for r in one.json()} == {"v"}
+    # Multiple models OR together (across providers).
+    assert {r["id"] for r in multi.json()} == {"v", "a"}
+    # Unknown model → empty, not errored.
+    assert unknown.status_code == 200
+    assert unknown.json() == []
+    # No models param → all models.
+    assert {r["id"] for r in none.json()} == {"v", "a", "s"}
+    # models AND teams: ADJ excluded by team filter even though its model matches.
+    assert {r["id"] for r in combo.json()} == {"v"}
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_filters_by_models(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "VIB-1", "VIB"),
+            ("b", "ADJ-1", "ADJ"),
+            ("c", "SYM-1", "SYM"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r3', 'c', 'implement', 'completed', NULL, '2026-05-17T12:00:00Z')
+            """
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "opus-4.1", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5-codex", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("claude", "sonnet-4-6", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            multi = await client.get(
+                "/api/spend/summary?models=claude:opus-4.1,codex:gpt-5-codex"
+            )
+            combo = await client.get(
+                "/api/spend/summary?models=claude:opus-4.1,claude:sonnet-4-6"
+                "&provider=claude"
+            )
+    finally:
+        await conn.close()
+
+    assert multi.status_code == 200
+    body = multi.json()
+    # Only the selected models' rows; SYM's sonnet-4-6 excluded.
+    assert {t["key"] for t in body["per_team"]} == {"VIB", "ADJ"}
+    assert body["totals"]["output_tokens"] == 20 + 5
+    assert body["totals"]["issues"] == 2
+    providers = {p["provider"]: p for p in body["per_provider"]}
+    assert set(providers) == {"claude", "codex"}
+    assert providers["claude"]["output_tokens"] == 20
+    assert providers["codex"]["output_tokens"] == 5
+
+    # models AND provider: both selected models are claude; codex unaffected.
+    assert combo.status_code == 200
+    cbody = combo.json()
+    assert {t["key"] for t in cbody["per_team"]} == {"VIB", "SYM"}
+    assert cbody["totals"]["output_tokens"] == 20 + 2
+    assert [p["provider"] for p in cbody["per_provider"]] == ["claude"]
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_returns_unscoped_models(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="VIB-1", title="t", team_key="VIB"
+        )
+        await db.issues.upsert(
+            conn, id="b", identifier="ADJ-1", title="t", team_key="ADJ"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z')
+            """
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "opus-4.1", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5-codex", 50, 5, 5, 5)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            unfiltered = await client.get("/api/spend/summary")
+            filtered = await client.get("/api/spend/summary?models=claude:opus-4.1")
+    finally:
+        await conn.close()
+
+    assert unfiltered.status_code == 200
+    # Distinct (provider, model) from run_model_usage, sorted, unscoped.
+    expected = [
+        {"provider": "claude", "model": "opus-4.1"},
+        {"provider": "codex", "model": "gpt-5-codex"},
+    ]
+    assert unfiltered.json()["models"] == expected
+    # The list is stable under an active filter.
+    assert filtered.json()["models"] == expected
+
+
+@pytest.mark.asyncio
+async def test_api_spend_heatmap_filters_by_models(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "VIB-1", "VIB"),
+            ("b", "ADJ-1", "ADJ"),
+            ("c", "SYM-1", "SYM"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r3', 'c', 'implement', 'completed', NULL, '2026-05-16T09:00:00Z')
+            """
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "opus-4.1", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5-codex", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("claude", "sonnet-4-6", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            one = await client.get(
+                "/api/spend/heatmap?days=60&models=claude:opus-4.1"
+            )
+            multi = await client.get(
+                "/api/spend/heatmap?days=60&models=claude:opus-4.1,codex:gpt-5-codex"
+            )
+    finally:
+        await conn.close()
+
+    assert one.status_code == 200
+    one_days = {d["date"]: d for d in one.json()["days"]}
+    assert one_days["2026-05-17"] == {
+        "date": "2026-05-17",
+        "input_tokens": 100, "output_tokens": 20,
+        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+    }
+    # SYM's sonnet-4-6 row on 05-16 is excluded.
+    assert "2026-05-16" not in one_days
+
+    # Multiple models OR together within the day bucket.
+    multi_days = {d["date"]: d for d in multi.json()["days"]}
+    assert multi_days["2026-05-17"]["output_tokens"] == 20 + 5
+    assert multi_days["2026-05-17"]["issues"] == 2
+
+
+@pytest.mark.asyncio
 async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)

@@ -40,4 +40,10 @@ describe("FiltersProvider / useFilters", () => {
   it("parses teams and date from the URL", () => {
     expect(render("/?teams=VIB,ADJ&dates=7d")).toContain("all|VIB,ADJ||7d");
   });
+
+  it("parses provider-qualified models from the URL", () => {
+    expect(render("/?models=claude:opus-4.1,codex:gpt-5-codex")).toContain(
+      "all||claude:opus-4.1,codex:gpt-5-codex|-",
+    );
+  });
 });
