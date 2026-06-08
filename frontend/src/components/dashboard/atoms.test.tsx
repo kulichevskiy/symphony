@@ -18,7 +18,7 @@ describe("token palette", () => {
     expect(markup).toContain("bg-blue-500");
     expect(markup).toContain("bg-violet-500");
     expect(markup).toContain("bg-cyan-500");
-    expect(markup).toContain("bg-slate-400");
+    expect(markup).toContain("bg-slate-300");
     // No leftovers from the old in=sky / out=emerald / cache-write=amber palette.
     expect(markup).not.toContain("bg-sky-500");
     expect(markup).not.toContain("bg-emerald-500");
@@ -41,11 +41,11 @@ describe("MixBar", () => {
       cache_read_tokens: 25,
     };
     const markup = renderToStaticMarkup(<MixBar split={split} />);
-    // Four equal segments → 25% each, no segment encodes a hidden total length.
+    // Four equal segments → 25% each.
     expect(markup.match(/width:25%/g)).toHaveLength(4);
   });
 
-  it("encodes proportions, not magnitude (small and large rows look identical)", () => {
+  it("defaults to composition: small and large rows fill the full track", () => {
     const small: TokenSplit = {
       input_tokens: 1,
       output_tokens: 3,
@@ -61,12 +61,27 @@ describe("MixBar", () => {
     const widths = (markup: string) => markup.match(/width:[\d.]+%/g);
     const smallBar = renderToStaticMarkup(<MixBar split={small} />);
     const largeBar = renderToStaticMarkup(<MixBar split={large} />);
-    // Same proportions → identical segment geometry regardless of magnitude.
+    // Same proportions → identical geometry: full-width fill + 25/75 segments.
     expect(widths(smallBar)).toEqual(widths(largeBar));
-    expect(widths(smallBar)).toEqual(["width:25%", "width:75%"]);
+    expect(widths(smallBar)).toEqual(["width:100%", "width:25%", "width:75%"]);
   });
 
-  it("omits zero segments and renders an empty bar at zero total", () => {
+  it("magnitude mode scales the bar's total length by tokens vs maxTotal", () => {
+    const half: TokenSplit = {
+      input_tokens: 25,
+      output_tokens: 25,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+    };
+    const markup = renderToStaticMarkup(
+      <MixBar split={half} mode="magnitude" maxTotal={100} />,
+    );
+    // 50 of 100 total → 50% length, with the 50/50 segment split inside.
+    expect(markup).toContain("width:50%");
+    expect(markup.match(/width:50%/g)).toHaveLength(3);
+  });
+
+  it("omits zero segments at zero total (no colored fill)", () => {
     const markup = renderToStaticMarkup(
       <MixBar
         split={{
@@ -77,6 +92,8 @@ describe("MixBar", () => {
         }}
       />,
     );
-    expect(markup).not.toContain("width:");
+    expect(markup).not.toContain("bg-blue-500");
+    expect(markup).not.toContain("bg-violet-500");
+    expect(markup).not.toContain("bg-cyan-500");
   });
 });

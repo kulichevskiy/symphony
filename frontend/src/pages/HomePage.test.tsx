@@ -2,22 +2,15 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
-import type {
-  IssueSummary,
-  ProviderSpend,
-  SpendHeatmap,
-  SpendSummary,
-  TeamSpend,
-} from "@/lib/api";
+import type { IssueSummary, SpendHeatmap, SpendSummary } from "@/lib/api";
 
 import {
-  HeadlineTotals,
+  BreakdownTable,
   IssueTable,
-  PerProvider,
-  PerTeam,
+  MixLegend,
   SectionTotals,
-  sortTeams,
-  SpendOverview,
+  StatRail,
+  TokenOverview,
 } from "./HomePage";
 
 const NOW_MS = Date.UTC(2026, 4, 17, 12, 0, 0);
@@ -102,107 +95,87 @@ describe("SectionTotals", () => {
   });
 });
 
-describe("sortTeams", () => {
-  const teams: TeamSpend[] = [
-    { key: "VIB", input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 30, cache_read_tokens: 9, issues: 4 },
-    { key: "ADJ", input_tokens: 1_000_000, output_tokens: 8_000_000, cache_write_tokens: 10, cache_read_tokens: 7, issues: 9 },
-    { key: "SYM", input_tokens: 2_000_000, output_tokens: 3_000_000, cache_write_tokens: 20, cache_read_tokens: 8, issues: 1 },
-  ];
-  const keys = (rows: TeamSpend[]) => rows.map((t) => t.key);
-
-  it("does not mutate the input array", () => {
-    const before = keys(teams);
-    sortTeams(teams, "output_tokens", "desc");
-    expect(keys(teams)).toEqual(before);
-  });
-
-  it("sorts numeric columns ascending and descending", () => {
-    expect(keys(sortTeams(teams, "output_tokens", "desc"))).toEqual(["ADJ", "SYM", "VIB"]);
-    expect(keys(sortTeams(teams, "output_tokens", "asc"))).toEqual(["VIB", "SYM", "ADJ"]);
-    expect(keys(sortTeams(teams, "input_tokens", "desc"))).toEqual(["VIB", "SYM", "ADJ"]);
-    expect(keys(sortTeams(teams, "issues", "asc"))).toEqual(["SYM", "VIB", "ADJ"]);
-    expect(keys(sortTeams(teams, "cache_write_tokens", "desc"))).toEqual(["VIB", "SYM", "ADJ"]);
-    expect(keys(sortTeams(teams, "cache_read_tokens", "asc"))).toEqual(["ADJ", "SYM", "VIB"]);
-  });
-
-  it("sorts the team column alphabetically", () => {
-    expect(keys(sortTeams(teams, "key", "asc"))).toEqual(["ADJ", "SYM", "VIB"]);
-    expect(keys(sortTeams(teams, "key", "desc"))).toEqual(["VIB", "SYM", "ADJ"]);
+describe("StatRail", () => {
+  it("renders four token stat blocks with palette swatches and no summed total", () => {
+    const totals: SpendSummary["totals"] = {
+      input_tokens: 1_000,
+      output_tokens: 2_000,
+      cache_write_tokens: 3_000,
+      cache_read_tokens: 4_000,
+      issues: 172,
+    };
+    const markup = renderToStaticMarkup(<StatRail totals={totals} />);
+    expect(markup).not.toContain("$");
+    // Each category carries its shared-palette swatch.
+    expect(markup).toContain("bg-blue-500");
+    expect(markup).toContain("bg-violet-500");
+    expect(markup).toContain("bg-cyan-500");
+    expect(markup).toContain("bg-slate-300");
+    expect(markup).toContain('title="1000">1k</span>');
+    expect(markup).toContain('title="2000">2k</span>');
+    expect(markup).toContain('title="3000">3k</span>');
+    expect(markup).toContain('title="4000">4k</span>');
+    // No summed hero number (1000+2000+3000+4000 = 10000).
+    expect(markup).not.toContain("10k");
   });
 });
 
-describe("PerTeam", () => {
-  const teams: TeamSpend[] = [
-    { key: "VIB", input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 4 },
-    { key: "ADJ", input_tokens: 1_000_000, output_tokens: 8_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 9 },
+describe("MixLegend", () => {
+  it("lists the four token categories", () => {
+    const markup = renderToStaticMarkup(<MixLegend />);
+    for (const label of ["in", "out", "cache-write", "cache-read"]) {
+      expect(markup).toContain(label);
+    }
+  });
+});
+
+describe("BreakdownTable", () => {
+  const teamRows = [
+    { rowKey: "VIB", teamKey: "VIB", issues: 4, input_tokens: 4_000_000, output_tokens: 1_000_000, cache_write_tokens: 0, cache_read_tokens: 0 },
+    { rowKey: "ADJ", teamKey: "ADJ", issues: 9, input_tokens: 1_000_000, output_tokens: 8_000_000, cache_write_tokens: 0, cache_read_tokens: 0 },
   ];
 
-  it("renders a table with the team breakdown columns", () => {
-    const markup = renderToStaticMarkup(<PerTeam teams={teams} />);
+  it("renders team columns and defaults to output descending", () => {
+    const markup = renderToStaticMarkup(
+      <BreakdownTable rows={teamRows} kind="team" />,
+    );
     expect(markup).toContain("<table");
-    for (const header of [">Team", ">Issues", ">mix", ">in", ">out", ">cache-write", ">cache-read"]) {
+    for (const header of [">Team", ">Issues", ">Mix", ">IN", ">OUT", ">CACHE-WRITE", ">CACHE-READ"]) {
       expect(markup).toContain(header);
     }
-    // Numeric columns are right-aligned like IssueTable.
-    expect(markup).toContain("text-right");
-    // mix column keeps the proportional bar with its tooltip.
-    expect(markup).toContain("width:");
-  });
-
-  it("defaults to output descending with a direction arrow", () => {
-    const markup = renderToStaticMarkup(<PerTeam teams={teams} />);
-    // ADJ wins on output even though VIB has more input → output, not a summed total, decides order.
+    expect(markup).not.toContain("$");
+    // ADJ wins on output even though VIB has more input → output decides order.
     expect(markup.indexOf("ADJ")).toBeLessThan(markup.indexOf("VIB"));
-    expect(markup).not.toContain("$");
     expect(markup).toContain('title="8000000">8M</span>');
-    // Active-column descending indicator.
-    expect(markup).toContain("↓");
+  });
+
+  it("magnitude bar: the smaller-total row gets a scaled-down length", () => {
+    const rows = [
+      { rowKey: "BIG", teamKey: "BIG", issues: 1, input_tokens: 100, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0 },
+      { rowKey: "SML", teamKey: "SML", issues: 1, input_tokens: 50, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0 },
+    ];
+    const markup = renderToStaticMarkup(
+      <BreakdownTable rows={rows} kind="team" barMode="magnitude" />,
+    );
+    // Largest total fills the track; the 50-token row is half as long.
+    expect(markup).toContain("width:100%");
+    expect(markup).toContain("width:50%");
+  });
+
+  it("renders provider/model rows with a provider tag", () => {
+    const modelRows = [
+      { rowKey: "claude/opus-4.1", provider: "claude", model: "opus-4.1", issues: 7, input_tokens: 2_000_000, output_tokens: 7_000_000, cache_write_tokens: 0, cache_read_tokens: 0 },
+    ];
+    const markup = renderToStaticMarkup(
+      <BreakdownTable rows={modelRows} kind="model" />,
+    );
+    expect(markup).toContain("Provider / model");
+    expect(markup).toContain("opus-4.1");
+    expect(markup).toContain("claude");
   });
 });
 
-describe("PerProvider", () => {
-  const providers: ProviderSpend[] = [
-    {
-      provider: "codex",
-      input_tokens: 1_000_000,
-      output_tokens: 500_000,
-      cache_write_tokens: 0,
-      cache_read_tokens: 0,
-      issues: 2,
-      per_model: [
-        { model: "gpt-5.5", input_tokens: 1_000_000, output_tokens: 500_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 2 },
-      ],
-    },
-    {
-      provider: "claude",
-      input_tokens: 2_000_000,
-      output_tokens: 7_000_000,
-      cache_write_tokens: 0,
-      cache_read_tokens: 0,
-      issues: 7,
-      per_model: [
-        { model: "claude-opus-4-8", input_tokens: 2_000_000, output_tokens: 7_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 7 },
-      ],
-    },
-  ];
-
-  it("sorts providers by output and shows the four figures", () => {
-    const markup = renderToStaticMarkup(<PerProvider providers={providers} />);
-    expect(markup.indexOf("claude")).toBeLessThan(markup.indexOf("codex"));
-    expect(markup).not.toContain("$");
-    expect(markup).toContain('title="7000000">7M</span>');
-    expect(markup).toContain("7 issues");
-    expect(markup).toContain("width:");
-  });
-
-  it("keeps model rows collapsed until the provider is expanded", () => {
-    const markup = renderToStaticMarkup(<PerProvider providers={providers} />);
-    expect(markup).not.toContain("claude-opus-4-8");
-    expect(markup).not.toContain("gpt-5.5");
-  });
-});
-
-describe("SpendOverview", () => {
+describe("TokenOverview", () => {
   const summary: SpendSummary = {
     totals: {
       input_tokens: 1_000,
@@ -226,6 +199,17 @@ describe("SpendOverview", () => {
           { model: "claude-opus-4-8", input_tokens: 2_000_000, output_tokens: 7_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 7 },
         ],
       },
+      {
+        provider: "codex",
+        input_tokens: 1_000_000,
+        output_tokens: 500_000,
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
+        issues: 2,
+        per_model: [
+          { model: "gpt-5-codex", input_tokens: 1_000_000, output_tokens: 500_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 2 },
+        ],
+      },
     ],
   };
   const heatmap: SpendHeatmap = {
@@ -236,56 +220,34 @@ describe("SpendOverview", () => {
     end: "2026-06-01",
   };
 
-  function render(): string {
-    return renderToStaticMarkup(
-      <SpendOverview summary={summary} heatmap={heatmap} onPickTeam={() => {}} />,
+  it("renders heatmap + all-time rail + a single Breakdown table with a By team/By model toggle", () => {
+    const markup = renderToStaticMarkup(
+      <TokenOverview
+        summary={summary}
+        heatmap={heatmap}
+        provider="all"
+        onPickTeam={() => {}}
+      />,
     );
-  }
-
-  it("stacks heatmap + totals (row 1), team full-width (row 2), provider (row 3)", () => {
-    const markup = render();
-    // Row 1: the heatmap and the all-time totals both render.
     expect(markup).toContain("Daily token burn");
     expect(markup).toContain("Tokens · all-time");
-    // Top-down order: row-1 totals → row-2 team → row-3 provider.
-    expect(markup.indexOf("Tokens · all-time")).toBeLessThan(
-      markup.indexOf("Tokens by team"),
+    expect(markup).toContain("Breakdown");
+    expect(markup).toContain("By team");
+    expect(markup).toContain("By model");
+    // Defaults to the team view (VIB row present, no model names yet).
+    expect(markup).toContain(">VIB</span>");
+    expect(markup).not.toContain("gpt-5-codex");
+  });
+
+  it("suffixes the rail eyebrow with the active provider", () => {
+    const markup = renderToStaticMarkup(
+      <TokenOverview
+        summary={summary}
+        heatmap={heatmap}
+        provider="codex"
+        onPickTeam={() => {}}
+      />,
     );
-    expect(markup.indexOf("Tokens by team")).toBeLessThan(
-      markup.indexOf("Tokens by provider / model"),
-    );
-  });
-
-  it("no longer renders its own provider toggle (the global header control replaces it)", () => {
-    expect(render()).not.toContain("Heatmap provider");
-  });
-
-  it("constrains the provider list width so it does not stretch across the card", () => {
-    const markup = render();
-    const providerIdx = markup.indexOf("Tokens by provider / model");
-    // The row-3 wrapper before the heading carries a max-width constraint.
-    expect(markup.slice(0, providerIdx)).toMatch(/max-w-/);
-  });
-});
-
-describe("HeadlineTotals", () => {
-  it("renders four token stat blocks under a context label and no summed total", () => {
-    const totals: SpendSummary["totals"] = {
-      input_tokens: 1_000,
-      output_tokens: 2_000,
-      cache_write_tokens: 3_000,
-      cache_read_tokens: 4_000,
-      issues: 172,
-    };
-    const markup = renderToStaticMarkup(<HeadlineTotals totals={totals} />);
-    expect(markup).toContain("Tokens");
-    expect(markup).not.toContain("Total tokens");
-    expect(markup).not.toContain("$");
-    expect(markup).toContain('title="1000">1k</span>');
-    expect(markup).toContain('title="2000">2k</span>');
-    expect(markup).toContain('title="3000">3k</span>');
-    expect(markup).toContain('title="4000">4k</span>');
-    // No summed hero number (1000+2000+3000+4000 = 10000).
-    expect(markup).not.toContain("10k");
+    expect(markup).toContain("· codex");
   });
 });

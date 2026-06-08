@@ -228,7 +228,7 @@ export function Heatmap({
           <div className="mt-0.5 font-mono text-muted-foreground">
             {hover.cell.issues} {hover.cell.issues === 1 ? "issue" : "issues"}
           </div>
-          <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 border-t border-border pt-1 font-mono text-[11px] text-muted-foreground">
+          <div className="mt-1 grid grid-cols-[auto_auto] gap-x-4 gap-y-0.5 border-t border-border pt-1 font-mono text-[11px] text-muted-foreground">
             <span>in <Tk value={hover.cell.input} /></span>
             <span>out <Tk value={hover.cell.output} /></span>
             <span>cache-write <Tk value={hover.cell.cacheWrite} /></span>

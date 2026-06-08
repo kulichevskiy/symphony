@@ -30,7 +30,7 @@ export function Segmented({
             type="button"
             onClick={() => onChange(opt.value)}
             className={cn(
-              "rounded-[5px] font-medium transition-colors",
+              "whitespace-nowrap rounded-[5px] font-medium transition-colors",
               pad,
               active
                 ? "bg-background text-foreground shadow-sm"
