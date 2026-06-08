@@ -193,14 +193,29 @@ def _optional_int(value: object) -> int | None:
     return int(str(value))
 
 
-def _parse_iso(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+# Day-string param shape (`YYYY-MM-DD`) for the `from`/`to` date-window filters.
+DAY_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+
+
+def _started_at_window(
+    date_from: str | None, date_to: str | None
+) -> tuple[list[str], list[str]]:
+    """SQL conditions + params windowing `runs.started_at` to a UTC-day range.
+    Timestamps are stored as UTC ISO strings, so the first 10 chars are the
+    calendar day and a lexicographic compare is date-correct."""
+    conds: list[str] = []
+    params: list[str] = []
+    if date_from is not None:
+        conds.append("substr(r.started_at, 1, 10) >= ?")
+        params.append(date_from)
+    if date_to is not None:
+        conds.append("substr(r.started_at, 1, 10) <= ?")
+        params.append(date_to)
+    return conds, params
+
+
+def _where(conds: list[str]) -> str:
+    return f"WHERE {' AND '.join(conds)}" if conds else ""
 
 
 def _parse_teams(value: str | None) -> list[str]:
@@ -225,20 +240,25 @@ def _team_in_clause(teams: list[str]) -> str:
 # Per-team spend, sourced from the run_model_usage child table so it carries a
 # provider dimension. With no provider filter every provider's rows are summed,
 # so rail = sum of teams = codex + claude reconciles exactly. A provider and/or
-# `teams` filter AND together. Issue counts are DISTINCT issues touched by the
-# (optionally scoped) usage.
+# `teams` filter AND together, plus an optional UTC-day window on run start day.
+# Issue counts are DISTINCT issues touched by the (optionally scoped) usage.
 def _spend_summary_query(
-    provider: str | None, teams: list[str]
+    provider: str | None,
+    teams: list[str],
+    date_from: str | None,
+    date_to: str | None,
 ) -> tuple[str, tuple[str, ...]]:
-    where: list[str] = []
+    conds: list[str] = []
     params: list[str] = []
     if provider is not None:
-        where.append("u.provider = ?")
+        conds.append("u.provider = ?")
         params.append(provider)
     if teams:
-        where.append(_team_in_clause(teams))
+        conds.append(_team_in_clause(teams))
         params.extend(teams)
-    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    wconds, wparams = _started_at_window(date_from, date_to)
+    conds += wconds
+    params += wparams
     return (
         f"""
         SELECT
@@ -251,7 +271,7 @@ def _spend_summary_query(
         FROM run_model_usage u
         JOIN runs r ON r.id = u.run_id
         JOIN issues i ON i.id = r.issue_id
-        {where_sql}
+        {_where(conds)}
         GROUP BY i.team_key
         """,
         tuple(params),
@@ -260,10 +280,16 @@ def _spend_summary_query(
 
 # Token attribution by (provider, model), aggregated from the run_model_usage
 # child table. Issue counts are DISTINCT per group so a model used across many
-# issues counts each once. Joins `issues` only when scoping to teams.
-def _spend_per_model_query(teams: list[str]) -> tuple[str, tuple[str, ...]]:
+# issues counts each once. Joins `issues` only when scoping to teams; windowed
+# by run start day like the per-team query.
+def _spend_per_model_query(
+    teams: list[str], date_from: str | None, date_to: str | None
+) -> tuple[str, tuple[str, ...]]:
     join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
-    where_sql = f"WHERE {_team_in_clause(teams)}" if teams else ""
+    conds, params = _started_at_window(date_from, date_to)
+    if teams:
+        conds.append(_team_in_clause(teams))
+        params.extend(teams)
     return (
         f"""
         SELECT
@@ -277,30 +303,33 @@ def _spend_per_model_query(teams: list[str]) -> tuple[str, tuple[str, ...]]:
         FROM run_model_usage u
         JOIN runs r ON r.id = u.run_id
         {join}
-        {where_sql}
+        {_where(conds)}
         GROUP BY u.provider, u.model
         """,
-        tuple(teams),
+        tuple(params),
     )
 
 
 # Provider-level distinct issue counts, computed separately because summing
 # the per-model issue counts would double-count issues spanning two models.
 def _spend_per_provider_issues_query(
-    teams: list[str],
+    teams: list[str], date_from: str | None, date_to: str | None
 ) -> tuple[str, tuple[str, ...]]:
     join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
-    where_sql = f"WHERE {_team_in_clause(teams)}" if teams else ""
+    conds, params = _started_at_window(date_from, date_to)
+    if teams:
+        conds.append(_team_in_clause(teams))
+        params.extend(teams)
     return (
         f"""
         SELECT u.provider AS provider, COUNT(DISTINCT r.issue_id) AS issues
         FROM run_model_usage u
         JOIN runs r ON r.id = u.run_id
         {join}
-        {where_sql}
+        {_where(conds)}
         GROUP BY u.provider
         """,
-        tuple(teams),
+        tuple(params),
     )
 
 
@@ -466,7 +495,8 @@ def _list_issues_query(
     q: str | None,
     *,
     now: datetime,
-    cutoff: datetime | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     provider: str | None = None,
     teams: list[str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
@@ -475,16 +505,24 @@ def _list_issues_query(
 
     if scope is IssueScope.ACTIVE:
         where.append("i.id IN (SELECT issue_id FROM active_issue_ids)")
+        # Date applies to active issues by their last activity day.
+        if date_from is not None:
+            where.append("substr(la.latest_activity_ts, 1, 10) >= ?")
+            where_params.append(date_from)
+        if date_to is not None:
+            where.append("substr(la.latest_activity_ts, 1, 10) <= ?")
+            where_params.append(date_to)
     elif scope is IssueScope.DONE:
-        # Candidate prefilter: completion plausibly within the window — either a
-        # PR merged since the cutoff, or activity since the cutoff. The precise
-        # "is this canonically done?" check runs in Python on this small set.
-        cutoff_iso = _utc_iso(cutoff if cutoff is not None else now)
-        where.append(
-            "((pr.max_merged_at IS NOT NULL AND pr.max_merged_at >= ?) "
-            "OR (la.latest_activity_ts IS NOT NULL AND la.latest_activity_ts >= ?))"
-        )
-        where_params.extend([cutoff_iso, cutoff_iso])
+        # Candidate prefilter: completion (latest PR merge, else last activity)
+        # plausibly within the window. The precise "is this canonically done?"
+        # check runs in Python on this small set.
+        completion = "COALESCE(pr.max_merged_at, la.latest_activity_ts)"
+        if date_from is not None:
+            where.append(f"substr({completion}, 1, 10) >= ?")
+            where_params.append(date_from)
+        if date_to is not None:
+            where.append(f"substr({completion}, 1, 10) <= ?")
+            where_params.append(date_to)
 
     normalized_q = q.strip().lower() if q is not None else ""
     if normalized_q:
@@ -600,7 +638,8 @@ def create_api_router(
     async def list_issues(
         q: Annotated[str | None, Query()] = None,
         scope: Annotated[IssueScope, Query()] = IssueScope.ACTIVE,
-        within_secs: Annotated[int, Query(ge=1)] = 7 * 86_400,
+        date_from: Annotated[str | None, Query(alias="from", pattern=DAY_PATTERN)] = None,
+        date_to: Annotated[str | None, Query(alias="to", pattern=DAY_PATTERN)] = None,
         provider: Annotated[str | None, Query()] = None,
         teams: Annotated[str | None, Query()] = None,
     ) -> list[IssueSummary]:
@@ -614,14 +653,12 @@ def create_api_router(
         try:
             conn = await ui_db_pool.connection()
             request_now = now()
-            cutoff = (
-                request_now - timedelta(seconds=within_secs) if is_done else None
-            )
             query, params = _list_issues_query(
                 scope,
                 q,
                 now=request_now,
-                cutoff=cutoff,
+                date_from=date_from,
+                date_to=date_to,
                 provider=provider_filter,
                 teams=team_filter,
             )
@@ -648,7 +685,8 @@ def create_api_router(
 
         if is_done:
             # Keep only canonically-done issues whose completion lands inside the
-            # window, newest first.
+            # window, newest first. The window is open-ended when a bound is
+            # omitted (all-time done by default).
             kept: list[tuple[dict[str, object], object, str]] = []
             for issue, status in statuses:
                 if status.state != "done":
@@ -656,12 +694,12 @@ def create_api_router(
                 completed_at = issue.get("max_merged_at") or issue.get(
                     "latest_activity_ts"
                 )
-                completed_dt = _parse_iso(completed_at)
-                if (
-                    completed_dt is None
-                    or cutoff is None
-                    or completed_dt < cutoff
-                ):
+                if completed_at is None:
+                    continue
+                completed_day = str(completed_at)[:10]
+                if date_from is not None and completed_day < date_from:
+                    continue
+                if date_to is not None and completed_day > date_to:
                     continue
                 kept.append((issue, status, str(completed_at)))
             kept.sort(
@@ -703,21 +741,30 @@ def create_api_router(
     async def spend_summary(
         provider: Annotated[str | None, Query()] = None,
         teams: Annotated[str | None, Query()] = None,
+        date_from: Annotated[str | None, Query(alias="from", pattern=DAY_PATTERN)] = None,
+        date_to: Annotated[str | None, Query(alias="to", pattern=DAY_PATTERN)] = None,
     ) -> SpendSummary:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
+        # "all" (and the omitted param) mean no provider scoping.
         provider_filter = None if provider in (None, "all") else provider
         team_filter = _parse_teams(teams)
-        team_query, team_params = _spend_summary_query(provider_filter, team_filter)
-        model_query, model_params = _spend_per_model_query(team_filter)
-        issues_query, issues_params = _spend_per_provider_issues_query(team_filter)
+        team_query, team_params = _spend_summary_query(
+            provider_filter, team_filter, date_from, date_to
+        )
+        model_query, model_params = _spend_per_model_query(
+            team_filter, date_from, date_to
+        )
+        provider_issues_query, provider_issues_params = (
+            _spend_per_provider_issues_query(team_filter, date_from, date_to)
+        )
         try:
             conn = await ui_db_pool.connection()
             cur = await conn.execute(team_query, team_params)
             rows = [dict(row) for row in await cur.fetchall()]
             cur = await conn.execute(model_query, model_params)
             model_rows = [dict(row) for row in await cur.fetchall()]
-            cur = await conn.execute(issues_query, issues_params)
+            cur = await conn.execute(provider_issues_query, provider_issues_params)
             provider_issue_rows = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
             raise HTTPException(

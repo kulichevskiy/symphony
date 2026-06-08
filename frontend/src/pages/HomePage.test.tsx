@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
 import type { IssueSummary, SpendHeatmap, SpendSummary } from "@/lib/api";
+import { DEFAULT_DATE } from "@/lib/filters";
 
 import {
   BreakdownTable,
@@ -223,7 +224,13 @@ describe("TokenOverview", () => {
 
   it("renders heatmap + all-time rail + a single Breakdown table with a By team/By model toggle", () => {
     const markup = renderToStaticMarkup(
-      <TokenOverview summary={summary} heatmap={heatmap} provider="all" />,
+      <TokenOverview
+        summary={summary}
+        heatmap={heatmap}
+        provider="all"
+        date={DEFAULT_DATE}
+        window={{ from: null, to: null }}
+      />,
     );
     expect(markup).toContain("Daily token burn");
     expect(markup).toContain("Tokens · all-time");
@@ -237,8 +244,31 @@ describe("TokenOverview", () => {
 
   it("suffixes the rail eyebrow with the active provider", () => {
     const markup = renderToStaticMarkup(
-      <TokenOverview summary={summary} heatmap={heatmap} provider="codex" />,
+      <TokenOverview
+        summary={summary}
+        heatmap={heatmap}
+        provider="codex"
+        date={DEFAULT_DATE}
+        window={{ from: null, to: null }}
+      />,
     );
     expect(markup).toContain("· codex");
+  });
+
+  it("reflects the active window in the rail header and dims out-of-window cells", () => {
+    const markup = renderToStaticMarkup(
+      <TokenOverview
+        summary={summary}
+        heatmap={heatmap}
+        provider="all"
+        date={{ kind: "preset", preset: "7d" }}
+        window={{ from: "2026-06-10", to: "2026-06-17" }}
+      />,
+    );
+    // Header tracks the window, not "all-time".
+    expect(markup).toContain("Tokens · last 7 days");
+    expect(markup).not.toContain("Tokens · all-time");
+    // The single 2026-06-01 cell is outside [06-10, 06-17] → dimmed.
+    expect(markup).toContain("opacity-25");
   });
 });

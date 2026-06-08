@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildHeatThresholds, heatLevel } from "./Heatmap";
+import { buildHeatThresholds, heatLevel, isInWindow } from "./Heatmap";
 
 describe("buildHeatThresholds", () => {
   it("derives quantile cut points from non-zero days only", () => {
@@ -50,5 +50,23 @@ describe("heatLevel", () => {
     expect(heatLevel(150, thresholds)).toBe(2);
     expect(heatLevel(250, thresholds)).toBe(3);
     expect(heatLevel(999, thresholds)).toBe(4);
+  });
+});
+
+describe("isInWindow", () => {
+  it("includes every cell when bounds are open (all-time)", () => {
+    expect(isInWindow("2026-01-01", null, null)).toBe(true);
+  });
+
+  it("honors inclusive lower and upper day bounds", () => {
+    expect(isInWindow("2026-05-10", "2026-05-11", "2026-05-17")).toBe(false);
+    expect(isInWindow("2026-05-11", "2026-05-11", "2026-05-17")).toBe(true);
+    expect(isInWindow("2026-05-17", "2026-05-11", "2026-05-17")).toBe(true);
+    expect(isInWindow("2026-05-18", "2026-05-11", "2026-05-17")).toBe(false);
+  });
+
+  it("treats a single missing bound as open on that side", () => {
+    expect(isInWindow("1999-01-01", null, "2026-05-17")).toBe(true);
+    expect(isInWindow("2030-01-01", "2026-05-11", null)).toBe(true);
   });
 });

@@ -43,14 +43,16 @@ export function FilterTrigger({
 }
 
 /** A trigger + a floating panel that closes on outside click / Escape. The
- *  trigger is a render prop so callers reuse `FilterTrigger` with live state. */
+ *  trigger is a render prop so callers reuse `FilterTrigger` with live state.
+ *  Panel content may also be a render prop, receiving `close` so a selection
+ *  or Apply action can dismiss the panel. */
 export function Popover({
   trigger,
   children,
   align = "start",
 }: {
   trigger: (state: { open: boolean; toggle: () => void }) => ReactNode;
-  children: ReactNode;
+  children: ReactNode | ((state: { close: () => void }) => ReactNode);
   align?: "start" | "end";
 }) {
   const [open, setOpen] = useState(false);
@@ -82,7 +84,9 @@ export function Popover({
             align === "end" ? "right-0" : "left-0",
           )}
         >
-          {children}
+          {typeof children === "function"
+            ? children({ close: () => setOpen(false) })
+            : children}
         </div>
       ) : null}
     </div>
