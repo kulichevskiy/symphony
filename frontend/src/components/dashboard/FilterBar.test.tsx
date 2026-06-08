@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
@@ -7,12 +8,15 @@ import { FiltersProvider } from "@/lib/filters";
 import { FilterBar } from "./FilterBar";
 
 function render(initialEntry: string): string {
+  const queryClient = new QueryClient();
   return renderToStaticMarkup(
-    <MemoryRouter initialEntries={[initialEntry]}>
-      <FiltersProvider>
-        <FilterBar />
-      </FiltersProvider>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[initialEntry]}>
+        <FiltersProvider>
+          <FilterBar />
+        </FiltersProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

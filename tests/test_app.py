@@ -11,6 +11,7 @@ import pytest
 from symphony import db
 from symphony.agent.model_usage import ModelUsage
 from symphony.app import create_app
+from symphony.config import Config, RepoBinding
 from symphony.linear.slash import SlashKind
 from symphony.ui import api as ui_api
 from symphony.webhook import WebhookSettings
@@ -2234,6 +2235,233 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
         "input_tokens": 10, "output_tokens": 2,
         "cache_write_tokens": 0, "cache_read_tokens": 3, "issues": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_api_issues_filters_by_teams(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("v", "VIB-1", "VIB"),
+            ("a", "ADJ-1", "ADJ"),
+            ("s", "SYM-1", "SYM"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+            VALUES
+                ('rv', 'v', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 100, 20, 30, 40),
+                ('ra', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 50, 5, 5, 5),
+                ('rs', 's', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 10, 2, 0, 3)
+            """
+        )
+        await conn.execute(
+            "INSERT INTO review_state (issue_id, iteration) "
+            "VALUES ('v', 1), ('a', 1), ('s', 1)"
+        )
+        await conn.commit()
+        # VIB on claude, ADJ on codex — lets us prove teams AND provider.
+        await db.run_model_usage.replace_for_run(
+            conn, "rv", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "ra", [ModelUsage("codex", "gpt-5.5", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "rs", [ModelUsage("claude", "claude-opus-4-8", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            one = await client.get("/api/issues?scope=active&teams=VIB")
+            multi = await client.get("/api/issues?scope=active&teams=VIB,ADJ")
+            unknown = await client.get("/api/issues?scope=active&teams=NOPE")
+            none = await client.get("/api/issues?scope=active")
+            combo = await client.get(
+                "/api/issues?scope=active&teams=VIB,ADJ&provider=claude"
+            )
+    finally:
+        await conn.close()
+
+    assert one.status_code == 200
+    assert {r["id"] for r in one.json()} == {"v"}
+    # Multiple teams OR together.
+    assert {r["id"] for r in multi.json()} == {"v", "a"}
+    # Unknown team → empty, not errored.
+    assert unknown.status_code == 200
+    assert unknown.json() == []
+    # No teams param → all teams.
+    assert {r["id"] for r in none.json()} == {"v", "a", "s"}
+    # teams AND provider: ADJ has no claude usage, so it drops out.
+    assert {r["id"] for r in combo.json()} == {"v"}
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_filters_by_teams(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "VIB-1", "VIB"),
+            ("b", "ADJ-1", "ADJ"),
+            ("c", "SYM-1", "SYM"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r3', 'c', 'implement', 'completed', NULL, '2026-05-17T12:00:00Z')
+            """
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5.5", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("claude", "claude-opus-4-8", 10, 2, 0, 3)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            multi = await client.get("/api/spend/summary?teams=VIB,ADJ")
+            combo = await client.get("/api/spend/summary?teams=VIB&provider=claude")
+    finally:
+        await conn.close()
+
+    assert multi.status_code == 200
+    body = multi.json()
+    # Only the selected teams' rows; SYM excluded. Sorted by output desc.
+    assert [t["key"] for t in body["per_team"]] == ["VIB", "ADJ"]
+    assert body["totals"]["output_tokens"] == 20 + 5
+    assert body["totals"]["issues"] == 2
+    # per_provider also scopes to the teams: claude(VIB)=20, codex(ADJ)=5.
+    providers = {p["provider"]: p for p in body["per_provider"]}
+    assert set(providers) == {"claude", "codex"}
+    assert providers["claude"]["output_tokens"] == 20
+    assert providers["codex"]["output_tokens"] == 5
+
+    # teams AND provider.
+    assert combo.status_code == 200
+    cbody = combo.json()
+    assert [t["key"] for t in cbody["per_team"]] == ["VIB"]
+    assert cbody["totals"]["output_tokens"] == 20
+    assert [p["provider"] for p in cbody["per_provider"]] == ["claude"]
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_returns_unscoped_teams_from_config(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="VIB-1", title="t", team_key="VIB"
+        )
+        await conn.execute(
+            "INSERT INTO runs (id, issue_id, stage, status, pid, started_at) "
+            "VALUES ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z')"
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        states = {"ready": "Ready"}
+        config = Config(
+            repos=[
+                RepoBinding(project_key="VIB", github_repo="o/v", states=states),
+                RepoBinding(project_key="ADJ", github_repo="o/a", states=states),
+            ]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            ui_external_config=config,
+        )
+        async with await _client(app) as client:
+            unfiltered = await client.get("/api/spend/summary")
+            filtered = await client.get("/api/spend/summary?teams=VIB")
+    finally:
+        await conn.close()
+
+    assert unfiltered.status_code == 200
+    # Teams list sourced from config bindings, sorted, regardless of seeded data.
+    assert unfiltered.json()["teams"] == ["ADJ", "VIB"]
+    # The list does not change when a filter is applied.
+    assert filtered.json()["teams"] == ["ADJ", "VIB"]
+
+
+@pytest.mark.asyncio
+async def test_api_spend_heatmap_filters_by_teams(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "VIB-1", "VIB"),
+            ("b", "ADJ-1", "ADJ"),
+            ("c", "SYM-1", "SYM"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
+                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z',
+                 100, 20, 30, 40),
+                ('r2', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z',
+                 50, 5, 5, 5),
+                ('r3', 'c', 'implement', 'completed', NULL, '2026-05-16T09:00:00Z',
+                 10, 2, 0, 3)
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            one = await client.get("/api/spend/heatmap?days=60&teams=VIB")
+            multi = await client.get("/api/spend/heatmap?days=60&teams=VIB,ADJ")
+    finally:
+        await conn.close()
+
+    assert one.status_code == 200
+    one_days = {d["date"]: d for d in one.json()["days"]}
+    assert one_days["2026-05-17"] == {
+        "date": "2026-05-17",
+        "input_tokens": 100, "output_tokens": 20,
+        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+    }
+    # SYM's 05-16 row is excluded.
+    assert "2026-05-16" not in one_days
+
+    # Multiple teams OR together within the day bucket.
+    multi_days = {d["date"]: d for d in multi.json()["days"]}
+    assert multi_days["2026-05-17"]["output_tokens"] == 20 + 5
+    assert multi_days["2026-05-17"]["issues"] == 2
 
 
 @pytest.mark.asyncio

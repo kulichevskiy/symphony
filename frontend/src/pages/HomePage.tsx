@@ -443,34 +443,42 @@ export function HomePage() {
   const navigate = useNavigate();
   const nowMs = useNowMs();
   const [doneWindow, setDoneWindow] = useState("7d");
-  const { provider } = useFilters();
+  const { provider, teams } = useFilters();
   const win = DONE_WINDOWS.find((w) => w.value === doneWindow) ?? DONE_WINDOWS[1];
 
+  const providerFilter = provider === "all" ? undefined : provider;
+  // Stable cache key for the team selection (order-independent).
+  const teamsKey = [...teams].sort().join(",");
+  const teamsFilter = teams.length ? teams : undefined;
+
   const summaryQuery = useQuery({
-    queryKey: ["spend-summary", provider],
-    queryFn: () =>
-      fetchSpendSummary(provider === "all" ? undefined : provider),
+    queryKey: ["spend-summary", provider, teamsKey],
+    queryFn: () => fetchSpendSummary(providerFilter, teamsFilter),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
   const heatmapQuery = useQuery({
-    queryKey: ["spend-heatmap", provider],
-    queryFn: () =>
-      fetchSpendHeatmap(371, provider === "all" ? undefined : provider),
+    queryKey: ["spend-heatmap", provider, teamsKey],
+    queryFn: () => fetchSpendHeatmap(371, providerFilter, teamsFilter),
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
-  const providerFilter = provider === "all" ? undefined : provider;
   const activeQuery = useQuery({
-    queryKey: ["issues", "active", provider],
-    queryFn: () => fetchIssues({ scope: "active", provider: providerFilter }),
+    queryKey: ["issues", "active", provider, teamsKey],
+    queryFn: () =>
+      fetchIssues({ scope: "active", provider: providerFilter, teams: teamsFilter }),
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", win.secs, provider],
+    queryKey: ["issues", "done", win.secs, provider, teamsKey],
     queryFn: () =>
-      fetchIssues({ scope: "done", withinSecs: win.secs, provider: providerFilter }),
+      fetchIssues({
+        scope: "done",
+        withinSecs: win.secs,
+        provider: providerFilter,
+        teams: teamsFilter,
+      }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
