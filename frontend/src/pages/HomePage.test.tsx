@@ -140,6 +140,8 @@ describe("BreakdownTable", () => {
       <BreakdownTable rows={teamRows} kind="team" />,
     );
     expect(markup).toContain("<table");
+    // Rows are non-interactive — no click-to-pick affordance.
+    expect(markup).not.toContain("cursor-pointer");
     for (const header of [">Team", ">Issues", ">Mix", ">IN", ">OUT", ">CACHE-WRITE", ">CACHE-READ"]) {
       expect(markup).toContain(header);
     }
@@ -222,12 +224,7 @@ describe("TokenOverview", () => {
 
   it("renders heatmap + all-time rail + a single Breakdown table with a By team/By model toggle", () => {
     const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="all"
-        onPickTeam={() => {}}
-      />,
+      <TokenOverview summary={summary} heatmap={heatmap} provider="all" />,
     );
     expect(markup).toContain("Daily token burn");
     expect(markup).toContain("Tokens · all-time");
@@ -241,12 +238,7 @@ describe("TokenOverview", () => {
 
   it("suffixes the rail eyebrow with the active provider", () => {
     const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="codex"
-        onPickTeam={() => {}}
-      />,
+      <TokenOverview summary={summary} heatmap={heatmap} provider="codex" />,
     );
     expect(markup).toContain("· codex");
   });

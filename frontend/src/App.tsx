@@ -1,13 +1,9 @@
 import { Link, Route, Routes } from "react-router";
 
+import { FilterBar } from "@/components/dashboard/FilterBar";
 import { LiveDot } from "@/components/dashboard/StatusBadge";
 import { ThemeToggle } from "@/components/dashboard/ThemeToggle";
-import { Segmented } from "@/components/ui/segmented";
-import {
-  PROVIDER_OPTIONS,
-  ProviderFilterProvider,
-  useProviderFilter,
-} from "@/lib/providerFilter";
+import { FiltersProvider } from "@/lib/filters";
 import { useTheme } from "@/lib/useTheme";
 import { HomePage } from "@/pages/HomePage";
 import { IssuePage } from "@/pages/IssuePage";
@@ -33,28 +29,11 @@ function Wordmark() {
   );
 }
 
-function ProviderControl() {
-  const { provider, setProvider } = useProviderFilter();
-  return (
-    <span className="flex items-center gap-1.5">
-      <span className="hidden text-xs font-medium text-muted-foreground sm:inline">
-        Model
-      </span>
-      <Segmented
-        ariaLabel="Model provider"
-        options={PROVIDER_OPTIONS}
-        value={provider}
-        onChange={setProvider}
-      />
-    </span>
-  );
-}
-
 export function App() {
   const { dark, toggle } = useTheme();
 
   return (
-    <ProviderFilterProvider>
+    <FiltersProvider>
       <div className="min-h-screen bg-background text-foreground">
         <header className="sticky top-0 z-20 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
           <div className="mx-auto flex h-14 w-full max-w-[1200px] items-center justify-between gap-4 px-4 sm:px-6 lg:px-8">
@@ -62,7 +41,6 @@ export function App() {
               <Wordmark />
             </Link>
             <div className="flex items-center gap-2">
-              <ProviderControl />
               <span className="hidden items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground sm:inline-flex">
                 <LiveDot tone="bg-green-500" /> daemon · loopback
               </span>
@@ -71,11 +49,13 @@ export function App() {
           </div>
         </header>
 
+        <FilterBar />
+
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/issue/:id" element={<IssuePage />} />
         </Routes>
       </div>
-    </ProviderFilterProvider>
+    </FiltersProvider>
   );
 }

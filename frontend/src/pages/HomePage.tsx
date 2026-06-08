@@ -23,7 +23,7 @@ import {
   type SpendTotals,
   type TokenSplit,
 } from "@/lib/api";
-import { type Provider, useProviderFilter } from "@/lib/providerFilter";
+import { type Provider, useFilters } from "@/lib/filters";
 import { cn } from "@/lib/utils";
 
 import { formatRelativeTimestamp, formatUtcTimestamp } from "./activityFreshness";
@@ -123,12 +123,10 @@ export function BreakdownTable({
   rows,
   kind,
   barMode = "magnitude",
-  onPick,
 }: {
   rows: BreakdownRow[];
   kind: "team" | "model";
   barMode?: "composition" | "magnitude";
-  onPick?: (key: string) => void;
 }) {
   const [sortKey, setSortKey] = useState<keyof TokenSplit>("output_tokens");
   const sorted = [...rows].sort((a, b) => b[sortKey] - a[sortKey]);
@@ -172,15 +170,10 @@ export function BreakdownTable({
         </thead>
         <tbody>
           {sorted.map((r) => {
-            const clickable = kind === "team" && onPick;
             return (
               <tr
                 key={r.rowKey}
-                className={cn(
-                  "border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50",
-                  clickable && "cursor-pointer",
-                )}
-                onClick={clickable ? () => onPick(r.teamKey ?? r.rowKey) : undefined}
+                className="border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
               >
                 <td className="whitespace-nowrap px-3 py-2.5">
                   {kind === "team" ? (
@@ -237,12 +230,10 @@ export function TokenOverview({
   summary,
   heatmap,
   provider,
-  onPickTeam,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
   provider: Provider;
-  onPickTeam: (key: string) => void;
 }) {
   const [view, setView] = useState<"team" | "model">("team");
 
@@ -322,12 +313,7 @@ export function TokenOverview({
           </div>
           <MixLegend />
         </div>
-        <BreakdownTable
-          rows={rows}
-          kind={view}
-          barMode="magnitude"
-          onPick={view === "team" ? onPickTeam : undefined}
-        />
+        <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
       </div>
     </Card>
   );
@@ -456,9 +442,8 @@ export function IssueTable({
 export function HomePage() {
   const navigate = useNavigate();
   const nowMs = useNowMs();
-  const [query, setQuery] = useState("");
   const [doneWindow, setDoneWindow] = useState("7d");
-  const { provider } = useProviderFilter();
+  const { provider } = useFilters();
   const win = DONE_WINDOWS.find((w) => w.value === doneWindow) ?? DONE_WINDOWS[1];
 
   const summaryQuery = useQuery({
@@ -490,15 +475,8 @@ export function HomePage() {
     placeholderData: (prev) => prev,
   });
 
-  const q = query.trim().toLowerCase();
-  const matches = (i: IssueSummary) =>
-    !q ||
-    i.identifier.toLowerCase().includes(q) ||
-    i.title.toLowerCase().includes(q) ||
-    i.team_key.toLowerCase().includes(q);
-
-  const active = (activeQuery.data ?? []).filter(matches);
-  const done = (doneQuery.data ?? []).filter(matches);
+  const active = activeQuery.data ?? [];
+  const done = doneQuery.data ?? [];
   const tracked = summaryQuery.data?.totals.issues ?? 0;
 
   const openIssue = (id: string) => navigate(`/issue/${encodeURIComponent(id)}`);
@@ -512,28 +490,12 @@ export function HomePage() {
             {tracked} issues tracked · {active.length + done.length} shown
           </p>
         </div>
-        <div className="relative">
-          <Icon
-            name="search"
-            size={15}
-            className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
-          />
-          <input
-            type="search"
-            aria-label="Search issues"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search identifier or title"
-            className="h-9 w-full rounded-md border border-input bg-background pl-8 pr-3 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-72"
-          />
-        </div>
       </div>
 
       <TokenOverview
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
         provider={provider}
-        onPickTeam={(k) => setQuery(k)}
       />
 
       <section className="mt-7">
