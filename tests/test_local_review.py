@@ -196,6 +196,68 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert argv[-2:] == ["--", "please review"]
 
 
+def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> None:
+    """Tier B (pass 2 only): codex switches to a writable sandbox so the
+    verifier can write a throwaway test and run it."""
+    argv = build_local_review_command(
+        agent="codex",
+        prompt="verify",
+        base_branch="main",
+        codex_model="gpt-5.1-codex",
+        last_message_path="/tmp/last.txt",
+        pass_two=True,
+    )
+    assert argv[:2] == ["codex", "exec"]
+    assert "--sandbox" in argv
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    assert "read-only" not in argv
+
+
+def test_build_local_review_command_claude_pass_two_grants_tier_b_tools() -> None:
+    """Tier B (pass 2 only): claude gets Write/Edit plus a narrow set of
+    test-runner Bash commands so it can prove a finding by running code."""
+    argv = build_local_review_command(
+        agent="claude",
+        prompt="verify",
+        base_branch="main",
+        pass_two=True,
+    )
+    tools = argv[argv.index("--tools") + 1].split(",")
+    allowed = argv[argv.index("--allowedTools") + 1]
+    disallowed = argv[argv.index("--disallowedTools") + 1].split(",")
+    # Write/Edit are now in-surface.
+    assert {"Write", "Edit"}.issubset(tools)
+    assert "Write" in allowed and "Edit" in allowed
+    # Targeted test-runner commands are allowed; whole-suite is bounded by
+    # the prompt, not the allowlist.
+    assert "Bash(uv run pytest *)" in allowed
+    assert "Bash(npm test *)" in allowed
+    assert "Bash(tsc *)" in allowed
+    # Write/Edit must NOT be disallowed this pass.
+    assert "Write" not in disallowed
+    assert "Edit" not in disallowed
+
+
+def test_build_local_review_command_pass_one_and_single_pass_stay_read_only() -> None:
+    """Pass 1 and the single-pass fallback (pass_two=False) keep the
+    read-only surface: no exec/write for codex or claude."""
+    codex_argv = build_local_review_command(
+        agent="codex", prompt="p", base_branch="main"
+    )
+    assert codex_argv[codex_argv.index("--sandbox") + 1] == "read-only"
+    assert "workspace-write" not in codex_argv
+
+    claude_argv = build_local_review_command(
+        agent="claude", prompt="p", base_branch="main"
+    )
+    tools = claude_argv[claude_argv.index("--tools") + 1].split(",")
+    disallowed = claude_argv[claude_argv.index("--disallowedTools") + 1].split(",")
+    assert {"Write", "Edit"}.isdisjoint(tools)
+    assert {"Write", "Edit"}.issubset(disallowed)
+    allowed = claude_argv[claude_argv.index("--allowedTools") + 1]
+    assert "pytest" not in allowed
+
+
 def test_build_local_review_command_unknown_agent_raises() -> None:
     with pytest.raises(ValueError, match="unknown reviewer agent"):
         build_local_review_command(
@@ -450,6 +512,47 @@ def test_verifier_prompt_injects_pass_one_findings_and_emits_marker() -> None:
     # Emits the same marker contract as the single-pass reviewer.
     assert VERDICT_APPROVED_MARKER in prompt
     assert VERDICT_CHANGES_REQUESTED_MARKER in prompt
+
+
+def test_verifier_prompt_is_finding_triggered_and_caps_runs() -> None:
+    """Pass 2 may PROVE a finding by running code, but only when it has a
+    concrete hypothesis, with throwaway targeted tests capped at three."""
+    prompt = local_review_verifier_prompt(
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        base_branch="main",
+        pass_one_findings="- suspicion",
+    )
+    lower = prompt.lower()
+    # Finding-triggered: only with a concrete hypothesis.
+    assert "concrete hypothesis" in lower
+    # Throwaway failing test, run targeted (not the whole suite).
+    assert "throwaway" in lower
+    assert "uv run pytest" in lower
+    # Hard cap of three targeted runs.
+    assert "three" in lower or "3" in prompt
+    # Proven findings carry their failing-test evidence into Findings.
+    assert "evidence" in lower
+    # The verifier is NOT told to keep the tree read-only (it has write
+    # access this pass); the no-mutation line is single-pass / finder only.
+    assert "Do NOT modify any files" not in prompt
+
+
+def test_single_pass_and_finder_prompts_stay_read_only() -> None:
+    """Only pass 2 may write/execute; the single-pass reviewer and pass-1
+    finder must keep the explicit no-mutation instruction."""
+    single = local_review_prompt(
+        issue_title="t", issue_body="b", labels=[], base_branch="main"
+    )
+    finder = local_review_finder_prompt(
+        issue_title="t", issue_body="b", labels=[], base_branch="main"
+    )
+    assert "Do NOT modify any files" in single
+    assert "Do NOT modify any files" in finder
+    # No execution-grounding language leaks into the read-only roles.
+    assert "throwaway" not in single.lower()
+    assert "throwaway" not in finder.lower()
 
 
 def test_verifier_prompt_handles_empty_pass_one_findings() -> None:
