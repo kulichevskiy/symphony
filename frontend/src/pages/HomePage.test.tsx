@@ -222,12 +222,7 @@ describe("TokenOverview", () => {
 
   it("renders heatmap + all-time rail + a single Breakdown table with a By team/By model toggle", () => {
     const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="all"
-        onPickTeam={() => {}}
-      />,
+      <TokenOverview summary={summary} heatmap={heatmap} provider="all" />,
     );
     expect(markup).toContain("Daily token burn");
     expect(markup).toContain("Tokens · all-time");
@@ -241,12 +236,7 @@ describe("TokenOverview", () => {
 
   it("suffixes the rail eyebrow with the active provider", () => {
     const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="codex"
-        onPickTeam={() => {}}
-      />,
+      <TokenOverview summary={summary} heatmap={heatmap} provider="codex" />,
     );
     expect(markup).toContain("· codex");
   });
