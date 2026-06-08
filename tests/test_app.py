@@ -2511,20 +2511,127 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
             ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            wk = await client.get("/api/issues?scope=done&within_secs=604800")
-            mo = await client.get("/api/issues?scope=done&within_secs=2592000")
+            wk = await client.get(
+                "/api/issues?scope=done&from=2026-05-10&to=2026-05-17"
+            )
+            mo = await client.get(
+                "/api/issues?scope=done&from=2026-04-25&to=2026-05-17"
+            )
+            allt = await client.get("/api/issues?scope=done")
     finally:
         await conn.close()
 
     assert wk.status_code == 200
     week = wk.json()
+    # done-old (merged 05-01) is below the from bound; only ENG-1 lands in window.
     assert [i["identifier"] for i in week] == ["ENG-1"]
     assert week[0]["completed_at"] == "2026-05-16T10:00:00Z"
     assert "cost_usd" not in week[0]
     assert week[0]["canonical_status"]["state"] == "done"
 
-    # 30-day window includes both, newest first.
+    # Wider window includes both, newest first.
     assert [i["identifier"] for i in mo.json()] == ["ENG-1", "ENG-2"]
+    # No window → all-time done, both kept.
+    assert [i["identifier"] for i in allt.json()] == ["ENG-1", "ENG-2"]
+
+
+@pytest.mark.asyncio
+async def test_api_issues_active_scope_filters_by_date_window(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="act-new", identifier="ENG-1", title="new", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="act-old", identifier="ENG-2", title="old", team_key="ENG"
+        )
+        # Both are active (running runs); their last activity is the run start.
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'act-new', 'implement', 'running', 1, '2026-05-16T09:00:00Z'),
+                ('r2', 'act-old', 'implement', 'running', 2, '2026-04-01T09:00:00Z')
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            win = await client.get(
+                "/api/issues?scope=active&from=2026-05-10&to=2026-05-17"
+            )
+            allt = await client.get("/api/issues?scope=active")
+    finally:
+        await conn.close()
+
+    assert win.status_code == 200
+    # Only the issue whose last activity falls in the window.
+    assert [i["identifier"] for i in win.json()] == ["ENG-1"]
+    # No window → both active issues.
+    assert {i["identifier"] for i in allt.json()} == {"ENG-1", "ENG-2"}
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_filters_by_date_window(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="b", identifier="WEB-1", title="t", team_key="WEB"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'a', 'review', 'completed', NULL, '2026-05-16T09:00:00Z'),
+                ('r-old', 'b', 'implement', 'completed', NULL, '2024-01-01T00:00:00Z')
+            """
+        )
+        await conn.commit()
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 10, 2, 3, 4)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r-old", [ModelUsage("claude", "claude-opus-4-8", 999, 99, 99, 99)]
+        )
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            windowed = await client.get(
+                "/api/spend/summary?from=2026-05-16&to=2026-05-17"
+            )
+            allt = await client.get("/api/spend/summary")
+    finally:
+        await conn.close()
+
+    assert windowed.status_code == 200
+    body = windowed.json()
+    # Only the two May runs (issue a); the 2024 run is outside the window.
+    assert body["totals"] == {
+        "input_tokens": 110,
+        "output_tokens": 22,
+        "cache_write_tokens": 33,
+        "cache_read_tokens": 44,
+        "issues": 1,
+    }
+    assert [t["key"] for t in body["per_team"]] == ["ENG"]
+    assert body["per_provider"][0]["output_tokens"] == 22
+    # All-time still sees the 2024 run on the WEB team.
+    assert allt.json()["totals"]["output_tokens"] == 22 + 99
+    assert {t["key"] for t in allt.json()["per_team"]} == {"ENG", "WEB"}
 
 
 class _FakeCommandSink:

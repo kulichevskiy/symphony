@@ -34,27 +34,155 @@ export function teamFilterSummary(selected: string[]): string {
   return `${selected.length} selected`;
 }
 
+/** Date-window presets, in display order. `"12mo"` is all-time (the default,
+ *  emits no URL param) — the others window the spend aggregates + issue lists. */
+export const DATE_PRESETS = [
+  "12mo",
+  "90d",
+  "30d",
+  "7d",
+  "yesterday",
+  "today",
+] as const;
+export type DatePreset = (typeof DATE_PRESETS)[number];
+
+/** The resolved date filter: a named preset, or a custom UTC-day range. */
+export type DateFilter =
+  | { kind: "preset"; preset: DatePreset }
+  | { kind: "custom"; from: string; to: string };
+
+/** All-time — the default; contributes no URL params. */
+export const DEFAULT_DATE: DateFilter = { kind: "preset", preset: "12mo" };
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isDatePreset(value: string | null | undefined): value is DatePreset {
+  return DATE_PRESETS.includes(value as DatePreset);
+}
+
+/** Parse the `dates`/`from`/`to` params into a {@link DateFilter}, falling back
+ *  to all-time on anything unrecognized or malformed. */
+export function parseDate(params: URLSearchParams): DateFilter {
+  const raw = params.get("dates");
+  if (raw === "custom") {
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && to && DAY_RE.test(from) && DAY_RE.test(to) && from <= to) {
+      return { kind: "custom", from, to };
+    }
+    return DEFAULT_DATE;
+  }
+  if (isDatePreset(raw)) return { kind: "preset", preset: raw };
+  return DEFAULT_DATE;
+}
+
+/** Set the `dates`/`from`/`to` params for a date filter, omitting all of them
+ *  at the all-time default. */
+function serializeDate(date: DateFilter, params: URLSearchParams): void {
+  if (date.kind === "custom") {
+    params.set("dates", "custom");
+    params.set("from", date.from);
+    params.set("to", date.to);
+    return;
+  }
+  if (date.preset !== "12mo") params.set("dates", date.preset);
+}
+
+function utcDayMinus(nowMs: number, days: number): string {
+  const d = new Date(nowMs);
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Resolve a date filter to inclusive UTC-day bounds (`YYYY-MM-DD`), or null
+ *  bounds for all-time. Relative presets are anchored to `nowMs`. */
+export function resolveDateWindow(
+  date: DateFilter,
+  nowMs: number,
+): { from: string | null; to: string | null } {
+  if (date.kind === "custom") return { from: date.from, to: date.to };
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  switch (date.preset) {
+    case "12mo":
+      return { from: null, to: null };
+    case "90d":
+      return { from: utcDayMinus(nowMs, 89), to: today };
+    case "30d":
+      return { from: utcDayMinus(nowMs, 29), to: today };
+    case "7d":
+      return { from: utcDayMinus(nowMs, 6), to: today };
+    case "yesterday": {
+      const y = utcDayMinus(nowMs, 1);
+      return { from: y, to: y };
+    }
+    case "today":
+      return { from: today, to: today };
+  }
+}
+
+const DATE_WINDOW_LABELS: Record<DatePreset, string> = {
+  "12mo": "all-time",
+  "90d": "last 90 days",
+  "30d": "last 30 days",
+  "7d": "last 7 days",
+  yesterday: "yesterday",
+  today: "today",
+};
+
+/** Human label for the stat-rail header — e.g. `last 7 days`, `custom range`. */
+export function dateWindowLabel(date: DateFilter): string {
+  return date.kind === "custom" ? "custom range" : DATE_WINDOW_LABELS[date.preset];
+}
+
+const DATE_TRIGGER_LABELS: Record<DatePreset, string> = {
+  "12mo": "12 months",
+  "90d": "90 days",
+  "30d": "30 days",
+  "7d": "7 days",
+  yesterday: "Yesterday",
+  today: "Today",
+};
+
+/** Short label for the filter-chip trigger. */
+export function dateTriggerLabel(date: DateFilter): string {
+  return date.kind === "custom"
+    ? `${date.from} → ${date.to}`
+    : DATE_TRIGGER_LABELS[date.preset];
+}
+
+/** Whether the date filter is at its all-time default. */
+export function isDefaultDate(date: DateFilter): boolean {
+  return date.kind === "preset" && date.preset === "12mo";
+}
+
 /** The single source of truth for every dashboard filter. */
 export type Filters = {
   teams: string[];
   provider: Provider;
   models: string[];
-  /** A completed-window token (e.g. `"7d"`); URL-only, never persisted. */
-  date: string | null;
+  /** The date window; URL-only, never persisted. All-time by default. */
+  date: DateFilter;
 };
 
 export const DEFAULT_FILTERS: Filters = {
   teams: [],
   provider: "all",
   models: [],
-  date: null,
+  date: DEFAULT_DATE,
 };
 
 /** localStorage blob key. Holds teams/provider/models — NOT date. */
 export const FILTERS_STORAGE_KEY = "sym-filters";
 
 /** The URL params this store owns (so a writer can clear them wholesale). */
-const FILTER_PARAM_KEYS = ["teams", "provider", "models", "date"] as const;
+const FILTER_PARAM_KEYS = [
+  "teams",
+  "provider",
+  "models",
+  "dates",
+  "from",
+  "to",
+] as const;
 
 function parseList(value: string | null): string[] {
   if (!value) return [];
@@ -68,7 +196,7 @@ export function serializeFilters(filters: Filters): URLSearchParams {
   if (filters.teams.length) params.set("teams", filters.teams.join(","));
   if (filters.provider !== "all") params.set("provider", filters.provider);
   if (filters.models.length) params.set("models", filters.models.join(","));
-  if (filters.date != null) params.set("date", filters.date);
+  serializeDate(filters.date, params);
   return params;
 }
 
@@ -91,7 +219,7 @@ export function parseFilters(params: URLSearchParams): Filters {
     teams: parseList(params.get("teams")),
     provider: normalizeProvider(params.get("provider")),
     models: parseList(params.get("models")),
-    date: params.get("date"),
+    date: parseDate(params),
   };
 }
 
@@ -150,7 +278,7 @@ export function resolveInitialFilters({
     models: params.has("models")
       ? parseList(params.get("models"))
       : (blob.models ?? DEFAULT_FILTERS.models),
-    date: params.get("date"),
+    date: parseDate(params),
   };
 }
 
@@ -158,7 +286,7 @@ type FiltersContextValue = Filters & {
   setProvider: (value: string) => void;
   setTeams: (value: string[]) => void;
   setModels: (value: string[]) => void;
-  setDate: (value: string | null) => void;
+  setDate: (value: DateFilter) => void;
 };
 
 const FiltersContext = createContext<FiltersContextValue | null>(null);
@@ -206,7 +334,7 @@ export function FiltersProvider({ children }: { children: ReactNode }) {
     [],
   );
   const setDate = useCallback(
-    (value: string | null) => setFilters((f) => ({ ...f, date: value })),
+    (value: DateFilter) => setFilters((f) => ({ ...f, date: value })),
     [],
   );
 

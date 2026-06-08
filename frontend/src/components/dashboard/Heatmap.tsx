@@ -40,6 +40,18 @@ export function heatLevel(output: number, thresholds: number[]): number {
   return 4;
 }
 
+/** Whether a cell's UTC day falls in the highlighted window. Open bounds (the
+ *  all-time default) put every cell in window, so nothing dims. */
+export function isInWindow(
+  iso: string,
+  from: string | null,
+  to: string | null,
+): boolean {
+  if (from != null && iso < from) return false;
+  if (to != null && iso > to) return false;
+  return true;
+}
+
 const MONTHS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -122,10 +134,16 @@ export function Heatmap({
   days,
   start,
   end,
+  highlightFrom = null,
+  highlightTo = null,
 }: {
   days: HeatmapDay[];
   start: string;
   end: string;
+  /** Inclusive UTC-day bounds of the active date window. Cells outside it are
+   *  dimmed; open bounds (all-time) highlight the whole 12-month grid. */
+  highlightFrom?: string | null;
+  highlightTo?: string | null;
 }) {
   const [hover, setHover] = useState<{ cell: Cell; left: number; top: number } | null>(
     null,
@@ -192,12 +210,14 @@ export function Heatmap({
                   if (!cell) {
                     return <div key={di} style={{ width: CELL, height: CELL }} />;
                   }
+                  const lit = isInWindow(cell.iso, highlightFrom, highlightTo);
                   return (
                     <div
                       key={di}
                       className={cn(
                         "rounded-sm ring-1 ring-inset ring-black/[0.04] transition-colors dark:ring-white/[0.04]",
                         HEAT_LEVELS[heatLevel(cell.output, thresholds)],
+                        !lit && "opacity-25",
                       )}
                       style={{ width: CELL, height: CELL }}
                       onMouseEnter={(e) => onEnter(e, cell)}

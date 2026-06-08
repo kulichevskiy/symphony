@@ -12,7 +12,7 @@ import { Heatmap } from "@/components/dashboard/Heatmap";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
-import { Segmented, type SegmentedOption } from "@/components/ui/segmented";
+import { Segmented } from "@/components/ui/segmented";
 import {
   fetchIssues,
   fetchSpendHeatmap,
@@ -23,7 +23,13 @@ import {
   type SpendTotals,
   type TokenSplit,
 } from "@/lib/api";
-import { type Provider, useFilters } from "@/lib/filters";
+import {
+  dateWindowLabel,
+  resolveDateWindow,
+  type DateFilter,
+  type Provider,
+  useFilters,
+} from "@/lib/filters";
 import { cn } from "@/lib/utils";
 
 import { formatRelativeTimestamp, formatUtcTimestamp } from "./activityFreshness";
@@ -36,12 +42,6 @@ const TEAM_TINT: Record<string, string> = {
   SYM: "bg-emerald-500",
   HQ: "bg-amber-500",
 };
-
-const DONE_WINDOWS: Array<SegmentedOption & { secs: number }> = [
-  { value: "24h", label: "24h", secs: 86_400 },
-  { value: "7d", label: "7d", secs: 7 * 86_400 },
-  { value: "30d", label: "30d", secs: 30 * 86_400 },
-];
 
 function useNowMs(): number {
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -230,10 +230,14 @@ export function TokenOverview({
   summary,
   heatmap,
   provider,
+  date,
+  window,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
   provider: Provider;
+  date: DateFilter;
+  window: { from: string | null; to: string | null };
 }) {
   const [view, setView] = useState<"team" | "model">("team");
 
@@ -276,14 +280,20 @@ export function TokenOverview({
             </span>
           </div>
           {heatmap ? (
-            <Heatmap days={heatmap.days} start={heatmap.start} end={heatmap.end} />
+            <Heatmap
+              days={heatmap.days}
+              start={heatmap.start}
+              end={heatmap.end}
+              highlightFrom={window.from}
+              highlightTo={window.to}
+            />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )}
         </div>
         <div className="lg:border-l lg:border-border lg:pl-6">
           <div className="mb-4 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Tokens · all-time
+            Tokens · {dateWindowLabel(date)}
             {provider !== "all" ? (
               <span className="text-foreground"> · {provider}</span>
             ) : null}
@@ -442,9 +452,12 @@ export function IssueTable({
 export function HomePage() {
   const navigate = useNavigate();
   const nowMs = useNowMs();
-  const [doneWindow, setDoneWindow] = useState("7d");
-  const { provider, teams } = useFilters();
-  const win = DONE_WINDOWS.find((w) => w.value === doneWindow) ?? DONE_WINDOWS[1];
+  const { provider, teams, date } = useFilters();
+  // Day-granular bounds; the strings are stable across the 10s `nowMs` ticker,
+  // so they don't churn the query keys.
+  const { from, to } = resolveDateWindow(date, nowMs);
+  const dateFrom = from ?? undefined;
+  const dateTo = to ?? undefined;
 
   const providerFilter = provider === "all" ? undefined : provider;
   // Stable cache key for the team selection (order-independent).
@@ -452,11 +465,14 @@ export function HomePage() {
   const teamsFilter = teams.length ? teams : undefined;
 
   const summaryQuery = useQuery({
-    queryKey: ["spend-summary", provider, teamsKey],
-    queryFn: () => fetchSpendSummary(providerFilter, teamsFilter),
+    queryKey: ["spend-summary", provider, teamsKey, from, to],
+    queryFn: () =>
+      fetchSpendSummary(providerFilter, teamsFilter, dateFrom, dateTo),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
+  // The heatmap is the time axis itself — it stays a fixed 12-month canvas and
+  // takes no date param; the window only highlights cells within it.
   const heatmapQuery = useQuery({
     queryKey: ["spend-heatmap", provider, teamsKey],
     queryFn: () => fetchSpendHeatmap(371, providerFilter, teamsFilter),
@@ -464,20 +480,27 @@ export function HomePage() {
     placeholderData: (prev) => prev,
   });
   const activeQuery = useQuery({
-    queryKey: ["issues", "active", provider, teamsKey],
+    queryKey: ["issues", "active", provider, teamsKey, from, to],
     queryFn: () =>
-      fetchIssues({ scope: "active", provider: providerFilter, teams: teamsFilter }),
+      fetchIssues({
+        scope: "active",
+        provider: providerFilter,
+        teams: teamsFilter,
+        from: dateFrom,
+        to: dateTo,
+      }),
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", win.secs, provider, teamsKey],
+    queryKey: ["issues", "done", provider, teamsKey, from, to],
     queryFn: () =>
       fetchIssues({
         scope: "done",
-        withinSecs: win.secs,
         provider: providerFilter,
         teams: teamsFilter,
+        from: dateFrom,
+        to: dateTo,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
@@ -504,6 +527,8 @@ export function HomePage() {
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
         provider={provider}
+        date={date}
+        window={{ from, to }}
       />
 
       <section className="mt-7">
@@ -533,21 +558,13 @@ export function HomePage() {
               · {done.length}
             </span>
           </h2>
-          <div className="flex items-center gap-3">
-            <SectionTotals issues={done} />
-            <Segmented
-              ariaLabel="Completed window"
-              options={DONE_WINDOWS}
-              value={doneWindow}
-              onChange={setDoneWindow}
-            />
-          </div>
+          <SectionTotals issues={done} />
         </div>
         {done.length ? (
           <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
         ) : (
           <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
-            Nothing completed in the last {doneWindow}
+            Nothing completed in {dateWindowLabel(date)}
           </div>
         )}
       </section>

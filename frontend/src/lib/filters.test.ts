@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DEFAULT_DATE,
   DEFAULT_FILTERS,
+  dateTriggerLabel,
+  dateWindowLabel,
+  isDefaultDate,
   mergeFiltersIntoParams,
   normalizeProvider,
+  parseDate,
   parseFilters,
   PROVIDERS,
+  resolveDateWindow,
   resolveInitialFilters,
   serializeFilters,
   serializePersisted,
   teamFilterSummary,
+  type DateFilter,
   type Filters,
 } from "./filters";
 
@@ -67,9 +74,108 @@ describe("serializeFilters (omit-at-default)", () => {
     expect(params.has("models")).toBe(false);
   });
 
-  it("emits date only when set", () => {
-    expect(serializeFilters({ ...DEFAULT_FILTERS, date: "30d" }).get("date")).toBe("30d");
-    expect(serializeFilters(DEFAULT_FILTERS).has("date")).toBe(false);
+  it("emits dates only off the 12mo default, and from/to for a custom range", () => {
+    const preset = serializeFilters({
+      ...DEFAULT_FILTERS,
+      date: { kind: "preset", preset: "30d" },
+    });
+    expect(preset.get("dates")).toBe("30d");
+
+    // 12mo is the all-time default — it emits nothing.
+    expect(serializeFilters(DEFAULT_FILTERS).has("dates")).toBe(false);
+
+    const custom = serializeFilters({
+      ...DEFAULT_FILTERS,
+      date: { kind: "custom", from: "2026-01-01", to: "2026-03-01" },
+    });
+    expect(custom.get("dates")).toBe("custom");
+    expect(custom.get("from")).toBe("2026-01-01");
+    expect(custom.get("to")).toBe("2026-03-01");
+  });
+});
+
+describe("parseDate", () => {
+  it("reads a preset, defaulting to all-time when absent or unknown", () => {
+    expect(parseDate(new URLSearchParams("dates=7d"))).toEqual({
+      kind: "preset",
+      preset: "7d",
+    });
+    expect(parseDate(new URLSearchParams())).toEqual(DEFAULT_DATE);
+    expect(parseDate(new URLSearchParams("dates=eternity"))).toEqual(DEFAULT_DATE);
+  });
+
+  it("reads a custom range and round-trips it", () => {
+    const date: DateFilter = { kind: "custom", from: "2026-01-01", to: "2026-03-01" };
+    const params = serializeFilters({ ...DEFAULT_FILTERS, date });
+    expect(parseDate(params)).toEqual(date);
+  });
+
+  it("falls back to all-time on a malformed or inverted custom range", () => {
+    expect(parseDate(new URLSearchParams("dates=custom&from=2026-01-01"))).toEqual(
+      DEFAULT_DATE,
+    );
+    expect(parseDate(new URLSearchParams("dates=custom&from=nope&to=2026-03-01"))).toEqual(
+      DEFAULT_DATE,
+    );
+    // to before from is rejected.
+    expect(
+      parseDate(new URLSearchParams("dates=custom&from=2026-03-01&to=2026-01-01")),
+    ).toEqual(DEFAULT_DATE);
+  });
+});
+
+describe("resolveDateWindow", () => {
+  // 2026-05-17T12:00:00Z
+  const NOW = Date.UTC(2026, 4, 17, 12, 0, 0);
+
+  it("returns open bounds for all-time (12mo)", () => {
+    expect(resolveDateWindow(DEFAULT_DATE, NOW)).toEqual({ from: null, to: null });
+  });
+
+  it("anchors relative presets to the UTC day of now", () => {
+    expect(resolveDateWindow({ kind: "preset", preset: "today" }, NOW)).toEqual({
+      from: "2026-05-17",
+      to: "2026-05-17",
+    });
+    expect(resolveDateWindow({ kind: "preset", preset: "yesterday" }, NOW)).toEqual({
+      from: "2026-05-16",
+      to: "2026-05-16",
+    });
+    expect(resolveDateWindow({ kind: "preset", preset: "7d" }, NOW)).toEqual({
+      from: "2026-05-11",
+      to: "2026-05-17",
+    });
+    expect(resolveDateWindow({ kind: "preset", preset: "30d" }, NOW)).toEqual({
+      from: "2026-04-18",
+      to: "2026-05-17",
+    });
+  });
+
+  it("passes a custom range straight through", () => {
+    expect(
+      resolveDateWindow({ kind: "custom", from: "2026-01-01", to: "2026-02-01" }, NOW),
+    ).toEqual({ from: "2026-01-01", to: "2026-02-01" });
+  });
+});
+
+describe("date labels", () => {
+  it("describes the window for the stat-rail header", () => {
+    expect(dateWindowLabel(DEFAULT_DATE)).toBe("all-time");
+    expect(dateWindowLabel({ kind: "preset", preset: "7d" })).toBe("last 7 days");
+    expect(dateWindowLabel({ kind: "custom", from: "a", to: "b" })).toBe("custom range");
+  });
+
+  it("knows when the filter is at its default", () => {
+    expect(isDefaultDate(DEFAULT_DATE)).toBe(true);
+    expect(isDefaultDate({ kind: "preset", preset: "7d" })).toBe(false);
+    expect(isDefaultDate({ kind: "custom", from: "a", to: "b" })).toBe(false);
+  });
+
+  it("renders a short trigger label", () => {
+    expect(dateTriggerLabel({ kind: "preset", preset: "7d" })).toBe("7 days");
+    expect(dateTriggerLabel({ kind: "custom", from: "2026-01-01", to: "2026-02-01" })).toBe(
+      "2026-01-01 → 2026-02-01",
+    );
   });
 });
 
@@ -106,7 +212,7 @@ describe("parseFilters", () => {
       teams: ["VIB", "ADJ"],
       provider: "codex",
       models: ["opus-4.1"],
-      date: "7d",
+      date: { kind: "preset", preset: "7d" },
     };
     expect(parseFilters(serializeFilters(filters))).toEqual(filters);
   });
@@ -127,11 +233,12 @@ describe("serializePersisted", () => {
         teams: ["VIB"],
         provider: "codex",
         models: ["opus-4.1"],
-        date: "7d",
+        date: { kind: "preset", preset: "7d" },
       }),
     );
     expect(blob).toEqual({ teams: ["VIB"], provider: "codex", models: ["opus-4.1"] });
     expect(blob).not.toHaveProperty("date");
+    expect(blob).not.toHaveProperty("dates");
   });
 });
 
@@ -163,14 +270,14 @@ describe("resolveInitialFilters (URL wins, then localStorage, then defaults)", (
   it("never reads date from storage — only the URL", () => {
     const fromStore = resolveInitialFilters({
       params: new URLSearchParams(),
-      stored: JSON.stringify({ date: "30d" }),
+      stored: JSON.stringify({ dates: "30d" }),
     });
-    expect(fromStore.date).toBeNull();
+    expect(fromStore.date).toEqual(DEFAULT_DATE);
     const fromUrl = resolveInitialFilters({
-      params: new URLSearchParams("date=30d"),
+      params: new URLSearchParams("dates=30d"),
       stored: null,
     });
-    expect(fromUrl.date).toBe("30d");
+    expect(fromUrl.date).toEqual({ kind: "preset", preset: "30d" });
   });
 
   it("tolerates corrupt stored JSON", () => {

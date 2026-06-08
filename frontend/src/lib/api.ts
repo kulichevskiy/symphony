@@ -260,13 +260,17 @@ function applyTeams(params: URLSearchParams, teams?: string[]): void {
 export function fetchIssues({
   q,
   scope = "active",
-  withinSecs,
+  from,
+  to,
   provider,
   teams,
 }: {
   q?: string;
   scope?: IssueScope;
-  withinSecs?: number;
+  /** Inclusive UTC-day lower bound (`YYYY-MM-DD`); omitted = open-ended. */
+  from?: string;
+  /** Inclusive UTC-day upper bound (`YYYY-MM-DD`); omitted = open-ended. */
+  to?: string;
   provider?: string;
   teams?: string[];
 } = {}): Promise<IssueSummary[]> {
@@ -275,8 +279,11 @@ export function fetchIssues({
   if (normalizedQ) {
     params.set("q", normalizedQ);
   }
-  if (withinSecs != null) {
-    params.set("within_secs", String(withinSecs));
+  if (from) {
+    params.set("from", from);
+  }
+  if (to) {
+    params.set("to", to);
   }
   if (provider) {
     params.set("provider", provider);
@@ -293,12 +300,20 @@ export function fetchIssues({
 export function fetchSpendSummary(
   provider?: string,
   teams?: string[],
+  from?: string,
+  to?: string,
 ): Promise<SpendSummary> {
   const params = new URLSearchParams();
   if (provider) {
     params.set("provider", provider);
   }
   applyTeams(params, teams);
+  if (from) {
+    params.set("from", from);
+  }
+  if (to) {
+    params.set("to", to);
+  }
   const query = params.toString();
   return fetchJson<SpendSummary>(
     query ? `/api/spend/summary?${query}` : "/api/spend/summary",

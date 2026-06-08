@@ -5,9 +5,11 @@ import { Segmented } from "@/components/ui/segmented";
 import { fetchSpendSummary } from "@/lib/api";
 import { PROVIDER_OPTIONS, useFilters } from "@/lib/filters";
 
-/** The global filter bar: the Teams multi-select and the Model provider
- *  control. The Teams options come from the always-unscoped `teams` list on
- *  /spend/summary — fetched without filters so it never narrows itself. */
+import { DateFilter } from "./DateFilter";
+
+/** The global filter bar: the Teams multi-select, the Model provider control,
+ *  and the date window. The Teams options come from the always-unscoped `teams`
+ *  list on /spend/summary — fetched without filters so it never narrows itself. */
 export function FilterBar() {
   const { provider, setProvider } = useFilters();
   const teamsQuery = useQuery({
@@ -31,6 +33,7 @@ export function FilterBar() {
             onChange={setProvider}
           />
         </span>
+        <DateFilter />
       </div>
     </div>
   );

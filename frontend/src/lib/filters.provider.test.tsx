@@ -2,13 +2,18 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
-import { FiltersProvider, useFilters } from "./filters";
+import { FiltersProvider, isDefaultDate, useFilters } from "./filters";
 
 function Probe() {
   const { provider, teams, models, date } = useFilters();
+  const dateStr = isDefaultDate(date)
+    ? "-"
+    : date.kind === "preset"
+      ? date.preset
+      : "custom";
   return (
     <span data-testid="probe">
-      {`${provider}|${teams.join(",")}|${models.join(",")}|${date ?? "-"}`}
+      {`${provider}|${teams.join(",")}|${models.join(",")}|${dateStr}`}
     </span>
   );
 }
@@ -33,6 +38,6 @@ describe("FiltersProvider / useFilters", () => {
   });
 
   it("parses teams and date from the URL", () => {
-    expect(render("/?teams=VIB,ADJ&date=7d")).toContain("all|VIB,ADJ||7d");
+    expect(render("/?teams=VIB,ADJ&dates=7d")).toContain("all|VIB,ADJ||7d");
   });
 });
