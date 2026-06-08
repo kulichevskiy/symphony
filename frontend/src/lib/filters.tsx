@@ -64,6 +64,19 @@ export function serializeFilters(filters: Filters): URLSearchParams {
   return params;
 }
 
+/** The single URL writer's merge step: clear the keys this store owns, re-set
+ *  only the non-default ones (via {@link serializeFilters}), and preserve any
+ *  unrelated params already on the URL. */
+export function mergeFiltersIntoParams(
+  prev: URLSearchParams,
+  filters: Filters,
+): URLSearchParams {
+  const next = new URLSearchParams(prev);
+  for (const key of FILTER_PARAM_KEYS) next.delete(key);
+  for (const [key, value] of serializeFilters(filters)) next.set(key, value);
+  return next;
+}
+
 /** Parse filters from URL params, normalizing and falling back to defaults. */
 export function parseFilters(params: URLSearchParams): Filters {
   return {
@@ -83,14 +96,27 @@ export function serializePersisted(filters: Filters): string {
   });
 }
 
-type StoredFilters = Partial<Pick<Filters, "teams" | "provider" | "models">>;
+type StoredFilters = Partial<Pick<Filters, "teams" | "models">> & {
+  /** Raw stored provider; normalized via `normalizeProvider` on read. */
+  provider?: string;
+};
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
 
 function parseStored(raw: string | null): StoredFilters {
   if (!raw) return {};
   try {
     const blob = JSON.parse(raw);
     if (typeof blob !== "object" || blob === null) return {};
-    return blob as StoredFilters;
+    // Validate per field so a corrupt value (e.g. `teams: "VIB"`) falls through
+    // to defaults instead of poisoning state with a non-array.
+    return {
+      teams: isStringArray(blob.teams) ? blob.teams : undefined,
+      provider: typeof blob.provider === "string" ? blob.provider : undefined,
+      models: isStringArray(blob.models) ? blob.models : undefined,
+    };
   } catch {
     return {};
   }
@@ -153,17 +179,9 @@ export function FiltersProvider({ children }: { children: ReactNode }) {
     if (typeof localStorage !== "undefined") {
       localStorage.setItem(FILTERS_STORAGE_KEY, serializePersisted(filters));
     }
-    setSearchParams(
-      (prev) => {
-        const next = new URLSearchParams(prev);
-        for (const key of FILTER_PARAM_KEYS) next.delete(key);
-        for (const [key, value] of serializeFilters(filters)) {
-          next.set(key, value);
-        }
-        return next;
-      },
-      { replace: true },
-    );
+    setSearchParams((prev) => mergeFiltersIntoParams(prev, filters), {
+      replace: true,
+    });
   }, [filters, setSearchParams]);
 
   const setProvider = useCallback(

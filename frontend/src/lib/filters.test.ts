@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_FILTERS,
+  mergeFiltersIntoParams,
   normalizeProvider,
   parseFilters,
   PROVIDERS,
@@ -53,6 +54,33 @@ describe("serializeFilters (omit-at-default)", () => {
   it("emits date only when set", () => {
     expect(serializeFilters({ ...DEFAULT_FILTERS, date: "30d" }).get("date")).toBe("30d");
     expect(serializeFilters(DEFAULT_FILTERS).has("date")).toBe(false);
+  });
+});
+
+describe("mergeFiltersIntoParams (the single URL writer)", () => {
+  it("sets provider=codex, omits it on reset to 'all', and preserves unrelated params", () => {
+    const base = new URLSearchParams("tab=done");
+
+    // Non-default provider lands on the URL; the unrelated `tab` survives.
+    const withCodex = mergeFiltersIntoParams(base, {
+      ...DEFAULT_FILTERS,
+      provider: "codex",
+    });
+    expect(withCodex.get("provider")).toBe("codex");
+    expect(withCodex.get("tab")).toBe("done");
+
+    // Resetting to the default drops the param again, still preserving `tab`.
+    const reset = mergeFiltersIntoParams(withCodex, DEFAULT_FILTERS);
+    expect(reset.has("provider")).toBe(false);
+    expect(reset.get("tab")).toBe("done");
+  });
+
+  it("clears stale owned keys rather than leaving them on the URL", () => {
+    const prev = new URLSearchParams("provider=claude&teams=VIB&keep=1");
+    const next = mergeFiltersIntoParams(prev, DEFAULT_FILTERS);
+    expect(next.has("provider")).toBe(false);
+    expect(next.has("teams")).toBe(false);
+    expect(next.get("keep")).toBe("1");
   });
 });
 
@@ -133,5 +161,17 @@ describe("resolveInitialFilters (URL wins, then localStorage, then defaults)", (
     expect(
       resolveInitialFilters({ params: new URLSearchParams(), stored: "{not json" }),
     ).toEqual(DEFAULT_FILTERS);
+  });
+
+  it("ignores stored fields of the wrong type (e.g. teams as a string)", () => {
+    // A blob like {"teams":"VIB"} must not leak a string into `teams` — else the
+    // writer's `filters.teams.join` would throw and white-screen the app.
+    const resolved = resolveInitialFilters({
+      params: new URLSearchParams(),
+      stored: JSON.stringify({ teams: "VIB", models: 42, provider: "codex" }),
+    });
+    expect(resolved.teams).toEqual([]);
+    expect(resolved.models).toEqual([]);
+    expect(resolved.provider).toBe("codex"); // valid string still honored
   });
 });
