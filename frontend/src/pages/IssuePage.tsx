@@ -8,6 +8,7 @@ import {
   MixBar,
   PROVIDER_TINT,
   Tk,
+  TOKEN_CATS,
   TokenFigures,
 } from "@/components/dashboard/atoms";
 import { LiveDot, StatusBadge } from "@/components/dashboard/StatusBadge";
@@ -282,18 +283,11 @@ function TokensByModel({ rows }: { rows: TokenModelUsage[] }) {
   );
 }
 
-const TOKENS_STATS = [
-  { key: "input_tokens", label: "in" },
-  { key: "output_tokens", label: "out" },
-  { key: "cache_write_tokens", label: "cache-write" },
-  { key: "cache_read_tokens", label: "cache-read" },
-] as const;
-
 export function TokensCard({ c }: { c: Cockpit }) {
   return (
     <CockpitCard title="Tokens">
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        {TOKENS_STATS.map((s) => (
+        {TOKEN_CATS.map((s) => (
           <div
             key={s.key}
             className="rounded-md border border-border bg-secondary/20 px-3 py-2"
@@ -301,7 +295,8 @@ export function TokensCard({ c }: { c: Cockpit }) {
             <div className="font-mono text-lg font-semibold tracking-tight text-foreground">
               <Tk value={c.tokens[s.key]} />
             </div>
-            <div className="mt-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            <div className="mt-0.5 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              <span className={cn("h-2 w-2 shrink-0 rounded-sm", s.swatch)} />
               {s.label}
             </div>
           </div>
