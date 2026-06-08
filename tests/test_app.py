@@ -1791,6 +1791,20 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
                  5.00, 200, 40, 60, 80)
             """
         )
+        # per_team/totals now source tokens from run_model_usage; mirror each
+        # run's tokens with a single-provider usage row.
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 10, 2, 3, 4)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("claude", "claude-opus-4-8", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r4", [ModelUsage("claude", "claude-opus-4-8", 200, 40, 60, 80)]
+        )
         await conn.commit()
         app = create_app(
             _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
@@ -1819,8 +1833,9 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
     assert "total_tokens" not in eng
     assert "cost_usd" not in body["totals"]
     assert "cost_usd" not in eng
-    # No run_model_usage rows seeded → empty provider breakdown.
-    assert body["per_provider"] == []
+    # Single provider seeded → its breakdown reconciles with the rail totals.
+    assert [p["provider"] for p in body["per_provider"]] == ["claude"]
+    assert body["per_provider"][0]["output_tokens"] == 67
 
 
 async def test_api_spend_summary_per_provider_nested_per_model(
@@ -1886,6 +1901,123 @@ async def test_api_spend_summary_per_provider_nested_per_model(
     assert codex["output_tokens"] == 2
     assert codex["issues"] == 1
     assert codex["per_model"][0]["model"] == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_api_spend_summary_scoped_by_provider_reconciles(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "ENG-1", "ENG"),
+            ("b", "ENG-2", "ENG"),
+            ("c", "WEB-1", "WEB"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'a', 'review', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r3', 'b', 'implement', 'completed', NULL, '2026-05-17T12:00:00Z'),
+                ('r4', 'c', 'implement', 'completed', NULL, '2026-05-17T13:00:00Z')
+            """
+        )
+        # Issue a (ENG) is touched by both providers; b (ENG) by codex only;
+        # c (WEB) by both. Tokens per (provider, model) sum back to the rail.
+        await db.run_model_usage.replace_for_run(
+            conn,
+            "r1",
+            [
+                ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40),
+                ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3),
+            ],
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("codex", "gpt-5.5", 200, 40, 60, 80)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn,
+            "r4",
+            [
+                ModelUsage("claude", "claude-opus-4-8", 70, 7, 7, 7),
+                ModelUsage("codex", "gpt-5.5", 30, 3, 3, 3),
+            ],
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            all_resp = await client.get("/api/spend/summary?provider=all")
+            claude_resp = await client.get("/api/spend/summary?provider=claude")
+            codex_resp = await client.get("/api/spend/summary?provider=codex")
+            default_resp = await client.get("/api/spend/summary")
+    finally:
+        await conn.close()
+
+    assert all_resp.status_code == 200
+    assert claude_resp.status_code == 200
+    assert codex_resp.status_code == 200
+    all_body, claude_body, codex_body = (
+        all_resp.json(),
+        claude_resp.json(),
+        codex_resp.json(),
+    )
+
+    token_keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_read_tokens",
+    )
+
+    # Tokens reconcile exactly: all == codex + claude, for totals and per team.
+    for key in token_keys:
+        assert all_body["totals"][key] == (
+            claude_body["totals"][key] + codex_body["totals"][key]
+        )
+
+    def teams(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {t["key"]: t for t in body["per_team"]}
+
+    all_teams, claude_teams, codex_teams = (
+        teams(all_body),
+        teams(claude_body),
+        teams(codex_body),
+    )
+    assert set(all_teams) == {"ENG", "WEB"}
+    for team in ("ENG", "WEB"):
+        for key in token_keys:
+            assert all_teams[team][key] == (
+                claude_teams[team][key] + codex_teams[team][key]
+            )
+
+    # Spot-check the scoped values.
+    assert all_teams["ENG"]["output_tokens"] == 67
+    assert claude_teams["ENG"]["output_tokens"] == 25
+    assert codex_teams["ENG"]["output_tokens"] == 42
+
+    # Issue counts are DISTINCT issues touched by the selected provider, so they
+    # do NOT sum across providers (issue a is touched by both).
+    assert all_teams["ENG"]["issues"] == 2  # {a, b}
+    assert claude_teams["ENG"]["issues"] == 1  # {a}
+    assert codex_teams["ENG"]["issues"] == 2  # {a, b}
+    assert all_body["totals"]["issues"] == 3  # {a, b, c}
+    assert claude_body["totals"]["issues"] == 2  # {a, c}
+    assert codex_body["totals"]["issues"] == 3  # {a, b, c}
+
+    # No provider param behaves like provider=all.
+    assert default_resp.json()["totals"] == all_body["totals"]
 
 
 @pytest.mark.asyncio
