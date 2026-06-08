@@ -9,11 +9,20 @@ export function Tk({ value }: { value: number | null | undefined }) {
 }
 
 const MIX_SEGMENTS = [
-  { key: "input_tokens", tint: "bg-sky-500", label: "in" },
-  { key: "output_tokens", tint: "bg-emerald-500", label: "out" },
-  { key: "cache_write_tokens", tint: "bg-amber-500", label: "cache-write" },
-  { key: "cache_read_tokens", tint: "bg-violet-500", label: "cache-read" },
+  { key: "input_tokens", tint: "bg-blue-500", label: "in" },
+  { key: "output_tokens", tint: "bg-violet-500", label: "out" },
+  { key: "cache_write_tokens", tint: "bg-cyan-500", label: "cache-write" },
+  { key: "cache_read_tokens", tint: "bg-slate-400", label: "cache-read" },
 ] as const;
+
+/**
+ * Provider dot palette (Dashboard v2). Shared so every consumer speaks one
+ * color language. Unknown providers fall back to the slate dot at the call site.
+ */
+export const PROVIDER_TINT: Record<string, string> = {
+  codex: "bg-blue-500",
+  claude: "bg-violet-500",
+};
 
 /**
  * Per-row stacked token mix-bar. Every bar is the same full width; its segments

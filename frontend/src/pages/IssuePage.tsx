@@ -6,6 +6,7 @@ import {
   type Checks,
   CheckSummary,
   MixBar,
+  PROVIDER_TINT,
   Tk,
   TokenFigures,
 } from "@/components/dashboard/atoms";
@@ -211,11 +212,6 @@ function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
     </CockpitCard>
   );
 }
-
-const PROVIDER_TINT: Record<string, string> = {
-  claude: "bg-orange-500",
-  codex: "bg-sky-500",
-};
 
 type ProviderGroup = TokenSplit & {
   provider: string;

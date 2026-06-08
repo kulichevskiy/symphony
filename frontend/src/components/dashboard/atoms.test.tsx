@@ -3,7 +3,34 @@ import { describe, expect, it } from "vitest";
 
 import type { TokenSplit } from "@/lib/api";
 
-import { MixBar } from "./atoms";
+import { MixBar, PROVIDER_TINT } from "./atoms";
+
+describe("token palette", () => {
+  it("colors the four mix segments with the v2 token palette", () => {
+    const split: TokenSplit = {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_write_tokens: 1,
+      cache_read_tokens: 1,
+    };
+    const markup = renderToStaticMarkup(<MixBar split={split} />);
+    // input=blue, output=violet, cache-write=cyan, cache-read=slate.
+    expect(markup).toContain("bg-blue-500");
+    expect(markup).toContain("bg-violet-500");
+    expect(markup).toContain("bg-cyan-500");
+    expect(markup).toContain("bg-slate-400");
+    // No leftovers from the old in=sky / out=emerald / cache-write=amber palette.
+    expect(markup).not.toContain("bg-sky-500");
+    expect(markup).not.toContain("bg-emerald-500");
+    expect(markup).not.toContain("bg-amber-500");
+  });
+
+  it("maps provider dots to the v2 provider palette", () => {
+    // codex=blue, claude=violet (replacing codex=sky / claude=orange).
+    expect(PROVIDER_TINT.codex).toBe("bg-blue-500");
+    expect(PROVIDER_TINT.claude).toBe("bg-violet-500");
+  });
+});
 
 describe("MixBar", () => {
   it("sizes segments by the row's own raw-token proportions", () => {
