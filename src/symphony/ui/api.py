@@ -200,16 +200,38 @@ def _parse_iso(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+# Per-team spend, sourced from the run_model_usage child table so it carries a
+# provider dimension. With no provider filter (`all`) every provider's rows are
+# summed, so rail = sum of teams = codex + claude reconciles exactly. Issue
+# counts are DISTINCT issues touched by the (optionally provider-scoped) usage.
 _SPEND_SUMMARY_QUERY = """
 SELECT
     i.team_key AS team_key,
-    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
-    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
-    COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
-    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
     COUNT(DISTINCT r.issue_id) AS issues
-FROM runs r
+FROM run_model_usage u
+JOIN runs r ON r.id = u.run_id
 JOIN issues i ON i.id = r.issue_id
+GROUP BY i.team_key
+"""
+
+
+# Same per-team aggregation scoped to a single provider.
+_SPEND_SUMMARY_BY_PROVIDER_QUERY = """
+SELECT
+    i.team_key AS team_key,
+    COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+    COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+    COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+    COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+    COUNT(DISTINCT r.issue_id) AS issues
+FROM run_model_usage u
+JOIN runs r ON r.id = u.run_id
+JOIN issues i ON i.id = r.issue_id
+WHERE u.provider = ?
 GROUP BY i.team_key
 """
 
@@ -581,12 +603,18 @@ def create_api_router(
         return payloads
 
     @router.get("/spend/summary", response_model=SpendSummary)
-    async def spend_summary() -> SpendSummary:
+    async def spend_summary(
+        provider: Annotated[str | None, Query()] = None,
+    ) -> SpendSummary:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
+        if provider is None or provider == "all":
+            team_query, team_params = _SPEND_SUMMARY_QUERY, ()
+        else:
+            team_query, team_params = _SPEND_SUMMARY_BY_PROVIDER_QUERY, (provider,)
         try:
             conn = await ui_db_pool.connection()
-            cur = await conn.execute(_SPEND_SUMMARY_QUERY)
+            cur = await conn.execute(team_query, team_params)
             rows = [dict(row) for row in await cur.fetchall()]
             cur = await conn.execute(_SPEND_PER_MODEL_QUERY)
             model_rows = [dict(row) for row in await cur.fetchall()]

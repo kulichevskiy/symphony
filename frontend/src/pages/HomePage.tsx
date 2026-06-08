@@ -496,9 +496,11 @@ export function HomePage() {
   const win = DONE_WINDOWS.find((w) => w.value === doneWindow) ?? DONE_WINDOWS[1];
 
   const summaryQuery = useQuery({
-    queryKey: ["spend-summary"],
-    queryFn: fetchSpendSummary,
+    queryKey: ["spend-summary", provider],
+    queryFn: () =>
+      fetchSpendSummary(provider === "all" ? undefined : provider),
     refetchInterval: 30_000,
+    placeholderData: (prev) => prev,
   });
   const heatmapQuery = useQuery({
     queryKey: ["spend-heatmap", provider],

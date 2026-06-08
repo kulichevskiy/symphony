@@ -273,9 +273,12 @@ export function fetchIssues({
   );
 }
 
-export function fetchSpendSummary(): Promise<SpendSummary> {
+export function fetchSpendSummary(provider?: string): Promise<SpendSummary> {
+  const query = provider
+    ? `/api/spend/summary?provider=${encodeURIComponent(provider)}`
+    : "/api/spend/summary";
   return fetchJson<SpendSummary>(
-    "/api/spend/summary",
+    query,
     "Spend summary not found",
     "Failed to load spend summary",
   );
