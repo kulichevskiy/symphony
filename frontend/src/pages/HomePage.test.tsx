@@ -1,12 +1,14 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 
 import type { IssueSummary, SpendHeatmap, SpendSummary } from "@/lib/api";
-import { DEFAULT_DATE } from "@/lib/filters";
+import { DEFAULT_DATE, FiltersProvider } from "@/lib/filters";
 
 import {
   BreakdownTable,
+  HomePage,
   IssueTable,
   MixLegend,
   SectionTotals,
@@ -174,6 +176,11 @@ describe("BreakdownTable", () => {
     expect(markup).toContain("opus-4.1");
     expect(markup).toContain("claude");
   });
+
+  it("renders the filtered empty-state copy when there are no rows", () => {
+    const markup = renderToStaticMarkup(<BreakdownTable rows={[]} kind="team" />);
+    expect(markup).toContain("No teams/models match the current filters");
+  });
 });
 
 describe("TokenOverview", () => {
@@ -274,5 +281,21 @@ describe("TokenOverview", () => {
     expect(markup).not.toContain("Tokens · all-time");
     // The single 2026-06-01 cell is outside [06-10, 06-17] → dimmed.
     expect(markup).toContain("opacity-25");
+  });
+});
+
+describe("HomePage filtered empty states", () => {
+  it("renders the filtered empty-state copy for the Active and Done sections", () => {
+    const markup = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <FiltersProvider>
+            <HomePage />
+          </FiltersProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(markup).toContain("No active issues match your filters");
+    expect(markup).toContain("No completed issues match your filters");
   });
 });

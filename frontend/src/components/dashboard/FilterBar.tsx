@@ -4,7 +4,7 @@ import { ModelFilter } from "@/components/dashboard/ModelFilter";
 import { TeamFilter } from "@/components/dashboard/TeamFilter";
 import { Segmented } from "@/components/ui/segmented";
 import { fetchSpendSummary } from "@/lib/api";
-import { PROVIDER_OPTIONS, useFilters } from "@/lib/filters";
+import { hasActiveFilters, PROVIDER_OPTIONS, useFilters } from "@/lib/filters";
 
 import { DateFilter } from "./DateFilter";
 
@@ -13,7 +13,7 @@ import { DateFilter } from "./DateFilter";
  *  always-unscoped `teams`/`models` lists on /spend/summary — fetched without
  *  filters so they never narrow themselves. */
 export function FilterBar() {
-  const { provider, setProvider } = useFilters();
+  const { provider, teams, models, date, setProvider, reset } = useFilters();
   const optionsQuery = useQuery({
     queryKey: ["filter-options"],
     queryFn: () => fetchSpendSummary(),
@@ -36,6 +36,15 @@ export function FilterBar() {
           />
         </span>
         <DateFilter />
+        {hasActiveFilters({ teams, provider, models, date }) ? (
+          <button
+            type="button"
+            onClick={reset}
+            className="ml-auto rounded-md px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+          >
+            Clear all
+          </button>
+        ) : null}
       </div>
     </div>
   );

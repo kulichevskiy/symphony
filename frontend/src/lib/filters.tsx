@@ -197,6 +197,17 @@ export const DEFAULT_FILTERS: Filters = {
   date: DEFAULT_DATE,
 };
 
+/** Whether any filter departs from its default — drives the Clear-all
+ *  affordance, which resets everything back to {@link DEFAULT_FILTERS}. */
+export function hasActiveFilters(filters: Filters): boolean {
+  return (
+    filters.teams.length > 0 ||
+    filters.provider !== "all" ||
+    filters.models.length > 0 ||
+    !isDefaultDate(filters.date)
+  );
+}
+
 /** localStorage blob key. Holds teams/provider/models — NOT date. */
 export const FILTERS_STORAGE_KEY = "sym-filters";
 
@@ -318,6 +329,8 @@ type FiltersContextValue = Filters & {
   setTeams: (value: string[]) => void;
   setModels: (value: string[]) => void;
   setDate: (value: DateFilter) => void;
+  /** Reset all four filters to their defaults in one action (state + URL). */
+  reset: () => void;
 };
 
 const FiltersContext = createContext<FiltersContextValue | null>(null);
@@ -372,10 +385,11 @@ export function FiltersProvider({ children }: { children: ReactNode }) {
     (value: DateFilter) => setFilters((f) => ({ ...f, date: value })),
     [],
   );
+  const reset = useCallback(() => setFilters(DEFAULT_FILTERS), []);
 
   const value = useMemo<FiltersContextValue>(
-    () => ({ ...filters, setProvider, setTeams, setModels, setDate }),
-    [filters, setProvider, setTeams, setModels, setDate],
+    () => ({ ...filters, setProvider, setTeams, setModels, setDate, reset }),
+    [filters, setProvider, setTeams, setModels, setDate, reset],
   );
 
   return <FiltersContext.Provider value={value}>{children}</FiltersContext.Provider>;

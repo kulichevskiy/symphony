@@ -5,6 +5,7 @@ import {
   DEFAULT_FILTERS,
   dateTriggerLabel,
   dateWindowLabel,
+  hasActiveFilters,
   isDefaultDate,
   mergeFiltersIntoParams,
   normalizeProvider,
@@ -84,6 +85,23 @@ describe("normalizeProvider", () => {
     expect(normalizeProvider("")).toBe("all");
     expect(normalizeProvider(null)).toBe("all");
     expect(normalizeProvider(undefined)).toBe("all");
+  });
+});
+
+describe("hasActiveFilters", () => {
+  it("is false when every filter is at its default", () => {
+    expect(hasActiveFilters(DEFAULT_FILTERS)).toBe(false);
+  });
+
+  it("is true when any single filter departs from its default", () => {
+    expect(hasActiveFilters({ ...DEFAULT_FILTERS, teams: ["VIB"] })).toBe(true);
+    expect(hasActiveFilters({ ...DEFAULT_FILTERS, provider: "codex" })).toBe(true);
+    expect(hasActiveFilters({ ...DEFAULT_FILTERS, models: ["claude:opus-4.1"] })).toBe(
+      true,
+    );
+    expect(
+      hasActiveFilters({ ...DEFAULT_FILTERS, date: { kind: "preset", preset: "7d" } }),
+    ).toBe(true);
   });
 });
 
