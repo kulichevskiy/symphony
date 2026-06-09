@@ -316,6 +316,7 @@ def merge_prompt(
         "- If no housekeeping change is needed, exit successfully without "
         "creating a commit.\n"
         "- Do not merge the PR, push, or edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 

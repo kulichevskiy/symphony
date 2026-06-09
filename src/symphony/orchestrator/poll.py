@@ -10989,6 +10989,7 @@ class Orchestrator:
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
                     command_secs=self.config.command_timeout_secs,
+                    binding_env=dict(binding.env),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
                     diff_size_provider=partial(

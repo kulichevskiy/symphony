@@ -151,6 +151,7 @@ async def run_local_review_session(
     cap: int,
     stall_secs: int,
     command_secs: int = 1800,
+    binding_env: dict[str, str] | None = None,
     last_message_dir: Path,
     head_sha_provider: HeadShaProvider,
     diff_size_provider: DiffSizeProvider | None = None,
@@ -435,6 +436,10 @@ async def run_local_review_session(
             stall_secs=stall_secs,
             command_secs=command_secs,
             stage="local_review_fix",
+            # The fixer is change-driving: inject the binding's resolved
+            # env: secrets (e.g. SUPABASE_ACCESS_TOKEN) so schema fixes use
+            # the CLI instead of the OAuth-only MCP dead end.
+            env=dict(binding_env or {}),
         )
         cost_before = fixer_estimator.total_cost_usd
         input_before = fixer_estimator.total_input_tokens
