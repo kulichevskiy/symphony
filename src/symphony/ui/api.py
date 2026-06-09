@@ -527,18 +527,32 @@ def _spend_heatmap_query(
     )
 
 
-# Per-stage output tokens bucketed by UTC start day, sourced from the
+# The breakdown dimension a series is grouped by. The key column is selected
+# AS `series_key` so the bucketing machinery stays dimension-agnostic: "stage"
+# is runs.stage, "team" is the issue's team key, "model" is provider/model
+# (matching the per-model rowKey the client builds for the totals table).
+SERIES_DIMENSIONS: dict[str, str] = {
+    "stage": "r.stage",
+    "team": "i.team_key",
+    "model": "u.provider || '/' || u.model",
+}
+
+
+# Per-dimension output tokens bucketed by UTC start day, sourced from the
 # run_model_usage child table under the SAME provider/teams/models/date filters
-# as _spend_per_stage_query so the trend reconciles with the by-stage totals.
-# Returns one row per (day, stage); weekly rollup happens in Python.
+# as the matching totals query so the trend reconciles with the totals view.
+# Returns one row per (day, series_key); weekly rollup happens in Python.
 def _spend_stage_series_query(
     provider: str | None,
     teams: list[str],
     models: list[tuple[str, str]],
     date_from: str | None,
     date_to: str | None,
+    by: str = "stage",
 ) -> tuple[str, tuple[str, ...]]:
-    join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
+    key_expr = SERIES_DIMENSIONS[by]
+    # The team key only exists on issues; join when grouping by team too.
+    join = "JOIN issues i ON i.id = r.issue_id" if teams or by == "team" else ""
     conds: list[str] = []
     params: list[str] = []
     if provider is not None:
@@ -557,13 +571,13 @@ def _spend_stage_series_query(
         f"""
         SELECT
             substr(r.started_at, 1, 10) AS day,
-            r.stage AS stage,
+            {key_expr} AS stage,
             COALESCE(SUM(u.output_tokens), 0) AS output_tokens
         FROM run_model_usage u
         JOIN runs r ON r.id = u.run_id
         {join}
         {_where(conds)}
-        GROUP BY day, r.stage
+        GROUP BY day, stage
         ORDER BY day
         """,
         tuple(params),
@@ -1137,6 +1151,7 @@ def create_api_router(
         provider: Annotated[str | None, Query()] = None,
         teams: Annotated[str | None, Query()] = None,
         models: Annotated[str | None, Query()] = None,
+        by: Annotated[str, Query(pattern="^(stage|team|model)$")] = "stage",
         date_from: Annotated[str | None, Query(alias="from", pattern=DAY_PATTERN)] = None,
         date_to: Annotated[str | None, Query(alias="to", pattern=DAY_PATTERN)] = None,
     ) -> StageSeries:
@@ -1147,7 +1162,7 @@ def create_api_router(
         team_filter = _parse_teams(teams)
         model_filter = _parse_models(models)
         query, params = _spend_stage_series_query(
-            provider_filter, team_filter, model_filter, date_from, date_to
+            provider_filter, team_filter, model_filter, date_from, date_to, by
         )
         try:
             conn = await ui_db_pool.connection()

@@ -13,7 +13,10 @@ import {
   TOKEN_CATS,
 } from "@/components/dashboard/atoms";
 import { Heatmap } from "@/components/dashboard/Heatmap";
-import { StageTrend } from "@/components/dashboard/StageTrend";
+import {
+  StageTrend,
+  type SeriesAdapter,
+} from "@/components/dashboard/StageTrend";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
@@ -27,7 +30,6 @@ import {
   type SpendHeatmap,
   type SpendSummary,
   type SpendTotals,
-  type StageSeries,
   type TokenSplit,
 } from "@/lib/api";
 import {
@@ -48,6 +50,23 @@ const TEAM_TINT: Record<string, string> = {
   LP: "bg-cyan-500",
   SYM: "bg-emerald-500",
   HQ: "bg-amber-500",
+};
+
+// How each Breakdown view stacks/labels/colors its trend keys. Stage uses the
+// component's own pipeline-ordered default; team/model keep the server's order
+// and color by the same team-dot / provider-dot palette as the totals table.
+// (model series keys are "provider/model"; tint by the provider prefix.)
+const TREND_ADAPTERS: Record<"team" | "model", SeriesAdapter> = {
+  team: {
+    order: (keys) => keys,
+    label: (key) => key,
+    tint: (key) => TEAM_TINT[key] ?? "bg-slate-400",
+  },
+  model: {
+    order: (keys) => keys,
+    label: (key) => key,
+    tint: (key) => PROVIDER_TINT[key.split("/")[0]] ?? "bg-slate-400",
+  },
 };
 
 function useNowMs(): number {
@@ -287,24 +306,56 @@ export function BreakdownTable({
 export function TokenOverview({
   summary,
   heatmap,
-  stageSeries,
   provider,
   date,
   window,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
-  stageSeries?: StageSeries;
   provider: Provider;
   date: DateFilter;
   window: { from: string | null; to: string | null };
 }) {
   const [view, setView] = useState<"team" | "model" | "stage">("team");
-  // Totals vs Trend sub-view, only meaningful (and shown) in the stage view.
+  // Totals vs Trend sub-view, available in every breakdown view.
   const [stageMode, setStageMode] = useState<"totals" | "trend">("totals");
-  // Tokens vs % share metric for the stage Trend chart; owned here so its toggle
-  // can sit in the shared Breakdown header row.
+  // Tokens vs % share metric for the Trend chart; owned here so its toggle can
+  // sit in the shared Breakdown header row.
   const [trendMetric, setTrendMetric] = useState<"tokens" | "share">("tokens");
+
+  // The trend series follows the active view (stage / team / model) and the
+  // resolved date window; fetched only while Trend is showing. Filters mirror
+  // the summary query so the trend reconciles with the totals table.
+  const { teams, models } = useFilters();
+  const providerFilter = provider === "all" ? undefined : provider;
+  const teamsKey = [...teams].sort().join(",");
+  const teamsFilter = teams.length ? teams : undefined;
+  const modelsKey = [...models].sort().join(",");
+  const modelsFilter = models.length ? models : undefined;
+  const seriesQuery = useQuery({
+    queryKey: [
+      "spend-series",
+      view,
+      provider,
+      teamsKey,
+      modelsKey,
+      window.from,
+      window.to,
+    ],
+    queryFn: () =>
+      fetchSpendStageSeries(
+        view,
+        providerFilter,
+        teamsFilter,
+        modelsFilter,
+        window.from ?? undefined,
+        window.to ?? undefined,
+      ),
+    enabled: stageMode === "trend",
+    refetchInterval: 30_000,
+    placeholderData: (prev) => prev,
+  });
+  const series = seriesQuery.data;
 
   const teamRows: BreakdownRow[] = (summary?.per_team ?? []).map((t) => ({
     rowKey: t.key,
@@ -401,18 +452,16 @@ export function TokenOverview({
               value={view}
               onChange={(v) => setView(v as "team" | "model" | "stage")}
             />
-            {view === "stage" ? (
-              <Segmented
-                ariaLabel="Stage view"
-                options={[
-                  { value: "totals", label: "Totals" },
-                  { value: "trend", label: "Trend" },
-                ]}
-                value={stageMode}
-                onChange={(v) => setStageMode(v as "totals" | "trend")}
-              />
-            ) : null}
-            {view === "stage" && stageMode === "trend" ? (
+            <Segmented
+              ariaLabel="Breakdown view"
+              options={[
+                { value: "totals", label: "Totals" },
+                { value: "trend", label: "Trend" },
+              ]}
+              value={stageMode}
+              onChange={(v) => setStageMode(v as "totals" | "trend")}
+            />
+            {stageMode === "trend" ? (
               <Segmented
                 ariaLabel="Trend metric"
                 options={[
@@ -424,18 +473,21 @@ export function TokenOverview({
               />
             ) : null}
           </div>
-          {view === "stage" && stageMode === "trend" ? (
+          {stageMode === "trend" ? (
             <span className="font-mono text-[11px] text-muted-foreground">
-              output tokens ·{" "}
-              {stageSeries?.bucket === "week" ? "weekly" : "daily"}
+              output tokens · {series?.bucket === "week" ? "weekly" : "daily"}
             </span>
           ) : (
             <MixLegend />
           )}
         </div>
-        {view === "stage" && stageMode === "trend" ? (
-          stageSeries ? (
-            <StageTrend series={stageSeries} mode={trendMetric} />
+        {stageMode === "trend" ? (
+          series ? (
+            <StageTrend
+              series={series}
+              mode={trendMetric}
+              adapter={view === "stage" ? undefined : TREND_ADAPTERS[view]}
+            />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )
@@ -604,21 +656,8 @@ export function HomePage() {
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
-  // The by-stage trend follows the resolved date window (server picks day/week
-  // bucketing); it only renders inside the stage view's Trend sub-toggle.
-  const stageSeriesQuery = useQuery({
-    queryKey: ["spend-stage-series", provider, teamsKey, modelsKey, from, to],
-    queryFn: () =>
-      fetchSpendStageSeries(
-        providerFilter,
-        teamsFilter,
-        modelsFilter,
-        dateFrom,
-        dateTo,
-      ),
-    refetchInterval: 30_000,
-    placeholderData: (prev) => prev,
-  });
+  // The trend series is fetched inside TokenOverview (it follows the active
+  // breakdown view), so HomePage doesn't fetch it here.
   const activeQuery = useQuery({
     queryKey: ["issues", "active", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
@@ -668,7 +707,6 @@ export function HomePage() {
       <TokenOverview
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
-        stageSeries={stageSeriesQuery.data}
         provider={provider}
         date={date}
         window={{ from, to }}

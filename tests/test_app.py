@@ -2388,6 +2388,64 @@ async def test_api_spend_stage_series_unfiltered_spans_history_and_scopes(
 
 
 @pytest.mark.asyncio
+async def test_api_spend_stage_series_by_team_and_model(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="VIB-1", title="t", team_key="VIB"
+        )
+        await db.issues.upsert(
+            conn, id="b", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-15T10:00:00Z'),
+                ('r2', 'b', 'merge', 'completed', NULL, '2026-05-15T11:00:00Z')
+            """
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 0, 10, 0, 0)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5.5", 0, 40, 0, 0)]
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            team = await client.get(
+                "/api/spend/stage-series?by=team&from=2026-05-10&to=2026-05-17"
+            )
+            model = await client.get(
+                "/api/spend/stage-series?by=model&from=2026-05-10&to=2026-05-17"
+            )
+            bad = await client.get("/api/spend/stage-series?by=bogus")
+    finally:
+        await conn.close()
+
+    # by=team keys the series on the issue's team_key.
+    tbody = team.json()
+    assert set(tbody["stages"]) == {"VIB", "ENG"}
+    t_by_start = {b["start"]: b["output_tokens"] for b in tbody["buckets"]}
+    assert t_by_start["2026-05-15"] == {"VIB": 10, "ENG": 40}
+    # by=model keys on provider/model (the per-model rowKey the client builds).
+    mbody = model.json()
+    assert set(mbody["stages"]) == {"claude/claude-opus-4-8", "codex/gpt-5.5"}
+    m_by_start = {b["start"]: b["output_tokens"] for b in mbody["buckets"]}
+    assert m_by_start["2026-05-15"] == {
+        "claude/claude-opus-4-8": 10,
+        "codex/gpt-5.5": 40,
+    }
+    # An unknown dimension is rejected by the route's pattern.
+    assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
