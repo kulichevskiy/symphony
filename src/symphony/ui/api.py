@@ -62,6 +62,15 @@ class TeamSpend(BaseModel):
     issues: int
 
 
+class StageSpend(BaseModel):
+    key: str
+    input_tokens: int
+    output_tokens: int
+    cache_write_tokens: int
+    cache_read_tokens: int
+    issues: int
+
+
 class SpendTotals(BaseModel):
     input_tokens: int
     output_tokens: int
@@ -98,6 +107,9 @@ class SpendSummary(BaseModel):
     totals: SpendTotals
     per_team: list[TeamSpend]
     per_provider: list[ProviderSpend]
+    # One row per distinct runs.stage in the filtered window, under the same
+    # filters as per_team/per_provider so its grand total reconciles with them.
+    per_stage: list[StageSpend]
     # Always-unscoped list of team keys from config, populating the Teams
     # filter popover. Never narrowed by an active filter.
     teams: list[str] = Field(default_factory=list)
@@ -390,6 +402,53 @@ def _spend_per_provider_issues_query(
     )
 
 
+# Per-stage spend, grouped by runs.stage from the run_model_usage child table
+# under the SAME provider/teams/models/date filters as _spend_summary_query, so
+# per_stage reconciles to the same grand total as per_team / per_provider. The
+# set of stages is whatever runs.stage values are present — no whitelist; a
+# stage whose runs spent zero output still appears (e.g. review). Joins `issues`
+# only when scoping to teams, like the per-model query.
+def _spend_per_stage_query(
+    provider: str | None,
+    teams: list[str],
+    models: list[tuple[str, str]],
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str, tuple[str, ...]]:
+    join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
+    conds: list[str] = []
+    params: list[str] = []
+    if provider is not None:
+        conds.append("u.provider = ?")
+        params.append(provider)
+    if teams:
+        conds.append(_team_in_clause(teams))
+        params.extend(teams)
+    if models:
+        conds.append(_model_in_clause(models))
+        params.extend(_model_params(models))
+    wconds, wparams = _started_at_window(date_from, date_to)
+    conds += wconds
+    params += wparams
+    return (
+        f"""
+        SELECT
+            r.stage AS stage,
+            COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+            COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+            COUNT(DISTINCT r.issue_id) AS issues
+        FROM run_model_usage u
+        JOIN runs r ON r.id = u.run_id
+        {join}
+        {_where(conds)}
+        GROUP BY r.stage
+        """,
+        tuple(params),
+    )
+
+
 # Always-unscoped distinct (provider, model) pairs from run_model_usage, used to
 # populate the Models filter popover. Never narrowed by an active filter.
 def _spend_models_query() -> str:
@@ -515,6 +574,7 @@ def _build_spend_summary(
     provider_issue_rows: list[dict[str, object]] | None = None,
     teams: list[str] | None = None,
     models: list[dict[str, object]] | None = None,
+    stage_rows: list[dict[str, object]] | None = None,
 ) -> SpendSummary:
     per_team: list[TeamSpend] = []
     acc = {
@@ -556,10 +616,22 @@ def _build_spend_summary(
     per_provider = _build_per_provider(
         model_rows or [], provider_issue_rows or []
     )
+    per_stage = [
+        StageSpend(
+            key=str(r["stage"]),
+            input_tokens=int(r["input_tokens"] or 0),
+            output_tokens=int(r["output_tokens"] or 0),
+            cache_write_tokens=int(r["cache_write_tokens"] or 0),
+            cache_read_tokens=int(r["cache_read_tokens"] or 0),
+            issues=int(r["issues"] or 0),
+        )
+        for r in (stage_rows or [])
+    ]
     return SpendSummary(
         totals=totals,
         per_team=per_team,
         per_provider=per_provider,
+        per_stage=per_stage,
         teams=teams or [],
         models=[
             ModelRef(provider=str(r["provider"]), model=str(r["model"]))
@@ -852,6 +924,9 @@ def create_api_router(
                 team_filter, model_filter, date_from, date_to
             )
         )
+        stage_query, stage_params = _spend_per_stage_query(
+            provider_filter, team_filter, model_filter, date_from, date_to
+        )
         models_query = _spend_models_query()
         try:
             conn = await ui_db_pool.connection()
@@ -861,6 +936,8 @@ def create_api_router(
             model_rows = [dict(row) for row in await cur.fetchall()]
             cur = await conn.execute(provider_issues_query, provider_issues_params)
             provider_issue_rows = [dict(row) for row in await cur.fetchall()]
+            cur = await conn.execute(stage_query, stage_params)
+            stage_rows = [dict(row) for row in await cur.fetchall()]
             cur = await conn.execute(models_query)
             available_models = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
@@ -873,6 +950,7 @@ def create_api_router(
             provider_issue_rows,
             teams=config_teams,
             models=available_models,
+            stage_rows=stage_rows,
         )
 
     @router.get("/spend/heatmap", response_model=SpendHeatmap)

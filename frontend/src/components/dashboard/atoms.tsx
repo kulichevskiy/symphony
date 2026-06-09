@@ -38,6 +38,80 @@ export const PROVIDER_TINT: Record<string, string> = {
 };
 
 /**
+ * The single shared stage constant — pipeline order + label + dot/segment color
+ * — used by both the lifecycle bar and the by-stage breakdown table so they
+ * speak one language. Colors come from the dashboard palette. Stages not listed
+ * here sort last (appended) and fall back to slate at the call site.
+ */
+export const STAGES = [
+  { key: "implement", label: "Implement", tint: "bg-blue-500" },
+  { key: "local_review", label: "Local review", tint: "bg-cyan-500" },
+  { key: "review", label: "Review", tint: "bg-violet-500" },
+  { key: "review_fix", label: "Review fix", tint: "bg-amber-500" },
+  { key: "merge", label: "Merge", tint: "bg-emerald-500" },
+  { key: "acceptance", label: "Acceptance", tint: "bg-slate-400" },
+] as const satisfies ReadonlyArray<{
+  key: string;
+  label: string;
+  tint: string;
+}>;
+
+const STAGE_RANK: Record<string, number> = Object.fromEntries(
+  STAGES.map((s, i) => [s.key, i]),
+);
+export const STAGE_TINT: Record<string, string> = Object.fromEntries(
+  STAGES.map((s) => [s.key, s.tint]),
+);
+export const STAGE_LABEL: Record<string, string> = Object.fromEntries(
+  STAGES.map((s) => [s.key, s.label]),
+);
+
+/** Pipeline rank of a stage; unknown stages sort after every known one. */
+export function stageRank(key: string): number {
+  return key in STAGE_RANK ? STAGE_RANK[key] : STAGES.length;
+}
+
+/**
+ * The pipeline lifecycle bar: one stacked track whose segments are each stage's
+ * share of total output tokens, colored by the shared stage palette. Rows are
+ * rendered in the order given (pipeline order); a 0-output stage adds no
+ * segment but is still listed in the by-stage table below.
+ */
+export function LifecycleBar({
+  rows,
+  className,
+}: {
+  rows: Array<{ key: string; output_tokens: number }>;
+  className?: string;
+}) {
+  const total = rows.reduce((s, r) => s + r.output_tokens, 0) || 1;
+  const title = rows
+    .map((r) => `${STAGE_LABEL[r.key] ?? r.key} ${formatTokens(r.output_tokens)}`)
+    .join(" · ");
+  return (
+    <div
+      className={cn(
+        "flex h-2.5 w-full overflow-hidden rounded-full bg-secondary/70",
+        className,
+      )}
+      title={title}
+    >
+      {rows.map((r) => {
+        const pct = (r.output_tokens / total) * 100;
+        if (pct <= 0) return null;
+        return (
+          <div
+            key={r.key}
+            className={STAGE_TINT[r.key] ?? "bg-slate-400"}
+            style={{ width: `${pct}%` }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+/**
  * Per-row stacked token mix-bar. Segments are always sized by this row's own
  * raw-token proportions of in / out / cache-write / cache-read.
  *

@@ -2119,6 +2119,101 @@ async def test_api_spend_summary_scoped_by_provider_reconciles(
 
 
 @pytest.mark.asyncio
+async def test_api_spend_summary_per_stage_reconciles_and_scopes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for iid, ident, team in (
+            ("a", "ENG-1", "ENG"),
+            ("b", "ENG-2", "ENG"),
+            ("c", "WEB-1", "WEB"),
+        ):
+            await db.issues.upsert(
+                conn, id=iid, identifier=ident, title=ident, team_key=team
+            )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z'),
+                ('r2', 'a', 'review', 'completed', NULL, '2026-05-17T10:20:00Z'),
+                ('r3', 'b', 'implement', 'completed', NULL, '2026-05-17T11:00:00Z'),
+                ('r4', 'c', 'merge', 'completed', NULL, '2026-05-17T12:00:00Z')
+            """
+        )
+        # The review run spent input/cache but zero output → 'review' must still
+        # appear as a 0-output row. implement spans two providers.
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 20, 30, 40)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 10, 0, 5, 4)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("codex", "gpt-5.5", 50, 5, 5, 5)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r4", [ModelUsage("claude", "claude-opus-4-8", 200, 40, 60, 80)]
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            resp = await client.get("/api/spend/summary")
+            claude_resp = await client.get("/api/spend/summary?provider=claude")
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    stages = {s["key"]: s for s in body["per_stage"]}
+    # One row per distinct runs.stage in the window — no whitelist.
+    assert set(stages) == {"implement", "review", "merge"}
+    # review present at zero output rather than hidden.
+    assert stages["review"]["output_tokens"] == 0
+    assert stages["review"]["input_tokens"] == 10
+    assert stages["review"]["issues"] == 1
+    # implement sums both providers; all four categories + issue count.
+    impl = stages["implement"]
+    assert impl["input_tokens"] == 150
+    assert impl["output_tokens"] == 25
+    assert impl["cache_write_tokens"] == 35
+    assert impl["cache_read_tokens"] == 45
+    assert impl["issues"] == 2  # {a, b}
+    assert stages["merge"]["output_tokens"] == 40
+
+    token_keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_read_tokens",
+    )
+
+    # per_stage reconciles to the same grand total as per_team / per_provider.
+    def col_sum(group: str, key: str) -> int:
+        return sum(int(r[key]) for r in body[group])
+
+    for key in token_keys:
+        assert col_sum("per_stage", key) == col_sum("per_team", key)
+        assert col_sum("per_stage", key) == col_sum("per_provider", key)
+    assert col_sum("per_stage", "output_tokens") == 65
+
+    # Provider filter scopes per_stage exactly like the other groupings.
+    cbody = claude_resp.json()
+    cstages = {s["key"]: s for s in cbody["per_stage"]}
+    assert cstages["implement"]["output_tokens"] == 20  # claude's r1 only
+    assert cstages["review"]["output_tokens"] == 0
+    for key in token_keys:
+        cstage = sum(int(s[key]) for s in cbody["per_stage"])
+        cteam = sum(int(t[key]) for t in cbody["per_team"])
+        assert cstage == cteam
+
+
+@pytest.mark.asyncio
 async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
