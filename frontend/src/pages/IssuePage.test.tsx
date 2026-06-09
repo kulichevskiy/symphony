@@ -1,8 +1,40 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { CmdButton, PrCard, TokensCard } from "./IssuePage";
+import {
+  aggregateRunsByStage,
+  CmdButton,
+  PrCard,
+  StageSpendCard,
+  TokensCard,
+} from "./IssuePage";
 import { applicability } from "./issueControls";
+
+function run(stage: string, tok: Partial<Record<string, number>>) {
+  return {
+    id: stage + Math.random(),
+    stage,
+    status: "done",
+    pid: null,
+    started_at: "2026-06-07T10:00:00Z",
+    ended_at: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_write_tokens: 0,
+    cache_read_tokens: 0,
+    termination_kind: "",
+    termination_detail: "",
+    exit_returncode: null,
+    ...tok,
+  };
+}
+
+const stageRuns = [
+  run("implement", { input_tokens: 100, output_tokens: 40, cache_write_tokens: 5, cache_read_tokens: 1000 }),
+  run("implement", { input_tokens: 50, output_tokens: 10 }),
+  run("review", { input_tokens: 20, output_tokens: 0 }),
+  run("merge", { output_tokens: 50 }),
+];
 
 describe("applicability", () => {
   it("enables only Stop while a run is in progress", () => {
@@ -142,6 +174,57 @@ describe("TokensCard", () => {
     // Proportional mix-bars, no provider/model summed total rendered.
     expect(markup).toContain("width:");
     expect(markup).not.toContain("10380000");
+  });
+});
+
+describe("aggregateRunsByStage", () => {
+  it("sums runs per stage with exact per-run totals, in pipeline order", () => {
+    const { rows, reached, total } = aggregateRunsByStage(stageRuns);
+    expect(rows.map((r) => r.key)).toEqual([
+      "implement",
+      "local_review",
+      "review",
+      "review_fix",
+      "merge",
+      "acceptance",
+    ]);
+    const impl = rows.find((r) => r.key === "implement")!;
+    expect(impl.input_tokens).toBe(150);
+    expect(impl.output_tokens).toBe(50);
+    expect(impl.reached).toBe(true);
+    expect(rows.find((r) => r.key === "local_review")!.reached).toBe(false);
+    // "Reached" = ≥1 run in the stage; M = canonical seen-stage list.
+    expect(reached).toBe(3);
+    expect(total).toBe(6);
+  });
+
+  it("appends a non-canonical stage after the known pipeline", () => {
+    const { rows, reached, total } = aggregateRunsByStage([
+      run("implement", { output_tokens: 5 }),
+      run("mystery", { output_tokens: 7 }),
+    ]);
+    expect(rows.map((r) => r.key).at(-1)).toBe("mystery");
+    // Non-canonical stages don't inflate the N/M count.
+    expect(reached).toBe(1);
+    expect(total).toBe(6);
+  });
+});
+
+describe("StageSpendCard", () => {
+  it("shows reached/canonical count, greys unreached, output share, raw cols", () => {
+    const markup = renderToStaticMarkup(<StageSpendCard runs={stageRuns} />);
+    expect(markup).toContain("Spend by lifecycle stage");
+    expect(markup).toContain("3/6 reached");
+    expect(markup).toContain("Implement");
+    expect(markup).toContain("Local review");
+    expect(markup).toContain("Merge");
+    // Unreached stages greyed.
+    expect(markup).toContain("opacity-40");
+    // Bars/share use output tokens — implement & merge each 50% of output.
+    expect(markup).toContain("50%");
+    // Table shows raw token categories with exact per-run sums.
+    expect(markup).toContain("CACHE-WRITE");
+    expect(markup).toContain('title="150">150</span>');
   });
 });
 

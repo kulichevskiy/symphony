@@ -5,8 +5,13 @@ import { Link, useParams } from "react-router";
 import {
   type Checks,
   CheckSummary,
+  LifecycleBar,
   MixBar,
   PROVIDER_TINT,
+  STAGE_LABEL,
+  STAGE_TINT,
+  STAGES,
+  stageRank,
   Tk,
   TOKEN_CATS,
   TokenFigures,
@@ -303,6 +308,171 @@ export function TokensCard({ c }: { c: Cockpit }) {
         ))}
       </div>
       <TokensByModel rows={c.byModel} />
+    </CockpitCard>
+  );
+}
+
+/** One lifecycle stage's exact per-run token sums for this issue, plus whether
+ *  the issue ever ran it. */
+export type StageAggRow = TokenSplit & {
+  key: string;
+  reached: boolean;
+};
+
+/** Aggregate an issue's runs by `stage` into one row per canonical pipeline
+ *  stage (in pipeline order), tracking which were reached (≥1 run). Stages the
+ *  issue ran that aren't in the canonical list are appended after. `reached`/
+ *  `total` describe the canonical seen-stage list only (the "N/M reached" count),
+ *  so non-canonical stages never inflate it. Sums are exact per-run totals. */
+export function aggregateRunsByStage(runs: IssueDetail["runs"]): {
+  rows: StageAggRow[];
+  reached: number;
+  total: number;
+} {
+  const sums = new Map<string, TokenSplit>();
+  for (const r of runs) {
+    const s = sums.get(r.stage) ?? {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_write_tokens: 0,
+      cache_read_tokens: 0,
+    };
+    s.input_tokens += r.input_tokens;
+    s.output_tokens += r.output_tokens;
+    s.cache_write_tokens += r.cache_write_tokens;
+    s.cache_read_tokens += r.cache_read_tokens;
+    sums.set(r.stage, s);
+  }
+  const extras = [...sums.keys()]
+    .filter((k) => !(k in STAGE_TINT))
+    .sort((a, b) => stageRank(a) - stageRank(b));
+  const keys = [...STAGES.map((s) => s.key), ...extras];
+  const rows: StageAggRow[] = keys.map((key) => {
+    const s = sums.get(key);
+    return {
+      key,
+      reached: s !== undefined,
+      input_tokens: s?.input_tokens ?? 0,
+      output_tokens: s?.output_tokens ?? 0,
+      cache_write_tokens: s?.cache_write_tokens ?? 0,
+      cache_read_tokens: s?.cache_read_tokens ?? 0,
+    };
+  });
+  return {
+    rows,
+    reached: STAGES.filter((s) => sums.has(s.key)).length,
+    total: STAGES.length,
+  };
+}
+
+const STAGE_NUM_COLS: Array<{ key: keyof TokenSplit; head: string }> = [
+  { key: "input_tokens", head: "IN" },
+  { key: "output_tokens", head: "OUT" },
+  { key: "cache_write_tokens", head: "CACHE-WRITE" },
+  { key: "cache_read_tokens", head: "CACHE-READ" },
+];
+
+/** "Spend by lifecycle stage" — a stage flow bar + per-stage output-share step
+ *  bars + a raw-token table, all derived from this issue's `runs`. Bars and the
+ *  share % are output-tokens-everywhere; the table prints the four raw token
+ *  categories. Stages the issue never reached are greyed. */
+export function StageSpendCard({ runs }: { runs: IssueDetail["runs"] }) {
+  const { rows, reached, total } = aggregateRunsByStage(runs);
+  const totalOutput = rows.reduce((s, r) => s + r.output_tokens, 0);
+  return (
+    <CockpitCard
+      title="Spend by lifecycle stage"
+      aside={
+        <span className="font-mono text-[11px] text-muted-foreground">
+          {reached}/{total} reached
+        </span>
+      }
+    >
+      {/* stage flow bar — each reached stage's share of output tokens */}
+      <LifecycleBar rows={rows.filter((r) => r.reached)} className="mb-4" />
+
+      {/* per-stage step bars — output share, greyed where unreached */}
+      <div className="space-y-2">
+        {rows.map((r) => {
+          const pct = totalOutput > 0 ? (r.output_tokens / totalOutput) * 100 : 0;
+          return (
+            <div
+              key={r.key}
+              className={cn("flex items-center gap-3", !r.reached && "opacity-40")}
+            >
+              <span className="flex w-28 shrink-0 items-center gap-1.5 text-xs">
+                <span
+                  className={cn(
+                    "h-2 w-2 shrink-0 rounded-full",
+                    r.reached ? STAGE_TINT[r.key] ?? "bg-slate-400" : "bg-slate-400",
+                  )}
+                />
+                <span className="truncate font-medium">
+                  {STAGE_LABEL[r.key] ?? r.key}
+                </span>
+              </span>
+              <div className="h-2.5 flex-1 overflow-hidden rounded-full bg-secondary/70">
+                <div
+                  className={cn("h-full", STAGE_TINT[r.key] ?? "bg-slate-400")}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <span className="w-10 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                {Math.round(pct)}%
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* stage table — raw token categories (not output-only) */}
+      <div className="mt-4 overflow-x-auto rounded-md border border-border">
+        <table className="w-full caption-bottom text-sm">
+          <thead>
+            <tr className="border-b border-border bg-secondary/40 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              <th className="px-3 py-1.5 text-left font-medium">Stage</th>
+              {STAGE_NUM_COLS.map((c) => (
+                <th key={c.key} className="px-3 py-1.5 text-right font-medium">
+                  {c.head}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr
+                key={r.key}
+                className={cn(
+                  "border-b border-border/70 last:border-0",
+                  !r.reached && "opacity-40",
+                )}
+              >
+                <td className="whitespace-nowrap px-3 py-2">
+                  <span className="flex items-center gap-2">
+                    <span
+                      className={cn(
+                        "h-2 w-2 shrink-0 rounded-full",
+                        r.reached ? STAGE_TINT[r.key] ?? "bg-slate-400" : "bg-slate-400",
+                      )}
+                    />
+                    <span className="text-sm font-medium">
+                      {STAGE_LABEL[r.key] ?? r.key}
+                    </span>
+                  </span>
+                </td>
+                {STAGE_NUM_COLS.map((c) => (
+                  <td
+                    key={c.key}
+                    className="whitespace-nowrap px-3 py-2 text-right font-mono text-xs tabular-nums"
+                  >
+                    <Tk value={r[c.key]} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </CockpitCard>
   );
 }
@@ -703,6 +873,7 @@ export function IssuePage() {
               <TokensCard c={cockpit} />
               <PrCard pr={cockpit.pr} />
             </div>
+            <StageSpendCard runs={detail.runs} />
             <CockpitCard
               title="Controls"
               aside={
