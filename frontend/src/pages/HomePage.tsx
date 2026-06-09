@@ -3,8 +3,12 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import {
+  LifecycleBar,
   MixBar,
   PROVIDER_TINT,
+  STAGE_LABEL,
+  STAGE_TINT,
+  stageRank,
   Tk,
   TOKEN_CATS,
 } from "@/components/dashboard/atoms";
@@ -93,14 +97,15 @@ export function MixLegend() {
   );
 }
 
-/** One unified breakdown row — a team or a provider/model — carrying the four
- *  token figures plus enough identity to render its name cell. */
+/** One unified breakdown row — a team, a provider/model, or a stage — carrying
+ *  the four token figures plus enough identity to render its name cell. */
 type BreakdownRow = TokenSplit & {
   rowKey: string;
   issues: number;
   teamKey?: string;
   provider?: string;
   model?: string;
+  stageKey?: string;
 };
 
 const NUM_COLS: Array<{ key: keyof TokenSplit; head: string }> = [
@@ -116,21 +121,28 @@ function rowTotal(r: TokenSplit): number {
   );
 }
 
-/** The unified Breakdown table — renders team rows or provider/model rows with
- *  the same columns, a magnitude mix bar (length = sum of tokens), and click-to-
- *  sort on the four numeric columns (descending). */
+/** The unified Breakdown table — renders team, provider/model, or stage rows
+ *  with the same columns and a magnitude mix bar (length = sum of tokens).
+ *  Team/model are click-to-sort on the four numeric columns (descending); the
+ *  stage view is non-sortable, kept in the caller's pipeline order, and gains a
+ *  "Share" column showing each stage's percentage of total output tokens. */
 export function BreakdownTable({
   rows,
   kind,
   barMode = "magnitude",
 }: {
   rows: BreakdownRow[];
-  kind: "team" | "model";
+  kind: "team" | "model" | "stage";
   barMode?: "composition" | "magnitude";
 }) {
   const [sortKey, setSortKey] = useState<keyof TokenSplit>("output_tokens");
-  const sorted = [...rows].sort((a, b) => b[sortKey] - a[sortKey]);
+  const sortable = kind !== "stage";
+  // Stage stays in the caller's pipeline order; team/model sort by the column.
+  const sorted = sortable
+    ? [...rows].sort((a, b) => b[sortKey] - a[sortKey])
+    : rows;
   const maxTotal = rows.length ? Math.max(...rows.map(rowTotal)) : 0;
+  const totalOutput = rows.reduce((s, r) => s + r.output_tokens, 0);
 
   if (rows.length === 0) {
     return (
@@ -140,17 +152,31 @@ export function BreakdownTable({
     );
   }
 
+  const nameHead =
+    kind === "team" ? "Team" : kind === "model" ? "Provider / model" : "Stage";
+
   return (
     <div className="overflow-x-auto rounded-md border border-border">
       <table className="w-full caption-bottom text-sm">
         <thead>
           <tr className="border-b border-border bg-secondary/40 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            <th className="px-3 py-1.5 text-left font-medium">
-              {kind === "team" ? "Team" : "Provider / model"}
-            </th>
+            <th className="px-3 py-1.5 text-left font-medium">{nameHead}</th>
             <th className="px-3 py-1.5 text-right font-medium">Issues</th>
+            {kind === "stage" && (
+              <th className="px-3 py-1.5 text-right font-medium">Share</th>
+            )}
             <th className="w-[180px] px-3 py-1.5 text-left font-medium">Mix</th>
             {NUM_COLS.map((c) => {
+              if (!sortable) {
+                return (
+                  <th
+                    key={c.key}
+                    className="px-3 py-1.5 text-right font-medium"
+                  >
+                    {c.head}
+                  </th>
+                );
+              }
               const active = sortKey === c.key;
               return (
                 <th
@@ -178,6 +204,10 @@ export function BreakdownTable({
         </thead>
         <tbody>
           {sorted.map((r) => {
+            const sharePct =
+              totalOutput > 0
+                ? Math.round((r.output_tokens / totalOutput) * 100)
+                : 0;
             return (
               <tr
                 key={r.rowKey}
@@ -194,7 +224,7 @@ export function BreakdownTable({
                       />
                       <span className="text-sm font-medium">{r.teamKey}</span>
                     </span>
-                  ) : (
+                  ) : kind === "model" ? (
                     <span className="flex items-center gap-2">
                       <span
                         className={cn(
@@ -207,11 +237,28 @@ export function BreakdownTable({
                         {r.provider}
                       </span>
                     </span>
+                  ) : (
+                    <span className="flex items-center gap-2">
+                      <span
+                        className={cn(
+                          "h-2 w-2 shrink-0 rounded-full",
+                          STAGE_TINT[r.stageKey ?? ""] ?? "bg-slate-400",
+                        )}
+                      />
+                      <span className="text-sm font-medium">
+                        {STAGE_LABEL[r.stageKey ?? ""] ?? r.stageKey}
+                      </span>
+                    </span>
                   )}
                 </td>
                 <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs tabular-nums text-muted-foreground">
                   {r.issues}
                 </td>
+                {kind === "stage" && (
+                  <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs tabular-nums text-muted-foreground">
+                    {sharePct}%
+                  </td>
+                )}
                 <td className="px-3 py-2.5">
                   <MixBar split={r} mode={barMode} maxTotal={maxTotal} />
                 </td>
@@ -247,7 +294,7 @@ export function TokenOverview({
   date: DateFilter;
   window: { from: string | null; to: string | null };
 }) {
-  const [view, setView] = useState<"team" | "model">("team");
+  const [view, setView] = useState<"team" | "model" | "stage">("team");
 
   const teamRows: BreakdownRow[] = (summary?.per_team ?? []).map((t) => ({
     rowKey: t.key,
@@ -274,7 +321,22 @@ export function TokenOverview({
         cache_read_tokens: m.cache_read_tokens,
       })),
     );
-  const rows = view === "team" ? teamRows : modelRows;
+  // per_stage is provider-scoped server-side, so it reconciles with the rail as
+  // returned; just reorder into pipeline order (unknown stages appended).
+  const sortedStages = [...(summary?.per_stage ?? [])].sort(
+    (a, b) => stageRank(a.key) - stageRank(b.key),
+  );
+  const stageRows: BreakdownRow[] = sortedStages.map((s) => ({
+    rowKey: s.key,
+    stageKey: s.key,
+    issues: s.issues,
+    input_tokens: s.input_tokens,
+    output_tokens: s.output_tokens,
+    cache_write_tokens: s.cache_write_tokens,
+    cache_read_tokens: s.cache_read_tokens,
+  }));
+  const rows =
+    view === "team" ? teamRows : view === "model" ? modelRows : stageRows;
 
   return (
     <Card className="p-5">
@@ -324,13 +386,17 @@ export function TokenOverview({
               options={[
                 { value: "team", label: "By team" },
                 { value: "model", label: "By model" },
+                { value: "stage", label: "By stage" },
               ]}
               value={view}
-              onChange={(v) => setView(v as "team" | "model")}
+              onChange={(v) => setView(v as "team" | "model" | "stage")}
             />
           </div>
           <MixLegend />
         </div>
+        {view === "stage" ? (
+          <LifecycleBar rows={sortedStages} className="mb-3" />
+        ) : null}
         <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
       </div>
     </Card>

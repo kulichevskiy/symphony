@@ -63,6 +63,11 @@ export interface ProviderSpend extends TokenSplit {
   per_model: ModelSpend[];
 }
 
+export interface StageSpend extends TokenSplit {
+  key: string;
+  issues: number;
+}
+
 /** A provider-qualified model, as surfaced by the always-unscoped `models`
  *  list on /spend/summary to populate the Models filter popover. */
 export interface ModelRef {
@@ -74,6 +79,9 @@ export interface SpendSummary {
   totals: SpendTotals;
   per_team: TeamSpend[];
   per_provider: ProviderSpend[];
+  /** One row per distinct runs.stage in the filtered window; reconciles with
+   *  per_team / per_provider. */
+  per_stage: StageSpend[];
   /** Always-unscoped team keys from config, for the Teams filter popover. */
   teams: string[];
   /** Always-unscoped (provider, model) pairs, for the Models filter popover. */

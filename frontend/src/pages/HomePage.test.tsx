@@ -181,6 +181,31 @@ describe("BreakdownTable", () => {
     const markup = renderToStaticMarkup(<BreakdownTable rows={[]} kind="team" />);
     expect(markup).toContain("No teams/models match the current filters");
   });
+
+  it("renders stage rows in the given pipeline order without re-sorting", () => {
+    // Outputs are NOT descending: an output-sort would put merge first.
+    const stageRows = [
+      { rowKey: "implement", stageKey: "implement", issues: 2, input_tokens: 150, output_tokens: 10, cache_write_tokens: 0, cache_read_tokens: 0 },
+      { rowKey: "review", stageKey: "review", issues: 1, input_tokens: 10, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0 },
+      { rowKey: "merge", stageKey: "merge", issues: 1, input_tokens: 0, output_tokens: 100, cache_write_tokens: 0, cache_read_tokens: 0 },
+    ];
+    const markup = renderToStaticMarkup(
+      <BreakdownTable rows={stageRows} kind="stage" barMode="magnitude" />,
+    );
+    expect(markup).toContain(">Stage</th>");
+    // Pipeline order preserved (implement → review → merge), not output-sorted.
+    expect(markup.indexOf("Implement")).toBeLessThan(markup.indexOf("Review"));
+    expect(markup.indexOf("Review")).toBeLessThan(markup.indexOf("Merge"));
+    // Non-sortable: numeric headers are plain text, no sort affordance.
+    expect(markup).not.toContain('aria-sort');
+    // Share column on output: merge 100/110 ≈ 91%, review at 0%.
+    expect(markup).toContain(">Share</th>");
+    expect(markup).toContain("0%");
+    // Stage palette dots + raw OUT values.
+    expect(markup).toContain("bg-violet-500"); // review tint
+    expect(markup).toContain("bg-emerald-500"); // merge tint
+    expect(markup).toContain('title="100">100</span>');
+  });
 });
 
 describe("TokenOverview", () => {
@@ -219,6 +244,11 @@ describe("TokenOverview", () => {
         ],
       },
     ],
+    per_stage: [
+      { key: "implement", input_tokens: 5_000_000, output_tokens: 6_000_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 5 },
+      { key: "review", input_tokens: 100, output_tokens: 0, cache_write_tokens: 0, cache_read_tokens: 0, issues: 1 },
+      { key: "merge", input_tokens: 1_000, output_tokens: 1_500_000, cache_write_tokens: 0, cache_read_tokens: 0, issues: 3 },
+    ],
     teams: ["VIB", "ADJ"],
     models: [
       { provider: "claude", model: "claude-opus-4-8" },
@@ -248,6 +278,7 @@ describe("TokenOverview", () => {
     expect(markup).toContain("Breakdown");
     expect(markup).toContain("By team");
     expect(markup).toContain("By model");
+    expect(markup).toContain("By stage");
     // Defaults to the team view (VIB row present, no model names yet).
     expect(markup).toContain(">VIB</span>");
     expect(markup).not.toContain("gpt-5-codex");
