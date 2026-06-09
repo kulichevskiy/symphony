@@ -284,6 +284,30 @@ describe("TokenOverview", () => {
     expect(markup).not.toContain("gpt-5-codex");
   });
 
+  const stageSeries = {
+    bucket: "day" as const,
+    start: "2026-06-01",
+    end: "2026-06-01",
+    stages: ["implement"],
+    buckets: [{ start: "2026-06-01", output_tokens: { implement: 100 } }],
+  };
+
+  it("shows the Totals/Trend sub-toggle only in the stage view", () => {
+    const team = renderToStaticMarkup(
+      <TokenOverview
+        summary={summary}
+        heatmap={heatmap}
+        stageSeries={stageSeries}
+        provider="all"
+        date={DEFAULT_DATE}
+        window={{ from: null, to: null }}
+      />,
+    );
+    // Team view: no stage sub-toggle.
+    expect(team).not.toContain("Totals");
+    expect(team).not.toContain("Trend");
+  });
+
   it("suffixes the rail eyebrow with the active provider", () => {
     const markup = renderToStaticMarkup(
       <TokenOverview

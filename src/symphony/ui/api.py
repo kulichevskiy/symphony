@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Protocol
 
@@ -131,6 +131,26 @@ class SpendHeatmap(BaseModel):
     days: list[HeatmapDay]
     start: str
     end: str
+
+
+class StageSeriesBucket(BaseModel):
+    # Bucket start day (`YYYY-MM-DD`): the calendar day for daily buckets, the
+    # week's Monday for weekly ones. `output_tokens` maps stage -> summed output
+    # for the bucket, carrying only non-zero stages (the client zero-fills).
+    start: str
+    output_tokens: dict[str, int]
+
+
+class StageSeries(BaseModel):
+    buckets: list[StageSeriesBucket]
+    # "day" for short windows (<= ~6 weeks), "week" beyond.
+    bucket: str
+    # Distinct runs.stage values present in the window (incl. zero-output ones),
+    # like per_stage. Pipeline ordering is applied client-side.
+    stages: list[str]
+    # Inclusive bucketing window; null only when unfiltered and no runs exist.
+    start: str | None
+    end: str | None
 
 
 class CommandRequest(BaseModel):
@@ -504,6 +524,124 @@ def _spend_heatmap_query(
         ORDER BY day
         """,
         tuple(params),
+    )
+
+
+# Per-stage output tokens bucketed by UTC start day, sourced from the
+# run_model_usage child table under the SAME provider/teams/models/date filters
+# as _spend_per_stage_query so the trend reconciles with the by-stage totals.
+# Returns one row per (day, stage); weekly rollup happens in Python.
+def _spend_stage_series_query(
+    provider: str | None,
+    teams: list[str],
+    models: list[tuple[str, str]],
+    date_from: str | None,
+    date_to: str | None,
+) -> tuple[str, tuple[str, ...]]:
+    join = "JOIN issues i ON i.id = r.issue_id" if teams else ""
+    conds: list[str] = []
+    params: list[str] = []
+    if provider is not None:
+        conds.append("u.provider = ?")
+        params.append(provider)
+    if teams:
+        conds.append(_team_in_clause(teams))
+        params.extend(teams)
+    if models:
+        conds.append(_model_in_clause(models))
+        params.extend(_model_params(models))
+    wconds, wparams = _started_at_window(date_from, date_to)
+    conds += wconds
+    params += wparams
+    return (
+        f"""
+        SELECT
+            substr(r.started_at, 1, 10) AS day,
+            r.stage AS stage,
+            COALESCE(SUM(u.output_tokens), 0) AS output_tokens
+        FROM run_model_usage u
+        JOIN runs r ON r.id = u.run_id
+        {join}
+        {_where(conds)}
+        GROUP BY day, r.stage
+        ORDER BY day
+        """,
+        tuple(params),
+    )
+
+
+# Daily buckets while the window spans <= ~6 weeks (42-day span), weekly beyond.
+_STAGE_SERIES_DAILY_MAX_SPAN_DAYS = 42
+
+
+def _series_granularity(start: str, end: str) -> str:
+    span = (date.fromisoformat(end) - date.fromisoformat(start)).days
+    return "day" if span <= _STAGE_SERIES_DAILY_MAX_SPAN_DAYS else "week"
+
+
+def _week_start(day: date) -> date:
+    """The Monday of the ISO week containing `day` (matches the heatmap grid)."""
+    return day - timedelta(days=day.weekday())
+
+
+def _build_stage_series(
+    rows: list[dict[str, object]],
+    date_from: str | None,
+    date_to: str | None,
+) -> StageSeries:
+    """Roll per-(day, stage) output rows into a dense day/week-bucketed series.
+
+    The window follows the active date filter; an open bound falls back to the
+    earliest/latest observed run day so an unfiltered series spans all history.
+    """
+    observed = sorted({str(r["day"]) for r in rows})
+    start = date_from or (observed[0] if observed else None)
+    end = date_to or (observed[-1] if observed else None)
+    if start is None or end is None or start > end:
+        return StageSeries(
+            buckets=[], bucket="day", stages=[], start=start, end=end
+        )
+
+    granularity = _series_granularity(start, end)
+
+    def bucket_of(day_str: str) -> str:
+        if granularity == "week":
+            return _week_start(date.fromisoformat(day_str)).isoformat()
+        return day_str
+
+    stages: list[str] = []
+    agg: dict[str, dict[str, int]] = {}
+    for r in rows:
+        stage = str(r["stage"])
+        if stage not in stages:
+            stages.append(stage)
+        slot = agg.setdefault(bucket_of(str(r["day"])), {})
+        slot[stage] = slot.get(stage, 0) + int(r["output_tokens"] or 0)
+    stages.sort()
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end)
+    starts: list[str] = []
+    if granularity == "week":
+        cur, last = _week_start(start_d), _week_start(end_d)
+        while cur <= last:
+            starts.append(cur.isoformat())
+            cur += timedelta(days=7)
+    else:
+        cur = start_d
+        while cur <= end_d:
+            starts.append(cur.isoformat())
+            cur += timedelta(days=1)
+
+    buckets = [
+        StageSeriesBucket(
+            start=s,
+            output_tokens={k: v for k, v in agg.get(s, {}).items() if v},
+        )
+        for s in starts
+    ]
+    return StageSeries(
+        buckets=buckets, bucket=granularity, stages=stages, start=start, end=end
     )
 
 
@@ -993,6 +1131,33 @@ def create_api_router(
             start=start.isoformat(),
             end=request_now.date().isoformat(),
         )
+
+    @router.get("/spend/stage-series", response_model=StageSeries)
+    async def spend_stage_series(
+        provider: Annotated[str | None, Query()] = None,
+        teams: Annotated[str | None, Query()] = None,
+        models: Annotated[str | None, Query()] = None,
+        date_from: Annotated[str | None, Query(alias="from", pattern=DAY_PATTERN)] = None,
+        date_to: Annotated[str | None, Query(alias="to", pattern=DAY_PATTERN)] = None,
+    ) -> StageSeries:
+        if ui_db_pool is None:
+            raise HTTPException(status_code=503, detail="UI database is not configured")
+        # "all" (and the omitted param) mean no provider scoping.
+        provider_filter = None if provider in (None, "all") else provider
+        team_filter = _parse_teams(teams)
+        model_filter = _parse_models(models)
+        query, params = _spend_stage_series_query(
+            provider_filter, team_filter, model_filter, date_from, date_to
+        )
+        try:
+            conn = await ui_db_pool.connection()
+            cur = await conn.execute(query, params)
+            rows = [dict(row) for row in await cur.fetchall()]
+        except aiosqlite.Error as exc:
+            raise HTTPException(
+                status_code=503, detail="UI database is not available"
+            ) from exc
+        return _build_stage_series(rows, date_from, date_to)
 
     @router.post("/issues/{issue_id}/command", response_model=CommandAccepted)
     async def issue_command(issue_id: str, body: CommandRequest) -> CommandAccepted:
