@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -24,6 +25,8 @@ log = logging.getLogger(__name__)
 CloneFn = Callable[[str, Path], Awaitable[None]]
 DEFAULT_TTL_SECS = 7 * 24 * 3600
 DEFAULT_SWEEP_INTERVAL_SECS = 6 * 3600
+ARCHIVE_DIR = "_archive"
+ARCHIVE_TTL_SECS = 14 * 24 * 3600
 
 
 class WorkspaceError(RuntimeError):
@@ -120,27 +123,83 @@ class Workspace:
         """Mark a workspace no longer in active use (eligible for sweep)."""
         self._in_use.discard(self.path_for(binding, issue))
 
-    async def cleanup(self, issue: Issue) -> None:
-        """Remove the workspace dir for `issue` from every repo namespace."""
+    async def cleanup(self, issue: Issue) -> list[Path]:
+        """Remove the workspace dir for `issue` from every repo namespace.
+
+        Last line of defense against data loss: a workspace with
+        uncommitted changes or unpushed commits is moved to
+        `{root}/_archive/<issue>-<timestamp>` instead of deleted.
+        Returns the archive paths (empty when everything was clean).
+        """
+        archived: list[Path] = []
         if not self._root.exists():
-            return
+            return archived
         issue_id = issue.identifier.lower()
         for repo_dir in self._root.iterdir():
-            if not repo_dir.is_dir():
+            if not repo_dir.is_dir() or repo_dir.name == ARCHIVE_DIR:
                 continue
             candidate = repo_dir / issue_id
             async with self._hold_lock(candidate):
                 if candidate.exists():
-                    await asyncio.to_thread(shutil.rmtree, candidate)
+                    if await self._has_unsaved_work(candidate):
+                        dest = await asyncio.to_thread(
+                            self._archive, candidate, issue_id
+                        )
+                        log.warning(
+                            "workspace %s has uncommitted or unpushed work; "
+                            "archived to %s",
+                            candidate,
+                            dest,
+                        )
+                        archived.append(dest)
+                    else:
+                        await asyncio.to_thread(shutil.rmtree, candidate)
                 self._in_use.discard(candidate)
+        return archived
+
+    async def _has_unsaved_work(self, path: Path) -> bool:
+        # No .git → interrupted-clone residue, nothing recoverable.
+        if not (path / ".git").exists():
+            return False
+        try:
+            if (await self._git_out(path, "status", "--porcelain")).strip():
+                return True
+            # Commits on any local branch missing from every remote ref —
+            # catches unpushed work whether or not an upstream is set.
+            return bool(
+                (
+                    await self._git_out(
+                        path, "log", "--branches", "--not", "--remotes", "--oneline"
+                    )
+                ).strip()
+            )
+        except WorkspaceError:
+            # Can't prove the workspace is clean — keep it.
+            return True
+
+    def _archive(self, candidate: Path, issue_id: str) -> Path:
+        archive_root = self._root / ARCHIVE_DIR
+        archive_root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = archive_root / f"{issue_id}-{stamp}"
+        n = 1
+        while dest.exists():
+            dest = archive_root / f"{issue_id}-{stamp}-{n}"
+            n += 1
+        shutil.move(str(candidate), str(dest))
+        # Stamp archival time so the archive TTL counts from now, not
+        # from the workspace's last activity.
+        os.utime(dest)
+        return dest
 
     async def sweep_ttl(self, *, now: float | None = None) -> None:
         """Remove issue dirs whose mtime is older than `ttl_secs`."""
         if not self._root.exists():
             return
-        threshold = (now if now is not None else time.time()) - self._ttl_secs
+        now_secs = now if now is not None else time.time()
+        threshold = now_secs - self._ttl_secs
         for repo_dir in self._root.iterdir():
-            if not repo_dir.is_dir():
+            if not repo_dir.is_dir() or repo_dir.name == ARCHIVE_DIR:
                 continue
             for issue_dir in repo_dir.iterdir():
                 if not issue_dir.is_dir():
@@ -166,6 +225,23 @@ class Workspace:
                         continue
                     log.info("ttl sweep: removing stale workspace %s", issue_dir)
                     await asyncio.to_thread(shutil.rmtree, issue_dir, ignore_errors=True)
+        await self._sweep_archives(now_secs)
+
+    async def _sweep_archives(self, now_secs: float) -> None:
+        archive_root = self._root / ARCHIVE_DIR
+        if not archive_root.is_dir():
+            return
+        threshold = now_secs - ARCHIVE_TTL_SECS
+        for entry in archive_root.iterdir():
+            if not entry.is_dir():
+                continue
+            try:
+                if entry.stat().st_mtime >= threshold:
+                    continue
+            except FileNotFoundError:
+                continue
+            log.info("ttl sweep: removing expired archive %s", entry)
+            await asyncio.to_thread(shutil.rmtree, entry, ignore_errors=True)
 
     @staticmethod
     def _liveness_mtime(issue_dir: Path) -> float:
@@ -223,6 +299,22 @@ class Workspace:
                 f"git {' '.join(args)} in {cwd} exited {proc.returncode}: "
                 f"{stderr.decode(errors='replace').strip()}"
             )
+
+    async def _git_out(self, cwd: Path, *args: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise WorkspaceError(
+                f"git {' '.join(args)} in {cwd} exited {proc.returncode}: "
+                f"{stderr.decode(errors='replace').strip()}"
+            )
+        return stdout.decode(errors="replace")
 
     async def _git_ok(self, cwd: Path, *args: str) -> bool:
         proc = await asyncio.create_subprocess_exec(

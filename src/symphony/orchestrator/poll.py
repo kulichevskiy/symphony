@@ -10626,13 +10626,27 @@ class Orchestrator:
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
         await self._clear_operator_wait(issue.id, run_id)
         try:
-            await self._workspace.cleanup(issue)
+            archived = await self._workspace.cleanup(issue)
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "workspace cleanup failed after merge finalization for %s: %s",
                 issue.identifier,
                 e,
             )
+        else:
+            for archive_path in archived:
+                try:
+                    await tracker.post_comment(
+                        issue.id,
+                        "⚠️ Workspace had uncommitted or unpushed work and was "
+                        f"archived to `{archive_path}` (kept 14 days).",
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "could not post workspace archive comment for %s: %s",
+                        issue.identifier,
+                        e,
+                    )
 
     async def _mark_merge_needs_approval(
         self,

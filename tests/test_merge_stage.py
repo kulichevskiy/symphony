@@ -1132,7 +1132,7 @@ async def test_green_review_and_ci_auto_merges_with_fake_gh(tmp_path: Path) -> N
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
         workspace.release = MagicMock()
-        workspace.cleanup = AsyncMock(return_value=None)
+        workspace.cleanup = AsyncMock(return_value=[])
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.move_issue = AsyncMock(return_value=None)
@@ -1199,7 +1199,7 @@ async def test_auto_merge_disabled_degrades_to_sync_merge_with_fake_gh(
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
         workspace.release = MagicMock()
-        workspace.cleanup = AsyncMock(return_value=None)
+        workspace.cleanup = AsyncMock(return_value=[])
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.move_issue = AsyncMock(return_value=None)
@@ -1240,6 +1240,54 @@ async def test_auto_merge_disabled_degrades_to_sync_merge_with_fake_gh(
         second = merge_calls[1]["argv"]
         assert "--auto" in first
         assert "--auto" not in second
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_archived_workspace_posts_linear_comment_with_path(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        shim, _calls_log = _write_fake_gh(tmp_path)
+        runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
+        archive_path = tmp_path / "ws" / "_archive" / "eng-1-20260609-120000"
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock(return_value=[archive_path])
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        push_fn = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="codex")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=GitHub(gh_path=str(shim)),
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        workspace.cleanup.assert_awaited_once_with(_issue())
+        bodies = [c.args[1] for c in linear.post_comment.await_args_list]
+        assert any(str(archive_path) in b for b in bodies), (
+            "archive path must be posted as a Linear comment"
+        )
     finally:
         await conn.close()
 

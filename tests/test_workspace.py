@@ -163,8 +163,77 @@ async def test_cleanup_removes_workspace_dir(tmp_path: Path) -> None:
     path = await ws.acquire(_binding(), _issue("ENG-7"))
     assert path.exists()
 
-    await ws.cleanup(_issue("ENG-7"))
+    archived = await ws.cleanup(_issue("ENG-7"))
     assert not path.exists()
+    assert archived == [], "clean workspace must not be archived"
+    assert not (tmp_path / "ws" / "_archive").exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_archives_dirty_workspace_and_it_survives_sweep(
+    tmp_path: Path,
+) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+
+    path = await ws.acquire(_binding(), _issue("ENG-7"))
+    (path / "only-copy.txt").write_text("uncommitted feature\n")
+
+    archived = await ws.cleanup(_issue("ENG-7"))
+
+    assert not path.exists()
+    assert len(archived) == 1
+    dest = archived[0]
+    assert dest.parent == tmp_path / "ws" / "_archive"
+    assert dest.name.startswith("eng-7-")
+    assert (dest / "only-copy.txt").read_text() == "uncommitted feature\n"
+
+    # A fresh archive must survive the TTL sweep.
+    await ws.sweep_ttl(now=time.time())
+    assert (dest / "only-copy.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_archives_workspace_with_unpushed_commits(
+    tmp_path: Path,
+) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+
+    path = await ws.acquire(_binding(), _issue("ENG-8"))
+    await _run("git", "config", "user.email", "test@example.com", cwd=path)
+    await _run("git", "config", "user.name", "Tester", cwd=path)
+    (path / "feature.txt").write_text("done\n")
+    await _run("git", "add", "feature.txt", cwd=path)
+    await _run("git", "commit", "-q", "-m", "unpushed work", cwd=path)
+
+    archived = await ws.cleanup(_issue("ENG-8"))
+
+    assert not path.exists()
+    assert len(archived) == 1
+    assert (archived[0] / "feature.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_ttl_gcs_archives_older_than_14_days(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    old = root / "_archive" / "eng-1-20260101-000000"
+    fresh = root / "_archive" / "eng-2-20260601-000000"
+    old.mkdir(parents=True)
+    fresh.mkdir(parents=True)
+
+    now = time.time()
+    os.utime(old, (now - 15 * 24 * 3600, now - 15 * 24 * 3600))
+    os.utime(fresh, (now - 13 * 24 * 3600, now - 13 * 24 * 3600))
+
+    async def clone_fn(repo: str, dest: Path) -> None:
+        raise AssertionError("clone should not be called during sweep")
+
+    ws = Workspace(root=root, clone_fn=clone_fn)
+    await ws.sweep_ttl(now=now)
+
+    assert not old.exists()
+    assert fresh.exists()
 
 
 @pytest.mark.asyncio
