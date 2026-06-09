@@ -103,6 +103,24 @@ export interface SpendHeatmap {
   end: string;
 }
 
+/** One time bucket of the by-stage trend: stage key -> summed output tokens
+ *  (non-zero stages only; missing stages are zero). `start` is the bucket's
+ *  UTC day — the calendar day for daily buckets, the Monday for weekly ones. */
+export interface StageSeriesBucket {
+  start: string;
+  output_tokens: Record<string, number>;
+}
+
+export interface StageSeries {
+  buckets: StageSeriesBucket[];
+  /** "day" for short windows (≤ ~6 weeks), "week" beyond. */
+  bucket: "day" | "week";
+  /** Distinct stage keys present in the window (incl. zero-output ones). */
+  stages: string[];
+  start: string | null;
+  end: string | null;
+}
+
 export interface CommandAccepted {
   status: string;
   command_id: string;
@@ -361,6 +379,35 @@ export function fetchSpendHeatmap(
     `/api/spend/heatmap?${params.toString()}`,
     "Spend heatmap not found",
     "Failed to load spend heatmap",
+  );
+}
+
+/** The by-stage trend: output-token-per-stage time buckets. Window + bucket
+ *  granularity follow the active date filter (all history when unfiltered). */
+export function fetchSpendStageSeries(
+  provider?: string,
+  teams?: string[],
+  models?: string[],
+  from?: string,
+  to?: string,
+): Promise<StageSeries> {
+  const params = new URLSearchParams();
+  if (provider) {
+    params.set("provider", provider);
+  }
+  applyList(params, "teams", teams);
+  applyList(params, "models", models);
+  if (from) {
+    params.set("from", from);
+  }
+  if (to) {
+    params.set("to", to);
+  }
+  const query = params.toString();
+  return fetchJson<StageSeries>(
+    query ? `/api/spend/stage-series?${query}` : "/api/spend/stage-series",
+    "Stage series not found",
+    "Failed to load stage series",
   );
 }
 

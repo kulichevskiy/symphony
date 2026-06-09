@@ -13,6 +13,7 @@ import {
   TOKEN_CATS,
 } from "@/components/dashboard/atoms";
 import { Heatmap } from "@/components/dashboard/Heatmap";
+import { StageTrend } from "@/components/dashboard/StageTrend";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
@@ -20,11 +21,13 @@ import { Segmented } from "@/components/ui/segmented";
 import {
   fetchIssues,
   fetchSpendHeatmap,
+  fetchSpendStageSeries,
   fetchSpendSummary,
   type IssueSummary,
   type SpendHeatmap,
   type SpendSummary,
   type SpendTotals,
+  type StageSeries,
   type TokenSplit,
 } from "@/lib/api";
 import {
@@ -284,17 +287,21 @@ export function BreakdownTable({
 export function TokenOverview({
   summary,
   heatmap,
+  stageSeries,
   provider,
   date,
   window,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
+  stageSeries?: StageSeries;
   provider: Provider;
   date: DateFilter;
   window: { from: string | null; to: string | null };
 }) {
   const [view, setView] = useState<"team" | "model" | "stage">("team");
+  // Totals vs Trend sub-view, only meaningful (and shown) in the stage view.
+  const [stageMode, setStageMode] = useState<"totals" | "trend">("totals");
 
   const teamRows: BreakdownRow[] = (summary?.per_team ?? []).map((t) => ({
     rowKey: t.key,
@@ -391,13 +398,34 @@ export function TokenOverview({
               value={view}
               onChange={(v) => setView(v as "team" | "model" | "stage")}
             />
+            {view === "stage" ? (
+              <Segmented
+                ariaLabel="Stage view"
+                options={[
+                  { value: "totals", label: "Totals" },
+                  { value: "trend", label: "Trend" },
+                ]}
+                value={stageMode}
+                onChange={(v) => setStageMode(v as "totals" | "trend")}
+              />
+            ) : null}
           </div>
-          <MixLegend />
+          {!(view === "stage" && stageMode === "trend") ? <MixLegend /> : null}
         </div>
-        {view === "stage" ? (
-          <LifecycleBar rows={sortedStages} className="mb-3" />
-        ) : null}
-        <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
+        {view === "stage" && stageMode === "trend" ? (
+          stageSeries ? (
+            <StageTrend series={stageSeries} />
+          ) : (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          )
+        ) : (
+          <>
+            {view === "stage" ? (
+              <LifecycleBar rows={sortedStages} className="mb-3" />
+            ) : null}
+            <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
+          </>
+        )}
       </div>
     </Card>
   );
@@ -555,6 +583,21 @@ export function HomePage() {
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
+  // The by-stage trend follows the resolved date window (server picks day/week
+  // bucketing); it only renders inside the stage view's Trend sub-toggle.
+  const stageSeriesQuery = useQuery({
+    queryKey: ["spend-stage-series", provider, teamsKey, modelsKey, from, to],
+    queryFn: () =>
+      fetchSpendStageSeries(
+        providerFilter,
+        teamsFilter,
+        modelsFilter,
+        dateFrom,
+        dateTo,
+      ),
+    refetchInterval: 30_000,
+    placeholderData: (prev) => prev,
+  });
   const activeQuery = useQuery({
     queryKey: ["issues", "active", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
@@ -604,6 +647,7 @@ export function HomePage() {
       <TokenOverview
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
+        stageSeries={stageSeriesQuery.data}
         provider={provider}
         date={date}
         window={{ from, to }}

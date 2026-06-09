@@ -2213,6 +2213,180 @@ async def test_api_spend_summary_per_stage_reconciles_and_scopes(
         assert cstage == cteam
 
 
+def test_series_granularity_daily_for_short_window_weekly_beyond() -> None:
+    # <= ~6 weeks (42-day span) buckets daily; one day more flips to weekly.
+    assert ui_api._series_granularity("2026-05-01", "2026-05-01") == "day"
+    assert ui_api._series_granularity("2026-04-01", "2026-05-13") == "day"  # 42d span
+    assert ui_api._series_granularity("2026-04-01", "2026-05-14") == "week"  # 43d span
+
+
+@pytest.mark.asyncio
+async def test_api_spend_stage_series_daily_buckets_short_window(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="b", identifier="ENG-2", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-05-15T10:00:00Z'),
+                ('r2', 'a', 'review', 'completed', NULL, '2026-05-15T10:20:00Z'),
+                ('r3', 'b', 'merge', 'completed', NULL, '2026-05-16T11:00:00Z')
+            """
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 100, 10, 0, 0)]
+        )
+        # review spends input but zero output — still a present stage.
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 5, 0, 0, 0)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("codex", "gpt-5.5", 0, 40, 0, 0)]
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            resp = await client.get(
+                "/api/spend/stage-series?from=2026-05-10&to=2026-05-17"
+            )
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["bucket"] == "day"
+    assert body["start"] == "2026-05-10"
+    assert body["end"] == "2026-05-17"
+    # zero-output review stage is still listed, like per_stage.
+    assert set(body["stages"]) == {"implement", "review", "merge"}
+    # Dense daily buckets across the inclusive window.
+    starts = [b["start"] for b in body["buckets"]]
+    assert starts == [f"2026-05-{d:02d}" for d in range(10, 18)]
+    by_start = {b["start"]: b["output_tokens"] for b in body["buckets"]}
+    # 05-15 carries implement output; review's 0 output is omitted from the map.
+    assert by_start["2026-05-15"] == {"implement": 10}
+    assert by_start["2026-05-16"] == {"merge": 40}
+    assert by_start["2026-05-11"] == {}
+
+
+@pytest.mark.asyncio
+async def test_api_spend_stage_series_weekly_for_long_window(tmp_path: Path) -> None:
+    from datetime import date as _date, timedelta as _td
+
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-03-03T10:00:00Z'),
+                ('r2', 'a', 'implement', 'completed', NULL, '2026-03-05T10:00:00Z'),
+                ('r3', 'a', 'merge', 'completed', NULL, '2026-04-20T10:00:00Z')
+            """
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 0, 10, 0, 0)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("claude", "claude-opus-4-8", 0, 7, 0, 0)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r3", [ModelUsage("claude", "claude-opus-4-8", 0, 40, 0, 0)]
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            resp = await client.get(
+                "/api/spend/stage-series?from=2026-03-01&to=2026-05-17"
+            )
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["bucket"] == "week"
+    # Every bucket starts on a Monday.
+    for b in body["buckets"]:
+        assert _date.fromisoformat(b["start"]).weekday() == 0
+    # r1 (03-03 Tue) and r2 (03-05 Thu) share an ISO week → aggregated.
+    monday = (_date(2026, 3, 3) - _td(days=_date(2026, 3, 3).weekday())).isoformat()
+    by_start = {b["start"]: b["output_tokens"] for b in body["buckets"]}
+    assert by_start[monday] == {"implement": 17}
+    # r3 lands in a different week's merge segment.
+    merge_weeks = [s for s, m in by_start.items() if m.get("merge")]
+    assert len(merge_weeks) == 1
+    assert by_start[merge_weeks[0]]["merge"] == 40
+
+
+@pytest.mark.asyncio
+async def test_api_spend_stage_series_unfiltered_spans_history_and_scopes(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES
+                ('r1', 'a', 'implement', 'completed', NULL, '2026-01-05T10:00:00Z'),
+                ('r2', 'a', 'implement', 'completed', NULL, '2026-05-15T10:00:00Z')
+            """
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r1", [ModelUsage("claude", "claude-opus-4-8", 0, 10, 0, 0)]
+        )
+        await db.run_model_usage.replace_for_run(
+            conn, "r2", [ModelUsage("codex", "gpt-5.5", 0, 40, 0, 0)]
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            allr = await client.get("/api/spend/stage-series")
+            claude = await client.get("/api/spend/stage-series?provider=claude")
+    finally:
+        await conn.close()
+
+    # Unfiltered window spans all observed history → weekly here (>42d span).
+    body = allr.json()
+    assert body["bucket"] == "week"
+    assert body["start"] == "2026-01-05"
+    assert body["end"] == "2026-05-15"
+    series_out = sum(
+        v for b in body["buckets"] for v in b["output_tokens"].values()
+    )
+    assert series_out == 50  # 10 + 40
+    # Provider filter scopes the series like every other grouping.
+    cbody = claude.json()
+    cout = sum(v for b in cbody["buckets"] for v in b["output_tokens"].values())
+    assert cout == 10
+
+
 @pytest.mark.asyncio
 async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
