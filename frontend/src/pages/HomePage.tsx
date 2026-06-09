@@ -302,6 +302,9 @@ export function TokenOverview({
   const [view, setView] = useState<"team" | "model" | "stage">("team");
   // Totals vs Trend sub-view, only meaningful (and shown) in the stage view.
   const [stageMode, setStageMode] = useState<"totals" | "trend">("totals");
+  // Tokens vs % share metric for the stage Trend chart; owned here so its toggle
+  // can sit in the shared Breakdown header row.
+  const [trendMetric, setTrendMetric] = useState<"tokens" | "share">("tokens");
 
   const teamRows: BreakdownRow[] = (summary?.per_team ?? []).map((t) => ({
     rowKey: t.key,
@@ -409,12 +412,30 @@ export function TokenOverview({
                 onChange={(v) => setStageMode(v as "totals" | "trend")}
               />
             ) : null}
+            {view === "stage" && stageMode === "trend" ? (
+              <Segmented
+                ariaLabel="Trend metric"
+                options={[
+                  { value: "tokens", label: "Tokens" },
+                  { value: "share", label: "% share" },
+                ]}
+                value={trendMetric}
+                onChange={(v) => setTrendMetric(v as "tokens" | "share")}
+              />
+            ) : null}
           </div>
-          {!(view === "stage" && stageMode === "trend") ? <MixLegend /> : null}
+          {view === "stage" && stageMode === "trend" ? (
+            <span className="font-mono text-[11px] text-muted-foreground">
+              output tokens ·{" "}
+              {stageSeries?.bucket === "week" ? "weekly" : "daily"}
+            </span>
+          ) : (
+            <MixLegend />
+          )}
         </div>
         {view === "stage" && stageMode === "trend" ? (
           stageSeries ? (
-            <StageTrend series={stageSeries} />
+            <StageTrend series={stageSeries} mode={trendMetric} />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )

@@ -1,7 +1,6 @@
 import { useRef, useState } from "react";
 
-import { Segmented } from "@/components/ui/segmented";
-import type { StageSeries, StageSeriesBucket } from "@/lib/api";
+import type { StageSeries } from "@/lib/api";
 import { formatLongDate, formatTokens } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -85,9 +84,16 @@ export function stageBars(
  * - % share mode: every column fills the track; only the segment split varies.
  *
  * Both modes derive purely from output tokens. No event/prompt-change markers.
+ * `mode` (Tokens / % share) is owned by the parent so its toggle can sit in the
+ * shared Breakdown header row alongside Totals / Trend.
  */
-export function StageTrend({ series }: { series: StageSeries }) {
-  const [mode, setMode] = useState<"tokens" | "share">("tokens");
+export function StageTrend({
+  series,
+  mode,
+}: {
+  series: StageSeries;
+  mode: "tokens" | "share";
+}) {
   const [hover, setHover] = useState<
     { column: StageColumn; left: number; top: number } | null
   >(null);
@@ -112,21 +118,6 @@ export function StageTrend({ series }: { series: StageSeries }) {
 
   return (
     <div>
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <Segmented
-          ariaLabel="Trend metric"
-          options={[
-            { value: "tokens", label: "Tokens" },
-            { value: "share", label: "% share" },
-          ]}
-          value={mode}
-          onChange={(v) => setMode(v as "tokens" | "share")}
-        />
-        <span className="font-mono text-[11px] text-muted-foreground">
-          output tokens · {series.bucket === "week" ? "weekly" : "daily"}
-        </span>
-      </div>
-
       {columns.length === 0 ? (
         <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
           No stage activity in this window
