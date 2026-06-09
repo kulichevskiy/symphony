@@ -121,6 +121,10 @@ def _build_fix_command(
             "--output-format",
             "stream-json",
             "--verbose",
+            # Headless MCP policy: the fixer sees no MCP servers at all.
+            # (The binding's allowlist is not threaded into this session;
+            # the empty strict config matches the policy default of none.)
+            "--strict-mcp-config",
             prompt,
         ]
     if agent == "codex":

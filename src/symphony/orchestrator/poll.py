@@ -522,8 +522,15 @@ def build_runner_command(
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
+    mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    """Per-runner argv for the Implement stage prompt."""
+    """Per-runner argv for the Implement stage prompt.
+
+    `mcp_servers` is the binding's MCP allowlist. Claude spawns always run
+    `--strict-mcp-config` so the agent only sees servers the binding
+    explicitly grants — none by default. Codex MCP wiring lives in its own
+    config.toml and is unaffected.
+    """
     if agent == "claude":
         command = [
             "claude",
@@ -531,7 +538,12 @@ def build_runner_command(
             "--output-format",
             "stream-json",
             "--verbose",
+            "--strict-mcp-config",
         ]
+        if mcp_servers:
+            command.extend(
+                ["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})]
+            )
         command.append(prompt)
         return command
     if agent == "codex":
@@ -550,6 +562,7 @@ def build_fix_runner_command(
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
+    mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """argv for a Review-stage fix-run.
 
@@ -563,6 +576,7 @@ def build_fix_runner_command(
         prompt,
         codex_model=codex_model,
         workspace_path=workspace_path,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -572,6 +586,7 @@ def build_merge_runner_command(
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
     workspace_path: Path | None = None,
+    mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """argv for the Merge-stage final local pass."""
     return build_runner_command(
@@ -579,6 +594,7 @@ def build_merge_runner_command(
         prompt,
         codex_model=codex_model,
         workspace_path=workspace_path,
+        mcp_servers=mcp_servers,
     )
 
 
@@ -5600,6 +5616,7 @@ class Orchestrator:
             prompt,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
+            mcp_servers=binding.mcp_servers,
         )
         return await self._run_stage_command(
             binding=binding,
@@ -5703,6 +5720,7 @@ class Orchestrator:
                 prompt,
                 codex_model=binding.codex_model,
                 workspace_path=workspace_path,
+                mcp_servers=binding.mcp_servers,
             )
             try:
                 usage_delta, final_kind, final_returncode = (
@@ -11978,6 +11996,7 @@ class Orchestrator:
             prompt,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
+            mcp_servers=binding.mcp_servers,
         )
         return await self._run_stage_command(
             binding=binding,
@@ -12011,6 +12030,7 @@ class Orchestrator:
             prompt,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
+            mcp_servers=binding.mcp_servers,
         )
         return await self._run_stage_command(
             binding=binding,
@@ -12039,6 +12059,7 @@ class Orchestrator:
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
+            env=dict(binding.env),
             stall_secs=self.config.stall_timeout_secs,
             command_secs=self.config.command_timeout_secs,
             stage=stage,
@@ -12121,6 +12142,7 @@ class Orchestrator:
             prompt,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
+            mcp_servers=binding.mcp_servers,
         )
         return await self._run_runner(
             run_id=run_id,
@@ -12150,6 +12172,7 @@ class Orchestrator:
             prompt,
             codex_model=binding.codex_model,
             workspace_path=workspace_path,
+            mcp_servers=binding.mcp_servers,
         )
         return await self._run_runner(
             run_id=run_id,
@@ -12246,6 +12269,7 @@ class Orchestrator:
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
+            env=dict(binding.env),
             stall_secs=self.config.stall_timeout_secs,
             command_secs=self.config.command_timeout_secs,
             stage=stage,

@@ -77,6 +77,15 @@ LINEAR_WEBHOOK_SECRET=
 # GH_TOKEN=
 ```
 
+`.env` is also the home for any secret a binding's `env:` mapping references
+(see below) — for example a Supabase access token for schema work:
+
+```bash
+# Personal access token from https://supabase.com/dashboard/account/tokens
+MASHA2_SUPABASE_ACCESS_TOKEN=sbp_...
+MASHA2_SUPABASE_PROJECT_REF=abcdefghijklmnop
+```
+
 ### 2. Topology — `config.local.yaml`
 
 ```bash
@@ -132,6 +141,41 @@ Notes:
   automatically; re-run it after upgrading Codex.
 - Using the remote `@codex review` bot? Install the **Codex GitHub App** on the
   target repo.
+
+### Headless agents: MCP allowlist and per-binding env
+
+Agents run headless — their prompts ban interactive auth flows (OAuth URLs,
+browser logins, device codes); an agent that hits one stops and reports
+`SYMPHONY_BLOCKED: <what the operator must authorize and where>` instead of
+hanging the run. Two binding-level knobs keep agents on non-interactive paths:
+
+- **`mcp_servers:`** — the MCP allowlist. Claude agents are spawned with
+  `--strict-mcp-config` and an MCP config generated from this mapping, so they
+  only see servers the binding explicitly grants. The default is **none**:
+  user-level MCP servers (including OAuth-only ones like Supabase's) are
+  invisible. Only grant servers that authenticate headlessly.
+- **`env:`** — extra environment variables injected into the binding's agent
+  processes. Values name keys in `.env`; secrets never live in the YAML, and a
+  key missing at startup fails config load.
+
+Example — make Supabase schema tasks autonomously completable via the
+`supabase` CLI (`supabase db push`, `supabase gen types typescript`) instead of
+the OAuth-only Supabase MCP server:
+
+1. Create a personal access token at
+   <https://supabase.com/dashboard/account/tokens>.
+2. Put it in symphony's `.env`, e.g. `MASHA2_SUPABASE_ACCESS_TOKEN=sbp_...`
+   (plus `MASHA2_SUPABASE_PROJECT_REF=<project-ref>`).
+3. Reference it from the binding:
+
+```yaml
+    env:
+      SUPABASE_ACCESS_TOKEN: MASHA2_SUPABASE_ACCESS_TOKEN
+      SUPABASE_PROJECT_REF: MASHA2_SUPABASE_PROJECT_REF
+```
+
+The agent's `supabase` CLI picks up `SUPABASE_ACCESS_TOKEN` and never needs a
+browser.
 
 ### Review configuration
 
