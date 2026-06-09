@@ -24,6 +24,7 @@ from symphony.agent.prompt import (
     implement_prompt,
     merge_conflict_fix_prompt,
     merge_conflict_rebase_fix_prompt,
+    merge_prompt,
     merge_required_check_fix_prompt,
     review_comment_fix_prompt,
     review_fix_prompt,
@@ -60,6 +61,7 @@ def _change_prompts() -> list[str]:
             failing_checks=[],
             action_log_tail="",
         ),
+        merge_prompt(**common, pr_url="https://github.com/org/repo/pull/7"),
     ]
 
 
@@ -106,6 +108,21 @@ def test_local_review_fix_command_is_strict_mcp() -> None:
         agent="claude", codex_model="gpt-5.1-codex", prompt="fix it"
     )
     assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
+    assert argv[-1] == "fix it"
+
+
+def test_local_review_fix_command_passes_binding_mcp_allowlist() -> None:
+    servers = {"supabase": {"type": "http", "url": "https://mcp.example"}}
+    argv = _build_fix_command(
+        agent="claude",
+        codex_model="gpt-5.1-codex",
+        prompt="fix it",
+        mcp_servers=servers,
+    )
+    assert "--strict-mcp-config" in argv
+    config_json = argv[argv.index("--mcp-config") + 1]
+    assert json.loads(config_json) == {"mcpServers": servers}
     assert argv[-1] == "fix it"
 
 

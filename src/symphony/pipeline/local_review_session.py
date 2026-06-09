@@ -32,11 +32,12 @@ Caller responsibilities outside this module:
 
 from __future__ import annotations
 
+import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
@@ -107,6 +108,7 @@ def _build_fix_command(
     agent: ImplementerAgent,
     codex_model: str,
     prompt: str,
+    mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Mirror `build_fix_runner_command` without importing from orchestrator.
 
@@ -115,18 +117,23 @@ def _build_fix_command(
     orchestrator's command-builders.
     """
     if agent == "claude":
-        return [
+        # Headless MCP policy: always run --strict-mcp-config so the fixer
+        # only sees servers the binding explicitly grants (none by default).
+        # Mirrors `build_runner_command` in poll.py.
+        command = [
             "claude",
             "--print",
             "--output-format",
             "stream-json",
             "--verbose",
-            # Headless MCP policy: the fixer sees no MCP servers at all.
-            # (The binding's allowlist is not threaded into this session;
-            # the empty strict config matches the policy default of none.)
             "--strict-mcp-config",
-            prompt,
         ]
+        if mcp_servers:
+            command.extend(
+                ["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})]
+            )
+        command.append(prompt)
+        return command
     if agent == "codex":
         return build_codex_workspace_write_command(
             prompt=prompt,
@@ -152,6 +159,7 @@ async def run_local_review_session(
     stall_secs: int,
     command_secs: int = 1800,
     binding_env: dict[str, str] | None = None,
+    mcp_servers: Mapping[str, Any] | None = None,
     last_message_dir: Path,
     head_sha_provider: HeadShaProvider,
     diff_size_provider: DiffSizeProvider | None = None,
@@ -428,6 +436,7 @@ async def run_local_review_session(
             agent=implementer_agent,
             codex_model=implementer_codex_model,
             prompt=prompt,
+            mcp_servers=mcp_servers,
         )
         spec = RunnerSpec(
             run_id=_safe_run_id(parent_run_id, f"fix-{iteration}"),
