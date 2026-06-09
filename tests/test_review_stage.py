@@ -45,14 +45,21 @@ from symphony.pipeline.local_review import LocalVerdict, LocalVerdictKind
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
+from ._workspace_helpers import advance_head
+
 
 class _FakeRunner:
-    def __init__(self, events: list[RunnerEvent]) -> None:
+    def __init__(
+        self, events: list[RunnerEvent], *, commit_on_implement: bool = False
+    ) -> None:
         self.events = events
+        self.commit_on_implement = commit_on_implement
         self.captured_spec: RunnerSpec | None = None
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         self.captured_spec = spec
+        if self.commit_on_implement and spec.stage == "implement":
+            advance_head(spec.workspace_path)
         return self._aiter()
 
     async def _aiter(self) -> AsyncIterator[RunnerEvent]:
@@ -270,7 +277,16 @@ def _states() -> dict[str, str]:
 @pytest.mark.asyncio
 async def test_implement_success_posts_codex_review_and_records_review_handoff(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The autouse fixture pins HEAD sha constant; a successful implement run
+    # must advance HEAD so the completion gate classifies it as completed.
+    _head_shas = iter(["base-sha", "advanced-sha"])
+
+    async def _advancing_head(_workspace_path: Path) -> str:
+        return next(_head_shas, "advanced-sha")
+
+    monkeypatch.setattr(poll_module, "_workspace_head_sha", _advancing_head)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(

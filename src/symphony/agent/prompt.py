@@ -45,7 +45,15 @@ def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) ->
         "- Make the smallest change that satisfies the issue.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Follow strict TDD: write a failing test first, then the code.\n"
-        "- Do not edit unrelated files.\n"
+        "- Do not edit unrelated files.\n\n"
+        "# Completion contract\n\n"
+        "Your final message MUST end with exactly one machine-readable marker on "
+        "its own final line:\n"
+        "- `SYMPHONY_DONE` — the issue is implemented and committed.\n"
+        "- `SYMPHONY_BLOCKED: <exactly what a human must do>` — you cannot finish "
+        "without a human action (e.g. authorizing an OAuth URL, providing a "
+        "secret). State the precise action; do not end with `SYMPHONY_DONE` when "
+        "you are actually waiting on a human.\n"
         f"{HEADLESS_RULES}"
     )
 

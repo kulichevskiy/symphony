@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -534,7 +534,13 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
             return_value=(UsageDelta(cost_usd=0.25), "exit", 0)
         )
 
-        run_id = await orch._dispatch_one(secondary_binding, issue)  # noqa: SLF001
+        # `_run_agent` is mocked, so simulate the agent advancing HEAD so the
+        # completion gate classifies the run as completed.
+        with patch(
+            "symphony.orchestrator.poll._workspace_head_sha",
+            AsyncMock(side_effect=["base-sha", "advanced-sha"]),
+        ):
+            run_id = await orch._dispatch_one(secondary_binding, issue)  # noqa: SLF001
 
         scoped_issue_id = db.issues.contextual_id(
             id=issue.id,

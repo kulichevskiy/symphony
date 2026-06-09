@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
@@ -90,6 +91,19 @@ def _issue(
         team_key="ENG",
         labels=labels or [],
     )
+
+
+@pytest.fixture(autouse=True)
+def _advancing_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake workspace is not a git repo. Simulate a successful agent
+    advancing HEAD so the Implement completion gate classifies rc=0 runs as
+    completed (returns a fresh SHA on every call, so HEAD always advances)."""
+    counter = itertools.count()
+
+    async def _head(workspace_path: object) -> str:
+        return f"sha-{next(counter)}"
+
+    monkeypatch.setattr("symphony.orchestrator.poll._workspace_head_sha", _head)
 
 
 def _make_orch(

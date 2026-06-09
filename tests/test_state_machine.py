@@ -14,9 +14,13 @@ from __future__ import annotations
 import pytest
 
 from symphony.pipeline.state_machine import (
+    ImplementCompletion,
     Transition,
+    classify_blocked_final_message,
+    classify_implement_completion,
     classify_termination,
     on_runner_event,
+    parse_completion_marker,
 )
 
 
@@ -170,3 +174,127 @@ def test_classify_termination_covers_terminal_enums(
 
 def test_classify_termination_success_is_empty() -> None:
     assert classify_termination(status="completed") == ("", "")
+
+
+# --- Completion gate: SYMPHONY_DONE / SYMPHONY_BLOCKED marker + HEAD advance ---
+
+# Verbatim final message from MCH-14: the agent ended its turn politely
+# blocked on a human OAuth action. Today it exits rc=0 and is mislabeled
+# `completed`; the gate must classify it `blocked`.
+MCH14_FINAL_MESSAGE = (
+    "I need you to authorize the Supabase MCP server before I can continue. "
+    "Please open the following URL and approve access, then let me know once "
+    "you've done so and I'll resume the implementation."
+)
+
+
+def test_parse_completion_marker_done() -> None:
+    marker = parse_completion_marker("All set.\n\nSYMPHONY_DONE")
+    assert marker.kind == "done"
+    assert marker.blocked_reason == ""
+
+
+def test_parse_completion_marker_blocked_captures_reason_verbatim() -> None:
+    reason = "authorize the Supabase MCP server at https://example.com/oauth"
+    marker = parse_completion_marker(f"Did some work.\n\nSYMPHONY_BLOCKED: {reason}")
+    assert marker.kind == "blocked"
+    assert marker.blocked_reason == reason
+
+
+def test_parse_completion_marker_absent() -> None:
+    assert parse_completion_marker("No marker here at all.").kind is None
+
+
+def test_parse_completion_marker_last_marker_wins() -> None:
+    # The agent may quote the contract from the prompt earlier; the operative
+    # marker is the final one.
+    text = "Contract: emit SYMPHONY_DONE or SYMPHONY_BLOCKED: x\n\nSYMPHONY_DONE"
+    assert parse_completion_marker(text).kind == "done"
+
+
+# Path 1: SYMPHONY_DONE + HEAD advanced -> completed (today's happy path).
+def test_classify_done_marker_with_head_advance_completes() -> None:
+    spy: list[str] = []
+    completion = classify_implement_completion(
+        final_message="Implemented.\n\nSYMPHONY_DONE",
+        head_advanced=True,
+        classifier=lambda m: (spy.append(m), ("ambiguous", ""))[1],
+    )
+    assert completion == ImplementCompletion(outcome="completed", blocked_reason="")
+    assert spy == []  # classifier must NOT run when a marker is present
+
+
+# Path 2: SYMPHONY_BLOCKED -> blocked, reason captured verbatim, no classifier.
+def test_classify_blocked_marker_captures_reason_verbatim() -> None:
+    spy: list[str] = []
+    reason = "authorize the Supabase MCP server, then reply $continue"
+    completion = classify_implement_completion(
+        final_message=f"SYMPHONY_BLOCKED: {reason}",
+        head_advanced=False,
+        classifier=lambda m: (spy.append(m), ("ambiguous", ""))[1],
+    )
+    assert completion.outcome == "blocked"
+    assert completion.blocked_reason == reason
+    assert spy == []
+
+
+# A blocked marker wins even when HEAD advanced (partial work then blocked).
+def test_classify_blocked_marker_wins_over_head_advance() -> None:
+    completion = classify_implement_completion(
+        final_message="SYMPHONY_BLOCKED: need a secret from you",
+        head_advanced=True,
+    )
+    assert completion.outcome == "blocked"
+    assert completion.blocked_reason == "need a secret from you"
+
+
+# Path 3: no marker AND no commits -> classifier fallback -> blocked (MCH-14).
+def test_classify_no_marker_no_commits_runs_classifier_blocked() -> None:
+    completion = classify_implement_completion(
+        final_message=MCH14_FINAL_MESSAGE,
+        head_advanced=False,
+    )
+    assert completion.outcome == "blocked"
+    assert "authorize" in completion.blocked_reason.lower()
+
+
+# Path 4: no marker, no commits, ambiguous message -> failed.
+def test_classify_no_marker_no_commits_ambiguous_fails() -> None:
+    completion = classify_implement_completion(
+        final_message="I looked around the repo and read some files.",
+        head_advanced=False,
+    )
+    assert completion.outcome == "failed"
+
+
+# Acceptance: rc=0 without commits and without SYMPHONY_DONE never completes.
+def test_classify_done_marker_without_commits_not_completed() -> None:
+    completion = classify_implement_completion(
+        final_message="Nothing to change.\n\nSYMPHONY_DONE",
+        head_advanced=False,
+    )
+    assert completion.outcome != "completed"
+
+
+# Commits but a forgotten marker: ground-truth commits complete it; the
+# classifier fallback must NOT run because HEAD advanced.
+def test_classify_no_marker_with_commits_completes_without_classifier() -> None:
+    spy: list[str] = []
+    completion = classify_implement_completion(
+        final_message="Forgot the marker but I committed the fix.",
+        head_advanced=True,
+        classifier=lambda m: (spy.append(m), ("ambiguous", ""))[1],
+    )
+    assert completion.outcome == "completed"
+    assert spy == []
+
+
+def test_classify_blocked_final_message_detects_human_action_ask() -> None:
+    kind, reason = classify_blocked_final_message(MCH14_FINAL_MESSAGE)
+    assert kind == "blocked"
+    assert reason.strip() != ""
+
+
+def test_classify_blocked_final_message_ambiguous() -> None:
+    kind, _ = classify_blocked_final_message("Explored the code paths.")
+    assert kind == "ambiguous"

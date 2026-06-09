@@ -32,6 +32,12 @@ from symphony.pipeline.local_review import (
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 from symphony.pipeline.review_classifier import Verdict, VerdictKind
 
+from ._workspace_helpers import advance_head
+
+
+def _events_exit_zero(events: list[RunnerEvent]) -> bool:
+    return any(ev.kind == "exit" and ev.returncode == 0 for ev in events)
+
 
 class _StagedRunner:
     """Returns scripted events keyed by `RunnerSpec.stage`.
@@ -53,6 +59,10 @@ class _StagedRunner:
                 f"unexpected stage {spec.stage!r}; remaining={self._scripts}"
             )
         events = bucket.pop(0)
+        # A successful implement run commits its work; the completion gate
+        # requires HEAD to advance over the branch base.
+        if spec.stage == "implement" and _events_exit_zero(events):
+            advance_head(spec.workspace_path)
 
         async def gen() -> AsyncIterator[RunnerEvent]:
             for ev in events:

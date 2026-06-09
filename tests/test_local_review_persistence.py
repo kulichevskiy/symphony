@@ -21,6 +21,8 @@ from symphony.orchestrator.poll import (
 from symphony.pipeline.local_review import VERDICT_APPROVED_MARKER
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
+from ._workspace_helpers import advance_head
+
 # --- pure status mapper -----------------------------------------------
 
 
@@ -59,6 +61,10 @@ class _StagedRunner:
         if not bucket:
             raise AssertionError(f"unexpected stage {spec.stage!r}")
         events = bucket.pop(0)
+        if spec.stage == "implement" and any(
+            ev.kind == "exit" and ev.returncode == 0 for ev in events
+        ):
+            advance_head(spec.workspace_path)
 
         async def gen() -> AsyncIterator[RunnerEvent]:
             for ev in events:
