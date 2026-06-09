@@ -60,11 +60,10 @@ describe("stageBars", () => {
 });
 
 describe("StageTrend", () => {
-  it("renders stacked columns with the shared stage palette, defaults to Tokens", () => {
-    const markup = renderToStaticMarkup(<StageTrend series={series} />);
-    // Both metric modes offered; Tokens is the active default.
-    expect(markup).toContain("Tokens");
-    expect(markup).toContain("% share");
+  it("renders stacked columns with the shared stage palette", () => {
+    const markup = renderToStaticMarkup(
+      <StageTrend series={series} mode="tokens" />,
+    );
     // Stage palette segments (implement=blue, merge=emerald) are drawn.
     expect(markup).toContain("bg-blue-500");
     expect(markup).toContain("bg-emerald-500");
@@ -72,8 +71,6 @@ describe("StageTrend", () => {
     expect(markup.indexOf("Implement")).toBeLessThan(markup.indexOf("Merge"));
     // Month axis label rendered.
     expect(markup).toContain("May");
-    // Daily granularity hint.
-    expect(markup).toContain("daily");
     // No event/prompt-change markers are drawn.
     expect(markup.toLowerCase()).not.toContain("marker");
   });
@@ -86,7 +83,9 @@ describe("StageTrend", () => {
       stages: [],
       buckets: [],
     };
-    const markup = renderToStaticMarkup(<StageTrend series={empty} />);
+    const markup = renderToStaticMarkup(
+      <StageTrend series={empty} mode="tokens" />,
+    );
     expect(markup).toContain("No stage activity");
   });
 });

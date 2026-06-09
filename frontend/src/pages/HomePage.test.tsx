@@ -182,6 +182,23 @@ describe("BreakdownTable", () => {
     expect(markup).toContain("No teams/models match the current filters");
   });
 
+  it("marks selected rows when selection is enabled", () => {
+    const markup = renderToStaticMarkup(
+      <BreakdownTable
+        rows={teamRows}
+        kind="team"
+        selectedKeys={new Set(["VIB"])}
+        onToggleRow={() => {}}
+      />,
+    );
+    // Selected row carries aria-selected=true and a highlight; the unselected
+    // one is aria-selected=false. Rows become click-to-select (cursor-pointer).
+    expect(markup).toContain('aria-selected="true"');
+    expect(markup).toContain('aria-selected="false"');
+    expect(markup).toContain("bg-secondary");
+    expect(markup).toContain("cursor-pointer");
+  });
+
   it("renders stage rows in the given pipeline order without re-sorting", () => {
     // Outputs are NOT descending: an output-sort would put merge first.
     const stageRows = [
@@ -207,6 +224,20 @@ describe("BreakdownTable", () => {
     expect(markup).toContain('title="100">100</span>');
   });
 });
+
+// TokenOverview now fetches its trend series with useQuery and reads
+// teams/models from useFilters, so it must render under both providers.
+function renderOverview(props: Parameters<typeof TokenOverview>[0]): string {
+  return renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <FiltersProvider>
+          <TokenOverview {...props} />
+        </FiltersProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
 
 describe("TokenOverview", () => {
   const summary: SpendSummary = {
@@ -264,15 +295,13 @@ describe("TokenOverview", () => {
   };
 
   it("renders heatmap + all-time rail + a single Breakdown table with a By team/By model toggle", () => {
-    const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="all"
-        date={DEFAULT_DATE}
-        window={{ from: null, to: null }}
-      />,
-    );
+    const markup = renderOverview({
+      summary,
+      heatmap,
+      provider: "all",
+      date: DEFAULT_DATE,
+      window: { from: null, to: null },
+    });
     expect(markup).toContain("Daily token burn");
     expect(markup).toContain("Tokens · all-time");
     expect(markup).toContain("Breakdown");
@@ -282,55 +311,45 @@ describe("TokenOverview", () => {
     // Defaults to the team view (VIB row present, no model names yet).
     expect(markup).toContain(">VIB</span>");
     expect(markup).not.toContain("gpt-5-codex");
+    // Team Totals shows the stacked totals bar (its segment title is the team
+    // label + tokens — unique to LifecycleBar, distinct from the table rows).
+    expect(markup).toContain('title="VIB ');
   });
 
-  const stageSeries = {
-    bucket: "day" as const,
-    start: "2026-06-01",
-    end: "2026-06-01",
-    stages: ["implement"],
-    buckets: [{ start: "2026-06-01", output_tokens: { implement: 100 } }],
-  };
-
-  it("shows the Totals/Trend sub-toggle only in the stage view", () => {
-    const team = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        stageSeries={stageSeries}
-        provider="all"
-        date={DEFAULT_DATE}
-        window={{ from: null, to: null }}
-      />,
-    );
-    // Team view: no stage sub-toggle.
-    expect(team).not.toContain("Totals");
-    expect(team).not.toContain("Trend");
+  it("offers the Totals/Trend sub-toggle in every breakdown view, Totals by default", () => {
+    const markup = renderOverview({
+      summary,
+      heatmap,
+      provider: "all",
+      date: DEFAULT_DATE,
+      window: { from: null, to: null },
+    });
+    // The sub-toggle is present even in the default (team) view now.
+    expect(markup).toContain("Totals");
+    expect(markup).toContain("Trend");
+    // Totals is the default, so the totals table (team row) shows, not a chart.
+    expect(markup).toContain(">VIB</span>");
   });
 
   it("suffixes the rail eyebrow with the active provider", () => {
-    const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="codex"
-        date={DEFAULT_DATE}
-        window={{ from: null, to: null }}
-      />,
-    );
+    const markup = renderOverview({
+      summary,
+      heatmap,
+      provider: "codex",
+      date: DEFAULT_DATE,
+      window: { from: null, to: null },
+    });
     expect(markup).toContain("· codex");
   });
 
   it("reflects the active window in the rail header and dims out-of-window cells", () => {
-    const markup = renderToStaticMarkup(
-      <TokenOverview
-        summary={summary}
-        heatmap={heatmap}
-        provider="all"
-        date={{ kind: "preset", preset: "7d" }}
-        window={{ from: "2026-06-10", to: "2026-06-17" }}
-      />,
-    );
+    const markup = renderOverview({
+      summary,
+      heatmap,
+      provider: "all",
+      date: { kind: "preset", preset: "7d" },
+      window: { from: "2026-06-10", to: "2026-06-17" },
+    });
     // Header tracks the window, not "all-time".
     expect(markup).toContain("Tokens · last 7 days");
     expect(markup).not.toContain("Tokens · all-time");

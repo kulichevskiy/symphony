@@ -13,7 +13,10 @@ import {
   TOKEN_CATS,
 } from "@/components/dashboard/atoms";
 import { Heatmap } from "@/components/dashboard/Heatmap";
-import { StageTrend } from "@/components/dashboard/StageTrend";
+import {
+  StageTrend,
+  type SeriesAdapter,
+} from "@/components/dashboard/StageTrend";
 import { StatusBadge } from "@/components/dashboard/StatusBadge";
 import { Card } from "@/components/ui/card";
 import { Icon } from "@/components/ui/icon";
@@ -27,7 +30,6 @@ import {
   type SpendHeatmap,
   type SpendSummary,
   type SpendTotals,
-  type StageSeries,
   type TokenSplit,
 } from "@/lib/api";
 import {
@@ -48,6 +50,23 @@ const TEAM_TINT: Record<string, string> = {
   LP: "bg-cyan-500",
   SYM: "bg-emerald-500",
   HQ: "bg-amber-500",
+};
+
+// How each Breakdown view stacks/labels/colors its trend keys. Stage uses the
+// component's own pipeline-ordered default; team/model keep the server's order
+// and color by the same team-dot / provider-dot palette as the totals table.
+// (model series keys are "provider/model"; tint by the provider prefix.)
+const TREND_ADAPTERS: Record<"team" | "model", SeriesAdapter> = {
+  team: {
+    order: (keys) => keys,
+    label: (key) => key,
+    tint: (key) => TEAM_TINT[key] ?? "bg-slate-400",
+  },
+  model: {
+    order: (keys) => keys,
+    label: (key) => key,
+    tint: (key) => PROVIDER_TINT[key.split("/")[0]] ?? "bg-slate-400",
+  },
 };
 
 function useNowMs(): number {
@@ -133,10 +152,17 @@ export function BreakdownTable({
   rows,
   kind,
   barMode = "magnitude",
+  selectedKeys,
+  onToggleRow,
 }: {
   rows: BreakdownRow[];
   kind: "team" | "model" | "stage";
   barMode?: "composition" | "magnitude";
+  // When provided, rows are click-to-select (toggle) and the selected set is
+  // highlighted; the charts above filter to it. Sorting still works via the
+  // column headers (their clicks don't bubble to row selection).
+  selectedKeys?: Set<string>;
+  onToggleRow?: (key: string) => void;
 }) {
   const [sortKey, setSortKey] = useState<keyof TokenSplit>("output_tokens");
   const sortable = kind !== "stage";
@@ -211,10 +237,17 @@ export function BreakdownTable({
               totalOutput > 0
                 ? Math.round((r.output_tokens / totalOutput) * 100)
                 : 0;
+            const selected = selectedKeys?.has(r.rowKey) ?? false;
             return (
               <tr
                 key={r.rowKey}
-                className="border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
+                aria-selected={onToggleRow ? selected : undefined}
+                onClick={onToggleRow ? () => onToggleRow(r.rowKey) : undefined}
+                className={cn(
+                  "border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50",
+                  onToggleRow && "cursor-pointer select-none",
+                  selected && "bg-secondary",
+                )}
               >
                 <td className="whitespace-nowrap px-3 py-2.5">
                   {kind === "team" ? (
@@ -287,21 +320,68 @@ export function BreakdownTable({
 export function TokenOverview({
   summary,
   heatmap,
-  stageSeries,
   provider,
   date,
   window,
 }: {
   summary?: SpendSummary;
   heatmap?: SpendHeatmap;
-  stageSeries?: StageSeries;
   provider: Provider;
   date: DateFilter;
   window: { from: string | null; to: string | null };
 }) {
   const [view, setView] = useState<"team" | "model" | "stage">("team");
-  // Totals vs Trend sub-view, only meaningful (and shown) in the stage view.
+  // Totals vs Trend sub-view, available in every breakdown view.
   const [stageMode, setStageMode] = useState<"totals" | "trend">("totals");
+  // Tokens vs % share metric for the Trend chart; owned here so its toggle can
+  // sit in the shared Breakdown header row.
+  const [trendMetric, setTrendMetric] = useState<"tokens" | "share">("tokens");
+  // Rows pinned by clicking the table: the charts (totals bar + trend) collapse
+  // to just these. Empty = no filter (show all). Reset when the view changes,
+  // since a key from one view (e.g. a team) is meaningless in another.
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  useEffect(() => setSelectedKeys(new Set()), [view]);
+  const toggleRow = (key: string) =>
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
+  // The trend series follows the active view (stage / team / model) and the
+  // resolved date window; fetched only while Trend is showing. Filters mirror
+  // the summary query so the trend reconciles with the totals table.
+  const { teams, models } = useFilters();
+  const providerFilter = provider === "all" ? undefined : provider;
+  const teamsKey = [...teams].sort().join(",");
+  const teamsFilter = teams.length ? teams : undefined;
+  const modelsKey = [...models].sort().join(",");
+  const modelsFilter = models.length ? models : undefined;
+  const seriesQuery = useQuery({
+    queryKey: [
+      "spend-series",
+      view,
+      provider,
+      teamsKey,
+      modelsKey,
+      window.from,
+      window.to,
+    ],
+    queryFn: () =>
+      fetchSpendStageSeries(
+        view,
+        providerFilter,
+        teamsFilter,
+        modelsFilter,
+        window.from ?? undefined,
+        window.to ?? undefined,
+      ),
+    enabled: stageMode === "trend",
+    refetchInterval: 30_000,
+    placeholderData: (prev) => prev,
+  });
+  const series = seriesQuery.data;
 
   const teamRows: BreakdownRow[] = (summary?.per_team ?? []).map((t) => ({
     rowKey: t.key,
@@ -344,6 +424,35 @@ export function TokenOverview({
   }));
   const rows =
     view === "team" ? teamRows : view === "model" ? modelRows : stageRows;
+  // The totals bar's segments (output-token share) and its palette: stage uses
+  // the default pipeline palette, team/model reuse their trend adapter so the
+  // bar matches the table's row dots.
+  const barAdapter = view === "stage" ? undefined : TREND_ADAPTERS[view];
+  const barRows = rows.map((r) => ({
+    key: r.rowKey,
+    output_tokens: r.output_tokens,
+  }));
+
+  // Charts collapse to the pinned rows; empty selection = show everything.
+  const hasSelection = selectedKeys.size > 0;
+  const chartBarRows = hasSelection
+    ? barRows.filter((r) => selectedKeys.has(r.key))
+    : barRows;
+  const chartSeries =
+    series && hasSelection
+      ? {
+          ...series,
+          stages: series.stages.filter((s) => selectedKeys.has(s)),
+          buckets: series.buckets.map((b) => ({
+            ...b,
+            output_tokens: Object.fromEntries(
+              Object.entries(b.output_tokens).filter(([k]) =>
+                selectedKeys.has(k),
+              ),
+            ),
+          })),
+        }
+      : series;
 
   return (
     <Card className="p-5">
@@ -398,34 +507,73 @@ export function TokenOverview({
               value={view}
               onChange={(v) => setView(v as "team" | "model" | "stage")}
             />
-            {view === "stage" ? (
+            <Segmented
+              ariaLabel="Breakdown view"
+              options={[
+                { value: "totals", label: "Totals" },
+                { value: "trend", label: "Trend" },
+              ]}
+              value={stageMode}
+              onChange={(v) => setStageMode(v as "totals" | "trend")}
+            />
+            {stageMode === "trend" ? (
               <Segmented
-                ariaLabel="Stage view"
+                ariaLabel="Trend metric"
                 options={[
-                  { value: "totals", label: "Totals" },
-                  { value: "trend", label: "Trend" },
+                  { value: "tokens", label: "Tokens" },
+                  { value: "share", label: "% share" },
                 ]}
-                value={stageMode}
-                onChange={(v) => setStageMode(v as "totals" | "trend")}
+                value={trendMetric}
+                onChange={(v) => setTrendMetric(v as "tokens" | "share")}
               />
             ) : null}
+            {hasSelection ? (
+              <button
+                type="button"
+                onClick={() => setSelectedKeys(new Set())}
+                className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              >
+                Clear ({selectedKeys.size})
+              </button>
+            ) : null}
           </div>
-          {!(view === "stage" && stageMode === "trend") ? <MixLegend /> : null}
+          {stageMode === "trend" ? (
+            <span className="font-mono text-[11px] text-muted-foreground">
+              output tokens · {series?.bucket === "week" ? "weekly" : "daily"}
+            </span>
+          ) : (
+            <MixLegend />
+          )}
         </div>
-        {view === "stage" && stageMode === "trend" ? (
-          stageSeries ? (
-            <StageTrend series={stageSeries} />
+        {stageMode === "trend" ? (
+          chartSeries ? (
+            <StageTrend
+              series={chartSeries}
+              mode={trendMetric}
+              adapter={barAdapter}
+            />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )
         ) : (
-          <>
-            {view === "stage" ? (
-              <LifecycleBar rows={sortedStages} className="mb-3" />
-            ) : null}
-            <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
-          </>
+          <LifecycleBar
+            rows={chartBarRows}
+            label={barAdapter?.label}
+            tint={barAdapter?.tint}
+          />
         )}
+        {/* The breakdown table shows in both modes — under the totals bar, and
+            under the trend chart (so the figures stay visible while charting).
+            Clicking a row pins it; the charts above collapse to the selection. */}
+        <div className="mt-4">
+          <BreakdownTable
+            rows={rows}
+            kind={view}
+            barMode="magnitude"
+            selectedKeys={selectedKeys}
+            onToggleRow={toggleRow}
+          />
+        </div>
       </div>
     </Card>
   );
@@ -583,21 +731,8 @@ export function HomePage() {
     refetchInterval: 60_000,
     placeholderData: (prev) => prev,
   });
-  // The by-stage trend follows the resolved date window (server picks day/week
-  // bucketing); it only renders inside the stage view's Trend sub-toggle.
-  const stageSeriesQuery = useQuery({
-    queryKey: ["spend-stage-series", provider, teamsKey, modelsKey, from, to],
-    queryFn: () =>
-      fetchSpendStageSeries(
-        providerFilter,
-        teamsFilter,
-        modelsFilter,
-        dateFrom,
-        dateTo,
-      ),
-    refetchInterval: 30_000,
-    placeholderData: (prev) => prev,
-  });
+  // The trend series is fetched inside TokenOverview (it follows the active
+  // breakdown view), so HomePage doesn't fetch it here.
   const activeQuery = useQuery({
     queryKey: ["issues", "active", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
@@ -647,7 +782,6 @@ export function HomePage() {
       <TokenOverview
         summary={summaryQuery.data}
         heatmap={heatmapQuery.data}
-        stageSeries={stageSeriesQuery.data}
         provider={provider}
         date={date}
         window={{ from, to }}

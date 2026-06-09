@@ -72,21 +72,25 @@ export function stageRank(key: string): number {
 }
 
 /**
- * The pipeline lifecycle bar: one stacked track whose segments are each stage's
- * share of total output tokens, colored by the shared stage palette. Rows are
- * rendered in the order given (pipeline order); a 0-output stage adds no
- * segment but is still listed in the by-stage table below.
+ * One stacked track whose segments are each row's share of total output tokens.
+ * Rows render in the order given; a 0-output row adds no segment. `label`/`tint`
+ * default to the shared stage palette (the by-stage lifecycle bar) and are
+ * overridden by the by-team / by-model totals bars to match their tables.
  */
 export function LifecycleBar({
   rows,
+  label = (key) => STAGE_LABEL[key] ?? key,
+  tint = (key) => STAGE_TINT[key] ?? "bg-slate-400",
   className,
 }: {
   rows: Array<{ key: string; output_tokens: number }>;
+  label?: (key: string) => string;
+  tint?: (key: string) => string;
   className?: string;
 }) {
   const total = rows.reduce((s, r) => s + r.output_tokens, 0) || 1;
   const title = rows
-    .map((r) => `${STAGE_LABEL[r.key] ?? r.key} ${formatTokens(r.output_tokens)}`)
+    .map((r) => `${label(r.key)} ${formatTokens(r.output_tokens)}`)
     .join(" · ");
   return (
     <div
@@ -102,7 +106,7 @@ export function LifecycleBar({
         return (
           <div
             key={r.key}
-            className={STAGE_TINT[r.key] ?? "bg-slate-400"}
+            className={tint(r.key)}
             style={{ width: `${pct}%` }}
           />
         );

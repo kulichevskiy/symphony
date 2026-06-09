@@ -1,7 +1,6 @@
 import { useRef, useState } from "react";
 
-import { Segmented } from "@/components/ui/segmented";
-import type { StageSeries, StageSeriesBucket } from "@/lib/api";
+import type { StageSeries } from "@/lib/api";
 import { formatLongDate, formatTokens } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -23,14 +22,32 @@ function orderedSeriesStages(stages: string[]): string[] {
   return [...stages].sort((a, b) => stageRank(a) - stageRank(b));
 }
 
-/** Reduce the series into pipeline-ordered stage keys, per-bucket columns with
- *  their output total, and the largest column total (for magnitude scaling). */
-export function buildStageColumns(series: StageSeries): {
+/** How a trend dimension (stage / team / model) renders its keys: the stack
+ *  order, the legend/tooltip label, and the segment color. Defaults below give
+ *  the by-stage behavior; the by-team / by-model views pass their own. */
+export type SeriesAdapter = {
+  order: (keys: string[]) => string[];
+  label: (key: string) => string;
+  tint: (key: string) => string;
+};
+
+const STAGE_ADAPTER: SeriesAdapter = {
+  order: orderedSeriesStages,
+  label: (key) => STAGE_LABEL[key] ?? key,
+  tint: (key) => STAGE_TINT[key] ?? "bg-slate-400",
+};
+
+/** Reduce the series into ordered keys, per-bucket columns with their output
+ *  total, and the largest column total (for magnitude scaling). */
+export function buildStageColumns(
+  series: StageSeries,
+  order: (keys: string[]) => string[] = orderedSeriesStages,
+): {
   stages: string[];
   columns: StageColumn[];
   maxTotal: number;
 } {
-  const stages = orderedSeriesStages(series.stages);
+  const stages = order(series.stages);
   const columns: StageColumn[] = series.buckets.map((b) => ({
     start: b.start,
     total: Object.values(b.output_tokens).reduce((s, v) => s + v, 0),
@@ -62,37 +79,48 @@ export function seriesMonthMarks(
   return marks;
 }
 
-/** Pipeline-ordered, non-zero stage bars for one bucket — used by the tooltip. */
+/** Ordered, non-zero stacked bars for one bucket — used by the tooltip. */
 export function stageBars(
   column: StageColumn,
   stages: string[],
+  label: (key: string) => string = STAGE_ADAPTER.label,
 ): Array<{ key: string; label: string; value: number }> {
   return stages
     .map((key) => ({
       key,
-      label: STAGE_LABEL[key] ?? key,
+      label: label(key),
       value: column.perStage[key] ?? 0,
     }))
     .filter((b) => b.value > 0);
 }
 
 /**
- * The by-stage Trend: output tokens over time as stacked columns, one per
- * bucket, stages stacked in pipeline order with the shared stage palette.
+ * The Trend chart: output tokens over time as stacked columns, one per bucket,
+ * keys stacked in the adapter's order with its palette. Drives the by-stage,
+ * by-team, and by-model trends — only the `adapter` differs.
  *
  * - Tokens mode (default): a column's height encodes its output total relative
- *   to the busiest bucket; segments within split by each stage's share.
+ *   to the busiest bucket; segments within split by each key's share.
  * - % share mode: every column fills the track; only the segment split varies.
  *
  * Both modes derive purely from output tokens. No event/prompt-change markers.
+ * `mode` (Tokens / % share) is owned by the parent so its toggle can sit in the
+ * shared Breakdown header row alongside Totals / Trend.
  */
-export function StageTrend({ series }: { series: StageSeries }) {
-  const [mode, setMode] = useState<"tokens" | "share">("tokens");
+export function StageTrend({
+  series,
+  mode,
+  adapter = STAGE_ADAPTER,
+}: {
+  series: StageSeries;
+  mode: "tokens" | "share";
+  adapter?: SeriesAdapter;
+}) {
   const [hover, setHover] = useState<
     { column: StageColumn; left: number; top: number } | null
   >(null);
   const wrapRef = useRef<HTMLDivElement>(null);
-  const { stages, columns, maxTotal } = buildStageColumns(series);
+  const { stages, columns, maxTotal } = buildStageColumns(series, adapter.order);
   const monthMarks = seriesMonthMarks(columns.map((c) => c.start));
   const markByIndex = new Map(monthMarks.map((m) => [m.index, m.label]));
 
@@ -112,21 +140,6 @@ export function StageTrend({ series }: { series: StageSeries }) {
 
   return (
     <div>
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <Segmented
-          ariaLabel="Trend metric"
-          options={[
-            { value: "tokens", label: "Tokens" },
-            { value: "share", label: "% share" },
-          ]}
-          value={mode}
-          onChange={(v) => setMode(v as "tokens" | "share")}
-        />
-        <span className="font-mono text-[11px] text-muted-foreground">
-          output tokens · {series.bucket === "week" ? "weekly" : "daily"}
-        </span>
-      </div>
-
       {columns.length === 0 ? (
         <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
           No stage activity in this window
@@ -160,7 +173,7 @@ export function StageTrend({ series }: { series: StageSeries }) {
                       return (
                         <div
                           key={st}
-                          className={STAGE_TINT[st] ?? "bg-slate-400"}
+                          className={adapter.tint(st)}
                           style={{ height: `${(value / c.total) * 100}%` }}
                         />
                       );
@@ -190,12 +203,9 @@ export function StageTrend({ series }: { series: StageSeries }) {
                 className="flex items-center gap-1.5 text-[11px] text-muted-foreground"
               >
                 <span
-                  className={cn(
-                    "h-2 w-2 rounded-sm",
-                    STAGE_TINT[st] ?? "bg-slate-400",
-                  )}
+                  className={cn("h-2 w-2 rounded-sm", adapter.tint(st))}
                 />
-                {STAGE_LABEL[st] ?? st}
+                {adapter.label(st)}
               </span>
             ))}
           </div>
@@ -209,13 +219,10 @@ export function StageTrend({ series }: { series: StageSeries }) {
                 {formatLongDate(hover.column.start)}
               </div>
               <div className="mt-1 grid grid-cols-[auto_auto] gap-x-4 gap-y-0.5 font-mono text-[11px] text-muted-foreground">
-                {stageBars(hover.column, stages).map((b) => (
+                {stageBars(hover.column, stages, adapter.label).map((b) => (
                   <span key={b.key} className="flex items-center gap-1.5">
                     <span
-                      className={cn(
-                        "h-2 w-2 rounded-sm",
-                        STAGE_TINT[b.key] ?? "bg-slate-400",
-                      )}
+                      className={cn("h-2 w-2 rounded-sm", adapter.tint(b.key))}
                     />
                     {b.label} {formatTokens(b.value)}
                   </span>

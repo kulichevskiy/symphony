@@ -382,9 +382,11 @@ export function fetchSpendHeatmap(
   );
 }
 
-/** The by-stage trend: output-token-per-stage time buckets. Window + bucket
- *  granularity follow the active date filter (all history when unfiltered). */
+/** The trend series: output-token time buckets grouped by `by` (stage / team /
+ *  model). Window + bucket granularity follow the active date filter (all
+ *  history when unfiltered). `series.stages` carries the dimension's keys. */
 export function fetchSpendStageSeries(
+  by: "stage" | "team" | "model",
   provider?: string,
   teams?: string[],
   models?: string[],
@@ -392,6 +394,9 @@ export function fetchSpendStageSeries(
   to?: string,
 ): Promise<StageSeries> {
   const params = new URLSearchParams();
+  if (by !== "stage") {
+    params.set("by", by);
+  }
   if (provider) {
     params.set("provider", provider);
   }
