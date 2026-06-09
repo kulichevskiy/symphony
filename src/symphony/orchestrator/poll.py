@@ -1327,6 +1327,50 @@ async def _workspace_scrub(workspace_path: Path) -> None:
             pass
 
 
+async def _workspace_dirty_files(workspace_path: Path) -> list[str]:
+    """`git status --porcelain` entries for *workspace_path*.
+
+    Returns the raw porcelain lines (status prefix + path). Best-effort
+    like the other workspace helpers: if git itself fails (not a repo,
+    git missing) the tree can't be inspected and we return [] so the
+    gate degrades to today's behavior instead of dead-ending every push.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "status", "--porcelain",
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            return [
+                line
+                for line in stdout.decode(errors="replace").splitlines()
+                if line.strip()
+            ]
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def dirty_tree_fix_prompt(dirty_files: list[str]) -> str:
+    """Prompt for the single pre-push fix turn on a dirty working tree.
+
+    Deliberately does NOT auto-commit for the agent: shipping `.env`
+    files or debug artifacts blindly is worse than failing the run.
+    """
+    listing = "\n".join(f"- {line}" for line in dirty_files)
+    return (
+        "These files are uncommitted:\n"
+        f"{listing}\n\n"
+        "Either commit them or explain why they are scratch/junk "
+        "(then clean them up). The working tree must be clean "
+        "(`git status --porcelain` empty) when you finish."
+    )
+
+
 def _github_commit_url(repo: str, sha: str) -> str:
     """Return a browser commit URL for *sha* in [HOST/]OWNER/REPO."""
     if not sha:
@@ -10029,6 +10073,39 @@ class Orchestrator:
                 )
                 return run_id
 
+        # 4.8. Pre-push dirty-tree gate. Pushing only commits means any
+        # uncommitted work silently vanishes on workspace cleanup (MCH-14).
+        # Dirty tree → one fix turn → re-check → fail-closed.
+        dirty_files = await _workspace_dirty_files(workspace_path)
+        if dirty_files:
+            log.warning(
+                "dirty working tree before push for %s (%d entries); "
+                "dispatching one fix turn",
+                issue.identifier,
+                len(dirty_files),
+            )
+            await self._run_dirty_tree_fix_turn(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                workspace_path=workspace_path,
+                parent_run_id=run_id,
+                dirty_files=dirty_files,
+            )
+            dirty_files = await _workspace_dirty_files(workspace_path)
+        if dirty_files:
+            listing = "\n".join(f"- `{line}`" for line in dirty_files)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                "working tree still dirty after one fix turn; "
+                f"not pushing. Uncommitted files:\n{listing}",
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+            )
+            return run_id
+
         # 5. Push branch, open PR, post stage-transition comment.
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
@@ -11842,6 +11919,69 @@ class Orchestrator:
             issue=issue,
             activity_stage="acceptance_fix",
             prior_total=prior_total,
+        )
+
+    async def _run_dirty_tree_fix_turn(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        workspace_path: Path,
+        parent_run_id: str,
+        dirty_files: list[str],
+    ) -> None:
+        """One agent turn to commit (or clean up) a dirty working tree.
+
+        Reuses the review fix-run machinery: same command builder, same
+        runner plumbing, its own `runs` row so the spend is attributed.
+        Best-effort — any failure here just leaves the tree dirty and the
+        caller's re-check fails closed.
+        """
+        fix_run_id = f"{parent_run_id}-dirty-fix"
+        await db.runs.create(
+            self._conn,
+            id=fix_run_id,
+            issue_id=storage_issue_id,
+            stage="implement_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+        command = build_fix_runner_command(
+            binding.agent,
+            dirty_tree_fix_prompt(dirty_files),
+            codex_model=binding.codex_model,
+            workspace_path=workspace_path,
+        )
+        status = "failed"
+        try:
+            usage, final_kind, returncode = await self._run_runner(
+                run_id=fix_run_id,
+                workspace_path=workspace_path,
+                command=command,
+                stage="implement_fix",
+                agent=binding.agent,
+                codex_model=binding.codex_model,
+                binding=binding,
+                issue=issue,
+            )
+            await _add_run_usage(self._conn, fix_run_id, usage)
+            transition = on_runner_event(
+                stage="implement",
+                event_kind=final_kind,
+                returncode=returncode,
+            )
+            status = transition.next_run_status
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "dirty-tree fix turn failed for %s: %s", issue.identifier, e
+            )
+        await db.runs.update_status(
+            self._conn,
+            fix_run_id,
+            status,
+            ended_at=datetime.now(UTC).isoformat(),
         )
 
     async def _run_runner(

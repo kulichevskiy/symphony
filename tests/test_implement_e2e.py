@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+import subprocess
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
@@ -719,6 +720,229 @@ async def test_failed_implement_stop_keeps_wait_when_blocked_state_missing(
         assert orch._dispatch_run_ids["iss-1"] == "failed-run"  # noqa: SLF001
         posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
         assert any("missing blocked state" in body for body in posted)
+    finally:
+        await conn.close()
+
+
+class _RecordingRunner:
+    """Like `_FakeRunner` but keeps every spec and supports a per-run hook."""
+
+    def __init__(
+        self,
+        events: list[RunnerEvent],
+        on_run: Callable[[RunnerSpec], None] | None = None,
+    ) -> None:
+        self.events = events
+        self.specs: list[RunnerSpec] = []
+        self.on_run = on_run
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.specs.append(spec)
+        if self.on_run is not None:
+            self.on_run(spec)
+        return self._aiter()
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        for ev in self.events:
+            yield ev
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+def _git(workspace: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.name=t",
+            "-c", "user.email=t@example.com",
+            *args,
+        ],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _init_git_workspace(workspace: Path) -> None:
+    _git(workspace, "init", "-q")
+    _git(workspace, "commit", "--allow-empty", "-m", "init")
+
+
+def _dirty_gate_fixture(tmp_path: Path) -> dict[str, object]:
+    cfg = Config(
+        repos=[_binding()],
+        log_root=tmp_path / "logs",
+        workspace_root=tmp_path / "ws",
+        db_path=tmp_path / "s.sqlite",
+    )
+    linear = AsyncMock()
+    linear.issues_in_state = AsyncMock(return_value=[_issue()])
+    linear.lookup_issue = AsyncMock(return_value=_issue())
+    linear.post_comment = AsyncMock(return_value="cmt-1")
+    linear.move_issue = AsyncMock()
+
+    workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+    workspace_path.mkdir(parents=True)
+    _init_git_workspace(workspace_path)
+    workspace = MagicMock()
+    workspace.acquire = AsyncMock(return_value=workspace_path)
+    workspace.release = MagicMock()
+
+    gh = MagicMock()
+    gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+    gh.pr_comment = AsyncMock()
+    gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+    return {
+        "cfg": cfg,
+        "linear": linear,
+        "workspace_path": workspace_path,
+        "workspace": workspace,
+        "gh": gh,
+        "push_fn": AsyncMock(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_dirty_tree_blocks_push_after_one_failed_fix_turn(
+    tmp_path: Path,
+) -> None:
+    """Uncommitted files + a fix turn that doesn't clean up → no push, no
+    PR, implement run fails into the operator-wait path with the file
+    list on Linear."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        fx = _dirty_gate_fixture(tmp_path)
+        workspace_path: Path = fx["workspace_path"]  # type: ignore[assignment]
+        (workspace_path / "feature.py").write_text("print('hi')\n")
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+        orch = Orchestrator(
+            fx["cfg"],
+            fx["linear"],
+            conn,
+            runner=runner,
+            gh=fx["gh"],
+            workspace=fx["workspace"],
+            push_fn=fx["push_fn"],
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, fx["cfg"].repos[0])  # type: ignore[union-attr]
+
+        fx["push_fn"].assert_not_awaited()  # type: ignore[union-attr]
+        fx["gh"].pr_create.assert_not_awaited()  # type: ignore[union-attr]
+
+        # Exactly one fix turn after the implement turn.
+        assert len(runner.specs) == 2
+        fix_prompt = runner.specs[1].command[-1]
+        assert "uncommitted" in fix_prompt
+        assert "feature.py" in fix_prompt
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        by_stage = {r.stage: r for r in history}
+        assert by_stage["implement"].status == "failed"
+        assert "implement_fix" in by_stage
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+
+        posted = [
+            str(c.args[1])
+            for c in fx["linear"].post_comment.await_args_list  # type: ignore[union-attr]
+        ]
+        assert any("feature.py" in body for body in posted), (
+            "expected the uncommitted file list in a Linear comment"
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dirty_tree_fix_turn_commits_and_push_proceeds(
+    tmp_path: Path,
+) -> None:
+    """The one fix turn commits the leftovers → push and PR happen."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        fx = _dirty_gate_fixture(tmp_path)
+        workspace_path: Path = fx["workspace_path"]  # type: ignore[assignment]
+        (workspace_path / "feature.py").write_text("print('hi')\n")
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+
+        def _commit_on_fix_turn(spec: RunnerSpec) -> None:
+            if len(runner.specs) == 2:
+                _git(workspace_path, "add", "-A")
+                _git(workspace_path, "commit", "-m", "commit leftovers")
+
+        runner.on_run = _commit_on_fix_turn
+
+        orch = Orchestrator(
+            fx["cfg"],
+            fx["linear"],
+            conn,
+            runner=runner,
+            gh=fx["gh"],
+            workspace=fx["workspace"],
+            push_fn=fx["push_fn"],
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, fx["cfg"].repos[0])  # type: ignore[union-attr]
+
+        assert len(runner.specs) == 2
+        fx["push_fn"].assert_awaited_once()  # type: ignore[union-attr]
+        fx["gh"].pr_create.assert_awaited_once()  # type: ignore[union-attr]
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        by_stage = {r.stage: r for r in history}
+        assert by_stage["implement"].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_clean_tree_skips_fix_turn_entirely(tmp_path: Path) -> None:
+    """Clean working tree → no extra agent turn, push proceeds."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        fx = _dirty_gate_fixture(tmp_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+        orch = Orchestrator(
+            fx["cfg"],
+            fx["linear"],
+            conn,
+            runner=runner,
+            gh=fx["gh"],
+            workspace=fx["workspace"],
+            push_fn=fx["push_fn"],
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, fx["cfg"].repos[0])  # type: ignore[union-attr]
+
+        assert len(runner.specs) == 1
+        fx["push_fn"].assert_awaited_once()  # type: ignore[union-attr]
+        fx["gh"].pr_create.assert_awaited_once()  # type: ignore[union-attr]
     finally:
         await conn.close()
 
