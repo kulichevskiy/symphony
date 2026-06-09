@@ -951,6 +951,7 @@ def build_acceptance_command(
         "--verbose",
         "--permission-mode",
         _CLAUDE_ACCEPTANCE_PERMISSION_MODE,
+        "--strict-mcp-config",
         "--disallowedTools",
         (
             _CLAUDE_DEV_ACCEPTANCE_DISALLOWED_TOOLS
@@ -965,7 +966,6 @@ def build_acceptance_command(
             [
                 "--mcp-config",
                 str(mcp_config_path),
-                "--strict-mcp-config",
                 "--allowedTools",
                 "mcp__playwright__*",
             ]

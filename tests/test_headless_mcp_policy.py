@@ -380,6 +380,7 @@ async def test_local_review_fixer_spawn_injects_binding_env(
         cap=1,
         stall_secs=10,
         binding_env={"SUPABASE_ACCESS_TOKEN": "sbp-resolved"},
+        mcp_servers={"supabase": {"type": "http", "url": "https://mcp.example"}},
         last_message_dir=tmp_path / "msgs",
         head_sha_provider=head_sha,
     )
@@ -392,3 +393,10 @@ async def test_local_review_fixer_spawn_injects_binding_env(
     # The headline assertion: the binding's resolved secret reaches the
     # fixer process env. Dropping `env=dict(binding_env or {})` fails here.
     assert spec.env == {"SUPABASE_ACCESS_TOKEN": "sbp-resolved"}
+    # The binding's MCP allowlist must reach the fixer command end-to-end.
+    # Dropping `mcp_servers=mcp_servers` on either forwarding hop fails here.
+    assert "--strict-mcp-config" in spec.command
+    config_json = spec.command[spec.command.index("--mcp-config") + 1]
+    assert json.loads(config_json) == {
+        "mcpServers": {"supabase": {"type": "http", "url": "https://mcp.example"}}
+    }
