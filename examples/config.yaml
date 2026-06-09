@@ -41,6 +41,13 @@ repos:
     # webhook_secret: repo-specific-github-webhook-secret
     max_concurrent: 2
     runner: local
+    # Optional pre-push build/test gate, run in the workspace after the
+    # last code-mutating stage (post local-review fixes). Red gets one
+    # implementer fix turn, then a re-run; still red blocks the push/PR
+    # and parks the issue for the operator with the failure tail on
+    # Linear. Omit to skip the gate. Example (masha2 in config.local.yaml):
+    # verify_cmd: pnpm build && pnpm test
+    # verify_timeout_secs: 900   # default: command_timeout_secs (1800)
     linear_states:
       ready: Todo            # source state — orchestrator picks up issues here
       in_progress: In Progress

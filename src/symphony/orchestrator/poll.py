@@ -133,6 +133,7 @@ from ..pipeline.review_classifier import (
 )
 from ..pipeline.state_machine import classify_termination, on_runner_event
 from ..pipeline.taste_guide import load_taste_guide
+from ..pipeline.verify import VerifyResult, run_verify_session
 from ..tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
@@ -10073,9 +10074,32 @@ class Orchestrator:
                 )
                 return run_id
 
+        # 4.7. Verify gate. When `binding.verify_cmd` is set, run it after
+        # the last code-mutating stage (post local-review fixes) and before
+        # push, so what's verified is what gets pushed. Red gets one
+        # implementer fix turn, then a re-run; still red fails closed:
+        # no push, no PR, operator wait.
+        if binding.verify_cmd:
+            verify_result = await self._run_verify_phase(
+                binding=binding,
+                issue=issue,
+                workspace_path=workspace_path,
+                parent_run_id=run_id,
+            )
+            if not verify_result.ok:
+                await self._block_verify_failure(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    run_id=run_id,
+                    result=verify_result,
+                )
+                return run_id
+
         # 4.8. Pre-push dirty-tree gate. Pushing only commits means any
         # uncommitted work silently vanishes on workspace cleanup (MCH-14).
-        # Dirty tree → one fix turn → re-check → fail-closed.
+        # Runs after the verify gate so leftovers from the verify fix turn
+        # are caught too. Dirty tree → one fix turn → re-check → fail-closed.
         dirty_files = await _workspace_dirty_files(workspace_path)
         if dirty_files:
             log.warning(
@@ -11287,6 +11311,122 @@ class Orchestrator:
         except LinearError as e:
             log.warning(
                 "local-review blocked comment post failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+
+    async def _run_verify_phase(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        workspace_path: Path,
+        parent_run_id: str,
+    ) -> VerifyResult:
+        """Run the binding's `verify_cmd` gate in the workspace.
+
+        Unlike local review (which degrades on infra faults so a broken
+        reviewer can't dead-end the pipeline), a fault here returns a
+        failed result: the gate exists to stop unbuildable code from
+        reaching a PR, so an unverifiable workspace must not push either.
+        """
+        verify_cmd = binding.verify_cmd or ""
+        try:
+            result = await run_verify_session(
+                runner=self._runner,
+                workspace_path=workspace_path,
+                verify_cmd=verify_cmd,
+                timeout_secs=binding.resolved_verify_timeout_secs(
+                    self.config.command_timeout_secs
+                ),
+                parent_run_id=parent_run_id,
+                issue_title=issue.title,
+                issue_body=issue.description,
+                labels=list(issue.labels),
+                implementer_agent=binding.agent,
+                implementer_codex_model=binding.codex_model,
+                stall_secs=self.config.stall_timeout_secs,
+                command_secs=self.config.command_timeout_secs,
+            )
+        except Exception as e:  # noqa: BLE001 — fail closed
+            log.exception("verify phase raised on %s", issue.identifier)
+            return VerifyResult(ok=False, error=f"verify phase raised: {e}")
+        log.info(
+            "verify phase for %s: ok=%s fix_attempted=%s",
+            issue.identifier,
+            result.ok,
+            result.fix_attempted,
+        )
+        return result
+
+    async def _block_verify_failure(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        result: VerifyResult,
+    ) -> None:
+        """Fail-closed on a red verify gate: block the issue like a failed
+        implement run, with the failure tail in the Linear comment."""
+        reason = result.error or "verify_cmd failed"
+        await self._fail_run(run_id, reason)
+
+        tracker = self.tracker(binding)
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while blocking %s after failed verify: %s",
+                issue.identifier,
+                e,
+            )
+            states = {}
+
+        blocked_id = states.get(binding.linear_states.blocked)
+        if blocked_id is not None:
+            try:
+                await tracker.move_issue(issue.id, blocked_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to blocked after verify failure: %s",
+                    issue.identifier,
+                    e,
+                )
+        else:
+            log.warning(
+                "missing Linear blocked state %r for %s after verify failure",
+                binding.linear_states.blocked,
+                issue.identifier,
+            )
+
+        await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
+        body = failed(
+            CommentVars(
+                stage="verify",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+                error=f"`{binding.verify_cmd}` — {reason}",
+                last_log=result.tail,
+                auto_retry=False,
+            )
+        )
+        body += (
+            "\nReply with `$retry` or `$approve` to requeue this issue. "
+            "Reply with `$reject` or `$stop` to leave it halted.\n"
+        )
+        try:
+            await tracker.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "verify blocked comment post failed on %s: %s",
                 issue.identifier,
                 e,
             )

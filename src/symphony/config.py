@@ -152,6 +152,15 @@ class RepoBinding(BaseModel):
     # PR threads (already wired into a GitHub-side dashboard); others
     # want every verdict surfaced for human reviewers.
     post_local_review_pr_summary: bool | None = None
+    # Optional build/test gate (e.g. "pnpm build && pnpm test") run in the
+    # workspace after the last code-mutating stage (post local-review fixes)
+    # and before push, so what's verified is what gets pushed. Red gets one
+    # implementer fix turn, then a re-run; still red fails closed (no push,
+    # no PR). `None` skips the gate entirely (today's behavior).
+    verify_cmd: str | None = None
+    # Wall-clock cap for one `verify_cmd` invocation. `None` falls back to
+    # `Config.command_timeout_secs`.
+    verify_timeout_secs: int | None = Field(default=None, ge=1)
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
     activity_comments_enabled: bool | None = None
     activity_comment_interval_secs: int | None = Field(default=None, ge=1)
@@ -324,6 +333,14 @@ class RepoBinding(BaseModel):
         if self.post_local_review_pr_summary is None:
             return global_value
         return self.post_local_review_pr_summary
+
+    def resolved_verify_timeout_secs(self, global_default: int) -> int:
+        """Per-binding override wins; falls back to `command_timeout_secs`."""
+        return (
+            self.verify_timeout_secs
+            if self.verify_timeout_secs is not None
+            else global_default
+        )
 
 
 class Secrets(BaseSettings):
