@@ -10083,6 +10083,7 @@ class Orchestrator:
             verify_result = await self._run_verify_phase(
                 binding=binding,
                 issue=issue,
+                storage_issue_id=issue_id,
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
             )
@@ -11320,6 +11321,7 @@ class Orchestrator:
         *,
         binding: RepoBinding,
         issue: LinearIssue,
+        storage_issue_id: str,
         workspace_path: Path,
         parent_run_id: str,
     ) -> VerifyResult:
@@ -11329,8 +11331,32 @@ class Orchestrator:
         reviewer can't dead-end the pipeline), a fault here returns a
         failed result: the gate exists to stop unbuildable code from
         reaching a PR, so an unverifiable workspace must not push either.
+
+        Mirrors `_run_local_review_phase`: a `stage="verify"` runs row is
+        created so the fix turn's spend lands in `cost_for_issue` (feeding
+        the re-dispatch cost guard) and in the fail-closed Linear comment's
+        token totals — otherwise the implementer the fix turn spawns bills
+        nothing.
         """
         verify_cmd = binding.verify_cmd or ""
+        # `UsageCostEstimator.delta` is threaded into the fix turn's
+        # `collect_runner_output` to bill its tokens; the fix-turn stdout
+        # is written to `verify_log_path` for per-model attribution.
+        cost_estimator = _UsageCostEstimator(
+            agent=binding.agent, codex_model=binding.codex_model
+        )
+        verify_run_id = str(uuid.uuid4())
+        verify_log_path = self.config.log_root / f"{verify_run_id}.log"
+        await db.runs.create(
+            self._conn,
+            id=verify_run_id,
+            issue_id=storage_issue_id,
+            stage="verify",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+        result: VerifyResult | None = None
         try:
             result = await run_verify_session(
                 runner=self._runner,
@@ -11347,10 +11373,20 @@ class Orchestrator:
                 implementer_codex_model=binding.codex_model,
                 stall_secs=self.config.stall_timeout_secs,
                 command_secs=self.config.command_timeout_secs,
+                usage_handler=cost_estimator.delta,
+                fix_log_path=verify_log_path,
             )
         except Exception as e:  # noqa: BLE001 — fail closed
             log.exception("verify phase raised on %s", issue.identifier)
-            return VerifyResult(ok=False, error=f"verify phase raised: {e}")
+            result = VerifyResult(ok=False, error=f"verify phase raised: {e}")
+        finally:
+            await self._finalize_verify_run(
+                run_id=verify_run_id,
+                ok=result.ok if result is not None else False,
+                cost_estimator=cost_estimator,
+                log_path=verify_log_path,
+                codex_model=binding.codex_model,
+            )
         log.info(
             "verify phase for %s: ok=%s fix_attempted=%s",
             issue.identifier,
@@ -11358,6 +11394,59 @@ class Orchestrator:
             result.fix_attempted,
         )
         return result
+
+    async def _finalize_verify_run(
+        self,
+        *,
+        run_id: str,
+        ok: bool,
+        cost_estimator: _UsageCostEstimator,
+        log_path: Path,
+        codex_model: str | None,
+    ) -> None:
+        """Persist the verify fix turn's spend and close its `runs` row.
+
+        Always called from the phase's `finally`. The delta accumulated by
+        `cost_estimator` is the fix turn's whole-run spend; the row is
+        marked completed on a green gate, failed otherwise (the fail-closed
+        path also fails the parent implement run separately)."""
+        try:
+            await _add_run_usage(
+                self._conn,
+                run_id,
+                UsageDelta(
+                    cost_usd=cost_estimator.total_cost_usd,
+                    input_tokens=cost_estimator.total_input_tokens,
+                    output_tokens=cost_estimator.total_output_tokens,
+                    cache_write_tokens=cost_estimator.total_cache_write_tokens,
+                    cache_read_tokens=cost_estimator.total_cache_read_tokens,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("could not persist verify usage for run %s", run_id)
+        await _record_run_model_usage(
+            self._conn, run_id, log_path, codex_model=codex_model
+        )
+        try:
+            if ok:
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "completed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                )
+            else:
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "failed",
+                    ended_at=datetime.now(UTC).isoformat(),
+                    **_termination_kwargs(
+                        status="failed", reason="verify_cmd failed"
+                    ),
+                )
+        except Exception:  # noqa: BLE001
+            log.warning("could not finalize verify run %s", run_id)
 
     async def _block_verify_failure(
         self,

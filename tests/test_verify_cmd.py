@@ -23,6 +23,10 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
+from symphony.pipeline.local_review import (
+    VERDICT_APPROVED_MARKER,
+    VERDICT_CHANGES_REQUESTED_MARKER,
+)
 from symphony.pipeline.verify import (
     VerifyResult,
     run_verify_command,
@@ -451,5 +455,159 @@ async def test_verify_session_crash_fails_closed(tmp_path: Path) -> None:
         gh.pr_create.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
+    finally:
+        await conn.close()
+
+
+# --- verify_cmd + local_review together ------------------------------------
+
+
+def _codex_agent_message(text: str) -> RunnerEvent:
+    return RunnerEvent(
+        kind="stdout",
+        line=json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "i", "type": "agent_message", "text": text},
+            }
+        ),
+    )
+
+
+def _local_and_verify_binding(verify_cmd: str) -> RepoBinding:
+    return RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        agent="claude",
+        branch_prefix="symphony",
+        local_review=True,
+        remote_review=False,
+        reviewer_agent="codex",
+        verify_cmd=verify_cmd,
+        linear_states=LinearStates(
+            ready="Todo",
+            local_code_review="Local Code Review",
+            code_review="Needs Approval",
+        ),
+    )
+
+
+def _local_states() -> dict[str, str]:
+    states = _states()
+    states["Local Code Review"] = "state-local-review"
+    return states
+
+
+@pytest.mark.asyncio
+async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
+    """Acceptance: verify runs *after* the last code-mutating stage.
+
+    With `local_review` enabled, the gate must fire after the local-review
+    fix loop's last mutation — so what's verified is what gets pushed. The
+    local reviewer requests one change (→ `local_review_fix`) then approves;
+    `verify_cmd` is red on the first run (→ one `verify_fix` turn) and green
+    on the re-run, so push proceeds. The captured stage order proves the
+    verify gate ran strictly after the local-review fixes.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        # Red on the first invocation, green once `.sym_verified` exists.
+        # The mock fix turn does not really mutate the tree; the sentinel
+        # toggle stands in for "a fix landed" so the re-run goes green.
+        verify_cmd = (
+            "if [ -f .sym_verified ]; then exit 0; "
+            "else touch .sym_verified; echo VERIFY_RED_THEN_GREEN; exit 1; fi"
+        )
+        binding = _local_and_verify_binding(verify_cmd)
+        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
+            tmp_path, binding
+        )
+
+        def _result_line() -> RunnerEvent:
+            return RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "total_cost_usd": 0.05,
+                        "usage": {"input_tokens": 10, "output_tokens": 5},
+                    }
+                ),
+            )
+
+        runner = _StagedRunner(
+            {
+                "implement": [_implement_script()],
+                "local_review": [
+                    [
+                        _codex_agent_message(
+                            "## Findings\n- needs a tweak\n"
+                            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ],
+                    [
+                        _codex_agent_message(f"ok\n{VERDICT_APPROVED_MARKER}"),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ],
+                ],
+                "local_review_fix": [
+                    [
+                        RunnerEvent(kind="started", pid=2),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+                "verify_fix": [
+                    [
+                        RunnerEvent(kind="started", pid=3),
+                        _result_line(),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+            }
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _local_states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        stages = [s.stage for s in runner.captured]
+        assert stages == [
+            "implement",
+            "local_review",
+            "local_review_fix",
+            "local_review",
+            "verify_fix",
+        ]
+        # The verify gate's fix turn runs strictly after the local-review
+        # fix loop's last mutation.
+        last_mutation = max(
+            i
+            for i, s in enumerate(stages)
+            if s in ("local_review", "local_review_fix")
+        )
+        assert stages.index("verify_fix") > last_mutation
+
+        # Green on the re-run → push proceeds, PR opened.
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_create.assert_awaited_once()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is None
+
+        # The verify fix turn's spend is billed to a `stage="verify"` row.
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        verify_rows = [h for h in history if h.stage == "verify"]
+        assert len(verify_rows) == 1
+        assert verify_rows[0].status == "completed"
+        assert verify_rows[0].cost_usd > 0
     finally:
         await conn.close()

@@ -12,10 +12,13 @@ the caller's signal to fail closed — no push, no PR.
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..agent.process import Usage
 from ..agent.prompt import review_comment_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
 from .local_review_io import collect_runner_output
@@ -56,6 +59,11 @@ async def run_verify_command(
     Stdout and stderr are interleaved into one stream — build tools split
     diagnostics across both arbitrarily, and the fix turn wants the
     combined tail. A timeout kills the process and counts as red.
+
+    `start_new_session=True` puts the shell in its own process group so a
+    timeout can SIGKILL the whole tree (`os.killpg`): `proc.kill()` alone
+    only reaps the `/bin/sh -c` shell, leaving the spawned `node`/`pnpm`
+    grandchildren orphaned and still chewing through the workspace.
     """
     proc = await asyncio.create_subprocess_shell(
         verify_cmd,
@@ -63,13 +71,17 @@ async def run_verify_command(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         stdin=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
     )
     try:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_secs
         )
     except TimeoutError:
-        proc.kill()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # whole group already gone
         await proc.wait()
         return False, f"verify_cmd timed out after {timeout_secs}s"
     return proc.returncode == 0, stdout.decode("utf-8", errors="replace")
@@ -99,8 +111,16 @@ async def run_verify_session(
     stall_secs: int,
     command_secs: int = 1800,
     command_runner: VerifyCommandRunner = run_verify_command,
+    usage_handler: Callable[[Usage], object] | None = None,
+    fix_log_path: Path | None = None,
 ) -> VerifyResult:
-    """Run the verify gate: verify → (one fix turn → verify again) on red."""
+    """Run the verify gate: verify → (one fix turn → verify again) on red.
+
+    `usage_handler` (e.g. `UsageCostEstimator.delta`) is threaded into the
+    fix turn's `collect_runner_output` so its token/cost spend is billed to
+    the issue instead of vanishing. `fix_log_path`, when set, receives the
+    fix turn's stdout so the caller can attribute per-model usage from it.
+    """
     ok, output = await command_runner(workspace_path, verify_cmd, timeout_secs)
     if ok:
         return VerifyResult(ok=True)
@@ -124,7 +144,17 @@ async def run_verify_session(
         command_secs=command_secs,
         stage="verify_fix",
     )
-    collected = await collect_runner_output(runner, spec)
+    collected = await collect_runner_output(
+        runner, spec, usage_handler=usage_handler
+    )
+    if fix_log_path is not None:
+        try:
+            fix_log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+            fix_log_path.write_text(  # noqa: ASYNC240
+                collected.stdout, encoding="utf-8"
+            )
+        except OSError:
+            pass  # per-model attribution is best-effort
     if not collected.ok_exit:
         detail = (
             f"spawn_failed: {collected.spawn_error or 'unknown'}"
