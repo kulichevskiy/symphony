@@ -294,6 +294,9 @@ describe("TokenOverview", () => {
     // Defaults to the team view (VIB row present, no model names yet).
     expect(markup).toContain(">VIB</span>");
     expect(markup).not.toContain("gpt-5-codex");
+    // Team Totals shows the stacked totals bar (its segment title is the team
+    // label + tokens — unique to LifecycleBar, distinct from the table rows).
+    expect(markup).toContain('title="VIB ');
   });
 
   it("offers the Totals/Trend sub-toggle in every breakdown view, Totals by default", () => {

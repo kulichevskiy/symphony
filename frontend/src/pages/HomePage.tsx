@@ -398,6 +398,14 @@ export function TokenOverview({
   }));
   const rows =
     view === "team" ? teamRows : view === "model" ? modelRows : stageRows;
+  // The totals bar's segments (output-token share) and its palette: stage uses
+  // the default pipeline palette, team/model reuse their trend adapter so the
+  // bar matches the table's row dots.
+  const barAdapter = view === "stage" ? undefined : TREND_ADAPTERS[view];
+  const barRows = rows.map((r) => ({
+    key: r.rowKey,
+    output_tokens: r.output_tokens,
+  }));
 
   return (
     <Card className="p-5">
@@ -486,19 +494,23 @@ export function TokenOverview({
             <StageTrend
               series={series}
               mode={trendMetric}
-              adapter={view === "stage" ? undefined : TREND_ADAPTERS[view]}
+              adapter={barAdapter}
             />
           ) : (
             <p className="text-sm text-muted-foreground">Loading…</p>
           )
         ) : (
-          <>
-            {view === "stage" ? (
-              <LifecycleBar rows={sortedStages} className="mb-3" />
-            ) : null}
-            <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
-          </>
+          <LifecycleBar
+            rows={barRows}
+            label={barAdapter?.label}
+            tint={barAdapter?.tint}
+          />
         )}
+        {/* The breakdown table shows in both modes — under the totals bar, and
+            under the trend chart (so the figures stay visible while charting). */}
+        <div className="mt-4">
+          <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
+        </div>
       </div>
     </Card>
   );
