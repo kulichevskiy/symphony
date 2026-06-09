@@ -182,6 +182,23 @@ describe("BreakdownTable", () => {
     expect(markup).toContain("No teams/models match the current filters");
   });
 
+  it("marks selected rows when selection is enabled", () => {
+    const markup = renderToStaticMarkup(
+      <BreakdownTable
+        rows={teamRows}
+        kind="team"
+        selectedKeys={new Set(["VIB"])}
+        onToggleRow={() => {}}
+      />,
+    );
+    // Selected row carries aria-selected=true and a highlight; the unselected
+    // one is aria-selected=false. Rows become click-to-select (cursor-pointer).
+    expect(markup).toContain('aria-selected="true"');
+    expect(markup).toContain('aria-selected="false"');
+    expect(markup).toContain("bg-secondary");
+    expect(markup).toContain("cursor-pointer");
+  });
+
   it("renders stage rows in the given pipeline order without re-sorting", () => {
     // Outputs are NOT descending: an output-sort would put merge first.
     const stageRows = [

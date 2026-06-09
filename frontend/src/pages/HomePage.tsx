@@ -152,10 +152,17 @@ export function BreakdownTable({
   rows,
   kind,
   barMode = "magnitude",
+  selectedKeys,
+  onToggleRow,
 }: {
   rows: BreakdownRow[];
   kind: "team" | "model" | "stage";
   barMode?: "composition" | "magnitude";
+  // When provided, rows are click-to-select (toggle) and the selected set is
+  // highlighted; the charts above filter to it. Sorting still works via the
+  // column headers (their clicks don't bubble to row selection).
+  selectedKeys?: Set<string>;
+  onToggleRow?: (key: string) => void;
 }) {
   const [sortKey, setSortKey] = useState<keyof TokenSplit>("output_tokens");
   const sortable = kind !== "stage";
@@ -230,10 +237,17 @@ export function BreakdownTable({
               totalOutput > 0
                 ? Math.round((r.output_tokens / totalOutput) * 100)
                 : 0;
+            const selected = selectedKeys?.has(r.rowKey) ?? false;
             return (
               <tr
                 key={r.rowKey}
-                className="border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
+                aria-selected={onToggleRow ? selected : undefined}
+                onClick={onToggleRow ? () => onToggleRow(r.rowKey) : undefined}
+                className={cn(
+                  "border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50",
+                  onToggleRow && "cursor-pointer select-none",
+                  selected && "bg-secondary",
+                )}
               >
                 <td className="whitespace-nowrap px-3 py-2.5">
                   {kind === "team" ? (
@@ -322,6 +336,18 @@ export function TokenOverview({
   // Tokens vs % share metric for the Trend chart; owned here so its toggle can
   // sit in the shared Breakdown header row.
   const [trendMetric, setTrendMetric] = useState<"tokens" | "share">("tokens");
+  // Rows pinned by clicking the table: the charts (totals bar + trend) collapse
+  // to just these. Empty = no filter (show all). Reset when the view changes,
+  // since a key from one view (e.g. a team) is meaningless in another.
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  useEffect(() => setSelectedKeys(new Set()), [view]);
+  const toggleRow = (key: string) =>
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   // The trend series follows the active view (stage / team / model) and the
   // resolved date window; fetched only while Trend is showing. Filters mirror
@@ -407,6 +433,27 @@ export function TokenOverview({
     output_tokens: r.output_tokens,
   }));
 
+  // Charts collapse to the pinned rows; empty selection = show everything.
+  const hasSelection = selectedKeys.size > 0;
+  const chartBarRows = hasSelection
+    ? barRows.filter((r) => selectedKeys.has(r.key))
+    : barRows;
+  const chartSeries =
+    series && hasSelection
+      ? {
+          ...series,
+          stages: series.stages.filter((s) => selectedKeys.has(s)),
+          buckets: series.buckets.map((b) => ({
+            ...b,
+            output_tokens: Object.fromEntries(
+              Object.entries(b.output_tokens).filter(([k]) =>
+                selectedKeys.has(k),
+              ),
+            ),
+          })),
+        }
+      : series;
+
   return (
     <Card className="p-5">
       {/* top: heatmap (anchor) + all-time stat rail */}
@@ -480,6 +527,15 @@ export function TokenOverview({
                 onChange={(v) => setTrendMetric(v as "tokens" | "share")}
               />
             ) : null}
+            {hasSelection ? (
+              <button
+                type="button"
+                onClick={() => setSelectedKeys(new Set())}
+                className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+              >
+                Clear ({selectedKeys.size})
+              </button>
+            ) : null}
           </div>
           {stageMode === "trend" ? (
             <span className="font-mono text-[11px] text-muted-foreground">
@@ -490,9 +546,9 @@ export function TokenOverview({
           )}
         </div>
         {stageMode === "trend" ? (
-          series ? (
+          chartSeries ? (
             <StageTrend
-              series={series}
+              series={chartSeries}
               mode={trendMetric}
               adapter={barAdapter}
             />
@@ -501,15 +557,22 @@ export function TokenOverview({
           )
         ) : (
           <LifecycleBar
-            rows={barRows}
+            rows={chartBarRows}
             label={barAdapter?.label}
             tint={barAdapter?.tint}
           />
         )}
         {/* The breakdown table shows in both modes — under the totals bar, and
-            under the trend chart (so the figures stay visible while charting). */}
+            under the trend chart (so the figures stay visible while charting).
+            Clicking a row pins it; the charts above collapse to the selection. */}
         <div className="mt-4">
-          <BreakdownTable rows={rows} kind={view} barMode="magnitude" />
+          <BreakdownTable
+            rows={rows}
+            kind={view}
+            barMode="magnitude"
+            selectedKeys={selectedKeys}
+            onToggleRow={toggleRow}
+          />
         </div>
       </div>
     </Card>
