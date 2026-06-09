@@ -33,7 +33,12 @@ from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator, build_runner_command
-from symphony.pipeline.local_review_session import _build_fix_command
+from symphony.pipeline.local_review import VERDICT_CHANGES_REQUESTED_MARKER
+from symphony.pipeline.local_review_loop import LoopOutcome
+from symphony.pipeline.local_review_session import (
+    _build_fix_command,
+    run_local_review_session,
+)
 
 # --- 1. Headless / no-interactive-auth prompt rule -------------------------
 
@@ -311,3 +316,79 @@ async def test_implement_spawn_injects_binding_env_and_strict_mcp(
         }
     finally:
         await conn.close()
+
+
+class _FixerSpecCapturingRunner:
+    """Drives one review→fix iteration without a subprocess.
+
+    The reviewer pass emits a `CHANGES_REQUESTED` verdict (claude `result`
+    event) so the loop dispatches a fix-run; the fixer's `RunnerSpec` —
+    the masha2 schema-fix path — is then captured for env assertions.
+    """
+
+    def __init__(self) -> None:
+        self.fixer_spec: RunnerSpec | None = None
+
+    def run(self, spec: RunnerSpec):
+        if spec.stage == "local_review_fix":
+            self.fixer_spec = spec
+            return self._exit_only(pid=2)
+        return self._reviewer_changes_requested()
+
+    async def _reviewer_changes_requested(self):
+        message = (
+            "## Findings\n\n"
+            "- file.py:1 — schema drift; regenerate types.\n\n"
+            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+        )
+        yield RunnerEvent(kind="started", pid=1)
+        yield RunnerEvent(
+            kind="stdout",
+            line=json.dumps({"type": "result", "result": message}),
+        )
+        yield RunnerEvent(kind="exit", returncode=0)
+
+    async def _exit_only(self, *, pid: int):
+        yield RunnerEvent(kind="started", pid=pid)
+        yield RunnerEvent(kind="exit", returncode=0)
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_local_review_fixer_spawn_injects_binding_env(
+    tmp_path: Path,
+) -> None:
+    runner = _FixerSpecCapturingRunner()
+
+    async def head_sha(_path: Path) -> str:
+        return "deadbeef"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path,
+        base_branch="main",
+        parent_run_id="run-1",
+        issue_title="Apply schema migration",
+        issue_body="Add the breakdown table.",
+        labels=["symphony"],
+        implementer_agent="claude",
+        implementer_codex_model="",
+        reviewer_agent="claude",
+        reviewer_codex_model="",
+        cap=1,
+        stall_secs=10,
+        binding_env={"SUPABASE_ACCESS_TOKEN": "sbp-resolved"},
+        last_message_dir=tmp_path / "msgs",
+        head_sha_provider=head_sha,
+    )
+
+    # cap=1: reviewer requests changes → fixer runs once → loop exhausts.
+    assert result.outcome is LoopOutcome.EXHAUSTED
+    spec = runner.fixer_spec
+    assert spec is not None
+    assert spec.stage == "local_review_fix"
+    # The headline assertion: the binding's resolved secret reaches the
+    # fixer process env. Dropping `env=dict(binding_env or {})` fails here.
+    assert spec.env == {"SUPABASE_ACCESS_TOKEN": "sbp-resolved"}
