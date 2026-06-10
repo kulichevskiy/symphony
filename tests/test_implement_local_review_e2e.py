@@ -22,7 +22,9 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
+from symphony.github.client import GitHubError
 from symphony.linear.client import LinearIssue
+from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -1217,5 +1219,133 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
         assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_review_deliver_failed_resumes_after_restart(
+    tmp_path: Path,
+) -> None:
+    """A `local_review` binding whose `pr_create` fails after the completion
+    gate parks `deliver_failed`. After a daemon restart drops the in-memory
+    delivery stash, `$retry` must reconstruct the context as already-approved
+    and resume delivery to an open PR + review stage — never dead-end in
+    `_fail_review_run` ("local-only review did not approve"). Regression for
+    the reconstructed-as-`None` gate bug on a local-review binding.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _local_binding()  # local_review True, remote_review False
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(side_effect=GitHubError("gh pr create: HTTP 401"))
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        runner = _StagedRunner(
+            {
+                "implement": [
+                    [
+                        RunnerEvent(kind="started", pid=4242),
+                        RunnerEvent(
+                            kind="stdout",
+                            line=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                                }
+                            ),
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+            }
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        # Local review approves on the first (pre-PR) pass.
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=LoopOutcome.APPROVED, iterations=1, verdicts=()
+            )
+        )
+        # Spy on the dead-end path the reconstructed-as-None bug took.
+        orch._fail_review_run = AsyncMock(wraps=orch._fail_review_run)  # type: ignore[method-assign]  # noqa: SLF001
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # pr_create raised after the completion gate → parked deliver_failed,
+        # agent ran exactly once, PR not yet open.
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        run_id = wait.run_id
+        push_fn.assert_awaited_once()
+        assert len([s for s in runner.captured if s.stage == "implement"]) == 1
+
+        # --- Daemon restart: the in-memory delivery stash is gone, so the
+        # resume must reconstruct the context. ---
+        orch._pending_deliveries.clear()  # noqa: SLF001
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        # Resumed delivery opened the PR and started the Review stage; it never
+        # dead-ended in `_fail_review_run`, and the agent was not re-invoked.
+        gh.ensure_pr.assert_awaited_once()
+        orch._fail_review_run.assert_not_awaited()  # type: ignore[attr-defined]
+        assert len([s for s in runner.captured if s.stage == "implement"]) == 1
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert any(h.stage == "review" for h in history), (
+            "expected the resumed delivery to start the Review stage"
+        )
+        # The reconstructed synthetic-APPROVED result must not post a degenerate
+        # "iterations: 0" local-review PR summary.
+        summary_calls = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if "local reviewer" in str(c).lower()
+        ]
+        assert summary_calls == []
     finally:
         await conn.close()

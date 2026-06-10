@@ -467,6 +467,12 @@ class _PendingDelivery:
     branch: str
     cumulative_usage: UsageDelta
     local_review_result: LoopResult | None
+    # True when rebuilt by `_resolve_pending_delivery` after a daemon restart
+    # lost the in-memory stash. The workspace was re-acquired (possibly
+    # re-cloned) and the live local-review verdict is gone, so the resume
+    # path treats the gate as already-passed and skips degenerate audit
+    # artifacts (e.g. an "iterations: 0" PR summary).
+    reconstructed: bool = False
 
 
 class _TerminationKwargs(TypedDict):
@@ -1403,6 +1409,31 @@ async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     return ""
+
+
+async def _workspace_commits_ahead(
+    workspace_path: Path, base_branch: str
+) -> int | None:
+    """Commits on HEAD not in *base_branch*, or None if undeterminable.
+
+    Prefer `origin/<base>` (present after a fresh clone), fall back to the
+    local `<base>` ref. Returns None when neither ref resolves so callers can
+    degrade gracefully rather than mistake a measurement failure for "empty".
+    """
+    for ref in (f"origin/{base_branch}..HEAD", f"{base_branch}..HEAD"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-list", "--count", ref,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                return int(stdout.decode().strip() or "0")
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 async def _workspace_diff_size(
@@ -10574,33 +10605,10 @@ class Orchestrator:
             )
         )
 
-    async def _deliver_implement_run(self, *, ctx: _PendingDelivery) -> str:
-        """Push + open PR + hand off to review/merge for a completed implement.
-
-        Re-entrant: invoked once at the end of the implement dispatch and again
-        on a `$retry` of a `deliver_failed` wait. Never re-dispatches the agent
-        and never runs the completion gate. Push / `ensure_pr` failures park a
-        `deliver_failed` operator wait via `_park_deliver_failed`.
-        """
-        binding = ctx.binding
-        issue = ctx.issue
-        issue_id = ctx.storage_issue_id
-        run_id = ctx.run_id
-        workspace_path = ctx.workspace_path
-        branch = ctx.branch
-        cumulative_usage = ctx.cumulative_usage
-        local_review_result = ctx.local_review_result
-        tracker = self.tracker(binding)
-
-        # 5. Push branch, open PR, post stage-transition comment.
-        try:
-            await self._push_fn(workspace_path, branch)
-        except Exception as e:  # noqa: BLE001
-            log.warning("git push failed for %s: %s", issue.identifier, e)
-            await self._park_deliver_failed(f"push failed: {e}", ctx=ctx, exc=e)
-            return run_id
-
-        pr_url: str = ""
+    async def _resolve_base_branch(
+        self, binding: RepoBinding, issue: LinearIssue
+    ) -> str | None:
+        """The PR base branch: the binding override, else the repo default."""
         base_branch = binding.base_branch
         if base_branch is None:
             try:
@@ -10611,6 +10619,52 @@ class Orchestrator:
                     issue.identifier,
                     e,
                 )
+        return base_branch
+
+    async def _deliver_implement_run(self, *, ctx: _PendingDelivery) -> str:
+        """Push + open PR + hand off to review/merge for a completed implement.
+
+        Re-entrant: invoked once at the end of the implement dispatch and again
+        on a `$retry` of a `deliver_failed` wait. Never re-dispatches the agent
+        and never runs the completion gate. Push / `ensure_pr` failures park a
+        `deliver_failed` operator wait via `_park_deliver_failed`.
+        """
+        binding = ctx.binding
+        issue = ctx.issue
+        run_id = ctx.run_id
+        workspace_path = ctx.workspace_path
+        branch = ctx.branch
+        cumulative_usage = ctx.cumulative_usage
+        tracker = self.tracker(binding)
+
+        base_branch = await self._resolve_base_branch(binding, issue)
+
+        # On a reconstructed resume the workspace was re-acquired after the
+        # daemon restart — and on a *push*-failure the commits lived only in
+        # that workspace, which was already released. If it was swept past its
+        # TTL, `acquire()` may have re-cloned an empty branch from origin (the
+        # publish step is the very one that failed). Refuse to push / open an
+        # empty no-op PR with the work silently lost; re-park instead.
+        if ctx.reconstructed and base_branch is not None:
+            ahead = await _workspace_commits_ahead(workspace_path, base_branch)
+            if ahead == 0:
+                msg = (
+                    f"workspace swept before $retry: branch {branch} carries no "
+                    f"commits over {base_branch}; refusing to deliver an empty PR"
+                )
+                log.warning("%s for %s", msg, issue.identifier)
+                await self._park_deliver_failed(msg, ctx=ctx)
+                return run_id
+
+        # 5. Push branch, open PR, post stage-transition comment.
+        try:
+            await self._push_fn(workspace_path, branch)
+        except Exception as e:  # noqa: BLE001
+            log.warning("git push failed for %s: %s", issue.identifier, e)
+            await self._park_deliver_failed(f"push failed: {e}", ctx=ctx, exc=e)
+            return run_id
+
+        pr_url: str = ""
         try:
             pr_url = await self._gh.ensure_pr(
                 title=build_pr_title(issue),
@@ -10658,6 +10712,30 @@ class Orchestrator:
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
+
+        # Past the PR open the handoff (review-state writes, review-stage
+        # start, PR summary) is still post-completion delivery: an unexpected
+        # DB / Linear failure here must park `deliver_failed` for a `$retry`
+        # rather than propagate and leave a completed run with no review
+        # started and no operator wait.
+        try:
+            return await self._deliver_review_handoff(ctx=ctx, pr_url=pr_url)
+        except Exception as e:  # noqa: BLE001
+            log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
+            await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
+            return run_id
+
+    async def _deliver_review_handoff(
+        self, *, ctx: _PendingDelivery, pr_url: str
+    ) -> str:
+        """Post-PR handoff: register the merge candidate (no-review) or start
+        the Review stage. Raises on unexpected DB/Linear faults so the caller
+        can park `deliver_failed`."""
+        binding = ctx.binding
+        issue = ctx.issue
+        issue_id = ctx.storage_issue_id
+        run_id = ctx.run_id
+        local_review_result = ctx.local_review_result
 
         if (
             not binding.resolved_local_review()
@@ -10753,9 +10831,12 @@ class Orchestrator:
         #    failures are parked for operator action. The binding-level
         #    override wins over the global config so an
         #    operator can keep one repo's PR thread quiet without
-        #    disabling the feature everywhere.
+        #    disabling the feature everywhere. Skipped on a reconstructed
+        #    resume, whose synthetic APPROVED result would post a degenerate
+        #    "iterations: 0" summary.
         if (
-            binding.resolved_post_local_review_pr_summary(
+            not ctx.reconstructed
+            and binding.resolved_post_local_review_pr_summary(
                 self.config.post_local_review_pr_summary
             )
             and local_review_result is not None
@@ -13142,8 +13223,8 @@ class Orchestrator:
         daemon restarted and the in-memory stash was lost.
 
         The completion gate already passed before parking, so a reconstructed
-        context treats local review as already-approved (None result) and reads
-        the issue + workspace fresh; the branch and commits are intact on disk.
+        context treats local review as already-approved and reads the issue +
+        workspace fresh; the branch and commits are intact on disk.
         """
         ctx = self._pending_deliveries.get(run_id)
         if ctx is not None:
@@ -13183,7 +13264,15 @@ class Orchestrator:
             workspace_path=workspace_path,
             branch=f"{binding.branch_prefix}/{issue.identifier.lower()}",
             cumulative_usage=UsageDelta(),
-            local_review_result=None,
+            # Synthetic APPROVED: the local-review gate already passed before
+            # the original park, but the live verdict is gone after a restart.
+            # `None` would read as "not approved" at the delivery gate and
+            # dead-end a `local_review` binding in `_fail_review_run`; APPROVED
+            # lets `_local_review_permits_remote` treat the gate as passed.
+            local_review_result=LoopResult(
+                outcome=LoopOutcome.APPROVED, iterations=0, verdicts=()
+            ),
+            reconstructed=True,
         )
 
 
