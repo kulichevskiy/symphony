@@ -1413,6 +1413,33 @@ async def _workspace_diff_size(
     return DiffSize(changed_lines=0, changed_files=0)
 
 
+async def _branch_ahead_of_base(workspace_path: Path, base_branch: str | None) -> bool:
+    """True if HEAD has ≥1 commit not in *base_branch* (`git rev-list base..HEAD`).
+
+    Mirrors the diff helper's ref logic: prefer `origin/<base>..HEAD`, fall back
+    to `<base>..HEAD` when origin is absent. On any error (or no base), report
+    False so the run takes the normal agent path instead of skipping it — a
+    branch we can't prove is ahead must not bypass the implementer.
+    """
+    if not base_branch:
+        return False
+    for ref in (f"origin/{base_branch}..HEAD", f"{base_branch}..HEAD"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-list", "--count", ref,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                count = stdout.decode().strip()
+                return count.isdigit() and int(count) > 0
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 async def _workspace_scrub(workspace_path: Path) -> None:
     """Reset the working tree to HEAD and remove untracked files.
 
@@ -10311,6 +10338,86 @@ class Orchestrator:
             )
             return run_id
 
+        # 3.5. Resolve the delivery base once; both the branch-already-ahead
+        # short-circuit and ensure_pr use it.
+        base_branch = await self._resolve_base_branch(binding)
+
+        # A branch already ahead of base means a prior run committed the work:
+        # skip the agent and the completion gate, resume at the agent-free
+        # publish step. The completion gate can never fire on a delivery retry.
+        cumulative_usage: UsageDelta
+        local_review_result: LoopResult | None
+        if await _branch_ahead_of_base(workspace_path, base_branch):
+            log.info(
+                "branch for %s already ahead of %s; skipping agent, "
+                "resuming at publish",
+                issue.identifier,
+                base_branch,
+            )
+            self._workspace.release(binding, issue)
+            cumulative_usage = UsageDelta()
+            local_review_result = None
+        else:
+            phase = await self._run_implement_phase(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+            )
+            if phase is None:
+                # The agent step halted (failed / blocked / parked); the run
+                # state is already recorded. Never reaches publish.
+                return run_id
+            cumulative_usage, local_review_result = phase
+
+        return await self._publish_stage(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            base_branch=base_branch,
+            cumulative_usage=cumulative_usage,
+            local_review_result=local_review_result,
+        )
+
+    async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:
+        """The PR base: the binding's configured base, else the repo default.
+
+        On a default-branch lookup error, fall back to gh's own default (None)
+        rather than failing the run.
+        """
+        if binding.base_branch is not None:
+            return binding.base_branch
+        try:
+            return await self._gh.repo_default_branch(binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "repo_default_branch failed for %s; falling back to gh default: %s",
+                binding.github_repo,
+                e,
+            )
+            return None
+
+    async def _run_implement_phase(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+    ) -> tuple[UsageDelta, LoopResult | None] | None:
+        """The agent step: run the implementer, apply the completion gate, then
+        the local-review / verify / dirty-tree pre-push gates.
+
+        Returns ``(cumulative_usage, local_review_result)`` when the branch is
+        ready to publish, or ``None`` when the run was halted (failed, blocked,
+        or parked on an operator wait) and the caller should return. The
+        completion gate lives here and only here — it never guards delivery.
+        """
+        issue_id = storage_issue_id
         prior_total = await db.runs.cost_for_issue(self._conn, issue_id)
         # Branch base before the agent runs, so the completion gate can tell
         # whether the run actually advanced HEAD (≥1 new commit).
@@ -10338,7 +10445,7 @@ class Orchestrator:
                 binding=binding,
                 exc=e,
             )
-            return run_id
+            return None
         finally:
             self._workspace.release(binding, issue)
 
@@ -10368,7 +10475,7 @@ class Orchestrator:
                 final_kind=final_kind,
                 returncode=final_returncode,
             )
-            return run_id
+            return None
 
         # 4.25. Completion gate. rc=0 alone is not "done": an agent that ends
         # its turn politely blocked on a human action (MCH-14) also exits 0.
@@ -10403,7 +10510,7 @@ class Orchestrator:
                 binding=binding,
                 returncode=final_returncode,
             )
-            return run_id
+            return None
         if completion.outcome != "completed":
             reason = (
                 "implement run exited 0 but did not satisfy the completion "
@@ -10420,7 +10527,7 @@ class Orchestrator:
                 binding=binding,
                 returncode=final_returncode,
             )
-            return run_id
+            return None
 
         # 4.5. Local-review pre-flight. When `binding.local_review` is set,
         # run the reviewer in-workspace before pushing. This shortens the
@@ -10444,7 +10551,7 @@ class Orchestrator:
                     run_id=run_id,
                     result=local_review_result,
                 )
-                return run_id
+                return None
 
         # 4.7. Verify gate. When `binding.verify_cmd` is set, run it after
         # the last code-mutating stage (post local-review fixes) and before
@@ -10467,7 +10574,7 @@ class Orchestrator:
                     run_id=run_id,
                     result=verify_result,
                 )
-                return run_id
+                return None
             # SYM-108: record the green gate against the exact head it
             # verified so the merge gate can treat a no-CI repo as mergeable
             # only for this SHA. A later HEAD-advancing fix turn (e.g. the
@@ -10514,8 +10621,31 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
-            return run_id
+            return None
 
+        return cumulative_usage, local_review_result
+
+    async def _publish_stage(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+        base_branch: str | None,
+        cumulative_usage: UsageDelta,
+        local_review_result: LoopResult | None,
+    ) -> str:
+        """Delivery: push + ensure_pr + review/merge handoff.
+
+        Agent-free and idempotent — safe to (re)run on a branch that is already
+        pushed / already has a PR: the push fast-forwards to a no-op and
+        ``ensure_pr`` adopts the existing PR. The completion gate never guards
+        this step.
+        """
+        issue_id = storage_issue_id
+        tracker = self.tracker(binding)
         # 5. Push branch, open PR, post stage-transition comment.
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
@@ -10534,16 +10664,6 @@ class Orchestrator:
             return run_id
 
         pr_url: str = ""
-        base_branch = binding.base_branch
-        if base_branch is None:
-            try:
-                base_branch = await self._gh.repo_default_branch(binding.github_repo)
-            except GitHubError as e:
-                log.warning(
-                    "repo_default_branch failed for %s; falling back to gh default: %s",
-                    issue.identifier,
-                    e,
-                )
         try:
             pr_url = await self._gh.ensure_pr(
                 title=build_pr_title(issue),

@@ -1218,6 +1218,172 @@ async def test_clean_tree_skips_fix_turn_entirely(tmp_path: Path) -> None:
         await conn.close()
 
 
+def _done_result_line(message: str) -> str:
+    return json.dumps({"type": "result", "subtype": "success", "result": message})
+
+
+@pytest.mark.asyncio
+async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) -> None:
+    """An implement (re)dispatch on a branch already ahead of base skips the
+    agent and the completion gate entirely and proceeds straight to the
+    agent-free publish step (push + ensure_pr)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        # HEAD is one commit ahead of `trunk` (the resolved base): the prior
+        # run already committed the agent's work.
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        # Would advance HEAD / record a spec if the agent ran — it must not.
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # The agent never ran: no completion gate, no fix turns.
+        assert runner.specs == []
+        # Publish ran: branch pushed, PR ensured (idempotently).
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [r.stage for r in history] == ["implement"]
+        assert history[0].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_at_publish_after_delivery_failure_skips_agent(
+    tmp_path: Path,
+) -> None:
+    """A push failure parks the run; the re-dispatch resumes at publish —
+    the branch is already ahead of base, so the agent is skipped and only
+    push + ensure_pr run."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        # Base only; the first run's agent will advance HEAD over `trunk`.
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        def _commit_on_implement(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                (workspace_path / "feature.py").write_text("print('hi')\n")
+                _git(workspace_path, "add", "-A")
+                _git(workspace_path, "commit", "-m", "agent work")
+
+        runner1 = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(
+                    kind="stdout",
+                    line=_done_result_line("Implemented it.\n\nSYMPHONY_DONE"),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit_on_implement,
+        )
+        failing_push = AsyncMock(side_effect=RuntimeError("push boom"))
+
+        linear1 = AsyncMock()
+        linear1.post_comment = AsyncMock(return_value="cmt-1")
+        linear1.move_issue = AsyncMock()
+        orch1 = Orchestrator(
+            cfg, linear1, conn, runner=runner1, gh=gh, workspace=workspace,
+            push_fn=failing_push,
+        )
+        orch1._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch1._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        # First run: agent ran, push attempted and failed, no PR.
+        assert [s.stage for s in runner1.specs] == ["implement"]
+        failing_push.assert_awaited_once()
+        gh.ensure_pr.assert_not_awaited()
+        h1 = await db.runs.history_for_issue(conn, "iss-1")
+        assert h1[0].status == "failed"
+
+        # --- Resume: re-dispatch with a healthy push. The branch is ahead of
+        #     base now, so the agent must not run again. ---
+        runner2 = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=5151), RunnerEvent(kind="exit", returncode=0)]
+        )
+        good_push = AsyncMock()
+        linear2 = AsyncMock()
+        linear2.post_comment = AsyncMock(return_value="cmt-2")
+        linear2.move_issue = AsyncMock()
+        orch2 = Orchestrator(
+            cfg, linear2, conn, runner=runner2, gh=gh, workspace=workspace,
+            push_fn=good_push,
+        )
+        orch2._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch2._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        # The agent was skipped on resume.
+        assert runner2.specs == []
+        good_push.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+
+        h2 = await db.runs.history_for_issue(conn, "iss-1")
+        completed = [r for r in h2 if r.stage == "implement" and r.status == "completed"]
+        assert len(completed) == 1
+    finally:
+        await conn.close()
+
+
 def test_pr_title_and_body_format() -> None:
     """The PR title format is `[<LINEAR_ID>] <issue title>` and the body
     contains `Relates to <linear-url>`. Verified by introspecting the
