@@ -3966,6 +3966,9 @@ async def test_merge_conflict_fix_marker_survives_when_merge_capacity_full(
                 "baseRefName": "main",
                 "state": "OPEN",
                 "mergedAt": None,
+                "statusCheckRollup": [
+                    {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}
+                ],
             }
         )
         gh.pr_checks = AsyncMock(
