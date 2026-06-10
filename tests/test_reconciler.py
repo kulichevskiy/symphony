@@ -42,6 +42,7 @@ NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 class _FakeLinear:
     state_name: str = "In Progress"
     error: Exception | None = None
+    move_error: Exception | None = None
     calls: int = 0
     moves: list[tuple[str, str]] = field(default_factory=list)
     states_map: dict[str, str] = field(
@@ -76,6 +77,8 @@ class _FakeLinear:
         return dict(self.states_map)
 
     async def move_issue(self, issue_id_or_identifier: str, state_id: str) -> None:
+        if self.move_error is not None:
+            raise self.move_error
         self.moves.append((issue_id_or_identifier, state_id))
 
 
@@ -1495,6 +1498,107 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     assert linear.moves == [("iss-1", "state-needs-approval")]
     assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
     assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_move_failure_rolls_back_and_re_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        # Non-transient move failure must abort adoption: the whole tick rolls
+        # back so the wait survives and the next tick re-probes and retries.
+        linear = _FakeLinear(
+            state_name="Blocked",
+            move_error=LinearError("boom"),
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        with pytest.raises(LinearError, match="boom"):
+            await reconciler.tick()
+
+        # Rolled back: wait intact, nothing adopted.
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
+        assert (await db.review_state.get(conn, "iss-1")).pr_number is None
+        assert await _observation_rows(conn) == []
+        assert len(fake_gh.head_calls) == 1
+
+        # Next tick with the move recovered: re-probes and adopts.
+        linear.move_error = None
+        assert await reconciler.tick() == 2
+        assert len(fake_gh.head_calls) == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_transient_move_failure_backs_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        # Transient move failure routes through _BackoffRequested: the tick
+        # rolls back, enters backoff, and the next tick is skipped.
+        linear = _FakeLinear(
+            state_name="Blocked",
+            move_error=LinearError("server error 429: slow down"),
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        # _BackoffRequested is caught by the tick loop, no exception escapes.
+        await reconciler.tick()
+
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
+        # Backoff active: next tick is a no-op and does not re-probe.
+        assert await reconciler.tick() == 0
+        assert len(fake_gh.head_calls) == 1
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio

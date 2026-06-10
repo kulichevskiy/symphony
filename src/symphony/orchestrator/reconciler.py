@@ -855,10 +855,17 @@ class Reconciler:
         team_key: str,
         state_name: str,
     ) -> None:
-        """Move the tracked issue to ``state_name`` (best-effort, like poll).
+        """Move the tracked issue to ``state_name``, aborting adoption on failure.
 
-        Failures are logged and swallowed so a transient Linear error does not
-        roll back the adopted DB rows — an operator can re-move by hand.
+        A failed move must NOT commit. Adoption deletes the operator wait and
+        writes ``issue_prs``/``review_state``, but the review/merge pollers
+        reject the still-``Blocked`` issue and close the adopted run — and with
+        the wait gone the orphan probe never re-fires (``wait is None``), so the
+        issue is stuck for good with no auto-recovery. Raising here propagates
+        to the reconcile transaction's rollback (reconciler ``except`` →
+        ``rollback``), so the next tick re-probes the intact wait and retries.
+        Transient Linear errors route through ``_BackoffRequested`` like the
+        other tracker calls.
         """
         if not state_name:
             return
@@ -866,30 +873,21 @@ class Reconciler:
         try:
             states = await tracker.team_states(team_key)
         except LinearError as e:
-            log.warning(
-                "could not load states to move %s to %r: %s",
-                tracker_issue_id,
-                state_name,
-                e,
-            )
-            return
+            if _should_backoff(str(e)):
+                raise _BackoffRequested(source=SOURCE_LINEAR, error=str(e)) from e
+            raise
         state_id = states.get(state_name)
         if state_id is None:
-            log.warning(
-                "missing Linear state %r for %s during adoption",
-                state_name,
-                tracker_issue_id,
+            raise LinearError(
+                f"missing Linear state {state_name!r} for {tracker_issue_id} "
+                "during adoption"
             )
-            return
         try:
             await tracker.move_issue(tracker_issue_id, state_id)
         except LinearError as e:
-            log.warning(
-                "could not move %s to %r during adoption: %s",
-                tracker_issue_id,
-                state_name,
-                e,
-            )
+            if _should_backoff(str(e)):
+                raise _BackoffRequested(source=SOURCE_LINEAR, error=str(e)) from e
+            raise
 
     async def _candidate_enabled(self, issue_id: str, team_key: str) -> bool:
         wait = await db.operator_waits.get(self._conn, issue_id)
