@@ -291,6 +291,17 @@ def test_classify_no_marker_no_commits_ambiguous_fails() -> None:
     assert completion.outcome == "failed"
 
 
+# Acceptance: a _DONE_SIGNALS phrase (classifier "done" verdict) in an
+# unmarked, zero-commit final message must NOT classify as completed — same
+# criterion as the SYMPHONY_DONE-without-commits branch, via the fallback path.
+def test_classify_no_marker_no_commits_done_verdict_not_completed() -> None:
+    completion = classify_implement_completion(
+        final_message="Nothing to change.",
+        head_advanced=False,
+    )
+    assert completion.outcome != "completed"
+
+
 # Acceptance: rc=0 without commits and without SYMPHONY_DONE never completes.
 def test_classify_done_marker_without_commits_not_completed() -> None:
     completion = classify_implement_completion(

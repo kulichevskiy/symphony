@@ -158,8 +158,9 @@ def classify_implement_completion(
     * ``SYMPHONY_DONE`` without commits -> ``failed`` (claimed done, produced
       nothing to push).
     * No marker but HEAD advanced -> ``completed`` (commits are ground truth).
-    * No marker AND no commits -> run ``classifier`` on the final message to
-      decide done vs blocked; still ambiguous -> ``failed``.
+    * No marker AND no commits -> run ``classifier`` on the final message; only
+      a ``blocked`` ask is actionable. A ``done`` verdict here cannot mean
+      completed (no commits to push), so done/ambiguous -> ``failed``.
 
     The classifier fallback runs *only* in the last case (marker missing and
     HEAD did not advance).
@@ -176,8 +177,9 @@ def classify_implement_completion(
     verdict, ask = classifier(final_message)
     if verdict == "blocked":
         return ImplementCompletion(outcome="blocked", blocked_reason=ask)
-    if verdict == "done":
-        return ImplementCompletion(outcome="completed")
+    # No commits exist: a "done" verdict cannot mean completed (rc=0 without
+    # commits and without SYMPHONY_DONE never classifies as completed). Only a
+    # blocked ask is actionable here; everything else is a failure.
     return ImplementCompletion(outcome="failed")
 
 
