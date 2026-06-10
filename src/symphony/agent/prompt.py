@@ -12,6 +12,17 @@ from pathlib import Path
 REVIEW_LOG_TAIL_BYTES = 12_000
 REQUIRED_CHECK_LOG_TAIL_LINES = 200
 
+# Appended to every prompt that drives code changes (implement + fix runs).
+# The daemon has no human at the keyboard, so an interactive auth flow can
+# only hang the run; `SYMPHONY_BLOCKED` gives the agent a clean exit that the
+# operator can act on.
+HEADLESS_RULES = (
+    "\n# Headless environment\n\n"
+    "You run headless. Never start an interactive auth flow (OAuth URLs, "
+    "browser logins, device codes). If a tool requires one, stop and report "
+    "`SYMPHONY_BLOCKED: <what the operator must authorize and where>`.\n"
+)
+
 
 def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) -> str:
     """Build the system+user prompt for the Implement stage.
@@ -35,6 +46,7 @@ def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) ->
         "- Commit your changes on the current branch (do not push).\n"
         "- Follow strict TDD: write a failing test first, then the code.\n"
         "- Do not edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 
@@ -73,6 +85,7 @@ def review_fix_prompt(
         "- Make the smallest change that resolves the failing review signal.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 
@@ -99,6 +112,7 @@ def review_comment_fix_prompt(
         "- Make the smallest change that addresses the reviewer feedback.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 
@@ -131,6 +145,7 @@ def acceptance_fix_prompt(
         "- Follow strict TDD where practical: reproduce the mismatch first, "
         "then fix it.\n"
         "- Do not edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 
@@ -175,6 +190,7 @@ def merge_conflict_fix_prompt(
         "  integrating any new upstream changes from the base branch.\n"
         "- Do not edit files that are not in the conflicted list above.\n"
         "- Do not run git commands.\n"
+        f"{HEADLESS_RULES}"
     )
 
 
@@ -204,6 +220,7 @@ def merge_conflict_rebase_fix_prompt(
         "- Commit the resolved rebase result if needed, run the repo's test+lint "
         "gates, and push the updated branch.\n"
         "- Do not merge the PR or edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 
@@ -249,6 +266,7 @@ def merge_required_check_fix_prompt(
             "fetching more logs.\n"
             "- Commit your changes on the current branch (do not push).\n"
             "- Do not merge the PR or edit unrelated files.\n"
+            f"{HEADLESS_RULES}"
         ),
     )
     return template.format(
@@ -298,6 +316,7 @@ def merge_prompt(
         "- If no housekeeping change is needed, exit successfully without "
         "creating a commit.\n"
         "- Do not merge the PR, push, or edit unrelated files.\n"
+        f"{HEADLESS_RULES}"
     )
 
 

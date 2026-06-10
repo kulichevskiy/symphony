@@ -48,6 +48,26 @@ repos:
     # Linear. Omit to skip the gate. Example (masha2 in config.local.yaml):
     # verify_cmd: pnpm build && pnpm test
     # verify_timeout_secs: 900   # default: command_timeout_secs (1800)
+    # Extra env injected into this binding's agent processes. Values name
+    # keys in symphony's `.env` (or the daemon's process env) — the secrets
+    # themselves never live in this file. A key missing at startup fails
+    # `Config.load`, so typos surface at boot, not mid-run.
+    # Example (masha2-style Supabase schema work via the `supabase` CLI —
+    # `db push`, `gen types typescript` — instead of the OAuth-only MCP
+    # server):
+    # env:
+    #   SUPABASE_ACCESS_TOKEN: MASHA2_SUPABASE_ACCESS_TOKEN
+    #   SUPABASE_PROJECT_REF: MASHA2_SUPABASE_PROJECT_REF
+    #
+    # MCP servers this binding's agents may use. Agents run with
+    # `--strict-mcp-config`: anything not listed here is invisible, and the
+    # default is none. Entries are standard claude `--mcp-config` server
+    # definitions, passed through verbatim. Only grant servers that work
+    # headless (no OAuth/browser/device-code auth).
+    # mcp_servers:
+    #   linear:
+    #     type: http
+    #     url: https://mcp.linear.app/mcp
     linear_states:
       ready: Todo            # source state — orchestrator picks up issues here
       in_progress: In Progress

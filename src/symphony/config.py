@@ -161,6 +161,17 @@ class RepoBinding(BaseModel):
     # Wall-clock cap for one `verify_cmd` invocation. `None` falls back to
     # `Config.command_timeout_secs`.
     verify_timeout_secs: int | None = Field(default=None, ge=1)
+    # Extra env injected into this binding's agent subprocesses. YAML values
+    # name keys in symphony's `.env` (or the process env) — the secrets
+    # themselves never live in the YAML. `Config.load` replaces each value
+    # with the resolved secret via `resolve_env`; an unresolvable key fails
+    # the load so the daemon dies loudly at boot, not mid-run.
+    env: dict[str, str] = Field(default_factory=dict)
+    # MCP servers this binding's agents may see. Entries are claude
+    # `--mcp-config` server definitions, passed through verbatim. Spawns use
+    # `--strict-mcp-config`, so anything not listed here is invisible to the
+    # agent. Default: none.
+    mcp_servers: dict[str, dict[str, Any]] = Field(default_factory=dict)
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
     activity_comments_enabled: bool | None = None
     activity_comment_interval_secs: int | None = Field(default=None, ge=1)
@@ -191,6 +202,16 @@ class RepoBinding(BaseModel):
 
     def apply_tracker_secret_defaults(self, *, jira_base_url: str | None = None) -> None:
         self._apply_tracker_context_defaults(jira_base_url=jira_base_url)
+
+    def resolve_env(self, source: Mapping[str, str]) -> None:
+        """Replace `env:` key names with their values from `source`."""
+        missing = sorted(key for key in self.env.values() if key not in source)
+        if missing:
+            raise ValueError(
+                f"binding {self.project_key}/{self.github_repo}: env keys not "
+                f"found in .env or process env: {', '.join(missing)}"
+            )
+        self.env = {var: source[key] for var, key in self.env.items()}
 
     # Legacy `review_strategy` → boolean mapping. The old enum dropped the
     # remote fallback that `local` once carried; the booleans are now the
@@ -478,8 +499,21 @@ class Config(BaseModel):
                 "jira_webhook_secret": secrets.jira_webhook_secret,
             }
         )
+        # Per-binding agent env: same `.env` file pydantic-settings reads,
+        # with the real process env winning on conflicts (mirrors
+        # pydantic-settings precedence). Resolution happens here so a typo'd
+        # key kills the daemon at boot instead of stranding a run.
+        import os
+
+        from dotenv import dotenv_values
+
+        env_source: dict[str, str] = {
+            key: value for key, value in dotenv_values(".env").items() if value is not None
+        }
+        env_source.update(os.environ)
         for binding in cfg.repos:
             binding.apply_tracker_secret_defaults(jira_base_url=cfg.jira_base_url)
+            binding.resolve_env(env_source)
         # Expand ~ now so downstream code can assume absolute paths.
         cfg = cfg.model_copy(
             update={

@@ -40,3 +40,7 @@ GitHub branch protection is blocking PR #{pr_number} because a required status c
 - For GitHub Actions failures, use the failed log tail above before fetching more logs.
 - Commit your changes on the current branch (do not push).
 - Do not merge the PR or edit unrelated files.
+
+# Headless environment
+
+You run headless. Never start an interactive auth flow (OAuth URLs, browser logins, device codes). If a tool requires one, stop and report `SYMPHONY_BLOCKED: <what the operator must authorize and where>`.

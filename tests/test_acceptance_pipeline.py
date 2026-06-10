@@ -1358,6 +1358,8 @@ def test_acceptance_command_disallows_claude_tools_without_budget() -> None:
     assert {"Bash", "Read", "Edit", "Write", "MultiEdit"}.issubset(
         disallowed_tools
     )
+    assert "--strict-mcp-config" in command
+    assert "--mcp-config" not in command
     assert "--max-budget-usd" not in command
     assert command[-1] == "judge this"
 
