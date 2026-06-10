@@ -33,6 +33,20 @@ def test_implement_prompt_handles_empty_labels() -> None:
     assert prompt.strip() != ""
 
 
+def test_implement_prompt_mandates_completion_marker_contract() -> None:
+    prompt = implement_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+    )
+    # The agent's final message must end with a machine-readable marker so the
+    # orchestrator can tell "done" from "politely blocked on a human action".
+    assert "SYMPHONY_DONE" in prompt
+    assert "SYMPHONY_BLOCKED:" in prompt
+    # The blocked marker must demand the exact human action.
+    assert "final message" in prompt.lower()
+
+
 def test_implement_prompt_is_deterministic() -> None:
     a = implement_prompt(issue_title="t", issue_body="b", labels=["x"])
     b = implement_prompt(issue_title="t", issue_body="b", labels=["x"])

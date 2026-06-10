@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast
 
 import aiosqlite
 import httpx
@@ -107,7 +107,12 @@ from ..pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
 )
-from ..pipeline.local_review import DiffSize, LocalVerdict, parse_diff_numstat
+from ..pipeline.local_review import (
+    DiffSize,
+    LocalVerdict,
+    extract_last_agent_message,
+    parse_diff_numstat,
+)
 from ..pipeline.local_review_loop import LoopOutcome, LoopResult
 from ..pipeline.local_review_session import run_local_review_session
 from ..pipeline.preview_resolver import (
@@ -131,7 +136,11 @@ from ..pipeline.review_classifier import (
 from ..pipeline.review_classifier import (
     CheckRun as ReviewCheckRun,
 )
-from ..pipeline.state_machine import classify_termination, on_runner_event
+from ..pipeline.state_machine import (
+    classify_implement_completion,
+    classify_termination,
+    on_runner_event,
+)
 from ..pipeline.taste_guide import load_taste_guide
 from ..pipeline.verify import VerifyResult, run_verify_session
 from ..tracker import (
@@ -1272,6 +1281,25 @@ async def _git_add_and_continue_rebase(
 async def _workspace_head_sha(workspace_path: Path) -> str:
     """Return the HEAD commit SHA of *workspace_path*, or "" on error."""
     return await _workspace_ref_sha(workspace_path, "HEAD")
+
+
+def _read_run_final_message(log_path: Path, *, agent: str) -> str:
+    """Extract the agent's final message from a stage run log, or "" on error.
+
+    The run log is the runner's stdout (`claude` stream-json or `codex`
+    JSONL). The completion gate reads the final message to look for the
+    SYMPHONY_DONE / SYMPHONY_BLOCKED marker.
+    """
+    if agent not in ("claude", "codex"):
+        return ""
+    try:
+        stdout = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    reviewer_agent: Literal["claude", "codex"] = (
+        "claude" if agent == "claude" else "codex"
+    )
+    return extract_last_agent_message(agent=reviewer_agent, stdout=stdout)
 
 
 async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
@@ -10013,6 +10041,9 @@ class Orchestrator:
             return run_id
 
         prior_total = await db.runs.cost_for_issue(self._conn, issue_id)
+        # Branch base before the agent runs, so the completion gate can tell
+        # whether the run actually advanced HEAD (≥1 new commit).
+        head_before = await _workspace_head_sha(workspace_path)
 
         try:
             cumulative_usage, final_kind, final_returncode = (
@@ -10064,6 +10095,58 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 final_kind=final_kind,
+                returncode=final_returncode,
+            )
+            return run_id
+
+        # 4.25. Completion gate. rc=0 alone is not "done": an agent that ends
+        # its turn politely blocked on a human action (MCH-14) also exits 0.
+        # Require the SYMPHONY_DONE / SYMPHONY_BLOCKED marker plus a HEAD
+        # advance, and fall back to a cheap classifier of the final message.
+        head_after = await _workspace_head_sha(workspace_path)
+        head_advanced = bool(head_after) and head_after != head_before
+        log_path = self.config.log_root / f"{run_id}.log"
+        final_message = _read_run_final_message(log_path, agent=binding.agent)
+        completion = classify_implement_completion(
+            final_message=final_message,
+            head_advanced=head_advanced,
+        )
+        if completion.outcome == "blocked":
+            reason = (
+                completion.blocked_reason
+                or "agent blocked on a human action but gave no reason"
+            )
+            log.info("implement run %s classified blocked: %s", run_id, reason)
+            # Captured verbatim on the run record (termination_kind="blocked",
+            # termination_detail=<reason>) and parked for operator handling. The
+            # gate returns before any push/local-review, so a blocked run never
+            # opens a PR.
+            await self._fail_run_and_reset_issue(
+                run_id,
+                reason,
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+                returncode=final_returncode,
+                termination_kind="blocked",
+                termination_detail=reason,
+            )
+            return run_id
+        if completion.outcome != "completed":
+            reason = (
+                "implement run exited 0 but did not satisfy the completion "
+                "contract: HEAD did not advance and no SYMPHONY_DONE marker "
+                "could be confirmed as done"
+            )
+            log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                reason,
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
                 returncode=final_returncode,
             )
             return run_id
@@ -12350,19 +12433,32 @@ class Orchestrator:
         final_kind: str | None = None,
         returncode: int | None = None,
         exc: BaseException | str | None = None,
+        termination_kind: str | None = None,
+        termination_detail: str | None = None,
     ) -> None:
-        await db.runs.update_status(
-            self._conn,
-            run_id,
-            "failed",
-            ended_at=datetime.now(UTC).isoformat(),
-            **_termination_kwargs(
+        if termination_kind is not None:
+            # Explicit classification (e.g. a "blocked" completion-gate verdict);
+            # bypass the heuristic `classify_termination` so the kind/detail are
+            # recorded verbatim.
+            kwargs: _TerminationKwargs = {
+                "kind": termination_kind,
+                "detail": termination_detail if termination_detail is not None else reason,
+                "returncode": returncode,
+            }
+        else:
+            kwargs = _termination_kwargs(
                 status="failed",
                 final_kind=final_kind,
                 returncode=returncode,
                 exc=exc,
                 reason=reason,
-            ),
+            )
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            "failed",
+            ended_at=datetime.now(UTC).isoformat(),
+            **kwargs,
         )
 
     async def _fail_run_and_reset_issue(
@@ -12377,6 +12473,8 @@ class Orchestrator:
         final_kind: str | None = None,
         returncode: int | None = None,
         exc: BaseException | str | None = None,
+        termination_kind: str | None = None,
+        termination_detail: str | None = None,
     ) -> None:
         storage_issue_id = storage_issue_id or issue.id
         await self._fail_run(
@@ -12385,6 +12483,8 @@ class Orchestrator:
             final_kind=final_kind,
             returncode=returncode,
             exc=exc,
+            termination_kind=termination_kind,
+            termination_detail=termination_detail,
         )
         target_state_id = rollback_state_id
         if binding is not None:

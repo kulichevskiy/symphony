@@ -63,6 +63,17 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(
         "symphony.orchestrator.poll._default_push", AsyncMock()
     )
+    # The workspace is a fake path (no git repo), so simulate the agent
+    # advancing HEAD so the Implement completion gate sees commits and
+    # classifies the run as completed.
+    async def _fake_head_sha(workspace_path: object) -> str:
+        _fake_head_sha.calls += 1  # type: ignore[attr-defined]
+        return f"sha-{_fake_head_sha.calls}"  # type: ignore[attr-defined]
+
+    _fake_head_sha.calls = 0  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "symphony.orchestrator.poll._workspace_head_sha", _fake_head_sha
+    )
 
 
 def _populate(p: Path) -> None:
