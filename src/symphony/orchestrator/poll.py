@@ -10359,6 +10359,11 @@ class Orchestrator:
                 base_branch,
             )
             cumulative_usage = UsageDelta()
+            # Release before the gates run (mirroring the implement path,
+            # poll.py:_run_implement_phase): the gates operate on the released
+            # workspace, and releasing first means a gate raising can't leak
+            # the workspace into WorkspaceManager._in_use forever.
+            self._workspace.release(binding, issue)
             proceed, local_review_result = await self._run_prepush_gates(
                 binding=binding,
                 issue=issue,
@@ -10366,7 +10371,6 @@ class Orchestrator:
                 run_id=run_id,
                 workspace_path=workspace_path,
             )
-            self._workspace.release(binding, issue)
             if not proceed:
                 # A gate halted the run; state is already recorded.
                 return run_id

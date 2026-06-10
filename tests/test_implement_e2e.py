@@ -1288,6 +1288,130 @@ async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_branch_ahead_short_circuit_releases_workspace_when_gate_raises(
+    tmp_path: Path,
+) -> None:
+    """If a pre-push gate raises on the short-circuit path, the workspace is
+    still released (not leaked into WorkspaceManager._in_use forever) and
+    publish (push + ensure_pr) never runs."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        # HEAD one commit ahead of `trunk`: the short-circuit branch is taken.
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock()
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        # A gate blows up (e.g. a subprocess/db error inside verify/dirty-tree).
+        orch._run_prepush_gates = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=RuntimeError("gate boom")
+        )
+
+        with pytest.raises(RuntimeError, match="gate boom"):
+            await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        # The workspace was released *before* the gate ran, so the raise can't
+        # leak it; publish never ran.
+        workspace.release.assert_called_once()
+        assert runner.specs == []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_short_circuit_halts_before_publish_when_gate_fails(
+    tmp_path: Path,
+) -> None:
+    """If a pre-push gate halts the run (proceed=False) on the short-circuit
+    path, the workspace is released and publish (push + ensure_pr) never runs;
+    the run returns without raising."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock()
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        # A gate halts the run (recorded its own state) and returns proceed=False.
+        orch._run_prepush_gates = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=(False, None)
+        )
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        workspace.release.assert_called_once()
+        assert runner.specs == []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_at_publish_after_delivery_failure_skips_agent(
     tmp_path: Path,
 ) -> None:
