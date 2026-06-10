@@ -5870,3 +5870,47 @@ async def test_no_signal_pending_check_never_merges(tmp_path: Path) -> None:
         assert wait is None
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_failed_non_required_check_waits_for_operator(
+    tmp_path: Path,
+) -> None:
+    """A failing non-required check (no fix path) escalates, not silent poll.
+
+    PR #24: a Vercel-style check fails but is not branch-protection required,
+    so `_required_check_failures_for_view` returns []. The required-check fix
+    path never fires, so the failed no_signal candidate must surface to an
+    operator instead of polling a permanently red PR forever.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        failed_view = _no_checks_view()
+        failed_view["statusCheckRollup"] = [
+            {
+                "__typename": "CheckRun",
+                "name": "vercel",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+            }
+        ]
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=failed_view,
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+    finally:
+        await conn.close()

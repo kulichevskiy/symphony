@@ -8646,9 +8646,31 @@ class Orchestrator:
                             create_run=True,
                         )
                         continue
-                elif check_state != "green":
-                    # Pending → keep polling; failed → the required-check fix
-                    # path (handled above) drives the rerun. Never merge.
+                elif check_state == "pending":
+                    # Checks still running — keep polling until they settle.
+                    # Never merge.
+                    continue
+                elif check_state == "failed":
+                    # A failing *required* check is driven by the required-check
+                    # fix path above (it dispatched a rerun this tick, or one is
+                    # already mid-flight); keep polling for that. But a failing
+                    # *non-required* check (e.g. a Vercel build, PR #24) yields
+                    # no `required_check_failures` and thus no fix path — keep
+                    # polling forever otherwise. Escalate to an operator instead,
+                    # mirroring the "none" branch.
+                    if not required_check_failures:
+                        await self._mark_merge_needs_approval(
+                            binding=binding,
+                            issue=issue,
+                            pr_url=candidate.pr_url,
+                            run_id=str(uuid.uuid4()),
+                            reason=(
+                                "head CI failed and no failing check is "
+                                "branch-protection required (no fix path) — "
+                                "merge needs operator approval"
+                            ),
+                            create_run=True,
+                        )
                     continue
 
             if (
