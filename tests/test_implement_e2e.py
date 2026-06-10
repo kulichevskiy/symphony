@@ -927,11 +927,19 @@ async def test_dirty_tree_blocks_push_after_one_failed_fix_turn(
         workspace_path: Path = fx["workspace_path"]  # type: ignore[assignment]
         (workspace_path / "feature.py").write_text("print('hi')\n")
 
+        def _advance_head_on_implement(spec: RunnerSpec) -> None:
+            # The agent committed its work (HEAD advances) but left feature.py
+            # uncommitted; the empty commit satisfies the completion gate so
+            # the dirty-tree gate is the one that blocks the push.
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "agent work")
+
         runner = _RecordingRunner(
             [
                 RunnerEvent(kind="started", pid=4242),
                 RunnerEvent(kind="exit", returncode=0),
-            ]
+            ],
+            on_run=_advance_head_on_implement,
         )
         orch = Orchestrator(
             fx["cfg"],
@@ -994,6 +1002,11 @@ async def test_dirty_tree_fix_turn_commits_and_push_proceeds(
         )
 
         def _commit_on_fix_turn(spec: RunnerSpec) -> None:
+            # Implement turn: agent commits its work (HEAD advances) but leaves
+            # feature.py uncommitted, so the completion gate passes and the
+            # dirty-tree gate's single fix turn cleans up the leftover.
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "agent work")
             if len(runner.specs) == 2:
                 _git(workspace_path, "add", "-A")
                 _git(workspace_path, "commit", "-m", "commit leftovers")
@@ -1030,12 +1043,20 @@ async def test_clean_tree_skips_fix_turn_entirely(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         fx = _dirty_gate_fixture(tmp_path)
+        workspace_path: Path = fx["workspace_path"]  # type: ignore[assignment]
+
+        def _advance_head_on_implement(spec: RunnerSpec) -> None:
+            # Agent committed its work and left a clean tree; the empty commit
+            # satisfies the completion gate so push proceeds with no fix turn.
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "agent work")
 
         runner = _RecordingRunner(
             [
                 RunnerEvent(kind="started", pid=4242),
                 RunnerEvent(kind="exit", returncode=0),
-            ]
+            ],
+            on_run=_advance_head_on_implement,
         )
         orch = Orchestrator(
             fx["cfg"],

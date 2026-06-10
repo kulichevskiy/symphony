@@ -33,6 +33,8 @@ from symphony.pipeline.verify import (
     run_verify_session,
 )
 
+from ._workspace_helpers import advance_head
+
 
 class _StagedRunner:
     """Returns scripted events keyed by `RunnerSpec.stage`."""
@@ -43,6 +45,11 @@ class _StagedRunner:
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         self.captured.append(spec)
+        # Simulate the agent committing its work so the completion gate sees
+        # HEAD advance over the branch base and treats the implement run as
+        # completed (rc=0 alone no longer suffices).
+        if spec.stage == "implement":
+            advance_head(spec.workspace_path)
         bucket = self._scripts.get(spec.stage)
         if not bucket:
             raise AssertionError(
@@ -522,6 +529,9 @@ async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
         cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
             tmp_path, binding
         )
+        # The implement turn's commit (completion gate) gitignores the verify
+        # sentinel so it never trips the pre-push dirty-tree gate.
+        (workspace_path / ".gitignore").write_text(".sym_verified\n")
 
         def _result_line() -> RunnerEvent:
             return RunnerEvent(
