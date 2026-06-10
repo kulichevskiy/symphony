@@ -459,6 +459,9 @@ class Reconciler:
             elif github_action == ACTION_ADOPTED:
                 await self._adopt_orphan_prs(
                     issue_id=issue_id,
+                    tracker_issue_id=tracker_issue_id,
+                    tracker_ctx=tracker_ctx,
+                    team_key=str(issue_row["team_key"]),
                     wait=wait,
                     orphans=orphans,
                     observed_at=observed_at,
@@ -761,40 +764,54 @@ class Reconciler:
         self,
         *,
         issue_id: str,
+        tracker_issue_id: str,
+        tracker_ctx: TrackerContext | None,
+        team_key: str,
         wait: db.operator_waits.OperatorWait | None,
         orphans: list[_AdoptableOrphanPr],
         observed_at: str,
     ) -> None:
-        """Adopt discovered orphan PRs: record them and route to review/merge.
+        """Adopt a discovered orphan PR: record it and route to review/merge.
 
-        Mirrors the durable writes of the normal review-stage entry point
-        (`issue_prs` row + `review_state` + a live ``review`` run) so the
-        existing review/merge pollers pick the PR up, then clears the parked
-        operator wait. Network side effects (the `@codex` ping, Linear moves)
-        are intentionally left to those pollers.
+        Mirrors the durable writes of the normal implement-success path
+        (`issue_prs` row + `review_state`, plus a live ``review`` run when the
+        binding configures review) and moves the parked Linear issue out of
+        ``blocked`` into the active lane the relevant poller expects, then
+        clears the operator wait. Without that move the review/merge pollers
+        reject the issue (both treat ``Blocked`` as inactive) and the adopted
+        run is closed instead of advancing.
+
+        Only one orphan is adopted per tick: ``review_state`` is keyed per
+        issue (``ON CONFLICT(issue_id)``) so multiple orphans would clobber the
+        single row, and the action budget counts one adoption per tick.
         """
-        for orphan in orphans:
-            binding = orphan.binding
-            obs = orphan.observation
-            await db.issue_prs.upsert(
-                self._conn,
-                issue_id=issue_id,
-                github_repo=obs.github_repo,
-                binding_key=_binding_storage_key(binding),
-                pr_number=obs.pr_number,
-                pr_url=obs.url,
-                created_at=observed_at,
-                commit=False,
-            )
-            await db.review_state.begin_review(
-                self._conn,
-                issue_id,
-                pr_number=obs.pr_number,
-                pr_url=obs.url,
-                github_repo=obs.github_repo,
-                issue_label=binding.issue_label,
-                commit=False,
-            )
+        orphan = orphans[0]
+        binding = orphan.binding
+        obs = orphan.observation
+        review_configured = (
+            binding.resolved_local_review() or binding.resolved_remote_review()
+        )
+        await db.issue_prs.upsert(
+            self._conn,
+            issue_id=issue_id,
+            github_repo=obs.github_repo,
+            binding_key=_binding_storage_key(binding),
+            pr_number=obs.pr_number,
+            pr_url=obs.url,
+            created_at=observed_at,
+            review_bypassed=not review_configured,
+            commit=False,
+        )
+        await db.review_state.begin_review(
+            self._conn,
+            issue_id,
+            pr_number=obs.pr_number,
+            pr_url=obs.url,
+            github_repo=obs.github_repo,
+            issue_label=binding.issue_label,
+            commit=False,
+        )
+        if review_configured:
             await db.runs.create(
                 self._conn,
                 id=str(uuid.uuid4()),
@@ -805,12 +822,73 @@ class Reconciler:
                 started_at=observed_at,
                 commit=False,
             )
+            target_state = (
+                binding.linear_states.local_code_review
+                if binding.resolved_local_review()
+                else binding.linear_states.code_review
+            )
+        else:
+            # No review configured: the success path routes straight to merge
+            # with review_bypassed=True and starts no review stage. Land the
+            # issue in the merge-active lane (in_progress) so the merge poller
+            # picks it up.
+            target_state = binding.linear_states.in_progress
+        await self._move_issue_to_state(
+            tracker_issue_id=tracker_issue_id,
+            tracker_ctx=tracker_ctx,
+            team_key=team_key,
+            state_name=target_state,
+        )
         if wait is not None:
             await db.operator_waits.delete(
                 self._conn,
                 issue_id,
                 wait.run_id,
                 commit=False,
+            )
+
+    async def _move_issue_to_state(
+        self,
+        *,
+        tracker_issue_id: str,
+        tracker_ctx: TrackerContext | None,
+        team_key: str,
+        state_name: str,
+    ) -> None:
+        """Move the tracked issue to ``state_name`` (best-effort, like poll).
+
+        Failures are logged and swallowed so a transient Linear error does not
+        roll back the adopted DB rows — an operator can re-move by hand.
+        """
+        if not state_name:
+            return
+        tracker = self.tracker(tracker_ctx)
+        try:
+            states = await tracker.team_states(team_key)
+        except LinearError as e:
+            log.warning(
+                "could not load states to move %s to %r: %s",
+                tracker_issue_id,
+                state_name,
+                e,
+            )
+            return
+        state_id = states.get(state_name)
+        if state_id is None:
+            log.warning(
+                "missing Linear state %r for %s during adoption",
+                state_name,
+                tracker_issue_id,
+            )
+            return
+        try:
+            await tracker.move_issue(tracker_issue_id, state_id)
+        except LinearError as e:
+            log.warning(
+                "could not move %s to %r during adoption: %s",
+                tracker_issue_id,
+                state_name,
+                e,
             )
 
     async def _candidate_enabled(self, issue_id: str, team_key: str) -> bool:

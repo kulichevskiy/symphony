@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,16 @@ class _FakeLinear:
     state_name: str = "In Progress"
     error: Exception | None = None
     calls: int = 0
+    moves: list[tuple[str, str]] = field(default_factory=list)
+    states_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "In Progress": "state-in-progress",
+            "Needs Approval": "state-needs-approval",
+            "Local Code Review": "state-local-review",
+            "Blocked": "state-blocked",
+            "Done": "state-done",
+        }
+    )
 
     async def lookup_issue(self, issue_id: str) -> LinearIssue:
         self.calls += 1
@@ -61,6 +71,12 @@ class _FakeLinear:
             labels=["symphony"],
             updated_at="2026-05-17T11:58:00Z",
         )
+
+    async def team_states(self, team_key: str) -> dict[str, str]:
+        return dict(self.states_map)
+
+    async def move_issue(self, issue_id_or_identifier: str, state_id: str) -> None:
+        self.moves.append((issue_id_or_identifier, state_id))
 
 
 class _FakeGitHub:
@@ -111,6 +127,8 @@ def _binding(
     reconcile_enabled: bool = True,
     done_state: str = "Done",
     auto_merge: bool = True,
+    local_review: bool = False,
+    remote_review: bool = True,
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
@@ -118,6 +136,8 @@ def _binding(
         issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
         auto_merge=auto_merge,
+        local_review=local_review,
+        remote_review=remote_review,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done=done_state),
     )
 
@@ -1442,10 +1462,14 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
                 }
             }
         )
+        # The implement-failed park leaves the issue in `Blocked`; adoption
+        # must move it into the active review lane or the review/merge pollers
+        # (both reject `Blocked`) would close the adopted run.
+        linear = _FakeLinear(state_name="Blocked")
         reconciler = Reconciler(
             Config(repos=[_binding()]),
             conn,
-            _FakeLinear(),  # type: ignore[arg-type]
+            linear,  # type: ignore[arg-type]
             fake_gh,  # type: ignore[arg-type]
             clock=lambda: NOW,
         )
@@ -1466,8 +1490,61 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     assert pr.pr_url == "https://github.com/org/repo/pull/326"
     assert review.pr_number == 326
     assert [c.pr_number for c in merge_candidates] == [326]
+    # Default binding is remote-review (code_review="Needs Approval"); adoption
+    # moves the issue into that lane so `_review_issue_is_active` accepts it.
+    assert linear.moves == [("iss-1", "state-needs-approval")]
     assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
     assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_active_orphan_open_pr_adopted_and_routed_to_merge_no_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding(local_review=False, remote_review=False)]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        cur = await conn.execute(
+            "SELECT review_bypassed FROM issue_prs WHERE issue_id = ?", ("iss-1",)
+        )
+        review_bypassed = (await cur.fetchone())[0]
+        review_runs = await db.runs.list_live_by_stage(conn, stage="review")
+        merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    # No review configured: bypass review, route straight to merge, and land
+    # the issue in the merge-active lane (in_progress) — no review run started.
+    assert review_bypassed == 1
+    assert review_runs == []
+    assert [c.pr_number for c in merge_candidates] == [326]
+    assert linear.moves == [("iss-1", "state-in-progress")]
 
 
 @pytest.mark.asyncio
