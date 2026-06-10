@@ -686,6 +686,122 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
 
 
 @pytest.mark.asyncio
+async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
+    tmp_path: Path,
+) -> None:
+    """A post-completion-gate delivery failure (pr_create raises) parks the
+    issue as `deliver_failed` — NOT implement_failed — without re-dispatching
+    the agent or rewinding to the ready lane. `$retry` resumes the delivery
+    path: it opens the PR and advances to review/merge, never re-running the
+    agent or the completion gate (so it can't dead-end on "HEAD did not
+    advance"). Regression for the VIB-203 transient `gh pr create` 401 loop.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(side_effect=GitHubError("gh pr create: HTTP 401"))
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # pr_create raised → issue parked as deliver_failed (not implement_failed).
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        run_id = wait.run_id
+
+        # The branch was pushed and the PR open was attempted exactly once.
+        push_fn.assert_awaited_once()
+        assert gh.ensure_pr.await_count == 1
+
+        # The agent ran exactly once and the issue was NOT rewound to ready
+        # (which would re-dispatch the agent into the re-park loop).
+        assert len([s for s in runner.specs if s.stage == "implement"]) == 1
+        assert call("iss-1", "state-todo") not in linear.move_issue.await_args_list
+
+        # The parked comment captured the verbatim delivery error.
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("HTTP 401" in body for body in posted)
+
+        # --- `$retry` resumes delivery; pr_create now succeeds. ---
+        gh.ensure_pr = AsyncMock(
+            return_value="https://github.com/org/repo/pull/42"
+        )
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        # PR opened on resume; the agent was NOT re-invoked.
+        gh.ensure_pr.assert_awaited_once()
+        assert len([s for s in runner.specs if s.stage == "implement"]) == 1
+
+        # Wait cleared, run completed, merge candidate registered on the new PR.
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == ["implement"]
+        assert history[0].status == "completed"
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 42
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

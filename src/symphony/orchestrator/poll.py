@@ -448,6 +448,27 @@ class _ImplementHandoff:
     operator_comment: str
 
 
+@dataclass(frozen=True)
+class _PendingDelivery:
+    """Inputs needed to (re)run the post-completion delivery path.
+
+    The completion gate has already passed, so the agent's work is final. A
+    delivery-step failure (push / `ensure_pr` / review handoff) parks a
+    ``deliver_failed`` operator wait keyed by ``run_id`` and stashes this
+    context so a `$retry` can resume delivery on the existing branch without
+    re-dispatching the agent or re-running the completion gate.
+    """
+
+    binding: RepoBinding
+    issue: LinearIssue
+    storage_issue_id: str
+    run_id: str
+    workspace_path: Path
+    branch: str
+    cumulative_usage: UsageDelta
+    local_review_result: LoopResult | None
+
+
 class _TerminationKwargs(TypedDict):
     kind: str
     detail: str
@@ -1612,6 +1633,13 @@ class Orchestrator:
         self._operator_wait_run_ids: set[str] = set()
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
+        self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
+        # Pending delivery contexts, keyed by run_id. Set when a post-completion
+        # delivery step fails and a `deliver_failed` wait is parked; consumed by
+        # a `$retry` to resume push + `ensure_pr` + handoff on the existing
+        # branch. In-memory only: if the daemon restarts, the `$retry` falls
+        # back to reconstructing the context from the wait + workspace.
+        self._pending_deliveries: dict[str, _PendingDelivery] = {}
         # Pending blocked-resume handoffs, keyed by storage issue_id. Set when an
         # operator `$retry`s an IMPLEMENT_BLOCKED wait; consumed by the next
         # implement dispatch to seed the fresh run's prompt. In-memory only: if
@@ -2547,6 +2575,9 @@ class Orchestrator:
         if run_id in self._implement_blocked_run_bindings:
             await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._deliver_failed_run_bindings:
+            await self._handle_deliver_failed_slash_intent(issue_id, run_id, intent)
+            return
         if run_id in self._review_failed_run_bindings:
             await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
             return
@@ -2565,6 +2596,11 @@ class Orchestrator:
                 return
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
                 await self._handle_implement_blocked_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+                await self._handle_deliver_failed_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
@@ -3140,6 +3176,7 @@ class Orchestrator:
             if wait.kind not in (
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
                 db.operator_waits.KIND_IMPLEMENT_BLOCKED,
+                db.operator_waits.KIND_DELIVER_FAILED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
@@ -3176,6 +3213,8 @@ class Orchestrator:
             self._implement_failed_run_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
             self._implement_blocked_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+            self._deliver_failed_run_bindings[wait.run_id] = binding
         elif wait.kind in (
             db.operator_waits.KIND_REVIEW_FAILED,
             db.operator_waits.KIND_REVIEW_STOPPED,
@@ -3515,6 +3554,7 @@ class Orchestrator:
         self._operator_wait_run_ids.discard(run_id)
         self._implement_failed_run_bindings.pop(run_id, None)
         self._implement_blocked_run_bindings.pop(run_id, None)
+        self._deliver_failed_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
@@ -10516,21 +10556,48 @@ class Orchestrator:
             )
             return run_id
 
+        # 5-7. Delivery: push the branch, open the PR, hand off to review /
+        # merge. Past the completion gate the agent's work is final, so a
+        # delivery-step failure parks a `deliver_failed` wait (resumable via
+        # `$retry` on the existing branch) instead of rewinding the issue to
+        # re-run the agent — which would re-park on "HEAD did not advance".
+        return await self._deliver_implement_run(
+            ctx=_PendingDelivery(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                branch=f"{binding.branch_prefix}/{issue.identifier.lower()}",
+                cumulative_usage=cumulative_usage,
+                local_review_result=local_review_result,
+            )
+        )
+
+    async def _deliver_implement_run(self, *, ctx: _PendingDelivery) -> str:
+        """Push + open PR + hand off to review/merge for a completed implement.
+
+        Re-entrant: invoked once at the end of the implement dispatch and again
+        on a `$retry` of a `deliver_failed` wait. Never re-dispatches the agent
+        and never runs the completion gate. Push / `ensure_pr` failures park a
+        `deliver_failed` operator wait via `_park_deliver_failed`.
+        """
+        binding = ctx.binding
+        issue = ctx.issue
+        issue_id = ctx.storage_issue_id
+        run_id = ctx.run_id
+        workspace_path = ctx.workspace_path
+        branch = ctx.branch
+        cumulative_usage = ctx.cumulative_usage
+        local_review_result = ctx.local_review_result
+        tracker = self.tracker(binding)
+
         # 5. Push branch, open PR, post stage-transition comment.
-        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
             await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
             log.warning("git push failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"push failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-            )
+            await self._park_deliver_failed(f"push failed: {e}", ctx=ctx, exc=e)
             return run_id
 
         pr_url: str = ""
@@ -10555,15 +10622,7 @@ class Orchestrator:
             )
         except GitHubError as e:
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"pr_create failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-            )
+            await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
 
         try:
@@ -12908,6 +12967,224 @@ class Orchestrator:
             log.warning(
                 "implement blocked comment post failed on %s: %s", issue.identifier, e
             )
+
+    async def _park_deliver_failed(
+        self,
+        reason: str,
+        *,
+        ctx: _PendingDelivery,
+        exc: BaseException | str | None = None,
+    ) -> None:
+        """Park a post-completion delivery failure as a `deliver_failed` wait.
+
+        The completion gate already passed, so — unlike `_fail_run_and_reset_issue`
+        — this never rewinds the issue to the ready lane (which would re-dispatch
+        the agent and re-park on "HEAD did not advance"). The branch and commits
+        stay intact; the delivery context is stashed so a `$retry` resumes
+        delivery via `_deliver_implement_run`.
+        """
+        binding = ctx.binding
+        issue = ctx.issue
+        storage_issue_id = ctx.storage_issue_id
+        run_id = ctx.run_id
+        await self._fail_run(
+            run_id,
+            reason,
+            exc=exc,
+            termination_kind="deliver_failed",
+            termination_detail=reason,
+        )
+        # Park in a non-dispatch, operator-visible lane — never `ready`, which
+        # the implement scan would pick up and re-run the agent on.
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking deliver_failed %s: %s",
+                issue.identifier,
+                e,
+            )
+        else:
+            target_state_id = states.get(
+                binding.linear_states.needs_approval
+            ) or states.get(binding.linear_states.blocked)
+            if target_state_id is not None and target_state_id != issue.state_id:
+                try:
+                    await self.tracker(binding).move_issue(issue.id, target_state_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not park %s after delivery failure: %s",
+                        issue.identifier,
+                        e,
+                    )
+        self._pending_deliveries[run_id] = ctx
+        await self._track_deliver_failed_wait(storage_issue_id, run_id, binding)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
+        body = failed(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+                error=reason,
+            )
+        )
+        body += (
+            "\nThe change is committed; only delivery failed. Reply with "
+            "`$retry` to resume delivery (push + PR + handoff) on the existing "
+            "branch without re-running the agent. Reply with `$reject` or "
+            "`$stop` to leave it halted.\n"
+        )
+        try:
+            await self.tracker(binding).post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "deliver_failed comment post failed on %s: %s", issue.identifier, e
+            )
+
+    async def _track_deliver_failed_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._deliver_failed_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_DELIVER_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+
+    async def _handle_deliver_failed_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._deliver_failed_run_bindings.get(run_id)
+        if binding is None:
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_DELIVER_FAILED,),
+            )
+            if binding is None:
+                return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            states = await self._states_for_binding(binding)
+            blocked_id = states.get(binding.linear_states.blocked)
+            tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+            tracker = self.tracker(binding)
+            if blocked_id is None:
+                try:
+                    await tracker.post_comment(
+                        tracker_issue_id,
+                        truncate_body(
+                            command_rejected(
+                                f"${intent.kind}",
+                                "missing blocked state; keeping issue parked",
+                            )
+                        ),
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "deliver_failed stop rejection comment failed for %s: %s",
+                        issue_id,
+                        e,
+                    )
+                return
+            try:
+                await tracker.move_issue(tracker_issue_id, blocked_id)
+            except LinearError as e:
+                log.warning("could not move %s to blocked: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
+            self._pending_deliveries.pop(run_id, None)
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
+            log.info(
+                "slash %s received for deliver_failed run %s (ignored)",
+                intent.kind,
+                run_id,
+            )
+            return
+
+        ctx = await self._resolve_pending_delivery(issue_id, run_id, binding, intent)
+        if ctx is None:
+            return
+        # Clear the wait first so a re-failure parks a fresh wait cleanly.
+        self._pending_deliveries.pop(run_id, None)
+        await self._clear_operator_wait(issue_id, run_id)
+        await self._deliver_implement_run(ctx=ctx)
+
+    async def _resolve_pending_delivery(
+        self,
+        issue_id: str,
+        run_id: str,
+        binding: RepoBinding,
+        intent: SlashIntent,
+    ) -> _PendingDelivery | None:
+        """Return the delivery context to resume, reconstructing it if the
+        daemon restarted and the in-memory stash was lost.
+
+        The completion gate already passed before parking, so a reconstructed
+        context treats local review as already-approved (None result) and reads
+        the issue + workspace fresh; the branch and commits are intact on disk.
+        """
+        ctx = self._pending_deliveries.get(run_id)
+        if ctx is not None:
+            return ctx
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        try:
+            issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not look up %s to resume delivery: %s", issue_id, e
+            )
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"could not look up issue to resume delivery: {e}",
+            )
+            return None
+        try:
+            workspace_path = await self._workspace.acquire(binding, issue)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not re-acquire workspace to resume delivery for %s: %s",
+                issue.identifier,
+                e,
+            )
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"could not re-acquire workspace to resume delivery: {e}",
+            )
+            return None
+        return _PendingDelivery(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            branch=f"{binding.branch_prefix}/{issue.identifier.lower()}",
+            cumulative_usage=UsageDelta(),
+            local_review_result=None,
+        )
 
 
 __all__ = [

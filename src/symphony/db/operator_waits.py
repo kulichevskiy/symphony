@@ -15,6 +15,7 @@ from . import state_transitions
 
 KIND_IMPLEMENT_FAILED = "implement_failed"
 KIND_IMPLEMENT_BLOCKED = "implement_blocked"
+KIND_DELIVER_FAILED = "deliver_failed"
 KIND_REVIEW_FAILED = "review_failed"
 KIND_REVIEW_STOPPED = "review_stopped"
 KIND_MERGE = "merge"
@@ -246,6 +247,7 @@ async def delete(
 __all__ = [
     "KIND_ACCEPTANCE_BLOCKED",
     "KIND_ACCEPTANCE_REJECTED",
+    "KIND_DELIVER_FAILED",
     "KIND_IMPLEMENT_BLOCKED",
     "KIND_IMPLEMENT_FAILED",
     "KIND_MERGE",
