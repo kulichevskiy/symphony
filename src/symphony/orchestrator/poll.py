@@ -10345,6 +10345,10 @@ class Orchestrator:
         # A branch already ahead of base means a prior run committed the work:
         # skip the agent and the completion gate, resume at the agent-free
         # publish step. The completion gate can never fire on a delivery retry.
+        # The pre-push gates (local-review / verify / dirty-tree) still run
+        # against the reused workspace so the resume records the verify SHA,
+        # guards the dirty tree, and feeds publish a real local-review verdict
+        # — not the `None` its handoff would mis-read as "did not approve".
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
         if await _branch_ahead_of_base(workspace_path, base_branch):
@@ -10354,9 +10358,18 @@ class Orchestrator:
                 issue.identifier,
                 base_branch,
             )
-            self._workspace.release(binding, issue)
             cumulative_usage = UsageDelta()
-            local_review_result = None
+            proceed, local_review_result = await self._run_prepush_gates(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+            )
+            self._workspace.release(binding, issue)
+            if not proceed:
+                # A gate halted the run; state is already recorded.
+                return run_id
         else:
             phase = await self._run_implement_phase(
                 binding=binding,
@@ -10529,6 +10542,47 @@ class Orchestrator:
             )
             return None
 
+        proceed, local_review_result = await self._run_prepush_gates(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+        )
+        if not proceed:
+            # A gate halted the run (failed / blocked / parked); state is
+            # already recorded. Never reaches publish.
+            return None
+
+        return cumulative_usage, local_review_result
+
+    async def _run_prepush_gates(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+    ) -> tuple[bool, LoopResult | None]:
+        """Pre-push validation gates: local-review, verify, dirty-tree.
+
+        Runs after the agent step — or, on the branch-already-ahead
+        short-circuit, in place of it — and before the agent-free publish
+        stage, so what gets pushed is what was reviewed and verified. The
+        branch-ahead short-circuit reuses an existing workspace, so these
+        gates must re-run there too: otherwise a fresh dispatch on an
+        already-ahead branch would push without recording the verify SHA
+        (mis-routing the merge gate to operator approval), discard dirty
+        uncommitted work, and feed publish a ``None`` local-review verdict
+        that its handoff reads as "did not approve".
+
+        Returns ``(proceed, local_review_result)``: ``proceed`` is False when
+        a gate halted the run (failed / blocked / parked) and the caller
+        should stop — the run state is already recorded.
+        """
+        issue_id = storage_issue_id
+
         # 4.5. Local-review pre-flight. When `binding.local_review` is set,
         # run the reviewer in-workspace before pushing. This shortens the
         # iteration loop dramatically: the slow part of the existing flow is
@@ -10551,7 +10605,7 @@ class Orchestrator:
                     run_id=run_id,
                     result=local_review_result,
                 )
-                return None
+                return False, local_review_result
 
         # 4.7. Verify gate. When `binding.verify_cmd` is set, run it after
         # the last code-mutating stage (post local-review fixes) and before
@@ -10574,7 +10628,7 @@ class Orchestrator:
                     run_id=run_id,
                     result=verify_result,
                 )
-                return None
+                return False, local_review_result
             # SYM-108: record the green gate against the exact head it
             # verified so the merge gate can treat a no-CI repo as mergeable
             # only for this SHA. A later HEAD-advancing fix turn (e.g. the
@@ -10621,9 +10675,9 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
-            return None
+            return False, local_review_result
 
-        return cumulative_usage, local_review_result
+        return True, local_review_result
 
     async def _publish_stage(
         self,

@@ -27,6 +27,7 @@ from symphony.github.client import GitHubError
 from symphony.linear.client import LinearComment, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
+from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
 from ._workspace_helpers import advance_head
 
@@ -1380,6 +1381,187 @@ async def test_resume_at_publish_after_delivery_failure_skips_agent(
         h2 = await db.runs.history_for_issue(conn, "iss-1")
         completed = [r for r in h2 if r.stage == "implement" and r.status == "completed"]
         assert len(completed) == 1
+    finally:
+        await conn.close()
+
+
+def _head_sha(workspace: Path) -> str:
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True
+    )
+    return out.stdout.decode().strip()
+
+
+def _local_review_binding() -> RepoBinding:
+    return RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        agent="claude",
+        branch_prefix="symphony",
+        local_review=True,
+        remote_review=False,
+        auto_merge=False,
+        # The PR-summary post path needs verdicts on the result; this test
+        # only cares about routing, so keep the thread quiet.
+        post_local_review_pr_summary=False,
+        linear_states=LinearStates(
+            ready="Todo",
+            local_code_review="Local Code Review",
+            code_review="",
+            needs_approval="Needs Approval",
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_short_circuit_reruns_local_review_not_parked(
+    tmp_path: Path,
+) -> None:
+    """Branch-ahead short-circuit with a `local_review` binding: the pre-push
+    gates re-run, so publish gets a real APPROVED verdict — NOT the `None` its
+    handoff would mis-read as "local-only review did not approve" and park.
+    The implementer agent is still skipped."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _local_review_binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        # HEAD already one commit ahead of `trunk`: a prior run committed.
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        # The reused branch is re-reviewed; drive it to APPROVED so the
+        # routing decision under test is exercised without a real reviewer.
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=LoopOutcome.APPROVED, iterations=1, verdicts=()
+            )
+        )
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        # The implementer agent never ran (short-circuit), but the local
+        # review gate did re-run on the reused workspace.
+        assert runner.specs == []
+        orch._run_local_review_phase.assert_awaited_once()  # noqa: SLF001
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        impl = [r for r in history if r.stage == "implement"]
+        assert impl and impl[0].status == "completed"
+        # The review stage was started and NOT failed as "did not approve".
+        review = [r for r in history if r.stage == "review"]
+        assert review, "an approved local-only PR should start the review stage"
+        assert all(r.status != "failed" for r in review)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_short_circuit_records_verify_pass(
+    tmp_path: Path,
+) -> None:
+    """Branch-ahead short-circuit with a `verify_cmd` binding re-runs the
+    verify gate, so the green SHA is recorded — the merge gate still treats
+    the pushed head as verified instead of routing to operator approval."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            agent="claude",
+            branch_prefix="symphony",
+            local_review=False,
+            remote_review=False,
+            auto_merge=False,
+            verify_cmd="true",
+            linear_states=LinearStates(
+                ready="Todo",
+                local_code_review="",
+                code_review="",
+                needs_approval="Needs Approval",
+            ),
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        head = _head_sha(workspace_path)
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        # The implementer agent never ran; `verify_cmd="true"` runs as a
+        # subprocess (no fix turn → no runner spec) and passes.
+        assert runner.specs == []
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+
+        # The merge gate keys off the recorded green SHA for the pushed head.
+        assert await db.issue_prs.has_verify_passed(
+            conn, issue_id="iss-1", github_repo="org/repo", head_sha=head
+        )
     finally:
         await conn.close()
 
