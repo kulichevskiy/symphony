@@ -476,9 +476,14 @@ def _local_review_needs_approval(result: LoopResult | None) -> bool:
 
 
 def _local_review_infra_failed(result: LoopResult | None) -> bool:
+    # FIX_RUN_BLOCKED (SYM-107): a fix-run politely stalled on a human action.
+    # Routed through the same pre-push block path as infra failures so no push
+    # / PR happens and the issue is parked for the operator with the blocked
+    # reason captured verbatim (`result.error`).
     return result is None or result.outcome in {
         LoopOutcome.REVIEWER_FAILED,
         LoopOutcome.FIX_RUN_FAILED,
+        LoopOutcome.FIX_RUN_BLOCKED,
     }
 
 

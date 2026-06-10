@@ -338,6 +338,45 @@ async def test_fix_run_failure_aborts_loop() -> None:
     assert result.error == "fix-run died"
 
 
+@pytest.mark.asyncio
+async def test_blocked_fix_run_halts_loop_without_next_review() -> None:
+    """A fix-run that exits 0 but reports `blocked` (SYM-101 contract) halts
+    the loop and routes to the operator-wait path — no further review pass."""
+
+    @dataclass
+    class _BlockingFixer:
+        received: list[LocalVerdict] = field(default_factory=list)
+
+        async def __call__(self, i: int, verdict: LocalVerdict) -> FixerOutput:
+            self.received.append(verdict)
+            return FixerOutput(
+                ok=True,
+                blocked=True,
+                blocked_reason="authorize the Supabase OAuth URL",
+            )
+
+    reviewer = _ReviewerScript(
+        messages=[
+            f"## Findings\n- bug Z\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- bug Z still\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+        ],
+        head_shas=["s0", "s1"],
+    )
+    fixer = _BlockingFixer()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.FIX_RUN_BLOCKED
+    assert result.iterations == 1
+    # Reason captured verbatim; loop did not run a second review pass.
+    assert result.error == "authorize the Supabase OAuth URL"
+    assert reviewer.calls == [0]
+    assert len(fixer.received) == 1
+
+
 # --- verdict bookkeeping ---------------------------------------------
 
 
