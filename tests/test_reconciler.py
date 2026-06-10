@@ -19,12 +19,14 @@ from symphony.github.webhook import GitHubWebhookEvent
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import (
+    ACTION_ADOPTED,
     ACTION_CLEARED,
     ACTION_NOTED,
     ACTION_OBSERVED,
     ACTION_WOULD_CLEAR,
     DRIFT_LINEAR_STATE_DONE,
     DRIFT_MERGE_ZOMBIE,
+    DRIFT_ORPHAN_PR_OPEN,
     DRIFT_PR_CLOSED_NO_MERGE,
     DRIFT_PR_LOCALLY_MERGED,
     GithubPrObservation,
@@ -68,6 +70,8 @@ class _FakeGitHub:
         view: dict[str, object] | None = None,
         views_by_repo: dict[str, dict[str, object]] | None = None,
         error: Exception | None = None,
+        open_prs_by_head: dict[str, dict[str, Any]] | None = None,
+        head_error: Exception | None = None,
     ) -> None:
         self.view = view or {
             "state": "OPEN",
@@ -77,7 +81,10 @@ class _FakeGitHub:
         }
         self.views_by_repo = views_by_repo or {}
         self.error = error
+        self.open_prs_by_head = open_prs_by_head or {}
+        self.head_error = head_error
         self.calls: list[tuple[int, str | None]] = []
+        self.head_calls: list[tuple[str, str | None]] = []
 
     async def pr_view(self, pr: int | str, *, repo: str | None = None) -> dict[str, Any]:
         self.calls.append((int(pr), repo))
@@ -86,6 +93,15 @@ class _FakeGitHub:
         if repo is not None and repo in self.views_by_repo:
             return dict(self.views_by_repo[repo])
         return dict(self.view)
+
+    async def open_pr_for_head(
+        self, *, head: str, repo: str | None = None
+    ) -> dict[str, Any] | None:
+        self.head_calls.append((head, repo))
+        if self.head_error is not None:
+            raise self.head_error
+        entry = self.open_prs_by_head.get(head)
+        return dict(entry) if entry is not None else None
 
 
 def _binding(
@@ -141,6 +157,34 @@ async def _seed_merge_wait(
         issue_id=issue_id,
         run_id=f"run-{issue_id}",
         kind=db.operator_waits.KIND_MERGE,
+        linear_team_key="ENG",
+        github_repo=github_repo,
+        issue_label=issue_label,
+        created_at="2026-05-17T10:01:00Z",
+    )
+
+
+async def _seed_implement_failed_wait(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    issue_label: str = "symphony",
+    github_repo: str = "org/repo",
+) -> None:
+    await db.runs.create(
+        conn,
+        id=f"run-{issue_id}",
+        issue_id=issue_id,
+        stage="implement",
+        status="failed",
+        pid=None,
+        started_at="2026-05-17T10:00:00Z",
+    )
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=issue_id,
+        run_id=f"run-{issue_id}",
+        kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
         linear_team_key="ENG",
         github_repo=github_repo,
         issue_label=issue_label,
@@ -1378,3 +1422,120 @@ async def test_orchestrator_github_webhook_closed_unmerged_parked_pr_rechecks_re
     linear.move_issue.assert_not_awaited()
     linear.post_comment.assert_not_awaited()
     assert pr is not None
+
+
+@pytest.mark.asyncio
+async def test_active_orphan_open_pr_adopted_and_routed_to_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review = await db.review_state.get(conn, "iss-1")
+        merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert pr.pr_url == "https://github.com/org/repo/pull/326"
+    assert review.pr_number == 326
+    assert [c.pr_number for c in merge_candidates] == [326]
+    assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
+    assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_orphan_probe_without_open_pr_observes_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(open_prs_by_head={})
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is not None
+    assert pr is None
+    assert rows[1][1] is None
+    assert rows[1][2] == ACTION_OBSERVED
+
+
+@pytest.mark.asyncio
+async def test_dry_run_orphan_open_pr_would_clear_without_adoption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "1")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                open_prs_by_head={
+                    "symphony/eng-1": {
+                        "number": 326,
+                        "url": "https://github.com/org/repo/pull/326",
+                    }
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert pr is None
+    assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
+    assert rows[1][2] == ACTION_WOULD_CLEAR

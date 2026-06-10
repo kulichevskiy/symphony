@@ -102,6 +102,7 @@ async def create(
     pid: int | None,
     started_at: str,
     cost_usd: float = 0.0,
+    commit: bool = True,
 ) -> None:
     await conn.execute(
         """
@@ -110,7 +111,8 @@ async def create(
         """,
         (id, issue_id, stage, status, pid, started_at, cost_usd),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def create_if_no_active(
