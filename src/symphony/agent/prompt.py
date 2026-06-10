@@ -24,19 +24,62 @@ HEADLESS_RULES = (
 )
 
 
-def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) -> str:
+def implement_handoff_block(*, blocked_reason: str = "", operator_comment: str = "") -> str:
+    """Render the operator-handoff section for a blocked-run resume.
+
+    Returns "" when there is no handoff context. Otherwise it states the
+    original `SYMPHONY_BLOCKED` reason, the operator's `$retry` comment text
+    (which may carry tokens/instructions the agent now needs), and tells the
+    fresh run that prior work is preserved in the workspace.
+    """
+    blocked_reason = (blocked_reason or "").strip()
+    operator_comment = (operator_comment or "").strip()
+    if not blocked_reason and not operator_comment:
+        return ""
+    parts = [
+        "# Operator handoff (resumed after a block)\n\n",
+        "A prior run on this issue stopped blocked on a human action. The "
+        "operator has since acted and resumed you with `$retry`.\n\n",
+    ]
+    if blocked_reason:
+        parts.append(f"## Original blocked reason\n\n{blocked_reason}\n\n")
+    if operator_comment:
+        parts.append(f"## Operator's resume instructions\n\n{operator_comment}\n\n")
+    parts.append(
+        "Prior work from the blocked run is preserved in this workspace (it was "
+        "NOT reset). Start with `git status` and review the diff before making "
+        "changes, then continue from where the prior run left off.\n\n"
+    )
+    return "".join(parts)
+
+
+def implement_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    blocked_reason: str = "",
+    operator_comment: str = "",
+) -> str:
     """Build the system+user prompt for the Implement stage.
 
     The body shows the agent the entire Linear issue context so it can
     decide on its own scope. It also reminds the agent to commit on the
     current branch — the orchestrator pushes after the run, but does not
     do its own commits.
+
+    On a blocked-run resume, `blocked_reason` / `operator_comment` populate a
+    handoff block placed before the issue so the agent sees it first.
     """
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
+    handoff = implement_handoff_block(
+        blocked_reason=blocked_reason, operator_comment=operator_comment
+    )
     return (
         "You are Symphony's Implement-stage agent.\n"
         "Make the code changes that satisfy the following Linear issue.\n\n"
+        f"{handoff}"
         "# Issue\n\n"
         f"## Title\n{issue_title}\n\n"
         f"## Labels\n{label_line}\n\n"

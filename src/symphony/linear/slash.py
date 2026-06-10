@@ -51,6 +51,9 @@ class SlashIntent:
     kind: SlashKind
     comment_id: str
     created_at: str
+    # The operator's full comment text (e.g. `$retry <token>`). Carried so a
+    # blocked-resume handoff can pass any tokens/instructions to the fresh run.
+    text: str = ""
 
 
 def _is_thumbs_up(body: str) -> bool:
@@ -95,13 +98,22 @@ def parse(comments: Sequence[Comment]) -> list[SlashIntent]:
                     kind=SlashKind.APPROVE,
                     comment_id=c.id,
                     created_at=c.created_at,
+                    text=body,
                 )
             )
             continue
-        m = _PATTERN.match(_command_text(body))
+        command_text = _command_text(body)
+        m = _PATTERN.match(command_text)
         if not m:
             continue
         raw_kind = m.group(1).lower()
         kind = SlashKind.APPROVE if raw_kind == "approved" else SlashKind(raw_kind)
-        out.append(SlashIntent(kind=kind, comment_id=c.id, created_at=c.created_at))
+        out.append(
+            SlashIntent(
+                kind=kind,
+                comment_id=c.id,
+                created_at=c.created_at,
+                text=command_text,
+            )
+        )
     return out

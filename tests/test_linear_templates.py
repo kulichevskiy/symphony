@@ -7,6 +7,7 @@ from symphony.linear.templates import (
     awaiting_approval,
     failed,
     fix_pushed,
+    implement_blocked,
     run_started,
     stage_done,
     stuck_loop_escape,
@@ -54,6 +55,27 @@ def test_token_block_replaces_cost(template, stage) -> None:
     # Token breakdown block: in/out/cache w/r — no total clause.
     assert "Tokens: in 10 · out 20 · cache w 5 / r 3" in body
     assert "total" not in body
+
+
+def test_implement_blocked_comment_states_verbatim_ask_and_retry() -> None:
+    reason = "authorize the Supabase MCP at https://example.com/oauth then approve"
+    body = implement_blocked(
+        CommentVars(
+            stage="implement",
+            repo="org/repo",
+            issue=0,
+            run_id="run-1",
+            error=reason,
+        )
+    )
+    # Glanceable emoji marker for phone push notifications.
+    assert body[0].isascii() is False or body.startswith("🔒")
+    # The agent's SYMPHONY_BLOCKED reason is reproduced verbatim.
+    assert reason in body
+    # Tells the operator exactly how to resume.
+    assert "$retry" in body
+    # Tells the operator their prior work is preserved.
+    assert "preserved" in body.lower() or "uncommitted" in body.lower()
 
 
 def test_failed_comment_only_promises_retry_when_enabled() -> None:

@@ -216,6 +216,28 @@ def failed(v: CommentVars) -> str:
     return body
 
 
+def implement_blocked(v: CommentVars) -> str:
+    """Human-action handoff for a blocked Implement run.
+
+    `v.error` carries the agent's `SYMPHONY_BLOCKED` reason verbatim — the
+    OAuth URL, the secret to provide, etc. It is reproduced unmodified so the
+    operator can act on the precise ask, then resume with `$retry`.
+    """
+    return (
+        f"🔒 **Implement blocked — waiting on a human action**\n\n"
+        f"Symphony paused `{v.repo}#{v.issue}` after **implement**: the agent "
+        f"committed what it could but cannot finish without a human action.\n\n"
+        f"- Run ID: `{v.run_id}`\n"
+        f"- {token_block(v)}\n\n"
+        f"**Blocked on (verbatim from the agent):**\n\n"
+        f"```\n{v.error}\n```\n\n"
+        "**What to do:** perform the action above, then reply `$retry` on this "
+        "issue. Put any tokens, URLs, or instructions the agent needs in that "
+        "same comment — its text is handed to the fresh run. Your prior work in "
+        "the workspace is preserved (uncommitted changes are kept).\n"
+    )
+
+
 def resumed(v: CommentVars) -> str:
     return f"✅ Resumed — advancing `{v.repo}#{v.issue}` to **{v.next_stage}**\n"
 

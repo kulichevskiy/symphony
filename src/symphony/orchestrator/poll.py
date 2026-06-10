@@ -82,6 +82,7 @@ from ..linear.templates import (
     failed,
     fix_pushed,
     fixing_merge_conflict,
+    implement_blocked,
     moved_to_waiting,
     resumed,
     retry_acceptance_requested,
@@ -437,6 +438,14 @@ class WebhookDispatchResult:
     kind: str
     handled: bool
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class _ImplementHandoff:
+    """Context carried from a blocked-run `$retry` to the fresh implement run."""
+
+    blocked_reason: str
+    operator_comment: str
 
 
 class _TerminationKwargs(TypedDict):
@@ -1546,6 +1555,13 @@ class Orchestrator:
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
+        self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
+        # Pending blocked-resume handoffs, keyed by storage issue_id. Set when an
+        # operator `$retry`s an IMPLEMENT_BLOCKED wait; consumed by the next
+        # implement dispatch to seed the fresh run's prompt. In-memory only: if
+        # the daemon restarts between the `$retry` and the dispatch, the issue
+        # simply re-runs without the handoff block.
+        self._implement_handoffs: dict[str, _ImplementHandoff] = {}
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
         self._acceptance_rejected_run_bindings: dict[str, RepoBinding] = {}
@@ -2472,6 +2488,9 @@ class Orchestrator:
         if run_id in self._implement_failed_run_bindings:
             await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._implement_blocked_run_bindings:
+            await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
+            return
         if run_id in self._review_failed_run_bindings:
             await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
             return
@@ -2485,6 +2504,11 @@ class Orchestrator:
         if wait is not None:
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
                 await self._handle_implement_failed_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
+                await self._handle_implement_blocked_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
@@ -2925,11 +2949,141 @@ class Orchestrator:
             run_id,
         )
 
+    async def _track_implement_blocked_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._implement_blocked_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_IMPLEMENT_BLOCKED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+
+    async def _handle_implement_blocked_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._implement_blocked_run_bindings.get(run_id)
+        if binding is None:
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_IMPLEMENT_BLOCKED,),
+            )
+            if binding is None:
+                return
+
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        tracker = self.tracker(binding)
+        states = await self._states_for_binding(binding)
+        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                log.warning(
+                    "could not resume blocked implement run %s: missing ready state %r",
+                    run_id,
+                    binding.linear_states.ready,
+                )
+                return
+            # Seed the fresh run's prompt with the original block reason and the
+            # operator's resume comment (which may carry the requested tokens or
+            # instructions). Consumed by the next implement dispatch.
+            blocked_reason = await self._blocked_reason_for_run(run_id)
+            self._implement_handoffs[issue_id] = _ImplementHandoff(
+                blocked_reason=blocked_reason,
+                operator_comment=intent.text,
+            )
+            try:
+                await tracker.move_issue(tracker_issue_id, ready_id)
+            except LinearError as e:
+                self._implement_handoffs.pop(issue_id, None)
+                log.warning("could not move %s to ready for resume: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to ready state for resume: {e}",
+                ) from e
+            body = resumed(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    next_stage=binding.linear_states.ready,
+                )
+            )
+            try:
+                await tracker.post_comment(tracker_issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning(
+                    "implement resume comment failed for issue %s: %s", issue_id, e
+                )
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is None:
+                log.warning(
+                    "could not stop blocked implement run %s: missing blocked state %r",
+                    run_id,
+                    binding.linear_states.blocked,
+                )
+                try:
+                    await tracker.post_comment(
+                        tracker_issue_id,
+                        truncate_body(
+                            command_rejected(
+                                f"${intent.kind}",
+                                "missing blocked state; keeping issue parked",
+                            )
+                        ),
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "implement stop rejection comment failed for %s: %s",
+                        issue_id,
+                        e,
+                    )
+                return
+            try:
+                await tracker.move_issue(tracker_issue_id, blocked_id)
+            except LinearError as e:
+                log.warning("could not move %s to blocked: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        log.info(
+            "slash %s received for blocked implement run %s (ignored)",
+            intent.kind,
+            run_id,
+        )
+
+    async def _blocked_reason_for_run(self, run_id: str) -> str:
+        run = await db.runs.get_with_issue(self._conn, run_id)
+        if run is None:
+            return ""
+        return run.run.termination_detail or ""
+
     async def _restore_operator_waits(self) -> None:
         waits = await db.operator_waits.list_all(self._conn)
         for wait in waits:
             if wait.kind not in (
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
+                db.operator_waits.KIND_IMPLEMENT_BLOCKED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
@@ -2964,6 +3118,8 @@ class Orchestrator:
         self._operator_wait_run_ids.add(wait.run_id)
         if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
             self._implement_failed_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
+            self._implement_blocked_run_bindings[wait.run_id] = binding
         elif wait.kind in (
             db.operator_waits.KIND_REVIEW_FAILED,
             db.operator_waits.KIND_REVIEW_STOPPED,
@@ -3302,6 +3458,7 @@ class Orchestrator:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
         self._implement_failed_run_bindings.pop(run_id, None)
+        self._implement_blocked_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
@@ -10118,10 +10275,12 @@ class Orchestrator:
             )
             log.info("implement run %s classified blocked: %s", run_id, reason)
             # Captured verbatim on the run record (termination_kind="blocked",
-            # termination_detail=<reason>) and parked for operator handling. The
-            # gate returns before any push/local-review, so a blocked run never
-            # opens a PR.
-            await self._fail_run_and_reset_issue(
+            # termination_detail=<reason>) and parked on an IMPLEMENT_BLOCKED
+            # operator wait for human handoff. The gate returns before any
+            # push/local-review, so a blocked run never opens a PR, and the
+            # workspace (with any uncommitted work) is left untouched for the
+            # `$retry` resume.
+            await self._block_implement_run(
                 run_id,
                 reason,
                 issue=issue,
@@ -10129,8 +10288,6 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 returncode=final_returncode,
-                termination_kind="blocked",
-                termination_detail=reason,
             )
             return run_id
         if completion.outcome != "completed":
@@ -12071,10 +12228,16 @@ class Orchestrator:
         dollar total, so it is currently unused.
         """
         storage_issue_id = storage_issue_id or issue.id
+        # Consume a pending blocked-resume handoff (set when the operator
+        # `$retry`d an IMPLEMENT_BLOCKED wait), so the fresh run's prompt carries
+        # the original block reason + the operator's resume instructions.
+        handoff = self._implement_handoffs.pop(storage_issue_id, None)
         prompt = implement_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
             labels=list(issue.labels),
+            blocked_reason=handoff.blocked_reason if handoff else "",
+            operator_comment=handoff.operator_comment if handoff else "",
         )
         command = build_runner_command(
             binding.agent,
@@ -12543,6 +12706,81 @@ class Orchestrator:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("implement failed comment post failed on %s: %s", issue.identifier, e)
+
+    async def _block_implement_run(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        issue: LinearIssue,
+        storage_issue_id: str | None = None,
+        rollback_state_id: str,
+        binding: RepoBinding,
+        returncode: int | None = None,
+    ) -> None:
+        """Park an Implement run that ended blocked on a human action.
+
+        Mirrors `_fail_run_and_reset_issue` but opens an IMPLEMENT_BLOCKED
+        operator wait and posts the verbatim human-action handoff comment so
+        the operator can act and `$retry`. The run record keeps
+        termination_kind="blocked" with the reason verbatim.
+        """
+        storage_issue_id = storage_issue_id or issue.id
+        await self._fail_run(
+            run_id,
+            reason,
+            returncode=returncode,
+            termination_kind="blocked",
+            termination_detail=reason,
+        )
+        target_state_id = rollback_state_id
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking blocked implement %s: %s",
+                issue.identifier,
+                e,
+            )
+        else:
+            ready_id = states.get(binding.linear_states.ready)
+            if issue.state_id == ready_id:
+                target_state_id = (
+                    states.get(binding.linear_states.needs_approval)
+                    or states.get(binding.linear_states.blocked)
+                    or rollback_state_id
+                )
+        try:
+            tracker = self.tracker(binding)
+            await tracker.move_issue(issue.id, target_state_id)
+        except LinearError as e:
+            log.warning(
+                "could not park %s after blocked dispatch: %s",
+                issue.identifier,
+                e,
+            )
+        await self._track_implement_blocked_wait(storage_issue_id, run_id, binding)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
+        body = implement_blocked(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+                error=reason,
+            )
+        )
+        try:
+            tracker = self.tracker(binding)
+            await tracker.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "implement blocked comment post failed on %s: %s", issue.identifier, e
+            )
 
 
 __all__ = [
