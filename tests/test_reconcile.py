@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from symphony import db
+from symphony.config import LinearStates, RepoBinding
 from symphony.orchestrator.reconcile import reconcile
 from symphony.tracker import TrackerContext
 
@@ -382,6 +383,70 @@ async def test_reconcile_ignores_stale_issue_pr_for_pidless_review_retry(
         assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
 
         linear.post_comment.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_recovers_pidless_local_review_run(tmp_path: Path) -> None:
+    """A `local_review` run is in-process (no PID) and lives at stage
+    `local_review`, so neither pid sweep nor the `review`-only pidless sweep
+    catches it. Reconcile must flip it `interrupted` AND re-dispatch the issue
+    from `ready` — the automated equivalent of the manual Todo move that was
+    needed before — so the issue is not wedged in "Local Code Review"."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-local-review",
+            issue_id="iss-local",
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            agent="codex",
+            branch_prefix="symphony",
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.team_states = AsyncMock(return_value={"Todo": "state-ready"})
+        linear.move_issue = AsyncMock()
+
+        flipped = await reconcile(conn, linear, bindings=[binding])
+        assert flipped == 1
+
+        # Row flips to interrupted with an ended_at and orphaned kind.
+        cur = await conn.execute(
+            """
+            SELECT status, ended_at, termination_kind, termination_detail
+            FROM runs WHERE id=?
+            """,
+            ("pidless-local-review",),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.INTERRUPTED_STATUS
+        assert row[1] is not None
+        assert row["termination_kind"] == "orphaned"
+        assert "local review" in row["termination_detail"]
+
+        # Recovery path triggered: the issue is moved back to the ready state
+        # so the next poll re-dispatches a fresh implement.
+        linear.move_issue.assert_awaited_once_with("iss-local", "state-ready")
+
+        # Host-restart comment posted.
+        linear.post_comment.assert_awaited_once()
+        assert "Host restarted" in linear.post_comment.await_args.args[1]
     finally:
         await conn.close()
 

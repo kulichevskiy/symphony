@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import aiosqlite
 
 from .. import db
 from ..linear.client import LinearError
 from ..tracker import IssueTracker, TrackerContext, TrackerRegistry
+
+if TYPE_CHECKING:
+    from ..config import RepoBinding
 
 log = logging.getLogger(__name__)
 
@@ -157,14 +160,126 @@ async def _post_reconcile_comment(
         log.warning("could not post reconcile comment on %s: %s", issue_id, e)
 
 
+def _binding_for_issue(
+    bindings: Sequence[RepoBinding],
+    *,
+    team_key: str,
+    ctx: TrackerContext,
+) -> RepoBinding | None:
+    for binding in bindings:
+        if (
+            binding.linear_team_key == team_key
+            and binding.tracker_provider == ctx.provider
+            and binding.tracker_site == ctx.site
+        ):
+            return binding
+    return None
+
+
+async def _redispatch_orphaned_local_review(
+    conn: aiosqlite.Connection,
+    tracker_for_context: TrackerResolver,
+    bindings: Sequence[RepoBinding],
+    run: db.runs.Run,
+) -> None:
+    """Move the issue back to its `ready` state so the next poll re-dispatches
+    a fresh implement→local_review→push. The committed implement work survives,
+    so the re-run is cheap. This is the automated equivalent of the manual
+    "move the card back to Todo" recovery."""
+    if not bindings:
+        log.warning(
+            "cannot re-dispatch orphaned local_review run=%s issue=%s: "
+            "no bindings provided",
+            run.id,
+            run.issue_id,
+        )
+        return
+
+    cur = await conn.execute(
+        "SELECT tracker_issue_id, provider, site, team_key FROM issues WHERE id = ?",
+        (run.issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        log.warning(
+            "cannot re-dispatch orphaned local_review run=%s issue=%s: "
+            "missing issue row",
+            run.id,
+            run.issue_id,
+        )
+        return
+
+    provider = str(row["provider"] or "")
+    site = str(row["site"] or "")
+    ctx = (
+        TrackerContext(provider=provider, site=site)
+        if provider and site
+        else TrackerContext()
+    )
+    team_key = str(row["team_key"] or "")
+    binding = _binding_for_issue(bindings, team_key=team_key, ctx=ctx)
+    if binding is None:
+        log.warning(
+            "cannot re-dispatch orphaned local_review run=%s issue=%s: "
+            "no binding for team=%s provider=%s site=%s",
+            run.id,
+            run.issue_id,
+            team_key,
+            ctx.provider,
+            ctx.site,
+        )
+        return
+
+    try:
+        tracker = tracker_for_context(ctx)
+    except KeyError as e:
+        log.warning(
+            "cannot re-dispatch orphaned local_review run=%s: tracker resolve failed: %s",
+            run.id,
+            e,
+        )
+        return
+
+    tracker_issue_id = str(row["tracker_issue_id"] or run.issue_id)
+    ready_state = binding.linear_states.ready
+    try:
+        states = await tracker.team_states(team_key)
+        ready_id = states.get(ready_state)
+        if ready_id is None:
+            log.warning(
+                "cannot re-dispatch orphaned local_review run=%s issue=%s: "
+                "missing ready state %r for team %s",
+                run.id,
+                run.issue_id,
+                ready_state,
+                team_key,
+            )
+            return
+        await tracker.move_issue(tracker_issue_id, ready_id)
+    except LinearError as e:
+        log.warning(
+            "could not move %s to ready for local_review re-dispatch: %s",
+            run.issue_id,
+            e,
+        )
+        return
+    log.info(
+        "reconcile: re-dispatched orphaned local_review issue=%s to ready state %r",
+        run.issue_id,
+        ready_state,
+    )
+
+
 async def reconcile(
     conn: aiosqlite.Connection,
     tracker_or_resolver: TrackerInput,
+    bindings: Sequence[RepoBinding] | None = None,
 ) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
 
     Returns the number of rows flipped.
     """
+    bindings = bindings or ()
     tracker_for_context = _tracker_resolver(tracker_or_resolver)
     rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
@@ -217,6 +332,27 @@ async def reconcile(
                 detail="Host restarted; pidless review monitor orphaned",
             )
             await _preserve_pidless_review_retry_path(conn, run, created_at=now)
+        await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
+        flipped += 1
+
+    for run in await db.runs.list_live_local_review_without_pid(conn):
+        log.info(
+            "reconcile: local_review run=%s issue=%s has no pid — "
+            "marking interrupted and re-dispatching",
+            run.id,
+            run.issue_id,
+        )
+        await db.runs.update_status(
+            conn,
+            run.id,
+            db.runs.INTERRUPTED_STATUS,
+            ended_at=now,
+            kind="orphaned",
+            detail="Host restarted; pidless local review monitor orphaned",
+        )
+        await _redispatch_orphaned_local_review(
+            conn, tracker_for_context, bindings, run
+        )
         await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
     return flipped
