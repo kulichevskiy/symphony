@@ -102,7 +102,7 @@ def _make_orch(
     workspace.acquire = AsyncMock(return_value=Path("/dev/null"))
     workspace.release = MagicMock()
     gh = MagicMock()
-    gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/1")
+    gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/1")
     gh.pr_comment = AsyncMock()
     gh.repo_default_branch = AsyncMock(return_value="main")
     orch = Orchestrator(

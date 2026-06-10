@@ -517,7 +517,7 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
         tracker.move_issue = AsyncMock()
         gh = MagicMock()
         gh.repo_default_branch = AsyncMock(return_value="main")
-        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "workspace")

@@ -366,7 +366,7 @@ def _orch_fixtures(tmp_path: Path, binding: RepoBinding):  # type: ignore[no-unt
     workspace.release = MagicMock()
 
     gh = MagicMock()
-    gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+    gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
     gh.pr_comment = AsyncMock()
     gh.repo_clone = AsyncMock()
     gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -415,7 +415,7 @@ async def test_failing_verify_cmd_blocks_push_and_pr(tmp_path: Path) -> None:
 
         # Fail-closed: no push, no PR, issue blocked, operator wait.
         push_fn.assert_not_awaited()
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
 
@@ -463,7 +463,7 @@ async def test_passing_verify_cmd_push_proceeds(tmp_path: Path) -> None:
         await _scan_and_wait(orch, binding)
 
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
-        gh.pr_create.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is None
         # The green gate must have recorded a verify-pass mark for the exact
@@ -516,7 +516,7 @@ async def test_verify_session_crash_fails_closed(tmp_path: Path) -> None:
             poll_mod.run_verify_session = original  # type: ignore[assignment]
 
         push_fn.assert_not_awaited()
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
     finally:
@@ -666,7 +666,7 @@ async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
 
         # Green on the re-run → push proceeds, PR opened.
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
-        gh.pr_create.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is None
 

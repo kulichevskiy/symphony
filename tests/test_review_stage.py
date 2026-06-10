@@ -309,7 +309,7 @@ async def test_implement_success_posts_codex_review_and_records_review_handoff(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.repo_clone = AsyncMock()

@@ -46,7 +46,7 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     fake_workspace.acquire = AsyncMock(return_value=Path("/tmp/fake-ws"))
     fake_workspace.release = MagicMock()
     fake_gh = MagicMock()
-    fake_gh.pr_create = AsyncMock(return_value="https://example.invalid/pr/1")
+    fake_gh.ensure_pr = AsyncMock(return_value="https://example.invalid/pr/1")
     fake_gh.pr_comment = AsyncMock()
     fake_gh.repo_clone = AsyncMock()
     fake_gh.repo_default_branch = AsyncMock(return_value="main")

@@ -10545,7 +10545,7 @@ class Orchestrator:
                     e,
                 )
         try:
-            pr_url = await self._gh.pr_create(
+            pr_url = await self._gh.ensure_pr(
                 title=build_pr_title(issue),
                 body="",
                 base=base_branch,

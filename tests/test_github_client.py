@@ -176,6 +176,105 @@ async def test_pr_create_omits_base_when_not_provided(fake_gh) -> None:  # type:
     assert "--head" in argv and argv[argv.index("--head") + 1] == "x"
 
 
+# ---- ensure_pr (get-or-create) -------------------------------------
+
+
+async def test_pr_for_head_lists_open_pr_for_branch(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps([{"number": 7, "url": "https://github.com/org/r/pull/7"}])
+    log = fake_gh({"pr list": [0, payload]})
+    gh = GitHub()
+    assert await gh.pr_for_head(head="feat/x", repo="org/r") == (
+        "https://github.com/org/r/pull/7"
+    )
+    argv = _calls(log)[0]["argv"]
+    assert isinstance(argv, list)
+    assert argv[:2] == ["pr", "list"]
+    assert "--head" in argv and argv[argv.index("--head") + 1] == "feat/x"
+    assert "--state" in argv and argv[argv.index("--state") + 1] == "open"
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
+
+
+async def test_pr_for_head_returns_none_when_no_open_pr(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    log = fake_gh({"pr list": [0, "[]"]})
+    gh = GitHub()
+    assert await gh.pr_for_head(head="feat/x", repo="org/r") is None
+    assert len(_calls(log)) == 1
+
+
+async def test_ensure_pr_adopts_existing_open_pr(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    """exists → adopt: an open PR for the head is returned, no create."""
+    payload = json.dumps([{"number": 7, "url": "https://github.com/org/r/pull/7"}])
+    log = fake_gh({"pr list": [0, payload]})
+    gh = GitHub()
+    url = await gh.ensure_pr(
+        title="t", body="b", base="main", head="feat/x", repo="org/r"
+    )
+    assert url == "https://github.com/org/r/pull/7"
+    joined = [" ".join(c["argv"]) for c in _calls(log)]  # type: ignore[arg-type]
+    assert not any("pr create" in j for j in joined)
+
+
+async def test_ensure_pr_creates_when_absent(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    """absent → create: no existing PR, so one is created and returned."""
+    log = fake_gh(
+        {
+            "pr list": [0, "[]"],
+            "pr create": [0, "https://github.com/org/r/pull/9\n"],
+        }
+    )
+    gh = GitHub()
+    url = await gh.ensure_pr(
+        title="t", body="b", base="main", head="feat/x", repo="org/r"
+    )
+    assert url == "https://github.com/org/r/pull/9"
+    joined = [" ".join(c["argv"]) for c in _calls(log)]  # type: ignore[arg-type]
+    assert any("pr create" in j for j in joined)
+
+
+async def test_ensure_pr_recovers_from_create_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """create-race → recover: first list empty, create fails because a PR
+    already exists, second list finds it."""
+    existing = "https://github.com/org/r/pull/11"
+
+    list_results = iter([None, existing])
+
+    async def fake_pr_for_head(*, head: str, repo: str | None = None) -> str | None:
+        return next(list_results)
+
+    async def fake_pr_create(**kwargs: object) -> str:
+        raise GitHubError(
+            "gh pr create exited 1: a pull request already exists for org:feat/x"
+        )
+
+    gh = GitHub()
+    monkeypatch.setattr(gh, "pr_for_head", fake_pr_for_head)
+    monkeypatch.setattr(gh, "pr_create", fake_pr_create)
+
+    url = await gh.ensure_pr(
+        title="t", body="b", base="main", head="feat/x", repo="org/r"
+    )
+    assert url == existing
+
+
+async def test_ensure_pr_reraises_unrelated_create_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_pr_for_head(*, head: str, repo: str | None = None) -> str | None:
+        return None
+
+    async def fake_pr_create(**kwargs: object) -> str:
+        raise GitHubError("gh pr create exited 1: some other failure")
+
+    gh = GitHub()
+    monkeypatch.setattr(gh, "pr_for_head", fake_pr_for_head)
+    monkeypatch.setattr(gh, "pr_create", fake_pr_create)
+
+    with pytest.raises(GitHubError, match="some other failure"):
+        await gh.ensure_pr(title="t", body="b", head="feat/x", repo="org/r")
+
+
 async def test_pr_external_snapshot_reads_rollup_and_review_comments(fake_gh) -> None:  # type: ignore[no-untyped-def]
     view = json.dumps(
         {

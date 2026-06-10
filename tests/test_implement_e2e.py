@@ -156,7 +156,7 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -235,8 +235,8 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         push_fn.assert_awaited_once()
 
         # PR opened with the prescribed title and body.
-        gh.pr_create.assert_awaited_once()
-        kwargs = gh.pr_create.await_args.kwargs
+        gh.ensure_pr.assert_awaited_once()
+        kwargs = gh.ensure_pr.await_args.kwargs
         assert kwargs["title"] == "[ENG-1] Add authentication"
         assert kwargs["repo"] == "org/repo"
         assert kwargs["base"] == "trunk"
@@ -318,7 +318,7 @@ async def test_false_false_review_binding_opens_pr_without_review_stage(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -365,7 +365,7 @@ async def test_false_false_review_binding_opens_pr_without_review_stage(
 
         await _scan_and_wait(orch, binding)
 
-        gh.pr_create.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
         gh.pr_comment.assert_not_awaited()
         assert linear.move_issue.await_args_list == [call("iss-1", "state-progress")]
 
@@ -418,7 +418,7 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_default_branch = AsyncMock(side_effect=GitHubError("boom"))
 
@@ -437,8 +437,8 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        gh.pr_create.assert_awaited_once()
-        assert gh.pr_create.await_args.kwargs["base"] is None
+        gh.ensure_pr.assert_awaited_once()
+        assert gh.ensure_pr.await_args.kwargs["base"] is None
         history = await db.runs.history_for_issue(conn, "iss-1")
         # Implement run completes, Review monitor is recorded.
         assert [r.stage for r in history] == ["implement", "review"]
@@ -485,7 +485,7 @@ async def _run_blocked_dispatch(
     workspace.release = MagicMock()
 
     gh = MagicMock()
-    gh.pr_create = AsyncMock()
+    gh.ensure_pr = AsyncMock()
     gh.repo_default_branch = AsyncMock(return_value="trunk")
     push_fn = AsyncMock()
 
@@ -508,7 +508,7 @@ async def test_implement_blocked_marker_captures_reason_and_skips_push(
         gh, push_fn = await _run_blocked_dispatch(tmp_path, conn, runner)
 
         # A blocked run never opens a PR or pushes.
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         push_fn.assert_not_awaited()
 
         history = await db.runs.history_for_issue(conn, "iss-1")
@@ -534,7 +534,7 @@ async def test_implement_blocked_classifier_fallback_for_mch14(tmp_path: Path) -
         runner = _blocked_runner(message)
         gh, push_fn = await _run_blocked_dispatch(tmp_path, conn, runner)
 
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         push_fn.assert_not_awaited()
 
         history = await db.runs.history_for_issue(conn, "iss-1")
@@ -576,7 +576,7 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock()
+        gh.ensure_pr = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         reason = "authorize the Supabase MCP at https://example.com/oauth then $retry"
@@ -617,7 +617,7 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
         await _scan_and_wait(orch, cfg.repos[0])
 
         # Blocked run parks the issue — no PR.
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
 
         # A dedicated IMPLEMENT_BLOCKED wait was opened (not IMPLEMENT_FAILED).
         wait = await db.operator_waits.get(conn, "iss-1")
@@ -709,7 +709,7 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock()
+        gh.ensure_pr = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         events = [
@@ -727,7 +727,7 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         await _scan_and_wait(orch, cfg.repos[0])
 
         # No PR opened on failure.
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
             call("iss-1", "state-na"),
@@ -815,7 +815,7 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock()
+        gh.ensure_pr = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         orch = Orchestrator(
@@ -831,7 +831,7 @@ async def test_implement_dispatch_marks_failed_on_runner_exception(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         workspace.release.assert_called_once()
         assert linear.move_issue.await_args_list == [
             call("iss-1", "state-progress"),
@@ -872,7 +872,7 @@ async def test_manual_dispatch_failure_rolls_back_to_original_state(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock()
+        gh.ensure_pr = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
 
         runner = _FakeRunner(
@@ -1040,7 +1040,7 @@ def _dirty_gate_fixture(tmp_path: Path) -> dict[str, object]:
     workspace.release = MagicMock()
 
     gh = MagicMock()
-    gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+    gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
     gh.pr_comment = AsyncMock()
     gh.repo_default_branch = AsyncMock(return_value="trunk")
 
@@ -1095,7 +1095,7 @@ async def test_dirty_tree_blocks_push_after_one_failed_fix_turn(
         await _scan_and_wait(orch, fx["cfg"].repos[0])  # type: ignore[union-attr]
 
         fx["push_fn"].assert_not_awaited()  # type: ignore[union-attr]
-        fx["gh"].pr_create.assert_not_awaited()  # type: ignore[union-attr]
+        fx["gh"].ensure_pr.assert_not_awaited()  # type: ignore[union-attr]
 
         # Exactly one fix turn after the implement turn.
         assert len(runner.specs) == 2
@@ -1168,7 +1168,7 @@ async def test_dirty_tree_fix_turn_commits_and_push_proceeds(
 
         assert len(runner.specs) == 2
         fx["push_fn"].assert_awaited_once()  # type: ignore[union-attr]
-        fx["gh"].pr_create.assert_awaited_once()  # type: ignore[union-attr]
+        fx["gh"].ensure_pr.assert_awaited_once()  # type: ignore[union-attr]
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         by_stage = {r.stage: r for r in history}
@@ -1213,7 +1213,7 @@ async def test_clean_tree_skips_fix_turn_entirely(tmp_path: Path) -> None:
 
         assert len(runner.specs) == 1
         fx["push_fn"].assert_awaited_once()  # type: ignore[union-attr]
-        fx["gh"].pr_create.assert_awaited_once()  # type: ignore[union-attr]
+        fx["gh"].ensure_pr.assert_awaited_once()  # type: ignore[union-attr]
     finally:
         await conn.close()
 
