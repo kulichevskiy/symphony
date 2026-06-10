@@ -229,12 +229,13 @@ async def _redispatch_orphaned_local_review(
 
     provider = str(row["provider"] or "")
     site = str(row["site"] or "")
+    team_key = str(row["team_key"] or "")
+    project_key = team_key if provider == "jira" else ""
     ctx = (
-        TrackerContext(provider=provider, site=site)
+        TrackerContext(provider=provider, site=site, project_key=project_key)
         if provider and site
         else TrackerContext()
     )
-    team_key = str(row["team_key"] or "")
     binding = _binding_for_issue(bindings, team_key=team_key, ctx=ctx)
     if binding is None:
         log.warning(

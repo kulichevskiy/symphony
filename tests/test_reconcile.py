@@ -13,7 +13,7 @@ from symphony import db
 from symphony.config import LinearStates, RepoBinding
 from symphony.linear.client import LinearError
 from symphony.orchestrator.reconcile import reconcile
-from symphony.tracker import TrackerContext
+from symphony.tracker import TrackerContext, TrackerRegistry
 
 
 @pytest.mark.asyncio
@@ -582,6 +582,71 @@ async def test_reconcile_recovers_vib198_implement_plus_local_review(
         for call in linear.post_comment.await_args_list:
             assert call.args[0] == "iss-local"
             assert "Host restarted" in call.args[1]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_redispatches_jira_local_review_with_two_projects(
+    tmp_path: Path,
+) -> None:
+    """Two jira trackers share one provider/site, distinguished only by
+    `project_key`. Re-dispatching the orphaned `local_review` must build the
+    `TrackerContext` WITH `project_key`, or `TrackerRegistry.resolve` raises
+    `KeyError("multiple issue trackers registered ...")`, the re-dispatch is
+    swallowed, and the jira issue stays stranded — the exact bug this PR fixes,
+    re-introduced for jira. Drives reconcile through a real registry so the
+    `project_key` resolution path (invisible to the bare-AsyncMock tests) is
+    actually exercised."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-jira",
+            identifier="PROJ-9",
+            title="t",
+            team_key="PROJ",
+            provider="jira",
+            site="acme",
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-local-review",
+            issue_id="iss-jira",
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="PROJ",
+            github_repo="org/repo",
+            agent="codex",
+            branch_prefix="symphony",
+            provider="jira",
+            tracker_site="acme",
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        # Two jira trackers under the same provider/site, distinct project_key.
+        proj = AsyncMock()
+        proj.post_comment = AsyncMock(return_value="cmt-1")
+        proj.team_states = AsyncMock(return_value={"Todo": "state-ready"})
+        proj.move_issue = AsyncMock()
+        other = AsyncMock()
+        other.move_issue = AsyncMock()
+
+        registry = TrackerRegistry()
+        registry.register("jira", "acme", proj, project_key="PROJ")
+        registry.register("jira", "acme", other, project_key="OTHER")
+
+        flipped = await reconcile(conn, registry, bindings=[binding])
+        assert flipped == 1
+
+        # Re-dispatched on the correct project's tracker — not stranded.
+        proj.move_issue.assert_awaited_once_with("iss-jira", "state-ready")
+        other.move_issue.assert_not_awaited()
     finally:
         await conn.close()
 
