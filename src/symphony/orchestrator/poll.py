@@ -207,6 +207,13 @@ class SlashHandlerFailure(RuntimeError):
         self.reason = reason
 
 
+class _ImplementDeliveryFailure(RuntimeError):
+    def __init__(self, reason: str, exc: BaseException | str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.exc = exc
+
+
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
 
 
@@ -1611,6 +1618,7 @@ class Orchestrator:
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
+        self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
         # Pending blocked-resume handoffs, keyed by storage issue_id. Set when an
         # operator `$retry`s an IMPLEMENT_BLOCKED wait; consumed by the next
@@ -2544,6 +2552,9 @@ class Orchestrator:
         if run_id in self._implement_failed_run_bindings:
             await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._deliver_failed_run_bindings:
+            await self._handle_deliver_failed_slash_intent(issue_id, run_id, intent)
+            return
         if run_id in self._implement_blocked_run_bindings:
             await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
             return
@@ -2560,6 +2571,11 @@ class Orchestrator:
         if wait is not None:
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
                 await self._handle_implement_failed_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+                await self._handle_deliver_failed_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
@@ -2911,6 +2927,160 @@ class Orchestrator:
             tracker_site=binding.tracker_site,
         )
 
+    async def _track_deliver_failed_wait(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._deliver_failed_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_DELIVER_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+
+    async def _handle_deliver_failed_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._deliver_failed_run_bindings.get(run_id)
+        if binding is None:
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_DELIVER_FAILED,),
+            )
+            if binding is None:
+                return
+
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        tracker = self.tracker(binding)
+        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
+            try:
+                issue = await tracker.lookup_issue(tracker_issue_id)
+            except LinearError as e:
+                log.warning("could not load %s for delivery retry: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not load issue for delivery retry: {e}",
+                ) from e
+
+            run = await db.runs.get_with_issue(self._conn, run_id)
+            if run is None:
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "delivery run is no longer available",
+                )
+                return
+            usage = UsageDelta(
+                cost_usd=run.run.cost_usd,
+                input_tokens=run.run.input_tokens,
+                output_tokens=run.run.output_tokens,
+                cache_write_tokens=run.run.cache_write_tokens,
+                cache_read_tokens=run.run.cache_read_tokens,
+            )
+
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                await self._fail_delivery_run_and_wait(
+                    run_id,
+                    f"workspace acquire failed: {e}",
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    rollback_state_id=issue.state_id,
+                    binding=binding,
+                    exc=e,
+                )
+                return
+            finally:
+                self._workspace.release(binding, issue)
+
+            try:
+                await self._deliver_completed_implement(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    workspace_path=workspace_path,
+                    run_id=run_id,
+                    cumulative_usage=usage,
+                    resume_delivery=True,
+                )
+            except _ImplementDeliveryFailure as e:
+                await self._fail_delivery_run_and_wait(
+                    run_id,
+                    e.reason,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    rollback_state_id=issue.state_id,
+                    binding=binding,
+                    exc=e.exc,
+                )
+                return
+
+            next_stage = (
+                "merge"
+                if (
+                    not binding.resolved_local_review()
+                    and not binding.resolved_remote_review()
+                )
+                else "review"
+            )
+            try:
+                await tracker.post_comment(
+                    tracker_issue_id,
+                    truncate_body(
+                        resumed(
+                            CommentVars(
+                                stage="delivery",
+                                repo=binding.github_repo,
+                                issue=0,
+                                run_id=run_id,
+                                next_stage=next_stage,
+                            )
+                        )
+                    ),
+                )
+            except LinearError as e:
+                log.warning("delivery retry comment failed for issue %s: %s", issue_id, e)
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            states = await self._states_for_binding(binding)
+            blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is None:
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "missing blocked state; keeping delivery wait parked",
+                )
+                return
+            try:
+                await tracker.move_issue(tracker_issue_id, blocked_id)
+            except LinearError as e:
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        log.info(
+            "slash %s received for failed delivery run %s (ignored)",
+            intent.kind,
+            run_id,
+        )
+
     async def _handle_implement_failed_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -3140,6 +3310,7 @@ class Orchestrator:
             if wait.kind not in (
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
                 db.operator_waits.KIND_IMPLEMENT_BLOCKED,
+                db.operator_waits.KIND_DELIVER_FAILED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
@@ -3174,6 +3345,8 @@ class Orchestrator:
         self._operator_wait_run_ids.add(wait.run_id)
         if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
             self._implement_failed_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+            self._deliver_failed_run_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
             self._implement_blocked_run_bindings[wait.run_id] = binding
         elif wait.kind in (
@@ -3514,6 +3687,7 @@ class Orchestrator:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
         self._implement_failed_run_bindings.pop(run_id, None)
+        self._deliver_failed_run_bindings.pop(run_id, None)
         self._implement_blocked_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
@@ -10516,24 +10690,50 @@ class Orchestrator:
             )
             return run_id
 
-        # 5. Push branch, open PR, post stage-transition comment.
+        try:
+            await self._deliver_completed_implement(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                workspace_path=workspace_path,
+                run_id=run_id,
+                cumulative_usage=cumulative_usage,
+                local_review_result=local_review_result,
+            )
+        except _ImplementDeliveryFailure as e:
+            log.warning("implement delivery failed for %s: %s", issue.identifier, e.reason)
+            await self._fail_delivery_run_and_wait(
+                run_id,
+                e.reason,
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+                exc=e.exc,
+            )
+        return run_id
+
+    async def _deliver_completed_implement(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        workspace_path: Path,
+        run_id: str,
+        cumulative_usage: UsageDelta | db.runs.IssueTokens,
+        local_review_result: LoopResult | None = None,
+        resume_delivery: bool = False,
+    ) -> None:
+        """Push and hand off an implement run that already passed completion."""
+        tracker = self.tracker(binding)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
             await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
             log.warning("git push failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"push failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-            )
-            return run_id
+            raise _ImplementDeliveryFailure(f"push failed: {e}", e) from e
 
-        pr_url: str = ""
         base_branch = binding.base_branch
         if base_branch is None:
             try:
@@ -10555,16 +10755,7 @@ class Orchestrator:
             )
         except GitHubError as e:
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"pr_create failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-            )
-            return run_id
+            raise _ImplementDeliveryFailure(f"pr_create failed: {e}", e) from e
 
         try:
             next_stage = (
@@ -10607,7 +10798,7 @@ class Orchestrator:
             pr_number = pr_number_from_url(pr_url)
             await db.review_state.begin_review(
                 self._conn,
-                issue_id,
+                storage_issue_id,
                 pr_number=pr_number,
                 pr_url=pr_url,
                 github_repo=binding.github_repo,
@@ -10622,7 +10813,7 @@ class Orchestrator:
             else:
                 await db.issue_prs.upsert(
                     self._conn,
-                    issue_id=issue_id,
+                    issue_id=storage_issue_id,
                     github_repo=binding.github_repo,
                     binding_key=_binding_storage_key(binding),
                     pr_number=pr_number,
@@ -10630,29 +10821,32 @@ class Orchestrator:
                     created_at=datetime.now(UTC).isoformat(),
                     review_bypassed=True,
                 )
-            return run_id
+            return
 
-        # 6. Start the Review stage. A local loop is a hard pre-PR gate:
-        #    true/true runs remote review after local APPROVED, or after an
-        #    operator explicitly bypasses the local gate with $skip-local-review.
-        #    Other local terminals are parked below instead of falling through
-        #    to the GitHub bot.
+        # A delivery retry starts after local review/verify already succeeded.
+        # Do not re-run those gates or reinterpret their in-memory result.
         local_review_blocks_remote = (
             binding.resolved_local_review()
+            and not resume_delivery
             and not _local_review_permits_remote(local_review_result)
         )
         post_codex_review = (
             binding.resolved_remote_review() and not local_review_blocks_remote
         )
-        review_run = await self._start_review_stage(
-            binding=binding,
-            issue=issue,
-            storage_issue_id=issue_id,
-            pr_url=pr_url,
-            post_codex_review=post_codex_review,
-        )
+        try:
+            review_run = await self._start_review_stage(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=storage_issue_id,
+                pr_url=pr_url,
+                post_codex_review=post_codex_review,
+                fail_on_handoff_failure=True,
+            )
+        except GitHubError as e:
+            raise _ImplementDeliveryFailure(f"review handoff failed: {e}", e) from e
         if (
-            binding.resolved_local_review()
+            not resume_delivery
+            and binding.resolved_local_review()
             and _local_review_needs_approval(local_review_result)
         ):
             await self._park_local_only_review_needs_approval(
@@ -10663,9 +10857,10 @@ class Orchestrator:
                 result=local_review_result,
                 operator_wait=binding.resolved_remote_review(),
             )
-            return run_id
+            return
         if (
-            binding.resolved_local_review()
+            not resume_delivery
+            and binding.resolved_local_review()
             and not (
                 binding.resolved_remote_review()
                 and _local_review_permits_remote(local_review_result)
@@ -10687,16 +10882,10 @@ class Orchestrator:
                 auto_retry=False,
                 operator_wait=True,
             )
-            return run_id
-        # 7. Surface the local-review verdict on the GitHub PR thread
-        #    (not just on Linear) so human reviewers see the audit
-        #    trail. Only fires when local-review APPROVED; local-only
-        #    failures are parked for operator action. The binding-level
-        #    override wins over the global config so an
-        #    operator can keep one repo's PR thread quiet without
-        #    disabling the feature everywhere.
+            return
         if (
-            binding.resolved_post_local_review_pr_summary(
+            not resume_delivery
+            and binding.resolved_post_local_review_pr_summary(
                 self.config.post_local_review_pr_summary
             )
             and local_review_result is not None
@@ -10708,7 +10897,6 @@ class Orchestrator:
                 reviewer_agent=binding.resolved_reviewer_agent(),
                 result=local_review_result,
             )
-        return run_id
 
     async def _merge_approved_pr(
         self,
@@ -12000,6 +12188,7 @@ class Orchestrator:
         storage_issue_id: str | None = None,
         pr_url: str,
         post_codex_review: bool = True,
+        fail_on_handoff_failure: bool = False,
     ) -> db.runs.Run:
         """Persist the review state row, optionally ping `@codex review`.
 
@@ -12051,6 +12240,8 @@ class Orchestrator:
                         pr_number,
                         e,
                     )
+                    if fail_on_handoff_failure:
+                        raise
 
         if post_codex_review and binding.resolved_remote_review():
             await self._move_issue_to_review_state(binding=binding, issue=issue)
@@ -12833,6 +13024,74 @@ class Orchestrator:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
             log.warning("implement failed comment post failed on %s: %s", issue.identifier, e)
+
+    async def _fail_delivery_run_and_wait(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        issue: LinearIssue,
+        storage_issue_id: str | None = None,
+        rollback_state_id: str,
+        binding: RepoBinding,
+        exc: BaseException | str | None = None,
+    ) -> None:
+        storage_issue_id = storage_issue_id or issue.id
+        await self._fail_run(
+            run_id,
+            reason,
+            exc=exc,
+            termination_kind="delivery_failed",
+            termination_detail=reason,
+        )
+        target_state_id = rollback_state_id
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking failed delivery %s: %s",
+                issue.identifier,
+                e,
+            )
+        else:
+            ready_id = states.get(binding.linear_states.ready)
+            if issue.state_id == ready_id:
+                target_state_id = (
+                    states.get(binding.linear_states.needs_approval)
+                    or states.get(binding.linear_states.blocked)
+                    or rollback_state_id
+                )
+        try:
+            await self.tracker(binding).move_issue(issue.id, target_state_id)
+        except LinearError as e:
+            log.warning(
+                "could not park %s after failed delivery: %s",
+                issue.identifier,
+                e,
+            )
+        await self._track_deliver_failed_wait(storage_issue_id, run_id, binding)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
+        body = failed(
+            CommentVars(
+                stage="delivery",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+                error=reason,
+            )
+        )
+        body += (
+            "\nReply with `$retry` or `$approve` to resume delivery. "
+            "Reply with `$reject` or `$stop` to leave it halted.\n"
+        )
+        try:
+            await self.tracker(binding).post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("delivery failed comment post failed on %s: %s", issue.identifier, e)
 
     async def _block_implement_run(
         self,

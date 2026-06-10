@@ -1019,6 +1019,130 @@ def _init_git_workspace(workspace: Path) -> None:
     _git(workspace, "commit", "--allow-empty", "-m", "init")
 
 
+
+
+@pytest.mark.asyncio
+async def test_deliver_failed_retry_resumes_delivery_without_rerunning_agent(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(
+            return_value=_issue(state_id="state-na", state_name="Needs Approval")
+        )
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(
+            side_effect=[
+                GitHubError("HTTP 401 unauthorized"),
+                "https://github.com/org/repo/pull/42",
+            ]
+        )
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": "Implemented and committed.\n\nSYMPHONY_DONE",
+            }
+        )
+
+        def _advance_head_on_implement(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="stdout", line=result_line),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_advance_head_on_implement,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+
+        assert len(runner.specs) == 1
+        assert push_fn.await_count == 1
+        assert gh.ensure_pr.await_count == 1
+        gh.pr_comment.assert_not_awaited()
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-na"),
+        ]
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "failed"
+        assert history[0].termination_kind == "delivery_failed"
+        assert "pr_create failed: HTTP 401 unauthorized" in history[0].termination_detail
+        assert "HEAD did not advance" not in history[0].termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        assert wait.run_id == history[0].id
+        posted_bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("Delivery stage failed" in body for body in posted_bodies)
+        assert any("HTTP 401 unauthorized" in body for body in posted_bodies)
+
+        await orch._handle_deliver_failed_slash_intent(  # noqa: SLF001
+            "iss-1",
+            wait.run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        assert len(runner.specs) == 1
+        assert push_fn.await_count == 2
+        assert gh.ensure_pr.await_count == 2
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [(run.stage, run.status) for run in history] == [
+            ("implement", "completed"),
+            ("review", "running"),
+        ]
+        assert history[0].termination_kind == ""
+        assert history[0].termination_detail == ""
+    finally:
+        await conn.close()
+
+
 def _dirty_gate_fixture(tmp_path: Path) -> dict[str, object]:
     cfg = Config(
         repos=[_binding()],
