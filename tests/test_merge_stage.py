@@ -2792,7 +2792,7 @@ async def test_tick_schedules_merge_before_new_implementation_when_capacity_is_f
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="main")
-        gh.pr_create = AsyncMock()
+        gh.ensure_pr = AsyncMock()
         gh.pr_comment = AsyncMock()
 
         runner = _BlockingRunner()

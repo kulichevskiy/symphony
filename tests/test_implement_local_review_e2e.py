@@ -191,7 +191,7 @@ async def test_hybrid_strategy_runs_local_then_remote_then_merge(
         workspace.cleanup = AsyncMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -335,7 +335,7 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -394,7 +394,7 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
 
         await _scan_and_wait(orch, binding)
 
-        gh.pr_create.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
         codex_calls = [
             c
@@ -447,7 +447,7 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -512,7 +512,7 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
         )
 
         # PR was still opened.
-        gh.pr_create.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
 
         # `@codex review` was NOT posted — that's the whole point of local mode
         # with an APPROVED outcome.
@@ -565,7 +565,7 @@ async def test_local_strategy_approved_posts_pr_summary(tmp_path: Path) -> None:
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -660,7 +660,7 @@ async def test_local_strategy_disabled_pr_summary_does_not_post(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -753,7 +753,7 @@ async def test_binding_pr_summary_override_off_beats_global_on(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -839,7 +839,7 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -903,7 +903,7 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         ]
         assert codex_calls == []
         assert len(summary_calls) == 0
-        gh.pr_create.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-na" in move_targets
@@ -956,7 +956,7 @@ async def test_local_strategy_infra_failures_block_without_pr(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1007,7 +1007,7 @@ async def test_local_strategy_infra_failures_block_without_pr(
 
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
         push_fn.assert_not_awaited()
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         gh.pr_comment.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
@@ -1067,7 +1067,7 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -1107,7 +1107,7 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         gh.pr_comment.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
@@ -1154,7 +1154,7 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.pr_create = AsyncMock(
+        gh.ensure_pr = AsyncMock(
             return_value="https://github.com/org/repo/pull/42"
         )
         gh.pr_comment = AsyncMock()
@@ -1211,7 +1211,7 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
         assert codex_pings == [], (
             "local-only mode must not post @codex when the reviewer fails"
         )
-        gh.pr_create.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
         wait = await db.operator_waits.get(conn, "iss-1")

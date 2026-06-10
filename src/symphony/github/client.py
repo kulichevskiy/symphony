@@ -246,6 +246,71 @@ class GitHub:
         out = await self._run(argv)
         return out.strip()
 
+    async def pr_for_head(
+        self, *, head: str, repo: str | None = None
+    ) -> str | None:
+        """Return the URL of the open PR for `head`, or None if none exists."""
+        result = await self._run_json(
+            [
+                "pr",
+                "list",
+                "--head",
+                head,
+                "--state",
+                "open",
+                *self._repo_args(repo),
+                "--json",
+                "number,url",
+            ]
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"pr list: expected array, got {type(result).__name__}"
+            )
+        for entry in result:
+            if isinstance(entry, dict) and entry.get("url"):
+                return str(entry["url"])
+        return None
+
+    async def ensure_pr(
+        self,
+        *,
+        title: str,
+        body: str,
+        base: str | None = None,
+        head: str,
+        repo: str | None = None,
+        linear_url: str | None = None,
+        draft: bool = False,
+    ) -> str:
+        """Get-or-create the PR for `(repo, head)`; return its URL.
+
+        Idempotent: adopts an existing open PR for the head branch instead of
+        creating a duplicate, and recovers if `gh pr create` races and fails
+        because a PR already exists. This lets every retry or re-dispatch that
+        reaches the PR step converge on the one PR for the branch.
+        """
+        existing = await self.pr_for_head(head=head, repo=repo)
+        if existing:
+            return existing
+        try:
+            return await self.pr_create(
+                title=title,
+                body=body,
+                base=base,
+                head=head,
+                repo=repo,
+                linear_url=linear_url,
+                draft=draft,
+            )
+        except GitHubError as e:
+            if "a pull request already exists" not in str(e).casefold():
+                raise
+            recovered = await self.pr_for_head(head=head, repo=repo)
+            if recovered:
+                return recovered
+            raise
+
     async def pr_view(
         self,
         pr: int | str,
