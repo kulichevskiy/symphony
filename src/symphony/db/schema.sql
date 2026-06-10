@@ -105,6 +105,19 @@ CREATE TABLE IF NOT EXISTS merge_conflict_fix_marks (
     PRIMARY KEY (issue_id, github_repo)
 );
 
+-- A green `verify_cmd` gate (SYM-103) is recorded per pushed head so the
+-- merge gate (SYM-108) can treat a no_signal verdict on a repo without CI as
+-- mergeable only when that exact head was verified. The SHA is a strong key,
+-- so a fix-run that advances HEAD without re-verifying falls back to a wait.
+-- Survives restarts.
+CREATE TABLE IF NOT EXISTS verify_pass_marks (
+    issue_id    TEXT NOT NULL REFERENCES issues(id),
+    github_repo TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    marked_at   TEXT NOT NULL,
+    PRIMARY KEY (issue_id, github_repo, head_sha)
+);
+
 -- `last_seen_ids` is a JSON array of comment IDs that share `last_seen_at`.
 -- Combined with a `gte` filter on the next fetch, this prevents losing
 -- comments tied at the boundary timestamp (e.g. bursty creation, pagination

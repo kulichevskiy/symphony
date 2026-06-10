@@ -278,6 +278,59 @@ async def clear_merge_conflict_fixed(
     return (cur.rowcount or 0) > 0
 
 
+async def mark_verify_passed(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    head_sha: str,
+    marked_at: str,
+) -> bool:
+    """Record that `verify_cmd` ran green for *head_sha* (SYM-108).
+
+    Keyed on the commit SHA, so the mark stays valid only for the exact code
+    that was verified; a fix-run that advances HEAD without re-verifying does
+    not match and falls back to an operator wait at the merge gate.
+    """
+    if not head_sha:
+        return False
+    await conn.execute(
+        """
+        INSERT INTO verify_pass_marks (issue_id, github_repo, head_sha, marked_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(issue_id, github_repo, head_sha) DO UPDATE SET
+            marked_at = excluded.marked_at
+        """,
+        (issue_id, github_repo, head_sha, marked_at),
+    )
+    await conn.commit()
+    return True
+
+
+async def has_verify_passed(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    head_sha: str,
+) -> bool:
+    if not head_sha:
+        return False
+    cur = await conn.execute(
+        """
+        SELECT 1
+        FROM verify_pass_marks
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND head_sha = ?
+        LIMIT 1
+        """,
+        (issue_id, github_repo, head_sha),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
 async def get(
     conn: aiosqlite.Connection,
     *,
