@@ -7,6 +7,7 @@ from symphony.agent.prompt import (
     implement_prompt,
     merge_prompt,
     merge_required_check_fix_prompt,
+    review_comment_fix_prompt,
 )
 
 
@@ -51,6 +52,21 @@ def test_implement_prompt_is_deterministic() -> None:
     a = implement_prompt(issue_title="t", issue_body="b", labels=["x"])
     b = implement_prompt(issue_title="t", issue_body="b", labels=["x"])
     assert a == b
+
+
+def test_review_comment_fix_prompt_mandates_completion_marker_contract() -> None:
+    prompt = review_comment_fix_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+        trigger="src/auth.py:12 missing token validation",
+    )
+    # Fix runs share the implement completion contract (SYM-107): a fix-run
+    # that politely stalls on a human action must end SYMPHONY_BLOCKED, not
+    # exit 0 looking done.
+    assert "SYMPHONY_DONE" in prompt
+    assert "SYMPHONY_BLOCKED:" in prompt
+    assert "final message" in prompt.lower()
 
 
 def test_acceptance_fix_prompt_frames_product_mismatch_not_code_review() -> None:

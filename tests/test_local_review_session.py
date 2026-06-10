@@ -463,6 +463,65 @@ async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
     assert (log_dir / "fix-0.err.log").read_text(encoding="utf-8") == ""
 
 
+def _claude_result_stream(text: str) -> list[RunnerEvent]:
+    """A claude fix-run stream ending in a `result` event (final message)."""
+    return [
+        RunnerEvent(kind="stdout", line=json.dumps({"type": "result", "result": text})),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_blocked_fix_run_halts_session_as_blocked(tmp_path: Path) -> None:
+    """A fix-run that exits 0 but politely asks for human authorization
+    (no marker, HEAD did not advance) is classified blocked via the SYM-101
+    completion gate. The session halts as FIX_RUN_BLOCKED — no further review
+    pass — so the orchestrator parks it for the operator instead of pushing."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(
+                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
+            _claude_result_stream(
+                "I need you to authorize the Supabase OAuth URL before I can "
+                "regenerate the types. I cannot proceed without your approval."
+            ),
+        ]
+    )
+
+    # HEAD never advances: the fixer made no commit because it stalled on a
+    # human action. Same SHA before and after the fix-run.
+    async def head_sha(_: Path) -> str:
+        return "sha-stuck"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-blocked",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_BLOCKED
+    assert result.iterations == 1
+    # Only the first reviewer + the fixer ran; no second review pass.
+    assert len(runner.specs) == 2
+    assert runner.specs[1].stage == "local_review_fix"
+    # The human-action ask is surfaced verbatim for the operator.
+    assert result.error is not None
+    assert "authorize the Supabase OAuth URL" in result.error
+
+
 @pytest.mark.asyncio
 async def test_reviewer_prefers_last_message_file_over_stdout(
     tmp_path: Path,

@@ -23,6 +23,21 @@ HEADLESS_RULES = (
     "`SYMPHONY_BLOCKED: <what the operator must authorize and where>`.\n"
 )
 
+# Appended to every prompt that drives code changes (implement + fix runs).
+# rc=0 alone cannot tell "done" from "politely blocked on a human action"
+# (MCH-14), so the agent must end with a machine-readable marker. Shared by
+# the implement and fix prompts so the contract never forks between them.
+COMPLETION_CONTRACT = (
+    "# Completion contract\n\n"
+    "Your final message MUST end with exactly one machine-readable marker on "
+    "its own final line:\n"
+    "- `SYMPHONY_DONE` — the change is implemented and committed.\n"
+    "- `SYMPHONY_BLOCKED: <exactly what a human must do>` — you cannot finish "
+    "without a human action (e.g. authorizing an OAuth URL, providing a "
+    "secret). State the precise action; do not end with `SYMPHONY_DONE` when "
+    "you are actually waiting on a human.\n"
+)
+
 
 def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) -> str:
     """Build the system+user prompt for the Implement stage.
@@ -46,14 +61,7 @@ def implement_prompt(*, issue_title: str, issue_body: str, labels: list[str]) ->
         "- Commit your changes on the current branch (do not push).\n"
         "- Follow strict TDD: write a failing test first, then the code.\n"
         "- Do not edit unrelated files.\n\n"
-        "# Completion contract\n\n"
-        "Your final message MUST end with exactly one machine-readable marker on "
-        "its own final line:\n"
-        "- `SYMPHONY_DONE` — the issue is implemented and committed.\n"
-        "- `SYMPHONY_BLOCKED: <exactly what a human must do>` — you cannot finish "
-        "without a human action (e.g. authorizing an OAuth URL, providing a "
-        "secret). State the precise action; do not end with `SYMPHONY_DONE` when "
-        "you are actually waiting on a human.\n"
+        f"{COMPLETION_CONTRACT}"
         f"{HEADLESS_RULES}"
     )
 
@@ -119,7 +127,8 @@ def review_comment_fix_prompt(
         "# Working agreement\n\n"
         "- Make the smallest change that addresses the reviewer feedback.\n"
         "- Commit your changes on the current branch (do not push).\n"
-        "- Do not edit unrelated files.\n"
+        "- Do not edit unrelated files.\n\n"
+        f"{COMPLETION_CONTRACT}"
         f"{HEADLESS_RULES}"
     )
 

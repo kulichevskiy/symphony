@@ -928,6 +928,7 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
     [
         LoopOutcome.REVIEWER_FAILED,
         LoopOutcome.FIX_RUN_FAILED,
+        LoopOutcome.FIX_RUN_BLOCKED,
     ],
 )
 async def test_local_strategy_infra_failures_block_without_pr(

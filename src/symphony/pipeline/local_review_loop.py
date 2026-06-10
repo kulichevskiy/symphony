@@ -54,6 +54,7 @@ class LoopOutcome(StrEnum):
     EXHAUSTED = "exhausted"
     REVIEWER_FAILED = "reviewer_failed"
     FIX_RUN_FAILED = "fix_run_failed"
+    FIX_RUN_BLOCKED = "fix_run_blocked"
     STUCK_LOOP = "stuck_loop"
 
 
@@ -75,6 +76,12 @@ class ReviewerOutput:
 class FixerOutput:
     ok: bool
     error: str | None = None
+    # SYM-107: a fix-run that exits 0 but politely stalls on a human action
+    # (SYM-101 `SYMPHONY_BLOCKED` contract) sets `blocked` so the loop halts
+    # and routes to the operator-wait path instead of re-reviewing / pushing.
+    # `blocked` is independent of `ok`: a blocked run still exited 0.
+    blocked: bool = False
+    blocked_reason: str = ""
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -259,6 +266,15 @@ async def run_local_review_loop(
 
         fix = await fixer(i, verdict)
         _record_usage(fix)
+        # A blocked fix-run halts the loop before the next review pass: the
+        # branch is waiting on a human action, so re-reviewing or pushing is
+        # pointless. Checked before `ok` because a blocked run exited 0.
+        if fix.blocked:
+            return _result(
+                outcome=LoopOutcome.FIX_RUN_BLOCKED,
+                iterations=i + 1,
+                error=fix.blocked_reason or "fix-run blocked on a human action",
+            )
         if not fix.ok:
             return _result(
                 outcome=LoopOutcome.FIX_RUN_FAILED,

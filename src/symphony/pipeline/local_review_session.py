@@ -63,6 +63,7 @@ from .local_review_loop import (
     ReviewerOutput,
     run_local_review_loop,
 )
+from .state_machine import classify_implement_completion
 
 ImplementerAgent = Literal["claude", "codex"]
 
@@ -426,6 +427,7 @@ async def run_local_review_session(
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
+        head_before = await head_sha_provider(workspace_path)
         prompt = review_comment_fix_prompt(
             issue_title=issue_title,
             issue_body=issue_body,
@@ -492,6 +494,34 @@ async def run_local_review_session(
             return FixerOutput(
                 ok=False,
                 error=f"fix-run exited rc={collected.returncode}",
+                cost_usd=cost_delta,
+                input_tokens=input_delta,
+                output_tokens=output_delta,
+                cache_write_tokens=cache_write_delta,
+                cache_read_tokens=cache_read_delta,
+            )
+        # rc=0 is not enough (SYM-101/SYM-107): a fix-run that ends politely
+        # blocked on a human action (MCH-14: hand-edited generated types
+        # behind an OAuth wall) also exits 0. Reuse the implement completion
+        # gate — `SYMPHONY_BLOCKED` marker, else no-marker + no-HEAD-advance
+        # classifier — and halt the loop on a blocked verdict. Other outcomes
+        # keep rc=0 == ok: the loop's own re-review / dedup handles them.
+        final_message = extract_last_agent_message(
+            agent=implementer_agent, stdout=collected.stdout
+        )
+        head_after = await head_sha_provider(workspace_path)
+        head_advanced = bool(head_after) and head_after != head_before
+        completion = classify_implement_completion(
+            final_message=final_message, head_advanced=head_advanced
+        )
+        if completion.outcome == "blocked":
+            return FixerOutput(
+                ok=True,
+                blocked=True,
+                blocked_reason=(
+                    completion.blocked_reason
+                    or "fix-run blocked on a human action but gave no reason"
+                ),
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
