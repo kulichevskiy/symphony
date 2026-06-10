@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -299,6 +301,45 @@ def _implement_script() -> list[RunnerEvent]:
     ]
 
 
+def _init_git_workspace(path: Path) -> str:
+    """Make *path* a git repo with one clean commit; return its HEAD SHA.
+
+    Lets `_workspace_head_sha` resolve a real SHA so the verify-pass mark is
+    recorded against it, and keeps the tree clean so the pre-push dirty-tree
+    gate doesn't divert into a fix turn.
+    """
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    (path / "f.txt").write_text("x")
+    for cmd in (
+        ["git", "init", "-q"],
+        ["git", "add", "f.txt"],
+        ["git", "commit", "-q", "-m", "init"],
+    ):
+        subprocess.run(
+            cmd, cwd=path, check=True, env={**os.environ, **env}, capture_output=True
+        )
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True
+    )
+    return out.stdout.decode().strip()
+
+
+def _workspace_head(path: Path) -> str:
+    """Return *path*'s current HEAD SHA (sync, to stay off the async loop)."""
+    return (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True
+        )
+        .stdout.decode()
+        .strip()
+    )
+
+
 async def _scan_and_wait(orch: Orchestrator, binding: RepoBinding) -> None:
     tasks = await orch._scan_binding(binding)  # noqa: SLF001
     if tasks:
@@ -401,6 +442,11 @@ async def test_passing_verify_cmd_push_proceeds(tmp_path: Path) -> None:
         cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
             tmp_path, binding
         )
+        # A real git workspace with a clean base commit. The implement run
+        # advances HEAD (the completion gate requires it), so the green-gate
+        # recording (poll.py:_dispatch_one) keys the verify-pass mark on the
+        # *post-implement* head — the same SHA that gets pushed — not this base.
+        _init_git_workspace(workspace_path)
         # No `verify_fix` bucket: a green verify must not dispatch a fix turn.
         runner = _StagedRunner({"implement": [_implement_script()]})
         orch = Orchestrator(
@@ -420,6 +466,17 @@ async def test_passing_verify_cmd_push_proceeds(tmp_path: Path) -> None:
         gh.pr_create.assert_awaited_once()
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is None
+        # The green gate must have recorded a verify-pass mark for the exact
+        # pushed head (the post-implement HEAD); a regression in that recording
+        # would fail here while the merge-side tests (which inject the mark)
+        # stay green.
+        pushed_head = _workspace_head(workspace_path)
+        assert await db.issue_prs.has_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha=pushed_head,
+        )
     finally:
         await conn.close()
 

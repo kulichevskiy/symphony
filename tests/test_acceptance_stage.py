@@ -208,14 +208,30 @@ async def _seed_review_candidate(conn, binding: RepoBinding) -> None:  # type: i
 
 def _github() -> MagicMock:
     gh = MagicMock()
+    # Green CI rollup matches `pr_checks` below: SYM-108 gates the no_signal
+    # conflict-fix merge on the head's checks being green.
+    _green_rollup = [
+        {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}
+    ]
     gh.pr_view = AsyncMock(
         side_effect=[
-            {"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergedAt": None},
-            {"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergedAt": None},
+            {
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergedAt": None,
+                "statusCheckRollup": _green_rollup,
+            },
+            {
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergedAt": None,
+                "statusCheckRollup": _green_rollup,
+            },
             {
                 "headRefOid": "abc123",
                 "mergeable": "MERGEABLE",
                 "mergedAt": "2026-05-10T00:04:00Z",
+                "statusCheckRollup": _green_rollup,
             },
         ]
     )

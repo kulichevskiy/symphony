@@ -1011,6 +1011,57 @@ def _status_check_failed(check: Mapping[str, object]) -> bool:
     )
 
 
+# Terminal-success states across both rollup shapes: a `StatusContext` reports
+# `state`, a `CheckRun` reports `status`+`conclusion`. SKIPPED/NEUTRAL count as
+# non-blocking passes (GitHub treats them as green for branch protection).
+_STATUS_CHECK_SUCCESS_STATES = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def _status_check_succeeded(check: Mapping[str, object]) -> bool:
+    """True only when *check* has completed successfully (SYM-108).
+
+    A `CheckRun` that has not reached `COMPLETED` is still in flight, so it is
+    neither a success nor a failure — the caller treats it as pending.
+    """
+    if _status_check_failed(check):
+        return False
+    status = str(check.get("status") or "").upper()
+    if status and status != "COMPLETED":
+        return False
+    conclusion = str(check.get("conclusion") or "").upper()
+    if conclusion:
+        return conclusion in _STATUS_CHECK_SUCCESS_STATES
+    state = str(check.get("state") or "").upper()
+    if state:
+        return state in _STATUS_CHECK_SUCCESS_STATES
+    return False
+
+
+def _no_signal_head_check_state(view: dict[str, object]) -> str:
+    """Classify the CI rollup on the PR head for the no_signal merge gate.
+
+    Returns "green" (≥1 check, all complete and successful), "failed" (≥1
+    check failed), "pending" (≥1 check, none failed but some still running),
+    or "none" (no check reports on the head). SYM-108: a clean no_signal
+    bypass merges only on "green"; "none" needs a verify_cmd/opt-in; "pending"
+    keeps polling; "failed" defers to the review/required-check fix path.
+    """
+    head_sha = str(view.get("headRefOid") or "")
+    nodes: list[dict[str, Any]] = []
+    for check in _status_rollup_nodes(view.get("statusCheckRollup")):
+        check_sha = _status_check_sha(check)
+        if check_sha and head_sha and check_sha != head_sha:
+            continue
+        nodes.append(check)
+    if not nodes:
+        return "none"
+    if any(_status_check_failed(check) for check in nodes):
+        return "failed"
+    if all(_status_check_succeeded(check) for check in nodes):
+        return "green"
+    return "pending"
+
+
 def _required_check_detail(check: Mapping[str, object]) -> dict[str, object]:
     detail: dict[str, object] = {}
     for key in (
@@ -8569,6 +8620,64 @@ class Orchestrator:
                     )
                 )
 
+            # SYM-108: a no_signal merge trigger (conflict-fix or review
+            # bypass) is honored only when the head's CI is green. PR #24
+            # merged on an empty rollup before its build voted. Gate it:
+            # green → merge; pending → keep polling; failed → defer to the
+            # review/required-check fix path. With zero checks reporting,
+            # merge only when `verify_cmd` ran green for this exact head (or
+            # the repo opted into `allow_unverified_merge`); otherwise hand to
+            # an operator instead of silently merging unverified code.
+            if conflict_fix_ready or review_bypass_ready:
+                check_state = _no_signal_head_check_state(view)
+                if check_state == "none":
+                    verified = await db.issue_prs.has_verify_passed(
+                        self._conn,
+                        issue_id=candidate.issue_id,
+                        github_repo=binding.github_repo,
+                        head_sha=head_sha,
+                    )
+                    if not (binding.allow_unverified_merge or verified):
+                        await self._mark_merge_needs_approval(
+                            binding=binding,
+                            issue=issue,
+                            pr_url=candidate.pr_url,
+                            run_id=str(uuid.uuid4()),
+                            reason=(
+                                "no CI checks report on the head and no green "
+                                "verify_cmd for it — merge needs operator "
+                                "approval"
+                            ),
+                            create_run=True,
+                        )
+                        continue
+                elif check_state == "pending":
+                    # Checks still running — keep polling until they settle.
+                    # Never merge.
+                    continue
+                elif check_state == "failed":
+                    # A failing *required* check is driven by the required-check
+                    # fix path above (it dispatched a rerun this tick, or one is
+                    # already mid-flight); keep polling for that. But a failing
+                    # *non-required* check (e.g. a Vercel build, PR #24) yields
+                    # no `required_check_failures` and thus no fix path — keep
+                    # polling forever otherwise. Escalate to an operator instead,
+                    # mirroring the "none" branch.
+                    if not required_check_failures:
+                        await self._mark_merge_needs_approval(
+                            binding=binding,
+                            issue=issue,
+                            pr_url=candidate.pr_url,
+                            run_id=str(uuid.uuid4()),
+                            reason=(
+                                "head CI failed and no failing check is "
+                                "branch-protection required (no fix path) — "
+                                "merge needs operator approval"
+                            ),
+                            create_run=True,
+                        )
+                    continue
+
             if (
                 verdict.kind is VerdictKind.APPROVED
                 or conflict_fix_ready
@@ -10202,6 +10311,19 @@ class Orchestrator:
                     result=verify_result,
                 )
                 return run_id
+            # SYM-108: record the green gate against the exact head it
+            # verified so the merge gate can treat a no-CI repo as mergeable
+            # only for this SHA. A later HEAD-advancing fix turn (e.g. the
+            # dirty-tree gate) won't match, falling back to an operator wait.
+            verified_head = await _workspace_head_sha(workspace_path)
+            if verified_head:
+                await db.issue_prs.mark_verify_passed(
+                    self._conn,
+                    issue_id=issue_id,
+                    github_repo=binding.github_repo,
+                    head_sha=verified_head,
+                    marked_at=datetime.now(UTC).isoformat(),
+                )
 
         # 4.8. Pre-push dirty-tree gate. Pushing only commits means any
         # uncommitted work silently vanishes on workspace cleanup (MCH-14).

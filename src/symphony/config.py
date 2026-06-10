@@ -172,6 +172,11 @@ class RepoBinding(BaseModel):
     # `--strict-mcp-config`, so anything not listed here is invisible to the
     # agent. Default: none.
     mcp_servers: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Escape hatch for repos that deliberately run neither CI nor a
+    # `verify_cmd`: when true, a clean no_signal + mergeable PR auto-merges
+    # even with zero CI checks and no green verify (SYM-108). Default false
+    # keeps such unverified PRs waiting for an operator.
+    allow_unverified_merge: bool = False
     acceptance: AcceptanceConfig = Field(default_factory=AcceptanceConfig)
     activity_comments_enabled: bool | None = None
     activity_comment_interval_secs: int | None = Field(default=None, ge=1)

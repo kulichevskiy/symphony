@@ -3718,6 +3718,9 @@ async def test_merge_conflict_fix_reenters_merge_on_next_poll(
             "baseRefName": "release/1.2",
             "state": "OPEN",
             "mergedAt": None,
+            "statusCheckRollup": [
+                {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}
+            ],
         }
         merged_view = {
             **clean_view,
@@ -3963,6 +3966,9 @@ async def test_merge_conflict_fix_marker_survives_when_merge_capacity_full(
                 "baseRefName": "main",
                 "state": "OPEN",
                 "mergedAt": None,
+                "statusCheckRollup": [
+                    {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}
+                ],
             }
         )
         gh.pr_checks = AsyncMock(
@@ -4029,6 +4035,13 @@ async def test_merge_conflict_fix_marker_survives_when_scheduled_merge_bails(
                 "baseRefName": "main",
                 "state": "OPEN",
                 "mergedAt": None,
+                "statusCheckRollup": [
+                    {
+                        "__typename": "StatusContext",
+                        "context": "ci",
+                        "state": "SUCCESS",
+                    }
+                ],
             }
         )
         gh.pr_checks = AsyncMock(
@@ -5299,6 +5312,26 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
 
 
 def _no_signal_view() -> dict[str, object]:
+    # A reported, green CI rollup: a clean no_signal verdict is a valid merge
+    # signal only when the repo's checks have all passed (SYM-108).
+    return {
+        "headRefOid": "abc123",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "state": "OPEN",
+        "mergedAt": None,
+        "statusCheckRollup": [
+            {
+                "__typename": "StatusContext",
+                "context": "ci",
+                "state": "SUCCESS",
+            }
+        ],
+    }
+
+
+def _no_checks_view() -> dict[str, object]:
+    # A repo with zero CI checks reporting on the head.
     return {
         "headRefOid": "abc123",
         "mergeable": "MERGEABLE",
@@ -5313,9 +5346,10 @@ def _make_poll_merge_orchestrator(
     *,
     binding: RepoBinding,
     verdict: Verdict,
+    view: dict[str, object] | None = None,
 ) -> Orchestrator:
     gh = MagicMock()
-    gh.pr_view = AsyncMock(return_value=_no_signal_view())
+    gh.pr_view = AsyncMock(return_value=view if view is not None else _no_signal_view())
     linear = AsyncMock()
     linear.lookup_issue = AsyncMock(return_value=_issue())
     linear.move_issue = AsyncMock(return_value=None)
@@ -5656,5 +5690,230 @@ async def test_local_only_binding_merges_when_local_review_follows_fix(
 
         orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
         assert orch._schedule_merge.call_args.kwargs["pr_number"] == 42  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+# --- SYM-108: no_signal merge gate (CI + verify_cmd) --------------------
+#
+# A clean no_signal + mergeable verdict is no longer a sufficient merge
+# signal. The repo's CI rollup must be fully green; with zero checks the
+# binding's `verify_cmd` must have run green for the pushed head, else the PR
+# waits for an operator (PR #24 merged on an empty rollup before its build
+# voted).
+
+
+@pytest.mark.asyncio
+async def test_no_signal_zero_checks_no_verify_waits_for_operator(
+    tmp_path: Path,
+) -> None:
+    """false/false: zero CI + no verify_cmd → operator wait, never merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=_no_checks_view(),
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_zero_checks_green_verify_merges(tmp_path: Path) -> None:
+    """false/false: zero CI but a green verify_cmd for the head merges."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        await db.issue_prs.mark_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha="abc123",
+            marked_at="2026-05-10T00:01:30+00:00",
+        )
+        binding = _binding().model_copy(
+            update={
+                "local_review": False,
+                "remote_review": False,
+                "verify_cmd": "pnpm build && pnpm test",
+            }
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=_no_checks_view(),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert orch._schedule_merge.call_args.kwargs["pr_number"] == 42  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_zero_checks_verify_for_stale_head_waits(
+    tmp_path: Path,
+) -> None:
+    """A green verify for a different head SHA does not unblock this head."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        await db.issue_prs.mark_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha="stale99",
+            marked_at="2026-05-10T00:01:30+00:00",
+        )
+        binding = _binding().model_copy(
+            update={
+                "local_review": False,
+                "remote_review": False,
+                "verify_cmd": "pnpm build && pnpm test",
+            }
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=_no_checks_view(),
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_zero_checks_allow_unverified_merge_merges(
+    tmp_path: Path,
+) -> None:
+    """allow_unverified_merge opts a repo into merging with no CI / verify."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={
+                "local_review": False,
+                "remote_review": False,
+                "allow_unverified_merge": True,
+            }
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=_no_checks_view(),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_pending_check_never_merges(tmp_path: Path) -> None:
+    """A pending check on the head blocks the no_signal bypass merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        pending_view = _no_checks_view()
+        pending_view["statusCheckRollup"] = [
+            {
+                "__typename": "CheckRun",
+                "name": "build",
+                "status": "IN_PROGRESS",
+            }
+        ]
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=pending_view,
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        # Pending → keep polling, not a terminal operator wait.
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_signal_failed_non_required_check_waits_for_operator(
+    tmp_path: Path,
+) -> None:
+    """A failing non-required check (no fix path) escalates, not silent poll.
+
+    PR #24: a Vercel-style check fails but is not branch-protection required,
+    so `_required_check_failures_for_view` returns []. The required-check fix
+    path never fires, so the failed no_signal candidate must surface to an
+    operator instead of polling a permanently red PR forever.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)
+        binding = _binding().model_copy(
+            update={"local_review": False, "remote_review": False}
+        )
+        failed_view = _no_checks_view()
+        failed_view["statusCheckRollup"] = [
+            {
+                "__typename": "CheckRun",
+                "name": "vercel",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+            }
+        ]
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="no_signal"),
+            view=failed_view,
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
     finally:
         await conn.close()
