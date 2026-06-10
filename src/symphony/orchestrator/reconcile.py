@@ -33,6 +33,18 @@ _RETRY_BODY = (
     "automatically when possible; otherwise reply `$retry` to dispatch again.\n"
 )
 
+# A local_review orphan has no operator-wait and no active review monitor, so
+# `$retry` has no handler for it (poll.py rejects it as "no active retry
+# handler"). Re-dispatch is automatic, so the comment must not tell the
+# operator to do anything.
+_LOCAL_REVIEW_REDISPATCH_BODY = (
+    "🔁 **Host restarted — re-dispatched automatically**\n\n"
+    "The Symphony host was restarted while this issue was in local code review "
+    "(an in-process step with no subprocess to resume). The committed implement "
+    "work is intact, so the issue has been moved back to its ready state and "
+    "will be re-dispatched automatically on the next poll. No action needed.\n"
+)
+
 TrackerResolver = Callable[[TrackerContext], IssueTracker]
 TrackerInput = IssueTracker | TrackerRegistry | TrackerResolver
 
@@ -141,6 +153,7 @@ async def _post_reconcile_comment(
     conn: aiosqlite.Connection,
     tracker_for_context: TrackerResolver,
     issue_id: str,
+    body: str = _RETRY_BODY,
 ) -> None:
     tracker_issue_id, ctx = await _tracker_identity_for_issue(conn, issue_id)
     try:
@@ -155,7 +168,7 @@ async def _post_reconcile_comment(
         )
         return
     try:
-        await tracker.post_comment(tracker_issue_id, _RETRY_BODY)
+        await tracker.post_comment(tracker_issue_id, body)
     except LinearError as e:
         log.warning("could not post reconcile comment on %s: %s", issue_id, e)
 
@@ -181,11 +194,16 @@ async def _redispatch_orphaned_local_review(
     tracker_for_context: TrackerResolver,
     bindings: Sequence[RepoBinding],
     run: db.runs.Run,
-) -> None:
+) -> bool:
     """Move the issue back to its `ready` state so the next poll re-dispatches
     a fresh implement→local_review→push. The committed implement work survives,
     so the re-run is cheap. This is the automated equivalent of the manual
-    "move the card back to Todo" recovery."""
+    "move the card back to Todo" recovery.
+
+    Returns True if the issue was moved to `ready`. On any failure returns
+    False: the caller then leaves the run live so a later reconcile retries it,
+    rather than flipping it `interrupted` and stranding the issue in "Local
+    Code Review" with no live run and no working retry handler."""
     if not bindings:
         log.warning(
             "cannot re-dispatch orphaned local_review run=%s issue=%s: "
@@ -193,7 +211,7 @@ async def _redispatch_orphaned_local_review(
             run.id,
             run.issue_id,
         )
-        return
+        return False
 
     cur = await conn.execute(
         "SELECT tracker_issue_id, provider, site, team_key FROM issues WHERE id = ?",
@@ -207,7 +225,7 @@ async def _redispatch_orphaned_local_review(
             run.id,
             run.issue_id,
         )
-        return
+        return False
 
     provider = str(row["provider"] or "")
     site = str(row["site"] or "")
@@ -228,7 +246,7 @@ async def _redispatch_orphaned_local_review(
             ctx.provider,
             ctx.site,
         )
-        return
+        return False
 
     try:
         tracker = tracker_for_context(ctx)
@@ -238,7 +256,7 @@ async def _redispatch_orphaned_local_review(
             run.id,
             e,
         )
-        return
+        return False
 
     tracker_issue_id = str(row["tracker_issue_id"] or run.issue_id)
     ready_state = binding.linear_states.ready
@@ -254,7 +272,7 @@ async def _redispatch_orphaned_local_review(
                 ready_state,
                 team_key,
             )
-            return
+            return False
         await tracker.move_issue(tracker_issue_id, ready_id)
     except LinearError as e:
         log.warning(
@@ -262,12 +280,13 @@ async def _redispatch_orphaned_local_review(
             run.issue_id,
             e,
         )
-        return
+        return False
     log.info(
         "reconcile: re-dispatched orphaned local_review issue=%s to ready state %r",
         run.issue_id,
         ready_state,
     )
+    return True
 
 
 async def reconcile(
@@ -342,6 +361,16 @@ async def reconcile(
             run.id,
             run.issue_id,
         )
+        redispatched = await _redispatch_orphaned_local_review(
+            conn, tracker_for_context, bindings, run
+        )
+        if not redispatched:
+            # Re-dispatch failed (flaky move_issue, missing ready state, no
+            # binding). Leave the run live so a later reconcile retries on the
+            # still-live row — flipping it interrupted now would strand the
+            # issue in "Local Code Review" with no live run and no working
+            # retry handler.
+            continue
         await db.runs.update_status(
             conn,
             run.id,
@@ -350,9 +379,8 @@ async def reconcile(
             kind="orphaned",
             detail="Host restarted; pidless local review monitor orphaned",
         )
-        await _redispatch_orphaned_local_review(
-            conn, tracker_for_context, bindings, run
+        await _post_reconcile_comment(
+            conn, tracker_for_context, run.issue_id, _LOCAL_REVIEW_REDISPATCH_BODY
         )
-        await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
     return flipped

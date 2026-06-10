@@ -11,6 +11,7 @@ import pytest
 
 from symphony import db
 from symphony.config import LinearStates, RepoBinding
+from symphony.linear.client import LinearError
 from symphony.orchestrator.reconcile import reconcile
 from symphony.tracker import TrackerContext
 
@@ -444,9 +445,143 @@ async def test_reconcile_recovers_pidless_local_review_run(tmp_path: Path) -> No
         # so the next poll re-dispatches a fresh implement.
         linear.move_issue.assert_awaited_once_with("iss-local", "state-ready")
 
-        # Host-restart comment posted.
+        # Host-restart comment posted. It must NOT tell the operator to reply
+        # `$retry` — a local_review orphan has no retry handler, so re-dispatch
+        # is automatic and the comment says so.
         linear.post_comment.assert_awaited_once()
-        assert "Host restarted" in linear.post_comment.await_args.args[1]
+        body = linear.post_comment.await_args.args[1]
+        assert "Host restarted" in body
+        assert "$retry" not in body
+        assert "No action needed" in body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_local_review_live_when_move_fails(
+    tmp_path: Path,
+) -> None:
+    """If `move_issue` raises (flaky Linear call at startup), the run must stay
+    live — NOT flipped to `interrupted` — so a later reconcile retries it on
+    the still-live row. Flipping it now would strand the issue in "Local Code
+    Review" with no live run and no working `$retry` handler: exactly the bug
+    this PR exists to rescue would be re-introduced by a single flaky call."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-local-review",
+            issue_id="iss-local",
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            agent="codex",
+            branch_prefix="symphony",
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.team_states = AsyncMock(return_value={"Todo": "state-ready"})
+        linear.move_issue = AsyncMock(side_effect=LinearError("flaky move"))
+
+        flipped = await reconcile(conn, linear, bindings=[binding])
+        assert flipped == 0
+
+        # Run stays live so a later reconcile retries it.
+        rows = await db.runs.list_live_local_review_without_pid(conn)
+        assert [r.id for r in rows] == ["pidless-local-review"]
+        cur = await conn.execute(
+            "SELECT status, ended_at FROM runs WHERE id=?", ("pidless-local-review",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == "running"
+        assert row[1] is None
+
+        # No misleading comment posted, and no half-finished operator-wait.
+        linear.post_comment.assert_not_awaited()
+        assert await db.operator_waits.get(conn, "iss-local") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_recovers_vib198_implement_plus_local_review(
+    tmp_path: Path,
+) -> None:
+    """VIB-198 layout: a pidless `local_review` run coexists with its
+    pid-bearing `implement` run on the same issue. The pid sweep flips the
+    dead-pid implement run and comments; the local_review sweep re-dispatches
+    and comments — two "Host restarted" comments on the one issue, both runs
+    interrupted, the issue moved back to ready exactly once."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="implement",
+            issue_id="iss-local",
+            stage="implement",
+            status="running",
+            pid=999_999,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="local-review",
+            issue_id="iss-local",
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            agent="codex",
+            branch_prefix="symphony",
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.team_states = AsyncMock(return_value={"Todo": "state-ready"})
+        linear.move_issue = AsyncMock()
+
+        flipped = await reconcile(conn, linear, bindings=[binding])
+        assert flipped == 2
+
+        # Both runs flipped interrupted.
+        cur = await conn.execute(
+            "SELECT id, status FROM runs WHERE issue_id=? ORDER BY id", ("iss-local",)
+        )
+        statuses = {r["id"]: r["status"] for r in await cur.fetchall()}
+        assert statuses == {
+            "implement": db.runs.INTERRUPTED_STATUS,
+            "local-review": db.runs.INTERRUPTED_STATUS,
+        }
+
+        # The issue is moved back to ready once — by the local_review sweep.
+        linear.move_issue.assert_awaited_once_with("iss-local", "state-ready")
+
+        # Two host-restart comments land on the one issue (pid sweep + this one).
+        assert linear.post_comment.await_count == 2
+        for call in linear.post_comment.await_args_list:
+            assert call.args[0] == "iss-local"
+            assert "Host restarted" in call.args[1]
     finally:
         await conn.close()
 
