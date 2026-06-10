@@ -23,8 +23,12 @@ def advance_head(workspace_path: Path) -> None:
     git_dir = workspace_path / ".git"
     if not git_dir.exists():
         _git(workspace_path, "init", "-q")
-        _git(workspace_path, "config", "user.email", "test@example.com")
-        _git(workspace_path, "config", "user.name", "Test")
+    # Always pin a commit identity on the repo's own config. The workspace may
+    # have been initialised elsewhere (e.g. `_init_git_workspace`) which only
+    # sets identity via per-process env vars that don't persist here, so without
+    # this the commit below fails with exit 128 in CI (no global git identity).
+    _git(workspace_path, "config", "user.email", "test@example.com")
+    _git(workspace_path, "config", "user.name", "Test")
     marker = workspace_path / "implemented.txt"
     existing = marker.read_text() if marker.exists() else ""
     marker.write_text(existing + "x")
