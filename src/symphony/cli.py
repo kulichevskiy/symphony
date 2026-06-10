@@ -227,7 +227,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
         conn = await db.connect(cfg.db_path)
         try:
             orch = Orchestrator(cfg, trackers, conn)
-            await reconcile(conn, trackers)
+            await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access

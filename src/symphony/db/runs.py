@@ -604,6 +604,31 @@ async def list_live_review_without_pid(conn: aiosqlite.Connection) -> list[Run]:
     return [_row_to_run(r) for r in rows]
 
 
+async def list_live_local_review_without_pid(
+    conn: aiosqlite.Connection,
+) -> list[Run]:
+    """Live `local_review` runs with no PID.
+
+    Local review runs in-process (no subprocess pid) at stage `local_review`,
+    so it slips past both `list_live_with_pid` (needs a pid) and
+    `list_live_review_without_pid` (needs stage `review`). Startup reconcile
+    sweeps these separately to recover host-restart orphans."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+               termination_kind, termination_detail, exit_returncode
+        FROM runs
+        WHERE stage = 'local_review' AND status IN ({placeholders})
+              AND pid IS NULL
+        """,
+        LIVE_STATUSES,
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run(r) for r in rows]
+
+
 async def list_live_by_stage(
     conn: aiosqlite.Connection, *, stage: str
 ) -> list[Run]:
