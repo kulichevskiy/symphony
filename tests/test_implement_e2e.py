@@ -546,6 +546,146 @@ async def test_implement_blocked_classifier_fallback_for_mch14(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
+    tmp_path: Path,
+) -> None:
+    """blocked → IMPLEMENT_BLOCKED wait + verbatim handoff comment; survives a
+    daemon restart; `$retry` clears the wait and dispatches a FRESH implement
+    run in the same workspace whose prompt carries the handoff block and which
+    sees the prior run's uncommitted work."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.pr_create = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        reason = "authorize the Supabase MCP at https://example.com/oauth then $retry"
+
+        def _leave_uncommitted_work(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                (workspace_path / "wip.py").write_text("partial work\n")
+
+        blocked_runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "success",
+                            "result": f"Scaffolded the client.\n\nSYMPHONY_BLOCKED: {reason}",
+                        }
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_leave_uncommitted_work,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=blocked_runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+
+        # Blocked run parks the issue — no PR.
+        gh.pr_create.assert_not_awaited()
+
+        # A dedicated IMPLEMENT_BLOCKED wait was opened (not IMPLEMENT_FAILED).
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED
+
+        # The handoff comment reproduces the verbatim human-action ask + $retry.
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any(reason in body and "$retry" in body for body in posted), (
+            "expected a blocked handoff comment with the verbatim reason"
+        )
+
+        # Uncommitted work is left in the workspace.
+        assert (workspace_path / "wip.py").exists()
+
+        # --- Daemon restart: the wait is reloaded from SQLite. ---
+        retry_comment = LinearComment(
+            id="c-retry",
+            body="$retry token=sk-operator-123",
+            created_at="2026-05-10T01:00:00+00:00",
+            author_name="user",
+            author_is_me=False,
+            external_thread_type=None,
+        )
+        fresh_runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=5151),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+        restarted_linear = AsyncMock()
+        restarted_linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        restarted_linear.lookup_issue = AsyncMock(return_value=_issue())
+        restarted_linear.comments_since = AsyncMock(return_value=[retry_comment])
+        restarted_linear.move_issue = AsyncMock(return_value=None)
+        restarted_linear.post_comment = AsyncMock(return_value="cmt-2")
+        restarted = Orchestrator(
+            cfg,
+            restarted_linear,
+            conn,
+            runner=fresh_runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        restarted._states = {"ENG": _states()}  # noqa: SLF001
+
+        # `$retry` moves the issue back to Ready and clears the wait.
+        await restarted._poll_slash_commands()  # noqa: SLF001
+        restarted_linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        # The fresh implement run reuses the same workspace; the prior
+        # uncommitted work is still there.
+        assert (workspace_path / "wip.py").exists()
+
+        # Dispatch the fresh run; its prompt carries the handoff block.
+        await restarted._dispatch_one(cfg.repos[0], _issue())  # noqa: SLF001
+        assert fresh_runner.specs, "expected a fresh implement run to be dispatched"
+        fresh_prompt = fresh_runner.specs[-1].command[-1]
+        assert reason in fresh_prompt
+        assert "token=sk-operator-123" in fresh_prompt
+        assert "git status" in fresh_prompt
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

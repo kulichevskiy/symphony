@@ -23,6 +23,34 @@ def test_implement_prompt_includes_title_body_and_labels() -> None:
     assert "auth" in prompt
 
 
+def test_implement_prompt_handoff_block_carries_reason_comment_and_prior_work() -> None:
+    prompt = implement_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+        blocked_reason="authorize the Supabase MCP at https://example.com/oauth",
+        operator_comment="$retry token=sk-abc123",
+    )
+    # The original blocked reason is handed back to the fresh run verbatim.
+    assert "authorize the Supabase MCP at https://example.com/oauth" in prompt
+    # The operator's resume comment (tokens/instructions) reaches the prompt.
+    assert "$retry token=sk-abc123" in prompt
+    # The fresh run is told prior work exists and to start with git status.
+    assert "git status" in prompt
+    # Handoff context must precede the issue body so the agent sees it first.
+    assert prompt.index("authorize the Supabase MCP") < prompt.index("# Issue")
+
+
+def test_implement_prompt_without_handoff_has_no_handoff_block() -> None:
+    prompt = implement_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+    )
+    assert "git status" not in prompt
+    assert "Operator" not in prompt
+
+
 def test_implement_prompt_handles_empty_labels() -> None:
     prompt = implement_prompt(
         issue_title="Fix typo",

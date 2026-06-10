@@ -54,6 +54,15 @@ def test_parses_known_commands() -> None:
     ]
 
 
+def test_intent_captures_operator_comment_text() -> None:
+    # The operator's full comment text (tokens/instructions after the command)
+    # is captured so a blocked-resume handoff can pass it to the fresh run.
+    [intent] = parse([_c("$retry token=sk-abc123\nuse this to authorize")])
+    assert intent.kind is SlashKind.RETRY
+    assert "token=sk-abc123" in intent.text
+    assert "use this to authorize" in intent.text
+
+
 def test_skip_local_review_is_unknown_command() -> None:
     assert parse([_c("$skip-local-review", cid="a")]) == []
 
