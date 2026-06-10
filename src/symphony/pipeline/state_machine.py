@@ -44,7 +44,7 @@ MarkerKind = Literal["done", "blocked"]
 
 _DONE_MARKER_RE = re.compile(rf"(?m)^[ \t>*-]*{SYMPHONY_DONE_MARKER}\s*$")
 _BLOCKED_MARKER_RE = re.compile(
-    rf"{SYMPHONY_BLOCKED_PREFIX}\s*(?P<reason>.*)", re.DOTALL
+    rf"(?m)^[ \t>*-]*{SYMPHONY_BLOCKED_PREFIX}\s*(?P<reason>.*?)\s*$"
 )
 
 # Phrases an agent uses when it is stuck waiting on a human (the bug being

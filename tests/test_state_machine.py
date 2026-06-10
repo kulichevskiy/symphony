@@ -212,6 +212,30 @@ def test_parse_completion_marker_last_marker_wins() -> None:
     assert parse_completion_marker(text).kind == "done"
 
 
+def test_parse_completion_marker_blocked_last_wins_over_quoted_body() -> None:
+    # Regression: greedy DOTALL regex would match the first SYMPHONY_BLOCKED:
+    # occurrence and swallow everything including the operative one.
+    text = (
+        "...I will emit SYMPHONY_BLOCKED: <exactly what a human must do> if needed.\n\n"
+        "SYMPHONY_BLOCKED: authorize the OAuth URL at https://x"
+    )
+    marker = parse_completion_marker(text)
+    assert marker.kind == "blocked"
+    assert marker.blocked_reason == "authorize the OAuth URL at https://x"
+
+
+def test_parse_completion_marker_done_after_blocked_in_body() -> None:
+    # "Work committed. SYMPHONY_DONE — also note: SYMPHONY_BLOCKED: nothing really"
+    # The BLOCKED is on the same line AFTER the DONE text, but operative marker
+    # is the BLOCKED on its own line only if it appears after DONE's line.
+    # Here DONE is on its own line first, BLOCKED is quoted inline — DONE wins.
+    text = "Work committed.\n\nSYMPHONY_DONE\n\nalso note: SYMPHONY_BLOCKED: nothing really"
+    # BLOCKED is NOT on its own line (it's preceded by "also note: "), so only
+    # the anchored DONE matches → kind == "done".
+    marker = parse_completion_marker(text)
+    assert marker.kind == "done"
+
+
 # Path 1: SYMPHONY_DONE + HEAD advanced -> completed (today's happy path).
 def test_classify_done_marker_with_head_advance_completes() -> None:
     spy: list[str] = []
