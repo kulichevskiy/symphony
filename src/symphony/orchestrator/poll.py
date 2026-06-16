@@ -10396,8 +10396,11 @@ class Orchestrator:
 
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
+        publish_retry_without_resolved_base = (
+            previous_publish_failed and base_branch is None
+        )
         short_circuit = (
-            (branch_ahead or previous_publish_failed)
+            (branch_ahead or publish_retry_without_resolved_base)
             and not pending_handoff
             and not previous_requires_agent
         )
@@ -10414,14 +10417,30 @@ class Orchestrator:
             # workspace, and releasing first means a gate raising can't leak
             # the workspace into WorkspaceManager._in_use forever.
             release_workspace()
-            proceed, local_review_result = await self._run_prepush_gates(
-                binding=binding,
-                issue=issue,
-                storage_issue_id=issue_id,
-                run_id=run_id,
-                workspace_path=workspace_path,
-                allow_fixes=False,
-            )
+            try:
+                proceed, local_review_result = await self._run_prepush_gates(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                    allow_fixes=False,
+                )
+            except Exception as e:  # noqa: BLE001 — fail closed before publish
+                log.exception(
+                    "pre-push gate failed during publish resume for %s",
+                    issue.identifier,
+                )
+                await self._fail_run_and_reset_issue(
+                    run_id,
+                    f"pre-push gate failed during publish resume: {e}",
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    rollback_state_id=issue.state_id,
+                    binding=binding,
+                    exc=e,
+                )
+                return run_id
             if not proceed:
                 # A gate halted the run; state is already recorded.
                 return run_id

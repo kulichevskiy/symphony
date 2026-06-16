@@ -1590,8 +1590,8 @@ async def test_branch_ahead_short_circuit_releases_workspace_when_gate_raises(
     tmp_path: Path,
 ) -> None:
     """If a pre-push gate raises on the short-circuit path, the workspace is
-    still released (not leaked into WorkspaceManager._in_use forever) and
-    publish (push + ensure_pr) never runs."""
+    still released, the run is failed/parked, and publish (push + ensure_pr)
+    never runs."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _no_review_binding(auto_merge=False)
@@ -1636,15 +1636,24 @@ async def test_branch_ahead_short_circuit_releases_workspace_when_gate_raises(
             side_effect=RuntimeError("gate boom")
         )
 
-        with pytest.raises(RuntimeError, match="gate boom"):
-            await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
 
-        # The workspace was released *before* the gate ran, so the raise can't
-        # leak it; publish never ran.
+        # The workspace was released *before* the gate ran, so the raise could
+        # not leak it; the run failed closed before publish.
         workspace.release.assert_called_once()
         assert runner.specs == []
         push_fn.assert_not_awaited()
         gh.ensure_pr.assert_not_awaited()
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-na"),
+        ]
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].status == "failed"
+        assert "gate boom" in history[-1].termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
 
@@ -1862,6 +1871,63 @@ async def test_publish_failed_retry_resumes_publish_when_default_branch_unavaila
         history = await db.runs.history_for_issue(conn, "iss-1")
         completed = [r for r in history if r.stage == "implement" and r.status == "completed"]
         assert len(completed) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_publish_failed_retry_with_base_and_no_ahead_runs_agent_not_publish(
+    tmp_path: Path,
+) -> None:
+    """A prior publish_failed run is not enough to publish when a resolved
+    base proves the current branch has no commits to deliver."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        await _seed_publish_failed_implement_run(conn)
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock()
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=5151), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        assert [s.stage for s in runner.specs] == ["implement"]
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        impl = [r for r in history if r.stage == "implement"]
+        assert impl[-1].status == "failed"
+        assert "completion contract" in impl[-1].termination_detail
     finally:
         await conn.close()
 
