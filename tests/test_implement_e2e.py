@@ -26,7 +26,7 @@ from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import GitHubError
 from symphony.linear.client import LinearComment, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
-from symphony.orchestrator.poll import Orchestrator
+from symphony.orchestrator.poll import Orchestrator, _ImplementHandoff
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
 from ._workspace_helpers import advance_head
@@ -1401,12 +1401,11 @@ async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) ->
 
         workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
         workspace_path.mkdir(parents=True)
-        # HEAD is one commit ahead of `trunk` (the resolved base): the prior
-        # run already committed the agent's work.
+        # HEAD is one commit ahead of `trunk` (the resolved base): this can
+        # happen on a fresh dispatch when the branch already carries work.
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
-        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
@@ -1437,9 +1436,151 @@ async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) ->
         gh.ensure_pr.assert_awaited_once()
 
         history = await db.runs.history_for_issue(conn, "iss-1")
-        assert [r.stage for r in history] == ["implement", "implement"]
-        assert history[0].termination_kind == db.runs.PUBLISH_FAILED_KIND
+        assert [r.stage for r in history] == ["implement"]
         assert history[-1].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_setup_failure_releases_workspace_and_fails_run(
+    tmp_path: Path,
+) -> None:
+    """If setup after acquire fails before the branch decision, the workspace
+    is released and the implement run is marked failed instead of staying
+    live."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock()
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._resolve_base_branch = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=RuntimeError("base boom")
+        )
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        workspace.release.assert_called_once()
+        assert runner.specs == []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+        assert linear.move_issue.await_args_list == [
+            call("iss-1", "state-progress"),
+            call("iss-1", "state-na"),
+        ]
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status == "failed"
+        assert "base boom" in history[0].termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
+    tmp_path: Path,
+) -> None:
+    """A blocked-run `$retry` handoff is an explicit reason to run the agent
+    even when the branch is already ahead of base; the handoff must be included
+    in the prompt and consumed by that same orchestrator."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior blocked work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        def _commit_handoff_retry(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "handoff retry")
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(
+                    kind="stdout",
+                    line=_done_result_line("Resumed and finished.\n\nSYMPHONY_DONE"),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit_handoff_retry,
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._implement_handoffs["iss-1"] = _ImplementHandoff(  # noqa: SLF001
+            blocked_reason="authorize the deployment OAuth URL",
+            operator_comment="$retry token=available",
+        )
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        assert [s.stage for s in runner.specs] == ["implement"]
+        prompt = runner.specs[0].command[-1]
+        assert "authorize the deployment OAuth URL" in prompt
+        assert "$retry token=available" in prompt
+        assert "iss-1" not in orch._implement_handoffs  # noqa: SLF001
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
     finally:
         await conn.close()
 
@@ -1471,7 +1612,6 @@ async def test_branch_ahead_short_circuit_releases_workspace_when_gate_raises(
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
-        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
@@ -1535,7 +1675,6 @@ async def test_branch_ahead_short_circuit_halts_before_publish_when_gate_fails(
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
-        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)

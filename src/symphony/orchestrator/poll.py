@@ -10338,38 +10338,66 @@ class Orchestrator:
             )
             return run_id
 
+        workspace_released = False
+
+        def release_workspace() -> None:
+            nonlocal workspace_released
+            if not workspace_released:
+                self._workspace.release(binding, issue)
+                workspace_released = True
+
         # 3.5. Resolve the delivery base once; both the branch-already-ahead
         # short-circuit and ensure_pr use it.
-        base_branch = await self._resolve_base_branch(binding)
+        release_on_setup_failure = False
+        try:
+            base_branch = await self._resolve_base_branch(binding)
 
-        # Resume-at-publish short-circuit: only a previous implement run that
-        # reached the agent-free publish step and failed there is safe to
-        # resume without re-running the implementer. A failed agent run can
-        # also leave commits behind, but those are partial work and must go
-        # through the agent path again on $retry.
-        # The pre-push gates (local-review / verify / dirty-tree) still run
-        # against the reused workspace so the resume records the verify SHA,
-        # guards the dirty tree, and feeds publish a real local-review verdict
-        # — not the `None` its handoff would mis-read as "did not approve".
-        # A pending operator `$retry` handoff (`_implement_handoffs`) likewise
-        # forces the agent path so the handoff is consumed (poll.py:_run_agent)
-        # instead of silently dropped.
+            # Branch-already-ahead short-circuit: when HEAD already contains
+            # commits over the delivery base, skip the implementer and its
+            # completion gate and go straight to the agent-free publish path.
+            # The pre-push gates (local-review / verify / dirty-tree) still
+            # run against the reused workspace so the resume records the
+            # verify SHA, guards the dirty tree, and feeds publish a real
+            # local-review verdict — not the `None` its handoff would mis-read
+            # as "did not approve". A pending operator `$retry` handoff
+            # (`_implement_handoffs`) likewise forces the agent path so the
+            # handoff is consumed (poll.py:_run_agent) instead of silently
+            # dropped. Previous non-publish implement failures are unsafe to
+            # publish blindly because the agent may have left partial commits.
+            pending_handoff = self._implement_handoffs.get(issue_id) is not None
+            previous_requires_agent = await self._previous_implement_requires_agent(
+                issue_id=issue_id,
+                current_run_id=run_id,
+            )
+            branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
+        except Exception as e:  # noqa: BLE001 — surface as failed run
+            release_on_setup_failure = True
+            log.exception("implement dispatch setup failed for %s", issue.identifier)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"implement dispatch setup failed: {e}",
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+                exc=e,
+            )
+            return run_id
+        finally:
+            if release_on_setup_failure:
+                release_workspace()
+
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
-        pending_handoff = self._implement_handoffs.get(issue_id) is not None
-        safe_to_resume_at_publish = await self._previous_implement_reached_publish(
-            issue_id=issue_id,
-            current_run_id=run_id,
-        )
         short_circuit = (
-            not pending_handoff
-            and safe_to_resume_at_publish
-            and await _branch_ahead_of_base(workspace_path, base_branch)
+            branch_ahead
+            and not pending_handoff
+            and not previous_requires_agent
         )
         if short_circuit:
             log.info(
                 "branch for %s already ahead of %s; skipping agent, "
-                "resuming at publish",
+                "proceeding to publish",
                 issue.identifier,
                 base_branch,
             )
@@ -10378,7 +10406,7 @@ class Orchestrator:
             # poll.py:_run_implement_phase): the gates operate on the released
             # workspace, and releasing first means a gate raising can't leak
             # the workspace into WorkspaceManager._in_use forever.
-            self._workspace.release(binding, issue)
+            release_workspace()
             proceed, local_review_result = await self._run_prepush_gates(
                 binding=binding,
                 issue=issue,
@@ -10414,10 +10442,10 @@ class Orchestrator:
             local_review_result=local_review_result,
         )
 
-    async def _previous_implement_reached_publish(
+    async def _previous_implement_requires_agent(
         self, *, issue_id: str, current_run_id: str
     ) -> bool:
-        """Return True when the prior implement run failed in publish."""
+        """Return True when the prior implement terminal needs the agent path."""
 
         history = await db.runs.history_for_issue(self._conn, issue_id)
         previous = next(
@@ -10428,10 +10456,11 @@ class Orchestrator:
             ),
             None,
         )
+        if previous is None:
+            return False
         return (
-            previous is not None
-            and previous.status == db.runs.FAILED_STATUS
-            and previous.termination_kind == db.runs.PUBLISH_FAILED_KIND
+            previous.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
+            and previous.termination_kind != db.runs.PUBLISH_FAILED_KIND
         )
 
     async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:
