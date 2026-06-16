@@ -126,6 +126,12 @@ class _AdoptableOrphanPr:
 
 
 @dataclass(frozen=True)
+class _PostCommitReviewRequest:
+    github_repo: str
+    pr_number: int
+
+
+@dataclass(frozen=True)
 class _ReconcileIssueResult:
     observations: int
     actions_taken: int
@@ -173,6 +179,12 @@ def reconcile_auto_clear_enabled(env: Mapping[str, str] | None = None) -> bool:
     if value is None:
         return False
     return value.strip().casefold() in {"0", "false", "no", "off"}
+
+
+def _parse_rfc3339(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
 def classify_linear_drift(
@@ -352,6 +364,7 @@ class Reconciler:
         observed_at = self._now().isoformat()
         done_state_names = self._done_state_names(matched_bindings)
         tracker_ctx = self._tracker_context_from_issue_row(issue_row, matched_bindings)
+        post_commit_review_request: _PostCommitReviewRequest | None = None
         try:
             tracker_issue_id = str(issue_row["tracker_issue_id"] or issue_id)
             linear_issue, linear_payload = await self._tracker_payload(
@@ -468,7 +481,7 @@ class Reconciler:
                     github_prs=drift_prs,
                 )
             elif github_action == ACTION_ADOPTED:
-                await self._adopt_orphan_prs(
+                post_commit_review_request = await self._adopt_orphan_prs(
                     issue_id=issue_id,
                     tracker_issue_id=tracker_issue_id,
                     tracker_ctx=tracker_ctx,
@@ -481,6 +494,21 @@ class Reconciler:
         except Exception:
             await self._conn.rollback()
             raise
+
+        if post_commit_review_request is not None:
+            try:
+                await self._gh.pr_comment(
+                    post_commit_review_request.pr_number,
+                    "@codex review",
+                    repo=post_commit_review_request.github_repo,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not post @codex review on %s#%d: %s",
+                    post_commit_review_request.github_repo,
+                    post_commit_review_request.pr_number,
+                    e,
+                )
 
         return _ReconcileIssueResult(
             observations=2,
@@ -781,16 +809,21 @@ class Reconciler:
         wait: db.operator_waits.OperatorWait | None,
         orphans: list[_AdoptableOrphanPr],
         observed_at: str,
-    ) -> None:
+    ) -> _PostCommitReviewRequest | None:
         """Adopt a discovered orphan PR: record it and route to review/merge.
 
         Mirrors the durable writes of the normal implement-success path
-        (`issue_prs` row + `review_state`, plus a live ``review`` run when the
+        (`issue_prs` row + `review_state`, plus a ``review`` run when the
         binding configures review) and moves the parked Linear issue out of
         ``blocked`` into the active lane the relevant poller expects, then
         clears the operator wait. Without that move the review/merge pollers
         reject the issue (both treat ``Blocked`` as inactive) and the adopted
         run is closed instead of advancing.
+
+        Local-only review requires durable evidence that a completed
+        ``local_review`` run covers this PR cycle. If that evidence is absent,
+        adopt the PR record but park the review row and issue in the manual
+        approval lane instead of creating a merge candidate.
 
         Only one orphan is adopted per tick: ``review_state`` is keyed per
         issue (``ON CONFLICT(issue_id)``) so multiple orphans would clobber the
@@ -799,9 +832,17 @@ class Reconciler:
         orphan = orphans[0]
         binding = orphan.binding
         obs = orphan.observation
+        local_review_configured = binding.resolved_local_review()
+        remote_review_configured = binding.resolved_remote_review()
         review_configured = (
-            binding.resolved_local_review() or binding.resolved_remote_review()
+            local_review_configured or remote_review_configured
         )
+        local_only_review_ready = True
+        if local_review_configured and not remote_review_configured:
+            local_only_review_ready = await self._local_review_completed_for_adoption(
+                issue_id=issue_id,
+                pr_created_at=observed_at,
+            )
         await db.issue_prs.upsert(
             self._conn,
             issue_id=issue_id,
@@ -823,21 +864,26 @@ class Reconciler:
             commit=False,
         )
         if review_configured:
+            review_run_status = "running"
+            if local_review_configured and not remote_review_configured:
+                if not local_only_review_ready:
+                    review_run_status = db.runs.NEEDS_APPROVAL_STATUS
             await db.runs.create(
                 self._conn,
                 id=str(uuid.uuid4()),
                 issue_id=issue_id,
                 stage="review",
-                status="running",
+                status=review_run_status,
                 pid=None,
                 started_at=observed_at,
                 commit=False,
             )
-            target_state = (
-                binding.linear_states.code_review
-                if binding.resolved_remote_review()
-                else binding.linear_states.local_code_review
-            )
+            if remote_review_configured:
+                target_state = binding.linear_states.code_review
+            elif local_only_review_ready:
+                target_state = binding.linear_states.local_code_review
+            else:
+                target_state = binding.linear_states.needs_approval
         else:
             # No review configured: the success path routes straight to merge
             # with review_bypassed=True and starts no review stage. Land the
@@ -850,20 +896,6 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
-        if binding.resolved_remote_review():
-            try:
-                await self._gh.pr_comment(
-                    obs.pr_number,
-                    "@codex review",
-                    repo=obs.github_repo,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not post @codex review on %s#%d: %s",
-                    obs.github_repo,
-                    obs.pr_number,
-                    e,
-                )
         if wait is not None:
             await db.operator_waits.delete(
                 self._conn,
@@ -871,6 +903,49 @@ class Reconciler:
                 wait.run_id,
                 commit=False,
             )
+        if remote_review_configured:
+            return _PostCommitReviewRequest(
+                github_repo=obs.github_repo,
+                pr_number=obs.pr_number,
+            )
+        return None
+
+    async def _local_review_completed_for_adoption(
+        self,
+        *,
+        issue_id: str,
+        pr_created_at: str,
+    ) -> bool:
+        latest_implement = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="implement",
+        )
+        if latest_implement is None or _parse_rfc3339(
+            latest_implement.started_at
+        ) > _parse_rfc3339(pr_created_at):
+            return False
+        latest_local_review = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="local_review",
+            started_at_gte=latest_implement.started_at,
+        )
+        if (
+            latest_local_review is None
+            or latest_local_review.status != "completed"
+        ):
+            return False
+        latest_fix = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="review_fix",
+        )
+        if latest_fix is not None and _parse_rfc3339(
+            latest_fix.started_at
+        ) > _parse_rfc3339(latest_local_review.started_at):
+            return False
+        return True
 
     async def _move_issue_to_state(
         self,
