@@ -10342,22 +10342,28 @@ class Orchestrator:
         # short-circuit and ensure_pr use it.
         base_branch = await self._resolve_base_branch(binding)
 
-        # Resume-at-publish short-circuit: a branch already ahead of base has
-        # committed work to deliver, so skip the agent and the completion gate
-        # and resume at the agent-free publish step. The completion gate can
-        # never fire on a delivery retry. The pre-push gates (local-review /
-        # verify / dirty-tree) still run against the reused workspace so the
-        # resume records the verify SHA, guards the dirty tree, and feeds
-        # publish a real local-review verdict — not the `None` its handoff
-        # would mis-read as "did not approve".
+        # Resume-at-publish short-circuit: only a previous implement run that
+        # reached the agent-free publish step and failed there is safe to
+        # resume without re-running the implementer. A failed agent run can
+        # also leave commits behind, but those are partial work and must go
+        # through the agent path again on $retry.
+        # The pre-push gates (local-review / verify / dirty-tree) still run
+        # against the reused workspace so the resume records the verify SHA,
+        # guards the dirty tree, and feeds publish a real local-review verdict
+        # — not the `None` its handoff would mis-read as "did not approve".
         # A pending operator `$retry` handoff (`_implement_handoffs`) likewise
         # forces the agent path so the handoff is consumed (poll.py:_run_agent)
         # instead of silently dropped.
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
         pending_handoff = self._implement_handoffs.get(issue_id) is not None
+        safe_to_resume_at_publish = await self._previous_implement_reached_publish(
+            issue_id=issue_id,
+            current_run_id=run_id,
+        )
         short_circuit = (
             not pending_handoff
+            and safe_to_resume_at_publish
             and await _branch_ahead_of_base(workspace_path, base_branch)
         )
         if short_circuit:
@@ -10406,6 +10412,26 @@ class Orchestrator:
             base_branch=base_branch,
             cumulative_usage=cumulative_usage,
             local_review_result=local_review_result,
+        )
+
+    async def _previous_implement_reached_publish(
+        self, *, issue_id: str, current_run_id: str
+    ) -> bool:
+        """Return True when the prior implement run failed in publish."""
+
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        previous = next(
+            (
+                run
+                for run in reversed(history)
+                if run.stage == "implement" and run.id != current_run_id
+            ),
+            None,
+        )
+        return (
+            previous is not None
+            and previous.status == db.runs.FAILED_STATUS
+            and previous.termination_kind == db.runs.PUBLISH_FAILED_KIND
         )
 
     async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:

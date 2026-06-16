@@ -791,6 +791,131 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_retry_after_agent_failure_with_commits_runs_agent_before_publish(
+    tmp_path: Path,
+) -> None:
+    """A failed agent run can leave commits; `$retry` must still re-run the
+    implementer instead of treating branch-ahead as safe to publish."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        def _commit_then_fail(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                (workspace_path / "partial.py").write_text("print('partial')\n")
+                _git(workspace_path, "add", "-A")
+                _git(workspace_path, "commit", "-m", "partial agent work")
+
+        first_runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="stderr", line="boom"),
+                RunnerEvent(kind="exit", returncode=2),
+            ],
+            on_run=_commit_then_fail,
+        )
+        first_linear = AsyncMock()
+        first_linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        first_linear.lookup_issue = AsyncMock(return_value=_issue())
+        first_linear.post_comment = AsyncMock(return_value="cmt-1")
+        first_linear.move_issue = AsyncMock()
+        first_push = AsyncMock()
+        first_orch = Orchestrator(
+            cfg,
+            first_linear,
+            conn,
+            runner=first_runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=first_push,
+        )
+        first_orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(first_orch, binding)
+
+        assert [s.stage for s in first_runner.specs] == ["implement"]
+        first_push.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        failed_run = history[0]
+        assert failed_run.status == "failed"
+        assert failed_run.termination_kind == "agent_nonzero_exit"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+
+        await first_orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            "iss-1",
+            failed_run.id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+                text="$retry",
+            ),
+        )
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        def _commit_retry(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "retry work")
+
+        retry_runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=5151),
+                RunnerEvent(
+                    kind="stdout",
+                    line=_done_result_line("Retry implemented.\n\nSYMPHONY_DONE"),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit_retry,
+        )
+        retry_linear = AsyncMock()
+        retry_linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        retry_linear.lookup_issue = AsyncMock(return_value=_issue())
+        retry_linear.post_comment = AsyncMock(return_value="cmt-2")
+        retry_linear.move_issue = AsyncMock()
+        retry_push = AsyncMock()
+        retry_orch = Orchestrator(
+            cfg,
+            retry_linear,
+            conn,
+            runner=retry_runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=retry_push,
+        )
+        retry_orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(retry_orch, binding)
+
+        assert [s.stage for s in retry_runner.specs] == ["implement"]
+        retry_push.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_implement_dispatch_marks_failed_on_runner_exception(
     tmp_path: Path,
 ) -> None:
@@ -1223,6 +1348,36 @@ def _done_result_line(message: str) -> str:
     return json.dumps({"type": "result", "subtype": "success", "result": message})
 
 
+async def _seed_publish_failed_implement_run(
+    conn, *, run_id: str = "publish-failed-run"
+) -> None:
+    issue = _issue()
+    await db.issues.upsert(
+        conn,
+        id=issue.id,
+        identifier=issue.identifier,
+        title=issue.title,
+        team_key=issue.team_key,
+    )
+    await db.runs.create(
+        conn,
+        id=run_id,
+        issue_id=issue.id,
+        stage="implement",
+        status="running",
+        pid=None,
+        started_at="2026-05-10T00:00:00+00:00",
+    )
+    await db.runs.update_status(
+        conn,
+        run_id,
+        "failed",
+        ended_at="2026-05-10T00:01:00+00:00",
+        kind=db.runs.PUBLISH_FAILED_KIND,
+        detail="push failed: boom",
+    )
+
+
 @pytest.mark.asyncio
 async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) -> None:
     """An implement (re)dispatch on a branch already ahead of base skips the
@@ -1251,6 +1406,7 @@ async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) ->
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
@@ -1281,8 +1437,9 @@ async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) ->
         gh.ensure_pr.assert_awaited_once()
 
         history = await db.runs.history_for_issue(conn, "iss-1")
-        assert [r.stage for r in history] == ["implement"]
-        assert history[0].status == "completed"
+        assert [r.stage for r in history] == ["implement", "implement"]
+        assert history[0].termination_kind == db.runs.PUBLISH_FAILED_KIND
+        assert history[-1].status == "completed"
     finally:
         await conn.close()
 
@@ -1314,6 +1471,7 @@ async def test_branch_ahead_short_circuit_releases_workspace_when_gate_raises(
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
@@ -1377,6 +1535,7 @@ async def test_branch_ahead_short_circuit_halts_before_publish_when_gate_fails(
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
@@ -1561,6 +1720,7 @@ async def test_branch_ahead_short_circuit_reruns_local_review_not_parked(
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
@@ -1603,7 +1763,7 @@ async def test_branch_ahead_short_circuit_reruns_local_review_not_parked(
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         impl = [r for r in history if r.stage == "implement"]
-        assert impl and impl[0].status == "completed"
+        assert impl and impl[-1].status == "completed"
         # The review stage was started and NOT failed as "did not approve".
         review = [r for r in history if r.stage == "review"]
         assert review, "an approved local-only PR should start the review stage"
@@ -1649,6 +1809,7 @@ async def test_branch_ahead_short_circuit_records_verify_pass(
         _init_git_workspace(workspace_path)
         _git(workspace_path, "branch", "trunk")
         _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        await _seed_publish_failed_implement_run(conn)
         head = _head_sha(workspace_path)
 
         workspace = MagicMock()
