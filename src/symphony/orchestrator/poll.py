@@ -12196,16 +12196,6 @@ class Orchestrator:
                 pr_url,
                 issue.identifier,
             )
-        else:
-            await db.issue_prs.upsert(
-                self._conn,
-                issue_id=storage_issue_id,
-                github_repo=binding.github_repo,
-                binding_key=_binding_storage_key(binding),
-                pr_number=pr_number,
-                pr_url=pr_url,
-                created_at=datetime.now(UTC).isoformat(),
-            )
 
         review_run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC).isoformat()
@@ -12228,6 +12218,10 @@ class Orchestrator:
                 self._conn, issue_id=storage_issue_id, stage="review"
             )
             if existing is not None:
+                if post_codex_review and binding.resolved_remote_review():
+                    await self._move_issue_to_review_state(
+                        binding=binding, issue=issue
+                    )
                 return existing
             # Guard tripped on a live run in another stage but no review run
             # exists to adopt: force-create so the returned Run is persisted.
@@ -12241,6 +12235,16 @@ class Orchestrator:
                 started_at=started_at,
             )
             created_review_run = True
+        if created_review_run and pr_number is not None:
+            await db.issue_prs.upsert(
+                self._conn,
+                issue_id=storage_issue_id,
+                github_repo=binding.github_repo,
+                binding_key=_binding_storage_key(binding),
+                pr_number=pr_number,
+                pr_url=pr_url,
+                created_at=started_at,
+            )
         if created_review_run and pr_number is not None and post_codex_review:
             try:
                 await self._gh.pr_comment(
@@ -13286,7 +13290,11 @@ class Orchestrator:
         # Clear the wait first so a re-failure parks a fresh wait cleanly.
         self._pending_deliveries.pop(run_id, None)
         await self._clear_operator_wait(issue_id, run_id)
-        await self._deliver_implement_run(ctx=ctx)
+        try:
+            await self._deliver_implement_run(ctx=ctx)
+        finally:
+            if ctx.reconstructed:
+                self._workspace.release(ctx.binding, ctx.issue)
 
     async def _resolve_pending_delivery(
         self,

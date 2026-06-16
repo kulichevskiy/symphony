@@ -419,6 +419,8 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
         )
 
         gh.ensure_pr.assert_awaited_once()
+        assert workspace.acquire.await_count == 2
+        assert workspace.release.call_count == 2
         assert len([s for s in runner.captured if s.stage == "implement"]) == 1
         codex_calls = [
             c
@@ -446,9 +448,10 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
 ) -> None:
     """If handoff fails after the Review run starts, `$retry` adopts it.
 
-    The resumed delivery must not repost `@codex review` or move the issue to
-    Review again, and a successful resume must repair the Implement run status
-    that `deliver_failed` parking had flipped to failed.
+    The resumed delivery must not repost `@codex review`, but it must reassert
+    the Linear Review lane because `deliver_failed` parking moved the issue to
+    Needs Approval. A successful resume must repair the Implement run status
+    and preserve the PR row's original review-cycle timestamp.
     """
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -543,6 +546,9 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         assert implement.status == "failed"
         assert len(review_rows) == 1
         assert review_rows[0].status == "running"
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
+        assert issue_pr is not None
+        original_pr_created_at = issue_pr.created_at
 
         await orch._handle_slash_intent(  # noqa: SLF001
             "iss-1",
@@ -562,12 +568,19 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         ]
         assert len(codex_calls) == 1
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
-        assert move_targets.count("state-review") == 1
+        assert move_targets.count("state-review") == 2
+        assert move_targets[-1] == "state-review"
         assert gh.ensure_pr.await_count == 2
         assert push_fn.await_count == 2
         assert orch._post_local_review_pr_summary.await_count == 2  # type: ignore[attr-defined]  # noqa: SLF001
         assert [s.stage for s in runner.captured].count("implement") == 1
         assert await db.operator_waits.get(conn, "iss-1") is None
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
+        assert issue_pr is not None
+        assert issue_pr.created_at == original_pr_created_at
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 42
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         implement = next(run for run in history if run.stage == "implement")
