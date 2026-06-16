@@ -968,7 +968,10 @@ class Reconciler:
         other tracker calls.
         """
         if not state_name:
-            return
+            raise LinearError(
+                f"missing Linear state {state_name!r} for {tracker_issue_id} "
+                "during adoption"
+            )
         tracker = self.tracker(tracker_ctx)
         try:
             states = await tracker.team_states(team_key)

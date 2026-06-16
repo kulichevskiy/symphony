@@ -142,6 +142,7 @@ def _binding(
     auto_merge: bool = True,
     local_review: bool = False,
     remote_review: bool = True,
+    code_review_state: str = "Needs Approval",
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
@@ -151,7 +152,7 @@ def _binding(
         auto_merge=auto_merge,
         local_review=local_review,
         remote_review=remote_review,
-        linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done=done_state),
+        linear_states=LinearStates(ready="Todo", code_review=code_review_state, done=done_state),
     )
 
 
@@ -1788,6 +1789,47 @@ async def test_orphan_adoption_move_failure_rolls_back_and_re_probes(
     assert pr is not None
     assert pr.pr_number == 326
     assert linear.moves == [("iss-1", "state-needs-approval")]
+
+
+@pytest.mark.asyncio
+async def test_remote_orphan_adoption_empty_code_review_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding(remote_review=True, code_review_state="")]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 0
+
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
+        assert (await db.review_state.get(conn, "iss-1")).pr_number is None
+        assert await _observation_rows(conn) == []
+    finally:
+        await conn.close()
+
+    assert fake_gh.head_calls == [("symphony/eng-1", "org/repo")]
+    assert linear.moves == []
+    assert fake_gh.comments == []
 
 
 @pytest.mark.asyncio
