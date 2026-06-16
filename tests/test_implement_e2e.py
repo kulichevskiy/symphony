@@ -801,6 +801,109 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
         await conn.close()
 
 
+@pytest.mark.parametrize("base_branch", [None, "trunk"])
+@pytest.mark.asyncio
+async def test_reconstructed_deliver_retry_reparks_when_branch_work_unproven(
+    tmp_path: Path,
+    base_branch: str | None,
+) -> None:
+    """A restart-reconstructed delivery retry must prove the branch has work."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        run_id = "implement-run"
+
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id=run_id,
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id=run_id,
+            kind=db.operator_waits.KIND_DELIVER_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at="2026-05-10T00:01:00+00:00",
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        if base_branch is None:
+            gh.repo_default_branch = AsyncMock(
+                side_effect=GitHubError("default branch unavailable")
+            )
+        else:
+            gh.repo_default_branch = AsyncMock(return_value=base_branch)
+        gh.ensure_pr = AsyncMock()
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        for i in range(2):
+            await orch._handle_slash_intent(  # noqa: SLF001
+                "iss-1",
+                run_id,
+                SlashIntent(
+                    kind=SlashKind.RETRY,
+                    comment_id=f"c-retry-{i}",
+                    created_at=f"2026-05-10T00:0{i + 2}:00+00:00",
+                ),
+            )
+            wait = await db.operator_waits.get(conn, "iss-1")
+            assert wait is not None
+            assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+        assert workspace.acquire.await_count == 2
+        assert workspace.release.call_count == 2
+        assert run_id not in orch._pending_deliveries  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")

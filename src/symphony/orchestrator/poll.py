@@ -4299,6 +4299,49 @@ class Orchestrator:
             issue.identifier,
         )
 
+    async def _terminate_deliver_failed_review_monitors(
+        self, issue_id: str, *, detail: str
+    ) -> None:
+        """Retire Review monitors created by a delivery handoff that got rejected."""
+        live_review_runs = [
+            run
+            for run in await db.runs.list_live_by_stage(self._conn, stage="review")
+            if run.issue_id == issue_id
+        ]
+        if not live_review_runs:
+            return
+
+        now = datetime.now(UTC).isoformat()
+        closed_run_ids: set[str] = set()
+        for run in live_review_runs:
+            await db.runs.update_status(
+                self._conn,
+                run.id,
+                "interrupted",
+                ended_at=now,
+                kind="cancelled",
+                detail=detail,
+            )
+            closed_run_ids.add(run.id)
+            self._clear_review_no_signal_rearm_heads(run.id)
+            task = self._review_poll_run_tasks.pop(run.id, None)
+            if task is not None:
+                self._review_poll_tasks.discard(task)
+                if not task.done():
+                    task.cancel()
+            self._review_poll_run_ids.discard(run.id)
+            await self._clear_review_rearm_retry(run.id)
+
+        for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
+            if mapped_issue_id == issue_id or mapped_run_id in closed_run_ids:
+                self._review_poll_issue_ids.pop(mapped_issue_id, None)
+
+        log.info(
+            "interrupted review monitor(s) %s for issue_id=%s after deliver_failed halt",
+            ", ".join(sorted(closed_run_ids)),
+            issue_id,
+        )
+
     async def _maybe_rearm_codex_review_for_no_signal(
         self,
         *,
@@ -10678,8 +10721,25 @@ class Orchestrator:
         # TTL, `acquire()` may have re-cloned an empty branch from origin (the
         # publish step is the very one that failed). Refuse to push / open an
         # empty no-op PR with the work silently lost; re-park instead.
-        if ctx.reconstructed and base_branch is not None:
+        if ctx.reconstructed:
+            if base_branch is None:
+                msg = (
+                    f"could not resolve base branch for reconstructed $retry of "
+                    f"{branch}; refusing to deliver without proving branch work"
+                )
+                log.warning("%s for %s", msg, issue.identifier)
+                await self._park_deliver_failed(msg, ctx=ctx)
+                return run_id
             ahead = await _workspace_commits_ahead(workspace_path, base_branch)
+            if ahead is None:
+                msg = (
+                    f"could not compare reconstructed $retry branch {branch} "
+                    f"against {base_branch}; refusing to deliver without "
+                    "proving branch work"
+                )
+                log.warning("%s for %s", msg, issue.identifier)
+                await self._park_deliver_failed(msg, ctx=ctx)
+                return run_id
             if ahead == 0:
                 msg = (
                     f"workspace swept before $retry: branch {branch} carries no "
@@ -13180,7 +13240,10 @@ class Orchestrator:
                         issue.identifier,
                         e,
                     )
-        self._pending_deliveries[run_id] = ctx
+        if ctx.reconstructed:
+            self._pending_deliveries.pop(run_id, None)
+        else:
+            self._pending_deliveries[run_id] = ctx
         # Persist the real local-review verdict so a `$retry` after a daemon
         # restart (which drops the in-memory stash) rebuilds the human-approval
         # gate faithfully instead of assuming APPROVED. A needs-approval verdict
@@ -13294,6 +13357,10 @@ class Orchestrator:
                     slash_text=self._slash_text(intent),
                     reason=f"could not move issue to blocked state: {e}",
                 ) from e
+            await self._terminate_deliver_failed_review_monitors(
+                issue_id,
+                detail=f"${intent.kind} halted deliver_failed delivery wait",
+            )
             self._pending_deliveries.pop(run_id, None)
             await self._clear_operator_wait(issue_id, run_id)
             return

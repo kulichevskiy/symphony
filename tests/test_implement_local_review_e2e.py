@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
@@ -141,6 +142,24 @@ def _states() -> dict[str, str]:
         "Blocked": "state-bl",
         "Done": "state-done",
     }
+
+
+def _init_git_workspace_with_base(workspace_path: Path) -> None:
+    advance_head(workspace_path)
+    subprocess.run(
+        ["git", "branch", "trunk"],
+        cwd=workspace_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "symphony/eng-1"],
+        cwd=workspace_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 async def _scan_and_wait(orch: Orchestrator, binding: RepoBinding) -> None:
@@ -339,6 +358,7 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
 
         workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
         workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
         workspace.release = MagicMock()
@@ -604,6 +624,103 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         assert len(review_rows) == 1
         assert review_rows[0].status == "running"
     finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_deliver_failed_reject_interrupts_live_review_monitor(
+    tmp_path: Path,
+) -> None:
+    """Rejecting a failed delivery handoff must not leave Review running."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    review_task: asyncio.Task[bool] | None = None
+    try:
+        binding = _hybrid_binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        run_id = "implement-run"
+        review_run_id = "review-run"
+
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id=run_id,
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id=review_run_id,
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id=run_id,
+            kind=db.operator_waits.KIND_DELIVER_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at="2026-05-10T00:02:00+00:00",
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        review_task = asyncio.create_task(asyncio.Event().wait())
+        orch._review_poll_run_ids.add(review_run_id)  # noqa: SLF001
+        orch._review_poll_issue_ids["iss-1"] = review_run_id  # noqa: SLF001
+        orch._review_poll_run_tasks[review_run_id] = review_task  # noqa: SLF001
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.REJECT,
+                comment_id="c-reject",
+                created_at="2026-05-10T00:03:00+00:00",
+            ),
+        )
+        await asyncio.gather(review_task, return_exceptions=True)
+
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert review_run_id not in orch._review_poll_run_ids  # noqa: SLF001
+        assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
+        assert review_run_id not in orch._review_poll_run_tasks  # noqa: SLF001
+        assert review_task.cancelled()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_rows = [run for run in history if run.stage == "review"]
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "interrupted"
+        assert review_rows[0].termination_kind == "cancelled"
+    finally:
+        if review_task is not None and not review_task.done():
+            review_task.cancel()
+            await asyncio.gather(review_task, return_exceptions=True)
         await conn.close()
 
 
@@ -1548,6 +1665,7 @@ async def test_local_review_deliver_failed_resumes_after_restart(
 
         workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
         workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
         workspace.release = MagicMock()
