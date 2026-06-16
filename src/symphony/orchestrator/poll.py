@@ -10365,9 +10365,16 @@ class Orchestrator:
             # dropped. Previous non-publish implement failures are unsafe to
             # publish blindly because the agent may have left partial commits.
             pending_handoff = self._implement_handoffs.get(issue_id) is not None
-            previous_requires_agent = await self._previous_implement_requires_agent(
+            previous_terminal_kind = await self._previous_implement_terminal_kind(
                 issue_id=issue_id,
                 current_run_id=run_id,
+            )
+            previous_publish_failed = (
+                previous_terminal_kind == db.runs.PUBLISH_FAILED_KIND
+            )
+            previous_requires_agent = (
+                previous_terminal_kind is not None
+                and previous_terminal_kind != db.runs.PUBLISH_FAILED_KIND
             )
             branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
         except Exception as e:  # noqa: BLE001 — surface as failed run
@@ -10390,7 +10397,7 @@ class Orchestrator:
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
         short_circuit = (
-            branch_ahead
+            (branch_ahead or previous_publish_failed)
             and not pending_handoff
             and not previous_requires_agent
         )
@@ -10413,6 +10420,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 run_id=run_id,
                 workspace_path=workspace_path,
+                allow_fixes=False,
             )
             if not proceed:
                 # A gate halted the run; state is already recorded.
@@ -10442,10 +10450,10 @@ class Orchestrator:
             local_review_result=local_review_result,
         )
 
-    async def _previous_implement_requires_agent(
+    async def _previous_implement_terminal_kind(
         self, *, issue_id: str, current_run_id: str
-    ) -> bool:
-        """Return True when the prior implement terminal needs the agent path."""
+    ) -> str | None:
+        """Return the prior failed implement terminal kind, if any."""
 
         history = await db.runs.history_for_issue(self._conn, issue_id)
         previous = next(
@@ -10457,11 +10465,10 @@ class Orchestrator:
             None,
         )
         if previous is None:
-            return False
-        return (
-            previous.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
-            and previous.termination_kind != db.runs.PUBLISH_FAILED_KIND
-        )
+            return None
+        if previous.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+            return None
+        return previous.termination_kind
 
     async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:
         """The PR base: the binding's configured base, else the repo default.
@@ -10632,18 +10639,16 @@ class Orchestrator:
         storage_issue_id: str,
         run_id: str,
         workspace_path: Path,
+        allow_fixes: bool = True,
     ) -> tuple[bool, LoopResult | None]:
         """Pre-push validation gates: local-review, verify, dirty-tree.
 
         Runs after the agent step — or, on the branch-already-ahead
         short-circuit, in place of it — and before the agent-free publish
         stage, so what gets pushed is what was reviewed and verified. The
-        branch-ahead short-circuit reuses an existing workspace, so these
-        gates must re-run there too: otherwise a fresh dispatch on an
-        already-ahead branch would push without recording the verify SHA
-        (mis-routing the merge gate to operator approval), discard dirty
-        uncommitted work, and feed publish a ``None`` local-review verdict
-        that its handoff reads as "did not approve".
+        branch-ahead short-circuit reuses an existing workspace and calls with
+        ``allow_fixes=False``: validators may run, but any red/dirty result
+        fails closed instead of spawning a code-mutating fix turn.
 
         Returns ``(proceed, local_review_result)``: ``proceed`` is False when
         a gate halted the run (failed / blocked / parked) and the caller
@@ -10664,6 +10669,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
+                allow_fixes=allow_fixes,
             )
             if _local_review_infra_failed(local_review_result):
                 await self._block_local_only_review_infra_failure(
@@ -10687,6 +10693,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
+                allow_fixes=allow_fixes,
             )
             if not verify_result.ok:
                 await self._block_verify_failure(
@@ -10714,9 +10721,10 @@ class Orchestrator:
         # 4.8. Pre-push dirty-tree gate. Pushing only commits means any
         # uncommitted work silently vanishes on workspace cleanup (MCH-14).
         # Runs after the verify gate so leftovers from the verify fix turn
-        # are caught too. Dirty tree → one fix turn → re-check → fail-closed.
+        # are caught too. Normal implement path: one fix turn, re-check, then
+        # fail closed. Publish-resume path: no fix turn; fail closed directly.
         dirty_files = await _workspace_dirty_files(workspace_path)
-        if dirty_files:
+        if dirty_files and allow_fixes:
             log.warning(
                 "dirty working tree before push for %s (%d entries); "
                 "dispatching one fix turn",
@@ -10734,10 +10742,14 @@ class Orchestrator:
             dirty_files = await _workspace_dirty_files(workspace_path)
         if dirty_files:
             listing = "\n".join(f"- `{line}`" for line in dirty_files)
+            reason = (
+                "working tree still dirty after one fix turn; not pushing."
+                if allow_fixes
+                else "working tree dirty during publish resume; not pushing."
+            )
             await self._fail_run_and_reset_issue(
                 run_id,
-                "working tree still dirty after one fix turn; "
-                f"not pushing. Uncommitted files:\n{listing}",
+                f"{reason} Uncommitted files:\n{listing}",
                 issue=issue,
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
@@ -11502,6 +11514,7 @@ class Orchestrator:
         storage_issue_id: str | None = None,
         workspace_path: Path,
         parent_run_id: str,
+        allow_fixes: bool = True,
     ) -> LoopResult | None:
         """Run the local-review session and surface its outcome on Linear.
 
@@ -11609,6 +11622,7 @@ class Orchestrator:
                     ),
                     workspace_scrubber=_workspace_scrub,
                     on_iteration=_on_iteration,
+                    allow_fixes=allow_fixes,
                 )
             finally:
                 await self._finalize_local_review_run(
@@ -11955,6 +11969,7 @@ class Orchestrator:
         storage_issue_id: str,
         workspace_path: Path,
         parent_run_id: str,
+        allow_fixes: bool = True,
     ) -> VerifyResult:
         """Run the binding's `verify_cmd` gate in the workspace.
 
@@ -12006,6 +12021,7 @@ class Orchestrator:
                 command_secs=self.config.command_timeout_secs,
                 usage_handler=cost_estimator.delta,
                 fix_log_path=verify_log_path,
+                allow_fixes=allow_fixes,
             )
         except Exception as e:  # noqa: BLE001 — fail closed
             log.exception("verify phase raised on %s", issue.identifier)

@@ -166,6 +166,7 @@ async def run_local_review_session(
     diff_size_provider: DiffSizeProvider | None = None,
     workspace_scrubber: WorkspaceScrubber | None = None,
     on_iteration: IterationCallback | None = None,
+    allow_fixes: bool = True,
 ) -> LoopResult:
     """Run the review→fix loop in-workspace; return the loop's outcome.
 
@@ -427,6 +428,14 @@ async def run_local_review_session(
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
+        if not allow_fixes:
+            return FixerOutput(
+                ok=False,
+                error=(
+                    "local-review requested changes; "
+                    "fix turn disabled for publish resume"
+                ),
+            )
         head_before = await head_sha_provider(workspace_path)
         prompt = review_comment_fix_prompt(
             issue_title=issue_title,

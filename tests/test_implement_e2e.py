@@ -1807,6 +1807,65 @@ async def test_resume_at_publish_after_delivery_failure_skips_agent(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_publish_failed_retry_resumes_publish_when_default_branch_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A publish-failed retry resumes publish even when gh cannot resolve the
+    default branch; the delivery retry must not re-run the implementer."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        await _seed_publish_failed_implement_run(conn)
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(side_effect=GitHubError("boom"))
+
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=5151), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        assert runner.specs == []
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+        assert gh.ensure_pr.await_args.kwargs["base"] is None
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        completed = [r for r in history if r.stage == "implement" and r.status == "completed"]
+        assert len(completed) == 1
+    finally:
+        await conn.close()
+
+
 def _head_sha(workspace: Path) -> str:
     out = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=workspace, check=True, capture_output=True
@@ -1897,6 +1956,9 @@ async def test_branch_ahead_short_circuit_reruns_local_review_not_parked(
         # review gate did re-run on the reused workspace.
         assert runner.specs == []
         orch._run_local_review_phase.assert_awaited_once()  # noqa: SLF001
+        assert (  # noqa: SLF001
+            orch._run_local_review_phase.await_args.kwargs["allow_fixes"] is False
+        )
         push_fn.assert_awaited_once()
         gh.ensure_pr.assert_awaited_once()
 
@@ -1986,6 +2048,137 @@ async def test_branch_ahead_short_circuit_records_verify_pass(
         assert await db.issue_prs.has_verify_passed(
             conn, issue_id="iss-1", github_repo="org/repo", head_sha=head
         )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_short_circuit_dirty_tree_fails_without_fix_turn(
+    tmp_path: Path,
+) -> None:
+    """Dirty branch-ahead resume fails closed instead of spawning the
+    dirty-tree implement_fix agent."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+        (workspace_path / "leftover.txt").write_text("uncommitted\n")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        assert runner.specs == []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[-1].status == "failed"
+        assert "working tree dirty during publish resume" in history[-1].termination_detail
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_short_circuit_verify_failure_skips_fix_turn(
+    tmp_path: Path,
+) -> None:
+    """Red verify on branch-ahead resume fails closed without a verify_fix
+    runner turn."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            agent="claude",
+            branch_prefix="symphony",
+            local_review=False,
+            remote_review=False,
+            auto_merge=False,
+            verify_cmd="false",
+            linear_states=LinearStates(
+                ready="Todo",
+                local_code_review="",
+                code_review="",
+                needs_approval="Needs Approval",
+            ),
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+        push_fn = AsyncMock()
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        assert runner.specs == []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        impl = [r for r in history if r.stage == "implement"]
+        assert impl[-1].status == "failed"
+        assert "fix turn disabled for publish resume" in impl[-1].termination_detail
     finally:
         await conn.close()
 
