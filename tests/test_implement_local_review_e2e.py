@@ -550,6 +550,19 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         assert issue_pr is not None
         original_pr_created_at = issue_pr.created_at
 
+        parked_issue = _issue()
+        parked_issue.state_id = "state-na"
+        parked_issue.state_name = "Needs Approval"
+        parked_issue.state_type = "started"
+        linear.lookup_issue.return_value = parked_issue
+
+        tasks = await orch._poll_review_runs()  # noqa: SLF001
+        assert tasks == []
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        review_rows = [run for run in history if run.stage == "review"]
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "running"
+
         await orch._handle_slash_intent(  # noqa: SLF001
             "iss-1",
             run_id,

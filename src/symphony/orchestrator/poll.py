@@ -3886,6 +3886,10 @@ class Orchestrator:
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
             if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
+            if await self._review_poll_deferred_by_deliver_failed_wait(
+                run.issue_id, run.id
+            ):
+                continue
             tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
                 run.issue_id
             )
@@ -3934,6 +3938,20 @@ class Orchestrator:
                 continue
             scheduled.append(self._schedule_review_poll(run, binding, issue))
         return scheduled
+
+    async def _review_poll_deferred_by_deliver_failed_wait(
+        self, issue_id: str, review_run_id: str
+    ) -> bool:
+        wait = await db.operator_waits.get(self._conn, issue_id)
+        if wait is None or wait.kind != db.operator_waits.KIND_DELIVER_FAILED:
+            return False
+        log.info(
+            "skipping review run %s for %s: deliver_failed wait %s is pending",
+            review_run_id,
+            issue_id,
+            wait.run_id,
+        )
+        return True
 
     def _binding_for_issue(
         self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
@@ -4154,6 +4172,10 @@ class Orchestrator:
         live_review_runs = await db.runs.list_live_by_stage(self._conn, stage="review")
         if not any(live_run.id == run.id for live_run in live_review_runs):
             log.info("skipping review run %s: run is no longer live", run.id)
+            return None
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
             return None
         tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
             run.issue_id
