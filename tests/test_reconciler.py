@@ -91,6 +91,7 @@ class _FakeGitHub:
         error: Exception | None = None,
         open_prs_by_head: dict[str, dict[str, Any]] | None = None,
         head_error: Exception | None = None,
+        comment_error: Exception | None = None,
     ) -> None:
         self.view = view or {
             "state": "OPEN",
@@ -102,8 +103,10 @@ class _FakeGitHub:
         self.error = error
         self.open_prs_by_head = open_prs_by_head or {}
         self.head_error = head_error
+        self.comment_error = comment_error
         self.calls: list[tuple[int, str | None]] = []
         self.head_calls: list[tuple[str, str | None]] = []
+        self.comments: list[tuple[int, str, str | None]] = []
 
     async def pr_view(self, pr: int | str, *, repo: str | None = None) -> dict[str, Any]:
         self.calls.append((int(pr), repo))
@@ -121,6 +124,13 @@ class _FakeGitHub:
             raise self.head_error
         entry = self.open_prs_by_head.get(head)
         return dict(entry) if entry is not None else None
+
+    async def pr_comment(
+        self, pr: int | str, body: str, *, repo: str | None = None
+    ) -> None:
+        if self.comment_error is not None:
+            raise self.comment_error
+        self.comments.append((int(pr), body, repo))
 
 
 def _binding(
@@ -1521,11 +1531,47 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     assert pr.pr_url == "https://github.com/org/repo/pull/326"
     assert review.pr_number == 326
     assert [c.pr_number for c in merge_candidates] == [326]
+    assert fake_gh.comments == [(326, "@codex review", "org/repo")]
     # Default binding is remote-review (code_review="Needs Approval"); adoption
     # moves the issue into that lane so `_review_issue_is_active` accepts it.
     assert linear.moves == [("iss-1", "state-needs-approval")]
     assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
     assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_orphan_open_pr_adoption_uses_remote_review_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding(local_review=True, remote_review=True)]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+    finally:
+        await conn.close()
+
+    assert fake_gh.comments == [(326, "@codex review", "org/repo")]
+    assert linear.moves == [("iss-1", "state-needs-approval")]
 
 
 @pytest.mark.asyncio

@@ -834,9 +834,9 @@ class Reconciler:
                 commit=False,
             )
             target_state = (
-                binding.linear_states.local_code_review
-                if binding.resolved_local_review()
-                else binding.linear_states.code_review
+                binding.linear_states.code_review
+                if binding.resolved_remote_review()
+                else binding.linear_states.local_code_review
             )
         else:
             # No review configured: the success path routes straight to merge
@@ -850,6 +850,20 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
+        if binding.resolved_remote_review():
+            try:
+                await self._gh.pr_comment(
+                    obs.pr_number,
+                    "@codex review",
+                    repo=obs.github_repo,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not post @codex review on %s#%d: %s",
+                    obs.github_repo,
+                    obs.pr_number,
+                    e,
+                )
         if wait is not None:
             await db.operator_waits.delete(
                 self._conn,
