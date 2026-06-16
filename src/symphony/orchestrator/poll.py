@@ -2585,7 +2585,10 @@ class Orchestrator:
             return
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if wait is not None:
-            if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            if wait.kind in (
+                db.operator_waits.KIND_IMPLEMENT_FAILED,
+                db.operator_waits.KIND_DELIVER_FAILED,
+            ):
                 await self._handle_implement_failed_slash_intent(
                     issue_id, run_id, intent
                 )
@@ -2947,7 +2950,10 @@ class Orchestrator:
                 issue_id,
                 run_id,
                 intent,
-                expected_kinds=(db.operator_waits.KIND_IMPLEMENT_FAILED,),
+                expected_kinds=(
+                    db.operator_waits.KIND_IMPLEMENT_FAILED,
+                    db.operator_waits.KIND_DELIVER_FAILED,
+                ),
             )
             if binding is None:
                 return
@@ -3166,6 +3172,7 @@ class Orchestrator:
         for wait in waits:
             if wait.kind not in (
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
+                db.operator_waits.KIND_DELIVER_FAILED,
                 db.operator_waits.KIND_IMPLEMENT_BLOCKED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
@@ -3199,7 +3206,10 @@ class Orchestrator:
     ) -> None:
         self._dispatch_run_ids[wait.issue_id] = wait.run_id
         self._operator_wait_run_ids.add(wait.run_id)
-        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        if wait.kind in (
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+            db.operator_waits.KIND_DELIVER_FAILED,
+        ):
             self._implement_failed_run_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
             self._implement_blocked_run_bindings[wait.run_id] = binding

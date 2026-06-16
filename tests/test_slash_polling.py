@@ -252,6 +252,11 @@ async def test_stop_intent_kills_active_runner(tmp_path: Path) -> None:
             SlashKind.APPROVE,
         ),
         (
+            db.operator_waits.KIND_DELIVER_FAILED,
+            "_handle_implement_failed_slash_intent",
+            SlashKind.RETRY,
+        ),
+        (
             db.operator_waits.KIND_REVIEW_FAILED,
             "_handle_review_failed_slash_intent",
             SlashKind.RETRY,
@@ -283,7 +288,12 @@ async def test_operator_wait_handlers_lazy_restore_binding_and_dispatch(
         orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
         orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
 
-        stage = "merge" if wait_kind == db.operator_waits.KIND_MERGE else "implement"
+        if wait_kind == db.operator_waits.KIND_MERGE:
+            stage = "merge"
+        elif wait_kind == db.operator_waits.KIND_DELIVER_FAILED:
+            stage = "deliver"
+        else:
+            stage = "implement"
         status = (
             "needs_approval"
             if wait_kind == db.operator_waits.KIND_MERGE
@@ -303,7 +313,10 @@ async def test_operator_wait_handlers_lazy_restore_binding_and_dispatch(
 
         await getattr(orch, handler_name)("iss-1", "run-1", _intent(intent_kind))
 
-        if wait_kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        if wait_kind in (
+            db.operator_waits.KIND_IMPLEMENT_FAILED,
+            db.operator_waits.KIND_DELIVER_FAILED,
+        ):
             linear.move_issue.assert_awaited_once_with("iss-1", "state-todo")
             assert await db.operator_waits.get(conn, "iss-1") is None
         elif wait_kind == db.operator_waits.KIND_REVIEW_FAILED:

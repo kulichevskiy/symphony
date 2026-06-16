@@ -246,10 +246,15 @@ class GitHub:
         out = await self._run(argv)
         return out.strip()
 
-    async def pr_for_head(
+    async def open_pr_for_head(
         self, *, head: str, repo: str | None = None
-    ) -> str | None:
-        """Return the URL of the open PR for `head`, or None if none exists."""
+    ) -> dict[str, Any] | None:
+        """Return `{number, url}` of the open PR for `head`, or None.
+
+        Lists by head branch (`gh pr list --head <head> --state open`) so a
+        PR that was opened for the branch but never recorded locally can still
+        be discovered.
+        """
         result = await self._run_json(
             [
                 "pr",
@@ -269,8 +274,15 @@ class GitHub:
             )
         for entry in result:
             if isinstance(entry, dict) and entry.get("url"):
-                return str(entry["url"])
+                return {"number": int(entry["number"]), "url": str(entry["url"])}
         return None
+
+    async def pr_for_head(
+        self, *, head: str, repo: str | None = None
+    ) -> str | None:
+        """Return the URL of the open PR for `head`, or None if none exists."""
+        pr = await self.open_pr_for_head(head=head, repo=repo)
+        return pr["url"] if pr is not None else None
 
     async def ensure_pr(
         self,

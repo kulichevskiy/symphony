@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -46,11 +47,23 @@ DRIFT_MERGE_ZOMBIE = "merge_zombie"
 DRIFT_PR_CLOSED_NO_MERGE = "pr_closed_no_merge"
 DRIFT_LINEAR_STATE_DONE = "linear_state_done"
 DRIFT_PR_LOCALLY_MERGED = "pr_locally_merged"
+DRIFT_ORPHAN_PR_OPEN = "orphan_pr_open"
 
 ACTION_OBSERVED = "observed"
 ACTION_WOULD_CLEAR = "would_clear"
 ACTION_CLEARED = "cleared"
 ACTION_NOTED = "noted"
+ACTION_ADOPTED = "adopted"
+
+# Parked operator-wait kinds whose head branch we probe for an orphan open PR.
+# These are terminal handoffs where a PR may have been opened but never
+# recorded in `issue_prs`.
+_PARKED_WAIT_KINDS = frozenset(
+    {
+        db.operator_waits.KIND_IMPLEMENT_FAILED,
+        db.operator_waits.KIND_DELIVER_FAILED,
+    }
+)
 
 _TRANSIENT_STATUS_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response(?:\s+status)?|"
@@ -107,6 +120,18 @@ class GithubPrObservation:
 
 
 @dataclass(frozen=True)
+class _AdoptableOrphanPr:
+    binding: RepoBinding
+    observation: GithubPrObservation
+
+
+@dataclass(frozen=True)
+class _PostCommitReviewRequest:
+    github_repo: str
+    pr_number: int
+
+
+@dataclass(frozen=True)
 class _ReconcileIssueResult:
     observations: int
     actions_taken: int
@@ -154,6 +179,12 @@ def reconcile_auto_clear_enabled(env: Mapping[str, str] | None = None) -> bool:
     if value is None:
         return False
     return value.strip().casefold() in {"0", "false", "no", "off"}
+
+
+def _parse_rfc3339(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
 
 
 def classify_linear_drift(
@@ -265,6 +296,12 @@ class Reconciler:
             except _BackoffRequested as exc:
                 self._enter_backoff(source=exc.source, error=exc.error)
                 break
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "external reconcile failed for issue=%s; skipping candidate",
+                    candidate.issue_id,
+                )
+                continue
         if actions_deferred:
             log.warning(
                 "external reconciler action cap reached max_actions=%d "
@@ -327,6 +364,7 @@ class Reconciler:
         observed_at = self._now().isoformat()
         done_state_names = self._done_state_names(matched_bindings)
         tracker_ctx = self._tracker_context_from_issue_row(issue_row, matched_bindings)
+        post_commit_review_request: _PostCommitReviewRequest | None = None
         try:
             tracker_issue_id = str(issue_row["tracker_issue_id"] or issue_id)
             linear_issue, linear_payload = await self._tracker_payload(
@@ -334,9 +372,20 @@ class Reconciler:
                 tracker_ctx,
             )
             github_prs, github_payload = await self._github_payload(prs)
+            orphans = await self._orphan_open_prs(
+                issue_row=issue_row,
+                wait=wait,
+                matched_bindings=matched_bindings,
+                recorded_observations=github_prs,
+            )
         except _BackoffRequested:
             raise
 
+        if orphans:
+            combined = github_prs + [orphan.observation for orphan in orphans]
+            github_payload = {"prs": [pr.to_payload() for pr in combined]}
+
+        drift_prs = _github_prs_for_drift(wait=wait, github_prs=github_prs)
         linear_drift = classify_linear_drift(
             has_operator_wait=wait is not None,
             state_name=linear_issue.state_name if linear_issue is not None else None,
@@ -344,8 +393,14 @@ class Reconciler:
         )
         github_drift = classify_github_drift(
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
-            prs=_github_prs_for_drift(wait=wait, github_prs=github_prs),
+            prs=drift_prs,
         )
+        if (
+            github_drift is None
+            and linear_drift != DRIFT_LINEAR_STATE_DONE
+            and orphans
+        ):
+            github_drift = DRIFT_ORPHAN_PR_OPEN
         active = reconcile_auto_clear_enabled()
         remaining = action_budget_remaining
         actions_taken = 0
@@ -365,9 +420,17 @@ class Reconciler:
         github_clearable = _github_clearable(
             github_drift=github_drift,
             wait=wait,
-            github_prs=_github_prs_for_drift(wait=wait, github_prs=github_prs),
+            github_prs=drift_prs,
         )
-        if active and github_clearable:
+        if active and github_drift == DRIFT_ORPHAN_PR_OPEN and orphans:
+            if remaining is None or remaining > 0:
+                github_action = ACTION_ADOPTED
+                actions_taken += 1
+                if remaining is not None:
+                    remaining -= 1
+            else:
+                actions_deferred += 1
+        elif active and github_clearable:
             if remaining is None or remaining > 0:
                 github_action = ACTION_CLEARED
                 actions_taken += 1
@@ -419,12 +482,37 @@ class Reconciler:
                     issue_id=issue_id,
                     wait=wait,
                     drift_kind=github_drift,
-                    github_prs=_github_prs_for_drift(wait=wait, github_prs=github_prs),
+                    github_prs=drift_prs,
+                )
+            elif github_action == ACTION_ADOPTED:
+                post_commit_review_request = await self._adopt_orphan_prs(
+                    issue_id=issue_id,
+                    tracker_issue_id=tracker_issue_id,
+                    tracker_ctx=tracker_ctx,
+                    team_key=str(issue_row["team_key"]),
+                    wait=wait,
+                    orphans=orphans,
+                    observed_at=observed_at,
                 )
             await self._conn.commit()
         except Exception:
             await self._conn.rollback()
             raise
+
+        if post_commit_review_request is not None:
+            try:
+                await self._gh.pr_comment(
+                    post_commit_review_request.pr_number,
+                    "@codex review",
+                    repo=post_commit_review_request.github_repo,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not post @codex review on %s#%d: %s",
+                    post_commit_review_request.github_repo,
+                    post_commit_review_request.pr_number,
+                    e,
+                )
 
         return _ReconcileIssueResult(
             observations=2,
@@ -656,6 +744,280 @@ class Reconciler:
         if not prs:
             payload["error"] = "no linked unmerged PR"
         return observations, payload
+
+    async def _orphan_open_prs(
+        self,
+        *,
+        issue_row: aiosqlite.Row,
+        wait: db.operator_waits.OperatorWait | None,
+        matched_bindings: list[RepoBinding],
+        recorded_observations: list[GithubPrObservation],
+    ) -> list[_AdoptableOrphanPr]:
+        """Probe each parked binding's head branch for an unrecorded open PR.
+
+        Only fires for a parked implement/deliver-failed wait. Lists by head branch
+        (``gh pr list --head <branch_prefix>/<identifier>``) so a PR that was
+        opened for the branch but never landed in ``issue_prs`` is still found.
+        """
+        if wait is None or wait.kind not in _PARKED_WAIT_KINDS:
+            return []
+        identifier = str(issue_row["identifier"] or "").strip().lower()
+        if not identifier:
+            return []
+        active_recorded_repos = {
+            pr.github_repo.casefold()
+            for pr in recorded_observations
+            if pr.error is None and pr.state.upper() == "OPEN"
+        }
+        seen_repos: set[str] = set()
+        orphans: list[_AdoptableOrphanPr] = []
+        for binding in matched_bindings:
+            if not binding.reconcile_enabled:
+                continue
+            repo_key = binding.github_repo.casefold()
+            if repo_key in active_recorded_repos or repo_key in seen_repos:
+                continue
+            seen_repos.add(repo_key)
+            head = f"{binding.branch_prefix}/{identifier}"
+            try:
+                found = await self._gh.open_pr_for_head(
+                    head=head, repo=binding.github_repo
+                )
+            except GitHubError as exc:
+                if _should_backoff(str(exc)):
+                    raise _BackoffRequested(
+                        source=SOURCE_GITHUB, error=str(exc)
+                    ) from exc
+                continue
+            if found is None:
+                continue
+            orphans.append(
+                _AdoptableOrphanPr(
+                    binding=binding,
+                    observation=GithubPrObservation(
+                        github_repo=binding.github_repo,
+                        pr_number=int(found["number"]),
+                        state="OPEN",
+                        mergeable=None,
+                        merged=False,
+                        merged_at=None,
+                        url=str(found["url"]),
+                    ),
+                )
+            )
+        return orphans
+
+    async def _adopt_orphan_prs(
+        self,
+        *,
+        issue_id: str,
+        tracker_issue_id: str,
+        tracker_ctx: TrackerContext | None,
+        team_key: str,
+        wait: db.operator_waits.OperatorWait | None,
+        orphans: list[_AdoptableOrphanPr],
+        observed_at: str,
+    ) -> _PostCommitReviewRequest | None:
+        """Adopt a discovered orphan PR: record it and route to review/merge.
+
+        Mirrors the durable writes of the normal implement-success path
+        (`issue_prs` row + `review_state`, plus a ``review`` run when the
+        binding configures review) and moves the parked Linear issue out of
+        ``blocked`` into the active lane the relevant poller expects, then
+        clears the operator wait. Without that move the review/merge pollers
+        reject the issue (both treat ``Blocked`` as inactive) and the adopted
+        run is closed instead of advancing.
+
+        Local-only review requires durable evidence that a completed
+        ``local_review`` run covers this PR cycle. If that evidence is absent,
+        adopt the PR record but park the review row and issue in the manual
+        approval lane instead of creating a merge candidate.
+
+        Only one orphan is adopted per tick: ``review_state`` is keyed per
+        issue (``ON CONFLICT(issue_id)``) so multiple orphans would clobber the
+        single row, and the action budget counts one adoption per tick.
+        """
+        orphan = orphans[0]
+        binding = orphan.binding
+        obs = orphan.observation
+        local_review_configured = binding.resolved_local_review()
+        remote_review_configured = binding.resolved_remote_review()
+        review_configured = (
+            local_review_configured or remote_review_configured
+        )
+        local_only_review_ready = True
+        if local_review_configured and not remote_review_configured:
+            local_only_review_ready = await self._local_review_completed_for_adoption(
+                issue_id=issue_id,
+                pr_created_at=observed_at,
+            )
+        await db.issue_prs.upsert(
+            self._conn,
+            issue_id=issue_id,
+            github_repo=obs.github_repo,
+            binding_key=_binding_storage_key(binding),
+            pr_number=obs.pr_number,
+            pr_url=obs.url,
+            created_at=observed_at,
+            review_bypassed=not review_configured,
+            commit=False,
+        )
+        await db.review_state.begin_review(
+            self._conn,
+            issue_id,
+            pr_number=obs.pr_number,
+            pr_url=obs.url,
+            github_repo=obs.github_repo,
+            issue_label=binding.issue_label,
+            commit=False,
+        )
+        if review_configured:
+            review_run_status = "running"
+            if local_review_configured and not remote_review_configured:
+                if not local_only_review_ready:
+                    review_run_status = db.runs.NEEDS_APPROVAL_STATUS
+            review_run_id = str(uuid.uuid4())
+            await db.runs.create(
+                self._conn,
+                id=review_run_id,
+                issue_id=issue_id,
+                stage="review",
+                status=review_run_status,
+                pid=None,
+                started_at=observed_at,
+                commit=False,
+            )
+            if remote_review_configured:
+                target_state = binding.linear_states.code_review
+            elif local_only_review_ready:
+                target_state = binding.linear_states.local_code_review
+            else:
+                target_state = binding.linear_states.needs_approval
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    run_id=review_run_id,
+                    kind=db.operator_waits.KIND_REVIEW_FAILED,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=observed_at,
+                    provider=binding.provider,
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
+                    commit=False,
+                )
+        else:
+            # No review configured: the success path routes straight to merge
+            # with review_bypassed=True and starts no review stage. Land the
+            # issue in the merge-active lane (in_progress) so the merge poller
+            # picks it up.
+            target_state = binding.linear_states.in_progress
+        await self._move_issue_to_state(
+            tracker_issue_id=tracker_issue_id,
+            tracker_ctx=tracker_ctx,
+            team_key=team_key,
+            state_name=target_state,
+        )
+        if wait is not None and not (
+            local_review_configured
+            and not remote_review_configured
+            and not local_only_review_ready
+        ):
+            await db.operator_waits.delete(
+                self._conn,
+                issue_id,
+                wait.run_id,
+                commit=False,
+            )
+        if remote_review_configured:
+            return _PostCommitReviewRequest(
+                github_repo=obs.github_repo,
+                pr_number=obs.pr_number,
+            )
+        return None
+
+    async def _local_review_completed_for_adoption(
+        self,
+        *,
+        issue_id: str,
+        pr_created_at: str,
+    ) -> bool:
+        latest_implement = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="implement",
+        )
+        if latest_implement is None or _parse_rfc3339(
+            latest_implement.started_at
+        ) > _parse_rfc3339(pr_created_at):
+            return False
+        latest_local_review = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="local_review",
+            started_at_gte=latest_implement.started_at,
+        )
+        if (
+            latest_local_review is None
+            or latest_local_review.status != "completed"
+        ):
+            return False
+        latest_fix = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="review_fix",
+        )
+        if latest_fix is not None and _parse_rfc3339(
+            latest_fix.started_at
+        ) > _parse_rfc3339(latest_local_review.started_at):
+            return False
+        return True
+
+    async def _move_issue_to_state(
+        self,
+        *,
+        tracker_issue_id: str,
+        tracker_ctx: TrackerContext | None,
+        team_key: str,
+        state_name: str,
+    ) -> None:
+        """Move the tracked issue to ``state_name``, aborting adoption on failure.
+
+        A failed move must NOT commit. Adoption deletes the operator wait and
+        writes ``issue_prs``/``review_state``, but the review/merge pollers
+        reject the still-``Blocked`` issue and close the adopted run — and with
+        the wait gone the orphan probe never re-fires (``wait is None``), so the
+        issue is stuck for good with no auto-recovery. Raising here propagates
+        to the reconcile transaction's rollback (reconciler ``except`` →
+        ``rollback``), so the next tick re-probes the intact wait and retries.
+        Transient Linear errors route through ``_BackoffRequested`` like the
+        other tracker calls.
+        """
+        if not state_name:
+            raise LinearError(
+                f"missing Linear state {state_name!r} for {tracker_issue_id} "
+                "during adoption"
+            )
+        tracker = self.tracker(tracker_ctx)
+        try:
+            states = await tracker.team_states(team_key)
+        except LinearError as e:
+            if _should_backoff(str(e)):
+                raise _BackoffRequested(source=SOURCE_LINEAR, error=str(e)) from e
+            raise
+        state_id = states.get(state_name)
+        if state_id is None:
+            raise LinearError(
+                f"missing Linear state {state_name!r} for {tracker_issue_id} "
+                "during adoption"
+            )
+        try:
+            await tracker.move_issue(tracker_issue_id, state_id)
+        except LinearError as e:
+            if _should_backoff(str(e)):
+                raise _BackoffRequested(source=SOURCE_LINEAR, error=str(e)) from e
+            raise
 
     async def _candidate_enabled(self, issue_id: str, team_key: str) -> bool:
         wait = await db.operator_waits.get(self._conn, issue_id)
@@ -939,12 +1301,14 @@ def _should_backoff(message: str) -> bool:
 
 
 __all__ = [
+    "ACTION_ADOPTED",
     "ACTION_CLEARED",
     "ACTION_NOTED",
     "ACTION_OBSERVED",
     "ACTION_WOULD_CLEAR",
     "DRIFT_LINEAR_STATE_DONE",
     "DRIFT_MERGE_ZOMBIE",
+    "DRIFT_ORPHAN_PR_OPEN",
     "DRIFT_PR_CLOSED_NO_MERGE",
     "DRIFT_PR_LOCALLY_MERGED",
     "GithubPrObservation",

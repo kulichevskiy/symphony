@@ -15,6 +15,7 @@ from . import state_transitions
 
 KIND_IMPLEMENT_FAILED = "implement_failed"
 KIND_IMPLEMENT_BLOCKED = "implement_blocked"
+KIND_DELIVER_FAILED = "deliver_failed"
 KIND_REVIEW_FAILED = "review_failed"
 KIND_REVIEW_STOPPED = "review_stopped"
 KIND_MERGE = "merge"
@@ -49,6 +50,7 @@ async def upsert(
     provider: str | None = None,
     tracker_provider: str = "linear",
     tracker_site: str = "default",
+    commit: bool = True,
 ) -> None:
     old = await get(conn, issue_id)
     effective_provider = provider or tracker_provider
@@ -102,7 +104,8 @@ async def upsert(
         await state_transitions.record_transition(
             conn, issue_id, "operator_waits", "kind", old.kind, kind
         )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
@@ -246,6 +249,7 @@ async def delete(
 __all__ = [
     "KIND_ACCEPTANCE_BLOCKED",
     "KIND_ACCEPTANCE_REJECTED",
+    "KIND_DELIVER_FAILED",
     "KIND_IMPLEMENT_BLOCKED",
     "KIND_IMPLEMENT_FAILED",
     "KIND_MERGE",

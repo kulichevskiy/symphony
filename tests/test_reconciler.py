@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,12 +19,14 @@ from symphony.github.webhook import GitHubWebhookEvent
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.reconciler import (
+    ACTION_ADOPTED,
     ACTION_CLEARED,
     ACTION_NOTED,
     ACTION_OBSERVED,
     ACTION_WOULD_CLEAR,
     DRIFT_LINEAR_STATE_DONE,
     DRIFT_MERGE_ZOMBIE,
+    DRIFT_ORPHAN_PR_OPEN,
     DRIFT_PR_CLOSED_NO_MERGE,
     DRIFT_PR_LOCALLY_MERGED,
     GithubPrObservation,
@@ -40,7 +42,18 @@ NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 class _FakeLinear:
     state_name: str = "In Progress"
     error: Exception | None = None
+    move_error: Exception | None = None
     calls: int = 0
+    moves: list[tuple[str, str]] = field(default_factory=list)
+    states_map: dict[str, str] = field(
+        default_factory=lambda: {
+            "In Progress": "state-in-progress",
+            "Needs Approval": "state-needs-approval",
+            "Local Code Review": "state-local-review",
+            "Blocked": "state-blocked",
+            "Done": "state-done",
+        }
+    )
 
     async def lookup_issue(self, issue_id: str) -> LinearIssue:
         self.calls += 1
@@ -60,6 +73,14 @@ class _FakeLinear:
             updated_at="2026-05-17T11:58:00Z",
         )
 
+    async def team_states(self, team_key: str) -> dict[str, str]:
+        return dict(self.states_map)
+
+    async def move_issue(self, issue_id_or_identifier: str, state_id: str) -> None:
+        if self.move_error is not None:
+            raise self.move_error
+        self.moves.append((issue_id_or_identifier, state_id))
+
 
 class _FakeGitHub:
     def __init__(
@@ -68,6 +89,9 @@ class _FakeGitHub:
         view: dict[str, object] | None = None,
         views_by_repo: dict[str, dict[str, object]] | None = None,
         error: Exception | None = None,
+        open_prs_by_head: dict[str, dict[str, Any]] | None = None,
+        head_error: Exception | None = None,
+        comment_error: Exception | None = None,
     ) -> None:
         self.view = view or {
             "state": "OPEN",
@@ -77,7 +101,12 @@ class _FakeGitHub:
         }
         self.views_by_repo = views_by_repo or {}
         self.error = error
+        self.open_prs_by_head = open_prs_by_head or {}
+        self.head_error = head_error
+        self.comment_error = comment_error
         self.calls: list[tuple[int, str | None]] = []
+        self.head_calls: list[tuple[str, str | None]] = []
+        self.comments: list[tuple[int, str, str | None]] = []
 
     async def pr_view(self, pr: int | str, *, repo: str | None = None) -> dict[str, Any]:
         self.calls.append((int(pr), repo))
@@ -87,6 +116,22 @@ class _FakeGitHub:
             return dict(self.views_by_repo[repo])
         return dict(self.view)
 
+    async def open_pr_for_head(
+        self, *, head: str, repo: str | None = None
+    ) -> dict[str, Any] | None:
+        self.head_calls.append((head, repo))
+        if self.head_error is not None:
+            raise self.head_error
+        entry = self.open_prs_by_head.get(head)
+        return dict(entry) if entry is not None else None
+
+    async def pr_comment(
+        self, pr: int | str, body: str, *, repo: str | None = None
+    ) -> None:
+        if self.comment_error is not None:
+            raise self.comment_error
+        self.comments.append((int(pr), body, repo))
+
 
 def _binding(
     *,
@@ -95,6 +140,9 @@ def _binding(
     reconcile_enabled: bool = True,
     done_state: str = "Done",
     auto_merge: bool = True,
+    local_review: bool = False,
+    remote_review: bool = True,
+    code_review_state: str = "Needs Approval",
 ) -> RepoBinding:
     return RepoBinding(
         linear_team_key="ENG",
@@ -102,7 +150,9 @@ def _binding(
         issue_label=issue_label,
         reconcile_enabled=reconcile_enabled,
         auto_merge=auto_merge,
-        linear_states=LinearStates(ready="Todo", code_review="Needs Approval", done=done_state),
+        local_review=local_review,
+        remote_review=remote_review,
+        linear_states=LinearStates(ready="Todo", code_review=code_review_state, done=done_state),
     )
 
 
@@ -141,6 +191,62 @@ async def _seed_merge_wait(
         issue_id=issue_id,
         run_id=f"run-{issue_id}",
         kind=db.operator_waits.KIND_MERGE,
+        linear_team_key="ENG",
+        github_repo=github_repo,
+        issue_label=issue_label,
+        created_at="2026-05-17T10:01:00Z",
+    )
+
+
+async def _seed_implement_failed_wait(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    issue_label: str = "symphony",
+    github_repo: str = "org/repo",
+) -> None:
+    await db.runs.create(
+        conn,
+        id=f"run-{issue_id}",
+        issue_id=issue_id,
+        stage="implement",
+        status="failed",
+        pid=None,
+        started_at="2026-05-17T10:00:00Z",
+    )
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=issue_id,
+        run_id=f"run-{issue_id}",
+        kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+        linear_team_key="ENG",
+        github_repo=github_repo,
+        issue_label=issue_label,
+        created_at="2026-05-17T10:01:00Z",
+    )
+
+
+async def _seed_deliver_failed_wait(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    issue_label: str = "symphony",
+    github_repo: str = "org/repo",
+) -> None:
+    await db.runs.create(
+        conn,
+        id=f"run-{issue_id}",
+        issue_id=issue_id,
+        stage="deliver",
+        status="failed",
+        pid=None,
+        started_at="2026-05-17T10:00:00Z",
+    )
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=issue_id,
+        run_id=f"run-{issue_id}",
+        kind=db.operator_waits.KIND_DELIVER_FAILED,
         linear_team_key="ENG",
         github_repo=github_repo,
         issue_label=issue_label,
@@ -1378,3 +1484,653 @@ async def test_orchestrator_github_webhook_closed_unmerged_parked_pr_rechecks_re
     linear.move_issue.assert_not_awaited()
     linear.post_comment.assert_not_awaited()
     assert pr is not None
+
+
+@pytest.mark.asyncio
+async def test_active_orphan_open_pr_adopted_and_routed_to_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        # The implement-failed park leaves the issue in `Blocked`; adoption
+        # must move it into the active review lane or the review/merge pollers
+        # (both reject `Blocked`) would close the adopted run.
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review = await db.review_state.get(conn, "iss-1")
+        merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert pr.pr_url == "https://github.com/org/repo/pull/326"
+    assert review.pr_number == 326
+    assert [c.pr_number for c in merge_candidates] == [326]
+    assert fake_gh.comments == [(326, "@codex review", "org/repo")]
+    # Default binding is remote-review (code_review="Needs Approval"); adoption
+    # moves the issue into that lane so `_review_issue_is_active` accepts it.
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+    assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
+    assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_hybrid_orphan_open_pr_adoption_uses_remote_review_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding(local_review=True, remote_review=True)]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+    finally:
+        await conn.close()
+
+    assert fake_gh.comments == [(326, "@codex review", "org/repo")]
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+
+
+@pytest.mark.asyncio
+async def test_local_only_orphan_open_pr_without_local_review_parks_for_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        binding = _binding(local_review=True, remote_review=False)
+        reconciler = Reconciler(
+            Config(repos=[binding]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review_run = await db.runs.latest_for_issue_stage(
+            conn,
+            issue_id="iss-1",
+            stage="review",
+        )
+        merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+    assert review_run is not None
+    assert wait.run_id == review_run.id
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert review_run.status == "needs_approval"
+    assert merge_candidates == []
+    assert fake_gh.comments == []
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+
+
+@pytest.mark.asyncio
+async def test_local_only_orphan_open_pr_with_local_review_is_merge_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="local-review-iss-1",
+            issue_id="iss-1",
+            stage="local_review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-17T10:02:00Z",
+        )
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        binding = _binding(local_review=True, remote_review=False)
+        config = Config(repos=[binding])
+        reconciler = Reconciler(
+            config,
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+        orch = Orchestrator(
+            config,
+            linear,  # type: ignore[arg-type]
+            conn,
+            runner=MagicMock(),
+            gh=fake_gh,  # type: ignore[arg-type]
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+            clock=lambda: NOW,
+        )
+        local_review_completed = await orch._local_review_completed_for_issue(  # noqa: SLF001
+            merge_candidates[0]
+        )
+    finally:
+        await conn.close()
+
+    assert [c.pr_number for c in merge_candidates] == [326]
+    assert local_review_completed
+    assert fake_gh.comments == []
+    assert linear.moves == [("iss-1", "state-local-review")]
+
+
+@pytest.mark.asyncio
+async def test_active_deliver_failed_orphan_open_pr_adopted_and_routed_to_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_deliver_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review = await db.review_state.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert review.pr_number == 326
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+    assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
+    assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_orphan_open_pr_not_adopted_for_done_issue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is not None
+    assert pr is None
+    assert linear.moves == []
+    assert rows[0][1] == DRIFT_LINEAR_STATE_DONE
+    assert rows[0][2] == ACTION_NOTED
+    assert rows[1][1] is None
+    assert rows[1][2] == ACTION_OBSERVED
+
+
+@pytest.mark.asyncio
+async def test_orphan_probe_looks_past_stale_closed_pr_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await _seed_pr(conn, pr_number=42)
+        fake_gh = _FakeGitHub(
+            view={
+                "state": "CLOSED",
+                "mergeable": "UNKNOWN",
+                "merged": False,
+                "mergedAt": None,
+                "url": "https://github.com/org/repo/pull/42",
+            },
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            },
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert fake_gh.calls == [(42, "org/repo")]
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert pr.pr_url == "https://github.com/org/repo/pull/326"
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_move_failure_rolls_back_and_re_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        # Non-transient move failure aborts adoption for this issue: the
+        # per-candidate move rolls back so the wait survives and the next tick
+        # re-probes and retries. The tick-wide guard swallows the LinearError so
+        # one issue's misconfig cannot starve the rest of the tick.
+        linear = _FakeLinear(
+            state_name="Blocked",
+            move_error=LinearError("boom"),
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        # No exception escapes the tick; the failing candidate is logged + skipped.
+        assert await reconciler.tick() == 0
+
+        # Rolled back: wait intact, nothing adopted.
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
+        assert (await db.review_state.get(conn, "iss-1")).pr_number is None
+        assert await _observation_rows(conn) == []
+        assert len(fake_gh.head_calls) == 1
+
+        # Next tick with the move recovered: re-probes and adopts.
+        linear.move_error = None
+        assert await reconciler.tick() == 2
+        assert len(fake_gh.head_calls) == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+
+
+@pytest.mark.asyncio
+async def test_remote_orphan_adoption_empty_code_review_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding(remote_review=True, code_review_state="")]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 0
+
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
+        assert (await db.review_state.get(conn, "iss-1")).pr_number is None
+        assert await _observation_rows(conn) == []
+    finally:
+        await conn.close()
+
+    assert fake_gh.head_calls == [("symphony/eng-1", "org/repo")]
+    assert linear.moves == []
+    assert fake_gh.comments == []
+
+
+@pytest.mark.asyncio
+async def test_remote_orphan_review_comment_waits_for_adoption_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        async def fail_commit() -> None:
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(conn, "commit", fail_commit)
+
+        assert await reconciler.tick() == 0
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert pr is None
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+    assert fake_gh.comments == []
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_transient_move_failure_backs_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        # Transient move failure routes through _BackoffRequested: the tick
+        # rolls back, enters backoff, and the next tick is skipped.
+        linear = _FakeLinear(
+            state_name="Blocked",
+            move_error=LinearError("server error 429: slow down"),
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        # _BackoffRequested is caught by the tick loop, no exception escapes.
+        await reconciler.tick()
+
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
+        # Backoff active: next tick is a no-op and does not re-probe.
+        assert await reconciler.tick() == 0
+        assert len(fake_gh.head_calls) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_active_orphan_open_pr_adopted_and_routed_to_merge_no_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding(local_review=False, remote_review=False)]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        cur = await conn.execute(
+            "SELECT review_bypassed FROM issue_prs WHERE issue_id = ?", ("iss-1",)
+        )
+        review_bypassed = (await cur.fetchone())[0]
+        review_runs = await db.runs.list_live_by_stage(conn, stage="review")
+        merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    # No review configured: bypass review, route straight to merge, and land
+    # the issue in the merge-active lane (in_progress) — no review run started.
+    assert review_bypassed == 1
+    assert review_runs == []
+    assert [c.pr_number for c in merge_candidates] == [326]
+    assert linear.moves == [("iss-1", "state-in-progress")]
+
+
+@pytest.mark.asyncio
+async def test_orphan_probe_without_open_pr_observes_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(open_prs_by_head={})
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is not None
+    assert pr is None
+    assert rows[1][1] is None
+    assert rows[1][2] == ACTION_OBSERVED
+
+
+@pytest.mark.asyncio
+async def test_dry_run_orphan_open_pr_would_clear_without_adoption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "1")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                open_prs_by_head={
+                    "symphony/eng-1": {
+                        "number": 326,
+                        "url": "https://github.com/org/repo/pull/326",
+                    }
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert pr is None
+    assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
+    assert rows[1][2] == ACTION_WOULD_CLEAR
