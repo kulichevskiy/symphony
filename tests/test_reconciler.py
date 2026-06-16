@@ -215,6 +215,34 @@ async def _seed_implement_failed_wait(
     )
 
 
+async def _seed_deliver_failed_wait(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    issue_label: str = "symphony",
+    github_repo: str = "org/repo",
+) -> None:
+    await db.runs.create(
+        conn,
+        id=f"run-{issue_id}",
+        issue_id=issue_id,
+        stage="deliver",
+        status="failed",
+        pid=None,
+        started_at="2026-05-17T10:00:00Z",
+    )
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=issue_id,
+        run_id=f"run-{issue_id}",
+        kind=db.operator_waits.KIND_DELIVER_FAILED,
+        linear_team_key="ENG",
+        github_repo=github_repo,
+        issue_label=issue_label,
+        created_at="2026-05-17T10:01:00Z",
+    )
+
+
 async def _seed_pr(
     conn: aiosqlite.Connection,
     issue_id: str = "iss-1",
@@ -1501,6 +1529,51 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
 
 
 @pytest.mark.asyncio
+async def test_active_deliver_failed_orphan_open_pr_adopted_and_routed_to_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_deliver_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review = await db.review_state.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert review.pr_number == 326
+    assert linear.moves == [("iss-1", "state-needs-approval")]
+    assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
+    assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
 async def test_orphan_adoption_move_failure_rolls_back_and_re_probes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1518,8 +1591,10 @@ async def test_orphan_adoption_move_failure_rolls_back_and_re_probes(
                 }
             }
         )
-        # Non-transient move failure must abort adoption: the whole tick rolls
-        # back so the wait survives and the next tick re-probes and retries.
+        # Non-transient move failure aborts adoption for this issue: the
+        # per-candidate move rolls back so the wait survives and the next tick
+        # re-probes and retries. The tick-wide guard swallows the LinearError so
+        # one issue's misconfig cannot starve the rest of the tick.
         linear = _FakeLinear(
             state_name="Blocked",
             move_error=LinearError("boom"),
@@ -1532,8 +1607,8 @@ async def test_orphan_adoption_move_failure_rolls_back_and_re_probes(
             clock=lambda: NOW,
         )
 
-        with pytest.raises(LinearError, match="boom"):
-            await reconciler.tick()
+        # No exception escapes the tick; the failing candidate is logged + skipped.
+        assert await reconciler.tick() == 0
 
         # Rolled back: wait intact, nothing adopted.
         assert await db.operator_waits.get(conn, "iss-1") is not None

@@ -56,9 +56,14 @@ ACTION_NOTED = "noted"
 ACTION_ADOPTED = "adopted"
 
 # Parked operator-wait kinds whose head branch we probe for an orphan open PR.
-# These are terminal-implement failures where a PR may have been opened (by a
-# late `pr_create` or a human) but never recorded in `issue_prs`.
-_PARKED_WAIT_KINDS = frozenset({db.operator_waits.KIND_IMPLEMENT_FAILED})
+# These are terminal handoffs where a PR may have been opened but never
+# recorded in `issue_prs`.
+_PARKED_WAIT_KINDS = frozenset(
+    {
+        db.operator_waits.KIND_IMPLEMENT_FAILED,
+        db.operator_waits.KIND_DELIVER_FAILED,
+    }
+)
 
 _TRANSIENT_STATUS_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response(?:\s+status)?|"
@@ -279,6 +284,12 @@ class Reconciler:
             except _BackoffRequested as exc:
                 self._enter_backoff(source=exc.source, error=exc.error)
                 break
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "external reconcile failed for issue=%s; skipping candidate",
+                    candidate.issue_id,
+                )
+                continue
         if actions_deferred:
             log.warning(
                 "external reconciler action cap reached max_actions=%d "
@@ -712,7 +723,7 @@ class Reconciler:
     ) -> list[_AdoptableOrphanPr]:
         """Probe each parked binding's head branch for an unrecorded open PR.
 
-        Only fires for a parked implement-failed wait. Lists by head branch
+        Only fires for a parked implement/deliver-failed wait. Lists by head branch
         (``gh pr list --head <branch_prefix>/<identifier>``) so a PR that was
         opened for the branch but never landed in ``issue_prs`` is still found.
         """
