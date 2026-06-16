@@ -148,6 +148,39 @@ async def begin_review(
     await conn.commit()
 
 
+async def refresh_pr_metadata(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    pr_number: int | None,
+    pr_url: str,
+    github_repo: str,
+    issue_label: str | None,
+) -> None:
+    """Refresh active PR fields without resetting review-cycle state."""
+    old = await _get_existing(conn, issue_id)
+    await conn.execute(
+        """
+        INSERT INTO review_state (
+            issue_id, iteration, last_trigger_signature,
+            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label,
+            codex_lgtm_comment_id
+        )
+        VALUES (?, 0, '', 0, ?, ?, ?, ?, '')
+        ON CONFLICT(issue_id) DO UPDATE SET
+            pr_number = excluded.pr_number,
+            pr_url = excluded.pr_url,
+            github_repo = excluded.github_repo,
+            issue_label = excluded.issue_label
+        """,
+        (issue_id, pr_number, pr_url, github_repo, issue_label or ""),
+    )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
+    await conn.commit()
+
+
 async def bump_iteration(conn: aiosqlite.Connection, issue_id: str) -> int:
     """Increment the counter atomically and return the new value."""
     old = await _get_existing(conn, issue_id)
@@ -301,6 +334,7 @@ __all__ = [
     "bump_iteration",
     "bump_ci_fetch_failures",
     "get",
+    "refresh_pr_metadata",
     "reset",
     "reset_ci_fetch_failures",
     "set_codex_lgtm_comment_id",

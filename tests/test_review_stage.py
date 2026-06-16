@@ -2267,6 +2267,91 @@ def test_pr_number_from_url_returns_none_for_garbage() -> None:
     assert pr_number_from_url("not a url") is None
 
 
+@pytest.mark.asyncio
+async def test_start_review_stage_ignores_terminal_review_when_other_stage_live(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="old-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "old-review",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="live-local-review",
+            issue_id=issue.id,
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.status == "running"
+        assert run.id != "old-review"
+        history = await db.runs.history_for_issue(conn, issue.id)
+        review_rows = [row for row in history if row.stage == "review"]
+        assert [row.status for row in review_rows] == ["failed", "running"]
+        latest = await db.runs.latest_for_issue_stage(
+            conn, issue_id=issue.id, stage="review"
+        )
+        assert latest is not None
+        assert latest.id == run.id
+        assert latest.status == "running"
+        state = await db.review_state.get(conn, issue.id)
+        assert state.pr_number == 43
+    finally:
+        await conn.close()
+
+
 # --- Failure visibility and retry ------------------------------------------
 
 

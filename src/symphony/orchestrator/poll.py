@@ -12264,14 +12264,6 @@ class Orchestrator:
         """
         storage_issue_id = storage_issue_id or issue.id
         pr_number = pr_number_from_url(pr_url)
-        await db.review_state.begin_review(
-            self._conn,
-            storage_issue_id,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label,
-        )
         if pr_number is None:
             log.warning(
                 "could not parse PR number from %r for %s — skipping @codex review",
@@ -12296,17 +12288,25 @@ class Orchestrator:
         )
         created_review_run = inserted
         if not inserted:
-            existing = await db.runs.latest_for_issue_stage(
+            existing = await db.runs.latest_live_for_issue_stage(
                 self._conn, issue_id=storage_issue_id, stage="review"
             )
             if existing is not None:
+                await db.review_state.refresh_pr_metadata(
+                    self._conn,
+                    storage_issue_id,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label,
+                )
                 if post_codex_review and binding.resolved_remote_review():
                     await self._move_issue_to_review_state(
                         binding=binding, issue=issue
                     )
                 return existing
-            # Guard tripped on a live run in another stage but no review run
-            # exists to adopt: force-create so the returned Run is persisted.
+            # Guard tripped on a live run in another stage, but no live Review
+            # row exists to adopt: force-create so the returned Run is persisted.
             await db.runs.create(
                 self._conn,
                 id=review_run_id,
@@ -12317,6 +12317,15 @@ class Orchestrator:
                 started_at=started_at,
             )
             created_review_run = True
+        if created_review_run:
+            await db.review_state.begin_review(
+                self._conn,
+                storage_issue_id,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label,
+            )
         if created_review_run and pr_number is not None:
             await db.issue_prs.upsert(
                 self._conn,

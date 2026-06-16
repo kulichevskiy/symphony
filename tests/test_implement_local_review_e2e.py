@@ -569,6 +569,12 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         issue_pr = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
         assert issue_pr is not None
         original_pr_created_at = issue_pr.created_at
+        await db.review_state.set_signature(conn, "iss-1", "codex_inline:stale")
+        await db.review_state.bump_iteration(conn, "iss-1")
+        await db.review_state.bump_ci_fetch_failures(conn, "iss-1")
+        await db.review_state.set_codex_lgtm_comment_id(
+            conn, "iss-1", "comment-42"
+        )
 
         parked_issue = _issue()
         parked_issue.state_id = "state-na"
@@ -611,6 +617,11 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         issue_pr = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
         assert issue_pr is not None
         assert issue_pr.created_at == original_pr_created_at
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.iteration == 1
+        assert state.last_trigger_signature == "codex_inline:stale"
+        assert state.ci_fetch_failures == 1
+        assert state.codex_lgtm_comment_id == "comment-42"
         candidates = await db.issue_prs.list_merge_candidates(conn)
         assert len(candidates) == 1
         assert candidates[0].pr_number == 42
