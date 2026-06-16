@@ -441,6 +441,147 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
 
 
 @pytest.mark.asyncio
+async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_handoff(
+    tmp_path: Path,
+) -> None:
+    """If handoff fails after the Review run starts, `$retry` adopts it.
+
+    The resumed delivery must not repost `@codex review` or move the issue to
+    Review again, and a successful resume must repair the Implement run status
+    that `deliver_failed` parking had flipped to failed.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _hybrid_binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(
+            return_value="https://github.com/org/repo/pull/42"
+        )
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        runner = _StagedRunner(
+            {
+                "implement": [
+                    [
+                        RunnerEvent(kind="started", pid=4242),
+                        RunnerEvent(
+                            kind="stdout",
+                            line=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                                }
+                            ),
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+            }
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=LoopResult(
+                outcome=LoopOutcome.APPROVED, iterations=1, verdicts=()
+            )
+        )
+        orch._post_local_review_pr_summary = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=[RuntimeError("summary write failed"), None]
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        run_id = wait.run_id
+
+        codex_calls = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
+            == "@codex review"
+        ]
+        assert len(codex_calls) == 1
+        assert [s.stage for s in runner.captured].count("implement") == 1
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        implement = next(run for run in history if run.stage == "implement")
+        review_rows = [run for run in history if run.stage == "review"]
+        assert implement.status == "failed"
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "running"
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        codex_calls = [
+            c
+            for c in gh.pr_comment.await_args_list
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
+            == "@codex review"
+        ]
+        assert len(codex_calls) == 1
+        move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert move_targets.count("state-review") == 1
+        assert gh.ensure_pr.await_count == 2
+        assert push_fn.await_count == 2
+        assert orch._post_local_review_pr_summary.await_count == 2  # type: ignore[attr-defined]  # noqa: SLF001
+        assert [s.stage for s in runner.captured].count("implement") == 1
+        assert await db.operator_waits.get(conn, "iss-1") is None
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        implement = next(run for run in history if run.stage == "implement")
+        review_rows = [run for run in history if run.stage == "review"]
+        assert implement.status == "completed"
+        assert implement.termination_kind == ""
+        assert implement.termination_detail == ""
+        assert len(review_rows) == 1
+        assert review_rows[0].status == "running"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
     tmp_path: Path,
 ) -> None:

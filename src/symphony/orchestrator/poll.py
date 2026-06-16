@@ -10690,9 +10690,11 @@ class Orchestrator:
             await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
 
-        # `stage_done` + `completed` are first-delivery only. On a `$retry`
-        # resume past a faulted handoff the comment would be a duplicate and the
-        # completed write would re-flip a run the park left `failed`; skip both.
+        # The stage-transition comment is first-delivery only. The completed
+        # write must happen before the first handoff so the review run can pass
+        # its active-run guard; a resumed delivery reasserts completion after a
+        # successful handoff below, repairing the `failed` status left by
+        # `_park_deliver_failed`.
         if first_delivery:
             try:
                 next_stage = (
@@ -10736,11 +10738,21 @@ class Orchestrator:
         # rather than propagate and leave a completed run with no review
         # started and no operator wait.
         try:
-            return await self._deliver_review_handoff(ctx=ctx, pr_url=pr_url)
+            delivered_run_id = await self._deliver_review_handoff(
+                ctx=ctx, pr_url=pr_url
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
             return run_id
+        if not first_delivery:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+        return delivered_run_id
 
     async def _deliver_review_handoff(
         self, *, ctx: _PendingDelivery, pr_url: str
@@ -12194,23 +12206,6 @@ class Orchestrator:
                 pr_url=pr_url,
                 created_at=datetime.now(UTC).isoformat(),
             )
-            if post_codex_review:
-                try:
-                    await self._gh.pr_comment(
-                        pr_number,
-                        "@codex review",
-                        repo=binding.github_repo,
-                    )
-                except GitHubError as e:
-                    log.warning(
-                        "could not post @codex review on %s#%d: %s",
-                        binding.github_repo,
-                        pr_number,
-                        e,
-                    )
-
-        if post_codex_review and binding.resolved_remote_review():
-            await self._move_issue_to_review_state(binding=binding, issue=issue)
 
         review_run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC).isoformat()
@@ -12227,6 +12222,7 @@ class Orchestrator:
             pid=None,
             started_at=started_at,
         )
+        created_review_run = inserted
         if not inserted:
             existing = await db.runs.latest_for_issue_stage(
                 self._conn, issue_id=storage_issue_id, stage="review"
@@ -12244,6 +12240,28 @@ class Orchestrator:
                 pid=None,
                 started_at=started_at,
             )
+            created_review_run = True
+        if created_review_run and pr_number is not None and post_codex_review:
+            try:
+                await self._gh.pr_comment(
+                    pr_number,
+                    "@codex review",
+                    repo=binding.github_repo,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not post @codex review on %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+
+        if (
+            created_review_run
+            and post_codex_review
+            and binding.resolved_remote_review()
+        ):
+            await self._move_issue_to_review_state(binding=binding, issue=issue)
         return db.runs.Run(
             id=review_run_id,
             issue_id=storage_issue_id,
