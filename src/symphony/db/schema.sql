@@ -224,7 +224,11 @@ CREATE TABLE IF NOT EXISTS operator_waits (
     linear_team_key TEXT NOT NULL,
     github_repo     TEXT NOT NULL,
     issue_label     TEXT NOT NULL DEFAULT '',
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    -- For `deliver_failed` waits: the real local-review outcome at park time,
+    -- so a `$retry` after a daemon restart reconstructs the human-approval gate
+    -- faithfully instead of assuming APPROVED. NULL for other wait kinds.
+    local_review_outcome TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_operator_waits_run ON operator_waits(run_id);

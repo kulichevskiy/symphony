@@ -191,6 +191,12 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         )
     cur = await conn.execute("PRAGMA table_info(operator_waits)")
     cols = {row[1] for row in await cur.fetchall()}
+    if "local_review_outcome" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits ADD COLUMN local_review_outcome TEXT"
+        )
+    cur = await conn.execute("PRAGMA table_info(operator_waits)")
+    cols = {row[1] for row in await cur.fetchall()}
     if "provider" not in cols:
         await conn.execute(
             "ALTER TABLE operator_waits "

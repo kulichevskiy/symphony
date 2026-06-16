@@ -10639,6 +10639,17 @@ class Orchestrator:
 
         base_branch = await self._resolve_base_branch(binding, issue)
 
+        # First delivery vs. a `$retry` resume. A handoff that faulted *after*
+        # `_start_review_stage` created the review run leaves it live; on resume
+        # the `stage_done` comment and `completed` write must not fire again
+        # (the review run itself is deduped via `create_if_no_active`). A still-
+        # live review run for this issue is the marker that delivery already got
+        # that far. A fully-terminated prior cycle's review run is not live, so a
+        # legitimately new delivery still counts as first.
+        first_delivery = not await db.runs.has_live_stage(
+            self._conn, ctx.storage_issue_id, stage="review"
+        )
+
         # On a reconstructed resume the workspace was re-acquired after the
         # daemon restart — and on a *push*-failure the commits lived only in
         # that workspace, which was already released. If it was swept past its
@@ -10679,39 +10690,45 @@ class Orchestrator:
             await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
 
-        try:
-            next_stage = (
-                "merge"
-                if (
-                    not binding.resolved_local_review()
-                    and not binding.resolved_remote_review()
+        # `stage_done` + `completed` are first-delivery only. On a `$retry`
+        # resume past a faulted handoff the comment would be a duplicate and the
+        # completed write would re-flip a run the park left `failed`; skip both.
+        if first_delivery:
+            try:
+                next_stage = (
+                    "merge"
+                    if (
+                        not binding.resolved_local_review()
+                        and not binding.resolved_remote_review()
+                    )
+                    else "review"
                 )
-                else "review"
-            )
-            done_body = stage_done(
-                CommentVars(
-                    stage="implement",
-                    next_stage=next_stage,
-                    repo=binding.github_repo,
-                    issue=0,
-                    pr_url=pr_url or "(no PR)",
-                    run_id=run_id,
-                    input_tokens=cumulative_usage.input_tokens,
-                    output_tokens=cumulative_usage.output_tokens,
-                    cache_write_tokens=cumulative_usage.cache_write_tokens,
-                    cache_read_tokens=cumulative_usage.cache_read_tokens,
+                done_body = stage_done(
+                    CommentVars(
+                        stage="implement",
+                        next_stage=next_stage,
+                        repo=binding.github_repo,
+                        issue=0,
+                        pr_url=pr_url or "(no PR)",
+                        run_id=run_id,
+                        input_tokens=cumulative_usage.input_tokens,
+                        output_tokens=cumulative_usage.output_tokens,
+                        cache_write_tokens=cumulative_usage.cache_write_tokens,
+                        cache_read_tokens=cumulative_usage.cache_read_tokens,
+                    )
                 )
-            )
-            await tracker.post_comment(issue.id, truncate_body(done_body))
-        except LinearError as e:
-            log.warning("stage_done comment failed on %s: %s", issue.identifier, e)
+                await tracker.post_comment(issue.id, truncate_body(done_body))
+            except LinearError as e:
+                log.warning(
+                    "stage_done comment failed on %s: %s", issue.identifier, e
+                )
 
-        await db.runs.update_status(
-            self._conn,
-            run_id,
-            "completed",
-            ended_at=datetime.now(UTC).isoformat(),
-        )
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
 
         # Past the PR open the handoff (review-state writes, review-stage
         # start, PR summary) is still post-completion delivery: an unexpected
@@ -12197,7 +12214,11 @@ class Orchestrator:
 
         review_run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC).isoformat()
-        await db.runs.create(
+        # Idempotent under a `$retry` resume: a handoff that faulted after this
+        # point already left a live review run, so guard creation (mirrors
+        # `_merge_approved_pr`) and adopt the existing one instead of inserting
+        # a second running review-run row.
+        inserted = await db.runs.create_if_no_active(
             self._conn,
             id=review_run_id,
             issue_id=storage_issue_id,
@@ -12206,6 +12227,23 @@ class Orchestrator:
             pid=None,
             started_at=started_at,
         )
+        if not inserted:
+            existing = await db.runs.latest_for_issue_stage(
+                self._conn, issue_id=storage_issue_id, stage="review"
+            )
+            if existing is not None:
+                return existing
+            # Guard tripped on a live run in another stage but no review run
+            # exists to adopt: force-create so the returned Run is persisted.
+            await db.runs.create(
+                self._conn,
+                id=review_run_id,
+                issue_id=storage_issue_id,
+                stage="review",
+                status="running",
+                pid=None,
+                started_at=started_at,
+            )
         return db.runs.Run(
             id=review_run_id,
             issue_id=storage_issue_id,
@@ -13099,7 +13137,21 @@ class Orchestrator:
                         e,
                     )
         self._pending_deliveries[run_id] = ctx
-        await self._track_deliver_failed_wait(storage_issue_id, run_id, binding)
+        # Persist the real local-review verdict so a `$retry` after a daemon
+        # restart (which drops the in-memory stash) rebuilds the human-approval
+        # gate faithfully instead of assuming APPROVED. A needs-approval verdict
+        # (EXHAUSTED / STUCK_LOOP) must stay parked, not silently ping @codex.
+        local_review_outcome = (
+            ctx.local_review_result.outcome.value
+            if ctx.local_review_result is not None
+            else None
+        )
+        await self._track_deliver_failed_wait(
+            storage_issue_id,
+            run_id,
+            binding,
+            local_review_outcome=local_review_outcome,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
@@ -13128,7 +13180,12 @@ class Orchestrator:
             )
 
     async def _track_deliver_failed_wait(
-        self, issue_id: str, run_id: str, binding: RepoBinding
+        self,
+        issue_id: str,
+        run_id: str,
+        binding: RepoBinding,
+        *,
+        local_review_outcome: str | None = None,
     ) -> None:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
@@ -13145,6 +13202,7 @@ class Orchestrator:
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
+            local_review_outcome=local_review_outcome,
         )
 
     async def _handle_deliver_failed_slash_intent(
@@ -13223,8 +13281,10 @@ class Orchestrator:
         daemon restarted and the in-memory stash was lost.
 
         The completion gate already passed before parking, so a reconstructed
-        context treats local review as already-approved and reads the issue +
-        workspace fresh; the branch and commits are intact on disk.
+        context reads the issue + workspace fresh (the branch and commits are
+        intact on disk) and restores the local-review verdict persisted on the
+        wait — preserving the human-approval gate for a `needs_approval`
+        verdict rather than assuming APPROVED.
         """
         ctx = self._pending_deliveries.get(run_id)
         if ctx is not None:
@@ -13264,16 +13324,38 @@ class Orchestrator:
             workspace_path=workspace_path,
             branch=f"{binding.branch_prefix}/{issue.identifier.lower()}",
             cumulative_usage=UsageDelta(),
-            # Synthetic APPROVED: the local-review gate already passed before
-            # the original park, but the live verdict is gone after a restart.
-            # `None` would read as "not approved" at the delivery gate and
-            # dead-end a `local_review` binding in `_fail_review_run`; APPROVED
-            # lets `_local_review_permits_remote` treat the gate as passed.
-            local_review_result=LoopResult(
-                outcome=LoopOutcome.APPROVED, iterations=0, verdicts=()
+            local_review_result=await self._reconstructed_local_review_result(
+                run_id
             ),
             reconstructed=True,
         )
+
+    async def _reconstructed_local_review_result(
+        self, run_id: str
+    ) -> LoopResult | None:
+        """Rebuild the local-review verdict for a restart-reconstructed resume.
+
+        Reads the outcome persisted on the `deliver_failed` wait. A
+        needs-approval verdict (EXHAUSTED / STUCK_LOOP) is preserved so the
+        delivery handoff re-parks for human approval instead of pinging
+        `@codex` / merging. Falls back to a synthetic APPROVED when nothing was
+        persisted (legacy rows, or a binding without local review): `None`
+        would read as "not approved" and dead-end a `local_review` binding in
+        `_fail_review_run`, whereas APPROVED lets the gate treat it as passed.
+        """
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        outcome = LoopOutcome.APPROVED
+        if wait is not None and wait.local_review_outcome:
+            try:
+                outcome = LoopOutcome(wait.local_review_outcome)
+            except ValueError:
+                log.warning(
+                    "unknown persisted local_review_outcome %r for run %s; "
+                    "treating as APPROVED",
+                    wait.local_review_outcome,
+                    run_id,
+                )
+        return LoopResult(outcome=outcome, iterations=0, verdicts=())
 
 
 __all__ = [
