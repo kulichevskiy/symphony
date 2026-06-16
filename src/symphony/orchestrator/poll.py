@@ -10369,9 +10369,6 @@ class Orchestrator:
                 issue_id=issue_id,
                 current_run_id=run_id,
             )
-            previous_publish_failed = (
-                previous_terminal_kind == db.runs.PUBLISH_FAILED_KIND
-            )
             previous_requires_agent = (
                 previous_terminal_kind is not None
                 and previous_terminal_kind != db.runs.PUBLISH_FAILED_KIND
@@ -10396,11 +10393,13 @@ class Orchestrator:
 
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
-        publish_retry_without_resolved_base = (
-            previous_publish_failed and base_branch is None
-        )
+        # A prior publish_failed marker proves only that an earlier checkout
+        # reached delivery. The current checkout still needs its own proof of
+        # deliverable commits before publish can be resumed; when the base is
+        # unresolved, _branch_ahead_of_base deliberately cannot supply that
+        # proof, so the run falls back to the agent/completion-gate path.
         short_circuit = (
-            (branch_ahead or publish_retry_without_resolved_base)
+            branch_ahead
             and not pending_handoff
             and not previous_requires_agent
         )

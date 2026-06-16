@@ -1817,11 +1817,11 @@ async def test_resume_at_publish_after_delivery_failure_skips_agent(
 
 
 @pytest.mark.asyncio
-async def test_publish_failed_retry_resumes_publish_when_default_branch_unavailable(
+async def test_publish_failed_retry_without_resolved_base_runs_agent_not_publish(
     tmp_path: Path,
 ) -> None:
-    """A publish-failed retry resumes publish even when gh cannot resolve the
-    default branch; the delivery retry must not re-run the implementer."""
+    """A publish-failed retry is not enough to publish when the base cannot be
+    resolved and the current checkout cannot prove deliverable commits."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _no_review_binding(auto_merge=False)
@@ -1835,8 +1835,6 @@ async def test_publish_failed_retry_resumes_publish_when_default_branch_unavaila
         workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
         workspace_path.mkdir(parents=True)
         _init_git_workspace(workspace_path)
-        _git(workspace_path, "branch", "trunk")
-        _git(workspace_path, "commit", "--allow-empty", "-m", "prior agent work")
         await _seed_publish_failed_implement_run(conn)
 
         workspace = MagicMock()
@@ -1863,14 +1861,14 @@ async def test_publish_failed_retry_resumes_publish_when_default_branch_unavaila
 
         await orch._dispatch_one(binding, _issue())  # noqa: SLF001
 
-        assert runner.specs == []
-        push_fn.assert_awaited_once()
-        gh.ensure_pr.assert_awaited_once()
-        assert gh.ensure_pr.await_args.kwargs["base"] is None
+        assert [s.stage for s in runner.specs] == ["implement"]
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
 
         history = await db.runs.history_for_issue(conn, "iss-1")
-        completed = [r for r in history if r.stage == "implement" and r.status == "completed"]
-        assert len(completed) == 1
+        impl = [r for r in history if r.stage == "implement"]
+        assert impl[-1].status == "failed"
+        assert "completion contract" in impl[-1].termination_detail
     finally:
         await conn.close()
 
