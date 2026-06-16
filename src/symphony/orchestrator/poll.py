@@ -12300,6 +12300,25 @@ class Orchestrator:
                     github_repo=binding.github_repo,
                     issue_label=binding.issue_label,
                 )
+                if pr_number is not None:
+                    existing_issue_pr = await db.issue_prs.get(
+                        self._conn,
+                        issue_id=storage_issue_id,
+                        github_repo=binding.github_repo,
+                    )
+                    await db.issue_prs.upsert(
+                        self._conn,
+                        issue_id=storage_issue_id,
+                        github_repo=binding.github_repo,
+                        binding_key=_binding_storage_key(binding),
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        created_at=(
+                            existing_issue_pr.created_at
+                            if existing_issue_pr is not None
+                            else existing.started_at
+                        ),
+                    )
                 if post_codex_review and binding.resolved_remote_review():
                     await self._move_issue_to_review_state(
                         binding=binding, issue=issue
