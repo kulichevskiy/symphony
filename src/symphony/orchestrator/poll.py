@@ -10342,16 +10342,25 @@ class Orchestrator:
         # short-circuit and ensure_pr use it.
         base_branch = await self._resolve_base_branch(binding)
 
-        # A branch already ahead of base means a prior run committed the work:
-        # skip the agent and the completion gate, resume at the agent-free
-        # publish step. The completion gate can never fire on a delivery retry.
-        # The pre-push gates (local-review / verify / dirty-tree) still run
-        # against the reused workspace so the resume records the verify SHA,
-        # guards the dirty tree, and feeds publish a real local-review verdict
-        # — not the `None` its handoff would mis-read as "did not approve".
+        # Resume-at-publish short-circuit: a branch already ahead of base has
+        # committed work to deliver, so skip the agent and the completion gate
+        # and resume at the agent-free publish step. The completion gate can
+        # never fire on a delivery retry. The pre-push gates (local-review /
+        # verify / dirty-tree) still run against the reused workspace so the
+        # resume records the verify SHA, guards the dirty tree, and feeds
+        # publish a real local-review verdict — not the `None` its handoff
+        # would mis-read as "did not approve".
+        # A pending operator `$retry` handoff (`_implement_handoffs`) likewise
+        # forces the agent path so the handoff is consumed (poll.py:_run_agent)
+        # instead of silently dropped.
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
-        if await _branch_ahead_of_base(workspace_path, base_branch):
+        pending_handoff = self._implement_handoffs.get(issue_id) is not None
+        short_circuit = (
+            not pending_handoff
+            and await _branch_ahead_of_base(workspace_path, base_branch)
+        )
+        if short_circuit:
             log.info(
                 "branch for %s already ahead of %s; skipping agent, "
                 "resuming at publish",
@@ -10718,6 +10727,7 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 exc=e,
+                termination_kind=db.runs.PUBLISH_FAILED_KIND,
             )
             return run_id
 
@@ -10741,6 +10751,7 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 exc=e,
+                termination_kind=db.runs.PUBLISH_FAILED_KIND,
             )
             return run_id
 
