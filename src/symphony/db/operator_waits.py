@@ -50,6 +50,7 @@ async def upsert(
     provider: str | None = None,
     tracker_provider: str = "linear",
     tracker_site: str = "default",
+    commit: bool = True,
 ) -> None:
     old = await get(conn, issue_id)
     effective_provider = provider or tracker_provider
@@ -103,7 +104,8 @@ async def upsert(
         await state_transitions.record_transition(
             conn, issue_id, "operator_waits", "kind", old.kind, kind
         )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:

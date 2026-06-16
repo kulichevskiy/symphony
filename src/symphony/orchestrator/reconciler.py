@@ -376,7 +376,7 @@ class Reconciler:
                 issue_row=issue_row,
                 wait=wait,
                 matched_bindings=matched_bindings,
-                recorded_prs=prs,
+                recorded_observations=github_prs,
             )
         except _BackoffRequested:
             raise
@@ -395,7 +395,11 @@ class Reconciler:
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=drift_prs,
         )
-        if github_drift is None and orphans:
+        if (
+            github_drift is None
+            and linear_drift != DRIFT_LINEAR_STATE_DONE
+            and orphans
+        ):
             github_drift = DRIFT_ORPHAN_PR_OPEN
         active = reconcile_auto_clear_enabled()
         remaining = action_budget_remaining
@@ -747,7 +751,7 @@ class Reconciler:
         issue_row: aiosqlite.Row,
         wait: db.operator_waits.OperatorWait | None,
         matched_bindings: list[RepoBinding],
-        recorded_prs: list[LocalIssuePr],
+        recorded_observations: list[GithubPrObservation],
     ) -> list[_AdoptableOrphanPr]:
         """Probe each parked binding's head branch for an unrecorded open PR.
 
@@ -760,14 +764,18 @@ class Reconciler:
         identifier = str(issue_row["identifier"] or "").strip().lower()
         if not identifier:
             return []
-        recorded_repos = {pr.github_repo.casefold() for pr in recorded_prs}
+        active_recorded_repos = {
+            pr.github_repo.casefold()
+            for pr in recorded_observations
+            if pr.error is None and pr.state.upper() == "OPEN"
+        }
         seen_repos: set[str] = set()
         orphans: list[_AdoptableOrphanPr] = []
         for binding in matched_bindings:
             if not binding.reconcile_enabled:
                 continue
             repo_key = binding.github_repo.casefold()
-            if repo_key in recorded_repos or repo_key in seen_repos:
+            if repo_key in active_recorded_repos or repo_key in seen_repos:
                 continue
             seen_repos.add(repo_key)
             head = f"{binding.branch_prefix}/{identifier}"
@@ -868,9 +876,10 @@ class Reconciler:
             if local_review_configured and not remote_review_configured:
                 if not local_only_review_ready:
                     review_run_status = db.runs.NEEDS_APPROVAL_STATUS
+            review_run_id = str(uuid.uuid4())
             await db.runs.create(
                 self._conn,
-                id=str(uuid.uuid4()),
+                id=review_run_id,
                 issue_id=issue_id,
                 stage="review",
                 status=review_run_status,
@@ -884,6 +893,20 @@ class Reconciler:
                 target_state = binding.linear_states.local_code_review
             else:
                 target_state = binding.linear_states.needs_approval
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    run_id=review_run_id,
+                    kind=db.operator_waits.KIND_REVIEW_FAILED,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=observed_at,
+                    provider=binding.provider,
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
+                    commit=False,
+                )
         else:
             # No review configured: the success path routes straight to merge
             # with review_bypassed=True and starts no review stage. Land the
@@ -896,7 +919,11 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
-        if wait is not None:
+        if wait is not None and not (
+            local_review_configured
+            and not remote_review_configured
+            and not local_only_review_ready
+        ):
             await db.operator_waits.delete(
                 self._conn,
                 issue_id,
