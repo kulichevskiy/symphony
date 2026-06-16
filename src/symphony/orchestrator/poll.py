@@ -1413,6 +1413,33 @@ async def _workspace_diff_size(
     return DiffSize(changed_lines=0, changed_files=0)
 
 
+async def _branch_ahead_of_base(workspace_path: Path, base_branch: str | None) -> bool:
+    """True if HEAD has ≥1 commit not in *base_branch* (`git rev-list base..HEAD`).
+
+    Mirrors the diff helper's ref logic: prefer `origin/<base>..HEAD`, fall back
+    to `<base>..HEAD` when origin is absent. On any error (or no base), report
+    False so the run takes the normal agent path instead of skipping it — a
+    branch we can't prove is ahead must not bypass the implementer.
+    """
+    if not base_branch:
+        return False
+    for ref in (f"origin/{base_branch}..HEAD", f"{base_branch}..HEAD"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-list", "--count", ref,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                count = stdout.decode().strip()
+                return count.isdigit() and int(count) > 0
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 async def _workspace_scrub(workspace_path: Path) -> None:
     """Reset the working tree to HEAD and remove untracked files.
 
@@ -10311,6 +10338,192 @@ class Orchestrator:
             )
             return run_id
 
+        workspace_released = False
+
+        def release_workspace() -> None:
+            nonlocal workspace_released
+            if not workspace_released:
+                self._workspace.release(binding, issue)
+                workspace_released = True
+
+        # 3.5. Resolve the delivery base once; both the branch-already-ahead
+        # short-circuit and ensure_pr use it.
+        release_on_setup_failure = False
+        try:
+            base_branch = await self._resolve_base_branch(binding)
+
+            # Branch-already-ahead short-circuit: when HEAD already contains
+            # commits over the delivery base, skip the implementer and its
+            # completion gate and go straight to the agent-free publish path.
+            # The pre-push gates (local-review / verify / dirty-tree) still
+            # run against the reused workspace so the resume records the
+            # verify SHA, guards the dirty tree, and feeds publish a real
+            # local-review verdict — not the `None` its handoff would mis-read
+            # as "did not approve". A pending operator `$retry` handoff
+            # (`_implement_handoffs`) likewise forces the agent path so the
+            # handoff is consumed (poll.py:_run_agent) instead of silently
+            # dropped. Previous non-publish implement failures are unsafe to
+            # publish blindly because the agent may have left partial commits.
+            pending_handoff = self._implement_handoffs.get(issue_id) is not None
+            previous_terminal_kind = await self._previous_implement_terminal_kind(
+                issue_id=issue_id,
+                current_run_id=run_id,
+            )
+            previous_requires_agent = (
+                previous_terminal_kind is not None
+                and previous_terminal_kind != db.runs.PUBLISH_FAILED_KIND
+            )
+            branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
+        except Exception as e:  # noqa: BLE001 — surface as failed run
+            release_on_setup_failure = True
+            log.exception("implement dispatch setup failed for %s", issue.identifier)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"implement dispatch setup failed: {e}",
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+                exc=e,
+            )
+            return run_id
+        finally:
+            if release_on_setup_failure:
+                release_workspace()
+
+        cumulative_usage: UsageDelta
+        local_review_result: LoopResult | None
+        # A prior publish_failed marker proves only that an earlier checkout
+        # reached delivery. The current checkout still needs its own proof of
+        # deliverable commits before publish can be resumed; when the base is
+        # unresolved, _branch_ahead_of_base deliberately cannot supply that
+        # proof, so the run falls back to the agent/completion-gate path.
+        short_circuit = (
+            branch_ahead
+            and not pending_handoff
+            and not previous_requires_agent
+        )
+        if short_circuit:
+            log.info(
+                "branch for %s already ahead of %s; skipping agent, "
+                "proceeding to publish",
+                issue.identifier,
+                base_branch,
+            )
+            cumulative_usage = UsageDelta()
+            # Release before the gates run (mirroring the implement path,
+            # poll.py:_run_implement_phase): the gates operate on the released
+            # workspace, and releasing first means a gate raising can't leak
+            # the workspace into WorkspaceManager._in_use forever.
+            release_workspace()
+            try:
+                proceed, local_review_result = await self._run_prepush_gates(
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                    allow_fixes=False,
+                )
+            except Exception as e:  # noqa: BLE001 — fail closed before publish
+                log.exception(
+                    "pre-push gate failed during publish resume for %s",
+                    issue.identifier,
+                )
+                await self._fail_run_and_reset_issue(
+                    run_id,
+                    f"pre-push gate failed during publish resume: {e}",
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    rollback_state_id=issue.state_id,
+                    binding=binding,
+                    exc=e,
+                )
+                return run_id
+            if not proceed:
+                # A gate halted the run; state is already recorded.
+                return run_id
+        else:
+            phase = await self._run_implement_phase(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+            )
+            if phase is None:
+                # The agent step halted (failed / blocked / parked); the run
+                # state is already recorded. Never reaches publish.
+                return run_id
+            cumulative_usage, local_review_result = phase
+
+        return await self._publish_stage(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            base_branch=base_branch,
+            cumulative_usage=cumulative_usage,
+            local_review_result=local_review_result,
+        )
+
+    async def _previous_implement_terminal_kind(
+        self, *, issue_id: str, current_run_id: str
+    ) -> str | None:
+        """Return the prior failed implement terminal kind, if any."""
+
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        previous = next(
+            (
+                run
+                for run in reversed(history)
+                if run.stage == "implement" and run.id != current_run_id
+            ),
+            None,
+        )
+        if previous is None:
+            return None
+        if previous.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+            return None
+        return previous.termination_kind
+
+    async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:
+        """The PR base: the binding's configured base, else the repo default.
+
+        On a default-branch lookup error, fall back to gh's own default (None)
+        rather than failing the run.
+        """
+        if binding.base_branch is not None:
+            return binding.base_branch
+        try:
+            return await self._gh.repo_default_branch(binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "repo_default_branch failed for %s; falling back to gh default: %s",
+                binding.github_repo,
+                e,
+            )
+            return None
+
+    async def _run_implement_phase(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+    ) -> tuple[UsageDelta, LoopResult | None] | None:
+        """The agent step: run the implementer, apply the completion gate, then
+        the local-review / verify / dirty-tree pre-push gates.
+
+        Returns ``(cumulative_usage, local_review_result)`` when the branch is
+        ready to publish, or ``None`` when the run was halted (failed, blocked,
+        or parked on an operator wait) and the caller should return. The
+        completion gate lives here and only here — it never guards delivery.
+        """
+        issue_id = storage_issue_id
         prior_total = await db.runs.cost_for_issue(self._conn, issue_id)
         # Branch base before the agent runs, so the completion gate can tell
         # whether the run actually advanced HEAD (≥1 new commit).
@@ -10338,7 +10551,7 @@ class Orchestrator:
                 binding=binding,
                 exc=e,
             )
-            return run_id
+            return None
         finally:
             self._workspace.release(binding, issue)
 
@@ -10368,7 +10581,7 @@ class Orchestrator:
                 final_kind=final_kind,
                 returncode=final_returncode,
             )
-            return run_id
+            return None
 
         # 4.25. Completion gate. rc=0 alone is not "done": an agent that ends
         # its turn politely blocked on a human action (MCH-14) also exits 0.
@@ -10403,7 +10616,7 @@ class Orchestrator:
                 binding=binding,
                 returncode=final_returncode,
             )
-            return run_id
+            return None
         if completion.outcome != "completed":
             reason = (
                 "implement run exited 0 but did not satisfy the completion "
@@ -10420,7 +10633,46 @@ class Orchestrator:
                 binding=binding,
                 returncode=final_returncode,
             )
-            return run_id
+            return None
+
+        proceed, local_review_result = await self._run_prepush_gates(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+        )
+        if not proceed:
+            # A gate halted the run (failed / blocked / parked); state is
+            # already recorded. Never reaches publish.
+            return None
+
+        return cumulative_usage, local_review_result
+
+    async def _run_prepush_gates(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+        allow_fixes: bool = True,
+    ) -> tuple[bool, LoopResult | None]:
+        """Pre-push validation gates: local-review, verify, dirty-tree.
+
+        Runs after the agent step — or, on the branch-already-ahead
+        short-circuit, in place of it — and before the agent-free publish
+        stage, so what gets pushed is what was reviewed and verified. The
+        branch-ahead short-circuit reuses an existing workspace and calls with
+        ``allow_fixes=False``: validators may run, but any red/dirty result
+        fails closed instead of spawning a code-mutating fix turn.
+
+        Returns ``(proceed, local_review_result)``: ``proceed`` is False when
+        a gate halted the run (failed / blocked / parked) and the caller
+        should stop — the run state is already recorded.
+        """
+        issue_id = storage_issue_id
 
         # 4.5. Local-review pre-flight. When `binding.local_review` is set,
         # run the reviewer in-workspace before pushing. This shortens the
@@ -10435,6 +10687,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
+                allow_fixes=allow_fixes,
             )
             if _local_review_infra_failed(local_review_result):
                 await self._block_local_only_review_infra_failure(
@@ -10444,7 +10697,7 @@ class Orchestrator:
                     run_id=run_id,
                     result=local_review_result,
                 )
-                return run_id
+                return False, local_review_result
 
         # 4.7. Verify gate. When `binding.verify_cmd` is set, run it after
         # the last code-mutating stage (post local-review fixes) and before
@@ -10458,6 +10711,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 workspace_path=workspace_path,
                 parent_run_id=run_id,
+                allow_fixes=allow_fixes,
             )
             if not verify_result.ok:
                 await self._block_verify_failure(
@@ -10467,7 +10721,7 @@ class Orchestrator:
                     run_id=run_id,
                     result=verify_result,
                 )
-                return run_id
+                return False, local_review_result
             # SYM-108: record the green gate against the exact head it
             # verified so the merge gate can treat a no-CI repo as mergeable
             # only for this SHA. A later HEAD-advancing fix turn (e.g. the
@@ -10485,9 +10739,10 @@ class Orchestrator:
         # 4.8. Pre-push dirty-tree gate. Pushing only commits means any
         # uncommitted work silently vanishes on workspace cleanup (MCH-14).
         # Runs after the verify gate so leftovers from the verify fix turn
-        # are caught too. Dirty tree → one fix turn → re-check → fail-closed.
+        # are caught too. Normal implement path: one fix turn, re-check, then
+        # fail closed. Publish-resume path: no fix turn; fail closed directly.
         dirty_files = await _workspace_dirty_files(workspace_path)
-        if dirty_files:
+        if dirty_files and allow_fixes:
             log.warning(
                 "dirty working tree before push for %s (%d entries); "
                 "dispatching one fix turn",
@@ -10505,17 +10760,44 @@ class Orchestrator:
             dirty_files = await _workspace_dirty_files(workspace_path)
         if dirty_files:
             listing = "\n".join(f"- `{line}`" for line in dirty_files)
+            reason = (
+                "working tree still dirty after one fix turn; not pushing."
+                if allow_fixes
+                else "working tree dirty during publish resume; not pushing."
+            )
             await self._fail_run_and_reset_issue(
                 run_id,
-                "working tree still dirty after one fix turn; "
-                f"not pushing. Uncommitted files:\n{listing}",
+                f"{reason} Uncommitted files:\n{listing}",
                 issue=issue,
                 storage_issue_id=issue_id,
                 rollback_state_id=issue.state_id,
                 binding=binding,
             )
-            return run_id
+            return False, local_review_result
 
+        return True, local_review_result
+
+    async def _publish_stage(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+        base_branch: str | None,
+        cumulative_usage: UsageDelta,
+        local_review_result: LoopResult | None,
+    ) -> str:
+        """Delivery: push + ensure_pr + review/merge handoff.
+
+        Agent-free and idempotent — safe to (re)run on a branch that is already
+        pushed / already has a PR: the push fast-forwards to a no-op and
+        ``ensure_pr`` adopts the existing PR. The completion gate never guards
+        this step.
+        """
+        issue_id = storage_issue_id
+        tracker = self.tracker(binding)
         # 5. Push branch, open PR, post stage-transition comment.
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
@@ -10530,20 +10812,11 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 exc=e,
+                termination_kind=db.runs.PUBLISH_FAILED_KIND,
             )
             return run_id
 
         pr_url: str = ""
-        base_branch = binding.base_branch
-        if base_branch is None:
-            try:
-                base_branch = await self._gh.repo_default_branch(binding.github_repo)
-            except GitHubError as e:
-                log.warning(
-                    "repo_default_branch failed for %s; falling back to gh default: %s",
-                    issue.identifier,
-                    e,
-                )
         try:
             pr_url = await self._gh.ensure_pr(
                 title=build_pr_title(issue),
@@ -10563,6 +10836,7 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 exc=e,
+                termination_kind=db.runs.PUBLISH_FAILED_KIND,
             )
             return run_id
 
@@ -11258,6 +11532,7 @@ class Orchestrator:
         storage_issue_id: str | None = None,
         workspace_path: Path,
         parent_run_id: str,
+        allow_fixes: bool = True,
     ) -> LoopResult | None:
         """Run the local-review session and surface its outcome on Linear.
 
@@ -11365,6 +11640,7 @@ class Orchestrator:
                     ),
                     workspace_scrubber=_workspace_scrub,
                     on_iteration=_on_iteration,
+                    allow_fixes=allow_fixes,
                 )
             finally:
                 await self._finalize_local_review_run(
@@ -11711,6 +11987,7 @@ class Orchestrator:
         storage_issue_id: str,
         workspace_path: Path,
         parent_run_id: str,
+        allow_fixes: bool = True,
     ) -> VerifyResult:
         """Run the binding's `verify_cmd` gate in the workspace.
 
@@ -11762,6 +12039,7 @@ class Orchestrator:
                 command_secs=self.config.command_timeout_secs,
                 usage_handler=cost_estimator.delta,
                 fix_log_path=verify_log_path,
+                allow_fixes=allow_fixes,
             )
         except Exception as e:  # noqa: BLE001 — fail closed
             log.exception("verify phase raised on %s", issue.identifier)
