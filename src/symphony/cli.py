@@ -265,6 +265,9 @@ async def _run(config_path: Path, *, once: bool) -> None:
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
                     ),
                     ui_command_sink=orch,
+                    ui_webhook_public_url=os.environ.get(
+                        "SYMPHONY_WEBHOOK_PUBLIC_URL"
+                    ),
                 )
                 server = uvicorn.Server(
                     build_server_config(

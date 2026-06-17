@@ -20,6 +20,13 @@ export type CanonicalStatus = {
 export type IssueScope = "active" | "done";
 export type IssueWarning = "no_progress";
 
+export interface Meta {
+  /** Public origin the webhook receiver is reachable at (dev tunnel), or null. */
+  tunnel_url?: string | null;
+  /** Paste-ready Linear webhook URL (tunnel origin + /linear/webhook), or null. */
+  linear_webhook_url?: string | null;
+}
+
 export interface IssueSummary {
   id: string;
   identifier: string;
@@ -334,6 +341,10 @@ export function fetchIssues({
     "Issue list not found",
     "Failed to load issues",
   );
+}
+
+export function fetchMeta(): Promise<Meta> {
+  return fetchJson<Meta>("/api/meta", "Meta not found", "Failed to load meta");
 }
 
 export function fetchSpendSummary(

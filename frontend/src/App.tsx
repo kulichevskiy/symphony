@@ -1,8 +1,12 @@
+import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { Link, Route, Routes } from "react-router";
 
 import { FilterBar } from "@/components/dashboard/FilterBar";
 import { LiveDot } from "@/components/dashboard/StatusBadge";
 import { ThemeToggle } from "@/components/dashboard/ThemeToggle";
+import { Icon } from "@/components/ui/icon";
+import { fetchMeta } from "@/lib/api";
 import { FiltersProvider } from "@/lib/filters";
 import { useTheme } from "@/lib/useTheme";
 import { HomePage } from "@/pages/HomePage";
@@ -29,6 +33,35 @@ function Wordmark() {
   );
 }
 
+function WebhookChip() {
+  const { data } = useQuery({
+    queryKey: ["meta"],
+    queryFn: fetchMeta,
+    staleTime: Infinity,
+  });
+  const [copied, setCopied] = useState(false);
+  const url = data?.linear_webhook_url;
+  if (!url) return null;
+
+  const copy = () => {
+    void navigator.clipboard?.writeText(url);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      title={`${url}\n(click to copy — paste into the Linear webhook URL)`}
+      className="hidden max-w-[260px] items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground sm:inline-flex"
+    >
+      <Icon name={copied ? "check" : "external"} size={13} />
+      <span className="truncate font-mono">{copied ? "copied!" : url}</span>
+    </button>
+  );
+}
+
 export function App() {
   const { dark, toggle } = useTheme();
 
@@ -41,6 +74,7 @@ export function App() {
               <Wordmark />
             </Link>
             <div className="flex items-center gap-2">
+              <WebhookChip />
               <span className="hidden items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground sm:inline-flex">
                 <LiveDot tone="bg-green-500" /> daemon · loopback
               </span>

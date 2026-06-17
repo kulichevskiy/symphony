@@ -918,6 +918,13 @@ def _list_issues_query(
     )
 
 
+class Meta(BaseModel):
+    """Deployment-level info for the UI shell (not issue data)."""
+
+    tunnel_url: str | None = None
+    linear_webhook_url: str | None = None
+
+
 def create_api_router(
     ui_db_pool: ReadOnlyDbPool | None = None,
     *,
@@ -926,8 +933,13 @@ def create_api_router(
     no_progress_threshold: timedelta | None = None,
     command_sink: CommandSink | None = None,
     teams: list[str] | None = None,
+    webhook_public_url: str | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
+    # Public origin the webhook receiver is reachable at (e.g. the dev
+    # cloudflared quick-tunnel), surfaced in /meta so the UI can show the
+    # paste-ready Linear webhook URL. None in normal/prod runs.
+    webhook_base = (webhook_public_url or "").strip().rstrip("/") or None
     # Always-unscoped team keys from config, surfaced in /spend/summary to
     # populate the Teams filter popover. Sorted for a stable popover order.
     config_teams = sorted(teams or [])
@@ -1203,6 +1215,15 @@ def create_api_router(
         command_id = command_sink.enqueue_web_command(issue_id, kind)
         return CommandAccepted(
             status="accepted", command_id=command_id, command=f"${kind.value}"
+        )
+
+    @router.get("/meta", response_model=Meta, response_model_exclude_defaults=True)
+    async def meta() -> Meta:
+        return Meta(
+            tunnel_url=webhook_base,
+            linear_webhook_url=(
+                f"{webhook_base}/linear/webhook" if webhook_base else None
+            ),
         )
 
     @router.api_route(

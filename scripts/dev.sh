@@ -28,6 +28,13 @@ WEBHOOK_PORT="${WEBHOOK_PORT:-8787}"
 
 START_TUNNEL="${SYMPHONY_TUNNEL:-1}"
 
+# Let the reconciler actively heal drift (default in dev), so a PR merged by
+# hand at the merge gate completes the issue instead of stranding it as a
+# `merge_zombie` drift. `reconcile_auto_clear_enabled` reads os.environ
+# directly, so it must be exported here (.env is not loaded into the daemon's
+# process env). Set SYMPHONY_RECONCILE_DRYRUN=1 to keep observe-only.
+export SYMPHONY_RECONCILE_DRYRUN="${SYMPHONY_RECONCILE_DRYRUN:-0}"
+
 # symphony only mounts /linear/webhook when LINEAR_WEBHOOK_SECRET is set (env
 # or .env). Without it the tunnel would just advertise a 404, so detect the
 # secret and skip the tunnel with a hint when the receiver is disabled.
@@ -95,6 +102,9 @@ elif [[ "$START_TUNNEL" != "0" ]]; then
       sleep 0.5
     done
     if [[ -n "$TUNNEL_URL" ]]; then
+      # Hand the tunnel origin to the daemon so the UI can surface the
+      # paste-ready webhook URL (GET /api/meta → header link).
+      export SYMPHONY_WEBHOOK_PUBLIC_URL="$TUNNEL_URL"
       # The receiver registers POST /linear/webhook (no prefix), so the bare
       # tunnel origin would 404 — paste the full path into Linear.
       echo
