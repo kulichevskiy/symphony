@@ -280,6 +280,50 @@ async def test_ui_disabled_skips_ui_and_api_mounts(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_meta_returns_webhook_url_when_public_url_set(tmp_path: Path) -> None:
+    app = create_app(
+        _Handler(),
+        object(),  # type: ignore[arg-type]
+        ui_enabled=True,
+        ui_dist_dir=_dist(tmp_path),
+        ui_webhook_public_url="https://abc-123.trycloudflare.com/",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/meta")
+
+    assert response.status_code == 200
+    # Trailing slash on the public origin is stripped before the path is joined.
+    assert response.json() == {
+        "tunnel_url": "https://abc-123.trycloudflare.com",
+        "linear_webhook_url": "https://abc-123.trycloudflare.com/linear/webhook",
+    }
+
+
+@pytest.mark.asyncio
+async def test_api_meta_empty_without_public_url(tmp_path: Path) -> None:
+    app = create_app(
+        _Handler(),
+        object(),  # type: ignore[arg-type]
+        ui_enabled=True,
+        ui_dist_dir=_dist(tmp_path),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get("/api/meta")
+
+    assert response.status_code == 200
+    # Defaults excluded → no tunnel advertised in normal/prod runs.
+    assert response.json() == {}
+
+
+@pytest.mark.asyncio
 async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)

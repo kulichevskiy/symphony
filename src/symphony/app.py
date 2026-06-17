@@ -68,6 +68,7 @@ def create_app(
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
+    ui_webhook_public_url: str | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     ui_pool = (
@@ -156,6 +157,7 @@ def create_app(
                 no_progress_threshold=ui_pr_no_progress_threshold,
                 command_sink=ui_command_sink,
                 teams=ui_teams,
+                webhook_public_url=ui_webhook_public_url,
             )
         )
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST
