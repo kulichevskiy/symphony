@@ -2473,6 +2473,80 @@ async def test_start_review_stage_adopted_live_review_preserves_pr_timestamp(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_start_review_stage_adopted_live_review_keeps_pr_metadata_for_bad_url(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo=binding.github_repo,
+            issue_label=None,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            binding_key="old-binding",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-09T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="not-a-pr-url",
+        )
+
+        assert run.id == "live-review"
+        state = await db.review_state.get(conn, issue.id)
+        assert state.pr_number == 42
+        assert state.pr_url == "https://github.com/org/repo/pull/42"
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue.id)
+        assert issue_pr is not None
+        assert issue_pr.pr_number == 42
+        assert issue_pr.pr_url == "https://github.com/org/repo/pull/42"
+    finally:
+        await conn.close()
+
+
 # --- Failure visibility and retry ------------------------------------------
 
 

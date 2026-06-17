@@ -767,8 +767,17 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pr_error", "expected_error_text"),
+    [
+        (GitHubError("gh pr create: HTTP 401"), "HTTP 401"),
+        (TimeoutError("gh timed out"), "gh timed out"),
+    ],
+)
 async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
     tmp_path: Path,
+    pr_error: Exception,
+    expected_error_text: str,
 ) -> None:
     """A post-completion-gate delivery failure (pr_create raises) parks the
     issue as `deliver_failed` — NOT implement_failed — without re-dispatching
@@ -801,7 +810,7 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(side_effect=GitHubError("gh pr create: HTTP 401"))
+        gh.ensure_pr = AsyncMock(side_effect=pr_error)
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -850,7 +859,7 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
 
         # The parked comment captured the verbatim delivery error.
         posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
-        assert any("HTTP 401" in body for body in posted)
+        assert any(expected_error_text in body for body in posted)
 
         # --- `$retry` resumes delivery; pr_create now succeeds. ---
         gh.ensure_pr = AsyncMock(

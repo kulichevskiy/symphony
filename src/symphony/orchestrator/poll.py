@@ -10790,7 +10790,7 @@ class Orchestrator:
                 repo=binding.github_repo,
                 linear_url=issue.url,
             )
-        except GitHubError as e:
+        except Exception as e:  # noqa: BLE001
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
@@ -12310,15 +12310,15 @@ class Orchestrator:
             self._conn, issue_id=storage_issue_id, stage="review"
         )
         if existing is not None:
-            await db.review_state.refresh_pr_metadata(
-                self._conn,
-                storage_issue_id,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                github_repo=binding.github_repo,
-                issue_label=binding.issue_label,
-            )
             if pr_number is not None:
+                await db.review_state.refresh_pr_metadata(
+                    self._conn,
+                    storage_issue_id,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label,
+                )
                 existing_issue_pr = await db.issue_prs.get(
                     self._conn,
                     issue_id=storage_issue_id,
