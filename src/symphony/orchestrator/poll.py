@@ -11199,6 +11199,11 @@ class Orchestrator:
             return run_id
         if first_handoff:
             await self._clear_operator_wait(ctx.storage_issue_id, run_id)
+            # The run now continues into the review/merge stage, so it stays the
+            # active dispatch run for this issue. `_clear_operator_wait` drops the
+            # `_dispatch_run_ids` entry (correct when tearing down a parked wait,
+            # not here on a successful first handoff), so restore it.
+            self._dispatch_run_ids[ctx.storage_issue_id] = run_id
         if not first_handoff:
             await db.runs.update_status(
                 self._conn,
