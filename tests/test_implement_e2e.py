@@ -1174,6 +1174,100 @@ async def test_no_review_deliver_retry_skips_duplicate_stage_done_after_marker(
 
 
 @pytest.mark.asyncio
+async def test_first_handoff_persists_recovery_wait_before_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        real_update_status = db.runs.update_status
+        checked_completed = False
+
+        async def crash_after_completed(
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal checked_completed
+            await real_update_status(*args, **kwargs)  # type: ignore[arg-type]
+            run_id = str(args[1])
+            status = str(args[2])
+            if status != "completed":
+                return
+            wait = await db.operator_waits.get(conn, "iss-1")
+            assert wait is not None
+            assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+            assert wait.run_id == run_id
+            checked_completed = True
+            raise RuntimeError("daemon died after completed")
+
+        monkeypatch.setattr(db.runs, "update_status", crash_after_completed)
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match="daemon died after completed"):
+            await _scan_and_wait(orch, binding)
+
+        assert checked_completed
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "completed"
+        assert await db.issue_prs.get_for_issue(conn, issue_id="iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_no_review_deliver_retry_skips_stage_done_when_handoff_metadata_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -4150,6 +4150,10 @@ class Orchestrator:
             return
         current_binding, current_issue = current
         rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return
         rearm_done = True
         if rearm_retry_pending:
             state = await db.review_state.get(self._conn, run.issue_id)
@@ -4161,6 +4165,10 @@ class Orchestrator:
             )
             if rearm_done:
                 await self._clear_review_rearm_retry(run.id)
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return
         handled_feedback = await self._poll_review_run(
             run, current_binding, current_issue
         )
@@ -4343,6 +4351,33 @@ class Orchestrator:
         log.info(
             "interrupted review monitor(s) %s for issue_id=%s after deliver_failed halt",
             ", ".join(sorted(closed_run_ids)),
+            issue_id,
+        )
+
+    def _cancel_deliver_failed_review_poll_tasks(self, issue_id: str) -> None:
+        """Stop in-flight Review polling while delivery is parked as failed.
+
+        The durable Review monitor row stays live so a `$retry` can adopt it
+        once delivery resumes; only the current in-memory poll task is
+        cancelled/suppressed.
+        """
+        cancelled_run_ids: set[str] = set()
+        for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
+            if mapped_issue_id != issue_id:
+                continue
+            task = self._review_poll_run_tasks.pop(mapped_run_id, None)
+            if task is not None:
+                self._review_poll_tasks.discard(task)
+                if not task.done():
+                    task.cancel()
+            self._review_poll_run_ids.discard(mapped_run_id)
+            self._review_poll_issue_ids.pop(mapped_issue_id, None)
+            cancelled_run_ids.add(mapped_run_id)
+        if not cancelled_run_ids:
+            return
+        log.info(
+            "cancelled review poll task(s) %s for issue_id=%s after deliver_failed halt",
+            ", ".join(sorted(cancelled_run_ids)),
             issue_id,
         )
 
@@ -4645,6 +4680,11 @@ class Orchestrator:
                 ),
             )
 
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            storage_issue_id, run.id
+        ):
+            return False
+
         if remote_review:
             await self._maybe_post_codex_lgtm(
                 run=run,
@@ -4680,6 +4720,10 @@ class Orchestrator:
             if has_hit_iteration_cap(
                 iteration=state.iteration, cap=self.config.review_iteration_cap
             ):
+                if await self._review_poll_deferred_by_deliver_failed_wait(
+                    storage_issue_id, run.id
+                ):
+                    return False
                 await self._park_review_for_approval(
                     run=run,
                     binding=binding,
@@ -4708,6 +4752,10 @@ class Orchestrator:
         if has_hit_iteration_cap(
             iteration=state.iteration, cap=self.config.review_iteration_cap
         ):
+            if await self._review_poll_deferred_by_deliver_failed_wait(
+                storage_issue_id, run.id
+            ):
+                return False
             await self._park_review_for_approval(
                 run=run,
                 binding=binding,
@@ -4751,6 +4799,10 @@ class Orchestrator:
         verdict: Verdict,
         iteration: int,
     ) -> bool:
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return False
         log_tail = await self._failing_check_log_tail(
             checks=checks,
             verdict=verdict,
@@ -5219,6 +5271,10 @@ class Orchestrator:
         verdict: Verdict,
         iteration: int,
     ) -> bool:
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return False
         state = await db.review_state.get(self._conn, issue.id)
         pr_url = _pr_url_for_state(
             repo=binding.github_repo,
@@ -6437,6 +6493,10 @@ class Orchestrator:
         issue: LinearIssue,
         iteration: int,
     ) -> bool:
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return False
         base_branch = binding.base_branch
         if base_branch is None:
             try:
@@ -10808,9 +10868,10 @@ class Orchestrator:
 
         # The stage-transition comment is first-delivery only. The completed
         # write must happen before the first handoff so the review run can pass
-        # its active-run guard; a resumed delivery reasserts completion after a
-        # successful handoff below, repairing the `failed` status left by
-        # `_park_deliver_failed`.
+        # its active-run guard. Persist a recovery wait before that completed
+        # write so a daemon crash cannot leave a terminal implement run with no
+        # handoff metadata and no `$retry` target. Successful handoff clears the
+        # temporary wait below.
         if first_handoff:
             if not stage_done_announced:
                 await db.runs.mark_stage_done_announced(
@@ -10847,6 +10908,7 @@ class Orchestrator:
                         "stage_done comment failed on %s: %s", issue.identifier, e
                     )
 
+            await self._track_delivery_handoff_recovery_wait(ctx)
             await db.runs.update_status(
                 self._conn,
                 run_id,
@@ -10867,6 +10929,8 @@ class Orchestrator:
             log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
             return run_id
+        if first_handoff:
+            await self._clear_operator_wait(ctx.storage_issue_id, run_id)
         if not first_handoff:
             await db.runs.update_status(
                 self._conn,
@@ -13379,6 +13443,7 @@ class Orchestrator:
             binding,
             local_review_outcome=local_review_outcome,
         )
+        self._cancel_deliver_failed_review_poll_tasks(storage_issue_id)
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
@@ -13405,6 +13470,22 @@ class Orchestrator:
             log.warning(
                 "deliver_failed comment post failed on %s: %s", issue.identifier, e
             )
+
+    async def _track_delivery_handoff_recovery_wait(
+        self, ctx: _PendingDelivery
+    ) -> None:
+        """Persist a temporary retry target before first review handoff."""
+        local_review_outcome = (
+            ctx.local_review_result.outcome.value
+            if ctx.local_review_result is not None
+            else None
+        )
+        await self._track_deliver_failed_wait(
+            ctx.storage_issue_id,
+            ctx.run_id,
+            ctx.binding,
+            local_review_outcome=local_review_outcome,
+        )
 
     async def _track_deliver_failed_wait(
         self,

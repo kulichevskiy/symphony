@@ -1472,6 +1472,70 @@ async def test_active_review_polls_when_issue_is_in_configured_review_state(
 
 
 @pytest.mark.asyncio
+async def test_review_poll_rechecks_deliver_failed_wait_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        run = next(
+            run
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+            if run.id == "review-run"
+        )
+        await db.runs.create(
+            conn,
+            id="implement-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T23:59:00+00:00",
+        )
+
+        async def park_after_refresh(_run_id: str) -> bool:
+            await db.operator_waits.upsert(
+                conn,
+                issue_id="iss-1",
+                run_id="implement-run",
+                kind=db.operator_waits.KIND_DELIVER_FAILED,
+                linear_team_key=binding.linear_team_key,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label or "",
+                created_at="2026-05-10T00:01:00+00:00",
+                provider=binding.provider,
+                tracker_provider=binding.tracker_provider,
+                tracker_site=binding.tracker_site,
+            )
+            return False
+
+        orch._review_rearm_retry_pending = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=park_after_refresh
+        )
+        orch._poll_review_run = AsyncMock(return_value=True)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_review_run_with_limits(  # noqa: SLF001
+            run, binding, _issue_in_review()
+        )
+
+        orch._poll_review_run.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_active_review_closes_when_issue_leaves_review_active_states(
     tmp_path: Path,
 ) -> None:
