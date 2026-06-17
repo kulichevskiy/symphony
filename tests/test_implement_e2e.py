@@ -895,6 +895,92 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
 
 
 @pytest.mark.asyncio
+async def test_deliver_failed_retry_keeps_wait_when_delivery_raises(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(side_effect=GitHubError("gh pr create: HTTP 401"))
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        run_id = wait.run_id
+
+        orch._deliver_implement_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=RuntimeError("unexpected delivery crash")
+        )
+
+        with pytest.raises(RuntimeError, match="unexpected delivery crash"):
+            await orch._handle_slash_intent(  # noqa: SLF001
+                "iss-1",
+                run_id,
+                SlashIntent(
+                    kind=SlashKind.RETRY,
+                    comment_id="c-retry",
+                    created_at="2026-05-10T01:00:00+00:00",
+                ),
+            )
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        assert wait.run_id == run_id
+        assert run_id in orch._deliver_failed_run_bindings  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_in_memory_deliver_retry_reacquires_and_reparks_stale_workspace(
     tmp_path: Path,
 ) -> None:
@@ -1080,6 +1166,109 @@ async def test_no_review_deliver_retry_skips_duplicate_stage_done_after_marker(
         posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
         assert sum("**Implement → Merge**" in body for body in posted) == 1
         assert upsert_calls == 2
+        assert workspace.acquire.await_count == 2
+        assert workspace.release.call_count == 2
+        assert len([s for s in runner.specs if s.stage == "implement"]) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_review_deliver_retry_skips_stage_done_when_handoff_metadata_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        real_begin_review = db.review_state.begin_review
+        begin_calls = 0
+
+        async def flaky_begin_review(*args: object, **kwargs: object) -> None:
+            nonlocal begin_calls
+            begin_calls += 1
+            if begin_calls == 1:
+                raise RuntimeError("review_state write failed")
+            await real_begin_review(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(db.review_state, "begin_review", flaky_begin_review)
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        run_id = wait.run_id
+        state = await db.review_state.get(conn, "iss-1")
+        assert state.pr_number is None
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id="iss-1")
+        assert issue_pr is None
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert sum("**Implement → Merge**" in body for body in posted) == 1
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert sum("**Implement → Merge**" in body for body in posted) == 1
+        assert begin_calls == 2
         assert workspace.acquire.await_count == 2
         assert workspace.release.call_count == 2
         assert len([s for s in runner.specs if s.stage == "implement"]) == 1

@@ -10795,13 +10795,15 @@ class Orchestrator:
             await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
 
-        # First delivery vs. a `$retry` resume. Review-enabled handoff writes a
+        # First handoff vs. a `$retry` resume. Review-enabled handoff writes a
         # live review run; no-review handoff writes only review_state/issue_prs.
-        # Treat either durable PR marker as "handoff already got this far" so
-        # a retry after a late handoff failure does not repost stage_done or
-        # re-run first-delivery side effects.
-        first_delivery = not await self._delivery_handoff_started(
+        # The Linear stage_done announcement has its own durable marker because
+        # a handoff can fail before either PR/review metadata row exists.
+        first_handoff = not await self._delivery_handoff_started(
             ctx=ctx, pr_url=pr_url
+        )
+        stage_done_announced = await db.runs.has_stage_done_announced(
+            self._conn, run_id
         )
 
         # The stage-transition comment is first-delivery only. The completed
@@ -10809,35 +10811,41 @@ class Orchestrator:
         # its active-run guard; a resumed delivery reasserts completion after a
         # successful handoff below, repairing the `failed` status left by
         # `_park_deliver_failed`.
-        if first_delivery:
-            try:
-                next_stage = (
-                    "merge"
-                    if (
-                        not binding.resolved_local_review()
-                        and not binding.resolved_remote_review()
+        if first_handoff:
+            if not stage_done_announced:
+                await db.runs.mark_stage_done_announced(
+                    self._conn,
+                    run_id,
+                    announced_at=datetime.now(UTC).isoformat(),
+                )
+                try:
+                    next_stage = (
+                        "merge"
+                        if (
+                            not binding.resolved_local_review()
+                            and not binding.resolved_remote_review()
+                        )
+                        else "review"
                     )
-                    else "review"
-                )
-                done_body = stage_done(
-                    CommentVars(
-                        stage="implement",
-                        next_stage=next_stage,
-                        repo=binding.github_repo,
-                        issue=0,
-                        pr_url=pr_url or "(no PR)",
-                        run_id=run_id,
-                        input_tokens=cumulative_usage.input_tokens,
-                        output_tokens=cumulative_usage.output_tokens,
-                        cache_write_tokens=cumulative_usage.cache_write_tokens,
-                        cache_read_tokens=cumulative_usage.cache_read_tokens,
+                    done_body = stage_done(
+                        CommentVars(
+                            stage="implement",
+                            next_stage=next_stage,
+                            repo=binding.github_repo,
+                            issue=0,
+                            pr_url=pr_url or "(no PR)",
+                            run_id=run_id,
+                            input_tokens=cumulative_usage.input_tokens,
+                            output_tokens=cumulative_usage.output_tokens,
+                            cache_write_tokens=cumulative_usage.cache_write_tokens,
+                            cache_read_tokens=cumulative_usage.cache_read_tokens,
+                        )
                     )
-                )
-                await tracker.post_comment(issue.id, truncate_body(done_body))
-            except LinearError as e:
-                log.warning(
-                    "stage_done comment failed on %s: %s", issue.identifier, e
-                )
+                    await tracker.post_comment(issue.id, truncate_body(done_body))
+                except LinearError as e:
+                    log.warning(
+                        "stage_done comment failed on %s: %s", issue.identifier, e
+                    )
 
             await db.runs.update_status(
                 self._conn,
@@ -10859,7 +10867,7 @@ class Orchestrator:
             log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
             return run_id
-        if not first_delivery:
+        if not first_handoff:
             await db.runs.update_status(
                 self._conn,
                 run_id,
@@ -12338,6 +12346,13 @@ class Orchestrator:
                     ),
                 )
             if post_codex_review and binding.resolved_remote_review():
+                state = await db.review_state.get(self._conn, storage_issue_id)
+                if pr_number is not None and not state.codex_review_requested_at:
+                    await self._post_codex_review_request(
+                        binding=binding,
+                        storage_issue_id=storage_issue_id,
+                        pr_number=pr_number,
+                    )
                 await self._move_issue_to_review_state(binding=binding, issue=issue)
             return existing
 
@@ -12383,6 +12398,13 @@ class Orchestrator:
             )
             if existing is not None:
                 if post_codex_review and binding.resolved_remote_review():
+                    state = await db.review_state.get(self._conn, storage_issue_id)
+                    if pr_number is not None and not state.codex_review_requested_at:
+                        await self._post_codex_review_request(
+                            binding=binding,
+                            storage_issue_id=storage_issue_id,
+                            pr_number=pr_number,
+                        )
                     await self._move_issue_to_review_state(
                         binding=binding, issue=issue
                     )
@@ -12400,19 +12422,11 @@ class Orchestrator:
             )
             created_review_run = True
         if created_review_run and pr_number is not None and post_codex_review:
-            try:
-                await self._gh.pr_comment(
-                    pr_number,
-                    "@codex review",
-                    repo=binding.github_repo,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not post @codex review on %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
+            await self._post_codex_review_request(
+                binding=binding,
+                storage_issue_id=storage_issue_id,
+                pr_number=pr_number,
+            )
 
         if (
             created_review_run
@@ -12429,6 +12443,33 @@ class Orchestrator:
             started_at=started_at,
             ended_at=None,
             cost_usd=0.0,
+        )
+
+    async def _post_codex_review_request(
+        self,
+        *,
+        binding: RepoBinding,
+        storage_issue_id: str,
+        pr_number: int,
+    ) -> None:
+        try:
+            await self._gh.pr_comment(
+                pr_number,
+                "@codex review",
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not post @codex review on %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return
+        await db.review_state.set_codex_review_requested_at(
+            self._conn,
+            storage_issue_id,
+            datetime.now(UTC).isoformat(),
         )
 
     async def _move_issue_to_local_code_review_state(
@@ -13448,11 +13489,15 @@ class Orchestrator:
         ctx = await self._resolve_pending_delivery(issue_id, run_id, binding, intent)
         if ctx is None:
             return
-        # Clear the wait first so a re-failure parks a fresh wait cleanly.
+        # Keep the durable wait until delivery reaches success. If this retry
+        # crashes or raises before re-parking, the existing operator wait still
+        # gives the issue a retryable home.
         self._pending_deliveries.pop(run_id, None)
-        await self._clear_operator_wait(issue_id, run_id)
         try:
             await self._deliver_implement_run(ctx=ctx)
+            run = await db.runs.get_with_issue(self._conn, run_id)
+            if run is not None and run.run.status in db.runs.SUCCESS_STATUSES:
+                await self._clear_operator_wait(issue_id, run_id)
         finally:
             if ctx.retry_workspace_acquired:
                 self._workspace.release(ctx.binding, ctx.issue)

@@ -452,6 +452,43 @@ async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -
     await conn.commit()
 
 
+async def has_stage_done_announced(
+    conn: aiosqlite.Connection, run_id: str
+) -> bool:
+    cur = await conn.execute(
+        """
+        SELECT 1
+        FROM runs
+        WHERE id = ? AND stage_done_announced_at != ''
+        LIMIT 1
+        """,
+        (run_id,),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def mark_stage_done_announced(
+    conn: aiosqlite.Connection,
+    run_id: str,
+    *,
+    announced_at: str,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE runs
+           SET stage_done_announced_at =
+               CASE
+                   WHEN stage_done_announced_at = '' THEN ?
+                   ELSE stage_done_announced_at
+               END
+         WHERE id = ?
+        """,
+        (announced_at, run_id),
+    )
+    await conn.commit()
+
+
 async def add_usage(
     conn: aiosqlite.Connection,
     run_id: str,

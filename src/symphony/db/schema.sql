@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS runs (
     cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
     termination_kind   TEXT NOT NULL DEFAULT '',
     termination_detail TEXT NOT NULL DEFAULT '',
-    exit_returncode    INTEGER
+    exit_returncode    INTEGER,
+    stage_done_announced_at TEXT NOT NULL DEFAULT ''
 );
 
 -- Active-run lookup: dedupe in poll (status='running') and reconcile
@@ -158,6 +159,8 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 --   ci_fetch_failures      consecutive `gh pr checks` fetch failures.
 --   pr_number/pr_url       active PR under Review.
 --   github_repo/issue_label binding selected when Review started.
+--   codex_review_requested_at non-empty once the initial remote bot request
+--                          was posted successfully.
 CREATE TABLE IF NOT EXISTS review_state (
     issue_id               TEXT PRIMARY KEY REFERENCES issues(id),
     iteration              INTEGER NOT NULL DEFAULT 0,
@@ -167,7 +170,8 @@ CREATE TABLE IF NOT EXISTS review_state (
     pr_url                 TEXT NOT NULL DEFAULT '',
     github_repo            TEXT NOT NULL DEFAULT '',
     issue_label            TEXT NOT NULL DEFAULT '',
-    codex_lgtm_comment_id  TEXT NOT NULL DEFAULT ''
+    codex_lgtm_comment_id  TEXT NOT NULL DEFAULT '',
+    codex_review_requested_at TEXT NOT NULL DEFAULT ''
 );
 
 -- Acceptance-stage state per issue. The current code_only runner records

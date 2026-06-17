@@ -2410,6 +2410,67 @@ async def test_start_review_stage_adopts_live_review_and_persists_pr_row(
 
 
 @pytest.mark.asyncio
+async def test_start_review_stage_adopts_live_review_and_reposts_unconfirmed_bot(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=43,
+            pr_url="https://github.com/org/repo/pull/43",
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label,
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.id == "live-review"
+        gh.pr_comment.assert_awaited_once_with(43, "@codex review", repo="org/repo")
+        state = await db.review_state.get(conn, issue.id)
+        assert state.codex_review_requested_at
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_start_review_stage_adopted_live_review_preserves_pr_timestamp(
     tmp_path: Path,
 ) -> None:
