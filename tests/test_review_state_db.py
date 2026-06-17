@@ -162,6 +162,50 @@ async def test_review_state_begin_review_records_pr_metadata(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_review_state_refresh_pr_metadata_preserves_cycle_state(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label="auto",
+        )
+        await review_state.set_signature(conn, "iss-1", "codex_inline:stale")
+        await review_state.bump_iteration(conn, "iss-1")
+        await review_state.bump_ci_fetch_failures(conn, "iss-1")
+        await review_state.set_codex_lgtm_comment_id(conn, "iss-1", "comment-42")
+
+        await review_state.refresh_pr_metadata(
+            conn,
+            "iss-1",
+            pr_number=43,
+            pr_url="https://github.com/org/repo/pull/43",
+            github_repo="org/repo",
+            issue_label="fix",
+        )
+
+        s = await review_state.get(conn, "iss-1")
+        assert s.iteration == 1
+        assert s.last_trigger_signature == "codex_inline:stale"
+        assert s.ci_fetch_failures == 1
+        assert s.codex_lgtm_comment_id == "comment-42"
+        assert s.pr_number == 43
+        assert s.pr_url == "https://github.com/org/repo/pull/43"
+        assert s.github_repo == "org/repo"
+        assert s.issue_label == "fix"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_state_ci_fetch_failures_persist_and_reset(tmp_path: Path) -> None:
     db_path = tmp_path / "s.sqlite"
     conn = await db.connect(db_path)

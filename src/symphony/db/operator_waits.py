@@ -35,6 +35,11 @@ class OperatorWait:
     github_repo: str
     issue_label: str
     created_at: str
+    # For `deliver_failed` waits: the real local-review outcome at park time
+    # (a `LoopOutcome` value). Lets a `$retry` after a restart preserve the
+    # human-approval gate instead of reconstructing a synthetic APPROVED.
+    # NULL/None for every other wait kind.
+    local_review_outcome: str | None = None
 
 
 async def upsert(
@@ -50,6 +55,7 @@ async def upsert(
     provider: str | None = None,
     tracker_provider: str = "linear",
     tracker_site: str = "default",
+    local_review_outcome: str | None = None,
     commit: bool = True,
 ) -> None:
     old = await get(conn, issue_id)
@@ -66,9 +72,10 @@ async def upsert(
             linear_team_key,
             github_repo,
             issue_label,
-            created_at
+            created_at,
+            local_review_outcome
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id) DO UPDATE SET
             run_id = excluded.run_id,
             kind = excluded.kind,
@@ -78,7 +85,8 @@ async def upsert(
             linear_team_key = excluded.linear_team_key,
             github_repo = excluded.github_repo,
             issue_label = excluded.issue_label,
-            created_at = excluded.created_at
+            created_at = excluded.created_at,
+            local_review_outcome = excluded.local_review_outcome
         """,
         (
             issue_id,
@@ -91,6 +99,7 @@ async def upsert(
             github_repo,
             issue_label,
             created_at,
+            local_review_outcome,
         ),
     )
     if old is None:
@@ -121,7 +130,8 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
             linear_team_key,
             github_repo,
             issue_label,
-            created_at
+            created_at,
+            local_review_outcome
         FROM operator_waits
         ORDER BY created_at, issue_id
         """
@@ -139,6 +149,11 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
             github_repo=str(row["github_repo"]),
             issue_label=str(row["issue_label"] or ""),
             created_at=str(row["created_at"]),
+            local_review_outcome=(
+                str(row["local_review_outcome"])
+                if row["local_review_outcome"] is not None
+                else None
+            ),
         )
         for row in rows
     ]
@@ -157,7 +172,8 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
             linear_team_key,
             github_repo,
             issue_label,
-            created_at
+            created_at,
+            local_review_outcome
         FROM operator_waits
         WHERE issue_id = ?
         """,
@@ -177,6 +193,11 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"] or ""),
         created_at=str(row["created_at"]),
+        local_review_outcome=(
+            str(row["local_review_outcome"])
+            if row["local_review_outcome"] is not None
+            else None
+        ),
     )
 
 
@@ -195,7 +216,8 @@ async def get_by_run_id(
             linear_team_key,
             github_repo,
             issue_label,
-            created_at
+            created_at,
+            local_review_outcome
         FROM operator_waits
         WHERE run_id = ?
         """,
@@ -215,6 +237,11 @@ async def get_by_run_id(
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"] or ""),
         created_at=str(row["created_at"]),
+        local_review_outcome=(
+            str(row["local_review_outcome"])
+            if row["local_review_outcome"] is not None
+            else None
+        ),
     )
 
 

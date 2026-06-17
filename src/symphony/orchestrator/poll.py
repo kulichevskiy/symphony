@@ -448,6 +448,37 @@ class _ImplementHandoff:
     operator_comment: str
 
 
+@dataclass(frozen=True)
+class _PendingDelivery:
+    """Inputs needed to (re)run the post-completion delivery path.
+
+    The completion gate has already passed, so the agent's work is final. A
+    delivery-step failure (push / `ensure_pr` / review handoff) parks a
+    ``deliver_failed`` operator wait keyed by ``run_id`` and stashes this
+    context so a `$retry` can resume delivery on the existing branch without
+    re-dispatching the agent or re-running the completion gate.
+    """
+
+    binding: RepoBinding
+    issue: LinearIssue
+    storage_issue_id: str
+    run_id: str
+    workspace_path: Path
+    branch: str
+    cumulative_usage: UsageDelta
+    local_review_result: LoopResult | None
+    # True when a deliver_failed `$retry` reacquired this workspace. Retry
+    # contexts must prove the branch still carries work before pushing because
+    # the original workspace was already released and may have been swept.
+    retry_workspace_acquired: bool = False
+    # True when rebuilt by `_resolve_pending_delivery` after a daemon restart
+    # lost the in-memory stash. The workspace was re-acquired (possibly
+    # re-cloned) and the live local-review verdict is gone, so the resume
+    # path treats the gate as already-passed and skips degenerate audit
+    # artifacts (e.g. an "iterations: 0" PR summary).
+    reconstructed: bool = False
+
+
 class _TerminationKwargs(TypedDict):
     kind: str
     detail: str
@@ -1384,6 +1415,31 @@ async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
     return ""
 
 
+async def _workspace_commits_ahead(
+    workspace_path: Path, base_branch: str
+) -> int | None:
+    """Commits on HEAD not in *base_branch*, or None if undeterminable.
+
+    Prefer `origin/<base>` (present after a fresh clone), fall back to the
+    local `<base>` ref. Returns None when neither ref resolves so callers can
+    degrade gracefully rather than mistake a measurement failure for "empty".
+    """
+    for ref in (f"origin/{base_branch}..HEAD", f"{base_branch}..HEAD"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "rev-list", "--count", ref,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode == 0:
+                return int(stdout.decode().strip() or "0")
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
 async def _workspace_diff_size(
     workspace_path: Path, base_branch: str
 ) -> DiffSize:
@@ -1639,6 +1695,13 @@ class Orchestrator:
         self._operator_wait_run_ids: set[str] = set()
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
+        self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
+        # Pending delivery contexts, keyed by run_id. Set when a post-completion
+        # delivery step fails and a `deliver_failed` wait is parked; consumed by
+        # a `$retry` to resume push + `ensure_pr` + handoff on the existing
+        # branch. In-memory only: if the daemon restarts, the `$retry` falls
+        # back to reconstructing the context from the wait + workspace.
+        self._pending_deliveries: dict[str, _PendingDelivery] = {}
         # Pending blocked-resume handoffs, keyed by storage issue_id. Set when an
         # operator `$retry`s an IMPLEMENT_BLOCKED wait; consumed by the next
         # implement dispatch to seed the fresh run's prompt. In-memory only: if
@@ -2574,6 +2637,9 @@ class Orchestrator:
         if run_id in self._implement_blocked_run_bindings:
             await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._deliver_failed_run_bindings:
+            await self._handle_deliver_failed_slash_intent(issue_id, run_id, intent)
+            return
         if run_id in self._review_failed_run_bindings:
             await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
             return
@@ -2585,16 +2651,18 @@ class Orchestrator:
             return
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if wait is not None:
-            if wait.kind in (
-                db.operator_waits.KIND_IMPLEMENT_FAILED,
-                db.operator_waits.KIND_DELIVER_FAILED,
-            ):
+            if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
                 await self._handle_implement_failed_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
                 await self._handle_implement_blocked_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+                await self._handle_deliver_failed_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
@@ -2950,10 +3018,7 @@ class Orchestrator:
                 issue_id,
                 run_id,
                 intent,
-                expected_kinds=(
-                    db.operator_waits.KIND_IMPLEMENT_FAILED,
-                    db.operator_waits.KIND_DELIVER_FAILED,
-                ),
+                expected_kinds=(db.operator_waits.KIND_IMPLEMENT_FAILED,),
             )
             if binding is None:
                 return
@@ -3172,8 +3237,8 @@ class Orchestrator:
         for wait in waits:
             if wait.kind not in (
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
-                db.operator_waits.KIND_DELIVER_FAILED,
                 db.operator_waits.KIND_IMPLEMENT_BLOCKED,
+                db.operator_waits.KIND_DELIVER_FAILED,
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
@@ -3206,13 +3271,12 @@ class Orchestrator:
     ) -> None:
         self._dispatch_run_ids[wait.issue_id] = wait.run_id
         self._operator_wait_run_ids.add(wait.run_id)
-        if wait.kind in (
-            db.operator_waits.KIND_IMPLEMENT_FAILED,
-            db.operator_waits.KIND_DELIVER_FAILED,
-        ):
+        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
             self._implement_failed_run_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
             self._implement_blocked_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+            self._deliver_failed_run_bindings[wait.run_id] = binding
         elif wait.kind in (
             db.operator_waits.KIND_REVIEW_FAILED,
             db.operator_waits.KIND_REVIEW_STOPPED,
@@ -3552,6 +3616,7 @@ class Orchestrator:
         self._operator_wait_run_ids.discard(run_id)
         self._implement_failed_run_bindings.pop(run_id, None)
         self._implement_blocked_run_bindings.pop(run_id, None)
+        self._deliver_failed_run_bindings.pop(run_id, None)
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
@@ -3852,6 +3917,10 @@ class Orchestrator:
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
             if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
+            if await self._review_poll_deferred_by_deliver_failed_wait(
+                run.issue_id, run.id
+            ):
+                continue
             tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
                 run.issue_id
             )
@@ -3900,6 +3969,20 @@ class Orchestrator:
                 continue
             scheduled.append(self._schedule_review_poll(run, binding, issue))
         return scheduled
+
+    async def _review_poll_deferred_by_deliver_failed_wait(
+        self, issue_id: str, review_run_id: str
+    ) -> bool:
+        wait = await db.operator_waits.get(self._conn, issue_id)
+        if wait is None or wait.kind != db.operator_waits.KIND_DELIVER_FAILED:
+            return False
+        log.info(
+            "skipping review run %s for %s: deliver_failed wait %s is pending",
+            review_run_id,
+            issue_id,
+            wait.run_id,
+        )
+        return True
 
     def _binding_for_issue(
         self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
@@ -4094,6 +4177,10 @@ class Orchestrator:
             return
         current_binding, current_issue = current
         rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return
         rearm_done = True
         if rearm_retry_pending:
             state = await db.review_state.get(self._conn, run.issue_id)
@@ -4105,6 +4192,10 @@ class Orchestrator:
             )
             if rearm_done:
                 await self._clear_review_rearm_retry(run.id)
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return
         handled_feedback = await self._poll_review_run(
             run, current_binding, current_issue
         )
@@ -4120,6 +4211,10 @@ class Orchestrator:
         live_review_runs = await db.runs.list_live_by_stage(self._conn, stage="review")
         if not any(live_run.id == run.id for live_run in live_review_runs):
             log.info("skipping review run %s: run is no longer live", run.id)
+            return None
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
             return None
         tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
             run.issue_id
@@ -4241,6 +4336,76 @@ class Orchestrator:
             "completed review monitor(s) %s for %s before merge",
             ", ".join(sorted(closed_run_ids)),
             issue.identifier,
+        )
+
+    async def _terminate_deliver_failed_review_monitors(
+        self, issue_id: str, *, detail: str
+    ) -> None:
+        """Retire Review monitors created by a delivery handoff that got rejected."""
+        live_review_runs = [
+            run
+            for run in await db.runs.list_live_by_stage(self._conn, stage="review")
+            if run.issue_id == issue_id
+        ]
+        if not live_review_runs:
+            return
+
+        now = datetime.now(UTC).isoformat()
+        closed_run_ids: set[str] = set()
+        for run in live_review_runs:
+            await db.runs.update_status(
+                self._conn,
+                run.id,
+                "interrupted",
+                ended_at=now,
+                kind="cancelled",
+                detail=detail,
+            )
+            closed_run_ids.add(run.id)
+            self._clear_review_no_signal_rearm_heads(run.id)
+            task = self._review_poll_run_tasks.pop(run.id, None)
+            if task is not None:
+                self._review_poll_tasks.discard(task)
+                if not task.done():
+                    task.cancel()
+            self._review_poll_run_ids.discard(run.id)
+            await self._clear_review_rearm_retry(run.id)
+
+        for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
+            if mapped_issue_id == issue_id or mapped_run_id in closed_run_ids:
+                self._review_poll_issue_ids.pop(mapped_issue_id, None)
+
+        log.info(
+            "interrupted review monitor(s) %s for issue_id=%s after deliver_failed halt",
+            ", ".join(sorted(closed_run_ids)),
+            issue_id,
+        )
+
+    def _cancel_deliver_failed_review_poll_tasks(self, issue_id: str) -> None:
+        """Stop in-flight Review polling while delivery is parked as failed.
+
+        The durable Review monitor row stays live so a `$retry` can adopt it
+        once delivery resumes; only the current in-memory poll task is
+        cancelled/suppressed.
+        """
+        cancelled_run_ids: set[str] = set()
+        for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
+            if mapped_issue_id != issue_id:
+                continue
+            task = self._review_poll_run_tasks.pop(mapped_run_id, None)
+            if task is not None:
+                self._review_poll_tasks.discard(task)
+                if not task.done():
+                    task.cancel()
+            self._review_poll_run_ids.discard(mapped_run_id)
+            self._review_poll_issue_ids.pop(mapped_issue_id, None)
+            cancelled_run_ids.add(mapped_run_id)
+        if not cancelled_run_ids:
+            return
+        log.info(
+            "cancelled review poll task(s) %s for issue_id=%s after deliver_failed halt",
+            ", ".join(sorted(cancelled_run_ids)),
+            issue_id,
         )
 
     async def _maybe_rearm_codex_review_for_no_signal(
@@ -4542,6 +4707,11 @@ class Orchestrator:
                 ),
             )
 
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            storage_issue_id, run.id
+        ):
+            return False
+
         if remote_review:
             await self._maybe_post_codex_lgtm(
                 run=run,
@@ -4577,6 +4747,10 @@ class Orchestrator:
             if has_hit_iteration_cap(
                 iteration=state.iteration, cap=self.config.review_iteration_cap
             ):
+                if await self._review_poll_deferred_by_deliver_failed_wait(
+                    storage_issue_id, run.id
+                ):
+                    return False
                 await self._park_review_for_approval(
                     run=run,
                     binding=binding,
@@ -4605,6 +4779,10 @@ class Orchestrator:
         if has_hit_iteration_cap(
             iteration=state.iteration, cap=self.config.review_iteration_cap
         ):
+            if await self._review_poll_deferred_by_deliver_failed_wait(
+                storage_issue_id, run.id
+            ):
+                return False
             await self._park_review_for_approval(
                 run=run,
                 binding=binding,
@@ -4648,6 +4826,10 @@ class Orchestrator:
         verdict: Verdict,
         iteration: int,
     ) -> bool:
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return False
         log_tail = await self._failing_check_log_tail(
             checks=checks,
             verdict=verdict,
@@ -5116,6 +5298,10 @@ class Orchestrator:
         verdict: Verdict,
         iteration: int,
     ) -> bool:
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return False
         state = await db.review_state.get(self._conn, issue.id)
         pr_url = _pr_url_for_state(
             repo=binding.github_repo,
@@ -6334,6 +6520,10 @@ class Orchestrator:
         issue: LinearIssue,
         iteration: int,
     ) -> bool:
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            run.issue_id, run.id
+        ):
+            return False
         base_branch = binding.base_branch
         if base_branch is None:
             try:
@@ -10379,9 +10569,13 @@ class Orchestrator:
                 issue_id=issue_id,
                 current_run_id=run_id,
             )
+            delivery_terminal_kinds = {
+                db.runs.PUBLISH_FAILED_KIND,
+                db.operator_waits.KIND_DELIVER_FAILED,
+            }
             previous_requires_agent = (
                 previous_terminal_kind is not None
-                and previous_terminal_kind != db.runs.PUBLISH_FAILED_KIND
+                and previous_terminal_kind not in delivery_terminal_kinds
             )
             branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
         except Exception as e:  # noqa: BLE001 — surface as failed run
@@ -10403,7 +10597,7 @@ class Orchestrator:
 
         cumulative_usage: UsageDelta
         local_review_result: LoopResult | None
-        # A prior publish_failed marker proves only that an earlier checkout
+        # A prior delivery-failure marker proves only that an earlier checkout
         # reached delivery. The current checkout still needs its own proof of
         # deliverable commits before publish can be resumed; when the base is
         # unresolved, _branch_ahead_of_base deliberately cannot supply that
@@ -10806,24 +11000,112 @@ class Orchestrator:
         ``ensure_pr`` adopts the existing PR. The completion gate never guards
         this step.
         """
-        issue_id = storage_issue_id
-        tracker = self.tracker(binding)
-        # 5. Push branch, open PR, post stage-transition comment.
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        return await self._deliver_implement_run(
+            ctx=_PendingDelivery(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=storage_issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                branch=branch,
+                cumulative_usage=cumulative_usage,
+                local_review_result=local_review_result,
+            ),
+            base_branch=base_branch,
+        )
+
+    async def _delivery_handoff_started(
+        self, *, ctx: _PendingDelivery, pr_url: str
+    ) -> bool:
+        """True once delivery reached durable PR/review handoff metadata."""
+        if await db.runs.has_live_stage(
+            self._conn, ctx.storage_issue_id, stage="review"
+        ):
+            return True
+
+        pr_number = pr_number_from_url(pr_url)
+        state = await db.review_state.get(self._conn, ctx.storage_issue_id)
+        if state.github_repo == ctx.binding.github_repo:
+            if pr_number is not None and state.pr_number == pr_number:
+                return True
+            if state.pr_url and state.pr_url == pr_url:
+                return True
+
+        issue_pr = await db.issue_prs.get(
+            self._conn,
+            issue_id=ctx.storage_issue_id,
+            github_repo=ctx.binding.github_repo,
+        )
+        if issue_pr is None:
+            return False
+        if pr_number is not None and issue_pr.pr_number == pr_number:
+            return True
+        return issue_pr.pr_url == pr_url
+
+    async def _deliver_implement_run(
+        self, *, ctx: _PendingDelivery, base_branch: str | None = None
+    ) -> str:
+        """Push + open PR + hand off to review/merge for a completed implement.
+
+        Re-entrant: invoked once at the end of the implement dispatch and again
+        on a `$retry` of a `deliver_failed` wait. Never re-dispatches the agent
+        and never runs the completion gate. Push / `ensure_pr` failures park a
+        `deliver_failed` operator wait via `_park_deliver_failed`.
+        """
+        binding = ctx.binding
+        issue = ctx.issue
+        run_id = ctx.run_id
+        workspace_path = ctx.workspace_path
+        branch = ctx.branch
+        cumulative_usage = ctx.cumulative_usage
+        tracker = self.tracker(binding)
+
+        if base_branch is None:
+            base_branch = await self._resolve_base_branch(binding)
+
+        # On a reconstructed resume the workspace was re-acquired after the
+        # daemon restart. In-memory `$retry` resumes also re-acquire because
+        # the original implement dispatch already released the workspace. On a
+        # *push*-failure the commits lived only in that workspace; if it was
+        # swept past its TTL, `acquire()` may have re-cloned an empty branch
+        # from origin (the publish step is the very one that failed). Refuse to
+        # push / open an empty no-op PR with the work silently lost; re-park
+        # instead.
+        if ctx.reconstructed or ctx.retry_workspace_acquired:
+            if base_branch is None:
+                msg = (
+                    f"could not resolve base branch for $retry of "
+                    f"{branch}; refusing to deliver without proving branch work"
+                )
+                log.warning("%s for %s", msg, issue.identifier)
+                await self._park_deliver_failed(msg, ctx=ctx)
+                return run_id
+            ahead = await _workspace_commits_ahead(workspace_path, base_branch)
+            if ahead is None:
+                msg = (
+                    f"could not compare $retry branch {branch} "
+                    f"against {base_branch}; refusing to deliver without "
+                    "proving branch work"
+                )
+                log.warning("%s for %s", msg, issue.identifier)
+                await self._park_deliver_failed(msg, ctx=ctx)
+                return run_id
+            if ahead == 0:
+                msg = (
+                    f"workspace swept before $retry: branch {branch} carries no "
+                    f"commits over {base_branch}; refusing to deliver an empty PR"
+                )
+                log.warning("%s for %s", msg, issue.identifier)
+                await self._park_deliver_failed(msg, ctx=ctx)
+                return run_id
+
+        # 5. Push branch, open PR, post stage-transition comment.
         try:
             await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
             log.warning("git push failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"push failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-                termination_kind=db.runs.PUBLISH_FAILED_KIND,
-            )
+            await self._park_deliver_failed(f"push failed: {e}", ctx=ctx, exc=e)
             return run_id
 
         pr_url: str = ""
@@ -10836,53 +11118,112 @@ class Orchestrator:
                 repo=binding.github_repo,
                 linear_url=issue.url,
             )
-        except GitHubError as e:
+        except Exception as e:  # noqa: BLE001
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"pr_create failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-                termination_kind=db.runs.PUBLISH_FAILED_KIND,
-            )
+            await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
 
-        try:
-            next_stage = (
-                "merge"
-                if (
-                    not binding.resolved_local_review()
-                    and not binding.resolved_remote_review()
-                )
-                else "review"
-            )
-            done_body = stage_done(
-                CommentVars(
-                    stage="implement",
-                    next_stage=next_stage,
-                    repo=binding.github_repo,
-                    issue=0,
-                    pr_url=pr_url or "(no PR)",
-                    run_id=run_id,
-                    input_tokens=cumulative_usage.input_tokens,
-                    output_tokens=cumulative_usage.output_tokens,
-                    cache_write_tokens=cumulative_usage.cache_write_tokens,
-                    cache_read_tokens=cumulative_usage.cache_read_tokens,
-                )
-            )
-            await tracker.post_comment(issue.id, truncate_body(done_body))
-        except LinearError as e:
-            log.warning("stage_done comment failed on %s: %s", issue.identifier, e)
-
-        await db.runs.update_status(
-            self._conn,
-            run_id,
-            "completed",
-            ended_at=datetime.now(UTC).isoformat(),
+        # First handoff vs. a `$retry` resume. Review-enabled handoff writes a
+        # live review run; no-review handoff writes only review_state/issue_prs.
+        # The Linear stage_done announcement has its own durable marker because
+        # a handoff can fail before either PR/review metadata row exists.
+        first_handoff = not await self._delivery_handoff_started(
+            ctx=ctx, pr_url=pr_url
         )
+        stage_done_announced = await db.runs.has_stage_done_announced(
+            self._conn, run_id
+        )
+
+        # The stage-transition comment is first-delivery only. The completed
+        # write must happen before the first handoff so the review run can pass
+        # its active-run guard. Persist a recovery wait before that completed
+        # write so a daemon crash cannot leave a terminal implement run with no
+        # handoff metadata and no `$retry` target. Successful handoff clears the
+        # temporary wait below.
+        if first_handoff:
+            if not stage_done_announced:
+                await db.runs.mark_stage_done_announced(
+                    self._conn,
+                    run_id,
+                    announced_at=datetime.now(UTC).isoformat(),
+                )
+                try:
+                    next_stage = (
+                        "merge"
+                        if (
+                            not binding.resolved_local_review()
+                            and not binding.resolved_remote_review()
+                        )
+                        else "review"
+                    )
+                    done_body = stage_done(
+                        CommentVars(
+                            stage="implement",
+                            next_stage=next_stage,
+                            repo=binding.github_repo,
+                            issue=0,
+                            pr_url=pr_url or "(no PR)",
+                            run_id=run_id,
+                            input_tokens=cumulative_usage.input_tokens,
+                            output_tokens=cumulative_usage.output_tokens,
+                            cache_write_tokens=cumulative_usage.cache_write_tokens,
+                            cache_read_tokens=cumulative_usage.cache_read_tokens,
+                        )
+                    )
+                    await tracker.post_comment(issue.id, truncate_body(done_body))
+                except LinearError as e:
+                    log.warning(
+                        "stage_done comment failed on %s: %s", issue.identifier, e
+                    )
+
+            await self._track_delivery_handoff_recovery_wait(ctx)
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+
+        # Past the PR open the handoff (review-state writes, review-stage
+        # start, PR summary) is still post-completion delivery: an unexpected
+        # DB / Linear failure here must park `deliver_failed` for a `$retry`
+        # rather than propagate and leave a completed run with no review
+        # started and no operator wait.
+        try:
+            delivered_run_id = await self._deliver_review_handoff(
+                ctx=ctx, pr_url=pr_url
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
+            await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
+            return run_id
+        if first_handoff:
+            await self._clear_operator_wait(ctx.storage_issue_id, run_id)
+            # The run now continues into the review/merge stage, so it stays the
+            # active dispatch run for this issue. `_clear_operator_wait` drops the
+            # `_dispatch_run_ids` entry (correct when tearing down a parked wait,
+            # not here on a successful first handoff), so restore it.
+            self._dispatch_run_ids[ctx.storage_issue_id] = run_id
+        if not first_handoff:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "completed",
+                ended_at=datetime.now(UTC).isoformat(),
+            )
+        return delivered_run_id
+
+    async def _deliver_review_handoff(
+        self, *, ctx: _PendingDelivery, pr_url: str
+    ) -> str:
+        """Post-PR handoff: register the merge candidate (no-review) or start
+        the Review stage. Raises on unexpected DB/Linear faults so the caller
+        can park `deliver_failed`."""
+        binding = ctx.binding
+        issue = ctx.issue
+        issue_id = ctx.storage_issue_id
+        run_id = ctx.run_id
+        local_review_result = ctx.local_review_result
 
         if (
             not binding.resolved_local_review()
@@ -10978,9 +11319,12 @@ class Orchestrator:
         #    failures are parked for operator action. The binding-level
         #    override wins over the global config so an
         #    operator can keep one repo's PR thread quiet without
-        #    disabling the feature everywhere.
+        #    disabling the feature everywhere. Skipped on a reconstructed
+        #    resume, whose synthetic APPROVED result would post a degenerate
+        #    "iterations: 0" summary.
         if (
-            binding.resolved_post_local_review_pr_summary(
+            not ctx.reconstructed
+            and binding.resolved_post_local_review_pr_summary(
                 self.config.post_local_review_pr_summary
             )
             and local_review_result is not None
@@ -12301,6 +12645,68 @@ class Orchestrator:
         """
         storage_issue_id = storage_issue_id or issue.id
         pr_number = pr_number_from_url(pr_url)
+        if pr_number is None:
+            log.warning(
+                "could not parse PR number from %r for %s — skipping @codex review",
+                pr_url,
+                issue.identifier,
+            )
+
+        review_run_id = str(uuid.uuid4())
+        started_at = datetime.now(UTC).isoformat()
+
+        existing = await db.runs.latest_live_for_issue_stage(
+            self._conn, issue_id=storage_issue_id, stage="review"
+        )
+        if existing is not None:
+            previous_state = await db.review_state.get(self._conn, storage_issue_id)
+            if pr_number is not None:
+                await db.review_state.refresh_pr_metadata(
+                    self._conn,
+                    storage_issue_id,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label,
+                )
+                existing_issue_pr = await db.issue_prs.get(
+                    self._conn,
+                    issue_id=storage_issue_id,
+                    github_repo=binding.github_repo,
+                )
+                await db.issue_prs.upsert(
+                    self._conn,
+                    issue_id=storage_issue_id,
+                    github_repo=binding.github_repo,
+                    binding_key=_binding_storage_key(binding),
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    created_at=(
+                        existing_issue_pr.created_at
+                        if existing_issue_pr is not None
+                        else existing.started_at
+                    ),
+                )
+                if previous_state.pr_number not in (None, pr_number):
+                    await db.review_state.set_codex_review_requested_at(
+                        self._conn,
+                        storage_issue_id,
+                        "",
+                    )
+            if post_codex_review and binding.resolved_remote_review():
+                state = await db.review_state.get(self._conn, storage_issue_id)
+                if pr_number is not None and not state.codex_review_requested_at:
+                    await self._post_codex_review_request(
+                        binding=binding,
+                        storage_issue_id=storage_issue_id,
+                        pr_number=pr_number,
+                    )
+                await self._move_issue_to_review_state(binding=binding, issue=issue)
+            return existing
+
+        # Write PR metadata before exposing the live review run. A poll tick
+        # can see the run immediately after insertion, so it must not observe
+        # a default review_state row with no PR number.
         await db.review_state.begin_review(
             self._conn,
             storage_issue_id,
@@ -12309,13 +12715,7 @@ class Orchestrator:
             github_repo=binding.github_repo,
             issue_label=binding.issue_label,
         )
-        if pr_number is None:
-            log.warning(
-                "could not parse PR number from %r for %s — skipping @codex review",
-                pr_url,
-                issue.identifier,
-            )
-        else:
+        if pr_number is not None:
             await db.issue_prs.upsert(
                 self._conn,
                 issue_id=storage_issue_id,
@@ -12323,29 +12723,14 @@ class Orchestrator:
                 binding_key=_binding_storage_key(binding),
                 pr_number=pr_number,
                 pr_url=pr_url,
-                created_at=datetime.now(UTC).isoformat(),
+                created_at=started_at,
             )
-            if post_codex_review:
-                try:
-                    await self._gh.pr_comment(
-                        pr_number,
-                        "@codex review",
-                        repo=binding.github_repo,
-                    )
-                except GitHubError as e:
-                    log.warning(
-                        "could not post @codex review on %s#%d: %s",
-                        binding.github_repo,
-                        pr_number,
-                        e,
-                    )
 
-        if post_codex_review and binding.resolved_remote_review():
-            await self._move_issue_to_review_state(binding=binding, issue=issue)
-
-        review_run_id = str(uuid.uuid4())
-        started_at = datetime.now(UTC).isoformat()
-        await db.runs.create(
+        # Idempotent under a `$retry` resume: a handoff that faulted after this
+        # point already left a live review run, so guard creation (mirrors
+        # `_merge_approved_pr`) and adopt the existing one instead of inserting
+        # a second running review-run row.
+        inserted = await db.runs.create_if_no_active(
             self._conn,
             id=review_run_id,
             issue_id=storage_issue_id,
@@ -12354,6 +12739,49 @@ class Orchestrator:
             pid=None,
             started_at=started_at,
         )
+        created_review_run = inserted
+        if not inserted:
+            existing = await db.runs.latest_live_for_issue_stage(
+                self._conn, issue_id=storage_issue_id, stage="review"
+            )
+            if existing is not None:
+                if post_codex_review and binding.resolved_remote_review():
+                    state = await db.review_state.get(self._conn, storage_issue_id)
+                    if pr_number is not None and not state.codex_review_requested_at:
+                        await self._post_codex_review_request(
+                            binding=binding,
+                            storage_issue_id=storage_issue_id,
+                            pr_number=pr_number,
+                        )
+                    await self._move_issue_to_review_state(
+                        binding=binding, issue=issue
+                    )
+                return existing
+            # Guard tripped on a live run in another stage, but no live Review
+            # row exists to adopt: force-create so the returned Run is persisted.
+            await db.runs.create(
+                self._conn,
+                id=review_run_id,
+                issue_id=storage_issue_id,
+                stage="review",
+                status="running",
+                pid=None,
+                started_at=started_at,
+            )
+            created_review_run = True
+        if created_review_run and pr_number is not None and post_codex_review:
+            await self._post_codex_review_request(
+                binding=binding,
+                storage_issue_id=storage_issue_id,
+                pr_number=pr_number,
+            )
+
+        if (
+            created_review_run
+            and post_codex_review
+            and binding.resolved_remote_review()
+        ):
+            await self._move_issue_to_review_state(binding=binding, issue=issue)
         return db.runs.Run(
             id=review_run_id,
             issue_id=storage_issue_id,
@@ -12363,6 +12791,33 @@ class Orchestrator:
             started_at=started_at,
             ended_at=None,
             cost_usd=0.0,
+        )
+
+    async def _post_codex_review_request(
+        self,
+        *,
+        binding: RepoBinding,
+        storage_issue_id: str,
+        pr_number: int,
+    ) -> None:
+        try:
+            await self._gh.pr_comment(
+                pr_number,
+                "@codex review",
+                repo=binding.github_repo,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not post @codex review on %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return
+        await db.review_state.set_codex_review_requested_at(
+            self._conn,
+            storage_issue_id,
+            datetime.now(UTC).isoformat(),
         )
 
     async def _move_issue_to_local_code_review_state(
@@ -13196,6 +13651,333 @@ class Orchestrator:
             log.warning(
                 "implement blocked comment post failed on %s: %s", issue.identifier, e
             )
+
+    async def _park_deliver_failed(
+        self,
+        reason: str,
+        *,
+        ctx: _PendingDelivery,
+        exc: BaseException | str | None = None,
+    ) -> None:
+        """Park a post-completion delivery failure as a `deliver_failed` wait.
+
+        The completion gate already passed, so — unlike `_fail_run_and_reset_issue`
+        — this never rewinds the issue to the ready lane (which would re-dispatch
+        the agent and re-park on "HEAD did not advance"). The branch and commits
+        stay intact; the delivery context is stashed so a `$retry` resumes
+        delivery via `_deliver_implement_run`.
+        """
+        binding = ctx.binding
+        issue = ctx.issue
+        storage_issue_id = ctx.storage_issue_id
+        run_id = ctx.run_id
+        await self._fail_run(
+            run_id,
+            reason,
+            exc=exc,
+            termination_kind="deliver_failed",
+            termination_detail=reason,
+        )
+        # Park in a non-dispatch, operator-visible lane — never `ready`, which
+        # the implement scan would pick up and re-run the agent on.
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while parking deliver_failed %s: %s",
+                issue.identifier,
+                e,
+            )
+        else:
+            target_state_id = states.get(
+                binding.linear_states.needs_approval
+            ) or states.get(binding.linear_states.blocked)
+            if target_state_id is not None and target_state_id != issue.state_id:
+                try:
+                    await self.tracker(binding).move_issue(issue.id, target_state_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not park %s after delivery failure: %s",
+                        issue.identifier,
+                        e,
+                    )
+        if ctx.reconstructed:
+            self._pending_deliveries.pop(run_id, None)
+        else:
+            self._pending_deliveries[run_id] = ctx
+        # Persist the real local-review verdict so a `$retry` after a daemon
+        # restart (which drops the in-memory stash) rebuilds the human-approval
+        # gate faithfully instead of assuming APPROVED. A needs-approval verdict
+        # (EXHAUSTED / STUCK_LOOP) must stay parked, not silently ping @codex.
+        local_review_outcome = (
+            ctx.local_review_result.outcome.value
+            if ctx.local_review_result is not None
+            else None
+        )
+        await self._track_deliver_failed_wait(
+            storage_issue_id,
+            run_id,
+            binding,
+            local_review_outcome=local_review_outcome,
+        )
+        self._cancel_deliver_failed_review_poll_tasks(storage_issue_id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
+        body = failed(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+                error=reason,
+            )
+        )
+        body += (
+            "\nThe change is committed; only delivery failed. Reply with "
+            "`$retry` to resume delivery (push + PR + handoff) on the existing "
+            "branch without re-running the agent. Reply with `$reject` or "
+            "`$stop` to leave it halted.\n"
+        )
+        try:
+            await self.tracker(binding).post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "deliver_failed comment post failed on %s: %s", issue.identifier, e
+            )
+
+    async def _track_delivery_handoff_recovery_wait(
+        self, ctx: _PendingDelivery
+    ) -> None:
+        """Persist a temporary retry target before first review handoff."""
+        local_review_outcome = (
+            ctx.local_review_result.outcome.value
+            if ctx.local_review_result is not None
+            else None
+        )
+        await self._track_deliver_failed_wait(
+            ctx.storage_issue_id,
+            ctx.run_id,
+            ctx.binding,
+            local_review_outcome=local_review_outcome,
+        )
+
+    async def _track_deliver_failed_wait(
+        self,
+        issue_id: str,
+        run_id: str,
+        binding: RepoBinding,
+        *,
+        local_review_outcome: str | None = None,
+    ) -> None:
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._deliver_failed_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_DELIVER_FAILED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+            local_review_outcome=local_review_outcome,
+        )
+
+    async def _handle_deliver_failed_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._deliver_failed_run_bindings.get(run_id)
+        if binding is None:
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_DELIVER_FAILED,),
+            )
+            if binding is None:
+                return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            states = await self._states_for_binding(binding)
+            blocked_id = states.get(binding.linear_states.blocked)
+            tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+            tracker = self.tracker(binding)
+            if blocked_id is None:
+                try:
+                    await tracker.post_comment(
+                        tracker_issue_id,
+                        truncate_body(
+                            command_rejected(
+                                f"${intent.kind}",
+                                "missing blocked state; keeping issue parked",
+                            )
+                        ),
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "deliver_failed stop rejection comment failed for %s: %s",
+                        issue_id,
+                        e,
+                    )
+                return
+            try:
+                await tracker.move_issue(tracker_issue_id, blocked_id)
+            except LinearError as e:
+                log.warning("could not move %s to blocked: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
+            await self._terminate_deliver_failed_review_monitors(
+                issue_id,
+                detail=f"${intent.kind} halted deliver_failed delivery wait",
+            )
+            self._pending_deliveries.pop(run_id, None)
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
+            log.info(
+                "slash %s received for deliver_failed run %s (ignored)",
+                intent.kind,
+                run_id,
+            )
+            return
+
+        ctx = await self._resolve_pending_delivery(issue_id, run_id, binding, intent)
+        if ctx is None:
+            return
+        # Keep the durable wait until delivery reaches success. If this retry
+        # crashes or raises before re-parking, the existing operator wait still
+        # gives the issue a retryable home.
+        self._pending_deliveries.pop(run_id, None)
+        try:
+            await self._deliver_implement_run(ctx=ctx)
+            run = await db.runs.get_with_issue(self._conn, run_id)
+            if run is not None and run.run.status in db.runs.SUCCESS_STATUSES:
+                await self._clear_operator_wait(issue_id, run_id)
+        finally:
+            if ctx.retry_workspace_acquired:
+                self._workspace.release(ctx.binding, ctx.issue)
+
+    async def _resolve_pending_delivery(
+        self,
+        issue_id: str,
+        run_id: str,
+        binding: RepoBinding,
+        intent: SlashIntent,
+    ) -> _PendingDelivery | None:
+        """Return the delivery context to resume, reconstructing it if the
+        daemon restarted and the in-memory stash was lost.
+
+        The completion gate already passed before parking, so a reconstructed
+        context reads the issue + workspace fresh (the branch and commits are
+        intact on disk) and restores the local-review verdict persisted on the
+        wait — preserving the human-approval gate for a `needs_approval`
+        verdict rather than assuming APPROVED.
+        """
+        ctx = self._pending_deliveries.get(run_id)
+        if ctx is not None:
+            try:
+                workspace_path = await self._workspace.acquire(binding, ctx.issue)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not re-acquire workspace to resume delivery for %s: %s",
+                    ctx.issue.identifier,
+                    e,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    f"could not re-acquire workspace to resume delivery: {e}",
+                )
+                return None
+            return replace(
+                ctx,
+                workspace_path=workspace_path,
+                retry_workspace_acquired=True,
+            )
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        try:
+            issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not look up %s to resume delivery: %s", issue_id, e
+            )
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"could not look up issue to resume delivery: {e}",
+            )
+            return None
+        try:
+            workspace_path = await self._workspace.acquire(binding, issue)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not re-acquire workspace to resume delivery for %s: %s",
+                issue.identifier,
+                e,
+            )
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"could not re-acquire workspace to resume delivery: {e}",
+            )
+            return None
+        tokens = await db.runs.tokens_for_issue(self._conn, issue_id)
+        return _PendingDelivery(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            branch=f"{binding.branch_prefix}/{issue.identifier.lower()}",
+            cumulative_usage=UsageDelta(
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+            ),
+            local_review_result=await self._reconstructed_local_review_result(
+                run_id
+            ),
+            reconstructed=True,
+            retry_workspace_acquired=True,
+        )
+
+    async def _reconstructed_local_review_result(
+        self, run_id: str
+    ) -> LoopResult | None:
+        """Rebuild the local-review verdict for a restart-reconstructed resume.
+
+        Reads the outcome persisted on the `deliver_failed` wait. A
+        needs-approval verdict (EXHAUSTED / STUCK_LOOP) is preserved so the
+        delivery handoff re-parks for human approval instead of pinging
+        `@codex` / merging. Falls back to a synthetic APPROVED when nothing was
+        persisted (legacy rows, or a binding without local review): `None`
+        would read as "not approved" and dead-end a `local_review` binding in
+        `_fail_review_run`, whereas APPROVED lets the gate treat it as passed.
+        """
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        outcome = LoopOutcome.APPROVED
+        if wait is not None and wait.local_review_outcome:
+            try:
+                outcome = LoopOutcome(wait.local_review_outcome)
+            except ValueError:
+                log.warning(
+                    "unknown persisted local_review_outcome %r for run %s; "
+                    "treating as APPROVED",
+                    wait.local_review_outcome,
+                    run_id,
+                )
+        return LoopResult(outcome=outcome, iterations=0, verdicts=())
 
 
 __all__ = [

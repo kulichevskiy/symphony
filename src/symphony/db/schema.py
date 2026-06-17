@@ -79,6 +79,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         )
     if "exit_returncode" not in run_cols:
         await conn.execute("ALTER TABLE runs ADD COLUMN exit_returncode INTEGER")
+    if "stage_done_announced_at" not in run_cols:
+        await conn.execute(
+            "ALTER TABLE runs "
+            "ADD COLUMN stage_done_announced_at TEXT NOT NULL DEFAULT ''"
+        )
 
     cur = await conn.execute("PRAGMA table_info(comment_cursors)")
     cols = {row[1] for row in await cur.fetchall()}
@@ -113,6 +118,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE review_state "
             "ADD COLUMN codex_lgtm_comment_id TEXT NOT NULL DEFAULT ''"
+        )
+    if "codex_review_requested_at" not in review_cols:
+        await conn.execute(
+            "ALTER TABLE review_state "
+            "ADD COLUMN codex_review_requested_at TEXT NOT NULL DEFAULT ''"
         )
 
     cur = await conn.execute("PRAGMA table_info(webhook_deliveries)")
@@ -188,6 +198,12 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
                    'default'
                )
             """
+        )
+    cur = await conn.execute("PRAGMA table_info(operator_waits)")
+    cols = {row[1] for row in await cur.fetchall()}
+    if "local_review_outcome" not in cols:
+        await conn.execute(
+            "ALTER TABLE operator_waits ADD COLUMN local_review_outcome TEXT"
         )
     cur = await conn.execute("PRAGMA table_info(operator_waits)")
     cols = {row[1] for row in await cur.fetchall()}

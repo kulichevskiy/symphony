@@ -459,6 +459,43 @@ async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -
     await conn.commit()
 
 
+async def has_stage_done_announced(
+    conn: aiosqlite.Connection, run_id: str
+) -> bool:
+    cur = await conn.execute(
+        """
+        SELECT 1
+        FROM runs
+        WHERE id = ? AND stage_done_announced_at != ''
+        LIMIT 1
+        """,
+        (run_id,),
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def mark_stage_done_announced(
+    conn: aiosqlite.Connection,
+    run_id: str,
+    *,
+    announced_at: str,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE runs
+           SET stage_done_announced_at =
+               CASE
+                   WHEN stage_done_announced_at = '' THEN ?
+                   ELSE stage_done_announced_at
+               END
+         WHERE id = ?
+        """,
+        (announced_at, run_id),
+    )
+    await conn.commit()
+
+
 async def add_usage(
     conn: aiosqlite.Connection,
     run_id: str,
@@ -767,6 +804,32 @@ async def latest_for_issue_stage(
         LIMIT 1
         """,
         params,
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return _row_to_run(row)
+
+
+async def latest_live_for_issue_stage(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    stage: str,
+) -> Run | None:
+    """Most recent live run for an issue/stage, or None."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+               termination_kind, termination_detail, exit_returncode
+        FROM runs
+        WHERE issue_id = ? AND stage = ? AND status IN ({placeholders})
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (issue_id, stage, *LIVE_STATUSES),
     )
     row = await cur.fetchone()
     if row is None:

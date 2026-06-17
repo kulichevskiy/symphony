@@ -29,6 +29,7 @@ class ReviewState:
     github_repo: str
     issue_label: str
     codex_lgtm_comment_id: str
+    codex_review_requested_at: str
 
 
 _TRACKED_FIELDS = (
@@ -37,6 +38,7 @@ _TRACKED_FIELDS = (
     "ci_fetch_failures",
     "pr_number",
     "codex_lgtm_comment_id",
+    "codex_review_requested_at",
 )
 
 
@@ -53,7 +55,8 @@ async def _get_existing(
             pr_url,
             github_repo,
             issue_label,
-            codex_lgtm_comment_id
+            codex_lgtm_comment_id,
+            codex_review_requested_at
         FROM review_state
         WHERE issue_id = ?
         """,
@@ -71,6 +74,7 @@ async def _get_existing(
         github_repo=str(row["github_repo"]),
         issue_label=str(row["issue_label"]),
         codex_lgtm_comment_id=str(row["codex_lgtm_comment_id"]),
+        codex_review_requested_at=str(row["codex_review_requested_at"]),
     )
 
 
@@ -108,6 +112,7 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> ReviewState:
         github_repo="",
         issue_label="",
         codex_lgtm_comment_id="",
+        codex_review_requested_at="",
     )
 
 
@@ -128,9 +133,9 @@ async def begin_review(
         INSERT INTO review_state (
             issue_id, iteration, last_trigger_signature,
             ci_fetch_failures, pr_number, pr_url, github_repo, issue_label,
-            codex_lgtm_comment_id
+            codex_lgtm_comment_id, codex_review_requested_at
         )
-        VALUES (?, 0, '', 0, ?, ?, ?, ?, '')
+        VALUES (?, 0, '', 0, ?, ?, ?, ?, '', '')
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             last_trigger_signature = '',
@@ -139,7 +144,43 @@ async def begin_review(
             pr_url = excluded.pr_url,
             github_repo = excluded.github_repo,
             issue_label = excluded.issue_label,
-            codex_lgtm_comment_id = ''
+            codex_lgtm_comment_id = '',
+            codex_review_requested_at = ''
+        """,
+        (issue_id, pr_number, pr_url, github_repo, issue_label or ""),
+    )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
+    if commit:
+        await conn.commit()
+
+
+async def refresh_pr_metadata(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    pr_number: int | None,
+    pr_url: str,
+    github_repo: str,
+    issue_label: str | None,
+    commit: bool = True,
+) -> None:
+    """Refresh active PR fields without resetting review-cycle state."""
+    old = await _get_existing(conn, issue_id)
+    await conn.execute(
+        """
+        INSERT INTO review_state (
+            issue_id, iteration, last_trigger_signature,
+            ci_fetch_failures, pr_number, pr_url, github_repo, issue_label,
+            codex_lgtm_comment_id, codex_review_requested_at
+        )
+        VALUES (?, 0, '', 0, ?, ?, ?, ?, '', '')
+        ON CONFLICT(issue_id) DO UPDATE SET
+            pr_number = excluded.pr_number,
+            pr_url = excluded.pr_url,
+            github_repo = excluded.github_repo,
+            issue_label = excluded.issue_label
         """,
         (issue_id, pr_number, pr_url, github_repo, issue_label or ""),
     )
@@ -267,6 +308,28 @@ async def set_codex_lgtm_comment_id(
     await conn.commit()
 
 
+async def set_codex_review_requested_at(
+    conn: aiosqlite.Connection, issue_id: str, requested_at: str
+) -> None:
+    old = await _get_existing(conn, issue_id)
+    await conn.execute(
+        """
+        INSERT INTO review_state (
+            issue_id, iteration, last_trigger_signature, ci_fetch_failures,
+            codex_review_requested_at
+        )
+        VALUES (?, 0, '', 0, ?)
+        ON CONFLICT(issue_id) DO UPDATE SET
+            codex_review_requested_at = excluded.codex_review_requested_at
+        """,
+        (issue_id, requested_at),
+    )
+    new = await _get_existing(conn, issue_id)
+    assert new is not None
+    await _record_transitions(conn, issue_id, old, new)
+    await conn.commit()
+
+
 async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
     """Clear iteration and signature — used when leaving Review (e.g.
     Merge starts, or `$retry` re-enters the stage)."""
@@ -276,9 +339,9 @@ async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
         INSERT INTO review_state (
             issue_id, iteration, last_trigger_signature,
             ci_fetch_failures, pr_number, pr_url, github_repo, issue_label,
-            codex_lgtm_comment_id
+            codex_lgtm_comment_id, codex_review_requested_at
         )
-        VALUES (?, 0, '', 0, NULL, '', '', '', '')
+        VALUES (?, 0, '', 0, NULL, '', '', '', '', '')
         ON CONFLICT(issue_id) DO UPDATE SET
             iteration = 0,
             last_trigger_signature = '',
@@ -287,7 +350,8 @@ async def reset(conn: aiosqlite.Connection, issue_id: str) -> None:
             pr_url = '',
             github_repo = '',
             issue_label = '',
-            codex_lgtm_comment_id = ''
+            codex_lgtm_comment_id = '',
+            codex_review_requested_at = ''
         """,
         (issue_id,),
     )
@@ -303,8 +367,10 @@ __all__ = [
     "bump_iteration",
     "bump_ci_fetch_failures",
     "get",
+    "refresh_pr_metadata",
     "reset",
     "reset_ci_fetch_failures",
     "set_codex_lgtm_comment_id",
+    "set_codex_review_requested_at",
     "set_signature",
 ]

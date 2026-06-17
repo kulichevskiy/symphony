@@ -1472,6 +1472,70 @@ async def test_active_review_polls_when_issue_is_in_configured_review_state(
 
 
 @pytest.mark.asyncio
+async def test_review_poll_rechecks_deliver_failed_wait_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        run = next(
+            run
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+            if run.id == "review-run"
+        )
+        await db.runs.create(
+            conn,
+            id="implement-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-09T23:59:00+00:00",
+        )
+
+        async def park_after_refresh(_run_id: str) -> bool:
+            await db.operator_waits.upsert(
+                conn,
+                issue_id="iss-1",
+                run_id="implement-run",
+                kind=db.operator_waits.KIND_DELIVER_FAILED,
+                linear_team_key=binding.linear_team_key,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label or "",
+                created_at="2026-05-10T00:01:00+00:00",
+                provider=binding.provider,
+                tracker_provider=binding.tracker_provider,
+                tracker_site=binding.tracker_site,
+            )
+            return False
+
+        orch._review_rearm_retry_pending = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=park_after_refresh
+        )
+        orch._poll_review_run = AsyncMock(return_value=True)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_review_run_with_limits(  # noqa: SLF001
+            run, binding, _issue_in_review()
+        )
+
+        orch._poll_review_run.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_active_review_closes_when_issue_leaves_review_active_states(
     tmp_path: Path,
 ) -> None:
@@ -2265,6 +2329,414 @@ def test_pr_number_from_url_parses_github_url() -> None:
 def test_pr_number_from_url_returns_none_for_garbage() -> None:
     assert pr_number_from_url("") is None
     assert pr_number_from_url("not a url") is None
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_ignores_terminal_review_when_other_stage_live(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="old-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "old-review",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="live-local-review",
+            issue_id=issue.id,
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.status == "running"
+        assert run.id != "old-review"
+        history = await db.runs.history_for_issue(conn, issue.id)
+        review_rows = [row for row in history if row.stage == "review"]
+        assert [row.status for row in review_rows] == ["failed", "running"]
+        latest = await db.runs.latest_for_issue_stage(
+            conn, issue_id=issue.id, stage="review"
+        )
+        assert latest is not None
+        assert latest.id == run.id
+        assert latest.status == "running"
+        state = await db.review_state.get(conn, issue.id)
+        assert state.pr_number == 43
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_adopts_live_review_and_persists_pr_row(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.id == "live-review"
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue.id)
+        assert issue_pr is not None
+        assert issue_pr.pr_number == 43
+        assert issue_pr.pr_url == "https://github.com/org/repo/pull/43"
+        assert issue_pr.created_at == "2026-05-10T00:00:00+00:00"
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert [candidate.pr_number for candidate in candidates] == [43]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_adopts_live_review_and_reposts_unconfirmed_bot(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=43,
+            pr_url="https://github.com/org/repo/pull/43",
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label,
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.id == "live-review"
+        gh.pr_comment.assert_awaited_once_with(43, "@codex review", repo="org/repo")
+        state = await db.review_state.get(conn, issue.id)
+        assert state.codex_review_requested_at
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_adopted_live_review_reposts_bot_for_replacement_pr(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label,
+        )
+        old_requested_at = "2026-05-10T00:00:30+00:00"
+        await db.review_state.set_codex_review_requested_at(
+            conn, issue.id, old_requested_at
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.id == "live-review"
+        gh.pr_comment.assert_awaited_once_with(43, "@codex review", repo="org/repo")
+        state = await db.review_state.get(conn, issue.id)
+        assert state.pr_number == 43
+        assert state.codex_review_requested_at
+        assert state.codex_review_requested_at != old_requested_at
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_adopted_live_review_preserves_pr_timestamp(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            binding_key="old-binding",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-09T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="https://github.com/org/repo/pull/43",
+        )
+
+        assert run.id == "live-review"
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue.id)
+        assert issue_pr is not None
+        assert issue_pr.pr_number == 43
+        assert issue_pr.pr_url == "https://github.com/org/repo/pull/43"
+        assert issue_pr.created_at == "2026-05-09T00:00:00+00:00"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_adopted_live_review_keeps_pr_metadata_for_bad_url(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.review_state.begin_review(
+            conn,
+            issue.id,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo=binding.github_repo,
+            issue_label=None,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+            binding_key="old-binding",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-09T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="live-review",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            pr_url="not-a-pr-url",
+        )
+
+        assert run.id == "live-review"
+        state = await db.review_state.get(conn, issue.id)
+        assert state.pr_number == 42
+        assert state.pr_url == "https://github.com/org/repo/pull/42"
+        issue_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue.id)
+        assert issue_pr is not None
+        assert issue_pr.pr_number == 42
+        assert issue_pr.pr_url == "https://github.com/org/repo/pull/42"
+    finally:
+        await conn.close()
 
 
 # --- Failure visibility and retry ------------------------------------------

@@ -251,11 +251,11 @@ async def test_stop_intent_kills_active_runner(tmp_path: Path) -> None:
             "_handle_implement_failed_slash_intent",
             SlashKind.APPROVE,
         ),
-        (
-            db.operator_waits.KIND_DELIVER_FAILED,
-            "_handle_implement_failed_slash_intent",
-            SlashKind.RETRY,
-        ),
+        # `deliver_failed` is no longer handled by the shared implement-failed
+        # handler: SYM-111 routes it to the dedicated
+        # `_handle_deliver_failed_slash_intent`, which resumes delivery in place
+        # rather than moving the issue back to ready. That handler's behaviour
+        # is covered by tests/test_implement_e2e.py.
         (
             db.operator_waits.KIND_REVIEW_FAILED,
             "_handle_review_failed_slash_intent",
