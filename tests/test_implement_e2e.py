@@ -125,6 +125,24 @@ def _states() -> dict[str, str]:
     }
 
 
+def _init_git_workspace_with_base(workspace_path: Path) -> None:
+    advance_head(workspace_path)
+    subprocess.run(
+        ["git", "branch", "trunk"],
+        cwd=workspace_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "symphony/eng-1"],
+        cwd=workspace_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 async def _scan_and_wait(orch: Orchestrator, binding: RepoBinding) -> None:
     tasks = await orch._scan_binding(binding)  # noqa: SLF001
     if tasks:
@@ -285,6 +303,69 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert history[1].status == "running"
         assert await db.runs.has_running_or_completed(conn, "iss-1") is True
         gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_start_review_stage_writes_review_state_before_live_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        gh = MagicMock()
+        gh.pr_comment = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
+            team_key="ENG",
+        )
+
+        observed_pr_numbers: list[int | None] = []
+        real_create_if_no_active = db.runs.create_if_no_active
+
+        async def create_if_no_active_spy(*args: object, **kwargs: object) -> bool:
+            state = await db.review_state.get(conn, "iss-1")
+            observed_pr_numbers.append(state.pr_number)
+            return await real_create_if_no_active(  # type: ignore[arg-type]
+                *args, **kwargs
+            )
+
+        monkeypatch.setattr(db.runs, "create_if_no_active", create_if_no_active_spy)
+
+        run = await orch._start_review_stage(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            storage_issue_id="iss-1",
+            pr_url="https://github.com/org/repo/pull/42",
+            post_codex_review=False,
+        )
+
+        assert observed_pr_numbers == [42]
+        assert run.stage == "review"
+        assert run.status == "running"
     finally:
         await conn.close()
 
@@ -714,6 +795,7 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
 
         workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
         workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
         workspace.release = MagicMock()
@@ -787,6 +869,8 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
 
         # PR opened on resume; the agent was NOT re-invoked.
         gh.ensure_pr.assert_awaited_once()
+        assert workspace.acquire.await_count == 2
+        assert workspace.release.call_count == 2
         assert len([s for s in runner.specs if s.stage == "implement"]) == 1
 
         # Wait cleared, run completed, merge candidate registered on the new PR.
@@ -797,6 +881,199 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
         candidates = await db.issue_prs.list_merge_candidates(conn)
         assert len(candidates) == 1
         assert candidates[0].pr_number == 42
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_in_memory_deliver_retry_reacquires_and_reparks_stale_workspace(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        stale_path = tmp_path / "ws" / "org_srepo" / "eng-1-stale"
+        stale_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(side_effect=[workspace_path, stale_path])
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(side_effect=GitHubError("gh pr create: HTTP 401"))
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        run_id = wait.run_id
+
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        assert workspace.acquire.await_count == 2
+        assert workspace.release.call_count == 2
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_not_awaited()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any(
+            "refusing to deliver without proving branch work" in body
+            for body in posted
+        )
+        assert len([s for s in runner.specs if s.stage == "implement"]) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_no_review_deliver_retry_skips_duplicate_stage_done_after_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        real_upsert = db.issue_prs.upsert
+        upsert_calls = 0
+
+        async def flaky_upsert(*args: object, **kwargs: object) -> None:
+            nonlocal upsert_calls
+            upsert_calls += 1
+            if upsert_calls == 1:
+                raise RuntimeError("issue_prs write failed")
+            await real_upsert(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(db.issue_prs, "upsert", flaky_upsert)
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        run_id = wait.run_id
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert sum("**Implement → Merge**" in body for body in posted) == 1
+
+        await orch._handle_slash_intent(  # noqa: SLF001
+            "iss-1",
+            run_id,
+            SlashIntent(
+                kind=SlashKind.RETRY,
+                comment_id="c-retry",
+                created_at="2026-05-10T01:00:00+00:00",
+            ),
+        )
+
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert sum("**Implement → Merge**" in body for body in posted) == 1
+        assert upsert_calls == 2
+        assert workspace.acquire.await_count == 2
+        assert workspace.release.call_count == 2
+        assert len([s for s in runner.specs if s.stage == "implement"]) == 1
     finally:
         await conn.close()
 

@@ -491,6 +491,7 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
 
         workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
         workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=workspace_path)
         workspace.release = MagicMock()

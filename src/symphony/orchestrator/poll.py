@@ -467,6 +467,10 @@ class _PendingDelivery:
     branch: str
     cumulative_usage: UsageDelta
     local_review_result: LoopResult | None
+    # True when a deliver_failed `$retry` reacquired this workspace. Retry
+    # contexts must prove the branch still carries work before pushing because
+    # the original workspace was already released and may have been swept.
+    retry_workspace_acquired: bool = False
     # True when rebuilt by `_resolve_pending_delivery` after a daemon restart
     # lost the in-memory stash. The workspace was re-acquired (possibly
     # re-cloned) and the live local-review verdict is gone, so the resume
@@ -10686,6 +10690,34 @@ class Orchestrator:
                 )
         return base_branch
 
+    async def _delivery_handoff_started(
+        self, *, ctx: _PendingDelivery, pr_url: str
+    ) -> bool:
+        """True once delivery reached durable PR/review handoff metadata."""
+        if await db.runs.has_live_stage(
+            self._conn, ctx.storage_issue_id, stage="review"
+        ):
+            return True
+
+        pr_number = pr_number_from_url(pr_url)
+        state = await db.review_state.get(self._conn, ctx.storage_issue_id)
+        if state.github_repo == ctx.binding.github_repo:
+            if pr_number is not None and state.pr_number == pr_number:
+                return True
+            if state.pr_url and state.pr_url == pr_url:
+                return True
+
+        issue_pr = await db.issue_prs.get(
+            self._conn,
+            issue_id=ctx.storage_issue_id,
+            github_repo=ctx.binding.github_repo,
+        )
+        if issue_pr is None:
+            return False
+        if pr_number is not None and issue_pr.pr_number == pr_number:
+            return True
+        return issue_pr.pr_url == pr_url
+
     async def _deliver_implement_run(self, *, ctx: _PendingDelivery) -> str:
         """Push + open PR + hand off to review/merge for a completed implement.
 
@@ -10704,27 +10736,18 @@ class Orchestrator:
 
         base_branch = await self._resolve_base_branch(binding, issue)
 
-        # First delivery vs. a `$retry` resume. A handoff that faulted *after*
-        # `_start_review_stage` created the review run leaves it live; on resume
-        # the `stage_done` comment and `completed` write must not fire again
-        # (the review run itself is deduped via `create_if_no_active`). A still-
-        # live review run for this issue is the marker that delivery already got
-        # that far. A fully-terminated prior cycle's review run is not live, so a
-        # legitimately new delivery still counts as first.
-        first_delivery = not await db.runs.has_live_stage(
-            self._conn, ctx.storage_issue_id, stage="review"
-        )
-
         # On a reconstructed resume the workspace was re-acquired after the
-        # daemon restart — and on a *push*-failure the commits lived only in
-        # that workspace, which was already released. If it was swept past its
-        # TTL, `acquire()` may have re-cloned an empty branch from origin (the
-        # publish step is the very one that failed). Refuse to push / open an
-        # empty no-op PR with the work silently lost; re-park instead.
-        if ctx.reconstructed:
+        # daemon restart. In-memory `$retry` resumes also re-acquire because
+        # the original implement dispatch already released the workspace. On a
+        # *push*-failure the commits lived only in that workspace; if it was
+        # swept past its TTL, `acquire()` may have re-cloned an empty branch
+        # from origin (the publish step is the very one that failed). Refuse to
+        # push / open an empty no-op PR with the work silently lost; re-park
+        # instead.
+        if ctx.reconstructed or ctx.retry_workspace_acquired:
             if base_branch is None:
                 msg = (
-                    f"could not resolve base branch for reconstructed $retry of "
+                    f"could not resolve base branch for $retry of "
                     f"{branch}; refusing to deliver without proving branch work"
                 )
                 log.warning("%s for %s", msg, issue.identifier)
@@ -10733,7 +10756,7 @@ class Orchestrator:
             ahead = await _workspace_commits_ahead(workspace_path, base_branch)
             if ahead is None:
                 msg = (
-                    f"could not compare reconstructed $retry branch {branch} "
+                    f"could not compare $retry branch {branch} "
                     f"against {base_branch}; refusing to deliver without "
                     "proving branch work"
                 )
@@ -10771,6 +10794,15 @@ class Orchestrator:
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"pr_create failed: {e}", ctx=ctx, exc=e)
             return run_id
+
+        # First delivery vs. a `$retry` resume. Review-enabled handoff writes a
+        # live review run; no-review handoff writes only review_state/issue_prs.
+        # Treat either durable PR marker as "handoff already got this far" so
+        # a retry after a late handoff failure does not repost stage_done or
+        # re-run first-delivery side effects.
+        first_delivery = not await self._delivery_handoff_started(
+            ctx=ctx, pr_url=pr_url
+        )
 
         # The stage-transition comment is first-delivery only. The completed
         # write must happen before the first handoff so the review run can pass
@@ -12273,6 +12305,64 @@ class Orchestrator:
 
         review_run_id = str(uuid.uuid4())
         started_at = datetime.now(UTC).isoformat()
+
+        existing = await db.runs.latest_live_for_issue_stage(
+            self._conn, issue_id=storage_issue_id, stage="review"
+        )
+        if existing is not None:
+            await db.review_state.refresh_pr_metadata(
+                self._conn,
+                storage_issue_id,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label,
+            )
+            if pr_number is not None:
+                existing_issue_pr = await db.issue_prs.get(
+                    self._conn,
+                    issue_id=storage_issue_id,
+                    github_repo=binding.github_repo,
+                )
+                await db.issue_prs.upsert(
+                    self._conn,
+                    issue_id=storage_issue_id,
+                    github_repo=binding.github_repo,
+                    binding_key=_binding_storage_key(binding),
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    created_at=(
+                        existing_issue_pr.created_at
+                        if existing_issue_pr is not None
+                        else existing.started_at
+                    ),
+                )
+            if post_codex_review and binding.resolved_remote_review():
+                await self._move_issue_to_review_state(binding=binding, issue=issue)
+            return existing
+
+        # Write PR metadata before exposing the live review run. A poll tick
+        # can see the run immediately after insertion, so it must not observe
+        # a default review_state row with no PR number.
+        await db.review_state.begin_review(
+            self._conn,
+            storage_issue_id,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label,
+        )
+        if pr_number is not None:
+            await db.issue_prs.upsert(
+                self._conn,
+                issue_id=storage_issue_id,
+                github_repo=binding.github_repo,
+                binding_key=_binding_storage_key(binding),
+                pr_number=pr_number,
+                pr_url=pr_url,
+                created_at=started_at,
+            )
+
         # Idempotent under a `$retry` resume: a handoff that faulted after this
         # point already left a live review run, so guard creation (mirrors
         # `_merge_approved_pr`) and adopt the existing one instead of inserting
@@ -12292,33 +12382,6 @@ class Orchestrator:
                 self._conn, issue_id=storage_issue_id, stage="review"
             )
             if existing is not None:
-                await db.review_state.refresh_pr_metadata(
-                    self._conn,
-                    storage_issue_id,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    github_repo=binding.github_repo,
-                    issue_label=binding.issue_label,
-                )
-                if pr_number is not None:
-                    existing_issue_pr = await db.issue_prs.get(
-                        self._conn,
-                        issue_id=storage_issue_id,
-                        github_repo=binding.github_repo,
-                    )
-                    await db.issue_prs.upsert(
-                        self._conn,
-                        issue_id=storage_issue_id,
-                        github_repo=binding.github_repo,
-                        binding_key=_binding_storage_key(binding),
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        created_at=(
-                            existing_issue_pr.created_at
-                            if existing_issue_pr is not None
-                            else existing.started_at
-                        ),
-                    )
                 if post_codex_review and binding.resolved_remote_review():
                     await self._move_issue_to_review_state(
                         binding=binding, issue=issue
@@ -12336,25 +12399,6 @@ class Orchestrator:
                 started_at=started_at,
             )
             created_review_run = True
-        if created_review_run:
-            await db.review_state.begin_review(
-                self._conn,
-                storage_issue_id,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                github_repo=binding.github_repo,
-                issue_label=binding.issue_label,
-            )
-        if created_review_run and pr_number is not None:
-            await db.issue_prs.upsert(
-                self._conn,
-                issue_id=storage_issue_id,
-                github_repo=binding.github_repo,
-                binding_key=_binding_storage_key(binding),
-                pr_number=pr_number,
-                pr_url=pr_url,
-                created_at=started_at,
-            )
         if created_review_run and pr_number is not None and post_codex_review:
             try:
                 await self._gh.pr_comment(
@@ -13410,7 +13454,7 @@ class Orchestrator:
         try:
             await self._deliver_implement_run(ctx=ctx)
         finally:
-            if ctx.reconstructed:
+            if ctx.retry_workspace_acquired:
                 self._workspace.release(ctx.binding, ctx.issue)
 
     async def _resolve_pending_delivery(
@@ -13431,7 +13475,25 @@ class Orchestrator:
         """
         ctx = self._pending_deliveries.get(run_id)
         if ctx is not None:
-            return ctx
+            try:
+                workspace_path = await self._workspace.acquire(binding, ctx.issue)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "could not re-acquire workspace to resume delivery for %s: %s",
+                    ctx.issue.identifier,
+                    e,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    f"could not re-acquire workspace to resume delivery: {e}",
+                )
+                return None
+            return replace(
+                ctx,
+                workspace_path=workspace_path,
+                retry_workspace_acquired=True,
+            )
         tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         try:
             issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
@@ -13471,6 +13533,7 @@ class Orchestrator:
                 run_id
             ),
             reconstructed=True,
+            retry_workspace_acquired=True,
         )
 
     async def _reconstructed_local_review_result(
