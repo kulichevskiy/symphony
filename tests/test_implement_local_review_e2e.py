@@ -1700,7 +1700,12 @@ async def test_local_review_deliver_failed_resumes_after_restart(
                                 {
                                     "type": "result",
                                     "subtype": "success",
-                                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                                    "usage": {
+                                        "input_tokens": 7,
+                                        "output_tokens": 11,
+                                        "cache_creation_input_tokens": 13,
+                                        "cache_read_input_tokens": 17,
+                                    },
                                 }
                             ),
                         ),
@@ -1773,5 +1778,14 @@ async def test_local_review_deliver_failed_resumes_after_restart(
             if "local reviewer" in str(c).lower()
         ]
         assert summary_calls == []
+        posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        stage_done_posts = [
+            body for body in posted if "**Implement → Review**" in body
+        ]
+        assert len(stage_done_posts) == 1
+        assert (
+            "Tokens: in 7 · out 11 · cache w 13 / r 17"
+            in stage_done_posts[0]
+        )
     finally:
         await conn.close()

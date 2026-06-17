@@ -12318,6 +12318,7 @@ class Orchestrator:
             self._conn, issue_id=storage_issue_id, stage="review"
         )
         if existing is not None:
+            previous_state = await db.review_state.get(self._conn, storage_issue_id)
             if pr_number is not None:
                 await db.review_state.refresh_pr_metadata(
                     self._conn,
@@ -12345,6 +12346,12 @@ class Orchestrator:
                         else existing.started_at
                     ),
                 )
+                if previous_state.pr_number not in (None, pr_number):
+                    await db.review_state.set_codex_review_requested_at(
+                        self._conn,
+                        storage_issue_id,
+                        "",
+                    )
             if post_codex_review and binding.resolved_remote_review():
                 state = await db.review_state.get(self._conn, storage_issue_id)
                 if pr_number is not None and not state.codex_review_requested_at:
@@ -13566,6 +13573,7 @@ class Orchestrator:
                 f"could not re-acquire workspace to resume delivery: {e}",
             )
             return None
+        tokens = await db.runs.tokens_for_issue(self._conn, issue_id)
         return _PendingDelivery(
             binding=binding,
             issue=issue,
@@ -13573,7 +13581,12 @@ class Orchestrator:
             run_id=run_id,
             workspace_path=workspace_path,
             branch=f"{binding.branch_prefix}/{issue.identifier.lower()}",
-            cumulative_usage=UsageDelta(),
+            cumulative_usage=UsageDelta(
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+            ),
             local_review_result=await self._reconstructed_local_review_result(
                 run_id
             ),
