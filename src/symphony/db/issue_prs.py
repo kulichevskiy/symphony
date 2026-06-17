@@ -52,6 +52,7 @@ async def upsert(
     created_at: str,
     binding_key: str = "",
     review_bypassed: bool = False,
+    commit: bool = True,
 ) -> None:
     await conn.execute(
         """
@@ -88,7 +89,8 @@ async def upsert(
         """,
         (issue_id, github_repo, pr_number, created_at),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def mark_parked_for_manual_merge(

@@ -178,6 +178,45 @@ async def test_first_review_approves_and_session_returns_approved(
     assert "origin/main" in prompt_arg
 
 
+@pytest.mark.asyncio
+async def test_allow_fixes_false_fails_without_local_review_fix_turn(
+    tmp_path: Path,
+) -> None:
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(
+                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-no-fix",
+        issue_title="Add OAuth",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        allow_fixes=False,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert "fix turn disabled for publish resume" in (result.error or "")
+    assert [spec.stage for spec in runner.specs] == ["local_review"]
+
+
 @pytest.mark.parametrize("reviewer_agent", ["claude", "codex"])
 @pytest.mark.parametrize("implementer_agent", ["claude", "codex"])
 @pytest.mark.asyncio

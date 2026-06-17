@@ -124,6 +124,7 @@ async def begin_review(
     pr_url: str,
     github_repo: str,
     issue_label: str | None,
+    commit: bool = True,
 ) -> None:
     """Initialize durable state for a fresh Review stage."""
     old = await _get_existing(conn, issue_id)
@@ -184,7 +185,8 @@ async def refresh_pr_metadata(
     new = await _get_existing(conn, issue_id)
     assert new is not None
     await _record_transitions(conn, issue_id, old, new)
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def bump_iteration(conn: aiosqlite.Connection, issue_id: str) -> int:

@@ -113,6 +113,7 @@ async def run_verify_session(
     command_runner: VerifyCommandRunner = run_verify_command,
     usage_handler: Callable[[Usage], object] | None = None,
     fix_log_path: Path | None = None,
+    allow_fixes: bool = True,
 ) -> VerifyResult:
     """Run the verify gate: verify → (one fix turn → verify again) on red.
 
@@ -126,6 +127,13 @@ async def run_verify_session(
         return VerifyResult(ok=True)
 
     tail = output_tail(output)
+    if not allow_fixes:
+        return VerifyResult(
+            ok=False,
+            tail=tail,
+            error="verify_cmd failed; fix turn disabled for publish resume",
+        )
+
     prompt = review_comment_fix_prompt(
         issue_title=issue_title,
         issue_body=issue_body,

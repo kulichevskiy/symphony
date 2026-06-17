@@ -28,6 +28,11 @@ TERMINAL_NON_SUCCESS_STATUSES: frozenset[str] = frozenset(
     {FAILED_STATUS, INTERRUPTED_STATUS, NEEDS_APPROVAL_STATUS}
 )
 SUCCESS_STATUSES: frozenset[str] = frozenset({"completed", "done"})
+# termination_kind stamped on an implement run that passed the completion +
+# pre-push gates and entered the agent-free publish stage but failed there
+# (push / ensure_pr). Distinguishes a delivery failure — which is safe to
+# resume at publish — from an agent-stage failure that left partial work.
+PUBLISH_FAILED_KIND: str = "publish_failed"
 TERMINATION_DETAIL_MAX_BYTES: int = 4096
 TERMINATION_DETAIL_MAX_LINES: int = 80
 
@@ -102,6 +107,7 @@ async def create(
     pid: int | None,
     started_at: str,
     cost_usd: float = 0.0,
+    commit: bool = True,
 ) -> None:
     await conn.execute(
         """
@@ -110,7 +116,8 @@ async def create(
         """,
         (id, issue_id, stage, status, pid, started_at, cost_usd),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 async def create_if_no_active(
