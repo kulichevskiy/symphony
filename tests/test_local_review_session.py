@@ -832,6 +832,106 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
 
 
 @pytest.mark.asyncio
+async def test_finder_uses_sonnet_verifier_stays_on_opus(
+    tmp_path: Path,
+) -> None:
+    """`local_review_claude_model` routes ONLY the pass-1 finder; the
+    pass-2 verifier keeps the CLI default (Opus) unless its own override
+    is set. Finder argv carries `--model <sonnet>`; verifier argv has no
+    `--model`."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    verifier_text = f"tried to break it, held\n{VERDICT_APPROVED_MARKER}"
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("claude", finder_text),
+            _message_stream("claude", verifier_text),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-split",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        local_review_claude_model="claude-sonnet-4-6",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    finder_spec, verifier_spec = runner.specs
+    finder_argv = finder_spec.command
+    assert finder_argv[finder_argv.index("--model") + 1] == "claude-sonnet-4-6"
+    assert "--model" not in verifier_spec.command
+
+
+@pytest.mark.asyncio
+async def test_verifier_claude_model_override_runs_verifier_on_it(
+    tmp_path: Path,
+) -> None:
+    """The verifier override is independently selectable: when set, the
+    pass-2 verifier argv carries it while the finder keeps its own model."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    verifier_text = f"held\n{VERDICT_APPROVED_MARKER}"
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("claude", finder_text),
+            _message_stream("claude", verifier_text),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-vovr",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        local_review_claude_model="claude-sonnet-4-6",
+        local_review_verifier_claude_model="claude-opus-4-8",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    finder_spec, verifier_spec = runner.specs
+    finder_argv = finder_spec.command
+    verifier_argv = verifier_spec.command
+    assert finder_argv[finder_argv.index("--model") + 1] == "claude-sonnet-4-6"
+    assert verifier_argv[verifier_argv.index("--model") + 1] == "claude-opus-4-8"
+
+
+@pytest.mark.asyncio
 async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
     """The loop receives pass-2's merged findings, not pass-1's raw
     suspicions. Pass 2 requests changes, so the loop dispatches a fixer

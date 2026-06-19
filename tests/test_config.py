@@ -500,6 +500,27 @@ repos:
     p.write_text(raw)
     cfg = Config.load(p)
     assert cfg.repos[0].local_review_claude_model == "claude-sonnet-4-6"
+    # Verifier model is independent; unset → None (CLI default / Opus).
+    assert cfg.repos[0].local_review_verifier_claude_model is None
+
+
+def test_local_review_verifier_claude_model_can_be_set(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Verifier model is selectable independently of the finder model."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    local_review_claude_model: claude-sonnet-4-6
+    local_review_verifier_claude_model: claude-opus-4-8
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].local_review_claude_model == "claude-sonnet-4-6"
+    assert cfg.repos[0].local_review_verifier_claude_model == "claude-opus-4-8"
 
 
 def test_review_strategy_can_be_overridden(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
