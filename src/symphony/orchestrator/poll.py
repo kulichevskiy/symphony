@@ -7739,16 +7739,19 @@ class Orchestrator:
             )
         now = datetime.now(UTC).isoformat()
         review_run_id = str(uuid.uuid4())
+        # DB rows (`runs`, `review_state`, `issue_prs`) are keyed on the storage
+        # id `pr.issue_id`; `issue.id` is the tracker id (it can differ for
+        # contextual / provider-collision rows) and is only for tracker calls.
         await db.runs.create(
             self._conn,
             id=review_run_id,
-            issue_id=issue.id,
+            issue_id=pr.issue_id,
             stage="review",
             status="running",
             pid=None,
             started_at=now,
         )
-        state = await db.review_state.get(self._conn, issue.id)
+        state = await db.review_state.get(self._conn, pr.issue_id)
         body = resumed(
             CommentVars(
                 stage="review",
@@ -7769,7 +7772,7 @@ class Orchestrator:
             log.warning("resurrection comment failed for %s: %s", issue.identifier, e)
         run = db.runs.Run(
             id=review_run_id,
-            issue_id=issue.id,
+            issue_id=pr.issue_id,
             stage="review",
             status="running",
             pid=None,
