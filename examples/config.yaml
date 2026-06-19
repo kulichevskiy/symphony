@@ -93,7 +93,7 @@ repos:
 
 # Stuck-loop escapes (mirrors today's Symphony defaults).
 review_iteration_cap: 6
-# Local-review uses its own cap (defaults to 6). Set lower for
+# Local-review uses its own cap (defaults to 3). Set lower for
 # bindings where local-review should give up fast and fall back to
 # the remote @codex bot; set higher for finicky codebases where
 # the reviewer needs more rounds.
