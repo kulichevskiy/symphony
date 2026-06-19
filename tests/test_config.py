@@ -681,16 +681,17 @@ def test_review_strategy_property_bridges_booleans(
     assert binding.review_strategy == expected
 
 
-def test_local_review_iteration_cap_default_global_is_6(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Global default cap is 6 — well below remote's 12 because the
-    local loop should converge fast or not at all."""
+def test_local_review_iteration_cap_default_global_is_3(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Global default cap is 3 — well below remote's 12 because the
+    local loop converges in 1–3 rounds empirically (138 sessions); the
+    expensive 5–6 round tail escalates to a human instead."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"
     p.write_text(
         f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
     )
     cfg = Config.load(p)
-    assert cfg.local_review_iteration_cap == 6
+    assert cfg.local_review_iteration_cap == 3
     # Remote cap unchanged.
     assert cfg.review_iteration_cap == 12
     binding = cfg.repos[0]
@@ -700,7 +701,7 @@ def test_local_review_iteration_cap_default_global_is_6(tmp_path: Path, monkeypa
         binding.resolved_local_review_iteration_cap(
             cfg.local_review_iteration_cap
         )
-        == 6
+        == 3
     )
 
 
