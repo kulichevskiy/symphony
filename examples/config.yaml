@@ -97,7 +97,7 @@ review_iteration_cap: 6
 # bindings where local-review should give up fast and fall back to
 # the remote @codex bot; set higher for finicky codebases where
 # the reviewer needs more rounds.
-local_review_iteration_cap: 6
+local_review_iteration_cap: 3
 
 # Review notes (per-binding `local_review` / `remote_review` booleans):
 #   local_review:  run the in-workspace reviewer loop before opening the PR;
