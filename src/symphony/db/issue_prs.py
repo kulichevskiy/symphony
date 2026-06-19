@@ -129,6 +129,42 @@ async def mark_parked_for_manual_merge(
     return updated
 
 
+async def mark_review_bypassed(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+    commit: bool = True,
+) -> bool:
+    """Durably record that this PR's GitHub review is bypassed.
+
+    Set by `$skip-review` so the bypass survives a restart: the merge poll
+    keeps treating the PR as a candidate (`list_merge_candidates`) and the
+    review-monitor resurrection leaves it alone instead of re-opening the
+    feedback the operator skipped.
+    """
+    cur = await conn.execute(
+        """
+        UPDATE issue_prs
+        SET review_bypassed = 1
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND merged_at IS NULL
+        """,
+        (issue_id, github_repo, pr_number),
+    )
+    updated = (cur.rowcount or 0) > 0
+    if updated:
+        await state_transitions.record_transition(
+            conn, issue_id, "issue_prs", "review_bypassed", "0", "1"
+        )
+    if commit:
+        await conn.commit()
+    return updated
+
+
 async def clear_parked_for_manual_merge(
     conn: aiosqlite.Connection,
     *,
@@ -611,6 +647,7 @@ async def list_completed_review_prs_without_monitor(
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL
+          AND p.review_bypassed = 0
           AND NOT EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id

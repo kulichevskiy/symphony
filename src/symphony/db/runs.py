@@ -448,8 +448,10 @@ async def supersede_orphaned_merge_needs_approval(
 
     * A deliberate `$reject`/`$stop` also clears the wait and leaves the run at
       `needs_approval` — but it never dispatches a retry. So we only retire a
-      run that has a *later* merge run (the orphaned revival attempt); a
-      rejected run, with nothing after it, is left to keep the PR parked.
+      run that has a *later* merge run which a host restart left `orphaned`
+      (the revival attempt). A run with nothing after it (a plain reject), or
+      whose later retry was deliberately `$stop`ped (`cancelled`, not
+      `orphaned`), is left to keep the PR parked.
     * A merge `needs_approval` run legitimately coexists with the passive
       `review` monitor (created with `ignored_stage="review"`), so the
       in-flight guard ignores `review` runs — otherwise a live monitor would
@@ -483,6 +485,8 @@ async def supersede_orphaned_merge_needs_approval(
               WHERE later.issue_id = r.issue_id
                 AND later.stage = 'merge'
                 AND later.started_at > r.started_at
+                AND later.status = 'interrupted'
+                AND later.termination_kind = 'orphaned'
           )
           AND NOT EXISTS (
               SELECT 1 FROM runs r2

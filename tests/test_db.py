@@ -920,6 +920,67 @@ async def test_supersede_ignores_running_review_monitor(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_supersede_skips_stopped_merge_retry(tmp_path: Path) -> None:
+    # If the revival retry was deliberately $stop'd (later run interrupted with
+    # kind='cancelled', not 'orphaned'), the original needs_approval run must
+    # stay — retiring it would undo the operator's stop and re-enable merge.
+    conn = await db.connect(tmp_path / "stopped.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key='["ENG","org/repo","backend"]',
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "merge",
+            "needs_approval",
+            ended_at="2026-05-10T00:02:30+00:00",
+            kind="awaiting_human_merge",
+        )
+        await db.runs.create(
+            conn,
+            id="merge-retry",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:04:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "merge-retry",
+            "interrupted",
+            ended_at="2026-05-10T00:04:30+00:00",
+            kind="cancelled",
+        )
+        assert (
+            await db.runs.supersede_orphaned_merge_needs_approval(
+                conn, before="2026-05-10T01:00:00+00:00"
+            )
+            == []
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_issue_prs_lists_recent_merged_rows_since_cutoff(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     now = datetime(2026, 5, 19, 20, tzinfo=UTC)
@@ -1246,6 +1307,49 @@ async def test_completed_review_prs_without_monitor_excludes_dead_and_merging(
             status="completed",
             pid=None,
             started_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.issue_prs.list_completed_review_prs_without_monitor(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_review_prs_without_monitor_excludes_bypassed(
+    tmp_path: Path,
+) -> None:
+    # $skip-review marks the PR review_bypassed; the resurrection path must not
+    # re-open review the operator deliberately skipped (even in the restart
+    # window before the merge run exists).
+    conn = await db.connect(tmp_path / "bypass.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="completed-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        # Selected before the bypass is recorded...
+        assert [
+            c.pr_number
+            for c in await db.issue_prs.list_completed_review_prs_without_monitor(conn)
+        ] == [42]
+        # ...and excluded once $skip-review marks it bypassed.
+        assert await db.issue_prs.mark_review_bypassed(
+            conn, issue_id="iss-1", github_repo="org/repo", pr_number=42
         )
         assert await db.issue_prs.list_completed_review_prs_without_monitor(conn) == []
     finally:

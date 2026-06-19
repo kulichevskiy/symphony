@@ -7577,6 +7577,15 @@ class Orchestrator:
                     )
                 return
 
+        # Durably record the bypass *before* completing the monitor, so a
+        # restart in the window before the merge run is created cannot let the
+        # review-monitor resurrection re-open the feedback the operator skipped.
+        await db.issue_prs.mark_review_bypassed(
+            self._conn,
+            issue_id=issue_id,
+            github_repo=binding.github_repo,
+            pr_number=state.pr_number,
+        )
         # Mark the review run completed and cancel its asyncio task immediately so
         # it cannot dispatch any more fix runs mid-iteration.
         now = datetime.now(UTC).isoformat()
