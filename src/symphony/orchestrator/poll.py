@@ -9129,13 +9129,19 @@ class Orchestrator:
             # completed local-review loop; no-review bindings (false/false)
             # gate on CI alone.
             review_bypass_ready = False
-            if candidate.review_bypassed:
-                # Per-PR `$skip-review`: the operator deliberately waived the
-                # review verdict. Honor it regardless of the binding's
-                # remote_review setting — this is the restart-recovery path for
-                # a bypass persisted before `_schedule_merge` created the merge
-                # run. CI/mergeability are still gated below and at merge time.
-                review_bypass_ready = True
+            if candidate.review_bypassed and binding.resolved_remote_review():
+                # Per-PR `$skip-review` on a remote-review binding: the operator
+                # deliberately waived the Codex verdict. This is the
+                # restart-recovery path for a bypass persisted before
+                # `_schedule_merge` created the merge run. Still require a clean
+                # mergeable verdict so a transient UNKNOWN/BLOCKED isn't raced
+                # into a failed merge that parks the PR; CI is gated below.
+                # (No-review false/false bindings also carry review_bypassed but
+                # have remote_review off — they fall through to the no_signal
+                # branch, which keeps its own mergeability guard.)
+                review_bypass_ready = (
+                    str(view.get("mergeable") or "").upper() == "MERGEABLE"
+                )
             elif no_signal_mergeable and not binding.resolved_remote_review():
                 review_bypass_ready = (
                     not binding.resolved_local_review()
