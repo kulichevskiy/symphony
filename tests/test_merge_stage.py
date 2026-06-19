@@ -436,6 +436,24 @@ async def test_reconcile_orphaned_merge_runs_retires_zombie_and_wakes(
             ended_at="2026-05-10T00:02:30+00:00",
             kind="awaiting_human_merge",
         )
+        # The orphaned revival attempt that marks the run above as a crash
+        # orphan (vs a deliberate reject).
+        await db.runs.create(
+            conn,
+            id="merge-retry",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:04:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "merge-retry",
+            "interrupted",
+            ended_at="2026-05-10T00:04:30+00:00",
+            kind="orphaned",
+        )
 
         orch = _make_merge_wait_orchestrator(conn, gh_view={"mergedAt": None})
         orch._wake.clear()  # noqa: SLF001

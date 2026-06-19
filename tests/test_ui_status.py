@@ -40,13 +40,17 @@ async def _run(
     status: str,
     started_at: str,
     ended_at: str | None = None,
+    termination_kind: str = "",
 ) -> None:
     await conn.execute(
         """
-        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
-        VALUES (?, ?, ?, ?, NULL, ?, ?, 0)
+        INSERT INTO runs (
+            id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+            termination_kind
+        )
+        VALUES (?, ?, ?, ?, NULL, ?, ?, 0, ?)
         """,
-        (run_id, issue_id, stage, status, started_at, ended_at),
+        (run_id, issue_id, stage, status, started_at, ended_at, termination_kind),
     )
     await conn.commit()
 
@@ -474,6 +478,7 @@ async def test_canonical_status_interrupted_run_does_not_mask_open_pr(
             status="interrupted",
             started_at="2026-05-17T11:40:00Z",
             ended_at="2026-05-17T11:55:00Z",
+            termination_kind="orphaned",
         )
         await conn.execute(
             """
@@ -532,6 +537,46 @@ async def test_canonical_status_failed_run_still_masks_open_pr(
         await conn.commit()
 
         status = await compute_canonical_status(conn, "failed-pr", now=NOW)
+    finally:
+        await conn.close()
+
+    assert status.to_dict()["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_canonical_status_cancelled_interrupt_still_masks_open_pr(
+    tmp_path: Path,
+) -> None:
+    # A deliberately stopped run ($stop → interrupted/cancelled) must stay
+    # visible as FAILED even with an open PR — only orphan/superseded
+    # interruptions fall through to PR_OPEN.
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "cancelled")
+        await _run(
+            conn,
+            run_id="run-cancelled",
+            issue_id="cancelled",
+            stage="review",
+            status="interrupted",
+            started_at="2026-05-17T11:40:00Z",
+            ended_at="2026-05-17T11:55:00Z",
+            termination_kind="cancelled",
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (
+                issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+            )
+            VALUES (
+                'cancelled', 'org/repo', 'ENG|org/repo', 42,
+                'https://github.com/org/repo/pull/42', '2026-05-16T11:00:00Z', NULL
+            )
+            """
+        )
+        await conn.commit()
+
+        status = await compute_canonical_status(conn, "cancelled", now=NOW)
     finally:
         await conn.close()
 

@@ -7674,6 +7674,10 @@ class Orchestrator:
         binding = self._binding_for_pr(pr)
         if binding is None:
             return None
+        # `pr.issue_id` is the storage id; the tracker needs its own id (they
+        # differ for contextual / provider-collision rows), so resolve it
+        # before looking the issue up — mirroring the other poll paths.
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(pr.issue_id)
         tracker = self.tracker(binding)
         # Cooldown: skip if the last review run ended recently.
         last_review = await db.runs.latest_for_issue_stage(
@@ -7689,7 +7693,7 @@ class Orchestrator:
             except ValueError:
                 pass
         try:
-            issue = await tracker.lookup_issue(pr.issue_id)
+            issue = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning(
                 "could not look up orphaned review issue %s: %s",

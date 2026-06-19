@@ -437,12 +437,23 @@ async def supersede_orphaned_merge_needs_approval(
     """Retire `merge` runs stuck at `needs_approval` with no operator wait.
 
     A merge `needs_approval` run is created alongside an `operator_wait` of
-    kind `merge`. If the wait is later cleared (e.g. a revival path dispatched
-    a retry that was then orphaned by a host restart) without superseding the
-    run, the run lingers as `needs_approval`. `issue_prs.list_merge_candidates`
-    excludes any PR with such a run, so the still-open PR drops out of merge
-    polling forever — a zombie. Retiring the run re-opens merge candidacy so
-    the normal merge poll re-engages.
+    kind `merge`. A revival path can clear that wait and dispatch a retry; if a
+    host restart then orphans the retry, the original `needs_approval` run
+    lingers. `issue_prs.list_merge_candidates` excludes any PR with such a run,
+    so the still-open PR drops out of merge polling forever — a zombie.
+    Retiring the run re-opens merge candidacy so the normal merge poll
+    re-engages.
+
+    Two distinctions keep this from firing on legitimate state:
+
+    * A deliberate `$reject`/`$stop` also clears the wait and leaves the run at
+      `needs_approval` — but it never dispatches a retry. So we only retire a
+      run that has a *later* merge run (the orphaned revival attempt); a
+      rejected run, with nothing after it, is left to keep the PR parked.
+    * A merge `needs_approval` run legitimately coexists with the passive
+      `review` monitor (created with `ignored_stage="review"`), so the
+      in-flight guard ignores `review` runs — otherwise a live monitor would
+      keep the zombie from ever being retired.
 
     `before` (an ISO timestamp) gates on `ended_at < before` to avoid racing a
     freshly-created wait that has not yet committed. Returns the issue ids
@@ -467,9 +478,17 @@ async def supersede_orphaned_merge_needs_approval(
           AND NOT EXISTS (
               SELECT 1 FROM operator_waits w WHERE w.issue_id = r.issue_id
           )
+          AND EXISTS (
+              SELECT 1 FROM runs later
+              WHERE later.issue_id = r.issue_id
+                AND later.stage = 'merge'
+                AND later.started_at > r.started_at
+          )
           AND NOT EXISTS (
               SELECT 1 FROM runs r2
-              WHERE r2.issue_id = r.issue_id AND r2.status = 'running'
+              WHERE r2.issue_id = r.issue_id
+                AND r2.status = 'running'
+                AND r2.stage != 'review'
           )
           {before_filter}
         """,
