@@ -11922,7 +11922,7 @@ class Orchestrator:
             last_message_dir = (
                 self.config.log_root / "local_review" / parent_run_id
             )
-            # Local-review uses its own cap (default 6) which is
+            # Local-review uses its own cap (default 3) which is
             # typically lower than `review_iteration_cap` (default 12)
             # used by the remote `@codex` loop. The two loops have
             # different convergence shapes; conflating their caps was
