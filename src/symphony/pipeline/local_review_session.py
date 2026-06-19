@@ -109,6 +109,7 @@ def _build_fix_command(
     agent: ImplementerAgent,
     codex_model: str,
     prompt: str,
+    claude_model: str | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Mirror `build_fix_runner_command` without importing from orchestrator.
@@ -129,6 +130,8 @@ def _build_fix_command(
             "--verbose",
             "--strict-mcp-config",
         ]
+        if claude_model is not None:
+            command.extend(["--model", claude_model])
         if mcp_servers:
             command.extend(
                 ["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})]
@@ -156,6 +159,7 @@ async def run_local_review_session(
     implementer_codex_model: str,
     reviewer_agent: ReviewerAgent,
     reviewer_codex_model: str,
+    local_review_claude_model: str | None = None,
     cap: int,
     stall_secs: int,
     command_secs: int = 1800,
@@ -245,6 +249,7 @@ async def run_local_review_session(
             prompt=prompt,
             base_branch=base_branch,
             codex_model=codex_model or DEFAULT_CODEX_MODEL,
+            claude_model=local_review_claude_model,
             last_message_path=(
                 str(last_message_path) if agent == "codex" else None
             ),
@@ -447,6 +452,7 @@ async def run_local_review_session(
             agent=implementer_agent,
             codex_model=implementer_codex_model,
             prompt=prompt,
+            claude_model=local_review_claude_model,
             mcp_servers=mcp_servers,
         )
         spec = RunnerSpec(

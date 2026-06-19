@@ -196,6 +196,59 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert argv[-2:] == ["--", "please review"]
 
 
+def test_build_local_review_command_claude_omits_model_when_unset() -> None:
+    """`claude_model=None` (default) → no `--model` flag, identical to today."""
+    argv = build_local_review_command(
+        agent="claude",
+        prompt="please review",
+        base_branch="main",
+    )
+    assert "--model" not in argv
+
+
+def test_build_local_review_command_claude_injects_model_when_set() -> None:
+    """`claude_model` set → `--model <value>` injected into the claude argv.
+
+    Covers the finder and the single-pass reviewer; the pass-2 verifier
+    routes through this same builder (see pass_two variant below).
+    """
+    argv = build_local_review_command(
+        agent="claude",
+        prompt="please review",
+        base_branch="main",
+        claude_model="claude-sonnet-4-6",
+    )
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
+    # Prompt stays the trailing positional after the `--` separator.
+    assert argv[-2:] == ["--", "please review"]
+
+
+def test_build_local_review_command_claude_pass_two_injects_model_when_set() -> None:
+    """Pass-2 verifier routes through the same builder; `--model` applies."""
+    argv = build_local_review_command(
+        agent="claude",
+        prompt="verify",
+        base_branch="main",
+        claude_model="claude-sonnet-4-6",
+        pass_two=True,
+    )
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
+
+
+def test_build_local_review_command_codex_ignores_claude_model() -> None:
+    """Codex branch keeps using `codex_model`; `claude_model` is inert."""
+    argv = build_local_review_command(
+        agent="codex",
+        prompt="p",
+        base_branch="main",
+        codex_model="gpt-5.1-codex",
+        claude_model="claude-sonnet-4-6",
+    )
+    assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
+    assert "claude-sonnet-4-6" not in argv
+
+
 def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> None:
     """Tier B (pass 2 only): codex switches to a writable sandbox so the
     verifier can write a throwaway test and run it."""
