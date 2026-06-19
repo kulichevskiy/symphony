@@ -482,6 +482,24 @@ def test_review_strategy_defaults_to_remote(tmp_path: Path, monkeypatch) -> None
     assert binding.review_strategy == "remote"
     assert binding.reviewer_agent is None
     assert binding.reviewer_codex_model is None
+    assert binding.local_review_claude_model is None
+
+
+def test_local_review_claude_model_can_be_set(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Per-binding claude model for local review; None → CLI default."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    local_review_claude_model: claude-sonnet-4-6
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].local_review_claude_model == "claude-sonnet-4-6"
 
 
 def test_review_strategy_can_be_overridden(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

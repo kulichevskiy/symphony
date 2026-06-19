@@ -140,6 +140,11 @@ class RepoBinding(BaseModel):
     # Codex model for the reviewer when `reviewer_agent` resolves to
     # `codex`. Defaults to the binding's `codex_model` if unset.
     reviewer_codex_model: str | None = None
+    # Claude model for local-review claude passes (finder, single-pass
+    # reviewer, pass-2 verifier, and the inline fixer). `None` keeps the
+    # operator's CLI default — no `--model` is passed. Independent of the
+    # main `implement` stage model.
+    local_review_claude_model: str | None = None
     # Per-binding override for the local-review iteration cap. The
     # right number is usually smaller than the remote `review_iteration_cap`
     # because the local loop converges fast or it isn't going to — many

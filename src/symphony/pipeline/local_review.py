@@ -390,6 +390,7 @@ def build_local_review_command(
     prompt: str,
     base_branch: str,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
     last_message_path: str | None = None,
     pass_two: bool = False,
 ) -> list[str]:
@@ -443,7 +444,7 @@ def build_local_review_command(
             disallowed = _CLAUDE_REVIEWER_DISALLOWED_TOOLS
             tools = _CLAUDE_REVIEWER_TOOLS
             allowed = _CLAUDE_REVIEWER_ALLOWED_TOOLS
-        return [
+        command = [
             "claude",
             "--print",
             "--output-format",
@@ -463,9 +464,11 @@ def build_local_review_command(
             tools,
             "--allowedTools",
             allowed,
-            "--",
-            prompt,
         ]
+        if claude_model is not None:
+            command.extend(["--model", claude_model])
+        command.extend(["--", prompt])
+        return command
     raise ValueError(f"unknown reviewer agent {agent!r}")
 
 

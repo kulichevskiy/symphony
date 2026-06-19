@@ -343,6 +343,99 @@ async def test_fix_then_approve_dispatches_fix_run_in_correct_workspace(
 
 
 @pytest.mark.asyncio
+async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
+    tmp_path: Path,
+) -> None:
+    """`local_review_claude_model` threads `--model` into the claude
+    reviewer and fixer argv; unset → no `--model` (covered below)."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream(
+                "claude",
+                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            ),
+            _ok_fix_stream(),
+            _message_stream("claude", f"fixed\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+    sha_counter = {"i": 0}
+
+    async def head_sha(_: Path) -> str:
+        sha_counter["i"] += 1
+        return f"sha-{sha_counter['i']}"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-abc",
+        issue_title="t",
+        issue_body="b",
+        labels=["x"],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        local_review_claude_model="claude-sonnet-4-6",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(runner.specs) == 3  # rev-0, fix-0, rev-1
+    for spec in runner.specs:
+        argv = spec.command
+        assert argv[0] == "claude"
+        assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_local_review_claude_model_unset_omits_model_flag(
+    tmp_path: Path,
+) -> None:
+    """Default `None` → no `--model`; argv identical to today."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream(
+                "claude",
+                f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            ),
+            _ok_fix_stream(),
+            _message_stream("claude", f"fixed\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+    sha_counter = {"i": 0}
+
+    async def head_sha(_: Path) -> str:
+        sha_counter["i"] += 1
+        return f"sha-{sha_counter['i']}"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-abc",
+        issue_title="t",
+        issue_body="b",
+        labels=["x"],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    for spec in runner.specs:
+        assert "--model" not in spec.command
+
+
+@pytest.mark.asyncio
 async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
         scripts=[
