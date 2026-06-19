@@ -160,6 +160,7 @@ async def run_local_review_session(
     reviewer_agent: ReviewerAgent,
     reviewer_codex_model: str,
     local_review_claude_model: str | None = None,
+    local_review_verifier_claude_model: str | None = None,
     cap: int,
     stall_secs: int,
     command_secs: int = 1800,
@@ -220,6 +221,7 @@ async def run_local_review_session(
         *,
         agent: ReviewerAgent,
         codex_model: str,
+        claude_model: str | None,
         prompt: str,
         stem: str,
         run_suffix: str,
@@ -249,7 +251,7 @@ async def run_local_review_session(
             prompt=prompt,
             base_branch=base_branch,
             codex_model=codex_model or DEFAULT_CODEX_MODEL,
-            claude_model=local_review_claude_model,
+            claude_model=claude_model,
             last_message_path=(
                 str(last_message_path) if agent == "codex" else None
             ),
@@ -346,6 +348,7 @@ async def run_local_review_session(
             return await _run_reviewer_pass(
                 agent=reviewer_agent,
                 codex_model=reviewer_codex_model,
+                claude_model=local_review_claude_model,
                 prompt=review_prompt,
                 stem=f"review-{iteration}",
                 run_suffix=f"rev-{iteration}",
@@ -358,6 +361,7 @@ async def run_local_review_session(
         finder_out = await _run_reviewer_pass(
             agent=reviewer_agent,
             codex_model=reviewer_codex_model,
+            claude_model=local_review_claude_model,
             prompt=finder_prompt,
             stem=f"review-{iteration}-find",
             run_suffix=f"rev-{iteration}-find",
@@ -387,6 +391,7 @@ async def run_local_review_session(
         verifier_out = await _run_reviewer_pass(
             agent=implementer_agent,
             codex_model=implementer_codex_model,
+            claude_model=local_review_verifier_claude_model,
             prompt=verifier_prompt,
             stem=f"review-{iteration}-verify",
             run_suffix=f"rev-{iteration}-verify",

@@ -140,11 +140,18 @@ class RepoBinding(BaseModel):
     # Codex model for the reviewer when `reviewer_agent` resolves to
     # `codex`. Defaults to the binding's `codex_model` if unset.
     reviewer_codex_model: str | None = None
-    # Claude model for local-review claude passes (finder, single-pass
-    # reviewer, pass-2 verifier, and the inline fixer). `None` keeps the
-    # operator's CLI default — no `--model` is passed. Independent of the
-    # main `implement` stage model.
+    # Claude model for local-review claude passes (pass-1 finder, single-pass
+    # reviewer, and the inline fixer). `None` keeps the operator's CLI default
+    # — no `--model` is passed. Independent of the main `implement` stage
+    # model. The pass-2 verifier is selected separately via
+    # `local_review_verifier_claude_model` so the cheaper finder can move
+    # without downgrading the adversarial verifier that backstops it.
     local_review_claude_model: str | None = None
+    # Claude model for the pass-2 adversarial verifier specifically. `None`
+    # keeps the CLI default (Opus) — no `--model` is passed — so setting
+    # `local_review_claude_model` to a cheaper finder model leaves the
+    # verifier on Opus. Set this to pin the verifier to a specific model.
+    local_review_verifier_claude_model: str | None = None
     # Per-binding override for the local-review iteration cap. The
     # right number is usually smaller than the remote `review_iteration_cap`
     # because the local loop converges fast or it isn't going to — many

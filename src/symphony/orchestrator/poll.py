@@ -11983,6 +11983,9 @@ class Orchestrator:
                     reviewer_agent=reviewer_agent,
                     reviewer_codex_model=reviewer_codex_model,
                     local_review_claude_model=binding.local_review_claude_model,
+                    local_review_verifier_claude_model=(
+                        binding.local_review_verifier_claude_model
+                    ),
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
                     command_secs=self.config.command_timeout_secs,
