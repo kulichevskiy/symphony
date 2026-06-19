@@ -864,6 +864,15 @@ def _reactions_from_github(entries: list[dict[str, object]]) -> tuple[Reaction, 
     return tuple(reactions)
 
 
+# Codex's "no major issues" comment names the commit it reviewed, e.g.
+# `**Reviewed commit:** ` + "`2668682eeb`". Capture that SHA so the classifier
+# can require it to match the current HEAD before honouring the approval.
+_CODEX_REVIEWED_COMMIT_RE = re.compile(
+    r"reviewed\s+commit:\s*\**\s*`?\s*([0-9a-fA-F]{7,40})",
+    re.IGNORECASE,
+)
+
+
 def _codex_lgtm_reactions_from_issue_comments(
     entries: list[dict[str, object]],
 ) -> tuple[Reaction, ...]:
@@ -872,7 +881,9 @@ def _codex_lgtm_reactions_from_issue_comments(
     Codex sometimes reports the 👍 as text inside a top-level PR comment instead
     of as a GitHub reaction. The classifier already knows how to validate +1
     signals against the head commit time, so normalize this shape into the same
-    representation.
+    representation. When the comment names the commit it reviewed
+    ("Reviewed commit: <sha>"), thread the SHA through so the classifier can
+    reject the approval once HEAD moves past that commit (branch update/rebase).
     """
     reactions: list[Reaction] = []
     for entry in entries:
@@ -882,11 +893,13 @@ def _codex_lgtm_reactions_from_issue_comments(
         if not created_at:
             continue
         if is_codex_author(login) and CODEX_NO_ISSUES_MARKER in body.casefold():
+            match = _CODEX_REVIEWED_COMMIT_RE.search(body)
             reactions.append(
                 Reaction(
                     user_login=login,
                     content="+1",
                     created_at=created_at,
+                    commit_sha=match.group(1) if match else "",
                 )
             )
     return tuple(reactions)

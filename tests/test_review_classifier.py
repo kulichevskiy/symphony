@@ -634,6 +634,62 @@ def test_codex_no_issues_still_requires_mergeable() -> None:
     assert v.rule == "approved_unknown_mergeable"
 
 
+def test_codex_reaction_with_matching_head_sha_approves() -> None:
+    """A +1 naming the current HEAD (full OID) is honoured."""
+    reactions = (
+        Reaction(
+            user_login=CODEX_BOT_LOGIN,
+            content="+1",
+            created_at=LATER,
+            commit_sha=HEAD_SHA,
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
+def test_codex_reaction_with_abbreviated_head_sha_approves() -> None:
+    """Codex abbreviates the SHA; a prefix of the full HEAD OID still matches."""
+    reactions = (
+        Reaction(
+            user_login=CODEX_BOT_LOGIN,
+            content="+1",
+            created_at=LATER,
+            commit_sha=HEAD_SHA[:6],
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
+def test_codex_reaction_naming_stale_commit_does_not_approve() -> None:
+    """A +1 naming a commit that is no longer HEAD (branch updated/rebased)
+    must not authorize a merge — even though its timestamp is after HEAD."""
+    reactions = (
+        Reaction(
+            user_login=CODEX_BOT_LOGIN,
+            content="+1",
+            created_at=LATER,
+            commit_sha="cafebabe",  # != HEAD_SHA ("deadbeef")
+        ),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.PENDING
+    assert v.rule == "no_signal"
+
+
+def test_codex_reaction_without_sha_stays_time_validated() -> None:
+    """Genuine GitHub reactions carry no commit ref and keep the time gate."""
+    reactions = (
+        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
+    )
+    v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
+    assert v.kind == VerdictKind.APPROVED
+    assert v.rule == "codex_approved"
+
+
 def test_later_codex_approval_supersedes_older_inline_comment() -> None:
     comments = [
         ReviewComment(

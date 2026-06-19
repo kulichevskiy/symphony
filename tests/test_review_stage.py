@@ -48,6 +48,40 @@ from symphony.pipeline.review_classifier import Verdict, VerdictKind
 from ._workspace_helpers import advance_head
 
 
+def test_codex_lgtm_reaction_carries_reviewed_commit_sha() -> None:
+    """The "Reviewed commit: <sha>" line is threaded onto the reaction so the
+    classifier can reject the approval once HEAD moves past that commit."""
+    entries = [
+        {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "created_at": "2026-06-19T18:25:40Z",
+            "body": (
+                "Codex Review: Didn't find any major issues. Delightful!\n\n"
+                "**Reviewed commit:** `2668682eeb`\n"
+            ),
+        },
+    ]
+    reactions = poll_module._codex_lgtm_reactions_from_issue_comments(entries)
+    assert len(reactions) == 1
+    assert reactions[0].content == "+1"
+    assert reactions[0].commit_sha == "2668682eeb"
+
+
+def test_codex_lgtm_reaction_without_reviewed_commit_has_empty_sha() -> None:
+    """Absent a "Reviewed commit" line, the reaction keeps the legacy
+    time-only shape (empty commit_sha)."""
+    entries = [
+        {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "created_at": "2026-06-19T18:25:40Z",
+            "body": "Codex Review: Didn't find any major issues.",
+        },
+    ]
+    reactions = poll_module._codex_lgtm_reactions_from_issue_comments(entries)
+    assert len(reactions) == 1
+    assert reactions[0].commit_sha == ""
+
+
 class _FakeRunner:
     def __init__(
         self, events: list[RunnerEvent], *, commit_on_implement: bool = False
