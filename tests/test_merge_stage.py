@@ -402,6 +402,77 @@ def _make_merge_wait_orchestrator(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_orphaned_merge_runs_retires_zombie_and_wakes(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        # Orphaned merge needs_approval run (operator wait already gone) for a
+        # still-open PR — the zombie that strands the PR out of merge polling.
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "merge-run",
+            "needs_approval",
+            ended_at="2026-05-10T00:02:30+00:00",
+            kind="awaiting_human_merge",
+        )
+        # The orphaned revival attempt that marks the run above as a crash
+        # orphan (vs a deliberate reject).
+        await db.runs.create(
+            conn,
+            id="merge-retry",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:04:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "merge-retry",
+            "interrupted",
+            ended_at="2026-05-10T00:04:30+00:00",
+            kind="orphaned",
+        )
+
+        orch = _make_merge_wait_orchestrator(conn, gh_view={"mergedAt": None})
+        orch._wake.clear()  # noqa: SLF001
+
+        assert await orch._reconcile_orphaned_merge_runs() == 1  # noqa: SLF001
+        # Woke the poll loop so the merge candidate poll re-engages promptly.
+        assert orch._wake.is_set()  # noqa: SLF001
+
+        cur = await conn.execute(
+            "SELECT status, termination_kind FROM runs WHERE id = 'merge-run'"
+        )
+        row = await cur.fetchone()
+        assert row["status"] == "interrupted"
+        assert row["termination_kind"] == "superseded"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_merge_wait_conflict_dispatches_rebase_fix(
     tmp_path: Path,
 ) -> None:

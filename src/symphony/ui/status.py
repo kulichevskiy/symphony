@@ -89,6 +89,12 @@ ALWAYS_STUCK_STATES = frozenset(
 # a symphony restart); resurrection paths must treat it the same as `failed`.
 DEAD_RUN_STATUSES: frozenset[str] = frozenset({"failed", "interrupted"})
 
+# `interrupted` termination kinds that mean "no live worker, but the work is
+# still on track" — a host-restart orphan or a run we deliberately superseded.
+# These should not mask an open PR as Halted. Deliberate stops (`cancelled`)
+# and other kinds remain visible as FAILED.
+ORPHAN_INTERRUPT_KINDS: frozenset[str] = frozenset({"orphaned", "superseded"})
+
 OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
     operator_waits.KIND_ACCEPTANCE_REJECTED: CanonicalState.PAUSED,
     operator_waits.KIND_DELIVER_FAILED: CanonicalState.HALTED,
@@ -358,7 +364,7 @@ async def compute_canonical_status(
     latest_run = await _fetch_one(
         conn,
         """
-        SELECT stage, status, started_at, ended_at
+        SELECT stage, status, started_at, ended_at, termination_kind
         FROM runs
         WHERE issue_id = ?
         ORDER BY started_at DESC, COALESCE(ended_at, '') DESC, id DESC
@@ -366,22 +372,6 @@ async def compute_canonical_status(
         """,
         (issue_id,),
     )
-    if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
-        stage = _as_str(latest_run["stage"])
-        run_status = _as_str(latest_run["status"])
-        subtitle: str | None
-        if run_status and run_status != "failed":
-            subtitle = f"{stage} ({run_status})" if stage else run_status
-        else:
-            subtitle = stage
-        return _status(
-            CanonicalState.FAILED,
-            since=_as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"]),
-            subtitle=subtitle,
-            now=effective_now,
-            thresholds=thresholds,
-        )
-
     open_pr = await _fetch_one(
         conn,
         """
@@ -393,6 +383,35 @@ async def compute_canonical_status(
         """,
         (issue_id,),
     )
+    if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
+        # An orphaned `interrupted` run (host PID died on a restart, or a run
+        # we deliberately superseded) is not a real failure when the PR is
+        # still open: the merge/review polls re-drive it, so it must not mask
+        # the PR_OPEN/review state as Halted. A genuine `failed` run, or a
+        # deliberately `cancelled`/stopped one ($stop), still surfaces as
+        # FAILED — gate the fall-through on the orphan termination kinds only.
+        interrupted_with_open_pr = (
+            latest_run["status"] == "interrupted"
+            and _as_str(latest_run["termination_kind"]) in ORPHAN_INTERRUPT_KINDS
+            and open_pr is not None
+        )
+        if not interrupted_with_open_pr:
+            stage = _as_str(latest_run["stage"])
+            run_status = _as_str(latest_run["status"])
+            subtitle: str | None
+            if run_status and run_status != "failed":
+                subtitle = f"{stage} ({run_status})" if stage else run_status
+            else:
+                subtitle = stage
+            return _status(
+                CanonicalState.FAILED,
+                since=_as_str(latest_run["ended_at"])
+                or _as_str(latest_run["started_at"]),
+                subtitle=subtitle,
+                now=effective_now,
+                thresholds=thresholds,
+            )
+
     if open_pr is not None:
         return _status(
             CanonicalState.PR_OPEN,

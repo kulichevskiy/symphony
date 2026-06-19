@@ -94,6 +94,10 @@ class Reaction:
     user_login: str
     content: str  # +1, -1, eyes, ...
     created_at: str
+    # SHA the approval explicitly names, when known (e.g. Codex's "Reviewed
+    # commit: <sha>" line). Empty for genuine GitHub reactions, which carry no
+    # commit reference and are validated by time alone.
+    commit_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -146,6 +150,20 @@ def _parse_iso(ts: str) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt
+
+
+def _sha_refers_to(named: str, head: str) -> bool:
+    """True when an (often abbreviated) SHA refers to the full HEAD OID.
+
+    Git/GitHub abbreviate commit SHAs (Codex names ~10 hex chars) while
+    `headRefOid` is the full 40-char OID. Treat the shorter as a prefix of the
+    longer, case-insensitively. With no HEAD to compare against, do not match.
+    """
+    named = named.strip().lower()
+    head = head.strip().lower()
+    if not named or not head:
+        return False
+    return head.startswith(named) or named.startswith(head)
 
 
 def _comment_key(c: ReviewComment) -> str:
@@ -285,6 +303,17 @@ def review_classifier(
     # comments, supplied by the orchestrator as Reaction(content="+1").
     for rxn in snapshot.reactions:
         if is_codex_author(rxn.user_login) and rxn.content == "+1":
+            # When the approval names the commit it reviewed (Codex's
+            # "Reviewed commit: <sha>" line), require it to be the current
+            # HEAD. Otherwise a stale approval — e.g. after the branch is
+            # updated/rebased past the reviewed commit — would still
+            # authorize an auto-merge of a never-reviewed HEAD. Genuine
+            # GitHub reactions carry no SHA and stay time-validated. Codex
+            # abbreviates the SHA, so match it as a prefix of the full OID.
+            if rxn.commit_sha and not _sha_refers_to(
+                rxn.commit_sha, snapshot.head_sha
+            ):
+                continue
             record_codex_approval_time(
                 rxn.created_at,
                 require_head_timestamp=True,

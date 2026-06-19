@@ -429,6 +429,94 @@ async def interrupt_stale_merge_needs_approval(
     return interrupted
 
 
+async def supersede_orphaned_merge_needs_approval(
+    conn: aiosqlite.Connection,
+    *,
+    before: str | None = None,
+) -> list[str]:
+    """Retire `merge` runs stuck at `needs_approval` with no operator wait.
+
+    A merge `needs_approval` run is created alongside an `operator_wait` of
+    kind `merge`. A revival path can clear that wait and dispatch a retry; if a
+    host restart then orphans the retry, the original `needs_approval` run
+    lingers. `issue_prs.list_merge_candidates` excludes any PR with such a run,
+    so the still-open PR drops out of merge polling forever — a zombie.
+    Retiring the run re-opens merge candidacy so the normal merge poll
+    re-engages.
+
+    Two distinctions keep this from firing on legitimate state:
+
+    * A deliberate `$reject`/`$stop` also clears the wait and leaves the run at
+      `needs_approval` — but it never dispatches a retry. So we only retire a
+      run that has a *later* merge run which a host restart left `orphaned`
+      (the revival attempt). A run with nothing after it (a plain reject), or
+      whose later retry was deliberately `$stop`ped (`cancelled`, not
+      `orphaned`), is left to keep the PR parked.
+    * A merge `needs_approval` run legitimately coexists with the passive
+      `review` monitor (created with `ignored_stage="review"`), so the
+      in-flight guard ignores `review` runs — otherwise a live monitor would
+      keep the zombie from ever being retired.
+
+    `before` (an ISO timestamp) gates on `ended_at < before` to avoid racing a
+    freshly-created wait that has not yet committed. Returns the issue ids
+    whose runs were superseded.
+    """
+    before_filter = "" if before is None else " AND r.ended_at < ?"
+    params: list[object] = []
+    if before is not None:
+        params.append(before)
+    cur = await conn.execute(
+        f"""
+        SELECT r.id, r.issue_id
+        FROM runs r
+        WHERE r.stage = 'merge'
+          AND r.status = 'needs_approval'
+          AND EXISTS (
+              SELECT 1 FROM issue_prs p
+              WHERE p.issue_id = r.issue_id
+                AND p.merged_at IS NULL
+                AND r.started_at >= p.created_at
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM operator_waits w WHERE w.issue_id = r.issue_id
+          )
+          AND EXISTS (
+              SELECT 1 FROM runs later
+              WHERE later.issue_id = r.issue_id
+                AND later.stage = 'merge'
+                AND later.started_at > r.started_at
+                AND later.status = 'interrupted'
+                AND later.termination_kind = 'orphaned'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r2
+              WHERE r2.issue_id = r.issue_id
+                AND r2.status = 'running'
+                AND r2.stage != 'review'
+          )
+          {before_filter}
+        """,
+        params,
+    )
+    rows = await cur.fetchall()
+    ended_at = datetime.now(UTC).isoformat()
+    issue_ids: list[str] = []
+    for row in rows:
+        await update_status(
+            conn,
+            row["id"],
+            INTERRUPTED_STATUS,
+            ended_at=ended_at,
+            kind="superseded",
+            detail=(
+                "orphaned merge needs_approval (operator wait cleared) — "
+                "re-opening merge candidacy"
+            ),
+        )
+        issue_ids.append(str(row["issue_id"]))
+    return issue_ids
+
+
 async def interrupt_running_merge(conn: aiosqlite.Connection, run_id: str) -> int:
     cur = await conn.execute(
         """
