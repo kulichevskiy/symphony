@@ -24,9 +24,13 @@ class IssuePR:
     created_at: str
     merged_at: str | None
     parked_at: str | None
+    review_bypassed: bool = False
 
 
 def _row_to_issue_pr(row: aiosqlite.Row) -> IssuePR:
+    # `review_bypassed` is only selected by queries that need it; tolerate its
+    # absence so the shared mapper works for every SELECT shape.
+    has_bypass = "review_bypassed" in row.keys()
     return IssuePR(
         issue_id=row["issue_id"],
         identifier=row["identifier"],
@@ -39,6 +43,7 @@ def _row_to_issue_pr(row: aiosqlite.Row) -> IssuePR:
         created_at=row["created_at"],
         merged_at=row["merged_at"],
         parked_at=row["parked_at"],
+        review_bypassed=bool(row["review_bypassed"]) if has_bypass else False,
     )
 
 
@@ -439,6 +444,7 @@ async def has_orphaned_review_pr(conn: aiosqlite.Connection, *, issue_id: str) -
         FROM issue_prs p
         WHERE p.issue_id = ?
           AND p.merged_at IS NULL
+          AND p.review_bypassed = 0
           AND NOT EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
@@ -596,6 +602,7 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL
+          AND p.review_bypassed = 0
           AND NOT EXISTS (
               SELECT 1 FROM runs r
               WHERE r.issue_id = p.issue_id
@@ -693,7 +700,7 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
                p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
-               p.parked_at
+               p.parked_at, p.review_bypassed
         FROM issue_prs p
         JOIN issues i ON i.id = p.issue_id
         WHERE p.merged_at IS NULL

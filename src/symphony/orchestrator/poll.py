@@ -2054,12 +2054,23 @@ class Orchestrator:
             self._states[state_key] = states
         return states
 
+    async def startup_reconcile(self, *, reason: str = "startup") -> None:
+        """Self-heal stranded state before serving ticks.
+
+        Restores operator waits and retires/redrives orphaned merge runs and
+        stale merge waits. Called from `run()` and from the CLI `--once` path so
+        a cron-style single-tick invocation heals the same state the long-lived
+        daemon does — otherwise an orphaned `needs_approval` merge run keeps its
+        open PR out of merge candidacy on every once invocation.
+        """
+        await self._restore_operator_waits()
+        await self._reconcile_orphaned_merge_runs(reason=reason)
+        await self._reconcile_auto_recoverable_merge_waits(reason=reason)
+
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
-        await self._restore_operator_waits()
-        await self._reconcile_orphaned_merge_runs(reason="startup")
-        await self._reconcile_auto_recoverable_merge_waits(reason="startup")
+        await self.startup_reconcile(reason="startup")
         self._merge_wait_reconcile_task = asyncio.create_task(
             self._run_auto_recoverable_merge_wait_reconciler(self._shutdown)
         )
@@ -4073,13 +4084,18 @@ class Orchestrator:
     def _schedule_review_poll(
         self, run: db.runs.Run, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None]:
+        # Key the in-memory monitor by the storage issue id (`run.issue_id`),
+        # not the tracker id (`issue.id`). They differ for contextual /
+        # provider-collision rows, and slash polling / webhooks resolve commands
+        # against storage ids — so keying by the tracker id would strand
+        # `$skip-review`/`$retry` on resurrected monitors for those issues.
         self._review_poll_run_ids.add(run.id)
-        self._review_poll_issue_ids[issue.id] = run.id
+        self._review_poll_issue_ids[run.issue_id] = run.id
         task = asyncio.create_task(self._poll_review_run_with_limits(run, binding, issue))
         self._review_poll_tasks.add(task)
         self._review_poll_run_tasks[run.id] = task
         task.add_done_callback(
-            partial(self._review_poll_done, run_id=run.id, issue_id=issue.id)
+            partial(self._review_poll_done, run_id=run.id, issue_id=run.issue_id)
         )
         return task
 
@@ -9113,7 +9129,14 @@ class Orchestrator:
             # completed local-review loop; no-review bindings (false/false)
             # gate on CI alone.
             review_bypass_ready = False
-            if no_signal_mergeable and not binding.resolved_remote_review():
+            if candidate.review_bypassed:
+                # Per-PR `$skip-review`: the operator deliberately waived the
+                # review verdict. Honor it regardless of the binding's
+                # remote_review setting — this is the restart-recovery path for
+                # a bypass persisted before `_schedule_merge` created the merge
+                # run. CI/mergeability are still gated below and at merge time.
+                review_bypass_ready = True
+            elif no_signal_mergeable and not binding.resolved_remote_review():
                 review_bypass_ready = (
                     not binding.resolved_local_review()
                     or await self._local_review_completed_for_issue(

@@ -3150,6 +3150,72 @@ async def test_completed_review_monitor_not_rearmed_when_approved(
 
 
 @pytest.mark.asyncio
+async def test_schedule_review_poll_keys_by_storage_issue_id(tmp_path: Path) -> None:
+    """For contextual / provider-collision issues the run's storage id differs
+    from the tracker id. The in-memory monitor must be keyed by the storage id
+    (`run.issue_id`), since slash polling / webhooks resolve commands against
+    storage ids — keying by the tracker id would strand `$skip-review`/`$retry`.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        run = db.runs.Run(
+            id="rev-run",
+            issue_id="storage-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+            ended_at=None,
+            cost_usd=0.0,
+        )
+        issue = _issue_in_review()  # tracker id "iss-1"
+        assert issue.id != run.issue_id
+        task = orch._schedule_review_poll(run, _binding(), issue)  # noqa: SLF001
+        try:
+            assert orch._review_poll_issue_ids.get("storage-1") == "rev-run"  # noqa: SLF001
+            assert "iss-1" not in orch._review_poll_issue_ids  # noqa: SLF001
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_retires_orphaned_merge_run(tmp_path: Path) -> None:
+    """`startup_reconcile` (run by both `run()` and the CLI `--once` path) must
+    retire a zombie merge `needs_approval` run so its open PR re-enters merge
+    candidacy — otherwise once-mode invocations would strand it forever."""
+    from .test_db import _seed_orphaned_merge_needs_approval
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_orphaned_merge_needs_approval(conn)
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        await orch.startup_reconcile(reason="once")
+
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert [c.pr_number for c in candidates] == [42]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
     tmp_path: Path,
 ) -> None:
