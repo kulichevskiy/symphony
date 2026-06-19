@@ -429,6 +429,71 @@ async def interrupt_stale_merge_needs_approval(
     return interrupted
 
 
+async def supersede_orphaned_merge_needs_approval(
+    conn: aiosqlite.Connection,
+    *,
+    before: str | None = None,
+) -> list[str]:
+    """Retire `merge` runs stuck at `needs_approval` with no operator wait.
+
+    A merge `needs_approval` run is created alongside an `operator_wait` of
+    kind `merge`. If the wait is later cleared (e.g. a revival path dispatched
+    a retry that was then orphaned by a host restart) without superseding the
+    run, the run lingers as `needs_approval`. `issue_prs.list_merge_candidates`
+    excludes any PR with such a run, so the still-open PR drops out of merge
+    polling forever — a zombie. Retiring the run re-opens merge candidacy so
+    the normal merge poll re-engages.
+
+    `before` (an ISO timestamp) gates on `ended_at < before` to avoid racing a
+    freshly-created wait that has not yet committed. Returns the issue ids
+    whose runs were superseded.
+    """
+    before_filter = "" if before is None else " AND r.ended_at < ?"
+    params: list[object] = []
+    if before is not None:
+        params.append(before)
+    cur = await conn.execute(
+        f"""
+        SELECT r.id, r.issue_id
+        FROM runs r
+        WHERE r.stage = 'merge'
+          AND r.status = 'needs_approval'
+          AND EXISTS (
+              SELECT 1 FROM issue_prs p
+              WHERE p.issue_id = r.issue_id
+                AND p.merged_at IS NULL
+                AND r.started_at >= p.created_at
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM operator_waits w WHERE w.issue_id = r.issue_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r2
+              WHERE r2.issue_id = r.issue_id AND r2.status = 'running'
+          )
+          {before_filter}
+        """,
+        params,
+    )
+    rows = await cur.fetchall()
+    ended_at = datetime.now(UTC).isoformat()
+    issue_ids: list[str] = []
+    for row in rows:
+        await update_status(
+            conn,
+            row["id"],
+            INTERRUPTED_STATUS,
+            ended_at=ended_at,
+            kind="superseded",
+            detail=(
+                "orphaned merge needs_approval (operator wait cleared) — "
+                "re-opening merge candidacy"
+            ),
+        )
+        issue_ids.append(str(row["issue_id"]))
+    return issue_ids
+
+
 async def interrupt_running_merge(conn: aiosqlite.Connection, run_id: str) -> int:
     cur = await conn.execute(
         """

@@ -668,6 +668,166 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
         await conn.close()
 
 
+async def _seed_orphaned_merge_needs_approval(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str = "iss-1",
+    pr_number: int = 42,
+) -> None:
+    """Issue + open PR + completed review + a merge `needs_approval` run."""
+    await db.issues.upsert(
+        conn, id=issue_id, identifier=f"ENG-{pr_number}", title="t", team_key="ENG"
+    )
+    await db.issue_prs.upsert(
+        conn,
+        issue_id=issue_id,
+        github_repo="org/repo",
+        binding_key='["ENG","org/repo","backend"]',
+        pr_number=pr_number,
+        pr_url=f"https://github.com/org/repo/pull/{pr_number}",
+        created_at="2026-05-10T00:00:00+00:00",
+    )
+    await db.runs.create(
+        conn,
+        id=f"review-{issue_id}",
+        issue_id=issue_id,
+        stage="review",
+        status="completed",
+        pid=None,
+        started_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.runs.create(
+        conn,
+        id=f"merge-{issue_id}",
+        issue_id=issue_id,
+        stage="merge",
+        status="running",
+        pid=None,
+        started_at="2026-05-10T00:02:00+00:00",
+    )
+    await db.runs.update_status(
+        conn,
+        f"merge-{issue_id}",
+        "needs_approval",
+        ended_at="2026-05-10T00:02:30+00:00",
+        kind="awaiting_human_merge",
+    )
+
+
+@pytest.mark.asyncio
+async def test_supersede_orphaned_merge_needs_approval_reopens_candidacy(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_orphaned_merge_needs_approval(conn)
+        # The lingering needs_approval merge run keeps the open PR out of merge
+        # candidacy.
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        superseded = await db.runs.supersede_orphaned_merge_needs_approval(
+            conn, before="2026-05-10T01:00:00+00:00"
+        )
+        assert superseded == ["iss-1"]
+
+        # Candidacy re-opens for the still-open PR.
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert len(candidates) == 1
+        assert candidates[0].pr_number == 42
+        # Idempotent: the run is no longer needs_approval, so a second pass is a
+        # no-op.
+        assert (
+            await db.runs.supersede_orphaned_merge_needs_approval(
+                conn, before="2026-05-10T01:00:00+00:00"
+            )
+            == []
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_supersede_orphaned_merge_needs_approval_respects_guards(
+    tmp_path: Path,
+) -> None:
+    # Grace window: a run whose ended_at is not before the cutoff is left alone.
+    conn = await db.connect(tmp_path / "grace.sqlite")
+    try:
+        await _seed_orphaned_merge_needs_approval(conn)
+        assert (
+            await db.runs.supersede_orphaned_merge_needs_approval(
+                conn, before="2026-05-10T00:02:00+00:00"
+            )
+            == []
+        )
+    finally:
+        await conn.close()
+
+    # An active operator wait means the approval is real — not a zombie.
+    conn = await db.connect(tmp_path / "wait.sqlite")
+    try:
+        await _seed_orphaned_merge_needs_approval(conn)
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="merge-iss-1",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="backend",
+            created_at="2026-05-10T00:02:30+00:00",
+        )
+        assert (
+            await db.runs.supersede_orphaned_merge_needs_approval(
+                conn, before="2026-05-10T01:00:00+00:00"
+            )
+            == []
+        )
+    finally:
+        await conn.close()
+
+    # A running run for the issue means work is in flight — leave it.
+    conn = await db.connect(tmp_path / "running.sqlite")
+    try:
+        await _seed_orphaned_merge_needs_approval(conn)
+        await db.runs.create(
+            conn,
+            id="fix-iss-1",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:03:00+00:00",
+        )
+        assert (
+            await db.runs.supersede_orphaned_merge_needs_approval(
+                conn, before="2026-05-10T01:00:00+00:00"
+            )
+            == []
+        )
+    finally:
+        await conn.close()
+
+    # A merged PR is done — its needs_approval run is not a zombie.
+    conn = await db.connect(tmp_path / "merged.sqlite")
+    try:
+        await _seed_orphaned_merge_needs_approval(conn)
+        await db.issue_prs.mark_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            merged_at="2026-05-10T00:05:00+00:00",
+        )
+        assert (
+            await db.runs.supersede_orphaned_merge_needs_approval(
+                conn, before="2026-05-10T01:00:00+00:00"
+            )
+            == []
+        )
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_issue_prs_lists_recent_merged_rows_since_cutoff(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")

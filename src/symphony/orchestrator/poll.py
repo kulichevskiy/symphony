@@ -170,6 +170,9 @@ CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
+# Grace before an orphaned merge `needs_approval` run (operator wait gone) is
+# retired — long enough to never race a freshly-created wait.
+ORPHANED_MERGE_RUN_GRACE_SECS = 120
 MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
 PARKED_CLOSED_UNMERGED_COMMENT = "🛑 PR closed without merge — marking done"
@@ -2042,6 +2045,7 @@ class Orchestrator:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
         await self._restore_operator_waits()
+        await self._reconcile_orphaned_merge_runs(reason="startup")
         await self._reconcile_auto_recoverable_merge_waits(reason="startup")
         self._merge_wait_reconcile_task = asyncio.create_task(
             self._run_auto_recoverable_merge_wait_reconciler(self._shutdown)
@@ -2100,6 +2104,10 @@ class Orchestrator:
                 break
             except TimeoutError:
                 pass
+            try:
+                await self._reconcile_orphaned_merge_runs(reason="periodic")
+            except Exception:  # noqa: BLE001
+                log.exception("orphaned merge run reconcile failed")
             try:
                 recovered = await self._reconcile_auto_recoverable_merge_waits(
                     reason="periodic"
@@ -3621,6 +3629,32 @@ class Orchestrator:
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
+
+    async def _reconcile_orphaned_merge_runs(self, *, reason: str = "manual") -> int:
+        """Retire zombie merge `needs_approval` runs whose operator wait is gone.
+
+        When a merge wait is cleared without superseding its `needs_approval`
+        run (e.g. a revival retry that a host restart then orphaned), the run
+        lingers and `list_merge_candidates` keeps the still-open PR out of merge
+        polling forever — and the dead run shows the issue as Halted. Retiring
+        the run re-opens candidacy so the normal merge poll re-engages.
+        """
+        before = (
+            self._now() - timedelta(seconds=ORPHANED_MERGE_RUN_GRACE_SECS)
+        ).isoformat()
+        issue_ids = await db.runs.supersede_orphaned_merge_needs_approval(
+            self._conn, before=before
+        )
+        if issue_ids:
+            log.info(
+                "reconcile(%s): retired %d orphaned merge needs_approval run(s), "
+                "re-opening merge candidacy for %s",
+                reason,
+                len(issue_ids),
+                ", ".join(sorted(set(issue_ids))),
+            )
+            self._wake.set()
+        return len(issue_ids)
 
     async def _reconcile_auto_recoverable_merge_waits(
         self, *, reason: str = "manual"

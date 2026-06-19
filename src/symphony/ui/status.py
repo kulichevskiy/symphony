@@ -366,22 +366,6 @@ async def compute_canonical_status(
         """,
         (issue_id,),
     )
-    if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
-        stage = _as_str(latest_run["stage"])
-        run_status = _as_str(latest_run["status"])
-        subtitle: str | None
-        if run_status and run_status != "failed":
-            subtitle = f"{stage} ({run_status})" if stage else run_status
-        else:
-            subtitle = stage
-        return _status(
-            CanonicalState.FAILED,
-            since=_as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"]),
-            subtitle=subtitle,
-            now=effective_now,
-            thresholds=thresholds,
-        )
-
     open_pr = await _fetch_one(
         conn,
         """
@@ -393,6 +377,31 @@ async def compute_canonical_status(
         """,
         (issue_id,),
     )
+    if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
+        # An orphaned `interrupted` run (host PID died on a restart) is not a
+        # real failure when the PR is still open: the merge/review polls
+        # re-drive it, so it must not mask the PR_OPEN/review state as Halted.
+        # A genuine `failed` run still surfaces as FAILED.
+        interrupted_with_open_pr = (
+            latest_run["status"] == "interrupted" and open_pr is not None
+        )
+        if not interrupted_with_open_pr:
+            stage = _as_str(latest_run["stage"])
+            run_status = _as_str(latest_run["status"])
+            subtitle: str | None
+            if run_status and run_status != "failed":
+                subtitle = f"{stage} ({run_status})" if stage else run_status
+            else:
+                subtitle = stage
+            return _status(
+                CanonicalState.FAILED,
+                since=_as_str(latest_run["ended_at"])
+                or _as_str(latest_run["started_at"]),
+                subtitle=subtitle,
+                now=effective_now,
+                thresholds=thresholds,
+            )
+
     if open_pr is not None:
         return _status(
             CanonicalState.PR_OPEN,
