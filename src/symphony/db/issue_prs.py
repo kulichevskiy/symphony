@@ -589,6 +589,57 @@ async def list_orphaned_review_prs(conn: aiosqlite.Connection) -> list[IssuePR]:
     return [_row_to_issue_pr(r) for r in rows]
 
 
+async def list_completed_review_prs_without_monitor(
+    conn: aiosqlite.Connection,
+) -> list[IssuePR]:
+    """Open PRs whose latest review run COMPLETED but no monitor is live.
+
+    Mirrors `list_orphaned_review_prs` for the `completed` case instead of a
+    dead run. A review run can complete without ever monitoring the GitHub
+    `@codex` review — e.g. the binding's `remote_review` was flipped on after
+    the review stage already finished — leaving an open PR with review feedback
+    that nothing watches. The caller gates re-arming on `remote_review` and the
+    PR not being approved, so a normally-approved PR awaiting merge (whose
+    review also completed) is left alone.
+    """
+    live_placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,
+               p.binding_key, p.pr_number, p.pr_url, p.created_at, p.merged_at,
+               p.parked_at
+        FROM issue_prs p
+        JOIN issues i ON i.id = p.issue_id
+        WHERE p.merged_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'review'
+                AND r.status IN ({live_placeholders})
+          )
+          AND (
+              SELECT r.status FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'review'
+                AND r.started_at >= p.created_at
+              ORDER BY r.started_at DESC, r.rowid DESC
+              LIMIT 1
+          ) = 'completed'
+          AND NOT EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.issue_id = p.issue_id
+                AND r.stage = 'merge'
+                AND r.status IN ('running', 'completed', 'done', 'needs_approval')
+                AND r.started_at >= p.created_at
+          )
+        ORDER BY p.created_at ASC
+        """,
+        (*LIVE_STATUSES,),
+    )
+    rows = await cur.fetchall()
+    return [_row_to_issue_pr(r) for r in rows]
+
+
 async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     """PRs whose Review handoff completed and whose Merge has not finished.
 

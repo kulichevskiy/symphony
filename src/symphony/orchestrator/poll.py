@@ -7629,108 +7629,162 @@ class Orchestrator:
             log.warning("could not post skip-review comment for %s: %s", issue.identifier, e)
 
     async def _resurrect_review_runs(self) -> list[asyncio.Task[None]]:
-        """Restart review monitors that died but whose PRs are still open.
+        """Restart review monitors whose PRs are still open but have no monitor.
 
-        Guarded by REVIEW_RESURRECT_COOLDOWN_SECS so a persistently failing
-        review does not spin at full poll speed.
+        Two sources: review runs that died mid-flight (`list_orphaned_review_prs`),
+        and review runs that *completed* without ever monitoring the GitHub
+        review — e.g. `remote_review` was flipped on after the review stage
+        finished, so the PR's `@codex` feedback now has no watcher
+        (`list_completed_review_prs_without_monitor`). The completed case is
+        gated on `remote_review` being on and the PR not yet approved, so a
+        normally-approved PR awaiting merge is left alone. Guarded by
+        REVIEW_RESURRECT_COOLDOWN_SECS so a persistently failing review does not
+        spin at full poll speed.
         """
         scheduled: list[asyncio.Task[None]] = []
-        orphaned = await db.issue_prs.list_orphaned_review_prs(self._conn)
-        for pr in orphaned:
-            if pr.issue_id in self._scheduled_issue_ids:
-                continue
-            if await db.runs.has_active(self._conn, pr.issue_id):
-                continue
-            # If there is already an operator wait (manual $retry pending), skip.
-            if pr.issue_id in self._dispatch_run_ids:
-                continue
-            binding = self._binding_for_pr(pr)
-            if binding is None:
-                continue
-            tracker = self.tracker(binding)
-            # Cooldown: skip if the last review run ended recently.
-            last_review = await db.runs.latest_for_issue_stage(
-                self._conn, issue_id=pr.issue_id, stage="review"
+        for pr in await db.issue_prs.list_orphaned_review_prs(self._conn):
+            task = await self._resurrect_one_review_monitor(
+                pr, require_remote_review_unapproved=False
             )
-            if last_review is not None and last_review.ended_at is not None:
-                try:
-                    elapsed = (
-                        datetime.now(UTC) - _parse_rfc3339(last_review.ended_at)
-                    ).total_seconds()
-                    if elapsed < REVIEW_RESURRECT_COOLDOWN_SECS:
-                        continue
-                except ValueError:
-                    pass
+            if task is not None:
+                scheduled.append(task)
+        for pr in await db.issue_prs.list_completed_review_prs_without_monitor(
+            self._conn
+        ):
+            task = await self._resurrect_one_review_monitor(
+                pr, require_remote_review_unapproved=True
+            )
+            if task is not None:
+                scheduled.append(task)
+        return scheduled
+
+    async def _resurrect_one_review_monitor(
+        self,
+        pr: db.issue_prs.IssuePR,
+        *,
+        require_remote_review_unapproved: bool,
+    ) -> asyncio.Task[None] | None:
+        if pr.issue_id in self._scheduled_issue_ids:
+            return None
+        if await db.runs.has_active(self._conn, pr.issue_id):
+            return None
+        # If there is already an operator wait (manual $retry pending), skip.
+        if pr.issue_id in self._dispatch_run_ids:
+            return None
+        binding = self._binding_for_pr(pr)
+        if binding is None:
+            return None
+        tracker = self.tracker(binding)
+        # Cooldown: skip if the last review run ended recently.
+        last_review = await db.runs.latest_for_issue_stage(
+            self._conn, issue_id=pr.issue_id, stage="review"
+        )
+        if last_review is not None and last_review.ended_at is not None:
             try:
-                issue = await tracker.lookup_issue(pr.issue_id)
-            except LinearError as e:
+                elapsed = (
+                    datetime.now(UTC) - _parse_rfc3339(last_review.ended_at)
+                ).total_seconds()
+                if elapsed < REVIEW_RESURRECT_COOLDOWN_SECS:
+                    return None
+            except ValueError:
+                pass
+        try:
+            issue = await tracker.lookup_issue(pr.issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not look up orphaned review issue %s: %s",
+                pr.identifier,
+                e,
+            )
+            return None
+        if not _review_issue_is_active(issue, binding):
+            return None
+        if require_remote_review_unapproved:
+            # Only re-arm a completed-monitor PR when the GitHub review actually
+            # matters here and is unresolved — never re-monitor an approved PR
+            # that is merely awaiting merge.
+            if not binding.resolved_remote_review():
+                return None
+            try:
+                verdict = await self._review_verdict_for_pr(
+                    binding=binding, pr_number=pr.pr_number
+                )
+            except GitHubError as e:
                 log.warning(
-                    "could not look up orphaned review issue %s: %s",
-                    pr.identifier,
+                    "could not classify review before re-arming monitor for "
+                    "%s#%d: %s",
+                    binding.github_repo,
+                    pr.pr_number,
                     e,
                 )
-                continue
-            if not _review_issue_is_active(issue, binding):
-                continue
+                return None
+            if verdict.kind is VerdictKind.APPROVED:
+                return None
+            log.info(
+                "re-arming review monitor for %s (PR #%d): remote_review PR has "
+                "no live monitor and is not approved (%s)",
+                issue.identifier,
+                pr.pr_number,
+                verdict.rule or verdict.kind.value,
+            )
+        else:
             log.info(
                 "resurrecting dead review monitor for %s (PR #%d)",
                 issue.identifier,
                 pr.pr_number,
             )
-            now = datetime.now(UTC).isoformat()
-            review_run_id = str(uuid.uuid4())
-            await db.runs.create(
-                self._conn,
-                id=review_run_id,
-                issue_id=issue.id,
+        now = datetime.now(UTC).isoformat()
+        review_run_id = str(uuid.uuid4())
+        await db.runs.create(
+            self._conn,
+            id=review_run_id,
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at=now,
+        )
+        state = await db.review_state.get(self._conn, issue.id)
+        body = resumed(
+            CommentVars(
                 stage="review",
-                status="running",
-                pid=None,
-                started_at=now,
-            )
-            state = await db.review_state.get(self._conn, issue.id)
-            body = resumed(
-                CommentVars(
-                    stage="review",
+                repo=binding.github_repo,
+                issue=state.pr_number or 0,
+                run_id=review_run_id,
+                pr_url=_pr_url_for_state(
                     repo=binding.github_repo,
-                    issue=state.pr_number or 0,
-                    run_id=review_run_id,
-                    pr_url=_pr_url_for_state(
-                        repo=binding.github_repo,
-                        pr_number=state.pr_number,
-                        pr_url=state.pr_url,
-                    ),
-                    next_stage="review",
-                )
+                    pr_number=state.pr_number,
+                    pr_url=state.pr_url,
+                ),
+                next_stage="review",
             )
-            try:
-                await tracker.post_comment(issue.id, truncate_body(body))
-            except LinearError as e:
-                log.warning(
-                    "resurrection comment failed for %s: %s", issue.identifier, e
-                )
-            run = db.runs.Run(
-                id=review_run_id,
-                issue_id=issue.id,
-                stage="review",
-                status="running",
-                pid=None,
-                started_at=now,
-                ended_at=None,
-                cost_usd=0.0,
-            )
-            if binding.resolved_remote_review():
-                await self._move_issue_to_review_state(binding=binding, issue=issue)
-            scheduled.append(self._schedule_review_poll(run, binding, issue))
-            rearm_done = await self._retrigger_codex_review_unless_approved(
-                binding=binding,
-                issue=issue,
-                state=state,
-                require_no_signal=True,
-            )
-            if not rearm_done:
-                await self._mark_review_rearm_retry(review_run_id)
-        return scheduled
+        )
+        try:
+            await tracker.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning("resurrection comment failed for %s: %s", issue.identifier, e)
+        run = db.runs.Run(
+            id=review_run_id,
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at=now,
+            ended_at=None,
+            cost_usd=0.0,
+        )
+        if binding.resolved_remote_review():
+            await self._move_issue_to_review_state(binding=binding, issue=issue)
+        task = self._schedule_review_poll(run, binding, issue)
+        rearm_done = await self._retrigger_codex_review_unless_approved(
+            binding=binding,
+            issue=issue,
+            state=state,
+            require_no_signal=True,
+        )
+        if not rearm_done:
+            await self._mark_review_rearm_retry(review_run_id)
+        return task
 
     async def _fail_review_run(
         self,

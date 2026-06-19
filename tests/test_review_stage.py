@@ -2962,6 +2962,160 @@ async def test_dead_review_monitor_is_resurrected_after_cooldown(
 
 
 @pytest.mark.asyncio
+async def test_completed_review_monitor_rearmed_when_remote_review_unapproved(
+    tmp_path: Path,
+) -> None:
+    """A review run that COMPLETED without ever monitoring the GitHub review
+    (e.g. remote_review was flipped on after the review stage finished) is
+    re-armed so the PR's @codex feedback gets a watcher again."""
+    from datetime import UTC, datetime, timedelta
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        # Completed monitor, ended past the resurrection cooldown.
+        old_ended = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        await db.runs.update_status(conn, "review-run", "completed", ended_at=old_ended)
+
+        cfg = Config(
+            repos=[_binding()],  # remote_review=True by default
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock(return_value=None)
+
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(return_value=PRChecks())
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "sha", "mergeable": "MERGEABLE"}
+        )
+        gh.head_sha = AsyncMock(return_value="sha")
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-11T17:50:00Z")
+        gh.pr_reviews = AsyncMock(return_value=[])
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.pr_comment = AsyncMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        tasks = await orch._resurrect_review_runs()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        live = [r for r in history if r.stage == "review" and r.status == "running"]
+        assert len(live) == 1, "expected the completed monitor to be re-armed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_review_monitor_not_rearmed_when_approved(
+    tmp_path: Path,
+) -> None:
+    """A completed-monitor PR that is already APPROVED is left alone — it is
+    awaiting merge, not review."""
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    from symphony.pipeline.review_classifier import Verdict, VerdictKind
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        old_ended = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+        await db.runs.update_status(conn, "review-run", "completed", ended_at=old_ended)
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_review())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=gh)
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._review_verdict_for_pr = _AsyncMock(  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="approved")
+        )
+
+        tasks = await orch._resurrect_review_runs()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        live = [r for r in history if r.stage == "review" and r.status == "running"]
+        assert live == [], "approved PR must not be re-monitored"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_reconcile_pidless_review_run_is_resurrected_on_next_tick(
     tmp_path: Path,
 ) -> None:

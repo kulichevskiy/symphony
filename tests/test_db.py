@@ -1035,6 +1035,133 @@ async def test_orphaned_review_prs_require_latest_review_run_dead(
 
 
 @pytest.mark.asyncio
+async def test_completed_review_prs_without_monitor(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        # No review run yet → not a candidate (nothing completed).
+        assert await db.issue_prs.list_completed_review_prs_without_monitor(conn) == []
+
+        # A completed review run with no live monitor → candidate.
+        await db.runs.create(
+            conn,
+            id="completed-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        candidates = await db.issue_prs.list_completed_review_prs_without_monitor(conn)
+        assert [c.pr_number for c in candidates] == [42]
+
+        # An orphaned merge run (interrupted) does not disqualify it.
+        await db.runs.create(
+            conn,
+            id="orphan-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="interrupted",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        candidates = await db.issue_prs.list_completed_review_prs_without_monitor(conn)
+        assert [c.pr_number for c in candidates] == [42]
+
+        # A live review monitor → excluded (something is already watching).
+        await db.runs.create(
+            conn,
+            id="running-review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:03:00+00:00",
+        )
+        assert await db.issue_prs.list_completed_review_prs_without_monitor(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_review_prs_without_monitor_excludes_dead_and_merging(
+    tmp_path: Path,
+) -> None:
+    # A dead latest review run belongs to list_orphaned_review_prs, not here.
+    conn = await db.connect(tmp_path / "dead.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="failed-review",
+            issue_id="iss-1",
+            stage="review",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        assert await db.issue_prs.list_completed_review_prs_without_monitor(conn) == []
+    finally:
+        await conn.close()
+
+    # A submitted merge (completed) means the PR has progressed past review.
+    conn = await db.connect(tmp_path / "merging.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="completed-review",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="submitted-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        assert await db.issue_prs.list_completed_review_prs_without_monitor(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_latest_for_issue_stage_can_scope_to_current_cycle(
     tmp_path: Path,
 ) -> None:
