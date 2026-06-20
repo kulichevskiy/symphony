@@ -24,7 +24,7 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import GitHubError
-from symphony.linear.client import LinearComment, LinearIssue
+from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator, _ImplementHandoff
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
@@ -638,11 +638,13 @@ def _head_sha(workspace_path: Path) -> str:
 
 
 async def _run_already_satisfied_dispatch(
-    tmp_path: Path, conn: object, ref: str
+    tmp_path: Path, conn: object, ref: str, *, fail_done_move: bool = False
 ) -> tuple[object, object, object]:
     """Dispatch an implement run whose agent emits SYMPHONY_ALREADY_DONE (no
     commit) in a real git workspace. ``{head}`` in *ref* is substituted with
-    the workspace HEAD sha (a real ancestor). Returns (gh, push_fn, linear)."""
+    the workspace HEAD sha (a real ancestor). When *fail_done_move* is set, the
+    Linear move to the Done lane raises (the move to any other lane still
+    succeeds). Returns (gh, push_fn, linear)."""
     cfg = Config(
         repos=[_binding()],
         log_root=tmp_path / "logs",
@@ -654,6 +656,13 @@ async def _run_already_satisfied_dispatch(
     linear.lookup_issue = AsyncMock(return_value=_issue())
     linear.post_comment = AsyncMock(return_value="cmt-1")
     linear.move_issue = AsyncMock()
+    if fail_done_move:
+
+        async def _move(issue_id: str, state_id: str) -> None:
+            if state_id == "state-done":
+                raise LinearError("Done transition refused")
+
+        linear.move_issue.side_effect = _move
 
     workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
     workspace_path.mkdir(parents=True)
@@ -724,6 +733,35 @@ async def test_already_satisfied_unverifiable_ref_still_fails(tmp_path: Path) ->
         assert call("iss-1", "state-done") not in linear.move_issue.await_args_list
 
         # Parked as a failed implement run on an operator wait.
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status != "completed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_already_satisfied_done_move_failure_parks_instead_of_stranding(
+    tmp_path: Path,
+) -> None:
+    """A verifiable already-done ref whose move to Done raises must NOT complete
+    the run: completing it would strand the issue in In Progress with no PR and
+    no `$retry` path. The close bails to the failed/operator-wait path instead."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        gh, push_fn, linear = await _run_already_satisfied_dispatch(
+            tmp_path, conn, "{head} (org/repo#291)", fail_done_move=True
+        )
+
+        gh.ensure_pr.assert_not_awaited()
+        push_fn.assert_not_awaited()
+
+        # The Done transition was attempted but raised, so the run must not be
+        # marked completed — it parks on an operator wait with a `$retry` path.
+        assert call("iss-1", "state-done") in linear.move_issue.await_args_list
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status != "completed"

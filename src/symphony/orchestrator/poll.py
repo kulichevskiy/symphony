@@ -11003,9 +11003,10 @@ class Orchestrator:
         if completion.outcome != "completed":
             if completion.outcome == "already_satisfied":
                 reason = (
-                    "implement run claimed SYMPHONY_ALREADY_DONE but the "
-                    "delivering commit could not be verified as an ancestor of "
-                    f"HEAD (ref: {completion.already_satisfied_ref or '(none)'})"
+                    "implement run claimed SYMPHONY_ALREADY_DONE but could not "
+                    "be auto-closed: the delivering commit was not verifiable as "
+                    "an ancestor of HEAD, or the move to Done failed "
+                    f"(ref: {completion.already_satisfied_ref or '(none)'})"
                 )
             else:
                 reason = (
@@ -13858,12 +13859,18 @@ class Orchestrator:
 
         The agent emitted ``SYMPHONY_ALREADY_DONE: <ref>`` and made no commit.
         Before auto-closing, verify the named commit is real and an ancestor of
-        HEAD — a bogus claim must not close an undelivered issue. On success the
-        run is marked completed, the issue moves to the terminal Done lane with
-        an auto-comment referencing the delivering commit, and push / local
-        review / PR are skipped entirely. Returns True when closed; False when
-        the ref is unverifiable, so the caller falls back to the failed no-op
-        guard (a plain done-without-commits still parks on an operator).
+        HEAD — a bogus claim must not close an undelivered issue. The issue is
+        moved to the terminal Done lane *before* the run is marked completed: a
+        no-op run has nothing to push, so completing it while the issue is still
+        in In Progress would strand the issue with no PR, no `$retry` path, and
+        no reconciler. So if Done is unmapped/unloadable or the move raises, this
+        returns False *without* marking the run completed, leaving the caller to
+        park it on the failed/operator-wait path. On success the run is marked
+        completed, an auto-comment references the delivering commit, and push /
+        local review / PR are skipped entirely. Returns True when the issue
+        actually reached Done; False when the ref is unverifiable or the close
+        could not be completed (a plain done-without-commits still parks on an
+        operator).
         """
         storage_issue_id = storage_issue_id or issue.id
         candidate = _extract_delivering_commit(delivered_ref)
@@ -13879,34 +13886,48 @@ class Orchestrator:
             )
             return False
 
+        # Work IS delivered, so Done reads more accurately than Cancelled. Move
+        # the issue to Done before marking the run completed: only treat the
+        # close as successful once the issue has actually reached Done, so a
+        # failed transition cannot leave the issue stranded on a completed run.
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while closing already-satisfied %s; "
+                "leaving for the failed path: %s",
+                issue.identifier,
+                e,
+            )
+            return False
+        done_id = states.get(binding.linear_states.done)
+        if done_id is None:
+            log.warning(
+                "Done lane unmapped for %s; cannot close already-satisfied "
+                "run %s, leaving for the failed path",
+                issue.identifier,
+                run_id,
+            )
+            return False
+        if done_id != issue.state_id:
+            try:
+                await self.tracker(binding).move_issue(issue.id, done_id)
+            except LinearError as e:
+                log.warning(
+                    "could not move %s to Done while closing already-satisfied "
+                    "run %s; leaving for the failed path: %s",
+                    issue.identifier,
+                    run_id,
+                    e,
+                )
+                return False
+
         await db.runs.update_status(
             self._conn,
             run_id,
             "completed",
             ended_at=datetime.now(UTC).isoformat(),
         )
-        # Work IS delivered, so Done reads more accurately than Cancelled.
-        # Degrade gracefully if Done is unmapped or the move fails.
-        try:
-            states = await self._states_for_binding(binding)
-        except LinearError as e:
-            log.warning(
-                "could not load states while closing already-satisfied %s: %s",
-                issue.identifier,
-                e,
-            )
-        else:
-            done_id = states.get(binding.linear_states.done)
-            if done_id is not None and done_id != issue.state_id:
-                try:
-                    await self.tracker(binding).move_issue(issue.id, done_id)
-                except LinearError as e:
-                    log.warning(
-                        "could not move %s to Done after already-satisfied "
-                        "close: %s",
-                        issue.identifier,
-                        e,
-                    )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = implement_already_satisfied(
             CommentVars(
