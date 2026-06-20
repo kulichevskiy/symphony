@@ -5503,6 +5503,36 @@ async def test_skip_review_bypass_on_remote_binding_merges_when_mergeable(
 
 
 @pytest.mark.asyncio
+async def test_skip_review_bypass_merges_without_classifying_verdict(
+    tmp_path: Path,
+) -> None:
+    """A persisted `$skip-review` on a remote-review binding must not depend on
+    the review verdict fetch — the operator already waived review, so a failing
+    review-only API call must not strand the PR (it must still flow to merge)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)  # review_bypassed=True
+        binding = _binding()  # remote_review on
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.CHANGES_REQUESTED, rule="codex_inline"),
+        )
+        # Even if classification WOULD fail, the bypassed PR must still merge —
+        # and the waived path must not call it at all.
+        orch._review_verdict_for_pr = AsyncMock(side_effect=GitHubError("boom"))  # type: ignore[method-assign]  # noqa: SLF001
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._review_verdict_for_pr.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_review_bypass_waits_when_mergeable_unknown(
     tmp_path: Path,
 ) -> None:

@@ -3150,6 +3150,84 @@ async def test_completed_review_monitor_not_rearmed_when_approved(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_pidless_review_for_bypassed_pr_skips_review_failed_wait(
+    tmp_path: Path,
+) -> None:
+    """A `$skip-review`d PR whose pidless review run is orphaned on restart must
+    NOT get a `review_failed` operator wait — that would keep the bypassed PR
+    out of merge polling. The run is made terminal; merge polling picks it up."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)  # pidless running review run + open PR
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            binding_key="",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.mark_review_bypassed(
+            conn, issue_id="iss-1", github_repo="org/repo", pr_number=42
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        flipped = await reconcile(conn, linear)
+        assert flipped == 1
+
+        # No review_failed wait was created for the bypassed PR...
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is None
+        # ...and the bypassed PR is now a merge candidate (run is terminal).
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert [c.pr_number for c in candidates] == [42]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_tracker_identity_resolves_storage_id_to_tracker_id(tmp_path: Path) -> None:
+    """Review command handlers receive the storage id (registry/review_state are
+    storage-keyed) but must resolve the tracker id for tracker calls. This is the
+    resolution they rely on: a provider-collision row's scoped storage id maps
+    back to its tracker id, while a plain id is returned unchanged."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="DUP-1", identifier="L-1", title="t", team_key="ENG"
+        )
+        # Same tracker id under a different provider/site collides → scoped
+        # storage id, tracker_issue_id preserved as "DUP-1".
+        storage_id = await db.issues.upsert(
+            conn,
+            id="DUP-1",
+            identifier="J-1",
+            title="t",
+            team_key="ACME",
+            provider="jira",
+            site="acme",
+        )
+        assert storage_id != "DUP-1"
+
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        tracker_id, _ = await orch._tracker_identity_for_issue(storage_id)  # noqa: SLF001
+        assert tracker_id == "DUP-1"
+        # A non-contextual / unknown id is returned unchanged.
+        plain_id, _ = await orch._tracker_identity_for_issue("iss-x")  # noqa: SLF001
+        assert plain_id == "iss-x"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_schedule_review_poll_keys_by_storage_issue_id(tmp_path: Path) -> None:
     """For contextual / provider-collision issues the run's storage id differs
     from the tracker id. The in-memory monitor must be keyed by the storage id

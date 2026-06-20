@@ -2928,8 +2928,11 @@ class Orchestrator:
             )
         )
         tracker = self.tracker(binding)
+        # `issue_id` is the storage id; tracker posts need the tracker's own id
+        # (they differ for contextual / provider-collision rows).
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         try:
-            await tracker.post_comment(issue_id, truncate_body(body))
+            await tracker.post_comment(tracker_issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("active review retry comment failed for %s: %s", issue_id, e)
 
@@ -2947,23 +2950,9 @@ class Orchestrator:
                 await self._runner.kill(fix_run_id)
             except Exception:  # noqa: BLE001
                 log.exception("could not kill concurrent review run %s", fix_run_id)
-                try:
-                    tracker = await self._tracker_for_issue_id(issue_id)
-                    await tracker.post_comment(
-                        issue_id,
-                        truncate_body(
-                            command_rejected(
-                                "$stop",
-                                "could not stop active review fix-run",
-                            )
-                        ),
-                    )
-                except LinearError as e:
-                    log.warning(
-                        "could not post stop rejection for %s: %s",
-                        issue_id,
-                        e,
-                    )
+                await self._post_command_rejected(
+                    issue_id, "$stop", "could not stop active review fix-run"
+                )
                 return
 
         task = self._review_poll_run_tasks.get(run_id)
@@ -3016,8 +3005,10 @@ class Orchestrator:
             )
         )
         tracker = self.tracker(binding)
+        # `issue_id` is the storage id; tracker posts need the tracker's own id.
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         try:
-            await tracker.post_comment(issue_id, truncate_body(body))
+            await tracker.post_comment(tracker_issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("review stop confirmation failed for %s: %s", issue_id, e)
 
@@ -7529,42 +7520,30 @@ class Orchestrator:
         # A review_fix run may be active at the same time as the review monitor.
         # run_id may point to the fix run, not the monitor. Always look up the
         # monitor run ID directly so skip-review works regardless.
+        # `issue_id` is the storage id (the review-monitor registry and
+        # review_state are storage-keyed); tracker calls need the tracker's own
+        # id, which differs for contextual / provider-collision rows.
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         monitor_run_id = self._review_poll_issue_ids.get(issue_id)
         if monitor_run_id is None or monitor_run_id not in self._review_poll_run_ids:
-            try:
-                tracker = await self._tracker_for_issue_id(issue_id)
-                await tracker.post_comment(
-                    issue_id,
-                    truncate_body(
-                        command_rejected(
-                            "$skip-review",
-                            "no active review monitor — cannot skip",
-                        )
-                    ),
-                )
-            except LinearError as e:
-                log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
+            await self._post_command_rejected(
+                issue_id, "$skip-review", "no active review monitor — cannot skip"
+            )
             return
 
         tracker_ctx = await self._tracker_context_for_issue(issue_id)
         issue_tracker = self.tracker(tracker_ctx)
         try:
-            issue = await issue_tracker.lookup_issue(issue_id)
+            issue = await issue_tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning("could not look up %s for skip-review: %s", issue_id, e)
             return
 
         state = await db.review_state.get(self._conn, issue_id)
         if state.pr_number is None:
-            try:
-                await issue_tracker.post_comment(
-                    issue_id,
-                    truncate_body(
-                        command_rejected("$skip-review", "no PR found for this issue")
-                    ),
-                )
-            except LinearError as e:
-                log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
+            await self._post_command_rejected(
+                issue_id, "$skip-review", "no PR found for this issue"
+            )
             return
 
         binding = self._binding_for_review(issue, state, tracker_ctx=tracker_ctx)
@@ -7662,7 +7641,9 @@ class Orchestrator:
             next_stage="merge",
         )
         try:
-            await tracker.post_comment(issue_id, truncate_body(skip_review_forced(v)))
+            await tracker.post_comment(
+                tracker_issue_id, truncate_body(skip_review_forced(v))
+            )
         except LinearError as e:
             log.warning("could not post skip-review comment for %s: %s", issue.identifier, e)
 
@@ -9090,20 +9071,29 @@ class Orchestrator:
                     e,
                 )
                 continue
-            try:
-                verdict = await self._review_verdict_for_pr(
-                    binding=binding,
-                    pr_number=candidate.pr_number,
-                    view=view,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not classify review for %s#%d: %s",
-                    binding.github_repo,
-                    candidate.pr_number,
-                    e,
-                )
-                continue
+            # A persisted `$skip-review` on a remote-review binding already
+            # waived the Codex verdict. Don't re-fetch reviews/comments/reactions
+            # for it — the immediate `$skip-review` path schedules merge without
+            # classifying, so a failed review-only API call here must not strand
+            # the bypassed PR in the merge poll forever.
+            review_waived = candidate.review_bypassed and binding.resolved_remote_review()
+            if review_waived:
+                verdict = Verdict(kind=VerdictKind.PENDING, rule="review_waived")
+            else:
+                try:
+                    verdict = await self._review_verdict_for_pr(
+                        binding=binding,
+                        pr_number=candidate.pr_number,
+                        view=view,
+                    )
+                except GitHubError as e:
+                    log.warning(
+                        "could not classify review for %s#%d: %s",
+                        binding.github_repo,
+                        candidate.pr_number,
+                        e,
+                    )
+                    continue
 
             head_sha = str(view.get("headRefOid") or "")
             no_signal_mergeable = (
@@ -9129,7 +9119,7 @@ class Orchestrator:
             # completed local-review loop; no-review bindings (false/false)
             # gate on CI alone.
             review_bypass_ready = False
-            if candidate.review_bypassed and binding.resolved_remote_review():
+            if review_waived:
                 # Per-PR `$skip-review` on a remote-review binding: the operator
                 # deliberately waived the Codex verdict. This is the
                 # restart-recovery path for a bypass persisted before

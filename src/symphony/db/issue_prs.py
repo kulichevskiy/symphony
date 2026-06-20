@@ -474,6 +474,25 @@ async def has_orphaned_review_pr(conn: aiosqlite.Connection, *, issue_id: str) -
     return row is not None
 
 
+async def has_open_bypassed_pr(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
+    """True when the issue has an unmerged PR whose review was `$skip-review`d.
+
+    Reconcile uses this to avoid creating a `review_failed` operator wait for a
+    pidless review run when the operator already waived review — that wait would
+    otherwise keep the bypassed PR out of `_poll_merge_candidates`."""
+    cur = await conn.execute(
+        """
+        SELECT 1 FROM issue_prs
+        WHERE issue_id = ?
+          AND merged_at IS NULL
+          AND review_bypassed = 1
+        LIMIT 1
+        """,
+        (issue_id,),
+    )
+    return await cur.fetchone() is not None
+
+
 async def mark_merged(
     conn: aiosqlite.Connection,
     *,
