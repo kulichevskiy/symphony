@@ -3610,6 +3610,7 @@ class Orchestrator:
                     issue=issue,
                     pr_number=state.pr_number,
                     pr_url=state.pr_url,
+                    storage_issue_id=issue_id,
                 )
             body = acceptance_skipped(
                 CommentVars(
@@ -3845,6 +3846,7 @@ class Orchestrator:
                     pr_url=pr.pr_url,
                     approved_head_sha=approved_head_sha,
                     on_started=clear_reconciled_merge_wait,
+                    storage_issue_id=wait.issue_id,
                 )
             log.info(
                 "reconciled merge wait for %s via %s (reason=%s)",
@@ -4353,12 +4355,17 @@ class Orchestrator:
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
 
-    async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None:
+    async def _complete_review_monitors_for_merge(
+        self, issue: LinearIssue, *, storage_issue_id: str | None = None
+    ) -> None:
         """Retire review polling once a merge run owns the issue."""
+        # Runs and the monitor registry are storage-keyed; `issue.id` is the
+        # tracker id (differs for contextual / provider-collision rows).
+        storage_issue_id = storage_issue_id or issue.id
         live_review_runs = [
             run
             for run in await db.runs.list_live_by_stage(self._conn, stage="review")
-            if run.issue_id == issue.id
+            if run.issue_id == storage_issue_id
         ]
         if not live_review_runs:
             return
@@ -4383,7 +4390,7 @@ class Orchestrator:
             await self._clear_review_rearm_retry(run.id)
 
         for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
-            if mapped_issue_id == issue.id or mapped_run_id in closed_run_ids:
+            if mapped_issue_id == storage_issue_id or mapped_run_id in closed_run_ids:
                 self._review_poll_issue_ids.pop(mapped_issue_id, None)
 
         log.info(
@@ -7396,6 +7403,7 @@ class Orchestrator:
             pr_number=pr_number,
             pr_url=pr_url,
             on_started=on_merge_started,
+            storage_issue_id=issue_id,
         )
 
     async def _handle_acceptance_rejected_slash_intent(
@@ -7469,6 +7477,7 @@ class Orchestrator:
                     issue=issue,
                     pr_number=pr_number,
                     pr_url=pr_url,
+                    storage_issue_id=issue_id,
                 )
             body = skip_acceptance_forced(
                 CommentVars(
@@ -7625,6 +7634,7 @@ class Orchestrator:
             pr_number=state.pr_number,
             pr_url=state.pr_url,
             skip_review=True,
+            storage_issue_id=issue_id,
         )
         log.info(
             "skip-review: advancing %s (PR #%d) directly to merge",
@@ -9271,6 +9281,7 @@ class Orchestrator:
                         approved_head_sha=head_sha,
                         skip_review=verdict.kind is not VerdictKind.APPROVED,
                         on_started=on_started,
+                        storage_issue_id=candidate.issue_id,
                     )
                 )
             elif verdict.merge_conflict:
@@ -10136,9 +10147,16 @@ class Orchestrator:
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
+        # `issue.id` is the tracker id; for contextual / provider-collision rows
+        # the storage id differs. All persistence (runs, issue_prs, operator
+        # waits, in-memory dispatch/slot tracking) must be keyed by the storage
+        # id so a merged PR's storage-keyed row is marked merged and dropped
+        # from merge candidacy. Tracker calls still use `issue.id`.
+        storage_issue_id = storage_issue_id or issue.id
         binding_key = _binding_key(binding)
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        self._reserve_scheduled_slot(issue_id=storage_issue_id, binding_key=binding_key)
         task = asyncio.create_task(
             self._merge_with_limits(
                 binding=binding,
@@ -10148,13 +10166,14 @@ class Orchestrator:
                 approved_head_sha=approved_head_sha,
                 skip_review=skip_review,
                 on_started=on_started,
+                storage_issue_id=storage_issue_id,
             )
         )
         self._dispatch_tasks.add(task)
         task.add_done_callback(
             partial(
                 self._dispatch_task_done,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 binding_key=binding_key,
             )
         )
@@ -10170,7 +10189,9 @@ class Orchestrator:
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> None:
+        storage_issue_id = storage_issue_id or issue.id
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
             key,
@@ -10190,9 +10211,10 @@ class Orchestrator:
                         approved_head_sha=approved_head_sha,
                         skip_review=skip_review,
                         on_started=on_started,
+                        storage_issue_id=storage_issue_id,
                     )
         except asyncio.CancelledError:
-            run_id = self._dispatch_run_ids.get(issue.id)
+            run_id = self._dispatch_run_ids.get(storage_issue_id)
             if run_id is not None:
                 await self._fail_run(run_id, "merge cancelled")
             raise
@@ -11484,13 +11506,17 @@ class Orchestrator:
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> str | None:
+        # `issue.id` is the tracker id; persistence must use the storage id
+        # (they differ for contextual / provider-collision rows).
+        storage_issue_id = storage_issue_id or issue.id
         run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()
         inserted = await db.runs.create_if_no_active(
             self._conn,
             id=run_id,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             stage="merge",
             status="running",
             pid=None,
@@ -11501,8 +11527,10 @@ class Orchestrator:
         if not inserted:
             return None
 
-        await self._complete_review_monitors_for_merge(issue)
-        self._dispatch_run_ids[issue.id] = run_id
+        await self._complete_review_monitors_for_merge(
+            issue, storage_issue_id=storage_issue_id
+        )
+        self._dispatch_run_ids[storage_issue_id] = run_id
         if on_started is not None:
             try:
                 await on_started(run_id)
@@ -11525,6 +11553,7 @@ class Orchestrator:
                     run_id=run_id,
                     reason=f"workspace acquire failed: {e}",
                     exc=e,
+                    storage_issue_id=storage_issue_id,
                 )
                 return run_id
 
@@ -11543,7 +11572,9 @@ class Orchestrator:
                 )
 
             try:
-                prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+                prior_total = await db.runs.cost_for_issue(
+                    self._conn, storage_issue_id
+                )
                 (
                     cumulative_usage,
                     final_kind,
@@ -11565,6 +11596,7 @@ class Orchestrator:
                     run_id=run_id,
                     reason=f"merge agent execution failed: {e}",
                     exc=e,
+                    storage_issue_id=storage_issue_id,
                 )
                 return run_id
 
@@ -11584,6 +11616,7 @@ class Orchestrator:
                     reason=f"merge runner ended with {final_kind}",
                     final_kind=final_kind,
                     returncode=final_returncode,
+                    storage_issue_id=storage_issue_id,
                 )
                 return run_id
 
@@ -11598,6 +11631,7 @@ class Orchestrator:
                     run_id=run_id,
                     reason=str(e),
                     exc=e,
+                    storage_issue_id=storage_issue_id,
                 )
                 return run_id
 
@@ -11621,6 +11655,7 @@ class Orchestrator:
                         run_id=run_id,
                         reason=f"post-push HEAD verification failed: {e}",
                         exc=e,
+                        storage_issue_id=storage_issue_id,
                     )
                     return run_id
             else:
@@ -11653,8 +11688,11 @@ class Orchestrator:
                             pr_url=pr_url,
                             run_id=run_id,
                             reason=reason,
+                            storage_issue_id=storage_issue_id,
                         )
-                        state = await db.review_state.get(self._conn, issue.id)
+                        state = await db.review_state.get(
+                            self._conn, storage_issue_id
+                        )
                         await self._retrigger_codex_review_unless_approved(
                             binding=binding,
                             issue=issue,
@@ -11751,7 +11789,9 @@ class Orchestrator:
                         )
                         if (
                             dispatched
-                            or await db.operator_waits.get(self._conn, issue.id)
+                            or await db.operator_waits.get(
+                                self._conn, storage_issue_id
+                            )
                             is not None
                         ):
                             return run_id
@@ -11762,6 +11802,7 @@ class Orchestrator:
                     run_id=run_id,
                     reason=str(e),
                     exc=e,
+                    storage_issue_id=storage_issue_id,
                 )
                 return run_id
 
@@ -11772,6 +11813,7 @@ class Orchestrator:
                     pr_number=pr_number,
                     pr_url=pr_url,
                     run_id=run_id,
+                    storage_issue_id=storage_issue_id,
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning(
@@ -11787,6 +11829,7 @@ class Orchestrator:
                     run_id=run_id,
                     reason=f"merge finalization failed: {e}",
                     exc=e,
+                    storage_issue_id=storage_issue_id,
                 )
                 return run_id
             if not merged:
@@ -11800,7 +11843,7 @@ class Orchestrator:
         finally:
             if workspace_path is not None:
                 self._workspace.release(binding, issue)
-            self._dispatch_run_ids.pop(issue.id, None)
+            self._dispatch_run_ids.pop(storage_issue_id, None)
 
     async def _mark_merge_done_if_merged(
         self,
@@ -11810,6 +11853,7 @@ class Orchestrator:
         pr_number: int,
         pr_url: str,
         run_id: str,
+        storage_issue_id: str | None = None,
     ) -> bool:
         view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
         if not _pr_view_is_merged(view):
@@ -11819,6 +11863,7 @@ class Orchestrator:
             issue=issue,
             pr_url=pr_url,
             run_id=run_id,
+            storage_issue_id=storage_issue_id,
         )
         return True
 
@@ -11829,7 +11874,11 @@ class Orchestrator:
         issue: LinearIssue,
         pr_url: str,
         run_id: str,
+        storage_issue_id: str | None = None,
     ) -> None:
+        # `issue.id` (tracker) drives tracker calls; the storage id keys
+        # persistence (they differ for contextual / provider-collision rows).
+        storage_issue_id = storage_issue_id or issue.id
         states = await self._states_for_binding(binding)
         done_id = states.get(binding.linear_states.done)
         if done_id is None:
@@ -11839,10 +11888,11 @@ class Orchestrator:
                 pr_url=pr_url,
                 run_id=run_id,
                 reason=f"missing Linear state: {binding.linear_states.done}",
+                storage_issue_id=storage_issue_id,
             )
             return
 
-        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         tracker = self.tracker(binding)
         await tracker.move_issue(issue.id, done_id)
         final_body = stage_done(
@@ -11870,12 +11920,12 @@ class Orchestrator:
         ended_at = datetime.now(UTC).isoformat()
         await db.issue_prs.mark_merged(
             self._conn,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             github_repo=binding.github_repo,
             merged_at=ended_at,
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
-        await self._clear_operator_wait(issue.id, run_id)
+        await self._clear_operator_wait(storage_issue_id, run_id)
         try:
             archived = await self._workspace.cleanup(issue)
         except Exception as e:  # noqa: BLE001
@@ -11911,12 +11961,17 @@ class Orchestrator:
         final_kind: str | None = None,
         returncode: int | None = None,
         exc: BaseException | str | None = None,
+        storage_issue_id: str | None = None,
     ) -> None:
+        # `issue.id` (tracker) drives tracker calls; the storage id keys
+        # persistence (the merge operator wait must be storage-keyed so
+        # `_poll_merge_candidates` sees it and does not re-schedule the merge).
+        storage_issue_id = storage_issue_id or issue.id
         if create_run:
             inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=run_id,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 stage="merge",
                 status="running",
                 pid=None,
@@ -11939,7 +11994,7 @@ class Orchestrator:
                     e,
                 )
 
-            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
             body = awaiting_approval(
                 CommentVars(
                     stage="merge",
@@ -11990,13 +12045,13 @@ class Orchestrator:
             )
             # Register so $approve/$reject can be received after restart.
             # Done inside finally so it runs even when a non-LinearError above escapes.
-            self._dispatch_run_ids[issue.id] = run_id
+            self._dispatch_run_ids[storage_issue_id] = run_id
             self._operator_wait_run_ids.add(run_id)
             self._merge_needs_approval_bindings[run_id] = binding
             try:
                 await db.operator_waits.upsert(
                     self._conn,
-                    issue_id=issue.id,
+                    issue_id=storage_issue_id,
                     run_id=run_id,
                     kind=db.operator_waits.KIND_MERGE,
                     linear_team_key=binding.linear_team_key,

@@ -5503,6 +5503,85 @@ async def test_skip_review_bypass_on_remote_binding_merges_when_mergeable(
 
 
 @pytest.mark.asyncio
+async def test_merge_done_marks_storage_keyed_pr_for_contextual_issue(
+    tmp_path: Path,
+) -> None:
+    """For a provider-collision issue (storage id != tracker id), finalizing a
+    merge must mark the STORAGE-keyed issue_prs row merged and use the tracker id
+    for the Linear move — otherwise the PR stays open and re-eligible to merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="DUP-1", identifier="L-1", title="t", team_key="ENG"
+        )
+        storage_id = await db.issues.upsert(
+            conn,
+            id="DUP-1",
+            identifier="J-1",
+            title="t",
+            team_key="ENG",
+            provider="jira",
+            site="acme",
+        )
+        assert storage_id != "DUP-1"
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=storage_id,
+            github_repo="org/repo",
+            pr_number=99,
+            pr_url="https://github.com/org/repo/pull/99",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="merge-1",
+            issue_id=storage_id,
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        binding = _binding()
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.APPROVED, rule="codex_approved"),
+        )
+        orch._workspace = MagicMock()  # noqa: SLF001
+        orch._workspace.cleanup = AsyncMock(return_value=[])  # noqa: SLF001
+        tracker_issue = LinearIssue(
+            id="DUP-1",
+            identifier="J-1",
+            title="t",
+            description="",
+            url="u",
+            state_id="s",
+            state_name="In Progress",
+            state_type="started",
+            team_key="ENG",
+            labels=[],
+        )
+
+        await orch._mark_merge_done(  # noqa: SLF001
+            binding=binding,
+            issue=tracker_issue,
+            pr_url="https://github.com/org/repo/pull/99",
+            run_id="merge-1",
+            storage_issue_id=storage_id,
+        )
+
+        # The storage-keyed PR row is marked merged (not the tracker-id row).
+        pr = await db.issue_prs.get(conn, issue_id=storage_id, github_repo="org/repo")
+        assert pr is not None and pr.merged_at is not None
+        # The merge run (storage-keyed) is done; no candidacy remains.
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+        # The Linear move used the tracker id.
+        orch.tracker(binding).move_issue.assert_awaited_once_with("DUP-1", "state-done")  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_review_bypass_merges_without_classifying_verdict(
     tmp_path: Path,
 ) -> None:
