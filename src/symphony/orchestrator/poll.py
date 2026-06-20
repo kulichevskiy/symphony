@@ -3603,6 +3603,7 @@ class Orchestrator:
                     binding=binding,
                     issue=issue,
                     pr_url=state.pr_url,
+                    storage_issue_id=issue_id,
                 )
             else:
                 self._schedule_merge(
@@ -3809,7 +3810,9 @@ class Orchestrator:
                 ignored_stage="review",
             ):
                 return False
-            await self._complete_review_monitors_for_merge(issue)
+            await self._complete_review_monitors_for_merge(
+                issue, storage_issue_id=wait.issue_id
+            )
             if await db.runs.has_running_or_completed(self._conn, wait.issue_id):
                 return False
 
@@ -7470,6 +7473,7 @@ class Orchestrator:
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
+                    storage_issue_id=issue_id,
                 )
             else:
                 self._schedule_merge(
@@ -8853,8 +8857,12 @@ class Orchestrator:
         binding: RepoBinding,
         issue: LinearIssue,
         pr_url: str,
+        storage_issue_id: str | None = None,
     ) -> None:
-        await self._complete_review_monitors_for_merge(issue)
+        storage_issue_id = storage_issue_id or issue.id
+        await self._complete_review_monitors_for_merge(
+            issue, storage_issue_id=storage_issue_id
+        )
         await self._mark_merge_needs_approval(
             binding=binding,
             issue=issue,
@@ -8862,6 +8870,7 @@ class Orchestrator:
             run_id=str(uuid.uuid4()),
             reason=f"{NEEDS_HUMAN_APPROVAL_LABEL} label present",
             create_run=True,
+            storage_issue_id=storage_issue_id,
         )
 
     async def _park_pr_for_manual_merge(
@@ -8871,7 +8880,9 @@ class Orchestrator:
         issue: LinearIssue,
         pr_number: int,
         pr_url: str,
+        storage_issue_id: str | None = None,
     ) -> None:
+        storage_issue_id = storage_issue_id or issue.id
         try:
             states = await self._states_for_binding(binding)
         except LinearError as e:
@@ -8903,11 +8914,13 @@ class Orchestrator:
             )
             return
 
-        await self._complete_review_monitors_for_merge(issue)
+        await self._complete_review_monitors_for_merge(
+            issue, storage_issue_id=storage_issue_id
+        )
 
         parked = await db.issue_prs.mark_parked_for_manual_merge(
             self._conn,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             github_repo=binding.github_repo,
             pr_number=pr_number,
             parked_at=self._now().isoformat(),
@@ -9179,6 +9192,7 @@ class Orchestrator:
                                 "approval"
                             ),
                             create_run=True,
+                            storage_issue_id=candidate.issue_id,
                         )
                         continue
                 elif check_state == "pending":
@@ -9205,6 +9219,7 @@ class Orchestrator:
                                 "merge needs operator approval"
                             ),
                             create_run=True,
+                            storage_issue_id=candidate.issue_id,
                         )
                     continue
 
@@ -9241,6 +9256,7 @@ class Orchestrator:
                         issue=issue,
                         pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
+                        storage_issue_id=candidate.issue_id,
                     )
                     continue
                 if self._dispatch_capacity(binding) <= 0:
@@ -9250,6 +9266,7 @@ class Orchestrator:
                         binding=binding,
                         issue=issue,
                         pr_url=candidate.pr_url,
+                        storage_issue_id=candidate.issue_id,
                     )
                     continue
                 on_started: Callable[[str], Awaitable[None]] | None = None

@@ -5502,6 +5502,102 @@ async def test_skip_review_bypass_on_remote_binding_merges_when_mergeable(
         await conn.close()
 
 
+async def _seed_collision_issue_with_pr(conn, *, pr_number: int) -> str:  # type: ignore[no-untyped-def]
+    await db.issues.upsert(conn, id="DUP-1", identifier="L-1", title="t", team_key="ENG")
+    storage_id = await db.issues.upsert(
+        conn,
+        id="DUP-1",
+        identifier="J-1",
+        title="t",
+        team_key="ENG",
+        provider="jira",
+        site="acme",
+    )
+    assert storage_id != "DUP-1"
+    await db.issue_prs.upsert(
+        conn,
+        issue_id=storage_id,
+        github_repo="org/repo",
+        pr_number=pr_number,
+        pr_url=f"https://github.com/org/repo/pull/{pr_number}",
+        created_at="2026-05-10T00:00:00+00:00",
+    )
+    return storage_id
+
+
+def _tracker_collision_issue() -> LinearIssue:
+    return LinearIssue(
+        id="DUP-1",
+        identifier="J-1",
+        title="t",
+        description="",
+        url="u",
+        state_id="s",
+        state_name="In Progress",
+        state_type="started",
+        team_key="ENG",
+        labels=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_human_approval_wait_keyed_by_storage_id_for_contextual_issue(
+    tmp_path: Path,
+) -> None:
+    """The needs-human-approval merge wait must be created under the storage id
+    so storage-keyed merge polling / operator commands can see it."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        storage_id = await _seed_collision_issue_with_pr(conn, pr_number=99)
+        binding = _binding()
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.APPROVED, rule="codex_approved"),
+        )
+        await orch._open_merge_wait_for_human_approval_label(  # noqa: SLF001
+            binding=binding,
+            issue=_tracker_collision_issue(),
+            pr_url="https://github.com/org/repo/pull/99",
+            storage_issue_id=storage_id,
+        )
+        wait = await db.operator_waits.get(conn, storage_id)
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        # The merge run was created under the storage id.
+        runs = await db.runs.history_for_issue(conn, storage_id)
+        assert any(r.stage == "merge" and r.status == "needs_approval" for r in runs)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_merge_park_keyed_by_storage_id_for_contextual_issue(
+    tmp_path: Path,
+) -> None:
+    """auto_merge:false parking must mark the storage-keyed PR row parked."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        storage_id = await _seed_collision_issue_with_pr(conn, pr_number=99)
+        binding = _binding(auto_merge=False)
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.APPROVED, rule="codex_approved"),
+        )
+        await orch._park_pr_for_manual_merge(  # noqa: SLF001
+            binding=binding,
+            issue=_tracker_collision_issue(),
+            pr_number=99,
+            pr_url="https://github.com/org/repo/pull/99",
+            storage_issue_id=storage_id,
+        )
+        pr = await db.issue_prs.get(conn, issue_id=storage_id, github_repo="org/repo")
+        assert pr is not None and pr.parked_at is not None
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_merge_done_marks_storage_keyed_pr_for_contextual_issue(
     tmp_path: Path,
