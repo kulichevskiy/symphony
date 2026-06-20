@@ -34,10 +34,15 @@ from ._workspace_helpers import advance_head
 
 class _FakeRunner:
     def __init__(
-        self, events: list[RunnerEvent], *, commit_on_implement: bool = False
+        self,
+        events: list[RunnerEvent],
+        *,
+        commit_on_implement: bool = False,
+        dirty_on_implement: bool = False,
     ) -> None:
         self.events = events
         self.commit_on_implement = commit_on_implement
+        self.dirty_on_implement = dirty_on_implement
         self.captured_spec: RunnerSpec | None = None
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
@@ -46,6 +51,10 @@ class _FakeRunner:
         # HEAD advance over the branch base.
         if self.commit_on_implement and spec.stage == "implement":
             advance_head(spec.workspace_path)
+        # Simulate the agent editing files while investigating but NOT
+        # committing — leaves an uncommitted (dirty) tree, no HEAD advance.
+        if self.dirty_on_implement and spec.stage == "implement":
+            (spec.workspace_path / "scratch.txt").write_text("investigated\n")
         return self._aiter()
 
     async def _aiter(self) -> AsyncIterator[RunnerEvent]:
@@ -638,13 +647,19 @@ def _head_sha(workspace_path: Path) -> str:
 
 
 async def _run_already_satisfied_dispatch(
-    tmp_path: Path, conn: object, ref: str, *, fail_done_move: bool = False
+    tmp_path: Path,
+    conn: object,
+    ref: str,
+    *,
+    fail_done_move: bool = False,
+    dirty: bool = False,
 ) -> tuple[object, object, object]:
     """Dispatch an implement run whose agent emits SYMPHONY_ALREADY_DONE (no
     commit) in a real git workspace. ``{head}`` in *ref* is substituted with
     the workspace HEAD sha (a real ancestor). When *fail_done_move* is set, the
     Linear move to the Done lane raises (the move to any other lane still
-    succeeds). Returns (gh, push_fn, linear)."""
+    succeeds). When *dirty* is set, the agent leaves an uncommitted file in the
+    workspace. Returns (gh, push_fn, linear)."""
     cfg = Config(
         repos=[_binding()],
         log_root=tmp_path / "logs",
@@ -679,6 +694,7 @@ async def _run_already_satisfied_dispatch(
 
     # No commit: the scope already landed, so HEAD does not advance.
     runner = _blocked_runner(f"All criteria already met.\n\nSYMPHONY_ALREADY_DONE: {ref}")
+    runner.dirty_on_implement = dirty
 
     orch = Orchestrator(
         cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
@@ -762,6 +778,35 @@ async def test_already_satisfied_done_move_failure_parks_instead_of_stranding(
         # The Done transition was attempted but raised, so the run must not be
         # marked completed — it parks on an operator wait with a `$retry` path.
         assert call("iss-1", "state-done") in linear.move_issue.await_args_list
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status != "completed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_already_satisfied_dirty_tree_does_not_close(tmp_path: Path) -> None:
+    """Guard preserved: an already-done claim whose ref IS a verifiable ancestor
+    but whose workspace has uncommitted edits must NOT auto-close. A dirty tree
+    means the agent did work it failed to commit — the no-op claim is false, so
+    it falls back to the failed no-op path instead of closing as Done."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        gh, push_fn, linear = await _run_already_satisfied_dispatch(
+            tmp_path, conn, "{head} (org/repo#291)", dirty=True
+        )
+
+        gh.ensure_pr.assert_not_awaited()
+        push_fn.assert_not_awaited()
+
+        # Never closed as Done despite the verifiable ref.
+        assert call("iss-1", "state-done") not in linear.move_issue.await_args_list
+
+        # Parked as a failed implement run on an operator wait.
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert len(history) == 1
         assert history[0].status != "completed"

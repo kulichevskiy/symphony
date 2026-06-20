@@ -1472,6 +1472,27 @@ async def _workspace_ref_is_ancestor(
         return False
 
 
+async def _workspace_ref_landed_in_base(
+    workspace_path: Path, ref: str, base_branch: str | None
+) -> bool:
+    """True iff *ref* is reachable from the delivery base branch tip.
+
+    A genuinely already-delivered commit lives in the base branch's history, so
+    "already done elsewhere" is verified against the base, not against HEAD.
+    Checking HEAD alone is unsafe: on a retry after an earlier failed implement,
+    unpushed commits left on the issue branch are ancestors of HEAD too, so a
+    bogus already-done ref naming one of them would falsely pass. Tries
+    ``origin/<base>`` first (present after a fresh clone), then the local
+    ``<base>`` ref. False if base is unset or neither ref resolves.
+    """
+    if not base_branch:
+        return False
+    for descendant in (f"origin/{base_branch}", base_branch):
+        if await _workspace_ref_is_ancestor(workspace_path, ref, descendant):
+            return True
+    return False
+
+
 async def _workspace_commits_ahead(
     workspace_path: Path, base_branch: str
 ) -> int | None:
@@ -10812,6 +10833,7 @@ class Orchestrator:
                 storage_issue_id=issue_id,
                 run_id=run_id,
                 workspace_path=workspace_path,
+                base_branch=base_branch,
             )
             if phase is None:
                 # The agent step halted (failed / blocked / parked); the run
@@ -10876,6 +10898,7 @@ class Orchestrator:
         storage_issue_id: str,
         run_id: str,
         workspace_path: Path,
+        base_branch: str | None = None,
     ) -> tuple[UsageDelta, LoopResult | None] | None:
         """The agent step: run the implementer, apply the completion gate, then
         the local-review / verify / dirty-tree pre-push gates.
@@ -10983,8 +11006,9 @@ class Orchestrator:
             # The agent verified the scope was already delivered elsewhere and
             # made no commit (HEAD did not advance). This is a no-op done, not a
             # failure: close the issue as Done referencing the delivering commit
-            # — but only after verifying that commit is real and an ancestor of
-            # HEAD, so a bogus already-done claim cannot auto-close an issue. An
+            # — but only after verifying the tree is clean and that commit is
+            # real and landed in the base branch, so neither uncommitted work
+            # nor a bogus already-done claim can auto-close an issue. An
             # unverifiable claim falls back to the failed path below.
             closed = await self._complete_already_satisfied_run(
                 run_id,
@@ -10994,6 +11018,7 @@ class Orchestrator:
                 rollback_state_id=issue.state_id,
                 binding=binding,
                 workspace_path=workspace_path,
+                base_branch=base_branch,
                 returncode=final_returncode,
             )
             if closed:
@@ -11004,8 +11029,9 @@ class Orchestrator:
             if completion.outcome == "already_satisfied":
                 reason = (
                     "implement run claimed SYMPHONY_ALREADY_DONE but could not "
-                    "be auto-closed: the delivering commit was not verifiable as "
-                    "an ancestor of HEAD, or the move to Done failed "
+                    "be auto-closed: the working tree was dirty, the delivering "
+                    "commit was not verifiable as landed in the base branch, or "
+                    "the move to Done failed "
                     f"(ref: {completion.already_satisfied_ref or '(none)'})"
                 )
             else:
@@ -13853,36 +13879,54 @@ class Orchestrator:
         rollback_state_id: str,
         binding: RepoBinding,
         workspace_path: Path,
+        base_branch: str | None,
         returncode: int | None = None,
     ) -> bool:
         """Close a no-op Implement run whose scope was already delivered.
 
         The agent emitted ``SYMPHONY_ALREADY_DONE: <ref>`` and made no commit.
-        Before auto-closing, verify the named commit is real and an ancestor of
-        HEAD — a bogus claim must not close an undelivered issue. The issue is
-        moved to the terminal Done lane *before* the run is marked completed: a
-        no-op run has nothing to push, so completing it while the issue is still
-        in In Progress would strand the issue with no PR, no `$retry` path, and
-        no reconciler. So if Done is unmapped/unloadable or the move raises, this
-        returns False *without* marking the run completed, leaving the caller to
-        park it on the failed/operator-wait path. On success the run is marked
-        completed, an auto-comment references the delivering commit, and push /
-        local review / PR are skipped entirely. Returns True when the issue
-        actually reached Done; False when the ref is unverifiable or the close
-        could not be completed (a plain done-without-commits still parks on an
-        operator).
+        Two things are verified before auto-closing, and either failing parks
+        the run on the failed path instead: (1) the working tree is clean — a
+        dirty tree means the agent edited files but did not commit, which
+        contradicts "nothing to commit because it was pre-delivered" and is the
+        genuine no-op failure the guard must catch; (2) the named commit is real
+        and reachable from the delivery *base* branch — not merely an ancestor
+        of HEAD, since unpushed commits left on the issue branch by an earlier
+        failed implement are ancestors of HEAD too and must not pass as a
+        landed-elsewhere delivery. The issue is moved to the terminal Done lane
+        *before* the run is marked completed: a no-op run has nothing to push,
+        so completing it while the issue is still in In Progress would strand
+        the issue with no PR, no `$retry` path, and no reconciler. So if Done is
+        unmapped/unloadable or the move raises, this returns False *without*
+        marking the run completed, leaving the caller to park it on the
+        failed/operator-wait path. On success the run is marked completed, an
+        auto-comment references the delivering commit, and push / local review /
+        PR are skipped entirely. Returns True when the issue actually reached
+        Done; False when the claim is unverifiable or the close could not be
+        completed (a plain done-without-commits still parks on an operator).
         """
         storage_issue_id = storage_issue_id or issue.id
+        dirty = await _workspace_dirty_files(workspace_path)
+        if dirty:
+            log.warning(
+                "implement run %s claimed already-done but left %d uncommitted "
+                "change(s) in the workspace; a dirty tree contradicts the no-op "
+                "claim, treating as failed",
+                run_id,
+                len(dirty),
+            )
+            return False
         candidate = _extract_delivering_commit(delivered_ref)
-        if candidate is None or not await _workspace_ref_is_ancestor(
-            workspace_path, candidate
+        if candidate is None or not await _workspace_ref_landed_in_base(
+            workspace_path, candidate, base_branch
         ):
             log.warning(
                 "implement run %s claimed already-done (ref=%r) but no "
-                "delivering commit could be verified as an ancestor of HEAD; "
-                "treating as failed",
+                "delivering commit could be verified as landed in the base "
+                "branch (%s); treating as failed",
                 run_id,
                 delivered_ref,
+                base_branch,
             )
             return False
 

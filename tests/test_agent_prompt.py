@@ -74,6 +74,9 @@ def test_implement_prompt_mandates_completion_marker_contract() -> None:
     assert "SYMPHONY_BLOCKED:" in prompt
     # The blocked marker must demand the exact human action.
     assert "final message" in prompt.lower()
+    # The already-done no-op outcome is wired into the Implement completion gate
+    # only, so the implement prompt advertises it.
+    assert "SYMPHONY_ALREADY_DONE" in prompt
 
 
 def test_implement_prompt_is_deterministic() -> None:
@@ -95,6 +98,9 @@ def test_review_comment_fix_prompt_mandates_completion_marker_contract() -> None
     assert "SYMPHONY_DONE" in prompt
     assert "SYMPHONY_BLOCKED:" in prompt
     assert "final message" in prompt.lower()
+    # Fix runs do NOT implement the already-done no-op outcome, so the marker
+    # must not be advertised here (a fix-run completion path would mishandle it).
+    assert "SYMPHONY_ALREADY_DONE" not in prompt
 
 
 def test_acceptance_fix_prompt_frames_product_mismatch_not_code_review() -> None:
