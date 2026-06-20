@@ -14,7 +14,10 @@ from pathlib import Path
 
 import pytest
 
-from symphony.orchestrator.poll import _workspace_ref_landed_in_base
+from symphony.orchestrator.poll import (
+    _branch_ahead_of_base,
+    _workspace_ref_landed_in_base,
+)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -77,3 +80,24 @@ async def test_unknown_commit_is_rejected(repo: tuple[Path, str, str]) -> None:
 async def test_unset_base_branch_is_rejected(repo: tuple[Path, str, str]) -> None:
     ws, base_sha, _ = repo
     assert not await _workspace_ref_landed_in_base(ws, base_sha, None)
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_of_base_blocks_already_done_close(
+    repo: tuple[Path, str, str],
+) -> None:
+    # The issue branch carries a committed-but-unpushed commit ahead of trunk
+    # (e.g. left by an earlier failed implement). Even if the named delivering
+    # commit legitimately landed in trunk, the already-satisfied close must be
+    # refused so this work reaches the deliver path instead of being discarded.
+    ws, _, _ = repo
+    assert await _branch_ahead_of_base(ws, "trunk")
+
+
+@pytest.mark.asyncio
+async def test_branch_at_base_tip_is_not_ahead(repo: tuple[Path, str, str]) -> None:
+    # A genuine no-op already-satisfied run made no commit, so HEAD sits at the
+    # base tip — the guard must let that close through.
+    ws, _, _ = repo
+    _git(ws, "checkout", "-q", "-B", "symphony/eng-2", "trunk")
+    assert not await _branch_ahead_of_base(ws, "trunk")

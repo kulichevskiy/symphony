@@ -13885,7 +13885,7 @@ class Orchestrator:
         """Close a no-op Implement run whose scope was already delivered.
 
         The agent emitted ``SYMPHONY_ALREADY_DONE: <ref>`` and made no commit.
-        Two things are verified before auto-closing, and either failing parks
+        Three things are verified before auto-closing, and any failing parks
         the run on the failed path instead: (1) the working tree is clean — a
         dirty tree means the agent edited files but did not commit, which
         contradicts "nothing to commit because it was pre-delivered" and is the
@@ -13893,7 +13893,13 @@ class Orchestrator:
         and reachable from the delivery *base* branch — not merely an ancestor
         of HEAD, since unpushed commits left on the issue branch by an earlier
         failed implement are ancestors of HEAD too and must not pass as a
-        landed-elsewhere delivery. The issue is moved to the terminal Done lane
+        landed-elsewhere delivery; (3) HEAD is not ahead of the base branch — a
+        retry can start from a workspace whose branch already carries committed
+        work from an earlier failed implement, and even when the named delivering
+        commit legitimately lives in base, those extra commits are real unpushed
+        work that closing as already-satisfied would silently discard (no push,
+        no PR, no `$retry`), so an ahead branch is sent down the deliver path
+        instead. The issue is moved to the terminal Done lane
         *before* the run is marked completed: a no-op run has nothing to push,
         so completing it while the issue is still in In Progress would strand
         the issue with no PR, no `$retry` path, and no reconciler. So if Done is
@@ -13926,6 +13932,17 @@ class Orchestrator:
                 "branch (%s); treating as failed",
                 run_id,
                 delivered_ref,
+                base_branch,
+            )
+            return False
+        if await _branch_ahead_of_base(workspace_path, base_branch):
+            log.warning(
+                "implement run %s claimed already-done but HEAD is ahead of the "
+                "base branch (%s): the workspace carries committed, unpushed "
+                "work — likely from an earlier failed implement — that closing "
+                "as already-satisfied would silently discard (no push, no PR). "
+                "Treating as failed so the work reaches the normal deliver path",
+                run_id,
                 base_branch,
             )
             return False
