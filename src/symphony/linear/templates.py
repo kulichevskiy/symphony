@@ -238,6 +238,28 @@ def implement_blocked(v: CommentVars) -> str:
     )
 
 
+def implement_already_satisfied(v: CommentVars, *, delivered_ref: str) -> str:
+    """No-op-done close for an Implement run whose scope already landed.
+
+    The agent verified every acceptance criterion was already satisfied in the
+    current tree (nothing to commit) and named the delivering commit/PR via
+    `SYMPHONY_ALREADY_DONE`. The orchestrator verified that commit is an
+    ancestor of HEAD before moving the issue to Done — `delivered_ref` is
+    reproduced verbatim so the close is auditable.
+    """
+    return (
+        f"✅ **Already delivered — closing as done**\n\n"
+        f"Symphony found every acceptance criterion for `{v.repo}#{v.issue}` "
+        f"already satisfied in the current tree, so **implement** made no "
+        f"commit.\n\n"
+        f"- Delivered by: `{delivered_ref}`\n"
+        f"- Run ID: `{v.run_id}`\n"
+        f"- {token_block(v)}\n\n"
+        "No PR was opened (nothing to push). Moved to Done. Reopen and reply "
+        "`$retry` if this close was wrong.\n"
+    )
+
+
 def resumed(v: CommentVars) -> str:
     return f"✅ Resumed — advancing `{v.repo}#{v.issue}` to **{v.next_stage}**\n"
 

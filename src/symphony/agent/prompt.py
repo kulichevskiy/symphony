@@ -36,6 +36,14 @@ COMPLETION_CONTRACT = (
     "without a human action (e.g. authorizing an OAuth URL, providing a "
     "secret). State the precise action; do not end with `SYMPHONY_DONE` when "
     "you are actually waiting on a human.\n"
+    "- `SYMPHONY_ALREADY_DONE: <commit-sha> (<PR/issue ref>)` — every "
+    "acceptance criterion is ALREADY satisfied in the current tree by work "
+    "that landed elsewhere, so there is nothing to commit. Use this ONLY when "
+    "you made no commit because the scope was pre-delivered. The "
+    "`<commit-sha>` MUST be a real commit already in this branch's history "
+    "(an ancestor of HEAD) that delivered the work — it is verified before "
+    "the issue is auto-closed. Do not use this when you simply chose not to "
+    "make changes.\n"
 )
 
 

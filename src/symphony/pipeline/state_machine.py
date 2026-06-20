@@ -37,14 +37,18 @@ class Transition:
 
 SYMPHONY_DONE_MARKER = "SYMPHONY_DONE"
 SYMPHONY_BLOCKED_PREFIX = "SYMPHONY_BLOCKED:"
+SYMPHONY_ALREADY_DONE_PREFIX = "SYMPHONY_ALREADY_DONE:"
 
-ImplementOutcome = Literal["completed", "blocked", "failed"]
+ImplementOutcome = Literal["completed", "blocked", "failed", "already_satisfied"]
 ClassifierVerdict = Literal["done", "blocked", "ambiguous"]
-MarkerKind = Literal["done", "blocked"]
+MarkerKind = Literal["done", "blocked", "already_done"]
 
 _DONE_MARKER_RE = re.compile(rf"(?m)^[ \t>*-]*{SYMPHONY_DONE_MARKER}\s*$")
 _BLOCKED_MARKER_RE = re.compile(
     rf"(?m)^[ \t>*-]*{SYMPHONY_BLOCKED_PREFIX}\s*(?P<reason>.*?)\s*$"
+)
+_ALREADY_DONE_MARKER_RE = re.compile(
+    rf"(?m)^[ \t>*-]*{SYMPHONY_ALREADY_DONE_PREFIX}\s*(?P<ref>.*?)\s*$"
 )
 
 # Phrases an agent uses when it is stuck waiting on a human (the bug being
@@ -99,32 +103,46 @@ _DONE_SIGNALS: tuple[str, ...] = (
 class CompletionMarker:
     kind: MarkerKind | None
     blocked_reason: str = ""
+    already_done_ref: str = ""
 
 
 @dataclass(frozen=True)
 class ImplementCompletion:
     outcome: ImplementOutcome
     blocked_reason: str = ""
+    already_satisfied_ref: str = ""
 
 
 def parse_completion_marker(final_message: str) -> CompletionMarker:
-    """Read the `SYMPHONY_DONE` / `SYMPHONY_BLOCKED: <reason>` final-line marker.
+    """Read the `SYMPHONY_DONE` / `SYMPHONY_BLOCKED: <reason>` /
+    `SYMPHONY_ALREADY_DONE: <ref>` final-line marker.
 
     The agent may quote the contract from the prompt earlier in its message, so
     the *last* marker is the operative one (mirrors the local-review verdict
-    parsing). The blocked reason is captured verbatim from the prefix to the
-    end of the message.
+    parsing). The blocked reason / already-done ref is captured verbatim from
+    the prefix to the end of the line.
+
+    `SYMPHONY_ALREADY_DONE: <ref>` is the no-op-done signal: the agent verified
+    the scope was already delivered elsewhere and produced no commit. It is a
+    distinct marker (not inferred from `SYMPHONY_DONE` + clean tree) so a plain
+    done-without-commits stays a failure.
     """
     done_matches = list(_DONE_MARKER_RE.finditer(final_message))
     blocked_matches = list(_BLOCKED_MARKER_RE.finditer(final_message))
+    already_matches = list(_ALREADY_DONE_MARKER_RE.finditer(final_message))
     last_done = done_matches[-1].start() if done_matches else -1
     last_blocked = blocked_matches[-1].start() if blocked_matches else -1
-    if last_blocked >= 0 and last_blocked > last_done:
+    last_already = already_matches[-1].start() if already_matches else -1
+    best = max(last_done, last_blocked, last_already)
+    if best < 0:
+        return CompletionMarker(kind=None)
+    if last_blocked == best:
         reason = blocked_matches[-1].group("reason").strip()
         return CompletionMarker(kind="blocked", blocked_reason=reason)
-    if last_done >= 0:
-        return CompletionMarker(kind="done")
-    return CompletionMarker(kind=None)
+    if last_already == best:
+        ref = already_matches[-1].group("ref").strip()
+        return CompletionMarker(kind="already_done", already_done_ref=ref)
+    return CompletionMarker(kind="done")
 
 
 def classify_blocked_final_message(message: str) -> tuple[ClassifierVerdict, str]:
@@ -154,6 +172,11 @@ def classify_implement_completion(
     """Classify an rc=0 Implement run into completed / blocked / failed.
 
     * ``SYMPHONY_BLOCKED: …`` -> ``blocked`` with the reason verbatim.
+    * ``SYMPHONY_ALREADY_DONE: <ref>`` without commits -> ``already_satisfied``
+      with the ref verbatim (scope already delivered elsewhere; no-op done).
+      With a HEAD advance it is a normal ``completed`` (commits are ground
+      truth). This is a distinct marker so a plain ``SYMPHONY_DONE`` without
+      commits stays ``failed`` — the no-op guard is not weakened.
     * ``SYMPHONY_DONE`` + HEAD advanced -> ``completed`` (the happy path).
     * ``SYMPHONY_DONE`` without commits -> ``failed`` (claimed done, produced
       nothing to push).
@@ -168,6 +191,14 @@ def classify_implement_completion(
     marker = parse_completion_marker(final_message)
     if marker.kind == "blocked":
         return ImplementCompletion(outcome="blocked", blocked_reason=marker.blocked_reason)
+    if marker.kind == "already_done":
+        # Ground truth wins: a real HEAD advance means the agent actually
+        # committed, so this is a normal completion regardless of the claim.
+        if head_advanced:
+            return ImplementCompletion(outcome="completed")
+        return ImplementCompletion(
+            outcome="already_satisfied", already_satisfied_ref=marker.already_done_ref
+        )
     if marker.kind == "done":
         if head_advanced:
             return ImplementCompletion(outcome="completed")

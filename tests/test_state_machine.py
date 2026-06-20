@@ -324,6 +324,60 @@ def test_classify_no_marker_with_commits_completes_without_classifier() -> None:
     assert spy == []
 
 
+# --- already_satisfied (no-op done: scope delivered elsewhere) --------------
+
+
+def test_parse_completion_marker_already_done_captures_ref_verbatim() -> None:
+    ref = "f483299 (adjust/adjust_os#291)"
+    marker = parse_completion_marker(f"Scope already landed.\n\nSYMPHONY_ALREADY_DONE: {ref}")
+    assert marker.kind == "already_done"
+    assert marker.already_done_ref == ref
+
+
+def test_parse_completion_marker_already_done_does_not_match_plain_done() -> None:
+    # SYMPHONY_ALREADY_DONE must not be mistaken for the plain SYMPHONY_DONE
+    # marker (substring collision guard).
+    marker = parse_completion_marker("SYMPHONY_ALREADY_DONE: abc1234")
+    assert marker.kind == "already_done"
+
+
+def test_parse_completion_marker_last_marker_wins_already_over_done() -> None:
+    text = "SYMPHONY_DONE quoted in prompt\n\nSYMPHONY_ALREADY_DONE: abc1234"
+    assert parse_completion_marker(text).kind == "already_done"
+
+
+# Already-done marker + no HEAD advance -> distinct already_satisfied outcome,
+# NOT failed. This is the whole point of the issue: a no-op implement whose
+# scope already landed elsewhere should close as done, not halt on an operator.
+def test_classify_already_done_marker_no_head_advance_is_already_satisfied() -> None:
+    completion = classify_implement_completion(
+        final_message="Verified all criteria.\n\nSYMPHONY_ALREADY_DONE: f483299",
+        head_advanced=False,
+    )
+    assert completion.outcome == "already_satisfied"
+    assert completion.already_satisfied_ref == "f483299"
+
+
+# Ground truth wins: if the agent both claims already-done AND committed,
+# real commits make it a normal completion.
+def test_classify_already_done_marker_with_head_advance_completes() -> None:
+    completion = classify_implement_completion(
+        final_message="SYMPHONY_ALREADY_DONE: f483299",
+        head_advanced=True,
+    )
+    assert completion.outcome == "completed"
+
+
+# Guard preserved: a plain SYMPHONY_DONE with no commits and no explicit
+# already-done signal must STILL be failed, never already_satisfied.
+def test_classify_plain_done_no_commits_is_not_already_satisfied() -> None:
+    completion = classify_implement_completion(
+        final_message="Everything already satisfied.\n\nSYMPHONY_DONE",
+        head_advanced=False,
+    )
+    assert completion.outcome == "failed"
+
+
 def test_classify_blocked_final_message_detects_human_action_ask() -> None:
     kind, reason = classify_blocked_final_message(MCH14_FINAL_MESSAGE)
     assert kind == "blocked"

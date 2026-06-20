@@ -627,6 +627,113 @@ async def test_implement_blocked_classifier_fallback_for_mch14(tmp_path: Path) -
         await conn.close()
 
 
+def _head_sha(workspace_path: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+async def _run_already_satisfied_dispatch(
+    tmp_path: Path, conn: object, ref: str
+) -> tuple[object, object, object]:
+    """Dispatch an implement run whose agent emits SYMPHONY_ALREADY_DONE (no
+    commit) in a real git workspace. ``{head}`` in *ref* is substituted with
+    the workspace HEAD sha (a real ancestor). Returns (gh, push_fn, linear)."""
+    cfg = Config(
+        repos=[_binding()],
+        log_root=tmp_path / "logs",
+        workspace_root=tmp_path / "ws",
+        db_path=tmp_path / "s.sqlite",
+    )
+    linear = AsyncMock()
+    linear.issues_in_state = AsyncMock(return_value=[_issue()])
+    linear.lookup_issue = AsyncMock(return_value=_issue())
+    linear.post_comment = AsyncMock(return_value="cmt-1")
+    linear.move_issue = AsyncMock()
+
+    workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+    workspace_path.mkdir(parents=True)
+    _init_git_workspace_with_base(workspace_path)
+    ref = ref.replace("{head}", _head_sha(workspace_path))
+    workspace = MagicMock()
+    workspace.acquire = AsyncMock(return_value=workspace_path)
+    workspace.release = MagicMock()
+
+    gh = MagicMock()
+    gh.ensure_pr = AsyncMock()
+    gh.repo_default_branch = AsyncMock(return_value="trunk")
+    push_fn = AsyncMock()
+
+    # No commit: the scope already landed, so HEAD does not advance.
+    runner = _blocked_runner(f"All criteria already met.\n\nSYMPHONY_ALREADY_DONE: {ref}")
+
+    orch = Orchestrator(
+        cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+    )
+    orch._states = {"ENG": _states()}  # noqa: SLF001
+    await _scan_and_wait(orch, cfg.repos[0])
+    return gh, push_fn, linear
+
+
+@pytest.mark.asyncio
+async def test_already_satisfied_closes_done_without_pr_or_wait(tmp_path: Path) -> None:
+    """SYMPHONY_ALREADY_DONE naming a commit that IS an ancestor of HEAD: the
+    issue closes as Done with an auto-comment, no PR/push, no operator wait."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        gh, push_fn, linear = await _run_already_satisfied_dispatch(
+            tmp_path, conn, "{head} (org/repo#291)"
+        )
+
+        # No PR opened, nothing pushed.
+        gh.ensure_pr.assert_not_awaited()
+        push_fn.assert_not_awaited()
+
+        # Issue moved to the terminal Done lane.
+        assert call("iss-1", "state-done") in linear.move_issue.await_args_list
+
+        # Run completed (not failed); no operator wait raised.
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].stage == "implement"
+        assert history[0].status == "completed"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_already_satisfied_unverifiable_ref_still_fails(tmp_path: Path) -> None:
+    """Guard preserved: an already-done claim whose ref is NOT an ancestor of
+    HEAD must not auto-close — it falls back to the failed no-op path."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        # A hex SHA that does not exist in the workspace history.
+        gh, push_fn, linear = await _run_already_satisfied_dispatch(
+            tmp_path, conn, "deadbeefdeadbeef"
+        )
+
+        gh.ensure_pr.assert_not_awaited()
+        push_fn.assert_not_awaited()
+
+        # Never closed as Done.
+        assert call("iss-1", "state-done") not in linear.move_issue.await_args_list
+
+        # Parked as a failed implement run on an operator wait.
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].status != "completed"
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
     tmp_path: Path,

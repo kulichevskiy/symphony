@@ -82,6 +82,7 @@ from ..linear.templates import (
     failed,
     fix_pushed,
     fixing_merge_conflict,
+    implement_already_satisfied,
     implement_blocked,
     moved_to_waiting,
     resumed,
@@ -1429,6 +1430,46 @@ async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     return ""
+
+
+_COMMIT_SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+
+def _extract_delivering_commit(ref: str) -> str | None:
+    """Pull the first commit-SHA-looking token out of a `SYMPHONY_ALREADY_DONE`
+    ref (e.g. ``"f483299 (adjust/adjust_os#291)"`` -> ``"f483299"``).
+
+    Returns None when the ref names no verifiable commit SHA — a bare PR number
+    or prose can't be checked for ancestry, so the caller treats it as a failed
+    no-op rather than auto-closing on an unverifiable claim.
+    """
+    if not ref:
+        return None
+    match = _COMMIT_SHA_RE.search(ref)
+    return match.group(0) if match else None
+
+
+async def _workspace_ref_is_ancestor(
+    workspace_path: Path, ancestor: str, descendant: str = "HEAD"
+) -> bool:
+    """True iff *ancestor* is a commit reachable from *descendant* (default
+    HEAD) in *workspace_path*. False on any error (bad ref, not a repo).
+
+    Wraps ``git merge-base --is-ancestor`` (exit 0 = ancestor, 1 = not,
+    128 = bad/unknown commit). Used to verify an already-done claim before
+    auto-closing the issue.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "merge-base", "--is-ancestor", ancestor, descendant,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+        return proc.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def _workspace_commits_ahead(
@@ -10938,12 +10979,40 @@ class Orchestrator:
                 returncode=final_returncode,
             )
             return None
-        if completion.outcome != "completed":
-            reason = (
-                "implement run exited 0 but did not satisfy the completion "
-                "contract: HEAD did not advance and no SYMPHONY_DONE marker "
-                "could be confirmed as done"
+        if completion.outcome == "already_satisfied":
+            # The agent verified the scope was already delivered elsewhere and
+            # made no commit (HEAD did not advance). This is a no-op done, not a
+            # failure: close the issue as Done referencing the delivering commit
+            # — but only after verifying that commit is real and an ancestor of
+            # HEAD, so a bogus already-done claim cannot auto-close an issue. An
+            # unverifiable claim falls back to the failed path below.
+            closed = await self._complete_already_satisfied_run(
+                run_id,
+                completion.already_satisfied_ref,
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+                workspace_path=workspace_path,
+                returncode=final_returncode,
             )
+            if closed:
+                return None
+            # Verification failed — fall through to the failed path so the
+            # existing no-op guard still parks the run on an operator.
+        if completion.outcome != "completed":
+            if completion.outcome == "already_satisfied":
+                reason = (
+                    "implement run claimed SYMPHONY_ALREADY_DONE but the "
+                    "delivering commit could not be verified as an ancestor of "
+                    f"HEAD (ref: {completion.already_satisfied_ref or '(none)'})"
+                )
+            else:
+                reason = (
+                    "implement run exited 0 but did not satisfy the completion "
+                    "contract: HEAD did not advance and no SYMPHONY_DONE marker "
+                    "could be confirmed as done"
+                )
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
             await self._fail_run_and_reset_issue(
                 run_id,
@@ -13772,6 +13841,100 @@ class Orchestrator:
             log.warning(
                 "implement blocked comment post failed on %s: %s", issue.identifier, e
             )
+
+    async def _complete_already_satisfied_run(
+        self,
+        run_id: str,
+        delivered_ref: str,
+        *,
+        issue: LinearIssue,
+        storage_issue_id: str | None = None,
+        rollback_state_id: str,
+        binding: RepoBinding,
+        workspace_path: Path,
+        returncode: int | None = None,
+    ) -> bool:
+        """Close a no-op Implement run whose scope was already delivered.
+
+        The agent emitted ``SYMPHONY_ALREADY_DONE: <ref>`` and made no commit.
+        Before auto-closing, verify the named commit is real and an ancestor of
+        HEAD — a bogus claim must not close an undelivered issue. On success the
+        run is marked completed, the issue moves to the terminal Done lane with
+        an auto-comment referencing the delivering commit, and push / local
+        review / PR are skipped entirely. Returns True when closed; False when
+        the ref is unverifiable, so the caller falls back to the failed no-op
+        guard (a plain done-without-commits still parks on an operator).
+        """
+        storage_issue_id = storage_issue_id or issue.id
+        candidate = _extract_delivering_commit(delivered_ref)
+        if candidate is None or not await _workspace_ref_is_ancestor(
+            workspace_path, candidate
+        ):
+            log.warning(
+                "implement run %s claimed already-done (ref=%r) but no "
+                "delivering commit could be verified as an ancestor of HEAD; "
+                "treating as failed",
+                run_id,
+                delivered_ref,
+            )
+            return False
+
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            "completed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+        # Work IS delivered, so Done reads more accurately than Cancelled.
+        # Degrade gracefully if Done is unmapped or the move fails.
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states while closing already-satisfied %s: %s",
+                issue.identifier,
+                e,
+            )
+        else:
+            done_id = states.get(binding.linear_states.done)
+            if done_id is not None and done_id != issue.state_id:
+                try:
+                    await self.tracker(binding).move_issue(issue.id, done_id)
+                except LinearError as e:
+                    log.warning(
+                        "could not move %s to Done after already-satisfied "
+                        "close: %s",
+                        issue.identifier,
+                        e,
+                    )
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
+        body = implement_already_satisfied(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                input_tokens=tokens.input_tokens,
+                output_tokens=tokens.output_tokens,
+                cache_write_tokens=tokens.cache_write_tokens,
+                cache_read_tokens=tokens.cache_read_tokens,
+            ),
+            delivered_ref=delivered_ref.strip() or candidate,
+        )
+        try:
+            await self.tracker(binding).post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "already-satisfied close comment post failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+        log.info(
+            "implement run %s closed as already-satisfied (delivered by %s)",
+            run_id,
+            candidate,
+        )
+        return True
 
     async def _park_deliver_failed(
         self,
