@@ -347,7 +347,9 @@ async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
     tmp_path: Path,
 ) -> None:
     """`local_review_claude_model` threads `--model` into the claude
-    reviewer and fixer argv; unset → no `--model` (covered below)."""
+    reviewer argv; the `fix` role's `fix_claude_model` drives the fixer argv
+    (path 1). The two are decoupled so the reviewer and fixer can run on
+    different models."""
     runner = _ScriptedRunner(
         scripts=[
             _message_stream(
@@ -377,6 +379,7 @@ async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
         reviewer_agent="claude",
         reviewer_codex_model="gpt-5.1-codex",
         local_review_claude_model="claude-sonnet-4-6",
+        fix_claude_model="claude-opus-4-6",
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -388,7 +391,12 @@ async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
     for spec in runner.specs:
         argv = spec.command
         assert argv[0] == "claude"
-        assert argv[argv.index("--model") + 1] == "claude-sonnet-4-6"
+        expected = (
+            "claude-opus-4-6"
+            if spec.stage == "local_review_fix"
+            else "claude-sonnet-4-6"
+        )
+        assert argv[argv.index("--model") + 1] == expected
 
 
 @pytest.mark.asyncio

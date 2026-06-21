@@ -628,6 +628,7 @@ def build_fix_runner_command(
     prompt: str,
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
     workspace_path: Path | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
@@ -637,11 +638,15 @@ def build_fix_runner_command(
     the GitHub `@codex review` bot. The bot is only consulted via PR
     comments; the binding's `agent` field is what drives code changes
     in response to its feedback.
+
+    `claude_model` is the resolved `fix` role's Claude model: set →
+    `--model <alias>`, unset → no flag (CLI default). It is ignored for codex.
     """
     return build_runner_command(
         agent,
         prompt,
         codex_model=codex_model,
+        claude_model=claude_model,
         workspace_path=workspace_path,
         mcp_servers=mcp_servers,
     )
@@ -6197,6 +6202,7 @@ class Orchestrator:
             binding.agent,
             prompt,
             codex_model=binding.codex_model,
+            claude_model=self._fix_claude_model(binding),
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
@@ -6301,6 +6307,7 @@ class Orchestrator:
                 binding.agent,
                 prompt,
                 codex_model=binding.codex_model,
+                claude_model=self._fix_claude_model(binding),
                 workspace_path=workspace_path,
                 mcp_servers=binding.mcp_servers,
             )
@@ -12208,6 +12215,7 @@ class Orchestrator:
                     local_review_verifier_claude_model=(
                         binding.local_review_verifier_claude_model
                     ),
+                    fix_claude_model=self._fix_claude_model(binding),
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
                     command_secs=self.config.command_timeout_secs,
@@ -12615,6 +12623,7 @@ class Orchestrator:
                 labels=list(issue.labels),
                 implementer_agent=binding.agent,
                 implementer_codex_model=binding.codex_model,
+                fix_claude_model=self._fix_claude_model(binding),
                 stall_secs=self.config.stall_timeout_secs,
                 command_secs=self.config.command_timeout_secs,
                 usage_handler=cost_estimator.delta,
@@ -13475,6 +13484,17 @@ class Orchestrator:
         )
         return cumulative_usage, final_kind, final_returncode
 
+    def _fix_claude_model(self, binding: RepoBinding) -> str | None:
+        """The `fix` role's resolved Claude `--model`.
+
+        Resolves through the same matrix + per-binding override path as the
+        `implement` role (SYM-124): set → `--model <alias>`, unset → CLI
+        default. `None` for a codex-resolved `fix` role (the `--model` flag
+        is claude-only; codex carries its model via `codex_model`).
+        """
+        role = binding.resolved_role("fix", self.config.roles)
+        return None if role.agent == "codex" else role.model
+
     async def _run_fix_agent(
         self,
         *,
@@ -13489,6 +13509,7 @@ class Orchestrator:
             binding.agent,
             prompt,
             codex_model=binding.codex_model,
+            claude_model=self._fix_claude_model(binding),
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )

@@ -2296,6 +2296,47 @@ def test_build_fix_runner_command_uses_claude_when_binding_is_claude() -> None:
     assert "fix this" in argv
 
 
+@pytest.mark.asyncio
+async def test_review_fix_run_carries_fix_role_model(tmp_path: Path) -> None:
+    """Path 3 (remote `@codex` review fix): `_run_fix_agent` builds a command
+    carrying the resolved `fix` role's `--model`."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude").model_copy(
+            update={"roles": {"fix": RoleConfig(model="sonnet")}}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock()
+        )
+        captured: dict[str, list[str]] = {}
+
+        async def fake_run_runner(**kwargs: object) -> tuple[UsageDelta, str, int]:
+            captured["command"] = kwargs["command"]  # type: ignore[assignment]
+            return UsageDelta(), "exit", 0
+
+        orch._run_runner = fake_run_runner  # type: ignore[method-assign]  # noqa: SLF001
+        await orch._run_fix_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="fix-run",
+            workspace_path=tmp_path / "ws",
+            prompt="fix the bug",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[argv.index("--model") + 1] == "sonnet"
+    finally:
+        await conn.close()
+
+
 def test_build_fix_runner_command_uses_codex_when_binding_is_codex(
     tmp_path: Path,
 ) -> None:
@@ -2319,6 +2360,13 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex(
     ]
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert "fix this" in argv
+
+
+def test_build_fix_runner_command_passes_claude_model() -> None:
+    """Resolved `fix` role model → `--model`; unset → CLI default (no flag)."""
+    with_model = build_fix_runner_command("claude", "fix this", claude_model="opus")
+    assert with_model[with_model.index("--model") + 1] == "opus"
+    assert "--model" not in build_fix_runner_command("claude", "fix this")
 
 
 def test_build_fix_runner_command_passes_configured_codex_model(

@@ -161,6 +161,7 @@ async def run_local_review_session(
     reviewer_codex_model: str,
     local_review_claude_model: str | None = None,
     local_review_verifier_claude_model: str | None = None,
+    fix_claude_model: str | None = None,
     cap: int,
     stall_secs: int,
     command_secs: int = 1800,
@@ -457,7 +458,7 @@ async def run_local_review_session(
             agent=implementer_agent,
             codex_model=implementer_codex_model,
             prompt=prompt,
-            claude_model=local_review_claude_model,
+            claude_model=fix_claude_model,
             mcp_servers=mcp_servers,
         )
         spec = RunnerSpec(

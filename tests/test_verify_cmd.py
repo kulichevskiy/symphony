@@ -198,6 +198,61 @@ async def test_verify_session_red_then_fix_then_green() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verify_session_fix_turn_carries_fix_role_model() -> None:
+    """Path 2 (verify-gate fix turn): `fix_claude_model` threads `--model`
+    into the fix-turn argv; unset → no `--model`."""
+    outcomes = [(False, "build error TS2345"), (True, "ok")]
+
+    async def command_runner(
+        path: Path, cmd: str, timeout_secs: int
+    ) -> tuple[bool, str]:
+        return outcomes.pop(0)
+
+    runner = _StagedRunner(
+        {
+            "verify_fix": [
+                [
+                    RunnerEvent(kind="started", pid=1),
+                    RunnerEvent(kind="exit", returncode=0),
+                ]
+            ]
+        }
+    )
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner),
+        fix_claude_model="claude-opus-4-6",
+    )
+    assert result.ok
+    argv = runner.captured[0].command
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-6"
+
+
+@pytest.mark.asyncio
+async def test_verify_session_fix_turn_omits_model_when_unset() -> None:
+    """Default `None` → no `--model` (CLI default; no behavior change)."""
+    outcomes = [(False, "build error TS2345"), (True, "ok")]
+
+    async def command_runner(
+        path: Path, cmd: str, timeout_secs: int
+    ) -> tuple[bool, str]:
+        return outcomes.pop(0)
+
+    runner = _StagedRunner(
+        {
+            "verify_fix": [
+                [
+                    RunnerEvent(kind="started", pid=1),
+                    RunnerEvent(kind="exit", returncode=0),
+                ]
+            ]
+        }
+    )
+    result = await run_verify_session(**_session_kwargs(runner, command_runner))
+    assert result.ok
+    assert "--model" not in runner.captured[0].command
+
+
+@pytest.mark.asyncio
 async def test_verify_session_still_red_after_fix_fails_closed() -> None:
     outcomes = [(False, "first failure"), (False, "still red: TS2345 tail")]
 
