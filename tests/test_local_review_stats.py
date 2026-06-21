@@ -22,14 +22,31 @@ async def _seed_run(
     cost_usd: float,
     started_at: str,
     ended_at: str | None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
 ) -> None:
     await conn.execute(
         """
         INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
-                          ended_at, cost_usd)
-        VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+                          ended_at, cost_usd, input_tokens, output_tokens,
+                          cache_write_tokens, cache_read_tokens)
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (run_id, issue_id, stage, status, started_at, ended_at, cost_usd),
+        (
+            run_id,
+            issue_id,
+            stage,
+            status,
+            started_at,
+            ended_at,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+        ),
     )
     await conn.commit()
 
@@ -53,6 +70,10 @@ async def test_stats_empty_db_returns_all_zeros(tmp_path: Path) -> None:
     assert stats.avg_cost_usd == 0.0
     assert stats.avg_duration_secs == 0.0
     assert stats.approval_rate == 0.0
+    assert stats.total_input_tokens == 0
+    assert stats.total_output_tokens == 0
+    assert stats.total_cache_write_tokens == 0
+    assert stats.total_cache_read_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -78,6 +99,10 @@ async def test_stats_counts_by_status_and_skips_other_stages(
             cost_usd=0.12,
             started_at=_ts(0),
             ended_at=_ts(60),
+            input_tokens=100,
+            output_tokens=20,
+            cache_write_tokens=30,
+            cache_read_tokens=40,
         )
         await _seed_run(
             conn,
@@ -148,6 +173,11 @@ async def test_stats_counts_by_status_and_skips_other_stages(
     assert stats.approval_rate == pytest.approx(0.5)
     # Implement row's $99.99 must NOT leak in.
     assert stats.total_cost_usd < 10.0
+    # Token sums come only from local_review rows (lr-1 carried tokens).
+    assert stats.total_input_tokens == 100
+    assert stats.total_output_tokens == 20
+    assert stats.total_cache_write_tokens == 30
+    assert stats.total_cache_read_tokens == 40
 
 
 @pytest.mark.asyncio
@@ -349,6 +379,10 @@ def test_cli_local_review_stats_with_seeded_rows(tmp_path: Path) -> None:
                 cost_usd=0.20,
                 started_at=_ts(0),
                 ended_at=_ts(120),
+                input_tokens=100,
+                output_tokens=20,
+                cache_write_tokens=30,
+                cache_read_tokens=40,
             )
             await _seed_run(
                 conn,
@@ -374,6 +408,11 @@ def test_cli_local_review_stats_with_seeded_rows(tmp_path: Path) -> None:
     assert "interrupted" not in result.output
     assert "failed (other):          1" in result.output
     assert "approval rate:           50.0%" in result.output
+    # Effective (weighted) tokens are the headline spend figure now:
+    # lr-1 = 100 + 20 + 30*1.25 + 40*0.1 = 161.5 → 162; lr-2 has none.
+    assert "total effective tokens:  162" in result.output
+    # Dollar cost stays but is demoted to a notional list-price estimate.
     assert "total cost:              $1.0000" in result.output
     assert "avg cost per session:    $0.5000" in result.output
+    assert "notional" in result.output.lower()
     assert "avg duration per session: 120.0s" in result.output

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..tokens import effective_tokens
+
 # Linear silently rejects very long comment bodies. 4 KB is the documented
 # soft cap; truncating in the caller keeps dispatch deterministic when a
 # `failed` comment's log-tail field would otherwise blow past it.
@@ -84,12 +86,21 @@ def token_block(v: CommentVars) -> str:
 
     Replaces the former dollar `cost` line: input / output / cache write /
     cache read deltas as a 4-way inline split, so operators can gauge spend
-    without a pricing model baked into the comment. No total clause —
-    consistent with the "no total anywhere" rule applied across the UI.
+    without a pricing model baked into the comment. The trailing `eff`
+    figure is the weighted *effective* token total — the unit the per-issue
+    budget gates on — so an operator deciding `$approve` sees the same number
+    as the ceiling.
     """
+    eff = effective_tokens(
+        v.input_tokens,
+        v.output_tokens,
+        v.cache_write_tokens,
+        v.cache_read_tokens,
+    )
     return (
         f"Tokens: in {v.input_tokens} · out {v.output_tokens} · "
-        f"cache w {v.cache_write_tokens} / r {v.cache_read_tokens}"
+        f"cache w {v.cache_write_tokens} / r {v.cache_read_tokens} · "
+        f"eff {eff:,.0f}"
     )
 
 

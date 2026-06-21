@@ -989,6 +989,13 @@ class LocalReviewStats:
     avg_cost_usd: float  # over rows with ended_at
     avg_duration_secs: float  # over rows with ended_at AND started_at
     approval_rate: float  # completed / (completed + failed)
+    # Raw token sums across all local_review rows. The weighted effective
+    # total (the per-issue budget unit) is computed by the caller via the
+    # shared `symphony.tokens.effective_tokens` helper.
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_write_tokens: int = 0
+    total_cache_read_tokens: int = 0
 
 
 async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
@@ -1018,7 +1025,11 @@ async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
                     END
                 ),
                 0.0
-            ) AS avg_duration
+            ) AS avg_duration,
+            COALESCE(SUM(input_tokens), 0) AS total_input,
+            COALESCE(SUM(output_tokens), 0) AS total_output,
+            COALESCE(SUM(cache_write_tokens), 0) AS total_cache_write,
+            COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read
         FROM runs
         WHERE stage = 'local_review'
         """
@@ -1038,4 +1049,8 @@ async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
         avg_cost_usd=float(row["avg_cost"]),
         avg_duration_secs=float(row["avg_duration"]),
         approval_rate=approval_rate,
+        total_input_tokens=int(row["total_input"]),
+        total_output_tokens=int(row["total_output"]),
+        total_cache_write_tokens=int(row["total_cache_write"]),
+        total_cache_read_tokens=int(row["total_cache_read"]),
     )

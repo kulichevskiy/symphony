@@ -30,8 +30,8 @@ def _token_vars(stage: str) -> CommentVars:
         next_stage="next",
         input_tokens=10,
         output_tokens=20,
-        cache_write_tokens=5,
-        cache_read_tokens=3,
+        cache_write_tokens=8,
+        cache_read_tokens=10,
     )
 
 
@@ -52,9 +52,11 @@ def test_token_block_replaces_cost(template, stage) -> None:
     assert "Cost" not in body
     assert "cost" not in body
     assert "$0" not in body
-    # Token breakdown block: in/out/cache w/r — no total clause.
-    assert "Tokens: in 10 · out 20 · cache w 5 / r 3" in body
-    assert "total" not in body
+    # Raw breakdown: in/out/cache w/r.
+    assert "Tokens: in 10 · out 20 · cache w 8 / r 10" in body
+    # Effective (weighted) total — the unit the per-issue budget gates on:
+    # 10 + 20 + 8*1.25 + 10*0.1 = 41.
+    assert "eff 41" in body
 
 
 def test_implement_blocked_comment_states_verbatim_ask_and_retry() -> None:

@@ -4,6 +4,26 @@ export function exactInt(value: number | null | undefined): string {
   return String(Math.round(value ?? 0));
 }
 
+/**
+ * Weighted "effective" token total — the single unit the per-issue token
+ * budget gates on (SYM-130). Cache writes cost more than fresh input, cache
+ * reads far less. Mirrors the backend helper in `src/symphony/tokens.py`;
+ * keep the weights (1.25 / 0.1) in sync.
+ */
+export function effectiveTokens(t: {
+  input_tokens: number;
+  output_tokens: number;
+  cache_write_tokens: number;
+  cache_read_tokens: number;
+}): number {
+  return (
+    t.input_tokens +
+    t.output_tokens +
+    t.cache_write_tokens * 1.25 +
+    t.cache_read_tokens * 0.1
+  );
+}
+
 export function formatUtc(ts: string | null | undefined): string {
   if (!ts) {
     return "null";

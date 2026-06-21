@@ -34,6 +34,7 @@ from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
 from .orchestrator.reconcile import reconcile
+from .tokens import effective_tokens
 from .tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
@@ -442,7 +443,9 @@ async def _runs_ls(db_path: Path, limit: int) -> None:
     if not rows:
         click.echo("(no runs)")
         return
-    click.echo("id\tissue\tstage\tstatus\ttermination_kind\tcost\tstarted_at")
+    click.echo(
+        "id\tissue\tstage\tstatus\ttermination_kind\teff_tokens\tstarted_at"
+    )
     for r in rows:
         run = r.run
         termination_kind = (
@@ -450,9 +453,15 @@ async def _runs_ls(db_path: Path, limit: int) -> None:
             if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
             else ""
         )
+        eff = effective_tokens(
+            run.input_tokens,
+            run.output_tokens,
+            run.cache_write_tokens,
+            run.cache_read_tokens,
+        )
         click.echo(
             f"{run.id}\t{r.identifier}\t{run.stage}\t{run.status}\t"
-            f"{termination_kind}\t${run.cost_usd:.2f}\t{run.started_at}"
+            f"{termination_kind}\t{eff:,.0f}\t{run.started_at}"
         )
 
 
@@ -488,11 +497,21 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
     click.echo(f"pid:            {run.pid if run.pid is not None else '-'}")
     click.echo(f"started_at:     {run.started_at}")
     click.echo(f"ended_at:       {run.ended_at or '-'}")
-    click.echo(f"cost_usd:       {run.cost_usd}")
     click.echo(f"input_tokens:   {run.input_tokens}")
     click.echo(f"output_tokens:  {run.output_tokens}")
     click.echo(f"cache_write:    {run.cache_write_tokens}")
     click.echo(f"cache_read:     {run.cache_read_tokens}")
+    eff = effective_tokens(
+        run.input_tokens,
+        run.output_tokens,
+        run.cache_write_tokens,
+        run.cache_read_tokens,
+    )
+    click.echo(f"effective_tokens: {eff:,.0f}")
+    click.echo(
+        f"cost_usd:       {run.cost_usd}  "
+        "(notional list-price estimate, not the actual bill)"
+    )
     if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
         click.echo(f"termination_kind:   {run.termination_kind or '-'}")
         returncode = run.exit_returncode if run.exit_returncode is not None else "-"
@@ -615,7 +634,17 @@ async def _runs_local_review_stats(db_path: Path) -> None:
     click.echo(f"failed (other):          {stats.failed_count}")
     click.echo(f"running (in-flight):     {stats.running_count}")
     click.echo(f"approval rate:           {stats.approval_rate:.1%}")
-    click.echo(f"total cost:              ${stats.total_cost_usd:.4f}")
+    eff = effective_tokens(
+        stats.total_input_tokens,
+        stats.total_output_tokens,
+        stats.total_cache_write_tokens,
+        stats.total_cache_read_tokens,
+    )
+    click.echo(f"total effective tokens:  {eff:,.0f}")
+    click.echo(
+        f"total cost:              ${stats.total_cost_usd:.4f}  "
+        "(notional list-price estimate, not the actual bill)"
+    )
     click.echo(f"avg cost per session:    ${stats.avg_cost_usd:.4f}")
     click.echo(f"avg duration per session: {stats.avg_duration_secs:.1f}s")
     if finished == 0:

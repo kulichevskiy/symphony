@@ -137,7 +137,10 @@ def test_runs_ls_lists_runs_from_sqlite(tmp_path: Path) -> None:
     assert "review" in out
     assert "running" in out
     assert "completed" in out
-    assert "1.5" in out
+    # Effective (weighted) tokens headline the spend column, not dollars:
+    # run-a = 100 + 20 + 30*1.25 + 40*0.1 = 161.5 → 162.
+    assert "162" in out
+    assert "$" not in out
     assert "2026-05-10T00:00:00+00:00" in out
 
 
@@ -173,14 +176,17 @@ def test_runs_ls_surfaces_termination_kind_for_non_success(
         "stage",
         "status",
         "termination_kind",
-        "cost",
+        "eff_tokens",
         "started_at",
     ]
+    # Effective tokens (run-a = 162), not the former `$1.50` cost headline.
     assert (
-        "run-a\tENG-1\timplement\tfailed\tagent_nonzero_exit\t$1.50"
+        "run-a\tENG-1\timplement\tfailed\tagent_nonzero_exit\t162"
         in result.output
     )
-    assert "run-b\tENG-2\treview\tcompleted\t\t$0.25" in result.output
+    # run-b has no recorded usage → 0 effective tokens.
+    assert "run-b\tENG-2\treview\tcompleted\t\t0" in result.output
+    assert "$" not in result.output
 
 
 def test_runs_show_displays_full_detail(tmp_path: Path) -> None:
@@ -193,11 +199,16 @@ def test_runs_show_displays_full_detail(tmp_path: Path) -> None:
     assert "ENG-1" in out
     assert "implement" in out
     assert "running" in out
-    assert "1.5" in out
     assert "input_tokens:   100" in out
     assert "output_tokens:  20" in out
     assert "cache_write:    30" in out
     assert "cache_read:     40" in out
+    # Effective (weighted) total — the per-issue budget unit: 161.5 → 162.
+    assert "effective_tokens: 162" in out
+    # Dollar cost stays in the detail but is demoted to a notional estimate,
+    # no longer a headline number.
+    assert "1.5" in out
+    assert "notional" in out.lower()
     # The comment cursor for the issue is part of the detail surface.
     assert "2026-05-10T00:30:00+00:00" in out
 
