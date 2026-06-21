@@ -648,11 +648,9 @@ async def _runs_local_review_stats(db_path: Path) -> None:
         stats.total_cache_read_tokens,
     )
     click.echo(f"total effective tokens:  {eff:,.0f}")
-    click.echo(
-        f"total cost:              ${stats.total_cost_usd:.4f}  "
-        "(notional list-price estimate, not the actual bill)"
-    )
-    click.echo(f"avg cost per session:    ${stats.avg_cost_usd:.4f}")
+    click.echo("cost (notional list-price estimate, not the actual bill):")
+    click.echo(f"  total cost:            ${stats.total_cost_usd:.4f}")
+    click.echo(f"  avg cost per session:  ${stats.avg_cost_usd:.4f}")
     click.echo(f"avg duration per session: {stats.avg_duration_secs:.1f}s")
     if finished == 0:
         click.echo("(no finished local-review sessions yet)")

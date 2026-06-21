@@ -411,8 +411,12 @@ def test_cli_local_review_stats_with_seeded_rows(tmp_path: Path) -> None:
     # Effective (weighted) tokens are the headline spend figure now:
     # lr-1 = 100 + 20 + 30*1.25 + 40*0.1 = 161.5 → 162; lr-2 has none.
     assert "total effective tokens:  162" in result.output
-    # Dollar cost stays but is demoted to a notional list-price estimate.
-    assert "total cost:              $1.0000" in result.output
-    assert "avg cost per session:    $0.5000" in result.output
-    assert "notional" in result.output.lower()
+    # Dollar cost stays but is demoted to a notional list-price estimate;
+    # a single caveat header covers both the total and per-session figures.
+    assert (
+        "cost (notional list-price estimate, not the actual bill):"
+        in result.output
+    )
+    assert "total cost:            $1.0000" in result.output
+    assert "avg cost per session:  $0.5000" in result.output
     assert "avg duration per session: 120.0s" in result.output
