@@ -1357,6 +1357,79 @@ async def test_completed_review_prs_without_monitor_excludes_bypassed(
 
 
 @pytest.mark.asyncio
+async def test_orphaned_review_prs_exclude_bypassed(tmp_path: Path) -> None:
+    # A $skip-review PR whose pidless review run is marked interrupted/orphaned
+    # on restart must not be picked up by the orphaned-review resurrection
+    # queries, or the operator's deliberate skip would be undone.
+    conn = await db.connect(tmp_path / "bypass.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="orphaned-review",
+            issue_id="iss-1",
+            stage="review",
+            status="interrupted",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        # Selected before the bypass is recorded...
+        assert [c.pr_number for c in await db.issue_prs.list_orphaned_review_prs(conn)] == [
+            42
+        ]
+        assert await db.issue_prs.has_orphaned_review_pr(conn, issue_id="iss-1") is True
+        # ...and excluded once $skip-review marks it bypassed.
+        assert await db.issue_prs.mark_review_bypassed(
+            conn, issue_id="iss-1", github_repo="org/repo", pr_number=42
+        )
+        assert await db.issue_prs.list_orphaned_review_prs(conn) == []
+        assert await db.issue_prs.has_orphaned_review_pr(conn, issue_id="iss-1") is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_candidates_expose_review_bypassed(tmp_path: Path) -> None:
+    # The bypass flag must surface on the IssuePR so the merge poller can honor
+    # a $skip-review PR after a restart (before the merge run was created),
+    # regardless of the binding's remote_review setting.
+    conn = await db.connect(tmp_path / "bypass.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        # No review run + not bypassed → not a merge candidate.
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+
+        assert await db.issue_prs.mark_review_bypassed(
+            conn, issue_id="iss-1", github_repo="org/repo", pr_number=42
+        )
+        candidates = await db.issue_prs.list_merge_candidates(conn)
+        assert [c.pr_number for c in candidates] == [42]
+        assert candidates[0].review_bypassed is True
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_latest_for_issue_stage_can_scope_to_current_cycle(
     tmp_path: Path,
 ) -> None:

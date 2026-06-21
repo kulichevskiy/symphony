@@ -5472,6 +5472,267 @@ async def test_no_review_binding_merges_clean_ci_no_signal(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_skip_review_bypass_on_remote_binding_merges_when_mergeable(
+    tmp_path: Path,
+) -> None:
+    """`$skip-review` on a remote-review binding (review_bypassed=1) merges on a
+    clean mergeable verdict even though Codex never approved — the restart
+    recovery path for a bypass persisted before the merge run was created."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)  # sets review_bypassed=True
+        binding = _binding()  # remote_review on
+        assert binding.resolved_remote_review()
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            # Stale/unaddressed Codex feedback — deliberately NOT approved.
+            verdict=Verdict(kind=VerdictKind.CHANGES_REQUESTED, rule="codex_inline"),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 42
+        assert kwargs["skip_review"] is True
+    finally:
+        await conn.close()
+
+
+async def _seed_collision_issue_with_pr(conn, *, pr_number: int) -> str:  # type: ignore[no-untyped-def]
+    await db.issues.upsert(conn, id="DUP-1", identifier="L-1", title="t", team_key="ENG")
+    storage_id = await db.issues.upsert(
+        conn,
+        id="DUP-1",
+        identifier="J-1",
+        title="t",
+        team_key="ENG",
+        provider="jira",
+        site="acme",
+    )
+    assert storage_id != "DUP-1"
+    await db.issue_prs.upsert(
+        conn,
+        issue_id=storage_id,
+        github_repo="org/repo",
+        pr_number=pr_number,
+        pr_url=f"https://github.com/org/repo/pull/{pr_number}",
+        created_at="2026-05-10T00:00:00+00:00",
+    )
+    return storage_id
+
+
+def _tracker_collision_issue() -> LinearIssue:
+    return LinearIssue(
+        id="DUP-1",
+        identifier="J-1",
+        title="t",
+        description="",
+        url="u",
+        state_id="s",
+        state_name="In Progress",
+        state_type="started",
+        team_key="ENG",
+        labels=[],
+    )
+
+
+@pytest.mark.asyncio
+async def test_human_approval_wait_keyed_by_storage_id_for_contextual_issue(
+    tmp_path: Path,
+) -> None:
+    """The needs-human-approval merge wait must be created under the storage id
+    so storage-keyed merge polling / operator commands can see it."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        storage_id = await _seed_collision_issue_with_pr(conn, pr_number=99)
+        binding = _binding()
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.APPROVED, rule="codex_approved"),
+        )
+        await orch._open_merge_wait_for_human_approval_label(  # noqa: SLF001
+            binding=binding,
+            issue=_tracker_collision_issue(),
+            pr_url="https://github.com/org/repo/pull/99",
+            storage_issue_id=storage_id,
+        )
+        wait = await db.operator_waits.get(conn, storage_id)
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_MERGE
+        # The merge run was created under the storage id.
+        runs = await db.runs.history_for_issue(conn, storage_id)
+        assert any(r.stage == "merge" and r.status == "needs_approval" for r in runs)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_merge_park_keyed_by_storage_id_for_contextual_issue(
+    tmp_path: Path,
+) -> None:
+    """auto_merge:false parking must mark the storage-keyed PR row parked."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        storage_id = await _seed_collision_issue_with_pr(conn, pr_number=99)
+        binding = _binding(auto_merge=False)
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.APPROVED, rule="codex_approved"),
+        )
+        await orch._park_pr_for_manual_merge(  # noqa: SLF001
+            binding=binding,
+            issue=_tracker_collision_issue(),
+            pr_number=99,
+            pr_url="https://github.com/org/repo/pull/99",
+            storage_issue_id=storage_id,
+        )
+        pr = await db.issue_prs.get(conn, issue_id=storage_id, github_repo="org/repo")
+        assert pr is not None and pr.parked_at is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_done_marks_storage_keyed_pr_for_contextual_issue(
+    tmp_path: Path,
+) -> None:
+    """For a provider-collision issue (storage id != tracker id), finalizing a
+    merge must mark the STORAGE-keyed issue_prs row merged and use the tracker id
+    for the Linear move — otherwise the PR stays open and re-eligible to merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="DUP-1", identifier="L-1", title="t", team_key="ENG"
+        )
+        storage_id = await db.issues.upsert(
+            conn,
+            id="DUP-1",
+            identifier="J-1",
+            title="t",
+            team_key="ENG",
+            provider="jira",
+            site="acme",
+        )
+        assert storage_id != "DUP-1"
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=storage_id,
+            github_repo="org/repo",
+            pr_number=99,
+            pr_url="https://github.com/org/repo/pull/99",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="merge-1",
+            issue_id=storage_id,
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+        binding = _binding()
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.APPROVED, rule="codex_approved"),
+        )
+        orch._workspace = MagicMock()  # noqa: SLF001
+        orch._workspace.cleanup = AsyncMock(return_value=[])  # noqa: SLF001
+        tracker_issue = LinearIssue(
+            id="DUP-1",
+            identifier="J-1",
+            title="t",
+            description="",
+            url="u",
+            state_id="s",
+            state_name="In Progress",
+            state_type="started",
+            team_key="ENG",
+            labels=[],
+        )
+
+        await orch._mark_merge_done(  # noqa: SLF001
+            binding=binding,
+            issue=tracker_issue,
+            pr_url="https://github.com/org/repo/pull/99",
+            run_id="merge-1",
+            storage_issue_id=storage_id,
+        )
+
+        # The storage-keyed PR row is marked merged (not the tracker-id row).
+        pr = await db.issue_prs.get(conn, issue_id=storage_id, github_repo="org/repo")
+        assert pr is not None and pr.merged_at is not None
+        # The merge run (storage-keyed) is done; no candidacy remains.
+        assert await db.issue_prs.list_merge_candidates(conn) == []
+        # The Linear move used the tracker id.
+        orch.tracker(binding).move_issue.assert_awaited_once_with("DUP-1", "state-done")  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_review_bypass_merges_without_classifying_verdict(
+    tmp_path: Path,
+) -> None:
+    """A persisted `$skip-review` on a remote-review binding must not depend on
+    the review verdict fetch — the operator already waived review, so a failing
+    review-only API call must not strand the PR (it must still flow to merge)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)  # review_bypassed=True
+        binding = _binding()  # remote_review on
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.CHANGES_REQUESTED, rule="codex_inline"),
+        )
+        # Even if classification WOULD fail, the bypassed PR must still merge —
+        # and the waived path must not call it at all.
+        orch._review_verdict_for_pr = AsyncMock(side_effect=GitHubError("boom"))  # type: ignore[method-assign]  # noqa: SLF001
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._review_verdict_for_pr.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_review_bypass_waits_when_mergeable_unknown(
+    tmp_path: Path,
+) -> None:
+    """A bypassed PR must still wait for a clean mergeable verdict — a transient
+    UNKNOWN must not be raced into a merge that fails and parks the PR."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_no_review_candidate(conn)  # review_bypassed=True
+        binding = _binding()  # remote_review on
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.CHANGES_REQUESTED, rule="codex_inline"),
+            view={**_no_signal_view(), "mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"},
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_no_review_binding_auto_merge_false_parks_clean_ci_no_signal(
     tmp_path: Path,
 ) -> None:
