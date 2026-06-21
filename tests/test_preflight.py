@@ -166,6 +166,26 @@ async def test_fetch_claude_effort_capabilities_parses_effort_tree(
     ]
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"capabilities": {}}, {"capabilities": {"effort": {}}}],
+)
+async def test_fetch_claude_effort_capabilities_empty_tree_raises_valueerror(
+    monkeypatch, payload
+) -> None:  # type: ignore[no-untyped-def]
+    """An absent/empty effort tree must raise "cannot validate" — NOT return
+    `[]`, which the caller would read as "supports zero efforts" and use to
+    falsely reject a structurally valid pair."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    _install_mock_transport(monkeypatch, _handler)
+    with pytest.raises(ValueError, match="no effort capabilities"):
+        await fetch_claude_effort_capabilities("sonnet")
+
+
 async def test_fetch_claude_effort_capabilities_missing_key_raises_valueerror(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]

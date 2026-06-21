@@ -24,7 +24,10 @@ async def fetch_claude_effort_capabilities(model: str) -> list[str]:
     (`opus`/`sonnet`/`haiku` aliases flow through unchanged). Requires
     `ANTHROPIC_API_KEY`; raises `ValueError` — not a bare `httpx` error — when
     the key is missing or the request fails (auth, network, timeout), so
-    preflight can report a clean message instead of a raw traceback.
+    preflight can report a clean message instead of a raw traceback. Also
+    raises `ValueError` when the response carries no effort tree, so an
+    absent/empty tree reads as "cannot validate" rather than "supports zero
+    efforts" (which would falsely reject a structurally valid pair).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -56,6 +59,11 @@ async def fetch_claude_effort_capabilities(model: str) -> list[str]:
             f"{model!r}: {e}"
         ) from e
     effort_tree = (data.get("capabilities") or {}).get("effort") or {}
+    if not effort_tree:
+        raise ValueError(
+            f"Models API returned no effort capabilities for claude model "
+            f"{model!r}; cannot validate"
+        )
     return list(effort_tree)
 
 
