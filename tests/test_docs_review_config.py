@@ -28,6 +28,17 @@ def test_example_config_documents_review_booleans_and_local_lane() -> None:
         assert row in text
 
 
+def test_example_config_documents_roles_matrix() -> None:
+    text = _read("examples/config.yaml")
+
+    # AC3: the `roles:` matrix is documented — global default block, ...
+    assert "roles:" in text
+    # ... a per-binding override (the per-repo `roles:` block), ...
+    assert "model: sonnet" in text
+    # ... and at least one legacy -> matrix mapping line.
+    assert "agent                              -> roles.{implement,fix,accept}.agent" in text
+
+
 def test_readme_documents_review_venues_and_role_knobs() -> None:
     text = _read("README.md")
 

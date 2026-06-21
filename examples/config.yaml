@@ -21,6 +21,40 @@ reconcile_backoff_secs: 600
 ui:
   enabled: true
 
+# Roles matrix — the per-role `{agent, model, effort}` override that
+# supersedes the legacy top-level role fields (`agent`, `reviewer_agent`,
+# `codex_model`, `reviewer_codex_model`, `local_review_claude_model`,
+# `local_review_verifier_claude_model`). Those legacy fields still work but
+# are deprecated (they warn), and setting one alongside its matrix cell is a
+# hard error — pick one.
+#
+# Set the global default here; override per binding under each repo's own
+# `roles:` block. The two deep-merge per field:
+# `role = merge(global[role], binding[role])`.
+#
+# Roles: `implement`, `fix`, `accept` (builders, run the implementer family)
+# and `review_find`, `review_verify` (the local reviewer; default to the
+# opposite family for cross-family blind-spot diversity). Each cell takes:
+#   agent:  claude | codex
+#   model:  family-specific — Claude aliases (opus / sonnet / haiku) or a
+#           Codex model id (e.g. gpt-5.1-codex). Unset → the agent's CLI
+#           default (no `--model` flag).
+#   effort: reasoning effort. Codex roles translate it to
+#           `--config model_reasoning_effort=<v>` (minimal | low | medium |
+#           high); Claude roles have no effort knob. Setting effort requires
+#           an explicit model on the same role. Unset → the CLI default.
+# All-unset reproduces today's behavior exactly. The example below puts the
+# builder on claude and the reviewer on codex (the historical default).
+roles:
+  implement:
+    agent: claude
+  fix:
+    agent: claude
+  review_find:
+    agent: codex
+  review_verify:
+    agent: codex
+
 # Per-(linear-team, github-repo) bindings. The orchestrator scans each
 # team's issues and routes implementation to the paired repo.
 #
@@ -30,8 +64,19 @@ ui:
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
-    agent: claude        # builder: implement stage + local-review fix rounds
-    reviewer_agent: codex  # optional local reviewer; default is opposite of `agent`
+    # Per-binding `roles:` override — deep-merges per field over the global
+    # `roles:` above. Here the global default already puts the builder on
+    # claude and the reviewer on codex; this binding only pins its
+    # implementer to Sonnet and spends extra reasoning effort on the
+    # adversarial verifier (codex `review_verify`, with an explicit model
+    # since effort requires one). Everything unset falls back to the global
+    # cell, then to today's CLI default.
+    roles:
+      implement:
+        model: sonnet
+      review_verify:
+        model: gpt-5.1-codex
+        effort: high
     local_review: true
     remote_review: true
     issue_label: symphony
@@ -79,7 +124,7 @@ repos:
       done: Done
   - linear_team_key: WEB
     github_repo: org/marketing-web
-    agent: claude
+    # No `roles:` block → inherits the global matrix above verbatim.
     issue_label: symphony
     runner: local
     linear_states:
@@ -113,9 +158,16 @@ local_review_iteration_cap: 3
 #   local_review=false remote_review=false -> no review: implement -> PR -> CI -> merge.
 # The legacy `review_strategy` is deprecated. It is still accepted via shim,
 # but new configs should use `local_review` / `remote_review`.
-# Role knobs:
-#   agent:          builder for implementation and local-review fix rounds.
-#   reviewer_agent: local reviewer; defaults to the opposite family of `agent`.
-#   remote review:  always the `@codex` GitHub bot, not `reviewer_agent`.
-# Example: set `agent: claude` + `local_review: true` on a low-risk binding to
-# tighten the fix loop; add `remote_review: true` to also keep the bot check.
+#
+# Role knobs live in the `roles:` matrix (global default + per-binding
+# override; see the block above `repos:`). The legacy top-level role fields
+# map onto it for back-compat:
+#   agent                              -> roles.{implement,fix,accept}.agent
+#   codex_model                        -> roles.{implement,fix,accept}.model (codex)
+#   reviewer_agent                     -> roles.{review_find,review_verify}.agent
+#   reviewer_codex_model               -> roles.{review_find,review_verify}.model (codex)
+#   local_review_claude_model          -> roles.review_find.model (claude)
+#   local_review_verifier_claude_model -> roles.review_verify.model (claude)
+# These legacy fields still work but warn; setting one alongside its matrix
+# cell is a hard error. Remote review is always the `@codex` GitHub bot,
+# independent of the reviewer role's agent.

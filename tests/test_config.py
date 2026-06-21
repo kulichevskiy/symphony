@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from datetime import timedelta
 from pathlib import Path
 
@@ -1261,3 +1262,139 @@ repos:
         claude_model=fix_claude_model(cfg.repos[1]),
     )
     assert "--model" not in no_role
+
+
+# --- roles matrix: deprecation + conflict (SYM-127) -----------------------
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("agent", "codex"),
+        ("reviewer_agent", "codex"),
+        ("codex_model", "gpt-5.1-codex"),
+        ("reviewer_codex_model", "gpt-5.1-codex"),
+        ("local_review_claude_model", "sonnet"),
+        ("local_review_verifier_claude_model", "opus"),
+    ],
+)
+def test_legacy_role_field_emits_deprecation_warning(field: str, value: str) -> None:
+    """Any legacy top-level role field warns and points at the matrix."""
+    with pytest.warns(DeprecationWarning, match=field):
+        _review_binding(**{field: value})
+
+
+def test_no_legacy_role_field_no_deprecation_warning() -> None:
+    """A binding that touches no legacy role field is silent."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _review_binding(local_review=True, roles={"implement": {"agent": "claude"}})
+    assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
+
+
+def test_legacy_field_and_per_binding_matrix_conflict_fails(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy `agent` + a per-binding `roles[*].agent` for the same cell errors."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        agent: codex
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="conflicts"):
+        Config.load(p)
+
+
+def test_legacy_field_and_global_matrix_conflict_fails(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy `local_review_claude_model` + global `roles.review_find.model` errors."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+roles:
+  review_find:
+    model: sonnet
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    local_review_claude_model: haiku
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="conflicts"):
+        Config.load(p)
+
+
+def test_legacy_agent_with_matrix_model_does_not_conflict(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy `agent` and `roles.implement.model` target different cells → no error."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        model: sonnet
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role("implement", cfg.roles).model == "sonnet"
+
+
+# --- roles matrix: effort knob (SYM-127) ----------------------------------
+
+
+def test_roles_effort_unset_defaults_to_none() -> None:
+    """All-unset effort = today's CLI-default (no flag) for every role."""
+    binding = _review_binding()
+    for name in ("implement", "review_find", "review_verify", "fix", "accept"):
+        assert binding.resolved_role(name).effort is None
+
+
+def test_roles_effort_resolves_per_field_over_global(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Global `roles` effort default + per-binding override deep-merge per field.
+
+    Effort requires an explicit model (validated as a pair), so each role pins
+    a codex model; the assertion is about which `effort` wins per field.
+    """
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+roles:
+  implement:
+    agent: codex
+    model: gpt-5.1-codex
+    effort: medium
+  review_find:
+    agent: codex
+    model: gpt-5.1-codex
+    effort: high
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    roles:
+      implement:
+        effort: low
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+    assert binding.resolved_role("implement", cfg.roles).effort == "low"
+    assert binding.resolved_role("review_find", cfg.roles).effort == "high"

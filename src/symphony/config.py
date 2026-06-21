@@ -51,6 +51,32 @@ CLAUDE_MODEL_ALIASES = frozenset({"opus", "sonnet", "haiku"})
 RoleName = Literal["implement", "review_find", "review_verify", "fix", "accept"]
 _BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
 
+# Legacy top-level role fields the `roles:` matrix supersedes. Each is still
+# honored (mapped into the matrix below) but now warns, and collides loudly
+# with its matrix equivalent so an operator never sets both.
+_LEGACY_ROLE_FIELDS: frozenset[str] = frozenset(
+    {
+        "agent",
+        "reviewer_agent",
+        "codex_model",
+        "reviewer_codex_model",
+        "local_review_claude_model",
+        "local_review_verifier_claude_model",
+    }
+)
+
+# Which `(role, RoleConfig field)` cells each legacy field maps onto. Setting a
+# legacy field *and* any of its cells (in the global or per-binding `roles:`
+# block) is the conflict the guard rejects.
+_LEGACY_FIELD_CELLS: dict[str, tuple[tuple[RoleName, str], ...]] = {
+    "agent": (("implement", "agent"), ("fix", "agent"), ("accept", "agent")),
+    "codex_model": (("implement", "model"), ("fix", "model"), ("accept", "model")),
+    "reviewer_agent": (("review_find", "agent"), ("review_verify", "agent")),
+    "reviewer_codex_model": (("review_find", "model"), ("review_verify", "model")),
+    "local_review_claude_model": (("review_find", "model"),),
+    "local_review_verifier_claude_model": (("review_verify", "model"),),
+}
+
 
 class RoleConfig(BaseModel):
     """One pipeline role's `{agent, model, effort}` override.
@@ -344,6 +370,26 @@ class RepoBinding(BaseModel):
         self._apply_tracker_context_defaults()
         return self
 
+    @model_validator(mode="after")
+    def _warn_legacy_role_fields(self) -> Self:
+        """Warn when a binding still uses a legacy top-level role field.
+
+        The fields keep working (mapped into the matrix by `resolved_role`),
+        but new configs should declare a `roles:` block instead. Only fields
+        an operator actually set fire — defaults are silent.
+        """
+        used = sorted(_LEGACY_ROLE_FIELDS & self.model_fields_set)
+        if used:
+            fields = ", ".join(repr(name) for name in used)
+            warnings.warn(
+                f"binding {self.project_key}/{self.github_repo}: legacy role "
+                f"field(s) {fields} are deprecated; declare a `roles:` matrix "
+                f"block instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return self
+
     @property
     def review_strategy(self) -> Literal["remote", "local", "hybrid"]:
         """Deprecated legacy view of the review booleans.
@@ -632,6 +678,25 @@ class Config(BaseModel):
     jira_api_token: str = ""
     jira_webhook_secret: str = ""
 
+    def _reject_legacy_matrix_conflicts(self, binding: RepoBinding) -> None:
+        """Fail if a legacy field and its matrix cell are both set.
+
+        A legacy top-level field and its `roles:` equivalent (global or
+        per-binding) configure the same knob two ways; rather than pick a
+        silent winner, demand the operator set exactly one.
+        """
+        used_legacy = _LEGACY_ROLE_FIELDS & binding.model_fields_set
+        for legacy in sorted(used_legacy):
+            for role_name, field in _LEGACY_FIELD_CELLS[legacy]:
+                for scope, source in (("global", self.roles), ("binding", binding.roles)):
+                    role_cfg = source.get(role_name)
+                    if role_cfg is not None and getattr(role_cfg, field) is not None:
+                        raise ValueError(
+                            f"binding {binding.project_key}/{binding.github_repo}: "
+                            f"legacy field {legacy!r} conflicts with {scope} "
+                            f"roles[{role_name!r}].{field}; set one, not both."
+                        )
+
     @model_validator(mode="after")
     def _validate_roles(self) -> Self:
         """Validate explicitly-declared role models and warn on lost diversity.
@@ -642,6 +707,7 @@ class Config(BaseModel):
         the implementer's family warns — it forfeits cross-family blind spots.
         """
         for binding in self.repos:
+            self._reject_legacy_matrix_conflicts(binding)
             declared = set(self.roles) | set(binding.roles)
             for name in declared:
                 binding_role = binding.roles.get(name)
