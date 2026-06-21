@@ -370,7 +370,7 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
     assert str(workspace) not in body
     assert "supersecret" not in body
     assert "$" not in body
-    assert "Tokens: in 1200 · out 340 · cache w 50 / r 10 · total 1600" in body
+    assert "Tokens: in 1200 · out 340 · cache w 50 / r 10 · eff 1,604" in body
 
 
 @pytest.mark.asyncio

@@ -145,6 +145,7 @@ from ..pipeline.state_machine import (
 )
 from ..pipeline.taste_guide import load_taste_guide
 from ..pipeline.verify import VerifyResult, run_verify_session
+from ..tokens import effective_tokens
 from ..tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
@@ -12462,18 +12463,18 @@ class Orchestrator:
         last_findings = ""
         if result.last_verdict is not None and result.last_verdict.findings:
             last_findings = result.last_verdict.findings
-        total_tokens = (
-            result.input_tokens
-            + result.output_tokens
-            + result.cache_write_tokens
-            + result.cache_read_tokens
+        eff = effective_tokens(
+            result.input_tokens,
+            result.output_tokens,
+            result.cache_write_tokens,
+            result.cache_read_tokens,
         )
         body_parts = [
             f"**Local-review outcome:** `{outcome}` "
             f"(iterations={result.iterations}, "
             f"tokens: in {result.input_tokens} · out {result.output_tokens} · "
             f"cache w {result.cache_write_tokens} / r {result.cache_read_tokens} "
-            f"· total {total_tokens})",
+            f"· eff {eff:,.0f})",
         ]
         if result.error:
             body_parts.append(f"_Error:_ {result.error}")

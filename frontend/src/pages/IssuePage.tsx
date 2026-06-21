@@ -31,7 +31,13 @@ import {
   type TokenModelUsage,
   type TokenSplit,
 } from "@/lib/api";
-import { formatRelative, formatTokens, formatUtc } from "@/lib/format";
+import {
+  effectiveTokens,
+  exactInt,
+  formatRelative,
+  formatTokens,
+  formatUtc,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import {
@@ -289,8 +295,19 @@ function TokensByModel({ rows }: { rows: TokenModelUsage[] }) {
 }
 
 export function TokensCard({ c }: { c: Cockpit }) {
+  const eff = effectiveTokens(c.tokens);
   return (
-    <CockpitCard title="Tokens">
+    <CockpitCard
+      title="Tokens"
+      aside={
+        <span
+          className="text-xs font-medium text-muted-foreground"
+          title={`Effective (weighted) tokens — the per-issue budget unit: ${exactInt(eff)}`}
+        >
+          eff <span className="font-mono text-foreground">{formatTokens(eff)}</span>
+        </span>
+      }
+    >
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {TOKEN_CATS.map((s) => (
           <div
