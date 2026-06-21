@@ -129,22 +129,27 @@ class _BlockingRunner:
 def _binding(
     *,
     agent: str = "claude",
-    codex_model: str = "gpt-5.1-codex",
+    codex_model: str | None = "gpt-5.1-codex",
     issue_label: str | None = None,
     local_review: bool = False,
     remote_review: bool = True,
 ) -> RepoBinding:
-    return RepoBinding(
+    # `codex_model=None` leaves the legacy field unset (out of model_fields_set)
+    # so a binding can pair `agent` with a `roles:` model cell without tripping
+    # the legacy/matrix conflict guard.
+    kwargs: dict[str, object] = dict(
         linear_team_key="ENG",
         github_repo="org/repo",
-        agent=agent,  # type: ignore[arg-type]
-        codex_model=codex_model,
+        agent=agent,
         issue_label=issue_label,
         branch_prefix="symphony",
         local_review=local_review,
         remote_review=remote_review,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
+    if codex_model is not None:
+        kwargs["codex_model"] = codex_model
+    return RepoBinding(**kwargs)  # type: ignore[arg-type]
 
 
 def _issue() -> LinearIssue:
@@ -2304,7 +2309,7 @@ async def test_review_fix_run_carries_fix_role_model(tmp_path: Path) -> None:
 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding(agent="claude").model_copy(
+        binding = _binding(agent="claude", codex_model=None).model_copy(
             update={"roles": {"fix": RoleConfig(model="sonnet")}}
         )
         cfg = Config(
