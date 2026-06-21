@@ -39,7 +39,10 @@ ui:
 #   model:  family-specific — Claude aliases (opus / sonnet / haiku) or a
 #           Codex model id (e.g. gpt-5.1-codex). Unset → the agent's CLI
 #           default (no `--model` flag).
-#   effort: family-specific reasoning effort. Unset → the CLI default.
+#   effort: reasoning effort. Codex roles translate it to
+#           `--config model_reasoning_effort=<v>` (minimal | low | medium |
+#           high); Claude roles have no effort knob. Setting effort requires
+#           an explicit model on the same role. Unset → the CLI default.
 # All-unset reproduces today's behavior exactly. The example below puts the
 # builder on claude and the reviewer on codex (the historical default).
 roles:
@@ -65,12 +68,14 @@ repos:
     # `roles:` above. Here the global default already puts the builder on
     # claude and the reviewer on codex; this binding only pins its
     # implementer to Sonnet and spends extra reasoning effort on the
-    # adversarial verifier. Everything unset falls back to the global cell,
-    # then to today's CLI default.
+    # adversarial verifier (codex `review_verify`, with an explicit model
+    # since effort requires one). Everything unset falls back to the global
+    # cell, then to today's CLI default.
     roles:
       implement:
         model: sonnet
       review_verify:
+        model: gpt-5.1-codex
         effort: high
     local_review: true
     remote_review: true
