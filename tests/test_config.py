@@ -1201,3 +1201,63 @@ repos:
     p.write_text(raw)
     with pytest.raises(ValidationError, match="effort.*requires.*model"):
         Config.load(p)
+
+
+def test_roles_config_builds_fix_command_with_model(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A `roles`-based config drives the built `fix` claude command through
+    both builder-fix command builders (poll's `build_fix_runner_command` and
+    the local-review/verify `_build_fix_command`): resolved model → `--model`;
+    no `roles:` → no flag (today's behavior)."""
+    from symphony.orchestrator.poll import build_fix_runner_command
+    from symphony.pipeline.local_review_session import _build_fix_command
+
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      fix:
+        model: sonnet
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+    agent: claude
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+
+    def fix_claude_model(binding: RepoBinding) -> str | None:
+        role = binding.resolved_role("fix", cfg.roles)
+        return None if role.agent == "codex" else role.model
+
+    # Poll-side builder (remote @codex review fix + merge-gate fix).
+    with_role = build_fix_runner_command(
+        "claude", "fix it", claude_model=fix_claude_model(cfg.repos[0])
+    )
+    assert with_role[with_role.index("--model") + 1] == "sonnet"
+    no_role = build_fix_runner_command(
+        "claude", "fix it", claude_model=fix_claude_model(cfg.repos[1])
+    )
+    assert "--model" not in no_role
+
+    # Pipeline-side builder (local-review fix loop + verify-gate fix turn).
+    with_role = _build_fix_command(
+        agent="claude",
+        codex_model="gpt-5.1-codex",
+        prompt="fix it",
+        claude_model=fix_claude_model(cfg.repos[0]),
+    )
+    assert with_role[with_role.index("--model") + 1] == "sonnet"
+    no_role = _build_fix_command(
+        agent="claude",
+        codex_model="gpt-5.1-codex",
+        prompt="fix it",
+        claude_model=fix_claude_model(cfg.repos[1]),
+    )
+    assert "--model" not in no_role

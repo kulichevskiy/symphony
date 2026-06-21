@@ -5988,3 +5988,48 @@ async def test_no_signal_failed_non_required_check_waits_for_operator(
         assert wait.kind == db.operator_waits.KIND_MERGE
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_required_check_fix_run_carries_fix_role_model(
+    tmp_path: Path,
+) -> None:
+    """Path 4 (merge-gate fix, failed required CI): `_run_required_check_fix_agent`
+    builds a command carrying the resolved `fix` role's `--model`."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude").model_copy(
+            update={"roles": {"fix": RoleConfig(model="sonnet")}}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock()
+        )
+        captured: dict[str, list[str]] = {}
+
+        async def fake_run_stage_command(
+            **kwargs: object,
+        ) -> tuple[UsageDelta, str, int]:
+            captured["command"] = kwargs["command"]  # type: ignore[assignment]
+            return UsageDelta(), "exit", 0
+
+        orch._run_stage_command = fake_run_stage_command  # type: ignore[method-assign]  # noqa: SLF001
+        await orch._run_required_check_fix_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="fix-run",
+            workspace_path=tmp_path / "ws",
+            prompt="fix the failing check",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[argv.index("--model") + 1] == "sonnet"
+    finally:
+        await conn.close()
