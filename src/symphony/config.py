@@ -45,6 +45,11 @@ def _expand(path: str | Path) -> Path:
 # short aliases an operator types into a `roles:` block.
 CLAUDE_MODEL_ALIASES = frozenset({"opus", "sonnet", "haiku"})
 
+# Claude `--effort` scale (from `claude --help`): a role's `effort` becomes a
+# dedicated `--effort <level>` flag on the claude command, validated against
+# this family-specific set before it is threaded through. Unset → no flag.
+SUPPORTED_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
 # Every pipeline step Symphony invokes itself resolves to one of these roles.
 # Builder roles run the implementer family; review roles default to the
 # opposite family for cross-family blind-spot diversity. `accept` is dormant.
@@ -93,11 +98,9 @@ def _role_effort_in_family(
 ) -> bool:
     if effort is None:
         return True
-    # Only Codex translates `effort` to a CLI flag, so only Codex has a scale.
-    # Claude roles have no effort knob and must not silently drop the value.
     if agent == "codex":
         return effort in SUPPORTED_CODEX_EFFORTS
-    return False
+    return effort in SUPPORTED_CLAUDE_EFFORTS
 
 
 class AcceptanceConfig(BaseModel):
@@ -677,14 +680,17 @@ class Config(BaseModel):
                         )
                     if not _role_effort_in_family(role.agent, role.effort):
                         if role.agent == "codex":
-                            raise ValueError(
-                                f"role {name!r}: unknown Codex effort "
-                                f"{role.effort!r}; supported: "
-                                f"{', '.join(sorted(SUPPORTED_CODEX_EFFORTS))}"
+                            family, supported = "Codex", sorted(
+                                SUPPORTED_CODEX_EFFORTS
+                            )
+                        else:
+                            family, supported = "Claude", sorted(
+                                SUPPORTED_CLAUDE_EFFORTS
                             )
                         raise ValueError(
-                            f"role {name!r}: {role.agent} roles do not support "
-                            f"effort"
+                            f"role {name!r}: unknown {family} effort "
+                            f"{role.effort!r}; supported: "
+                            f"{', '.join(supported)}"
                         )
             implement = binding.resolved_role("implement", self.roles)
             for review_name in ("review_find", "review_verify"):

@@ -99,6 +99,17 @@ def test_claude_runner_command_omits_model_when_unset() -> None:
     assert "--model" not in argv
 
 
+def test_claude_runner_command_carries_effort_when_set() -> None:
+    argv = build_runner_command("claude", "do it", effort="high")
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert argv[-1] == "do it"
+
+
+def test_claude_runner_command_omits_effort_when_unset() -> None:
+    argv = build_runner_command("claude", "do it")
+    assert "--effort" not in argv
+
+
 def test_claude_runner_command_passes_binding_mcp_allowlist() -> None:
     servers = {"supabase": {"type": "http", "url": "https://mcp.example"}}
     argv = build_runner_command("claude", "do it", mcp_servers=servers)

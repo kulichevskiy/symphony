@@ -594,6 +594,10 @@ def build_runner_command(
 
     `claude_model` is the resolved `implement` role's Claude model: set →
     `--model <alias>`, unset → no flag (CLI default). It is ignored for codex.
+
+    `effort` is the resolved role's reasoning effort: for claude it becomes a
+    dedicated `--effort <level>` flag; for codex it becomes
+    `--config model_reasoning_effort="<v>"`. Unset → no flag (CLI default).
     """
     if agent == "claude":
         command = [
@@ -610,6 +614,8 @@ def build_runner_command(
             )
         if claude_model is not None:
             command.extend(["--model", claude_model])
+        if effort is not None:
+            command.extend(["--effort", effort])
         command.append(prompt)
         return command
     if agent == "codex":
@@ -13342,7 +13348,7 @@ class Orchestrator:
             prompt,
             codex_model=role.model if (is_codex and role.model) else binding.codex_model,
             claude_model=None if is_codex else role.model,
-            effort=role.effort if is_codex else None,
+            effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
