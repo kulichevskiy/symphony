@@ -18,6 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
+from ..tokens import effective_tokens
+
 ActivityEventKind = Literal["command_started", "command_completed", "file_changed"]
 ActivityPublishReason = Literal["interval", "threshold", "heartbeat", "final"]
 
@@ -308,11 +310,11 @@ def parse_codex_activity_line(line: str, workspace_path: Path) -> ActivityEvent 
 
 def format_activity_digest(digest: ActivityDigest) -> str:
     title_stage = digest.stage.replace("_", " ").title()
-    total_tokens = (
-        digest.input_tokens
-        + digest.output_tokens
-        + digest.cache_write_tokens
-        + digest.cache_read_tokens
+    eff = effective_tokens(
+        digest.input_tokens,
+        digest.output_tokens,
+        digest.cache_write_tokens,
+        digest.cache_read_tokens,
     )
     lines = [
         f"📡 **Activity digest — {title_stage}**",
@@ -321,7 +323,7 @@ def format_activity_digest(digest: ActivityDigest) -> str:
         (
             f"- Tokens: in {digest.input_tokens} · out {digest.output_tokens} · "
             f"cache w {digest.cache_write_tokens} / r {digest.cache_read_tokens} · "
-            f"total {total_tokens}"
+            f"eff {eff:,.0f}"
         ),
     ]
     if digest.running_commands:

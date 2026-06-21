@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
+from ..tokens import effective_tokens
 from .cost_guard import UsageDelta
 
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
@@ -327,18 +328,18 @@ def format_acceptance_verdict_comment(
     ):
         prefix = "**Acceptance: skipped - trivial change.**\n\n"
     usage = verdict.usage
-    total_tokens = (
-        usage.input_tokens
-        + usage.output_tokens
-        + usage.cache_write_tokens
-        + usage.cache_read_tokens
+    eff = effective_tokens(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_write_tokens,
+        usage.cache_read_tokens,
     )
     body = (
         f"**Acceptance verdict:** `{verdict.kind}`\n\n"
         f"- PR: {pr_url}\n"
         f"- Tokens: in {usage.input_tokens} · out {usage.output_tokens} · "
         f"cache w {usage.cache_write_tokens} / r {usage.cache_read_tokens} "
-        f"· total {total_tokens}\n"
+        f"· eff {eff:,.0f}\n"
     )
     if verdict.preview_url:
         body += f"- Dev URL: {verdict.preview_url}\n"
