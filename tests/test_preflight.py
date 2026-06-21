@@ -99,6 +99,94 @@ repos:
 """
 
 
+_STD_STATES = {
+    "Todo": "id1",
+    "In Progress": "id2",
+    "Needs Approval": "id3",
+    "Blocked": "id4",
+    "Done": "id5",
+}
+
+
+def _yaml_with_role_effort(effort: str, *, agent: str = "claude", model: str) -> str:
+    return f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    agent: {agent}
+    review_strategy: remote
+    roles:
+      implement:
+        model: {model}
+        effort: {effort}
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+
+
+def _fake_claude_caps(monkeypatch, supported: list[str]) -> None:  # type: ignore[no-untyped-def]
+    async def _fetch(_model: str) -> list[str]:
+        return list(supported)
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
+
+
+def test_preflight_accepts_supported_model_effort_pair(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+    _fake_claude_caps(monkeypatch, ["low", "medium", "high", "max"])
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("high", model="sonnet"))
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert "claude model 'sonnet' supports effort 'high'" in result.output
+
+
+def test_preflight_rejects_unsupported_model_effort_pair(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+    _fake_claude_caps(monkeypatch, ["low", "medium", "high", "max"])
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("xhigh", model="sonnet"))
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code != 0
+    assert (
+        "effort 'xhigh' not supported by claude model 'sonnet'; "
+        "supported: low, medium, high, max" in result.output
+    )
+
+
+def test_preflight_checks_codex_pair_via_family_enum(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Codex (model, effort) pairs are checked against the fixed family enum,
+    not the Models API — the claude fetcher is never called."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _boom(_model: str) -> list[str]:
+        raise AssertionError("claude Models API must not be queried for codex")
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _boom)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("high", agent="codex", model="gpt-5.1-codex"))
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert "codex model 'gpt-5.1-codex' supports effort 'high'" in result.output
+
+
 def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
