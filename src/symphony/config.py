@@ -23,7 +23,11 @@ import yaml
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .agent.codex_models import DEFAULT_CODEX_MODEL, SUPPORTED_CODEX_MODELS
+from .agent.codex_models import (
+    DEFAULT_CODEX_MODEL,
+    SUPPORTED_CODEX_EFFORTS,
+    SUPPORTED_CODEX_MODELS,
+)
 from .github.client import MergeStrategy
 from .ui.status import CanonicalState
 
@@ -49,27 +53,31 @@ _BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
 
 
 class RoleConfig(BaseModel):
-    """One pipeline role's `{agent, model}` override.
+    """One pipeline role's `{agent, model, effort}` override.
 
-    Both fields are optional so a global `roles:` default and a per-binding
+    All fields are optional so a global `roles:` default and a per-binding
     `roles:` override deep-merge per field
     (`role = merge(global[role], binding[role])`). `model=None` falls back to
     the back-compat default for the role, which may itself be `None` (no
-    `--model`, CLI default).
+    `--model`, CLI default). `effort` is a family-specific literal (like
+    `model`) validated in `Config.load`; `effort=None` passes no flag.
     """
 
     agent: Literal["claude", "codex"] | None = None
     model: str | None = None
+    effort: str | None = None
 
 
 class ResolvedRole(BaseModel):
     """A role after merge + back-compat defaults are applied.
 
     `model=None` means no `--model` flag is passed (the CLI default stands).
+    `effort=None` likewise passes no reasoning-effort flag.
     """
 
     agent: Literal["claude", "codex"]
     model: str | None = None
+    effort: str | None = None
 
 
 def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) -> bool:
@@ -78,6 +86,18 @@ def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) 
     if agent == "codex":
         return model in SUPPORTED_CODEX_MODELS
     return model in CLAUDE_MODEL_ALIASES
+
+
+def _role_effort_in_family(
+    agent: Literal["claude", "codex"], effort: str | None
+) -> bool:
+    if effort is None:
+        return True
+    # Only Codex translates `effort` to a CLI flag, so only Codex has a scale.
+    # Claude roles have no effort knob and must not silently drop the value.
+    if agent == "codex":
+        return effort in SUPPORTED_CODEX_EFFORTS
+    return False
 
 
 class AcceptanceConfig(BaseModel):
@@ -466,17 +486,26 @@ class RepoBinding(BaseModel):
         global_role = (global_roles or {}).get(name)
         agent: Literal["claude", "codex"] | None = None
         model: str | None = None
+        effort: str | None = None
         if binding_role is not None:
-            agent, model = binding_role.agent, binding_role.model
+            agent, model, effort = (
+                binding_role.agent,
+                binding_role.model,
+                binding_role.effort,
+            )
         if agent is None and global_role is not None:
             agent = global_role.agent
         if model is None and global_role is not None:
             model = global_role.model
+        if effort is None and global_role is not None:
+            effort = global_role.effort
         if agent is None:
             agent = self._default_role_agent(name)
         if model is None:
             model = self._default_role_model(name, agent)
-        return ResolvedRole(agent=agent, model=model)
+        # `effort` has no legacy top-level field, so its only source is the
+        # `roles:` blocks; unset stays None (no flag).
+        return ResolvedRole(agent=agent, model=model, effort=effort)
 
 
 class Secrets(BaseSettings):
@@ -615,17 +644,18 @@ class Config(BaseModel):
         for binding in self.repos:
             declared = set(self.roles) | set(binding.roles)
             for name in declared:
+                binding_role = binding.roles.get(name)
+                global_role = self.roles.get(name)
                 explicit_model = (
-                    binding.roles.get(name) is not None
-                    and binding.roles[name].model is not None
-                ) or (
-                    self.roles.get(name) is not None
-                    and self.roles[name].model is not None
-                )
-                if not explicit_model:
+                    binding_role is not None and binding_role.model is not None
+                ) or (global_role is not None and global_role.model is not None)
+                explicit_effort = (
+                    binding_role is not None and binding_role.effort is not None
+                ) or (global_role is not None and global_role.effort is not None)
+                if not (explicit_model or explicit_effort):
                     continue
                 role = binding.resolved_role(name, self.roles)
-                if not _role_model_in_family(role.agent, role.model):
+                if explicit_model and not _role_model_in_family(role.agent, role.model):
                     if role.agent == "codex":
                         family, supported = "Codex", sorted(SUPPORTED_CODEX_MODELS)
                     else:
@@ -634,6 +664,28 @@ class Config(BaseModel):
                         f"role {name!r}: unknown {family} model {role.model!r}; "
                         f"supported: {', '.join(supported)}"
                     )
+                if explicit_effort:
+                    # The effort/model pair is validated together (a model can
+                    # constrain its valid efforts), and only the model pins the
+                    # family — so effort without an explicit model can't be
+                    # checked locally.
+                    if not explicit_model:
+                        raise ValueError(
+                            f"role {name!r}: effort {role.effort!r} requires an "
+                            f"explicit model (the effort/model pair can't be "
+                            f"validated otherwise)"
+                        )
+                    if not _role_effort_in_family(role.agent, role.effort):
+                        if role.agent == "codex":
+                            raise ValueError(
+                                f"role {name!r}: unknown Codex effort "
+                                f"{role.effort!r}; supported: "
+                                f"{', '.join(sorted(SUPPORTED_CODEX_EFFORTS))}"
+                            )
+                        raise ValueError(
+                            f"role {name!r}: {role.agent} roles do not support "
+                            f"effort"
+                        )
             implement = binding.resolved_role("implement", self.roles)
             for review_name in ("review_find", "review_verify"):
                 review = binding.resolved_role(review_name, self.roles)

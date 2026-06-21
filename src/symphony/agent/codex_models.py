@@ -34,6 +34,11 @@ CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, CodexModelPricing] = {
 
 SUPPORTED_CODEX_MODELS = frozenset(CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS)
 
+# Codex `model_reasoning_effort` scale. Mirrors the `model` literal: a role's
+# `effort` is validated against this family-specific set before it becomes a
+# `--config model_reasoning_effort="<v>"` flag on the codex command.
+SUPPORTED_CODEX_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
+
 
 def pricing_for_codex_model(model: str) -> CodexModelPricing:
     try:
@@ -45,6 +50,7 @@ def pricing_for_codex_model(model: str) -> CodexModelPricing:
 __all__ = [
     "CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS",
     "DEFAULT_CODEX_MODEL",
+    "SUPPORTED_CODEX_EFFORTS",
     "SUPPORTED_CODEX_MODELS",
     "CodexModelPricing",
     "pricing_for_codex_model",

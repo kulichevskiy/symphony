@@ -1130,3 +1130,74 @@ repos:
     assert with_role[with_role.index("--model") + 1] == "sonnet"
     # Binding without a `roles:` block → claude CLI default, no `--model`.
     assert "--model" not in implement_command(cfg.repos[1])
+
+
+def test_roles_effort_resolves_and_builds_codex_command(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A codex role with `effort` resolves onto the role and drives the codex
+    command's `model_reasoning_effort` flag."""
+    from symphony.orchestrator.poll import build_runner_command
+
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    roles:
+      implement:
+        model: gpt-5.1-codex
+        effort: high
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    role = cfg.repos[0].resolved_role("implement", cfg.roles)
+    assert role.effort == "high"
+    command = build_runner_command(
+        role.agent,
+        "do it",
+        codex_model=role.model or "gpt-5.1-codex",
+        effort=role.effort,
+        workspace_path=tmp_path,
+    )
+    assert 'model_reasoning_effort="high"' in command
+
+
+def test_roles_unknown_codex_effort_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    roles:
+      implement:
+        model: gpt-5.1-codex
+        effort: turbo
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Codex effort"):
+        Config.load(p)
+
+
+def test_roles_effort_without_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    roles:
+      implement:
+        effort: high
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="effort.*requires.*model"):
+        Config.load(p)

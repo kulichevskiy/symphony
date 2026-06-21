@@ -580,6 +580,7 @@ def build_runner_command(
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
+    effort: str | None = None,
     workspace_path: Path | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
@@ -616,6 +617,7 @@ def build_runner_command(
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
+            effort=effort,
         )
     raise ValueError(f"unknown agent {agent!r}")
 
@@ -13339,6 +13341,7 @@ class Orchestrator:
             prompt,
             codex_model=role.model if (is_codex and role.model) else binding.codex_model,
             claude_model=None if is_codex else role.model,
+            effort=role.effort if is_codex else None,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
