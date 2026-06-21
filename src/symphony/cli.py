@@ -440,9 +440,11 @@ async def _preflight(config_path: Path) -> None:
     else:
         click.echo("codex permissions profile not required by configured repos")
     try:
-        caps_ok = await _preflight_validate_capabilities(cfg)
+        # Structural binding checks first: they emit their findings before the
+        # online capability check, so an ANTHROPIC_API_KEY gap can't mask them.
         async with _configured_tracker_registry(cfg) as (trackers, _):
             ok = await _preflight_configured_bindings(cfg, trackers)
+        caps_ok = await _preflight_validate_capabilities(cfg)
     except ValueError as e:
         click.echo(str(e), err=True)
         sys.exit(2)

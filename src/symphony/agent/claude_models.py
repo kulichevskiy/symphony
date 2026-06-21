@@ -22,8 +22,9 @@ async def fetch_claude_effort_capabilities(model: str) -> list[str]:
 
     Reads the Models API `capabilities.effort.<level>` tree for `model`
     (`opus`/`sonnet`/`haiku` aliases flow through unchanged). Requires
-    `ANTHROPIC_API_KEY`; raises `ValueError` if it is missing so preflight can
-    report a clean message instead of a bare auth error.
+    `ANTHROPIC_API_KEY`; raises `ValueError` — not a bare `httpx` error — when
+    the key is missing or the request fails (auth, network, timeout), so
+    preflight can report a clean message instead of a raw traceback.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -31,16 +32,29 @@ async def fetch_claude_effort_capabilities(model: str) -> list[str]:
             "ANTHROPIC_API_KEY is empty; cannot query the Models API to "
             f"validate claude model {model!r}"
         )
-    async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
-        resp = await client.get(
-            f"/v1/models/{model}",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": _ANTHROPIC_VERSION,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    try:
+        async with httpx.AsyncClient(
+            base_url=CLAUDE_MODELS_API_BASE, timeout=30
+        ) as client:
+            resp = await client.get(
+                f"/v1/models/{model}",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": _ANTHROPIC_VERSION,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as e:
+        raise ValueError(
+            f"Models API returned HTTP {e.response.status_code} for claude "
+            f"model {model!r}; cannot validate its effort capabilities"
+        ) from e
+    except httpx.HTTPError as e:
+        raise ValueError(
+            f"could not reach the Models API to validate claude model "
+            f"{model!r}: {e}"
+        ) from e
     effort_tree = (data.get("capabilities") or {}).get("effort") or {}
     return list(effort_tree)
 

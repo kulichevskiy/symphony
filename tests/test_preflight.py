@@ -5,8 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import httpx
+import pytest
 from click.testing import CliRunner
 
+from symphony.agent.claude_models import fetch_claude_effort_capabilities
 from symphony.cli import main
 
 
@@ -127,6 +130,86 @@ repos:
       blocked: Blocked
       done: Done
 """
+
+
+def _install_mock_transport(monkeypatch, handler) -> None:  # type: ignore[no-untyped-def]
+    """Make `fetch_claude_effort_capabilities` route through `handler` so the
+    real request/`raise_for_status` path is exercised without the network."""
+    import symphony.agent.claude_models as cm
+
+    real_client = cm.httpx.AsyncClient
+
+    def _client(*args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(cm.httpx, "AsyncClient", _client)
+
+
+async def test_fetch_claude_effort_capabilities_parses_effort_tree(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-api-key"] == "sk-test"
+        return httpx.Response(
+            200,
+            json={"capabilities": {"effort": {"low": {}, "medium": {}, "high": {}}}},
+        )
+
+    _install_mock_transport(monkeypatch, _handler)
+    assert await fetch_claude_effort_capabilities("sonnet") == [
+        "low",
+        "medium",
+        "high",
+    ]
+
+
+async def test_fetch_claude_effort_capabilities_missing_key_raises_valueerror(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
+        await fetch_claude_effort_capabilities("sonnet")
+
+
+async def test_fetch_claude_effort_capabilities_http_error_raises_valueerror(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """A 401 from an invalid key surfaces as a clean ValueError, not a raw
+    httpx.HTTPStatusError that would escape preflight's `except ValueError`."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "bad")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "auth"})
+
+    _install_mock_transport(monkeypatch, _handler)
+    with pytest.raises(ValueError, match="HTTP 401"):
+        await fetch_claude_effort_capabilities("sonnet")
+
+
+def test_preflight_exits_cleanly_when_fetcher_http_errors(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """An httpx error from the fetcher must not escape as a traceback — preflight
+    exits 2 with a message via the re-raised ValueError."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(
+        monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES})
+    )
+
+    async def _raise(_model: str) -> list[str]:
+        raise ValueError("Models API returned HTTP 401 for claude model 'sonnet'")
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _raise)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("high", model="sonnet"))
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "HTTP 401" in result.output
 
 
 def _fake_claude_caps(monkeypatch, supported: list[str]) -> None:  # type: ignore[no-untyped-def]
