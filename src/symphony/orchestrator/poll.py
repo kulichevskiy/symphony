@@ -77,6 +77,7 @@ from ..linear.templates import (
     acceptance_retry_requested,
     acceptance_skipped,
     awaiting_approval,
+    budget_exceeded,
     codex_lgtm,
     command_rejected,
     failed,
@@ -1809,6 +1810,7 @@ class Orchestrator:
         self._review_failed_run_bindings: dict[str, RepoBinding] = {}
         self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
         self._acceptance_rejected_run_bindings: dict[str, RepoBinding] = {}
+        self._budget_exceeded_run_bindings: dict[str, RepoBinding] = {}
         self._runs_moved_to_in_progress: set[str] = set()
         self._review_poll_tasks: set[asyncio.Task[None]] = set()
         self._review_poll_run_ids: set[str] = set()
@@ -2752,6 +2754,9 @@ class Orchestrator:
         if run_id in self._acceptance_rejected_run_bindings:
             await self._handle_acceptance_rejected_slash_intent(issue_id, run_id, intent)
             return
+        if run_id in self._budget_exceeded_run_bindings:
+            await self._handle_budget_exceeded_slash_intent(issue_id, run_id, intent)
+            return
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if wait is not None:
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
@@ -2787,6 +2792,11 @@ class Orchestrator:
                 return
             if wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
                 await self._handle_acceptance_rejected_slash_intent(
+                    issue_id, run_id, intent
+                )
+                return
+            if wait.kind == db.operator_waits.KIND_BUDGET_EXCEEDED:
+                await self._handle_budget_exceeded_slash_intent(
                     issue_id, run_id, intent
                 )
                 return
@@ -3347,6 +3357,7 @@ class Orchestrator:
                 db.operator_waits.KIND_MERGE,
                 db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
                 db.operator_waits.KIND_ACCEPTANCE_REJECTED,
+                db.operator_waits.KIND_BUDGET_EXCEEDED,
             ):
                 log.warning(
                     "ignoring unsupported operator wait kind %r for issue %s",
@@ -3389,6 +3400,8 @@ class Orchestrator:
             self._merge_needs_approval_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
             self._acceptance_rejected_run_bindings[wait.run_id] = binding
+        elif wait.kind == db.operator_waits.KIND_BUDGET_EXCEEDED:
+            self._budget_exceeded_run_bindings[wait.run_id] = binding
 
     async def _restore_operator_wait_binding(
         self,
@@ -3723,7 +3736,202 @@ class Orchestrator:
         self._review_failed_run_bindings.pop(run_id, None)
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
+        self._budget_exceeded_run_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
+
+    async def _token_budget_ceiling(
+        self, issue_id: str, binding: RepoBinding
+    ) -> float | None:
+        """Soft ceiling = `per_issue_token_budget + granted_token_budget`.
+
+        Returns `None` when the gate is off for this binding (no global
+        default and no per-binding override).
+        """
+        budget = binding.resolved_per_issue_token_budget(
+            self.config.per_issue_token_budget
+        )
+        if budget is None:
+            return None
+        granted = await db.issues.get_granted_token_budget(self._conn, issue_id)
+        return float(budget + granted)
+
+    async def _would_exceed_token_budget(
+        self, issue_id: str, binding: RepoBinding
+    ) -> bool:
+        """True when cumulative effective tokens have reached the ceiling.
+
+        Soft gate: uses whatever token data is recorded; the ~40% of runs
+        without token data err toward *not* parking, which is acceptable.
+        """
+        ceiling = await self._token_budget_ceiling(issue_id, binding)
+        if ceiling is None:
+            return False
+        tokens = await db.runs.tokens_for_issue(self._conn, issue_id)
+        return tokens.effective_tokens >= ceiling
+
+    async def _maybe_park_for_token_budget(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> bool:
+        """Park the issue instead of dispatching its next run if over budget.
+
+        Evaluated at agent-dispatch boundaries (never mid-run — runaway within
+        one process is covered by `stall_timeout`). Returns True when parked,
+        so the caller skips the dispatch it was about to make.
+        """
+        if not await self._would_exceed_token_budget(issue_id, binding):
+            return False
+        await self._park_for_token_budget(issue_id, run_id, binding)
+        return True
+
+    async def _park_for_token_budget(
+        self, issue_id: str, run_id: str, binding: RepoBinding
+    ) -> None:
+        ceiling = await self._token_budget_ceiling(issue_id, binding)
+        tokens = await db.runs.tokens_for_issue(self._conn, issue_id)
+        breakdown = await db.runs.effective_tokens_by_stage_for_issue(
+            self._conn, issue_id
+        )
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        tracker = self.tracker(binding)
+        pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
+        body = budget_exceeded(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=pr.pr_number if pr is not None else 0,
+                run_id=run_id,
+                pr_url=pr.pr_url if pr is not None else "(no PR yet)",
+            ),
+            used_effective=tokens.effective_tokens,
+            ceiling=ceiling or 0.0,
+            breakdown=list(breakdown.items()),
+        )
+        try:
+            await tracker.post_comment(tracker_issue_id, truncate_body(body))
+        except LinearError as e:
+            log.warning("budget-exceeded comment failed for %s: %s", issue_id, e)
+        try:
+            states = await self._states_for_binding(binding)
+            needs_approval_id = states.get(binding.linear_states.needs_approval)
+            if needs_approval_id is not None:
+                await tracker.move_issue(tracker_issue_id, needs_approval_id)
+        except LinearError as e:
+            log.warning("could not park %s for token budget: %s", issue_id, e)
+        # Complete the boundary run row (no subprocess is live at a dispatch
+        # boundary) so the issue has no active run blocking re-dispatch after
+        # `$approve`. The live agent is never killed.
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            "completed",
+            ended_at=datetime.now(UTC).isoformat(),
+        )
+        self._dispatch_run_ids[issue_id] = run_id
+        self._operator_wait_run_ids.add(run_id)
+        self._budget_exceeded_run_bindings[run_id] = binding
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=issue_id,
+            run_id=run_id,
+            kind=db.operator_waits.KIND_BUDGET_EXCEEDED,
+            linear_team_key=binding.linear_team_key,
+            github_repo=binding.github_repo,
+            issue_label=binding.issue_label or "",
+            created_at=datetime.now(UTC).isoformat(),
+            provider=binding.provider,
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+
+    async def _handle_budget_exceeded_slash_intent(
+        self, issue_id: str, run_id: str, intent: SlashIntent
+    ) -> None:
+        binding = self._budget_exceeded_run_bindings.get(run_id)
+        if binding is None:
+            binding = await self._restore_operator_wait_binding(
+                issue_id,
+                run_id,
+                intent,
+                expected_kinds=(db.operator_waits.KIND_BUDGET_EXCEEDED,),
+            )
+            if binding is None:
+                return
+
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        tracker = self.tracker(binding)
+        states = await self._states_for_binding(binding)
+        if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
+            # Grant one more budget window (repeatable). Raising the ceiling
+            # before re-dispatch keeps the guard from immediately re-parking.
+            budget = binding.resolved_per_issue_token_budget(
+                self.config.per_issue_token_budget
+            )
+            if budget is not None:
+                await db.issues.add_granted_token_budget(
+                    self._conn, issue_id, budget
+                )
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                log.warning(
+                    "could not resume budget-parked run %s: missing ready state %r",
+                    run_id,
+                    binding.linear_states.ready,
+                )
+                return
+            try:
+                await tracker.move_issue(tracker_issue_id, ready_id)
+            except LinearError as e:
+                log.warning("could not move %s to ready for resume: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to ready state for resume: {e}",
+                ) from e
+            body = resumed(
+                CommentVars(
+                    stage="implement",
+                    repo=binding.github_repo,
+                    issue=0,
+                    run_id=run_id,
+                    next_stage=binding.linear_states.ready,
+                )
+            )
+            try:
+                await tracker.post_comment(tracker_issue_id, truncate_body(body))
+            except LinearError as e:
+                log.warning("budget resume comment failed for %s: %s", issue_id, e)
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
+            blocked_id = states.get(binding.linear_states.blocked)
+            if blocked_id is None:
+                log.warning(
+                    "could not block budget-parked run %s: missing blocked state %r",
+                    run_id,
+                    binding.linear_states.blocked,
+                )
+                await self._post_command_rejected(
+                    issue_id,
+                    self._slash_text(intent),
+                    "missing blocked state; keeping issue parked",
+                )
+                return
+            try:
+                await tracker.move_issue(tracker_issue_id, blocked_id)
+            except LinearError as e:
+                log.warning("could not move %s to blocked: %s", issue_id, e)
+                raise SlashHandlerFailure(
+                    slash_text=self._slash_text(intent),
+                    reason=f"could not move issue to blocked state: {e}",
+                ) from e
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+
+        log.info(
+            "slash %s received for budget-parked run %s (ignored)",
+            intent.kind,
+            run_id,
+        )
 
     async def _reconcile_orphaned_merge_runs(self, *, reason: str = "manual") -> int:
         """Retire zombie merge `needs_approval` runs whose operator wait is gone.
@@ -4867,6 +5075,10 @@ class Orchestrator:
 
         if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
             return False
+        # Soft per-issue token-budget gate at the remote-review / merge-gate
+        # fix-run dispatch boundary: park instead of dispatching the next fix.
+        if await self._maybe_park_for_token_budget(storage_issue_id, run.id, binding):
+            return True
         if verdict.merge_conflict:
             if not should_dispatch_fix_run(
                 prev_signature=state.last_trigger_signature,
@@ -11112,6 +11324,16 @@ class Orchestrator:
         should stop — the run state is already recorded.
         """
         issue_id = storage_issue_id
+
+        # Soft per-issue token-budget gate at the pre-push fix boundary
+        # (next local-review fix / verify-gate fix). The implement agent step
+        # has finished; if the issue has already crossed its budget, park
+        # rather than spawning further fix turns. Evaluated only when fixes
+        # could be dispatched (`allow_fixes`), never mid-run.
+        if allow_fixes and await self._maybe_park_for_token_budget(
+            issue_id, run_id, binding
+        ):
+            return False, None
 
         # 4.5. Local-review pre-flight. When `binding.local_review` is set,
         # run the reviewer in-workspace before pushing. This shortens the

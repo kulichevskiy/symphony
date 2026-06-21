@@ -165,6 +165,40 @@ def stuck_loop_escape(v: CommentVars) -> str:
     )
 
 
+def budget_exceeded(
+    v: CommentVars,
+    *,
+    used_effective: float,
+    ceiling: float,
+    breakdown: list[tuple[str, float]],
+) -> str:
+    """Per-issue token budget tripped — parked for a human decision.
+
+    Shows effective tokens used vs the ceiling (`per_issue_token_budget +
+    granted_token_budget`) with a per-stage breakdown. The unit is effective
+    tokens (input + output + cache_write*1.25 + cache_read*0.1), not dollars.
+    The live agent is never killed; the next run was simply not dispatched.
+    """
+    lines = "".join(
+        f"  - {stage}: {round(value):,}\n"
+        for stage, value in sorted(breakdown, key=lambda kv: kv[1], reverse=True)
+    )
+    return (
+        f"🟡 **Token budget exceeded — parked for approval**\n\n"
+        f"Symphony has paused `{v.repo}#{v.issue}`: this issue's cumulative "
+        f"effective tokens crossed its per-issue budget.\n\n"
+        f"- Effective tokens used: **{round(used_effective):,}** "
+        f"(ceiling **{round(ceiling):,}**)\n"
+        f"- Unit: effective tokens "
+        f"(in + out + cache_write×1.25 + cache_read×0.1), not dollars\n"
+        f"- Per-stage breakdown:\n{lines}"
+        f"- Run ID: `{v.run_id}`\n"
+        f"- PR: {v.pr_url}\n\n"
+        f"Reply with `$approve` (or 👍) to grant another budget window and "
+        f"resume, or `$reject` to stop here.\n"
+    )
+
+
 def acceptance_blocked(v: CommentVars) -> str:
     detail = f"\n\nLast infra error: {v.error}\n" if v.error else "\n"
     return (

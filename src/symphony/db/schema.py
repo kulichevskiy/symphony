@@ -50,6 +50,10 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE issues ADD COLUMN site TEXT NOT NULL DEFAULT 'default'"
         )
+    if "granted_token_budget" not in issue_cols:
+        await conn.execute(
+            "ALTER TABLE issues ADD COLUMN granted_token_budget INTEGER DEFAULT 0"
+        )
     await conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_tracker_identity

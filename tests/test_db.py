@@ -260,6 +260,98 @@ async def test_runs_add_usage_accumulates_all_buckets(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_granted_token_budget_defaults_zero_and_accumulates(
+    tmp_path: Path,
+) -> None:
+    """Default 0; `$approve` grants repeatable windows; survives reconnect."""
+    path = tmp_path / "s.sqlite"
+    conn = await db.connect(path)
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        assert await db.issues.get_granted_token_budget(conn, "iss-1") == 0
+        assert await db.issues.add_granted_token_budget(conn, "iss-1", 20_000_000) == (
+            20_000_000
+        )
+        # Repeatable: each approval grants one more window.
+        assert await db.issues.add_granted_token_budget(conn, "iss-1", 20_000_000) == (
+            40_000_000
+        )
+    finally:
+        await conn.close()
+
+    # Survives restart.
+    conn = await db.connect(path)
+    try:
+        assert await db.issues.get_granted_token_budget(conn, "iss-1") == 40_000_000
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_effective_tokens_weighting_and_per_stage_breakdown(
+    tmp_path: Path,
+) -> None:
+    """Effective tokens = in + out + cache_write*1.25 + cache_read*0.1,
+    summed across ALL of an issue's runs and broken down per stage."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="r-impl",
+            issue_id="iss-1",
+            stage="implement",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.add_usage(
+            conn,
+            "r-impl",
+            cost_usd=0.0,
+            input_tokens=1000,
+            output_tokens=200,
+            cache_write_tokens=400,
+            cache_read_tokens=10000,
+        )
+        await db.runs.create(
+            conn,
+            id="r-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T01:00:00+00:00",
+        )
+        await db.runs.add_usage(
+            conn,
+            "r-fix",
+            cost_usd=0.0,
+            input_tokens=100,
+            output_tokens=50,
+            cache_write_tokens=0,
+            cache_read_tokens=0,
+        )
+
+        tokens = await db.runs.tokens_for_issue(conn, "iss-1")
+        breakdown = await db.runs.effective_tokens_by_stage_for_issue(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    # implement: 1000 + 200 + 400*1.25 + 10000*0.1 = 1000+200+500+1000 = 2700
+    # review_fix: 100 + 50 = 150
+    assert tokens.effective_tokens == pytest.approx(2850.0)
+    assert breakdown == {
+        "implement": pytest.approx(2700.0),
+        "review_fix": pytest.approx(150.0),
+    }
+
+
+@pytest.mark.asyncio
 async def test_update_status_persists_unknown_for_unclassified_terminal_status(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

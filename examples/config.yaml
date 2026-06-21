@@ -144,6 +144,22 @@ review_iteration_cap: 6
 # the reviewer needs more rounds.
 local_review_iteration_cap: 3
 
+# Soft per-issue token budget. Off by default (omit / null) — no behavior
+# change. When set, an issue whose cumulative *effective tokens* cross
+# `per_issue_token_budget + granted_token_budget` is parked in Needs Approval
+# at the next agent-dispatch boundary instead of dispatching the next run; the
+# live agent is never killed. Resume with `$approve`/👍 (grants one more
+# budget window) or stop with `$reject`. Orthogonal to the iteration caps.
+#
+# The unit is EFFECTIVE TOKENS, NOT DOLLARS:
+#   effective = input + output + cache_write*1.25 + cache_read*0.1
+# summed across every run (implement, review, all fix paths, both Claude and
+# Codex). Dollars are list-price-notional under a flat subscription, so tokens
+# are the only honest, family-neutral signal. Recommended starting value
+# ~20_000_000 ≈ p95–p97 of current per-issue effective tokens (~4% of issues
+# trip). Per-binding override: set `per_issue_token_budget` on a repo entry.
+# per_issue_token_budget: 20_000_000
+
 # Review notes (per-binding `local_review` / `remote_review` booleans):
 #   local_review:  run the in-workspace reviewer loop before opening the PR;
 #                  the issue moves through `linear_states.local_code_review`.

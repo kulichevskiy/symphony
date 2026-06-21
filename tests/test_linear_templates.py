@@ -5,6 +5,7 @@ import pytest
 from symphony.linear.templates import (
     CommentVars,
     awaiting_approval,
+    budget_exceeded,
     failed,
     fix_pushed,
     implement_blocked,
@@ -12,6 +13,27 @@ from symphony.linear.templates import (
     stage_done,
     stuck_loop_escape,
 )
+
+
+def test_budget_exceeded_shows_effective_tokens_ceiling_and_breakdown() -> None:
+    body = budget_exceeded(
+        CommentVars(stage="review", repo="org/repo", issue=7, run_id="run-9"),
+        used_effective=21_000_000.0,
+        ceiling=20_000_000.0,
+        breakdown=[("implement", 15_000_000.0), ("review_fix", 6_000_000.0)],
+    )
+    assert body.startswith("🟡 **Token budget exceeded")
+    assert "21,000,000" in body
+    assert "20,000,000" in body
+    # Per-stage breakdown, sorted descending.
+    assert body.index("implement") < body.index("review_fix")
+    assert "15,000,000" in body
+    # States the unit is effective tokens, not dollars.
+    assert "effective tokens" in body
+    assert "not dollars" in body
+    # Resume affordances.
+    assert "$approve" in body
+    assert "$reject" in body
 
 
 def test_run_started_comment_uses_emoji_marker() -> None:

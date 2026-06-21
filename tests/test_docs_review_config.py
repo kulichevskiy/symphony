@@ -39,6 +39,17 @@ def test_example_config_documents_roles_matrix() -> None:
     assert "agent                              -> roles.{implement,fix,accept}.agent" in text
 
 
+def test_example_config_documents_per_issue_token_budget() -> None:
+    text = _read("examples/config.yaml")
+
+    assert "per_issue_token_budget" in text
+    # Recommended starting value.
+    assert "20_000_000" in text
+    # The unit is effective tokens, not dollars.
+    assert "effective tokens" in text.lower()
+    assert "not dollars" in text.lower()
+
+
 def test_readme_documents_review_venues_and_role_knobs() -> None:
     text = _read("README.md")
 

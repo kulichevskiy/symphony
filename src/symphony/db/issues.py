@@ -115,3 +115,45 @@ async def _execute_upsert(
         """,
         (storage_id, tracker_issue_id, provider, site, identifier, title, team_key),
     )
+
+
+async def get_granted_token_budget(
+    conn: aiosqlite.Connection, issue_id: str
+) -> int:
+    """Extra effective-token budget granted via `$approve` on a budget trip.
+
+    Returns 0 for an unknown issue or a NULL column (the default).
+    """
+    cur = await conn.execute(
+        "SELECT granted_token_budget FROM issues WHERE id = ?",
+        (issue_id,),
+    )
+    row = await cur.fetchone()
+    if row is None or row[0] is None:
+        return 0
+    return int(row[0])
+
+
+async def add_granted_token_budget(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    amount: int,
+    *,
+    commit: bool = True,
+) -> int:
+    """Grant `amount` more effective tokens to this issue; return the new total.
+
+    Each `$approve`/👍 after a budget trip grants one more window, so this is
+    additive and repeatable. Survives restart (persisted on `issues`).
+    """
+    await conn.execute(
+        """
+        UPDATE issues
+           SET granted_token_budget = COALESCE(granted_token_budget, 0) + ?
+         WHERE id = ?
+        """,
+        (amount, issue_id),
+    )
+    if commit:
+        await conn.commit()
+    return await get_granted_token_budget(conn, issue_id)
