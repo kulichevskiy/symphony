@@ -1167,6 +1167,59 @@ repos:
     assert 'model_reasoning_effort="high"' in command
 
 
+def test_roles_effort_resolves_and_builds_claude_command(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A claude role with `effort` resolves onto the role and drives the claude
+    command's `--effort` flag."""
+    from symphony.orchestrator.poll import build_runner_command
+
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        model: opus
+        effort: high
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    role = cfg.repos[0].resolved_role("implement", cfg.roles)
+    assert role.effort == "high"
+    command = build_runner_command(
+        role.agent,
+        "do it",
+        claude_model=role.model,
+        effort=role.effort,
+        workspace_path=tmp_path,
+    )
+    assert command[command.index("--effort") + 1] == "high"
+
+
+def test_roles_unknown_claude_effort_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        model: opus
+        effort: turbo
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Claude effort"):
+        Config.load(p)
+
+
 def test_roles_unknown_codex_effort_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
