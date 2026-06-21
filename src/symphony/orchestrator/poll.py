@@ -3794,13 +3794,24 @@ class Orchestrator:
         tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(binding)
         pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
+        # Surface the real boundary stage + human identifier in the comment.
+        # The run row is absent only when a merge-gate park synthesizes a fix
+        # run id (no live merge run); fall back to the PR-implied stage there.
+        run_row = await db.runs.get_with_issue(self._conn, run_id)
+        stage = (
+            run_row.run.stage
+            if run_row is not None
+            else ("review" if pr is not None else "implement")
+        )
+        linear_identifier = run_row.identifier if run_row is not None else ""
         body = budget_exceeded(
             CommentVars(
-                stage="implement",
+                stage=stage,
                 repo=binding.github_repo,
                 issue=pr.pr_number if pr is not None else 0,
                 run_id=run_id,
                 pr_url=pr.pr_url if pr is not None else "(no PR yet)",
+                linear_identifier=linear_identifier,
             ),
             used_effective=tokens.effective_tokens,
             ceiling=ceiling or 0.0,
@@ -3870,6 +3881,37 @@ class Orchestrator:
                 await db.issues.add_granted_token_budget(
                     self._conn, issue_id, budget
                 )
+            # If the parked boundary already has an open PR (any review/merge
+            # boundary), re-dispatch the review monitor directly. Routing
+            # through the ready scan would hit `_blocking_existing_pr` /
+            # `_park_already_has_pr`, which bounces an open-PR issue to In
+            # Progress — review never resumes and the granted window is wasted.
+            pr = await db.issue_prs.get(
+                self._conn,
+                issue_id=issue_id,
+                github_repo=binding.github_repo,
+            )
+            if pr is not None and pr.merged_at is None:
+                # Look up the issue BEFORE clearing the wait (in the helper) so
+                # a lookup failure leaves the wait intact for the next tick.
+                try:
+                    issue = await tracker.lookup_issue(tracker_issue_id)
+                except LinearError as e:
+                    log.warning("could not look up %s for resume: %s", issue_id, e)
+                    raise SlashHandlerFailure(
+                        slash_text=self._slash_text(intent),
+                        reason=f"could not look up issue for resume: {e}",
+                    ) from e
+                await self._resume_review_monitor(
+                    binding=binding,
+                    issue=issue,
+                    issue_id=issue_id,
+                    tracker_issue_id=tracker_issue_id,
+                    run_id=run_id,
+                )
+                return
+            # No open PR yet (implement boundary): the ready scan dispatches
+            # implement — the existing-PR guard is a no-op without a PR.
             ready_id = states.get(binding.linear_states.ready)
             if ready_id is None:
                 log.warning(
@@ -6079,6 +6121,15 @@ class Orchestrator:
             )
             return False
 
+        # Soft per-issue token-budget gate at the merge-gate fix-run dispatch
+        # boundary: park instead of dispatching the next fix. Mirrors the
+        # remote-review gate. No fix run exists yet at this boundary, so fall
+        # back to a fresh run id when no live merge run is driving us.
+        if await self._maybe_park_for_token_budget(
+            issue.id, merge_run_id or str(uuid.uuid4()), binding
+        ):
+            return False
+
         iteration = state.iteration + 1
         dispatched = await self._dispatch_merge_required_check_fix_run(
             binding=binding,
@@ -7439,6 +7490,33 @@ class Orchestrator:
                 slash_text=self._slash_text(intent),
                 reason=f"could not look up issue for retry: {e}",
             ) from e
+        await self._resume_review_monitor(
+            binding=binding,
+            issue=issue,
+            issue_id=issue_id,
+            tracker_issue_id=tracker_issue_id,
+            run_id=run_id,
+        )
+
+    async def _resume_review_monitor(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        issue_id: str,
+        tracker_issue_id: str,
+        run_id: str,
+    ) -> None:
+        """Clear the operator wait, re-create a `review` run and re-arm the
+        passive review monitor.
+
+        Shared by review-failed `$retry` and budget-exceeded `$approve`
+        resumes. Re-dispatching review directly (instead of routing the issue
+        back through the ready scan) is what keeps an open-PR issue clear of
+        `_blocking_existing_pr` / `_park_already_has_pr`, which would otherwise
+        bounce it to In Progress and strand it with the granted window wasted.
+        """
+        tracker = self.tracker(binding)
         await self._clear_operator_wait(issue_id, run_id)
         new_run_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()

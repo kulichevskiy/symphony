@@ -8,6 +8,7 @@ agent is never killed. `$approve`/👍 grants another budget window and resumes;
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -264,6 +265,81 @@ async def test_approve_grants_window_and_resumes_repeatably(tmp_path: Path) -> N
         )
         assert await db.issues.get_granted_token_budget(conn, "iss-1") == 2 * _BUDGET
     finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_with_open_pr_resumes_review_not_bounced(tmp_path: Path) -> None:
+    """$approve on a budget park at a review/merge boundary must re-arm the
+    review monitor directly. Routing through the ready scan would hit the
+    existing-PR guard, which bounces an open-PR issue to In Progress and
+    strands it — the granted window wasted and review never resuming.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding(per_issue_token_budget=_BUDGET)])
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        orch = _make_orch(cfg, linear, conn)
+        orch._gh.pr_comment = AsyncMock()  # noqa: SLF001
+        await _seed_issue(conn)
+        # An open (unmerged) PR exists — the park happened at a review boundary.
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-1",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label="",
+        )
+        await db.runs.create(
+            conn,
+            id="r-monitor",
+            issue_id="iss-1",
+            stage="review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="r-monitor",
+            kind=db.operator_waits.KIND_BUDGET_EXCEEDED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+
+        await orch._handle_budget_exceeded_slash_intent(  # noqa: SLF001
+            "iss-1", "r-monitor", _intent(SlashKind.APPROVE)
+        )
+
+        # Window granted + wait cleared, as before.
+        assert await db.issues.get_granted_token_budget(conn, "iss-1") == _BUDGET
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        # A fresh `review` run is dispatched (the review monitor is re-armed).
+        live_review = await db.runs.list_live_by_stage(conn, stage="review")
+        assert [r.id for r in live_review] != []
+        assert any(r.id != "r-monitor" for r in live_review)
+        # Crucially: NOT bounced to In Progress by the existing-PR guard.
+        moved_states = [c.args[1] for c in linear.move_issue.await_args_list]
+        assert "state-progress" not in moved_states
+    finally:
+        for task in list(orch._review_poll_tasks):  # noqa: SLF001
+            task.cancel()
+        await asyncio.gather(*orch._review_poll_tasks, return_exceptions=True)  # noqa: SLF001
         await conn.close()
 
 

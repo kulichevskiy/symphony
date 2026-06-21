@@ -183,9 +183,10 @@ def budget_exceeded(
         f"  - {stage}: {round(value):,}\n"
         for stage, value in sorted(breakdown, key=lambda kv: kv[1], reverse=True)
     )
+    target = v.linear_identifier or f"{v.repo}#{v.issue}"
     return (
         f"🟡 **Token budget exceeded — parked for approval**\n\n"
-        f"Symphony has paused `{v.repo}#{v.issue}`: this issue's cumulative "
+        f"Symphony has paused `{target}`: this issue's cumulative "
         f"effective tokens crossed its per-issue budget.\n\n"
         f"- Effective tokens used: **{round(used_effective):,}** "
         f"(ceiling **{round(ceiling):,}**)\n"
