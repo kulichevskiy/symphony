@@ -579,6 +579,7 @@ def build_runner_command(
     prompt: str,
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
     workspace_path: Path | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
@@ -588,6 +589,9 @@ def build_runner_command(
     `--strict-mcp-config` so the agent only sees servers the binding
     explicitly grants — none by default. Codex MCP wiring lives in its own
     config.toml and is unaffected.
+
+    `claude_model` is the resolved `implement` role's Claude model: set →
+    `--model <alias>`, unset → no flag (CLI default). It is ignored for codex.
     """
     if agent == "claude":
         command = [
@@ -602,6 +606,8 @@ def build_runner_command(
             command.extend(
                 ["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})]
             )
+        if claude_model is not None:
+            command.extend(["--model", claude_model])
         command.append(prompt)
         return command
     if agent == "codex":
@@ -13326,10 +13332,13 @@ class Orchestrator:
             blocked_reason=handoff.blocked_reason if handoff else "",
             operator_comment=handoff.operator_comment if handoff else "",
         )
+        role = binding.resolved_role("implement", self.config.roles)
+        is_codex = role.agent == "codex"
         command = build_runner_command(
-            binding.agent,
+            role.agent,
             prompt,
-            codex_model=binding.codex_model,
+            codex_model=role.model if (is_codex and role.model) else binding.codex_model,
+            claude_model=None if is_codex else role.model,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )

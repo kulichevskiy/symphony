@@ -35,6 +35,51 @@ def _expand(path: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(path)))).resolve()
 
 
+# Claude `--model` aliases accepted in the roles matrix. Full model IDs
+# (e.g. `claude-sonnet-4-6`) still flow through the legacy
+# `local_review_*_claude_model` fields untouched; the matrix validates the
+# short aliases an operator types into a `roles:` block.
+CLAUDE_MODEL_ALIASES = frozenset({"opus", "sonnet", "haiku"})
+
+# Every pipeline step Symphony invokes itself resolves to one of these roles.
+# Builder roles run the implementer family; review roles default to the
+# opposite family for cross-family blind-spot diversity. `accept` is dormant.
+RoleName = Literal["implement", "review_find", "review_verify", "fix", "accept"]
+_BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
+
+
+class RoleConfig(BaseModel):
+    """One pipeline role's `{agent, model}` override.
+
+    Both fields are optional so a global `roles:` default and a per-binding
+    `roles:` override deep-merge per field
+    (`role = merge(global[role], binding[role])`). `model=None` falls back to
+    the back-compat default for the role, which may itself be `None` (no
+    `--model`, CLI default).
+    """
+
+    agent: Literal["claude", "codex"] | None = None
+    model: str | None = None
+
+
+class ResolvedRole(BaseModel):
+    """A role after merge + back-compat defaults are applied.
+
+    `model=None` means no `--model` flag is passed (the CLI default stands).
+    """
+
+    agent: Literal["claude", "codex"]
+    model: str | None = None
+
+
+def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) -> bool:
+    if model is None:
+        return True
+    if agent == "codex":
+        return model in SUPPORTED_CODEX_MODELS
+    return model in CLAUDE_MODEL_ALIASES
+
+
 class AcceptanceConfig(BaseModel):
     """Per-binding Acceptance-stage knobs.
 
@@ -200,6 +245,10 @@ class RepoBinding(BaseModel):
     webhook_enabled: bool = True
     webhook_secret: str | None = None
     reconcile_enabled: bool = True
+    # Per-binding `{role: {agent, model}}` overrides. Deep-merged per field
+    # over the global `Config.roles` default in `resolved_role`. An empty map
+    # (the default) reproduces today's behavior via the legacy field mapping.
+    roles: dict[RoleName, RoleConfig] = Field(default_factory=dict)
     states: TrackerStates = Field(validation_alias=AliasChoices("states", "linear_states"))
 
     def _apply_tracker_context_defaults(
@@ -380,6 +429,55 @@ class RepoBinding(BaseModel):
             else global_default
         )
 
+    def _default_role_agent(self, name: RoleName) -> Literal["claude", "codex"]:
+        if name in _BUILDER_ROLES:
+            return self.agent
+        return self.resolved_reviewer_agent()
+
+    def _default_role_model(
+        self, name: RoleName, agent: Literal["claude", "codex"]
+    ) -> str | None:
+        """Back-compat model default for a role given its resolved agent.
+
+        Maps the legacy top-level fields into the matrix so a config with no
+        `roles:` block resolves to exactly today's values: codex builders
+        carry `codex_model`; claude builders pass no `--model`; review roles
+        carry `reviewer_codex_model` (codex) or the local-review claude
+        finder/verifier models (claude).
+        """
+        if name in _BUILDER_ROLES:
+            return self.codex_model if agent == "codex" else None
+        if agent == "codex":
+            return self.resolved_reviewer_codex_model()
+        if name == "review_verify":
+            return self.local_review_verifier_claude_model
+        return self.local_review_claude_model
+
+    def resolved_role(
+        self, name: RoleName, global_roles: Mapping[RoleName, RoleConfig] | None = None
+    ) -> ResolvedRole:
+        """Resolve a role to `{agent, model}`.
+
+        Deep-merges per field: a per-binding `roles[name]` field wins over the
+        global `roles[name]` field, and an unset field falls back to the
+        back-compat default derived from the legacy top-level fields.
+        """
+        binding_role = self.roles.get(name)
+        global_role = (global_roles or {}).get(name)
+        agent: Literal["claude", "codex"] | None = None
+        model: str | None = None
+        if binding_role is not None:
+            agent, model = binding_role.agent, binding_role.model
+        if agent is None and global_role is not None:
+            agent = global_role.agent
+        if model is None and global_role is not None:
+            model = global_role.model
+        if agent is None:
+            agent = self._default_role_agent(name)
+        if model is None:
+            model = self._default_role_model(name, agent)
+        return ResolvedRole(agent=agent, model=model)
+
 
 class Secrets(BaseSettings):
     """Secrets sourced from the environment.
@@ -465,6 +563,11 @@ class Config(BaseModel):
     reconcile_backoff_secs: int = Field(default=600, ge=1)
     ui: UIConfig = Field(default_factory=UIConfig)
 
+    # Global per-role `{agent, model}` default. Per-binding `RepoBinding.roles`
+    # deep-merges per field over this. Empty (the default) → every role
+    # resolves from the binding's legacy top-level fields.
+    roles: dict[RoleName, RoleConfig] = Field(default_factory=dict)
+
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 12
@@ -499,6 +602,51 @@ class Config(BaseModel):
     jira_email: str = ""
     jira_api_token: str = ""
     jira_webhook_secret: str = ""
+
+    @model_validator(mode="after")
+    def _validate_roles(self) -> Self:
+        """Validate explicitly-declared role models and warn on lost diversity.
+
+        Only models set inside a `roles:` block are family-checked; legacy
+        top-level fields keep their existing (or absent) validation so a
+        config with no `roles:` block is unaffected. A `review_*` role sharing
+        the implementer's family warns — it forfeits cross-family blind spots.
+        """
+        for binding in self.repos:
+            declared = set(self.roles) | set(binding.roles)
+            for name in declared:
+                explicit_model = (
+                    binding.roles.get(name) is not None
+                    and binding.roles[name].model is not None
+                ) or (
+                    self.roles.get(name) is not None
+                    and self.roles[name].model is not None
+                )
+                if not explicit_model:
+                    continue
+                role = binding.resolved_role(name, self.roles)
+                if not _role_model_in_family(role.agent, role.model):
+                    if role.agent == "codex":
+                        family, supported = "Codex", sorted(SUPPORTED_CODEX_MODELS)
+                    else:
+                        family, supported = "Claude", sorted(CLAUDE_MODEL_ALIASES)
+                    raise ValueError(
+                        f"role {name!r}: unknown {family} model {role.model!r}; "
+                        f"supported: {', '.join(supported)}"
+                    )
+            implement = binding.resolved_role("implement", self.roles)
+            for review_name in ("review_find", "review_verify"):
+                review = binding.resolved_role(review_name, self.roles)
+                if review.agent == implement.agent:
+                    warnings.warn(
+                        f"binding {binding.project_key}/{binding.github_repo}: "
+                        f"role {review_name!r} uses the same agent "
+                        f"({review.agent!r}) as implement; cross-family review "
+                        f"diversity is lost.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+        return self
 
     @classmethod
     def load(cls, path: Path) -> Config:

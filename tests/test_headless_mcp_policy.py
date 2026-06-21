@@ -88,6 +88,17 @@ def test_claude_runner_command_is_strict_mcp_with_no_servers_by_default() -> Non
     assert argv[-1] == "do it"
 
 
+def test_claude_runner_command_carries_model_when_set() -> None:
+    argv = build_runner_command("claude", "do it", claude_model="sonnet")
+    assert argv[argv.index("--model") + 1] == "sonnet"
+    assert argv[-1] == "do it"
+
+
+def test_claude_runner_command_omits_model_when_unset() -> None:
+    argv = build_runner_command("claude", "do it")
+    assert "--model" not in argv
+
+
 def test_claude_runner_command_passes_binding_mcp_allowlist() -> None:
     servers = {"supabase": {"type": "http", "url": "https://mcp.example"}}
     argv = build_runner_command("claude", "do it", mcp_servers=servers)

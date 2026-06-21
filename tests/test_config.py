@@ -960,3 +960,173 @@ repos:
     p.write_text(raw)
     cfg = Config.load(p)
     assert cfg.repos[0].auto_merge is False
+
+
+# --- roles matrix ---------------------------------------------------------
+
+
+def test_roles_old_style_claude_config_resolves_identically() -> None:
+    """A binding with no `roles:` block resolves builder→claude/None,
+    review→opposite-family (codex) carrying the legacy codex_model."""
+    binding = _review_binding(agent="claude", codex_model="gpt-5.1-codex-max")
+    impl = binding.resolved_role("implement")
+    assert impl.agent == "claude"
+    assert impl.model is None  # claude builder → CLI default, no --model
+    for name in ("fix", "accept"):
+        assert binding.resolved_role(name).agent == "claude"
+        assert binding.resolved_role(name).model is None
+    rf = binding.resolved_role("review_find")
+    rv = binding.resolved_role("review_verify")
+    assert rf.agent == "codex" and rf.model == "gpt-5.1-codex-max"
+    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex-max"
+
+
+def test_roles_old_style_codex_config_resolves_identically() -> None:
+    """codex builder carries codex_model; review defaults to claude with the
+    legacy local-review claude models (finder vs verifier kept distinct)."""
+    binding = _review_binding(
+        agent="codex",
+        codex_model="gpt-5.1-codex",
+        local_review_claude_model="sonnet",
+        local_review_verifier_claude_model="opus",
+    )
+    impl = binding.resolved_role("implement")
+    assert impl.agent == "codex" and impl.model == "gpt-5.1-codex"
+    rf = binding.resolved_role("review_find")
+    rv = binding.resolved_role("review_verify")
+    assert rf.agent == "claude" and rf.model == "sonnet"
+    assert rv.agent == "claude" and rv.model == "opus"
+
+
+def test_roles_per_binding_deep_merges_per_field_over_global(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Global `roles:` default + per-binding `roles:` override deep-merge per
+    field: `role = merge(global[role], binding[role])`."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+roles:
+  implement:
+    agent: claude
+    model: sonnet
+  review_find:
+    agent: codex
+    model: gpt-5.1-codex
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    roles:
+      implement:
+        model: opus
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    binding = cfg.repos[0]
+    impl = binding.resolved_role("implement", cfg.roles)
+    # agent inherited from global, model overridden per-field by binding.
+    assert impl.agent == "claude"
+    assert impl.model == "opus"
+    # review_find untouched by the binding → global value stands.
+    rf = binding.resolved_role("review_find", cfg.roles)
+    assert rf.agent == "codex" and rf.model == "gpt-5.1-codex"
+
+
+def test_roles_unknown_claude_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    roles:
+      implement:
+        agent: claude
+        model: gpt-5.1-codex
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Claude model"):
+        Config.load(p)
+
+
+def test_roles_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    roles:
+      implement:
+        agent: codex
+        model: future-codex
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Codex model"):
+        Config.load(p)
+
+
+def test_roles_same_family_review_warns(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    roles:
+      implement:
+        agent: claude
+      review_find:
+        agent: claude
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.warns(UserWarning, match="cross-family review diversity"):
+        Config.load(p)
+
+
+def test_roles_config_builds_implement_command_with_model(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A `roles`-based config drives the built `implement` claude command:
+    resolved model → `--model`; no `roles:` → no flag (today's behavior)."""
+    from symphony.orchestrator.poll import build_runner_command
+
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        model: sonnet
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+    agent: claude
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+
+    def implement_command(binding: RepoBinding) -> list[str]:
+        role = binding.resolved_role("implement", cfg.roles)
+        is_codex = role.agent == "codex"
+        return build_runner_command(
+            role.agent,
+            "do it",
+            codex_model=(
+                role.model if (is_codex and role.model) else binding.codex_model
+            ),
+            claude_model=None if is_codex else role.model,
+        )
+
+    with_role = implement_command(cfg.repos[0])
+    assert with_role[with_role.index("--model") + 1] == "sonnet"
+    # Binding without a `roles:` block → claude CLI default, no `--model`.
+    assert "--model" not in implement_command(cfg.repos[1])
