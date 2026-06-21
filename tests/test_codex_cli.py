@@ -34,6 +34,25 @@ def test_build_codex_workspace_write_command_uses_named_permissions_profile() ->
     ]
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
     assert argv[-1] == "fix this"
+    # Unset effort → no model_reasoning_effort flag (Codex CLI default).
+    assert not any("model_reasoning_effort" in arg for arg in argv)
+
+
+def test_build_codex_workspace_write_command_carries_effort() -> None:
+    argv = build_codex_workspace_write_command(
+        prompt="fix this",
+        codex_model="gpt-5.1-codex",
+        effort="high",
+    )
+
+    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
+    assert configs == [
+        CODEX_DEFAULT_PERMISSIONS_CONFIG,
+        CODEX_APPROVAL_POLICY_CONFIG,
+        'model_reasoning_effort="high"',
+    ]
+    assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
+    assert argv[-1] == "fix this"
 
 
 def test_ensure_symphony_permissions_profile_creates_missing_config(

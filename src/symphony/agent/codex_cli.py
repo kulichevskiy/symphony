@@ -244,10 +244,15 @@ def ensure_symphony_permissions_profile(
 
 
 def build_codex_workspace_write_command(
-    *, prompt: str, codex_model: str
+    *, prompt: str, codex_model: str, effort: str | None = None
 ) -> list[str]:
-    """Build `codex exec` argv for agents that must modify and commit."""
-    return [
+    """Build `codex exec` argv for agents that must modify and commit.
+
+    `effort` maps to `--config model_reasoning_effort="<v>"` (the same repeated
+    `--config` pattern as the permission/approval knobs). Unset → no flag, so
+    the Codex CLI default stands.
+    """
+    command = [
         "codex",
         "exec",
         "--json",
@@ -255,10 +260,11 @@ def build_codex_workspace_write_command(
         CODEX_DEFAULT_PERMISSIONS_CONFIG,
         "--config",
         CODEX_APPROVAL_POLICY_CONFIG,
-        "--model",
-        codex_model,
-        prompt,
     ]
+    if effort is not None:
+        command += ["--config", f'model_reasoning_effort="{effort}"']
+    command += ["--model", codex_model, prompt]
+    return command
 
 
 __all__ = [
