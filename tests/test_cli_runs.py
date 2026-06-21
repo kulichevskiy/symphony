@@ -261,6 +261,55 @@ def test_runs_show_unknown_id_errors(tmp_path: Path) -> None:
     assert "nope" in result.output
 
 
+def test_runs_local_review_trace_headlines_effective_tokens(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "state.sqlite"
+
+    async def _seed() -> None:
+        conn = await db.connect(p)
+        try:
+            await db.issues.upsert(
+                conn, id="iss-1", identifier="ENG-1", title="t1", team_key="ENG"
+            )
+            await db.runs.create(
+                conn,
+                id="lr-1",
+                issue_id="iss-1",
+                stage="local_review",
+                status="completed",
+                pid=None,
+                started_at="2026-05-10T00:00:00+00:00",
+                cost_usd=1.5,
+            )
+            await db.runs.add_usage(
+                conn,
+                "lr-1",
+                cost_usd=0.0,
+                input_tokens=100,
+                output_tokens=20,
+                cache_write_tokens=30,
+                cache_read_tokens=40,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_seed())
+
+    result = CliRunner().invoke(
+        main, ["runs", "local-review-trace", "ENG-1", "--db", str(p)]
+    )
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "lr-1" in out
+    # Effective (weighted) tokens headline the spend column, not dollars:
+    # 100 + 20 + 30*1.25 + 40*0.1 = 161.5 → 162.
+    assert "eff_tokens" in out
+    assert "162" in out
+    # The former `$cost` headline is gone.
+    assert "$" not in out
+
+
 # --- dispatch --------------------------------------------------------------
 
 

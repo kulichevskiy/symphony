@@ -544,9 +544,10 @@ def runs_local_review_trace(issue_identifier: str, db_path: Path) -> None:
     """List local-review phases for a single issue.
 
     Postmortem tool. Accepts the Linear identifier (`ENG-123`) and
-    prints each `stage='local_review'` row's status, cost, and
-    duration — most recent first. Run-row IDs are surfaced so the
-    operator can `symphony runs show <id>` for full detail.
+    prints each `stage='local_review'` row's status, effective
+    tokens, and duration — most recent first. Run-row IDs are
+    surfaced so the operator can `symphony runs show <id>` for full
+    detail.
     """
     asyncio.run(_runs_local_review_trace(issue_identifier, db_path))
 
@@ -583,13 +584,19 @@ async def _runs_local_review_trace(
         f"local-review runs for {issue_identifier} ({len(local_rows)} total):"
     )
     click.echo(
-        "started_at                       status        cost      duration  id"
+        "started_at                       status        eff_tokens  duration  id"
     )
     for h in reversed(local_rows):
         duration = _duration_secs(h.started_at, h.ended_at)
         duration_str = f"{duration:7.1f}s" if duration is not None else "      —"
+        eff = effective_tokens(
+            h.input_tokens,
+            h.output_tokens,
+            h.cache_write_tokens,
+            h.cache_read_tokens,
+        )
         click.echo(
-            f"{h.started_at:<32} {h.status:<13} ${h.cost_usd:<8.4f} "
+            f"{h.started_at:<32} {h.status:<13} {eff:<10,.0f} "
             f"{duration_str}  {h.id}"
         )
 
