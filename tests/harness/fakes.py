@@ -10,6 +10,8 @@ unit tests — this rig is about pipeline timing, not transport.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -142,7 +144,21 @@ class FakeGitHub:
         return None
 
     async def repo_clone(self, repo: str, dest: Path) -> None:
-        return None
+        """Create a minimal real git repo so workspace git operations succeed."""
+        dest.mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
+        git_env = {**env, "GIT_AUTHOR_NAME": "sim", "GIT_AUTHOR_EMAIL": "sim@test",
+                   "GIT_COMMITTER_NAME": "sim", "GIT_COMMITTER_EMAIL": "sim@test"}
+        init = await asyncio.create_subprocess_exec(
+            "git", "init", "-b", "main", str(dest),
+            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await init.wait()
+        commit = await asyncio.create_subprocess_exec(
+            "git", "-C", str(dest), "commit", "--allow-empty", "-m", "init",
+            env=git_env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await commit.wait()
 
     async def repo_default_branch(self, repo: str) -> str:
         return "main"
@@ -173,7 +189,8 @@ class FakeGitHub:
     ) -> str:
         for (pr_repo, _num), pr in self._sim.prs.items():
             if pr.head == head and (repo is None or pr_repo == repo):
-                return pr.url
+                if pr.state != PR_MERGED and pr.state != PR_CLOSED:
+                    return pr.url
         number = self._sim.next_pr_number()
         key_repo = repo or ""
         url = f"https://github.invalid/{key_repo}/pull/{number}"
@@ -197,7 +214,13 @@ class FakeGitHub:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
             raise KeyError(f"no such PR: {pr}")
-        return {
+        # Simulate GitHub auto-merge: when auto-merge is queued and checks pass,
+        # GitHub merges the PR in the background before the next poll.
+        if sim_pr.auto_merge_enabled and sim_pr.checks_passed and not sim_pr.merged:
+            sim_pr.state = PR_MERGED
+        checks_ok = sim_pr.checks_passed
+        merge_state = "CLEAN" if checks_ok else "BLOCKED"
+        view: dict[str, Any] = {
             "number": sim_pr.number,
             "title": sim_pr.title,
             "state": "MERGED" if sim_pr.merged else sim_pr.state.upper(),
@@ -206,10 +229,27 @@ class FakeGitHub:
             "headRefOid": sim_pr.head_sha,
             "baseRefName": sim_pr.base,
             "mergeable": "MERGEABLE",
-            "mergeStateStatus": "CLEAN",
+            "mergeStateStatus": merge_state,
             "isDraft": False,
             "mergedAt": self._sim.now_iso() if sim_pr.merged else None,
         }
+        if include_status_checks:
+            if checks_ok:
+                check_node = {
+                    "__typename": "CheckRun",
+                    "name": "ci",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                }
+            else:
+                check_node = {
+                    "__typename": "CheckRun",
+                    "name": "ci",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                }
+            view["statusCheckRollup"] = {"nodes": [check_node]}
+        return view
 
     async def pr_comment(
         self, pr: int | str, body: str, *, repo: str | None = None
@@ -265,4 +305,8 @@ class FakeGitHub:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
             raise KeyError(f"no such PR: {pr}")
-        sim_pr.state = PR_MERGED
+        if auto and not sim_pr.checks_passed:
+            # Queue auto-merge; GitHub merges later when checks go green.
+            sim_pr.auto_merge_enabled = True
+        else:
+            sim_pr.state = PR_MERGED

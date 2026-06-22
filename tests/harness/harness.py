@@ -129,6 +129,7 @@ class Harness:
 
     async def step(self) -> list[asyncio.Task[None]]:
         """Run one `_tick()` to quiescence and return the dispatched tasks."""
+        await self.orch._drain_web_commands()  # noqa: SLF001
         scheduled = await self.orch._tick()  # noqa: SLF001
         if scheduled:
             await asyncio.gather(*scheduled)
