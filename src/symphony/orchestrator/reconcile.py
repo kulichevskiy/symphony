@@ -303,7 +303,7 @@ async def reconcile(
     tracker_for_context = _tracker_resolver(tracker_or_resolver)
     rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(UTC).isoformat()  # noqa: clock — startup reconciliation, no injected clock
     for run in rows:
         if run.pid is None or _process_alive(run.pid):
             continue

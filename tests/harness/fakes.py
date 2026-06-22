@@ -90,7 +90,7 @@ class FakeLinear:
     ) -> Sequence[Comment]:
         out: list[Comment] = []
         for comment in self._sim.comments.get(issue_uuid, []):
-            if datetime.fromisoformat(comment.created_at) > after:
+            if datetime.fromisoformat(comment.created_at) >= after:
                 out.append(_to_comment(comment))
         return out
 
@@ -222,6 +222,7 @@ class FakeGitHub:
             title=title,
             url=url,
             issue_id=issue_id,
+            head_sha=head,
         )
         return url
 
