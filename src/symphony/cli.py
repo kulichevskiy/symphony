@@ -18,18 +18,20 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import click
 
 from . import db
+from .agent.claude_models import fetch_claude_effort_capabilities
 from .agent.codex_cli import (
     SYMPHONY_PERMISSIONS_PROFILE,
     CodexPermissionsProfileError,
     ensure_symphony_permissions_profile,
 )
+from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
-from .config import Config, RepoBinding, Secrets
+from .config import Config, RepoBinding, RoleName, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
@@ -378,6 +380,42 @@ async def _preflight_configured_bindings(
     return ok
 
 
+async def _preflight_validate_capabilities(cfg: Config) -> bool:
+    """Validate each resolved `(model, effort)` pair against the live source.
+
+    claude pairs are checked against the Models API `capabilities.effort`
+    tree; codex pairs against the fixed family enum. This is the *online*
+    check — preflight only. Daemon boot stays structural (`Config.load`'s
+    family-enum check) and never queries the network.
+    """
+    pairs: set[tuple[str, str, str]] = set()
+    for binding in cfg.repos:
+        for name in get_args(RoleName):
+            role = binding.resolved_role(name, cfg.roles)
+            if role.effort is None or role.model is None:
+                continue
+            pairs.add((role.agent, role.model, role.effort))
+    ok = True
+    claude_caps: dict[str, list[str]] = {}
+    for agent, model, effort in sorted(pairs):
+        if agent == "codex":
+            supported = sorted(SUPPORTED_CODEX_EFFORTS)
+        else:
+            if model not in claude_caps:
+                claude_caps[model] = await fetch_claude_effort_capabilities(model)
+            supported = claude_caps[model]
+        if effort in supported:
+            click.echo(f"  ✓ {agent} model {model!r} supports effort {effort!r}")
+        else:
+            click.echo(
+                f"effort {effort!r} not supported by {agent} model {model!r}; "
+                f"supported: {', '.join(supported)}",
+                err=True,
+            )
+            ok = False
+    return ok
+
+
 async def _preflight(config_path: Path) -> None:
     cfg = Config.load(config_path)
     if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
@@ -402,12 +440,15 @@ async def _preflight(config_path: Path) -> None:
     else:
         click.echo("codex permissions profile not required by configured repos")
     try:
+        # Structural binding checks first: they emit their findings before the
+        # online capability check, so an ANTHROPIC_API_KEY gap can't mask them.
         async with _configured_tracker_registry(cfg) as (trackers, _):
             ok = await _preflight_configured_bindings(cfg, trackers)
+        caps_ok = await _preflight_validate_capabilities(cfg)
     except ValueError as e:
         click.echo(str(e), err=True)
         sys.exit(2)
-    sys.exit(0 if ok else 1)
+    sys.exit(0 if (ok and caps_ok) else 1)
 
 
 @main.group()
