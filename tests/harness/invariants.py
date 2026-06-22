@@ -95,11 +95,20 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
             f"Sim ({sim_pr.merged})"
         )
 
-    # 5b. Every Sim PR with an issue_id must be recorded in issue_prs.
-    db_pr_keys = {(row["github_repo"], row["pr_number"]) for row in db_pr_rows}
+    # 5b. Every Sim PR with an issue_id must be recorded in issue_prs under the
+    #     correct issue — a PR filed under the wrong issue would pass check 5 but
+    #     silently corrupt issue ownership.
+    db_pr_issue: dict[tuple[str, int], str] = {
+        (row["github_repo"], row["pr_number"]): row["issue_id"] for row in db_pr_rows
+    }
     for (repo, number), sim_pr in sim.prs.items():
         if sim_pr.issue_id:
-            assert (repo, number) in db_pr_keys, (
+            assert (repo, number) in db_pr_issue, (
                 f"Sim PR ({repo!r}, {number}) for issue {sim_pr.issue_id!r} "
                 f"is not recorded in issue_prs"
+            )
+            db_issue_id = db_pr_issue[(repo, number)]
+            assert db_issue_id == sim_pr.issue_id, (
+                f"issue_prs records PR ({repo!r}, {number}) under issue "
+                f"{db_issue_id!r} but Sim has it under {sim_pr.issue_id!r}"
             )

@@ -67,6 +67,7 @@ class SimPR:
     head_sha: str = ""
     checks_passed: bool = True
     auto_merge_enabled: bool = False
+    merged_at: str | None = None
 
     @property
     def merged(self) -> bool:

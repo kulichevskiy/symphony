@@ -171,6 +171,10 @@ class FakeGitHub:
         self._sim = sim
         # (repo, number) → list of review dicts
         self._reviews: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        # (repo, number) → list of issue comment dicts
+        self._pr_comments: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        # sha → ISO timestamp recorded at PR creation time
+        self._commit_timestamps: dict[str, str] = {}
 
     def add_pr_review(
         self,
@@ -271,6 +275,7 @@ class FakeGitHub:
                     issue_id = issue.id
                     break
         head_sha = hashlib.sha1(f"{key_repo}:{head}:{number}".encode()).hexdigest()
+        self._commit_timestamps.setdefault(head_sha, self._sim.now_iso())
         self._sim.prs[(key_repo, number)] = SimPR(
             repo=key_repo,
             number=number,
@@ -295,8 +300,15 @@ class FakeGitHub:
             raise GitHubError(f"no such PR: {pr}")
         # Simulate GitHub auto-merge: when auto-merge is queued and checks pass,
         # GitHub merges the PR in the background before the next poll.
-        if sim_pr.auto_merge_enabled and sim_pr.checks_passed and not sim_pr.merged:
+        # Closed PRs are never auto-merged (they were closed before checks passed).
+        if (
+            sim_pr.auto_merge_enabled
+            and sim_pr.checks_passed
+            and not sim_pr.merged
+            and sim_pr.state != PR_CLOSED
+        ):
             sim_pr.state = PR_MERGED
+            sim_pr.merged_at = self._sim.now_iso()
         checks_ok = sim_pr.checks_passed
         merge_state = "CLEAN" if checks_ok else "BLOCKED"
         view: dict[str, Any] = {
@@ -310,7 +322,7 @@ class FakeGitHub:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": merge_state,
             "isDraft": False,
-            "mergedAt": self._sim.now_iso() if sim_pr.merged else None,
+            "mergedAt": sim_pr.merged_at,
         }
         if include_status_checks:
             if checks_ok:
@@ -333,7 +345,13 @@ class FakeGitHub:
     async def pr_comment(
         self, pr: int | str, body: str, *, repo: str | None = None
     ) -> None:
-        return None
+        sim_pr = self._pr(pr, repo)
+        if sim_pr is None:
+            return
+        key = (sim_pr.repo, sim_pr.number)
+        self._pr_comments.setdefault(key, []).append(
+            {"body": body, "author": {"login": "symphony"}}
+        )
 
     async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str:
         return ""
@@ -359,13 +377,15 @@ class FakeGitHub:
     async def pr_issue_comments(
         self, pr: int | str, *, repo: str
     ) -> list[dict[str, Any]]:
-        return []
+        return list(self._pr_comments.get((repo, int(pr)), []))
 
     async def pr_reactions(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         return []
 
     async def commit_committed_at(self, repo: str, sha: str) -> str:
-        return self._sim.now_iso()
+        if sha not in self._commit_timestamps:
+            self._commit_timestamps[sha] = self._sim.now_iso()
+        return self._commit_timestamps[sha]
 
     async def check_log_tail(self, check: object, **kwargs: object) -> str:
         return ""
@@ -391,3 +411,4 @@ class FakeGitHub:
             sim_pr.auto_merge_enabled = True
         else:
             sim_pr.state = PR_MERGED
+            sim_pr.merged_at = self._sim.now_iso()
