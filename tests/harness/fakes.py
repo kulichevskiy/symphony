@@ -11,6 +11,7 @@ unit tests — this rig is about pipeline timing, not transport.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from collections.abc import Sequence
 from datetime import datetime
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from symphony.github.client import CheckRun, PRChecks
+from symphony.linear.client import LinearError
 from symphony.tracker import Blocker, Comment, Issue
 
 from .sim import PR_CLOSED, PR_MERGED, Sim, SimComment, SimPR
@@ -71,7 +73,7 @@ class FakeLinear:
                     issue = candidate
                     break
         if issue is None:
-            raise KeyError(f"no such issue: {identifier_or_uuid}")
+            raise LinearError(f"issue not found: {identifier_or_uuid}")
         return _to_issue(issue)
 
     async def issues_in_state(
@@ -173,6 +175,11 @@ class FakeGitHub:
             env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await remote.wait()
+        push = await asyncio.create_subprocess_exec(
+            "git", "-C", str(dest), "push", "-u", "origin", "main",
+            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await push.wait()
 
     async def repo_default_branch(self, repo: str) -> str:
         return "main"
@@ -214,6 +221,7 @@ class FakeGitHub:
                 if issue.url == linear_url:
                     issue_id = issue.id
                     break
+        head_sha = hashlib.sha1(f"{key_repo}:{head}:{number}".encode()).hexdigest()
         self._sim.prs[(key_repo, number)] = SimPR(
             repo=key_repo,
             number=number,
@@ -222,7 +230,7 @@ class FakeGitHub:
             title=title,
             url=url,
             issue_id=issue_id,
-            head_sha=head,
+            head_sha=head_sha,
         )
         return url
 
@@ -283,7 +291,9 @@ class FakeGitHub:
 
     async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks:
         sim_pr = self._pr(pr, repo)
-        if sim_pr is None or sim_pr.checks_passed:
+        if sim_pr is None:
+            raise KeyError(f"no such PR: {pr}")
+        if sim_pr.checks_passed:
             return PRChecks(runs=[])
         return PRChecks(
             runs=[CheckRun(name="ci", state="FAILURE", bucket="fail")]

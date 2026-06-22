@@ -82,7 +82,8 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
     cur = await conn.execute(
         "SELECT issue_id, github_repo, pr_number, merged_at FROM issue_prs"
     )
-    for row in await cur.fetchall():
+    db_pr_rows = await cur.fetchall()
+    for row in db_pr_rows:
         key = (row["github_repo"], row["pr_number"])
         sim_pr = sim.prs.get(key)
         assert sim_pr is not None, (
@@ -93,3 +94,12 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
             f"issue_prs merge state for PR {key} ({db_merged}) disagrees with "
             f"Sim ({sim_pr.merged})"
         )
+
+    # 5b. Every Sim PR with an issue_id must be recorded in issue_prs.
+    db_pr_keys = {(row["github_repo"], row["pr_number"]) for row in db_pr_rows}
+    for (repo, number), sim_pr in sim.prs.items():
+        if sim_pr.issue_id:
+            assert (repo, number) in db_pr_keys, (
+                f"Sim PR ({repo!r}, {number}) for issue {sim_pr.issue_id!r} "
+                f"is not recorded in issue_prs"
+            )
