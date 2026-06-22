@@ -1859,7 +1859,7 @@ class Orchestrator:
     def _now(self) -> datetime:
         if self._clock is not None:
             return self._clock()
-        return datetime.now(UTC)
+        return datetime.now(UTC)  # noqa: clock — sanctioned wall-clock entry point
 
     def tracker(self, ctx: TrackerContext | RepoBinding | None = None) -> IssueTracker:
         if isinstance(ctx, RepoBinding):
@@ -8082,7 +8082,7 @@ class Orchestrator:
         if last_review is not None and last_review.ended_at is not None:
             try:
                 elapsed = (
-                    datetime.now(UTC) - _parse_rfc3339(last_review.ended_at)
+                    self._now() - _parse_rfc3339(last_review.ended_at)
                 ).total_seconds()
                 if elapsed < REVIEW_RESURRECT_COOLDOWN_SECS:
                     return None
