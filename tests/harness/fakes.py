@@ -13,12 +13,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from symphony.github.client import CheckRun, PRChecks
+from symphony.agent.runner import RunnerEvent, RunnerSpec
+from symphony.github.client import CheckRun, GitHubError, PRChecks
 from symphony.linear.client import LinearError
 from symphony.tracker import Blocker, Comment, Issue
 
@@ -51,6 +52,38 @@ def _to_comment(comment: SimComment) -> Comment:
         author_is_me=comment.author_is_me,
         external_thread_type=comment.external_thread_type,
     )
+
+
+class FakeRunner:
+    """Deterministic `Runner` that never spawns real subprocesses.
+
+    Each `run()` call pops one event sequence from `_queue`; if the queue is
+    empty it yields a bare success exit so tests that don't care about runner
+    output still see the pipeline advance.
+    """
+
+    def __init__(self) -> None:
+        self._queue: list[list[RunnerEvent]] = []
+
+    def enqueue(self, events: list[RunnerEvent]) -> None:
+        """Pre-program the event sequence for the next `run()` call."""
+        self._queue.append(events)
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        events = self._queue.pop(0) if self._queue else [RunnerEvent(kind="exit", returncode=0)]
+        return self._aiter(events)
+
+    async def _aiter(self, events: list[RunnerEvent]) -> AsyncIterator[RunnerEvent]:
+        for ev in events:
+            yield ev
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+# Re-export so tests can import Runner from this module without needing
+# the runner module directly.
+__all__ = ["FakeGitHub", "FakeLinear", "FakeRunner"]
 
 
 class FakeLinear:
@@ -116,7 +149,7 @@ class FakeLinear:
                     issue = candidate
                     break
         if issue is None:
-            raise KeyError(f"no such issue: {issue_id_or_identifier}")
+            raise LinearError(f"no such issue: {issue_id_or_identifier}")
         issue.state_id = state_id
         name = self._sim.state_name_for_id(issue.team_key, state_id)
         if name is not None:
@@ -136,6 +169,22 @@ class FakeGitHub:
 
     def __init__(self, sim: Sim) -> None:
         self._sim = sim
+        # (repo, number) → list of review dicts
+        self._reviews: dict[tuple[str, int], list[dict[str, Any]]] = {}
+
+    def add_pr_review(
+        self,
+        pr: int | str,
+        *,
+        repo: str,
+        state: str = "APPROVED",
+        author: str = "reviewer",
+    ) -> None:
+        """Seed a review signal so `pr_reviews()` returns it."""
+        number = int(pr)
+        self._reviews.setdefault((repo, number), []).append(
+            {"state": state, "author": {"login": author}}
+        )
 
     def _pr(self, pr: int | str, repo: str | None) -> SimPR | None:
         number = int(pr)
@@ -243,7 +292,7 @@ class FakeGitHub:
     ) -> dict[str, Any]:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
-            raise KeyError(f"no such PR: {pr}")
+            raise GitHubError(f"no such PR: {pr}")
         # Simulate GitHub auto-merge: when auto-merge is queued and checks pass,
         # GitHub merges the PR in the background before the next poll.
         if sim_pr.auto_merge_enabled and sim_pr.checks_passed and not sim_pr.merged:
@@ -292,7 +341,7 @@ class FakeGitHub:
     async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
-            raise KeyError(f"no such PR: {pr}")
+            raise GitHubError(f"no such PR: {pr}")
         if sim_pr.checks_passed:
             return PRChecks(runs=[])
         return PRChecks(
@@ -305,7 +354,7 @@ class FakeGitHub:
         return []
 
     async def pr_reviews(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
-        return []
+        return list(self._reviews.get((repo, int(pr)), []))
 
     async def pr_issue_comments(
         self, pr: int | str, *, repo: str
@@ -336,7 +385,7 @@ class FakeGitHub:
     ) -> None:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
-            raise KeyError(f"no such PR: {pr}")
+            raise GitHubError(f"no such PR: {pr}")
         if auto and not sim_pr.checks_passed:
             # Queue auto-merge; GitHub merges later when checks go green.
             sim_pr.auto_merge_enabled = True

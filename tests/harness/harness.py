@@ -18,7 +18,7 @@ from symphony.config import Config, LinearStates, RepoBinding
 from symphony.orchestrator.poll import Orchestrator
 
 from .clock import ManualClock
-from .fakes import FakeGitHub, FakeLinear
+from .fakes import FakeGitHub, FakeLinear, FakeRunner
 from .invariants import assert_consistent
 from .sim import Sim
 
@@ -78,6 +78,7 @@ class Harness:
         clock: ManualClock,
         linear: FakeLinear,
         github: FakeGitHub,
+        runner: FakeRunner,
         orch: Orchestrator,
     ) -> None:
         self.config = config
@@ -86,6 +87,7 @@ class Harness:
         self.clock = clock
         self.linear = linear
         self.github = github
+        self.runner = runner
         self.orch = orch
 
     @classmethod
@@ -107,10 +109,12 @@ class Harness:
         conn = await db.connect(tmp_path / "symphony.sqlite")
         linear = FakeLinear(sim)
         github = FakeGitHub(sim)
+        runner = FakeRunner()
         orch = Orchestrator(
             config,
             linear,
             conn,
+            runner=runner,
             gh=github,  # type: ignore[arg-type]
             clock=clock,
         )
@@ -121,6 +125,7 @@ class Harness:
             clock=clock,
             linear=linear,
             github=github,
+            runner=runner,
             orch=orch,
         )
 
@@ -138,8 +143,9 @@ class Harness:
         await self._drain()
 
     async def step(self) -> list[asyncio.Task[None]]:
-        """Run one `_tick()` to quiescence and return the dispatched tasks."""
+        """Run one `_tick()` + one reconciler tick to quiescence."""
         await self.orch._drain_web_commands()  # noqa: SLF001
+        await self.orch._reconciler.tick()  # noqa: SLF001
         scheduled = await self.orch._tick()  # noqa: SLF001
         if scheduled:
             await asyncio.gather(*scheduled)
