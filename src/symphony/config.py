@@ -252,6 +252,14 @@ class RepoBinding(BaseModel):
     # rounds usually means the reviewer is stuck on a pathological case.
     # `None` falls back to `Config.local_review_iteration_cap`.
     local_review_iteration_cap: int | None = Field(default=None, ge=1)
+    # Per-binding override for the soft per-issue *effective-token* budget.
+    # When the cumulative effective tokens across all of an issue's runs cross
+    # `per_issue_token_budget + issues.granted_token_budget`, the issue is
+    # parked in Needs Approval at the next dispatch boundary (the live agent is
+    # never killed). `None` falls back to `Config.per_issue_token_budget`; when
+    # both are `None` the gate is off (no behavior change). Measured in
+    # effective tokens, not dollars.
+    per_issue_token_budget: int | None = Field(default=None, ge=1)
     # Per-binding override for the GitHub PR summary comment posted on
     # local-review APPROVED. `None` falls back to
     # `Config.post_local_review_pr_summary`. Some repos prefer quieter
@@ -484,6 +492,19 @@ class RepoBinding(BaseModel):
             else global_cap
         )
 
+    def resolved_per_issue_token_budget(
+        self, global_default: int | None
+    ) -> int | None:
+        """Per-binding override wins; falls back to the global default.
+
+        `None` from both means the soft token gate is off for this binding.
+        """
+        return (
+            self.per_issue_token_budget
+            if self.per_issue_token_budget is not None
+            else global_default
+        )
+
     def resolved_post_local_review_pr_summary(self, global_value: bool) -> bool:
         """Per-binding override wins; falls back to the global default."""
         if self.post_local_review_pr_summary is None:
@@ -653,6 +674,16 @@ class Config(BaseModel):
     # below `review_iteration_cap`: more rounds means the in-workspace
     # reviewer is stuck. Per-binding overrides live on `RepoBinding`.
     local_review_iteration_cap: int = Field(default=3, ge=1)
+    # Soft per-issue *effective-token* budget. Off by default (`None`): no
+    # behavior change. When set, an issue whose cumulative effective tokens
+    # (summed across every run — implement, review, all fix paths, both agent
+    # families) cross `per_issue_token_budget + issues.granted_token_budget`
+    # is parked in Needs Approval at the next dispatch boundary rather than
+    # dispatching the next run; a human resumes with `$approve`/👍 (grants
+    # one more budget window) or stops with `$reject`. Orthogonal to the
+    # iteration caps. Per-binding overrides live on `RepoBinding`.
+    # ~20_000_000 ≈ p95–p97 of current per-issue effective tokens.
+    per_issue_token_budget: int | None = Field(default=None, ge=1)
     # When the local-review APPROVES, post a summary PR comment with
     # the iteration count + cost so human reviewers visiting GitHub
     # see the verdict trail (not just the Linear thread). Set to false

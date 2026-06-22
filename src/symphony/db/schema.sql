@@ -20,7 +20,12 @@ CREATE TABLE IF NOT EXISTS issues (
     site             TEXT NOT NULL DEFAULT 'default',
     identifier       TEXT NOT NULL,
     title            TEXT NOT NULL,
-    team_key         TEXT NOT NULL
+    team_key         TEXT NOT NULL,
+    -- Extra effective-token budget granted by operators via `$approve`/👍
+    -- after a per-issue token-budget trip. The soft ceiling is
+    -- `per_issue_token_budget + granted_token_budget`; each approval grants
+    -- one more window. Survives restart and wait-clear.
+    granted_token_budget INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS runs (

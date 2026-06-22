@@ -21,6 +21,10 @@ KIND_REVIEW_STOPPED = "review_stopped"
 KIND_MERGE = "merge"
 KIND_ACCEPTANCE_BLOCKED = "acceptance_blocked"
 KIND_ACCEPTANCE_REJECTED = "acceptance_rejected"
+# Soft per-issue token budget tripped at a dispatch boundary. The live agent
+# is never killed; the next run simply isn't dispatched. `$approve`/👍 grants
+# another budget window and resumes; `$reject` blocks.
+KIND_BUDGET_EXCEEDED = "budget_exceeded"
 
 
 @dataclass(frozen=True)
@@ -276,6 +280,7 @@ async def delete(
 __all__ = [
     "KIND_ACCEPTANCE_BLOCKED",
     "KIND_ACCEPTANCE_REJECTED",
+    "KIND_BUDGET_EXCEEDED",
     "KIND_DELIVER_FAILED",
     "KIND_IMPLEMENT_BLOCKED",
     "KIND_IMPLEMENT_FAILED",

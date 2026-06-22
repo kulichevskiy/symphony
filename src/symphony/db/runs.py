@@ -936,6 +936,30 @@ async def cost_for_issue(conn: aiosqlite.Connection, issue_id: str) -> float:
     return float(row[0])
 
 
+# Effective-token weights. Cache writes cost more than fresh tokens; cache
+# reads are nearly free. The weighted sum is the family-neutral "effective
+# tokens" signal the per-issue soft budget gates on — honest under a flat
+# subscription where dollar figures are list-price-notional/estimated.
+CACHE_WRITE_WEIGHT: float = 1.25
+CACHE_READ_WEIGHT: float = 0.1
+
+
+def effective_tokens(
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int,
+    cache_read_tokens: int,
+) -> float:
+    """Effective tokens = input + output + cache_write*1.25 + cache_read*0.1."""
+    return (
+        input_tokens
+        + output_tokens
+        + cache_write_tokens * CACHE_WRITE_WEIGHT
+        + cache_read_tokens * CACHE_READ_WEIGHT
+    )
+
+
 @dataclass
 class IssueTokens:
     """Cumulative token usage summed across all of an issue's runs."""
@@ -944,6 +968,50 @@ class IssueTokens:
     output_tokens: int = 0
     cache_write_tokens: int = 0
     cache_read_tokens: int = 0
+
+    @property
+    def effective_tokens(self) -> float:
+        return effective_tokens(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+        )
+
+
+async def effective_tokens_by_stage_for_issue(
+    conn: aiosqlite.Connection, issue_id: str
+) -> dict[str, float]:
+    """Per-stage effective-token sum across the issue's runs.
+
+    Used to render the budget-exceeded breakdown. Stages with no recorded
+    tokens are omitted. Uses whatever token data is present (~60% of runs
+    carry tokens today); the gap errs toward *not* parking.
+    """
+    cur = await conn.execute(
+        """
+        SELECT stage,
+               COALESCE(SUM(input_tokens), 0),
+               COALESCE(SUM(output_tokens), 0),
+               COALESCE(SUM(cache_write_tokens), 0),
+               COALESCE(SUM(cache_read_tokens), 0)
+        FROM runs WHERE issue_id = ?
+        GROUP BY stage
+        """,
+        (issue_id,),
+    )
+    rows = await cur.fetchall()
+    breakdown: dict[str, float] = {}
+    for row in rows:
+        value = effective_tokens(
+            input_tokens=int(row[1]),
+            output_tokens=int(row[2]),
+            cache_write_tokens=int(row[3]),
+            cache_read_tokens=int(row[4]),
+        )
+        if value > 0:
+            breakdown[str(row[0])] = value
+    return breakdown
 
 
 async def tokens_for_issue(

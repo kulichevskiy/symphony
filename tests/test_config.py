@@ -800,6 +800,72 @@ repos:
         Config.load(p)
 
 
+def test_per_issue_token_budget_default_off(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Off by default: global `None` and per-binding `None` → gate disabled."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    )
+    cfg = Config.load(p)
+    assert cfg.per_issue_token_budget is None
+    binding = cfg.repos[0]
+    assert binding.per_issue_token_budget is None
+    assert (
+        binding.resolved_per_issue_token_budget(cfg.per_issue_token_budget) is None
+    )
+
+
+def test_per_issue_token_budget_per_binding_override(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+per_issue_token_budget: 20000000
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    per_issue_token_budget: 5000000
+{_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.per_issue_token_budget == 20_000_000
+    # ENG overrides; WEB inherits the global default.
+    assert cfg.repos[0].per_issue_token_budget == 5_000_000
+    assert (
+        cfg.repos[0].resolved_per_issue_token_budget(cfg.per_issue_token_budget)
+        == 5_000_000
+    )
+    assert cfg.repos[1].per_issue_token_budget is None
+    assert (
+        cfg.repos[1].resolved_per_issue_token_budget(cfg.per_issue_token_budget)
+        == 20_000_000
+    )
+
+
+def test_per_issue_token_budget_must_be_positive(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Validation is daemon-start only: positive int or None."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+per_issue_token_budget: 0
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError):
+        Config.load(p)
+
+
 def test_post_local_review_pr_summary_default_global_true(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
