@@ -112,6 +112,8 @@ class Sim:
         self.issues: dict[str, SimIssue] = {}
         self.comments: dict[str, list[SimComment]] = {}
         self.states: dict[str, dict[str, str]] = {}
+        # team_key → {state_id → state_type}
+        self.state_types: dict[str, dict[str, str]] = {}
         self.viewer_teams: list[str] = []
         # GitHub reality, keyed by (repo, number).
         self.prs: dict[tuple[str, int], SimPR] = {}
@@ -128,9 +130,22 @@ class Sim:
 
     # --- seeding helpers (used by Harness defaults and scenarios) ---
 
-    def seed_team(self, team_key: str, states: dict[str, str]) -> None:
-        """Register a team's workflow states and make it viewer-visible."""
+    def seed_team(
+        self,
+        team_key: str,
+        states: dict[str, str],
+        types: dict[str, str] | None = None,
+    ) -> None:
+        """Register a team's workflow states and make it viewer-visible.
+
+        `states` maps state name → state id.
+        `types` maps state name → state type (e.g. "unstarted", "started", "completed").
+        """
         self.states[team_key] = dict(states)
+        if types:
+            self.state_types[team_key] = {
+                states[name]: t for name, t in types.items() if name in states
+            }
         if team_key not in self.viewer_teams:
             self.viewer_teams.append(team_key)
 
@@ -139,6 +154,9 @@ class Sim:
             if sid == state_id:
                 return name
         return None
+
+    def state_type_for_id(self, team_key: str, state_id: str) -> str | None:
+        return self.state_types.get(team_key, {}).get(state_id)
 
     def next_pr_number(self) -> int:
         return next(self._pr_counter)

@@ -116,6 +116,9 @@ class FakeLinear:
         name = self._sim.state_name_for_id(issue.team_key, state_id)
         if name is not None:
             issue.state_name = name
+        stype = self._sim.state_type_for_id(issue.team_key, state_id)
+        if stype is not None:
+            issue.state_type = stype
 
     async def upload_issue_attachment(
         self, *, issue_uuid: str, path: Path, title: str
@@ -205,7 +208,7 @@ class FakeGitHub:
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
             "isDraft": False,
-            "mergedAt": sim_pr.url if sim_pr.merged else None,
+            "mergedAt": self._sim.now_iso() if sim_pr.merged else None,
         }
 
     async def pr_comment(

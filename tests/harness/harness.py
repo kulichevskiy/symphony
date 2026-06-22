@@ -32,6 +32,13 @@ DEFAULT_STATES = {
     "Needs Approval": "state-review",
     "Done": "state-done",
 }
+DEFAULT_STATE_TYPES = {
+    "Todo": "unstarted",
+    "In Progress": "started",
+    "Local Code Review": "started",
+    "Needs Approval": "started",
+    "Done": "completed",
+}
 
 
 def _default_config(tmp_path: Path) -> Config:
@@ -85,7 +92,7 @@ class Harness:
         sim = Sim(clock)
         # Seed each binding's team workflow so warmup + state validation pass.
         for binding in config.repos:
-            sim.seed_team(binding.linear_team_key, DEFAULT_STATES)
+            sim.seed_team(binding.linear_team_key, DEFAULT_STATES, DEFAULT_STATE_TYPES)
 
         conn = await db.connect(tmp_path / "symphony.sqlite")
         linear = FakeLinear(sim)
