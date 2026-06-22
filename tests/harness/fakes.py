@@ -58,8 +58,9 @@ class FakeRunner:
     """Deterministic `Runner` that never spawns real subprocesses.
 
     Each `run()` call pops one event sequence from `_queue`; if the queue is
-    empty it yields a bare success exit so tests that don't care about runner
-    output still see the pipeline advance.
+    empty it yields a default sequence that satisfies the implement completion
+    gate (SYMPHONY_DONE marker + HEAD advance) for implement-stage runs and a
+    bare success exit for all other stages.
     """
 
     def __init__(self) -> None:
@@ -70,12 +71,38 @@ class FakeRunner:
         self._queue.append(events)
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
-        events = self._queue.pop(0) if self._queue else [RunnerEvent(kind="exit", returncode=0)]
-        return self._aiter(events)
+        if self._queue:
+            return self._aiter(self._queue.pop(0))
+        return self._default_aiter(spec)
 
     async def _aiter(self, events: list[RunnerEvent]) -> AsyncIterator[RunnerEvent]:
         for ev in events:
             yield ev
+
+    async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        if spec.stage == "implement":
+            # The completion gate requires both a SYMPHONY_DONE marker in the
+            # log and a HEAD advance. Make an empty commit so HEAD moves.
+            env = {
+                **os.environ,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "sim",
+                "GIT_AUTHOR_EMAIL": "sim@test",
+                "GIT_COMMITTER_NAME": "sim",
+                "GIT_COMMITTER_EMAIL": "sim@test",
+            }
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", str(spec.workspace_path),
+                "commit", "--allow-empty", "-m", "fake: implement",
+                env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            # Emit claude stream-json result event so _read_run_final_message
+            # extracts "SYMPHONY_DONE" via _claude_last_result_text.
+            yield RunnerEvent(kind="stdout", line='{"type":"result","result":"SYMPHONY_DONE"}')
+        yield RunnerEvent(kind="exit", returncode=0)
 
     async def kill(self, run_id: str) -> None:
         pass
@@ -187,7 +214,7 @@ class FakeGitHub:
         """Seed a review signal so `pr_reviews()` returns it."""
         number = int(pr)
         self._reviews.setdefault((repo, number), []).append(
-            {"state": state, "author": {"login": author}}
+            {"state": state, "user": {"login": author}}
         )
 
     def _pr(self, pr: int | str, repo: str | None) -> SimPR | None:
@@ -347,10 +374,10 @@ class FakeGitHub:
     ) -> None:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
-            return
+            raise GitHubError(f"no such PR: {pr}")
         key = (sim_pr.repo, sim_pr.number)
         self._pr_comments.setdefault(key, []).append(
-            {"body": body, "author": {"login": "symphony"}}
+            {"body": body, "user": {"login": "symphony"}, "created_at": self._sim.now_iso()}
         )
 
     async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str:
@@ -406,6 +433,8 @@ class FakeGitHub:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
             raise GitHubError(f"no such PR: {pr}")
+        if sim_pr.state == PR_CLOSED:
+            raise GitHubError(f"PR {pr} is already closed")
         if auto and not sim_pr.checks_passed:
             # Queue auto-merge; GitHub merges later when checks go green.
             sim_pr.auto_merge_enabled = True
