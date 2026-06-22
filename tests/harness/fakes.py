@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from symphony.github.client import CheckRun, PRChecks
-from symphony.tracker import Comment, Issue
+from symphony.tracker import Blocker, Comment, Issue
 
 from .sim import PR_CLOSED, PR_MERGED, Sim, SimComment, SimPR
 
@@ -35,6 +35,7 @@ def _to_issue(issue: object) -> Issue:
         state_type=issue.state_type,  # type: ignore[attr-defined]
         team_key=issue.team_key,  # type: ignore[attr-defined]
         labels=list(issue.labels),  # type: ignore[attr-defined]
+        blocked_by=list(issue.blocked_by),  # type: ignore[attr-defined]
         updated_at=issue.updated_at,  # type: ignore[attr-defined]
     )
 
@@ -145,10 +146,18 @@ class FakeGitHub:
 
     async def repo_clone(self, repo: str, dest: Path) -> None:
         """Create a minimal real git repo so workspace git operations succeed."""
-        dest.mkdir(parents=True, exist_ok=True)
         env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
         git_env = {**env, "GIT_AUTHOR_NAME": "sim", "GIT_AUTHOR_EMAIL": "sim@test",
                    "GIT_COMMITTER_NAME": "sim", "GIT_COMMITTER_EMAIL": "sim@test"}
+        # Create a bare origin so `git push -u origin <branch>` succeeds.
+        origin = dest.parent / (dest.name + "-origin.git")
+        origin.mkdir(parents=True, exist_ok=True)
+        init_bare = await asyncio.create_subprocess_exec(
+            "git", "init", "--bare", str(origin),
+            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await init_bare.wait()
+        dest.mkdir(parents=True, exist_ok=True)
         init = await asyncio.create_subprocess_exec(
             "git", "init", "-b", "main", str(dest),
             env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
@@ -159,6 +168,11 @@ class FakeGitHub:
             env=git_env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await commit.wait()
+        remote = await asyncio.create_subprocess_exec(
+            "git", "-C", str(dest), "remote", "add", "origin", str(origin),
+            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await remote.wait()
 
     async def repo_default_branch(self, repo: str) -> str:
         return "main"
@@ -194,6 +208,12 @@ class FakeGitHub:
         number = self._sim.next_pr_number()
         key_repo = repo or ""
         url = f"https://github.invalid/{key_repo}/pull/{number}"
+        issue_id = ""
+        if linear_url:
+            for issue in self._sim.issues.values():
+                if issue.url == linear_url:
+                    issue_id = issue.id
+                    break
         self._sim.prs[(key_repo, number)] = SimPR(
             repo=key_repo,
             number=number,
@@ -201,6 +221,7 @@ class FakeGitHub:
             base=base or "main",
             title=title,
             url=url,
+            issue_id=issue_id,
         )
         return url
 

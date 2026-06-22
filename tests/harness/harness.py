@@ -24,21 +24,30 @@ from .sim import Sim
 
 DEFAULT_TEAM = "ENG"
 DEFAULT_REPO = "org/repo"
-# A workflow that covers every lane a binding can reference.
-DEFAULT_STATES = {
-    "Todo": "state-todo",
-    "In Progress": "state-progress",
-    "Local Code Review": "state-local-review",
-    "Needs Approval": "state-review",
-    "Done": "state-done",
-}
-DEFAULT_STATE_TYPES = {
-    "Todo": "unstarted",
-    "In Progress": "started",
-    "Local Code Review": "started",
-    "Needs Approval": "started",
-    "Done": "completed",
-}
+
+
+def _states_from_binding(binding: RepoBinding) -> tuple[dict[str, str], dict[str, str]]:
+    """Derive state name → id and state name → type from a binding's TrackerStates."""
+    ls = binding.linear_states
+    role_types: list[tuple[str, str]] = [
+        (ls.ready, "unstarted"),
+        (ls.in_progress, "started"),
+        (ls.local_code_review, "started"),
+        (ls.code_review, "started"),
+        (ls.needs_approval, "started"),
+        (ls.in_acceptance, "started"),
+        (ls.blocked, "started"),
+        (ls.done, "completed"),
+    ]
+    if ls.waiting:
+        role_types.append((ls.waiting, "started"))
+    states: dict[str, str] = {}
+    types: dict[str, str] = {}
+    for name, stype in role_types:
+        if name and name not in states:
+            states[name] = "state-" + name.lower().replace(" ", "-")
+            types[name] = stype
+    return states, types
 
 
 def _default_config(tmp_path: Path) -> Config:
@@ -92,7 +101,8 @@ class Harness:
         sim = Sim(clock)
         # Seed each binding's team workflow so warmup + state validation pass.
         for binding in config.repos:
-            sim.seed_team(binding.linear_team_key, DEFAULT_STATES, DEFAULT_STATE_TYPES)
+            states, types = _states_from_binding(binding)
+            sim.seed_team(binding.linear_team_key, states, types)
 
         conn = await db.connect(tmp_path / "symphony.sqlite")
         linear = FakeLinear(sim)

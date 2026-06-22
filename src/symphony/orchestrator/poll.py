@@ -4673,7 +4673,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "completed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
@@ -4688,7 +4688,7 @@ class Orchestrator:
         if not live_review_runs:
             return
 
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         closed_run_ids: set[str] = set()
         for run in live_review_runs:
             await db.runs.update_status(
@@ -4729,7 +4729,7 @@ class Orchestrator:
         if not live_review_runs:
             return
 
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         closed_run_ids: set[str] = set()
         for run in live_review_runs:
             await db.runs.update_status(
@@ -8204,7 +8204,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "failed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
             **_termination_kwargs(status="failed", reason=error),
         )
         await self._clear_review_rearm_retry(run.id)

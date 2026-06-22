@@ -17,6 +17,8 @@ import itertools
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from symphony.tracker import Blocker
+
 from .clock import ManualClock
 
 # PR lifecycle in the Sim. `merged` is the terminal success state.
@@ -37,6 +39,7 @@ class SimIssue:
     state_type: str = ""
     team_key: str = ""
     labels: list[str] = field(default_factory=list)
+    blocked_by: list[Blocker] = field(default_factory=list)
     updated_at: str = ""
 
 
