@@ -22,7 +22,6 @@ import pytest
 
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.db.runs import LIVE_STATUSES
 from tests.harness import Harness, ManualClock
 
 TEAM = "ENG"
@@ -101,12 +100,12 @@ async def _step_until_done(harness: Harness, issue_id: str) -> None:
 
 
 async def _assert_converged(harness: Harness, issue_id: str) -> None:
-    """Issue in Done lane, PR merged in DB, no live runs, no drift."""
+    """Issue in Done lane, PR merged in DB, no drift."""
     assert harness.sim.issues[issue_id].state_name == DONE
     assert harness.sim.issues[issue_id].state_type == "completed"
-    runs = await db.runs.history_for_issue(harness.conn, issue_id)
-    live = [r.id for r in runs if r.status in LIVE_STATUSES]
-    assert live == [], f"live runs remain: {live}"
+    # Dispatch-free config (local_review=False, remote_review=False): runs list is
+    # always empty, so a live-run guard here would be vacuously true. Delegate to
+    # assert_consistent which covers the invariant unconditionally.
     await harness.assert_consistent()
 
 
@@ -175,12 +174,11 @@ async def test_duplicated_webhook_is_idempotent(
 
         await _step_until_done(harness, issue.id)
 
-        # No duplicate dispatch: at most one run per stage, none live.
+        # Dispatch-free config (local_review=False, remote_review=False): no runs
+        # are produced, so duplicate-dispatch coverage is out of scope for this
+        # scenario. Assert empty rather than the vacuously-true all() over {}.
         runs = await db.runs.history_for_issue(harness.conn, issue.id)
-        by_stage: dict[str, int] = {}
-        for r in runs:
-            by_stage[r.stage] = by_stage.get(r.stage, 0) + 1
-        assert all(n == 1 for n in by_stage.values()), f"duplicate runs: {by_stage}"
+        assert runs == [], f"unexpected runs in dispatch-free scenario: {[r.id for r in runs]}"
 
         await _assert_converged(harness, issue.id)
     finally:
