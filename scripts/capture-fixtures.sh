@@ -60,10 +60,15 @@ if [[ -n "${GH_REPO:-}" && -n "${PR:-}" ]]; then
       ' > "$_tmp"; then
     # Reject if any statusCheckRollup entry is non-green: a pending/failing
     # optional status would corrupt the "fully passing PR" contract fixture.
+    # CheckRun entries have a `status` field; treat anything other than
+    # COMPLETED as pending even when `conclusion` is null.
     if jq -e '
       .statusCheckRollup // [] | all(
-        (.conclusion == "SUCCESS" or .conclusion == null) and
-        (.state == "SUCCESS" or .state == null)
+        (
+          (.conclusion == "SUCCESS" or .conclusion == null) and
+          (.state == "SUCCESS" or .state == null)
+        ) and
+        (.__typename != "CheckRun" or .status == "COMPLETED")
       )
     ' "$_tmp" > /dev/null 2>&1; then
       mv "$_tmp" "$OUT/github_pr_view.json"
@@ -106,7 +111,20 @@ if [[ -n "${GH_REPO:-}" && -n "${FAILING_PR:-}" ]]; then
   echo "capturing github_pr_checks.json from $GH_REPO#$FAILING_PR"
   _tmp=$(mktemp)
   if gh pr checks "$FAILING_PR" --repo "$GH_REPO" --required --json name,state,bucket,link \
-      | jq 'map(.link = "https://github.com/acme/widgets/actions/runs/9876543210/job/12345678901")' \
+      | jq '
+        # Normalise to the single synthetic failing entry the contract fake models:
+        # name="ci", state="FAILURE", bucket="fail". This makes the fixture
+        # independent of the real check name/count while preserving the
+        # semantics the merge-gate tests on (any_failed=true, all_passed=false).
+        # Output [] if no failing entry is found; the length guard below rejects it.
+        map(select(.bucket == "fail" or .state == "FAILURE")) |
+        if length > 0 then [first | {
+          name: "ci",
+          state: "FAILURE",
+          bucket: "fail",
+          link: "https://github.com/acme/widgets/actions/runs/9876543210/job/12345678901"
+        }] else [] end
+      ' \
       > "$_tmp"; then
     # Exit 0 = all checks passed — wrong PR, golden unchanged.
     rm -f "$_tmp"
@@ -136,7 +154,10 @@ if [[ -n "${GH_REPO:-}" && -n "${HOOK_ID:-}" ]]; then
   # then verifies pull_request.merged == true so a closed-not-merged event
   # never becomes the golden.
   DELIVERY_ID=$(gh api "repos/$GH_REPO/hooks/$HOOK_ID/deliveries" \
-    --jq 'map(select(.event == "pull_request" and .action == "closed")) | .[0].id')
+    --jq 'map(select(.event == "pull_request" and .action == "closed")) | .[0].id' 2>&1) || {
+    echo "warning: gh api hook deliveries failed (wrong HOOK_ID or insufficient permissions?); existing golden unchanged" >&2
+    DELIVERY_ID=""
+  }
   if [[ -z "$DELIVERY_ID" || "$DELIVERY_ID" == "null" ]]; then
     echo "warning: no closed pull_request delivery found for hook $HOOK_ID; existing golden unchanged" >&2
   else
@@ -206,6 +227,7 @@ GQL
       .issues.nodes[0].state.type  = "unstarted" |
       .issues.nodes[0].team.key    = "SYM" |
       .issues.nodes[0].labels.nodes = [{"name": "symphony"}] |
+      .issues.nodes[0].updatedAt    = "2026-06-20T10:00:00.000Z" |
       .issues.nodes[0].relations         = {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}} |
       .issues.nodes[0].inverseRelations  = {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
     ' > "$_tmp"; then
@@ -261,11 +283,19 @@ if [[ -n "${LINEAR_COMMENT_DELIVERY:-}" && -f "${LINEAR_COMMENT_DELIVERY:-}" ]];
   echo "capturing linear_comment_webhook.json from $LINEAR_COMMENT_DELIVERY"
   _tmp=$(mktemp)
   if jq '
-    .data.id             = "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8" |
-    .data.body           = "$approve" |
-    .data.issueId        = "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b" |
-    .data.externalThread = null |
-    if .actor then .actor.id = "user-uuid" | .actor.name = "Alex" else . end
+    # Whitelist only the fields the contract tests act on so no extra fields
+    # from a real delivery leak into the committed fixture.
+    {
+      type:   .type,
+      action: .action,
+      data: {
+        id:             "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
+        body:           "$approve",
+        issueId:        "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b",
+        externalThread: null
+      },
+      actor: (if .actor then {"id": "user-uuid", "name": "Alex"} else null end)
+    }
   ' "$LINEAR_COMMENT_DELIVERY" > "$_tmp"; then
     mv "$_tmp" "$OUT/linear_comment_webhook.json"
   else
