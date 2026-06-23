@@ -196,6 +196,9 @@ fi
 
 if [[ -n "${LINEAR_API_KEY:-}" && -n "${ISSUE:-}" ]]; then
   echo "capturing linear_issues_in_state.json + linear_comments_since.json for $ISSUE"
+  # Pass Authorization via a temp curl config file so the token is not visible in argv.
+  _auth_cfg=$(mktemp)
+  printf 'header = "Authorization: %s"\n' "$LINEAR_API_KEY" > "$_auth_cfg"
   # Mirror queries.ISSUES_IN_STATE_NO_LABEL / ISSUE_COMMENTS_SINCE node shapes.
   ISSUE_Q=$(cat <<'GQL'
 query($id: String!) {
@@ -213,9 +216,12 @@ GQL
 )
   _tmp=$(mktemp)
   if curl -fsS https://api.linear.app/graphql \
-    -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
+    --config "$_auth_cfg" -H "Content-Type: application/json" \
     -d "$(jq -nc --arg q "$ISSUE_Q" --arg id "$ISSUE" '{query:$q, variables:{id:$id}}')" \
     | jq '
+      if .errors then error("Linear API returned errors: " + (.errors | tostring))
+      elif .data.issue == null then error("Linear API returned null issue; check ISSUE value")
+      else . end |
       {issues: {nodes: [.data.issue]}} |
       .issues.nodes[0].id          = "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b" |
       .issues.nodes[0].identifier  = "SYM-42" |
@@ -254,10 +260,13 @@ GQL
 )
   _tmp=$(mktemp)
   if curl -fsS https://api.linear.app/graphql \
-    -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
+    --config "$_auth_cfg" -H "Content-Type: application/json" \
     -d "$(jq -nc --arg q "$COMMENTS_Q" --arg id "$ISSUE" \
       '{query:$q, variables:{id:$id, after:"2000-01-01T00:00:00Z"}}')" \
     | jq '
+      if .errors then error("Linear API returned errors: " + (.errors | tostring))
+      elif .data.issue == null then error("Linear API returned null issue; check ISSUE value")
+      else . end |
       {issue: .data.issue} |
       if (.issue.comments.nodes | length) == 0
       then error("issue has no comments; pick an issue with >=1 comment")
@@ -277,20 +286,32 @@ GQL
     rm -f "$_tmp"
     echo "warning: linear_comments_since capture failed; existing golden unchanged" >&2
   fi
+  rm -f "$_auth_cfg"
 fi
 
 if [[ -n "${LINEAR_COMMENT_DELIVERY:-}" && -f "${LINEAR_COMMENT_DELIVERY:-}" ]]; then
   echo "capturing linear_comment_webhook.json from $LINEAR_COMMENT_DELIVERY"
   _tmp=$(mktemp)
   if jq '
+    # Reject deliveries that are not Comment events — copying .type/.action from
+    # a non-comment delivery and then fabricating comment-shaped data would produce
+    # a fixture that lies about the event type.
+    if .type != "Comment" then
+      error("not a Comment delivery; .type is " + (.type // "null"))
+    else . end |
     # Whitelist only the fields the contract tests act on so no extra fields
     # from a real delivery leak into the committed fixture.
+    # `createdAt` is preserved at both levels: comment_from_webhook_payload() reads
+    # data.createdAt first and falls back to the top-level field; omitting both
+    # causes it to return null.
     {
-      type:   .type,
-      action: .action,
+      type:      .type,
+      action:    .action,
+      createdAt: "2026-06-20T15:00:00.000Z",
       data: {
         id:             "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
         body:           "$approve",
+        createdAt:      "2026-06-20T15:00:00.000Z",
         issueId:        "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b",
         externalThread: null
       },
