@@ -122,6 +122,9 @@ class Sim:
         self.viewer_teams: list[str] = []
         # GitHub reality, keyed by (repo, number).
         self.prs: dict[tuple[str, int], SimPR] = {}
+        # branch → latest pushed SHA; populated by _sim_aware_push so
+        # ensure_pr (called after the push) can use the real HEAD hash.
+        self.branch_head_shas: dict[str, str] = {}
         self._pr_counter = itertools.count(1)
         self._comment_counter = itertools.count(1)
         self.linear = _LinearView(self)
