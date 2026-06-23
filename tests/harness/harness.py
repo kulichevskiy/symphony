@@ -21,7 +21,7 @@ from symphony.orchestrator.reconcile import reconcile
 from .clock import ManualClock
 from .fakes import FakeGitHub, FakeLinear, FakeRunner
 from .invariants import assert_consistent
-from .sim import Sim
+from .sim import PR_OPEN, Sim
 
 DEFAULT_TEAM = "ENG"
 DEFAULT_REPO = "org/repo"
@@ -82,7 +82,11 @@ async def _sim_aware_push(
         if commit_timestamps is not None:
             commit_timestamps.setdefault(head_sha, sim.now_iso())
         for sim_pr in sim.prs.values():
-            if sim_pr.head == branch and (pr_repo is None or sim_pr.repo == pr_repo):
+            if (
+                sim_pr.head == branch
+                and (pr_repo is None or sim_pr.repo == pr_repo)
+                and sim_pr.state == PR_OPEN
+            ):
                 sim_pr.head_sha = head_sha
                 break
 
@@ -244,5 +248,6 @@ class Harness:
 
     async def close(self) -> None:
         await self.orch.shutdown()
-        await self._drain()
+        await self.orch.drain_reconcile_event_tasks(cancel=True)
+        await self.orch.drain_dispatch_tasks(cancel=True)
         await self.conn.close()

@@ -12,7 +12,7 @@ import aiosqlite
 from symphony import db
 from symphony.db.runs import LIVE_STATUSES
 
-from .sim import Sim
+from .sim import PR_CLOSED, Sim
 
 
 async def _live_run_rows(conn: aiosqlite.Connection) -> list[aiosqlite.Row]:
@@ -102,7 +102,7 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
         (row["github_repo"], row["pr_number"]): row["issue_id"] for row in db_pr_rows
     }
     for (repo, number), sim_pr in sim.prs.items():
-        if sim_pr.issue_id:
+        if sim_pr.issue_id and sim_pr.state != PR_CLOSED:
             assert (repo, number) in db_pr_issue, (
                 f"Sim PR ({repo!r}, {number}) for issue {sim_pr.issue_id!r} "
                 f"is not recorded in issue_prs"
