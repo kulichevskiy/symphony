@@ -95,7 +95,14 @@ if [[ -n "${GH_REPO:-}" && -n "${FAILING_PR:-}" ]]; then
   else
     _gh_exit="${PIPESTATUS[0]}"
     case "$_gh_exit" in
-      1) mv "$_tmp" "$OUT/github_pr_checks.json" ;;
+      1) # Validate output is a non-empty JSON array — not an error message from a PR
+         # with no required checks or an unrelated gh failure.
+         if jq -e 'type == "array" and length > 0' "$_tmp" > /dev/null 2>&1; then
+           mv "$_tmp" "$OUT/github_pr_checks.json"
+         else
+           rm -f "$_tmp"
+           echo "warning: gh pr checks exit-1 output is not a non-empty check array (no required checks on FAILING_PR?); existing golden unchanged" >&2
+         fi ;;
       8) rm -f "$_tmp"
          echo "warning: gh pr checks exited 8 (checks pending, not failing); existing golden unchanged" >&2 ;;
       *) rm -f "$_tmp"
@@ -106,27 +113,44 @@ fi
 
 if [[ -n "${GH_REPO:-}" && -n "${HOOK_ID:-}" ]]; then
   echo "capturing github_pr_webhook.json from $GH_REPO hook $HOOK_ID"
-  # Select the most-recent closed (merged) pull_request delivery to avoid
-  # picking an opened/synchronize/reopened event from the same hook.
+  # Pick the most-recent closed pull_request delivery; the per-delivery fetch
+  # then verifies pull_request.merged == true so a closed-not-merged event
+  # never becomes the golden.
   DELIVERY_ID=$(gh api "repos/$GH_REPO/hooks/$HOOK_ID/deliveries" \
     --jq 'map(select(.event == "pull_request" and .action == "closed")) | .[0].id')
-  _tmp=$(mktemp)
-  if gh api "repos/$GH_REPO/hooks/$HOOK_ID/deliveries/$DELIVERY_ID" \
-      --jq '.request.payload' \
-      | jq '
-        .repository.full_name      = "acme/widgets" |
-        .repository.name           = "widgets" |
-        .repository.owner.login    = "acme" |
-        .pull_request.title        = "Fix flaky merge gate" |
-        .pull_request.head.ref     = "symphony/sym-42" |
-        .pull_request.head.sha     = "9f3a1c2e5b7d8a0f1234567890abcdef12345678" |
-        .pull_request.merged_by    = (if .pull_request.merged_by then {"login": "alex"} else null end) |
-        .sender.login              = "alex"
-      ' > "$_tmp"; then
-    mv "$_tmp" "$OUT/github_pr_webhook.json"
+  if [[ -z "$DELIVERY_ID" || "$DELIVERY_ID" == "null" ]]; then
+    echo "warning: no closed pull_request delivery found for hook $HOOK_ID; existing golden unchanged" >&2
   else
-    rm -f "$_tmp"
-    echo "warning: github_pr_webhook capture failed; existing golden unchanged" >&2
+    _tmp=$(mktemp)
+    # Whitelist only the fields the contract needs; reject deliveries where the
+    # PR was closed without merging (merged == true is required).
+    if gh api "repos/$GH_REPO/hooks/$HOOK_ID/deliveries/$DELIVERY_ID" \
+        --jq '.request.payload' \
+        | jq '
+          if .pull_request.merged != true then
+            error("delivery is a closed-without-merge PR; point HOOK_ID at a hook that received a merged-PR event")
+          else . end |
+          {
+            action: .action,
+            number: .pull_request.number,
+            pull_request: {
+              number: .pull_request.number,
+              state: .pull_request.state,
+              merged: .pull_request.merged,
+              merged_at: .pull_request.merged_at,
+              merged_by: (if .pull_request.merged_by then {"login": "alex"} else null end),
+              head: {"ref": "symphony/sym-42", "sha": "9f3a1c2e5b7d8a0f1234567890abcdef12345678"},
+              base: {"ref": "main"}
+            },
+            repository: {"full_name": "acme/widgets"},
+            sender: {"login": "alex"}
+          }
+        ' > "$_tmp"; then
+      mv "$_tmp" "$OUT/github_pr_webhook.json"
+    else
+      rm -f "$_tmp"
+      echo "warning: github_pr_webhook capture failed; existing golden unchanged" >&2
+    fi
   fi
 fi
 
@@ -159,6 +183,8 @@ GQL
       .issues.nodes[0].description = "The merge gate occasionally races with auto-merge." |
       .issues.nodes[0].url         = "https://linear.app/acme/issue/SYM-42/fix-flaky-merge-gate" |
       .issues.nodes[0].state.id    = "state-ready-uuid" |
+      .issues.nodes[0].state.name  = "Ready" |
+      .issues.nodes[0].state.type  = "unstarted" |
       .issues.nodes[0].team.key    = "SYM" |
       .issues.nodes[0].labels.nodes = [{"name": "symphony"}] |
       .issues.nodes[0].relations         = {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}} |
@@ -217,6 +243,7 @@ if [[ -n "${LINEAR_COMMENT_DELIVERY:-}" && -f "${LINEAR_COMMENT_DELIVERY:-}" ]];
   _tmp=$(mktemp)
   if jq '
     .data.id      = "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8" |
+    .data.body    = "$approve" |
     .data.issueId = "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b" |
     if .actor then .actor.id = "user-uuid" | .actor.name = "Alex" else . end
   ' "$LINEAR_COMMENT_DELIVERY" > "$_tmp"; then
