@@ -6,7 +6,6 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import cast
 
 import aiosqlite
 from fastapi import FastAPI
@@ -17,7 +16,7 @@ from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
 from .config import Config
-from .github.client import GitHub, GitHubClient
+from .github.client import GitHub
 from .github.webhook import (
     GitHubWebhookHandler,
     GitHubWebhookSettings,
@@ -26,7 +25,7 @@ from .github.webhook import (
 from .linear.client import Linear
 from .ui.api import CommandSink, create_api_router
 from .ui.db import ReadOnlyDbPool
-from .ui.external import ExternalSnapshotService
+from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
 from .ui.status import CanonicalState
 from .webhook import (
@@ -65,7 +64,7 @@ def create_app(
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     ui_external_config: Config | None = None,
     ui_external_linear: Linear | None = None,
-    ui_external_github: GitHubClient | None = None,
+    ui_external_github: GitHubExternalClient | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
@@ -86,7 +85,7 @@ def create_app(
         external_service = ExternalSnapshotService(
             ui_external_config,
             ui_external_linear,
-            cast(GitHub, ui_external_github) or GitHub(),
+            ui_external_github or GitHub(),
             clock=clock,
         )
 

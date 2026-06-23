@@ -24,6 +24,7 @@ from symphony.github.client import (
     DEFAULT_LOG_TAIL_BYTES,
     CheckRun,
     GitHubError,
+    MergeStrategy,
     PRChecks,
 )
 from symphony.linear.client import LinearError
@@ -473,7 +474,7 @@ class FakeGitHub:
         self,
         pr: int | str,
         *,
-        strategy: str,
+        strategy: MergeStrategy,
         auto: bool = False,
         repo: str | None = None,
     ) -> None:
