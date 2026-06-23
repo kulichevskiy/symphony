@@ -124,7 +124,8 @@ async def test_pr_checks_fake_matches_recorded_real_payload(
     gh = GitHub()
 
     async def fake_capture(*_args: Any, **_kwargs: Any) -> tuple[str, str, int]:
-        return (json.dumps(real_payload), "", 0)
+        # gh pr checks exits 1 when required checks are failing (not just "no checks").
+        return (json.dumps(real_payload), "", 1)
 
     monkeypatch.setattr(gh, "_run_capture", fake_capture)
     real_checks = await gh.pr_checks(1, repo="acme/widgets")

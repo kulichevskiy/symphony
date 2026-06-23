@@ -445,16 +445,18 @@ class GitHub:
             "name,state,bucket,link",
         ]
         stdout, stderr, returncode = await self._run_capture(argv)
-        # `gh pr checks --required` exits 1 when the branch has no reported
-        # checks, or when it has checks but none are required. Both cases are
-        # equivalent to an empty required-check list, not a transient failure.
+        # `gh pr checks --required` exits 1 in two distinct cases:
+        #   a) no checks / no required checks: stderr contains "no checks reported"
+        #      → treat as empty required-check list, not a transient failure.
+        #   b) one or more required checks are failing: stdout is a valid JSON array.
+        # Both exit 1; exit 8 means checks are still pending.
         output = f"{stderr}\n{stdout}".casefold()
         if returncode == 1 and (
             "no checks reported" in output
             or "no required checks reported" in output
         ):
             return PRChecks()
-        if returncode not in (0, 8):
+        if returncode not in (0, 1, 8):
             raise GitHubError(
                 f"gh {' '.join(argv)} exited {returncode}: {stderr.strip() or stdout.strip()}"
             )

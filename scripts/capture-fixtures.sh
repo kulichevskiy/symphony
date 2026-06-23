@@ -106,18 +106,22 @@ fi
 
 if [[ -n "${GH_REPO:-}" && -n "${HOOK_ID:-}" ]]; then
   echo "capturing github_pr_webhook.json from $GH_REPO hook $HOOK_ID"
+  # Select the most-recent closed (merged) pull_request delivery to avoid
+  # picking an opened/synchronize/reopened event from the same hook.
   DELIVERY_ID=$(gh api "repos/$GH_REPO/hooks/$HOOK_ID/deliveries" \
-    --jq 'map(select(.event == "pull_request")) | .[0].id')
+    --jq 'map(select(.event == "pull_request" and .action == "closed")) | .[0].id')
   _tmp=$(mktemp)
   if gh api "repos/$GH_REPO/hooks/$HOOK_ID/deliveries/$DELIVERY_ID" \
       --jq '.request.payload' \
       | jq '
-        .repository.full_name   = "acme/widgets" |
-        .repository.name        = "widgets" |
-        .repository.owner.login = "acme" |
-        .pull_request.title     = "Fix flaky merge gate" |
-        .pull_request.head.ref  = "symphony/sym-42" |
-        .sender.login           = "alex"
+        .repository.full_name      = "acme/widgets" |
+        .repository.name           = "widgets" |
+        .repository.owner.login    = "acme" |
+        .pull_request.title        = "Fix flaky merge gate" |
+        .pull_request.head.ref     = "symphony/sym-42" |
+        .pull_request.head.sha     = "9f3a1c2e5b7d8a0f1234567890abcdef12345678" |
+        .pull_request.merged_by    = (if .pull_request.merged_by then {"login": "alex"} else null end) |
+        .sender.login              = "alex"
       ' > "$_tmp"; then
     mv "$_tmp" "$OUT/github_pr_webhook.json"
   else
@@ -156,7 +160,9 @@ GQL
       .issues.nodes[0].url         = "https://linear.app/acme/issue/SYM-42/fix-flaky-merge-gate" |
       .issues.nodes[0].state.id    = "state-ready-uuid" |
       .issues.nodes[0].team.key    = "SYM" |
-      .issues.nodes[0].labels.nodes = [{"name": "symphony"}]
+      .issues.nodes[0].labels.nodes = [{"name": "symphony"}] |
+      .issues.nodes[0].relations         = {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}} |
+      .issues.nodes[0].inverseRelations  = {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
     ' > "$_tmp"; then
     mv "$_tmp" "$OUT/linear_issues_in_state.json"
   else
@@ -210,8 +216,9 @@ if [[ -n "${LINEAR_COMMENT_DELIVERY:-}" && -f "${LINEAR_COMMENT_DELIVERY:-}" ]];
   echo "capturing linear_comment_webhook.json from $LINEAR_COMMENT_DELIVERY"
   _tmp=$(mktemp)
   if jq '
-    .data.id = "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8" |
-    if .actor then .actor.name = "Alex" else . end
+    .data.id      = "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8" |
+    .data.issueId = "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b" |
+    if .actor then .actor.id = "user-uuid" | .actor.name = "Alex" else . end
   ' "$LINEAR_COMMENT_DELIVERY" > "$_tmp"; then
     mv "$_tmp" "$OUT/linear_comment_webhook.json"
   else
