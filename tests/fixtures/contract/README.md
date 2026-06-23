@@ -21,11 +21,16 @@ goes red.
 One command (set only the env vars for the surfaces you want to refresh):
 
 ```bash
-GH_REPO=owner/repo PR=1234 HOOK_ID=555000111 \
+GH_REPO=owner/repo PR=1234 FAILING_PR=5678 HOOK_ID=555000111 \
 LINEAR_API_KEY=lin_xxx ISSUE=SYM-42 \
 LINEAR_COMMENT_DELIVERY=/path/to/saved-delivery.json \
 scripts/capture-fixtures.sh
 ```
+
+`PR` must be an open, mergeable PR with all required checks green (used for
+`github_pr_view.json` and `github_pr_checks_passing.json`). `FAILING_PR` must
+be a PR with ≥1 failing required check (used for `github_pr_checks.json`; the
+script refuses to write pending-check output to this fixture).
 
 Then review the diff and run `uv run pytest tests/test_fake_contracts.py`.
 
@@ -34,8 +39,8 @@ webhook deliveries need a configured hook (`HOOK_ID`) or a saved inbound
 delivery body (`LINEAR_COMMENT_DELIVERY`); when those aren't available the
 committed copies are real-shaped payloads refreshed manually from a captured
 delivery. IDs/titles/SHAs are sanitized to a synthetic `acme/widgets` + `SYM`
-project — the contracts compare *domain semantics*, not literal identifiers, so
-sanitizing is safe.
+project by the capture script — the contracts compare *domain semantics*, not
+literal identifiers, so sanitizing is safe.
 
 ## Deferred (YAGNI)
 
