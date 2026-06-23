@@ -2518,14 +2518,14 @@ async def test_local_review_infra_failure_retry_short_circuits_skips_agent(
 
 
 @pytest.mark.asyncio
-async def test_legacy_local_review_failure_retry_short_circuits_skips_agent(
+async def test_untagged_prior_failure_with_sibling_local_review_runs_agent(
     tmp_path: Path,
 ) -> None:
-    """A pre-fix stuck row (implement failed with a heuristic kind like
-    "unknown", before LOCAL_REVIEW_INFRA_FAILED_KIND existed) is still
-    recognized as agent-free-resumable via its sibling failed local-review run,
-    so $retry skips the implementer instead of re-running it into the
-    "HEAD did not advance" failure. This is the SYM-133-on-disk case."""
+    """An implement run that failed with an untagged/heuristic kind (e.g.
+    "unknown") is NOT treated as agent-free-resumable, even when a sibling
+    failed local-review run exists — only the explicit
+    LOCAL_REVIEW_INFRA_FAILED_KIND qualifies. A fix-run failure can leave
+    partial commits, so an untagged failure must re-run the implementer."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _no_review_binding(auto_merge=False)
@@ -2613,10 +2613,11 @@ async def test_legacy_local_review_failure_retry_short_circuits_skips_agent(
 
         await _scan_and_wait(orch, binding)
 
-        # Recognized as resumable despite the legacy "unknown" kind.
-        assert runner.specs == []
-        push_fn.assert_awaited_once()
-        gh.ensure_pr.assert_awaited_once()
+        # Untagged failure → the implementer is re-dispatched (not skipped),
+        # and publish is not reached on this no-op recording run.
+        assert runner.specs != []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
     finally:
         await conn.close()
 

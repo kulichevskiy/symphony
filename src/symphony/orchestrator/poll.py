@@ -11070,17 +11070,12 @@ class Orchestrator:
             # A local-review *infra* failure (no verdict / the session raised)
             # also passed the completion gate, so the commits are complete —
             # but local review never finished, so the resume re-runs the gates
-            # *with fixes enabled* (a re-review may now request changes).
-            # Recognize the explicit kind and legacy rows alike: pre-fix
-            # failures carry a heuristic kind (e.g. "unknown"), so a sibling
-            # terminally-failed local-review run is the durable signal that the
-            # prior implement reached the local-review gate.
+            # *with fixes enabled* (a re-review may now request changes). Only
+            # the explicit kind qualifies: it is stamped solely for
+            # reviewer-never-verdicted failures, never for fix-run failures
+            # (which may have left partial commits and must re-run the agent).
             resume_after_local_review = (
                 previous_terminal_kind == db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
-            ) or (
-                previous_terminal_kind is not None
-                and previous_terminal_kind not in delivery_resume_kinds
-                and await self._issue_has_failed_local_review_run(issue_id)
             )
             previous_requires_agent = (
                 previous_terminal_kind is not None
@@ -11207,22 +11202,6 @@ class Orchestrator:
         if previous.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
             return None
         return previous.termination_kind
-
-    async def _issue_has_failed_local_review_run(self, issue_id: str) -> bool:
-        """True when the issue has a terminally-failed local-review run.
-
-        The durable, kind-agnostic signal that the prior implement reached the
-        local-review gate (so its commits are complete). Lets a $retry resume
-        agent-free even for legacy rows written before
-        LOCAL_REVIEW_INFRA_FAILED_KIND existed, whose implement run carries a
-        heuristic kind like "unknown".
-        """
-        history = await db.runs.history_for_issue(self._conn, issue_id)
-        return any(
-            run.stage == "local_review"
-            and run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
-            for run in history
-        )
 
     async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:
         """The PR base: the binding's configured base, else the repo default.
@@ -12853,15 +12832,24 @@ class Orchestrator:
         result: LoopResult | None,
     ) -> None:
         reason = _local_review_termination_reason(result)
-        # Every path into this handler is a local-review *infra* failure (a
-        # reviewer that emitted no verdict, a stalled fix-run, or `result is
-        # None` when the session raised) — all *after* the implement completion
-        # gate passed, so the agent's commits are intact. Tag the run so a
-        # $retry resumes agent-free (re-runs the gates with fixes enabled)
-        # instead of re-dispatching the implementer, which finds nothing to do
-        # and trips "HEAD did not advance".
+        # Tag only failures where the reviewer never produced a verdict — a
+        # `REVIEWER_FAILED` (no marker / reviewer crashed) or `result is None`
+        # (the session raised). Both happen *after* the implement completion
+        # gate, with no fix attempted, so the agent's commits are intact and a
+        # $retry can safely resume agent-free. `FIX_RUN_FAILED`/`FIX_RUN_BLOCKED`
+        # are deliberately left untagged: a fixer can fail/block after leaving
+        # partial commits, so those must re-run the implementer.
+        reviewer_never_verdicted = (
+            result is None or result.outcome == LoopOutcome.REVIEWER_FAILED
+        )
         await self._fail_run(
-            run_id, reason, termination_kind=db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
+            run_id,
+            reason,
+            termination_kind=(
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
+                if reviewer_never_verdicted
+                else None
+            ),
         )
 
         tracker = self.tracker(binding)
