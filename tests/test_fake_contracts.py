@@ -43,7 +43,7 @@ from symphony.tracker import Comment
 
 from tests.harness.clock import ManualClock
 from tests.harness.fakes import FakeGitHub, FakeLinear
-from tests.harness.sim import PR_OPEN, Sim, SimComment, SimIssue, SimPR
+from tests.harness.sim import PR_OPEN, Sim, SimCheck, SimComment, SimIssue, SimPR
 
 FIXTURES = Path(__file__).parent / "fixtures" / "contract"
 
@@ -106,6 +106,83 @@ async def test_pr_view_fake_matches_recorded_real_payload(
         state=PR_OPEN,
         head_sha=real_payload["headRefOid"],
         checks_passed=True,
+    )
+    fake = FakeGitHub(sim)
+    fake_view = await fake.pr_view(
+        real_payload["number"], repo="acme/widgets", include_status_checks=True
+    )
+
+    assert _pr_view_domain(fake_view) == _pr_view_domain(real_view)
+
+
+# Each edge state: the golden `gh pr view` payload + the SimPR fields that
+# reproduce it. The contract proves the fake lands in the SAME merge-gate
+# bucket as the recorded real payload — the values are pinned to reality, not
+# hand-invented.
+_EDGE_STATE_CASES = {
+    "github_pr_view_behind.json": {
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "BEHIND",
+        "checks": [SimCheck(name="ci", conclusion="SUCCESS", required=True)],
+    },
+    "github_pr_view_unstable.json": {
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "UNSTABLE",
+        "checks": [
+            SimCheck(name="ci", conclusion="SUCCESS", required=True),
+            SimCheck(name="vercel", conclusion="FAILURE", required=False),
+        ],
+    },
+    "github_pr_view_dirty.json": {
+        "mergeable": "CONFLICTING",
+        "merge_state_status": "DIRTY",
+        "checks": [SimCheck(name="ci", conclusion="SUCCESS", required=True)],
+    },
+    "github_pr_view_unknown.json": {
+        "mergeable": "UNKNOWN",
+        "merge_state_status": "UNKNOWN",
+        "checks": [SimCheck(name="ci", conclusion="SUCCESS", required=True)],
+    },
+    "github_pr_view_draft.json": {
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "DRAFT",
+        "is_draft": True,
+        "checks": [SimCheck(name="ci", conclusion="SUCCESS", required=True)],
+    },
+}
+
+
+@pytest.mark.parametrize("fixture", sorted(_EDGE_STATE_CASES))
+async def test_pr_view_edge_state_fake_matches_recorded_real_payload(
+    fixture: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_payload = _load(fixture)
+
+    gh = GitHub()
+
+    async def fake_run_json(*_args: Any, **_kwargs: Any) -> Any:
+        return real_payload
+
+    monkeypatch.setattr(gh, "_run_json", fake_run_json)
+    real_view = await gh.pr_view(real_payload["number"], include_status_checks=True)
+
+    # None of the edge states are merged or closed, and none is the happy
+    # clean-mergeable binary the original golden records.
+    assert not _pr_view_is_merged(real_payload)
+    assert not _pr_view_is_closed(real_payload)
+    assert not _pr_view_is_clean_mergeable(real_payload)
+
+    sim = _new_sim()
+    sim.prs[("acme/widgets", real_payload["number"])] = SimPR(
+        repo="acme/widgets",
+        number=real_payload["number"],
+        head=real_payload["headRefName"],
+        base=real_payload["baseRefName"],
+        title=real_payload["title"],
+        url=real_payload["url"],
+        state=PR_OPEN,
+        head_sha=real_payload["headRefOid"],
+        **_EDGE_STATE_CASES[fixture],
     )
     fake = FakeGitHub(sim)
     fake_view = await fake.pr_view(

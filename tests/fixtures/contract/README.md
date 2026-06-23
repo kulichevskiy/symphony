@@ -9,7 +9,12 @@ goes red.
 
 | Fixture | Surface | Real parsing path |
 |---|---|---|
-| `github_pr_view.json` | `gh pr view <n> --json …` | `GitHub.pr_view` → poll merge-gate classifiers |
+| `github_pr_view.json` | `gh pr view <n> --json …` (open, CLEAN, mergeable) | `GitHub.pr_view` → poll merge-gate classifiers |
+| `github_pr_view_behind.json` | `gh pr view <n> …` — `mergeStateStatus: BEHIND` | same; pins the BEHIND edge state |
+| `github_pr_view_unstable.json` | `gh pr view <n> …` — `UNSTABLE` + failing optional check | same; pins UNSTABLE + a non-required rollup failure |
+| `github_pr_view_dirty.json` | `gh pr view <n> …` — `DIRTY` / `CONFLICTING` | same; pins the merge-conflict edge state |
+| `github_pr_view_unknown.json` | `gh pr view <n> …` — `mergeable: UNKNOWN` | same; pins the "re-poll, don't act" edge state |
+| `github_pr_view_draft.json` | `gh pr view <n> …` — `isDraft: true` / `DRAFT` | same; pins the draft edge state |
 | `github_pr_checks.json` | `gh pr checks <n> --required --json …` | `GitHub.pr_checks` → `PRChecks` |
 | `github_pr_webhook.json` | `pull_request` (closed/merged) webhook delivery | `github.webhook._parse_event` |
 | `linear_issues_in_state.json` | `issues(...)` GraphQL `data` | `LinearTracker.issues_in_state` → `LinearIssue.from_node` |
@@ -33,6 +38,12 @@ be a PR with ≥1 failing required check (used for `github_pr_checks.json`; the
 script refuses to write pending-check output to this fixture).
 
 Then review the diff and run `uv run pytest tests/test_fake_contracts.py`.
+
+The `github_pr_view_*.json` edge-state goldens (BEHIND / UNSTABLE / DIRTY /
+UNKNOWN / draft) are captured the same way as `github_pr_view.json` — point `PR`
+at a real PR sitting in that state — or refreshed manually from a captured
+payload when no such PR is handy, then sanitized to `acme/widgets`. The
+contracts compare merge-gate *domain semantics*, so sanitizing IDs is safe.
 
 `pr_view` / `pr_checks` and the Linear issue/comment reads capture live. The two
 webhook deliveries need a configured hook (`HOOK_ID`) or a saved inbound

@@ -1,0 +1,21 @@
+{
+  "number": 4826,
+  "title": "Draft PR",
+  "state": "OPEN",
+  "url": "https://github.com/acme/widgets/pull/4826",
+  "headRefName": "symphony/sym-47",
+  "headRefOid": "5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "DRAFT",
+  "isDraft": true,
+  "mergedAt": null,
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "ci",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    }
+  ]
+}

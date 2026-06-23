@@ -1,0 +1,27 @@
+{
+  "number": 4823,
+  "title": "Unstable: optional check failing",
+  "state": "OPEN",
+  "url": "https://github.com/acme/widgets/pull/4823",
+  "headRefName": "symphony/sym-44",
+  "headRefOid": "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "UNSTABLE",
+  "isDraft": false,
+  "mergedAt": null,
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "ci",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "vercel",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE"
+    }
+  ]
+}
