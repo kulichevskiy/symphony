@@ -167,6 +167,9 @@ async def test_duplicated_webhook_is_idempotent(
         )
         row = await cur.fetchone()
         obs_after_first = row["n"]
+        assert obs_after_first == 2, (
+            f"first webhook delivery did not process the merge: expected 2 observations, got {obs_after_first}"
+        )
 
         await harness.orch.handle_github_webhook(event)
         await harness.drain()
