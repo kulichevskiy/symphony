@@ -201,6 +201,14 @@ ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
 AGENT_INFRA_RETRY_LIMIT = 5
 ACCEPTANCE_FIX_ITERATION_CAP = 1
+# Both transient-retry kinds share the same retry budget and backoff logic.
+# TRANSIENT_API_RETRY_KIND: implement-phase failure (no work done, HEAD unchanged).
+# LOCAL_REVIEW_TRANSIENT_RETRY_KIND: local-review-phase failure (implement succeeded,
+#   commits intact, but reviewer got a transient 500 before verdicting).
+_AGENT_INFRA_RETRY_KINDS: frozenset[str] = frozenset({
+    db.runs.TRANSIENT_API_RETRY_KIND,
+    db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+})
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
 
@@ -9745,7 +9753,7 @@ class Orchestrator:
                 continue
             if run.status in db.runs.LIVE_STATUSES:
                 continue
-            if run.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND:
+            if run.termination_kind in _AGENT_INFRA_RETRY_KINDS:
                 count += 1
             else:
                 break
@@ -9763,7 +9771,7 @@ class Orchestrator:
         )
         if (
             latest is None
-            or latest.termination_kind != db.runs.TRANSIENT_API_RETRY_KIND
+            or latest.termination_kind not in _AGENT_INFRA_RETRY_KINDS
             or latest.ended_at is None
         ):
             return False
@@ -9787,19 +9795,26 @@ class Orchestrator:
         api_error: StreamApiError | None,
         reason: str,
         returncode: int | None = None,
+        termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
     ) -> bool:
         """Requeue an implement run that died on a *transient* provider API
         error instead of escalating, until the retry budget is spent.
 
         A clean 5xx/429 means the agent did no work, so re-invoking is safe. The
-        run is marked failed with a durable `transient_api_retry` marker +
-        `ended_at` and the issue is moved back to its Ready lane; the poll loop
-        re-dispatches once the per-attempt backoff window elapses
-        (`_agent_infra_retry_backoff_active`) — no workspace slot is held during
-        the wait. Returns True when it handled the failure this way (the caller
-        must skip escalation). Returns False — the caller escalates exactly as
-        today — for a non-transient error, no API error, or once
-        `AGENT_INFRA_RETRY_LIMIT` consecutive retries have already happened."""
+        run is marked failed with a durable marker + `ended_at` and the issue is
+        moved back to its Ready lane; the poll loop re-dispatches once the
+        per-attempt backoff window elapses (`_agent_infra_retry_backoff_active`)
+        — no workspace slot is held during the wait. Returns True when it handled
+        the failure this way (the caller must skip escalation). Returns False —
+        the caller escalates exactly as today — for a non-transient error, no API
+        error, or once `AGENT_INFRA_RETRY_LIMIT` consecutive retries have already
+        happened.
+
+        `termination_kind` selects the durable marker stamped on the run:
+        `TRANSIENT_API_RETRY_KIND` for implement-phase failures (the default) and
+        `LOCAL_REVIEW_TRANSIENT_RETRY_KIND` for local-review-phase failures. The
+        re-dispatch resume logic reads this to decide whether to re-run the
+        implementer or short-circuit to the pre-push gates."""
         if api_error is None or not api_error.transient:
             return False
         # The current run is still `running` (its marker is stamped below), so
@@ -9824,7 +9839,7 @@ class Orchestrator:
             run_id,
             reason,
             returncode=returncode,
-            termination_kind=db.runs.TRANSIENT_API_RETRY_KIND,
+            termination_kind=termination_kind,
             termination_detail=reason,
         )
         try:
@@ -11241,12 +11256,18 @@ class Orchestrator:
             # also passed the completion gate, so the commits are complete —
             # but local review never finished, so the resume re-runs the gates
             # *with fixes enabled* (a re-review may now request changes). Only
-            # the explicit kind qualifies: it is stamped solely for
+            # the explicit kinds qualify: they are stamped solely for
             # reviewer-never-verdicted failures, never for fix-run failures
             # (which may have left partial commits and must re-run the agent).
-            resume_after_local_review = (
-                previous_terminal_kind == db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
-            )
+            # LOCAL_REVIEW_TRANSIENT_RETRY_KIND is the backoff variant: the
+            # implement succeeded and the local-review phase got a transient 500,
+            # so the re-dispatch must also skip the implementer and re-run only
+            # the pre-push gates (with fixes allowed) rather than treating it
+            # like a plain implement failure that needs a full re-run.
+            resume_after_local_review = previous_terminal_kind in {
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
+                db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+            }
             previous_requires_agent = (
                 previous_terminal_kind is not None
                 and previous_terminal_kind not in delivery_resume_kinds
@@ -11638,6 +11659,10 @@ class Orchestrator:
                 # A transient provider API error in the reviewer/fix turn left
                 # the agent's commits intact and did no further work — requeue
                 # with backoff instead of escalating, until the budget is spent.
+                # LOCAL_REVIEW_TRANSIENT_RETRY_KIND is used (not TRANSIENT_API_RETRY_KIND)
+                # so the re-dispatch resume logic recognises that the implement
+                # succeeded and short-circuits to the pre-push gates instead of
+                # re-running the implementer on an already-complete branch.
                 if await self._maybe_requeue_transient_agent_failure(
                     run_id=run_id,
                     binding=binding,
@@ -11649,6 +11674,7 @@ class Orchestrator:
                         else None
                     ),
                     reason=_local_review_termination_reason(local_review_result),
+                    termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
                 ):
                     return False, local_review_result
                 await self._block_local_only_review_infra_failure(
@@ -11675,6 +11701,14 @@ class Orchestrator:
                 allow_fixes=allow_fixes,
             )
             if not verify_result.ok:
+                # Verify-gate and dirty-tree fix failures are intentionally not
+                # routed through _maybe_requeue_transient_agent_failure: VerifyResult
+                # does not carry an api_error field (the fix turn's transient signal
+                # is not surfaced), and dirty-tree fix failures are best-effort
+                # (any failure just leaves the tree dirty and the re-check fails
+                # closed). Both are treated as non-transient, fail-closed operator
+                # waits. Wiring transient retry here would require plumbing api_error
+                # through run_verify_session / _run_dirty_tree_fix_turn — out of scope.
                 await self._block_verify_failure(
                     binding=binding,
                     issue=issue,

@@ -47,6 +47,14 @@ LOCAL_REVIEW_INFRA_FAILED_KIND: str = "local_review_infra_failed"
 # (poll.py _agent_infra_retry_backoff_active) up to AGENT_INFRA_RETRY_LIMIT
 # attempts before falling through to the normal infra-failure escalation.
 TRANSIENT_API_RETRY_KIND: str = "transient_api_retry"
+# Same semantics as TRANSIENT_API_RETRY_KIND but stamped when the transient
+# 5xx/429 occurred in the *local-review* turn (not the implement agent itself).
+# The implement commits are intact, so the re-dispatch short-circuits to the
+# pre-push gates instead of re-running the implementer (mirroring
+# LOCAL_REVIEW_INFRA_FAILED_KIND in the resume_after_local_review branch of
+# poll.py _run_implement_dispatch). Both kinds share the same retry budget and
+# backoff window tracked by _agent_infra_retry_count / _agent_infra_retry_backoff_active.
+LOCAL_REVIEW_TRANSIENT_RETRY_KIND: str = "local_review_transient_retry"
 TERMINATION_DETAIL_MAX_BYTES: int = 4096
 TERMINATION_DETAIL_MAX_LINES: int = 80
 
