@@ -1,0 +1,43 @@
+{
+  "issues": {
+    "nodes": [
+      {
+        "id": "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b",
+        "identifier": "SYM-42",
+        "title": "Fix flaky merge gate",
+        "description": "The merge gate occasionally races with auto-merge.",
+        "url": "https://linear.app/acme/issue/SYM-42/fix-flaky-merge-gate",
+        "state": {
+          "id": "state-ready-uuid",
+          "name": "Ready",
+          "type": "unstarted"
+        },
+        "team": {
+          "key": "SYM"
+        },
+        "labels": {
+          "nodes": [
+            {
+              "name": "symphony"
+            }
+          ]
+        },
+        "updatedAt": "2026-06-20T10:00:00.000Z",
+        "relations": {
+          "nodes": [],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          }
+        },
+        "inverseRelations": {
+          "nodes": [],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": null
+          }
+        }
+      }
+    ]
+  }
+}

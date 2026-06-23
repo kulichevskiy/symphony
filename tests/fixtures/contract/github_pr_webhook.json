@@ -1,0 +1,26 @@
+{
+  "action": "closed",
+  "number": 4821,
+  "pull_request": {
+    "number": 4821,
+    "state": "closed",
+    "merged": true,
+    "merged_at": "2026-06-20T14:32:10Z",
+    "merged_by": {
+      "login": "octocat"
+    },
+    "head": {
+      "ref": "symphony/sym-42",
+      "sha": "9f3a1c2e5b7d8a0f1234567890abcdef12345678"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widgets"
+  },
+  "sender": {
+    "login": "octocat"
+  }
+}
