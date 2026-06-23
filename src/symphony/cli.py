@@ -32,7 +32,6 @@ from .agent.codex_cli import (
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
 from .config import Config, RepoBinding, RoleName, Secrets
-from .github.client import GitHub
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
@@ -264,7 +263,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                     ui_external_config=cfg,
                     ui_external_linear=external_linear,
-                    ui_external_github=GitHub(),
+                    ui_external_github=orch._gh,  # noqa: SLF001
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
                     ),

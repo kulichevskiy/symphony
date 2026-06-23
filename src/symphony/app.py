@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import cast
 
 import aiosqlite
 from fastapi import FastAPI
@@ -16,7 +17,7 @@ from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
 from .config import Config
-from .github.client import GitHub
+from .github.client import GitHub, GitHubClient
 from .github.webhook import (
     GitHubWebhookHandler,
     GitHubWebhookSettings,
@@ -64,7 +65,7 @@ def create_app(
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     ui_external_config: Config | None = None,
     ui_external_linear: Linear | None = None,
-    ui_external_github: GitHub | None = None,
+    ui_external_github: GitHubClient | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
@@ -85,7 +86,7 @@ def create_app(
         external_service = ExternalSnapshotService(
             ui_external_config,
             ui_external_linear,
-            ui_external_github or GitHub(),
+            cast(GitHub, ui_external_github) or GitHub(),
             clock=clock,
         )
 

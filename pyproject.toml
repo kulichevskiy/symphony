@@ -55,4 +55,10 @@ select = ["E", "F", "I", "B", "UP", "ASYNC"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src/symphony"]
+files = ["src/symphony", "tests/harness/fakes.py", "tests/test_github_client_protocol.py"]
+
+[[tool.mypy.overrides]]
+# harness.py is pulled in transitively via tests/harness/__init__.py; it uses
+# Pydantic AliasChoices constructor kwargs that mypy doesn't understand.
+module = ["tests.harness.harness"]
+ignore_errors = true

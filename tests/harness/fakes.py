@@ -20,7 +20,12 @@ from pathlib import Path
 from typing import Any
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.github.client import CheckRun, GitHubError, PRChecks
+from symphony.github.client import (
+    DEFAULT_LOG_TAIL_BYTES,
+    CheckRun,
+    GitHubError,
+    PRChecks,
+)
 from symphony.linear.client import LinearError
 from symphony.tracker import Blocker, Comment, Issue
 
@@ -446,11 +451,21 @@ class FakeGitHub:
             self._commit_timestamps[sha] = self._sim.now_iso()
         return self._commit_timestamps[sha]
 
-    async def check_log_tail(self, check: object, **kwargs: object) -> str:
+    async def check_log_tail(
+        self,
+        check: CheckRun,
+        *,
+        repo: str | None = None,
+        max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    ) -> str:
         return ""
 
     async def run_failed_log_tail(
-        self, run_id: int | str, **kwargs: object
+        self,
+        run_id: int | str,
+        *,
+        repo: str | None = None,
+        max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
     ) -> str:
         return ""
 
