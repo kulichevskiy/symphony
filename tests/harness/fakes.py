@@ -418,6 +418,11 @@ class FakeGitHub:
         if sim_pr is None:
             raise GitHubError(f"no such PR: {pr}")
         if sim_pr.checks_passed:
+            # Empty runs have identical gate semantics to an all-green required-check
+            # list (PRChecks.all_passed is True for empty runs). This models the
+            # "no required checks reported" case, not "has checks that all pass" —
+            # individual run names/states are not modelled. See
+            # test_pr_checks_passing_fake_matches_recorded_real_payload.
             return PRChecks(runs=[])
         if sim_pr.auto_merge_enabled:
             return PRChecks(runs=[CheckRun(name="ci", state="IN_PROGRESS", bucket="pending")])

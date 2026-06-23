@@ -22,7 +22,7 @@ one-command regenerator are enough until real drift is observed.
 from __future__ import annotations
 
 import json
-from dataclasses import astuple, fields
+from dataclasses import astuple
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,7 @@ from symphony.orchestrator.poll import (
     _pr_view_is_closed,
     _pr_view_is_merged,
 )
-from symphony.tracker import Comment, Issue
+from symphony.tracker import Comment
 
 from tests.harness.clock import ManualClock
 from tests.harness.fakes import FakeGitHub, FakeLinear
@@ -150,6 +150,41 @@ async def test_pr_checks_fake_matches_recorded_real_payload(
     ]
 
 
+async def test_pr_checks_passing_fake_matches_recorded_real_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_payload = _load("github_pr_checks_passing.json")  # one passing required check
+
+    gh = GitHub()
+
+    async def fake_capture(*_args: Any, **_kwargs: Any) -> tuple[str, str, int]:
+        return (json.dumps(real_payload), "", 0)
+
+    monkeypatch.setattr(gh, "_run_capture", fake_capture)
+    real_checks = await gh.pr_checks(1, repo="acme/widgets")
+
+    # Fake with checks_passed=True models "passes the merge gate" as empty runs
+    # (see fakes.py). Gate semantics agree with a real all-green run; individual
+    # run names/states are not modelled by the fake.
+    sim = _new_sim()
+    sim.prs[("acme/widgets", 1)] = SimPR(
+        repo="acme/widgets", number=1, head="feat/x", checks_passed=True
+    )
+    fake = FakeGitHub(sim)
+    fake_checks = await fake.pr_checks(1, repo="acme/widgets")
+
+    # Gate semantics must agree: a green PR is unblocked in both cases.
+    assert (real_checks.all_passed, real_checks.any_failed, real_checks.pending) == (
+        fake_checks.all_passed,
+        fake_checks.any_failed,
+        fake_checks.pending,
+    )
+    # The fake collapses all-green to empty runs (identical gate semantics).
+    # Individual run names/states are intentionally not modelled — see fakes.py.
+    assert fake_checks.runs == []
+    assert real_checks.runs  # golden has at least one passing run
+
+
 async def test_github_pr_webhook_fake_matches_recorded_real_payload() -> None:
     real_payload = _load("github_pr_webhook.json")  # merged pull_request delivery
 
@@ -208,15 +243,27 @@ async def test_issues_in_state_fake_matches_recorded_real_payload() -> None:
     assert len(real_issues) == 1
     real = real_issues[0]
 
-    # Fake path: seed the Sim with the same issue, read it back via FakeLinear.
-    # `_to_issue` is independent code from `from_node`; if it drops or renames
-    # any field the real client produces, the astuple comparison goes red.
+    # Fake path: seed the Sim with hardcoded primitives matching the fixture's
+    # expected domain values, then read back via FakeLinear. The equality check
+    # below verifies that `from_node` parsed the fixture into exactly those values
+    # AND that `_to_issue` reproduces them faithfully. Seeding from `real` would
+    # be a tautology — both sides would derive from the same `from_node` call.
     sim = _new_sim()
-    sim.issues[real.id] = SimIssue(
-        **{f.name: getattr(real, f.name) for f in fields(Issue)}
+    sim.issues["8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b"] = SimIssue(
+        id="8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b",
+        identifier="SYM-42",
+        title="Fix flaky merge gate",
+        description="The merge gate occasionally races with auto-merge.",
+        url="https://linear.app/acme/issue/SYM-42/fix-flaky-merge-gate",
+        state_id="state-ready-uuid",
+        state_name="Ready",
+        state_type="unstarted",
+        team_key="SYM",
+        labels=["symphony"],
+        updated_at="2026-06-20T10:00:00.000Z",
     )
     fake = FakeLinear(sim)
-    fake_issues = await fake.issues_in_state(real.team_key, real.state_name, "symphony")
+    fake_issues = await fake.issues_in_state("SYM", "Ready", "symphony")
 
     assert len(fake_issues) == 1
     assert astuple(fake_issues[0]) == astuple(real)
@@ -240,17 +287,18 @@ async def test_comments_since_fake_matches_recorded_real_payload() -> None:
     assert len(real_comments) == 1
     real = real_comments[0]
 
-    # Fake path: seed the same comment, read it back via FakeLinear.
+    # Fake path: seed the Sim with hardcoded primitives matching the fixture's
+    # expected domain values — seeding from `real` would be a tautology.
     sim = _new_sim()
     sim.comments["issue-uuid"] = [
         SimComment(
-            id=real.id,
+            id="c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
             issue_id="issue-uuid",
-            body=real.body,
-            created_at=real.created_at,
-            author_name=real.author_name,
-            author_is_me=real.author_is_me,
-            external_thread_type=real.external_thread_type,
+            body="$approve",
+            created_at="2026-06-20T15:00:00.000Z",
+            author_name="Alex",
+            author_is_me=False,  # "$approve" is not a symphony-marked comment
+            external_thread_type=None,
         )
     ]
     fake = FakeLinear(sim)

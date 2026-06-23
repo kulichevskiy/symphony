@@ -1,0 +1,8 @@
+[
+  {
+    "name": "ci",
+    "state": "SUCCESS",
+    "bucket": "pass",
+    "link": "https://github.com/acme/widgets/actions/runs/9876543210/job/12345678901"
+  }
+]

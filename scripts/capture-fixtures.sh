@@ -36,9 +36,21 @@ if [[ -n "${GH_REPO:-}" && -n "${PR:-}" ]]; then
   gh pr view "$PR" --repo "$GH_REPO" --json "$PR_VIEW_FIELDS" | jq . > "$OUT/github_pr_view.json"
 
   echo "capturing github_pr_checks.json from $GH_REPO#$PR"
-  # `--required` mirrors the merge gate; exit 8 just means a check is failing.
-  gh pr checks "$PR" --repo "$GH_REPO" --required --json name,state,bucket,link \
-    | jq . > "$OUT/github_pr_checks.json" || true
+  # `--required` mirrors the merge gate; exit 8 means a check is failing (valid JSON).
+  # Capture to a temp file so a broken run never clobbers the committed golden.
+  _tmp=$(mktemp)
+  if gh pr checks "$PR" --repo "$GH_REPO" --required --json name,state,bucket,link \
+      | jq . > "$_tmp"; then
+    mv "$_tmp" "$OUT/github_pr_checks.json"
+  else
+    _gh_exit="${PIPESTATUS[0]}"
+    if [[ "$_gh_exit" -eq 8 ]]; then
+      mv "$_tmp" "$OUT/github_pr_checks.json"
+    else
+      rm -f "$_tmp"
+      echo "warning: gh pr checks failed (exit $_gh_exit); existing golden unchanged" >&2
+    fi
+  fi
 fi
 
 if [[ -n "${GH_REPO:-}" && -n "${HOOK_ID:-}" ]]; then
