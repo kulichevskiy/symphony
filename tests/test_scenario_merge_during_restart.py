@@ -49,7 +49,9 @@ def _config(tmp_path: Path) -> Config:
 
 
 @pytest.mark.asyncio
-async def test_pr_merged_during_restart_converges(tmp_path: Path) -> None:
+async def test_pr_merged_during_restart_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     clock = ManualClock()
     harness = await Harness.create(tmp_path, config=_config(tmp_path), clock=clock)
     try:
@@ -116,6 +118,10 @@ async def test_pr_merged_during_restart_converges(tmp_path: Path) -> None:
             harness.conn, issue_id=issue.id, github_repo=REPO
         )
         assert db_pr is not None and db_pr.merged_at is None
+
+        # Enable active reconcile so the reconciler writes merged_at to the DB
+        # (observe-only mode is the default; active auto-clear requires this).
+        monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
 
         # Deliver the queued merge webhook, then drain the fire-and-forget
         # reconcile tasks it scheduled. This marks the PR merged in the DB.
