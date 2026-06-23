@@ -94,19 +94,6 @@ def _safe_run_id(parent_run_id: str, suffix: str) -> str:
     return f"{base}-{suffix}"
 
 
-def _reviewer_stream_error(stdout: str) -> str | None:
-    """Human error message from a reviewer's JSONL stream when a turn failed.
-
-    The reviewer process can exit 0 having emitted only a provider API error
-    (claude `is_error`/`api_error_status` or codex `turn.failed`/`error`) and no
-    verdict. Returns the last such error's message so the loop reports the real
-    cause instead of a generic "no verdict marker", or None when absent.
-    Delegates to `classify_stream_api_error` (the typed classifier) and keeps
-    only its message for the `agent_error` string seam.
-    """
-    err = classify_stream_api_error(stdout)
-    return err.message if err is not None else None
-
 
 def _persist_runner_transcript(
     log_dir: Path, stem: str, collected: CollectedRunnerOutput

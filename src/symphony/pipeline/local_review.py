@@ -170,10 +170,12 @@ def _claude_result_api_error(event: dict) -> StreamApiError | None:
     status = status if isinstance(status, int) else None
     text = event.get("result")
     message = text.strip() if isinstance(text, str) and text.strip() else None
-    if message is None and status is not None:
-        message = f"API Error: {status}"
-    if message is None:
+    # Gate: require a recognized API error indicator — either api_error_status
+    # is present or the result text matches "API Error: <3-digit status>".
+    if status is None and (message is None or not _API_ERROR_STATUS_RE.search(message)):
         return None
+    if message is None:
+        message = f"API Error: {status}"
     if status is None:
         status = _status_from_text(message)
     return StreamApiError(message=message, status=status)
@@ -220,7 +222,10 @@ def _codex_event_api_error(event: dict) -> StreamApiError | None:
     inner_msg, inner_status = _unwrap_codex_error(raw)
     if inner_status is not None:
         status = inner_status
-    return StreamApiError(message=inner_msg or raw.strip(), status=status)
+    msg = inner_msg or raw.strip()
+    if status is not None and not msg.startswith("API Error:"):
+        msg = f"API Error: {status} {msg}"
+    return StreamApiError(message=msg, status=status)
 
 
 def classify_stream_api_error(stdout: str) -> StreamApiError | None:
