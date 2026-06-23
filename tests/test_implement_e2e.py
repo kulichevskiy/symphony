@@ -2518,6 +2518,110 @@ async def test_local_review_infra_failure_retry_short_circuits_skips_agent(
 
 
 @pytest.mark.asyncio
+async def test_legacy_local_review_failure_retry_short_circuits_skips_agent(
+    tmp_path: Path,
+) -> None:
+    """A pre-fix stuck row (implement failed with a heuristic kind like
+    "unknown", before LOCAL_REVIEW_INFRA_FAILED_KIND existed) is still
+    recognized as agent-free-resumable via its sibling failed local-review run,
+    so $retry skips the implementer instead of re-running it into the
+    "HEAD did not advance" failure. This is the SYM-133-on-disk case."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        # Prior implement run failed with a legacy/heuristic kind (no explicit
+        # LOCAL_REVIEW_INFRA_FAILED_KIND), as pre-fix rows were written.
+        await db.runs.create(
+            conn,
+            id="legacy-implement-run",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "legacy-implement-run",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+            kind="unknown",
+            detail="reviewer emitted no verdict marker",
+        )
+        # Its sibling local-review run, terminally failed — the durable signal.
+        await db.runs.create(
+            conn,
+            id="legacy-local-review-run",
+            issue_id=issue.id,
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "legacy-local-review-run",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior implement work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # Recognized as resumable despite the legacy "unknown" kind.
+        assert runner.specs == []
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_branch_setup_failure_releases_workspace_and_fails_run(
     tmp_path: Path,
 ) -> None:

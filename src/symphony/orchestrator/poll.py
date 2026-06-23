@@ -11060,18 +11060,32 @@ class Orchestrator:
                 issue_id=issue_id,
                 current_run_id=run_id,
             )
-            # Terminal kinds proving the prior implement reached/passed the
-            # completion gate (commits are complete), so a resume can skip the
-            # agent and re-run the pre-push gates + publish: delivery failures
-            # (publish/deliver) and a reviewer-infra local-review failure.
-            agent_free_resume_kinds = {
+            # Delivery failures (publish/deliver) passed the completion gate
+            # AND local review, so a resume skips the agent and re-runs only
+            # the agent-free publish path.
+            delivery_resume_kinds = {
                 db.runs.PUBLISH_FAILED_KIND,
                 db.operator_waits.KIND_DELIVER_FAILED,
-                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
             }
+            # A local-review *infra* failure (no verdict / the session raised)
+            # also passed the completion gate, so the commits are complete —
+            # but local review never finished, so the resume re-runs the gates
+            # *with fixes enabled* (a re-review may now request changes).
+            # Recognize the explicit kind and legacy rows alike: pre-fix
+            # failures carry a heuristic kind (e.g. "unknown"), so a sibling
+            # terminally-failed local-review run is the durable signal that the
+            # prior implement reached the local-review gate.
+            resume_after_local_review = (
+                previous_terminal_kind == db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
+            ) or (
+                previous_terminal_kind is not None
+                and previous_terminal_kind not in delivery_resume_kinds
+                and await self._issue_has_failed_local_review_run(issue_id)
+            )
             previous_requires_agent = (
                 previous_terminal_kind is not None
-                and previous_terminal_kind not in agent_free_resume_kinds
+                and previous_terminal_kind not in delivery_resume_kinds
+                and not resume_after_local_review
             )
             branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
         except Exception as e:  # noqa: BLE001 — surface as failed run
@@ -11123,7 +11137,12 @@ class Orchestrator:
                     storage_issue_id=issue_id,
                     run_id=run_id,
                     workspace_path=workspace_path,
-                    allow_fixes=False,
+                    # Delivery resumes already passed review → fail closed (no
+                    # code-mutating fix turn). A local-review-infra resume never
+                    # got a verdict, so it must allow the normal fix loop;
+                    # otherwise a re-review requesting changes would park as
+                    # FIX_RUN_FAILED instead of being fixed.
+                    allow_fixes=resume_after_local_review,
                 )
             except Exception as e:  # noqa: BLE001 — fail closed before publish
                 log.exception(
@@ -11188,6 +11207,22 @@ class Orchestrator:
         if previous.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
             return None
         return previous.termination_kind
+
+    async def _issue_has_failed_local_review_run(self, issue_id: str) -> bool:
+        """True when the issue has a terminally-failed local-review run.
+
+        The durable, kind-agnostic signal that the prior implement reached the
+        local-review gate (so its commits are complete). Lets a $retry resume
+        agent-free even for legacy rows written before
+        LOCAL_REVIEW_INFRA_FAILED_KIND existed, whose implement run carries a
+        heuristic kind like "unknown".
+        """
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        return any(
+            run.stage == "local_review"
+            and run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
+            for run in history
+        )
 
     async def _resolve_base_branch(self, binding: RepoBinding) -> str | None:
         """The PR base: the binding's configured base, else the repo default.
@@ -12818,19 +12853,16 @@ class Orchestrator:
         result: LoopResult | None,
     ) -> None:
         reason = _local_review_termination_reason(result)
-        # A pure reviewer infra failure (reviewer ran but emitted no verdict)
-        # leaves the implement agent's commits intact — the completion gate
-        # already passed before local review ran. Tag the run so a $retry
-        # resumes agent-free (re-runs the gates) instead of re-dispatching the
-        # implementer, which finds nothing to do and trips "HEAD did not
-        # advance". Fix-run failures/blocks are left unticketed: they may
-        # legitimately want the agent on retry.
-        termination_kind = (
-            db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
-            if result is not None and result.outcome == LoopOutcome.REVIEWER_FAILED
-            else None
+        # Every path into this handler is a local-review *infra* failure (a
+        # reviewer that emitted no verdict, a stalled fix-run, or `result is
+        # None` when the session raised) — all *after* the implement completion
+        # gate passed, so the agent's commits are intact. Tag the run so a
+        # $retry resumes agent-free (re-runs the gates with fixes enabled)
+        # instead of re-dispatching the implementer, which finds nothing to do
+        # and trips "HEAD did not advance".
+        await self._fail_run(
+            run_id, reason, termination_kind=db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
         )
-        await self._fail_run(run_id, reason, termination_kind=termination_kind)
 
         tracker = self.tracker(binding)
         try:
