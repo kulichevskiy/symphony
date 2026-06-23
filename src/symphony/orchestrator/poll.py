@@ -1486,16 +1486,6 @@ def _read_run_stream_api_error_obj(log_path: Path) -> StreamApiError | None:
     return classify_stream_api_error(stdout)
 
 
-def _read_run_stream_api_error(log_path: Path) -> str | None:
-    """The provider API-error *message* from a stage run log, or None.
-
-    Surfacing it in the termination detail beats the generic "did not satisfy
-    the completion contract" text.
-    """
-    err = _read_run_stream_api_error_obj(log_path)
-    return err.message if err is not None else None
-
-
 async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
     """Return the commit SHA for *ref* in *workspace_path*, or "" on error."""
     try:
@@ -9835,13 +9825,6 @@ class Orchestrator:
         ready_id = states.get(binding.linear_states.ready)
         if ready_id is None:
             return False
-        await self._fail_run(
-            run_id,
-            reason,
-            returncode=returncode,
-            termination_kind=termination_kind,
-            termination_detail=reason,
-        )
         try:
             await self.tracker(binding).move_issue(issue.id, ready_id)
         except LinearError as e:
@@ -9850,6 +9833,14 @@ class Orchestrator:
                 issue.identifier,
                 e,
             )
+            return False
+        await self._fail_run(
+            run_id,
+            reason,
+            returncode=returncode,
+            termination_kind=termination_kind,
+            termination_detail=reason,
+        )
         attempt = prior + 1
         log.info(
             "requeueing %s after transient API error "
