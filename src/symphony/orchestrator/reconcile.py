@@ -294,6 +294,8 @@ async def reconcile(
     conn: aiosqlite.Connection,
     tracker_or_resolver: TrackerInput,
     bindings: Sequence[RepoBinding] | None = None,
+    *,
+    clock: Callable[[], datetime] | None = None,
 ) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
 
@@ -303,7 +305,7 @@ async def reconcile(
     tracker_for_context = _tracker_resolver(tracker_or_resolver)
     rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
-    now = datetime.now(UTC).isoformat()  # noqa: clock — startup reconciliation, no injected clock
+    now = (clock() if clock is not None else datetime.now(UTC)).isoformat()  # noqa: clock
     for run in rows:
         if run.pid is None or _process_alive(run.pid):
             continue

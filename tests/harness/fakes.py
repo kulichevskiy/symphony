@@ -83,7 +83,7 @@ class FakeRunner:
         # Only mutating stages (implement, review_fix) need a real HEAD advance;
         # read-only stages (review, local_review, acceptance, merge) must not
         # commit so the reviewed SHA stays stable.
-        if spec.stage in ("implement", "review_fix"):
+        if spec.stage in ("implement", "review_fix", "acceptance_fix"):
             env = {
                 **os.environ,
                 "GIT_CONFIG_NOSYSTEM": "1",
@@ -145,7 +145,7 @@ class FakeLinear:
             for issue in self._sim.issues.values()
             if issue.team_key == team_key
             and issue.state_name == state_name
-            and (label is None or label in issue.labels)
+            and (not label or label in issue.labels)
         ]
 
     async def comments_since(
@@ -414,6 +414,8 @@ class FakeGitHub:
             raise GitHubError(f"no such PR: {pr}")
         if sim_pr.checks_passed:
             return PRChecks(runs=[])
+        if sim_pr.auto_merge_enabled:
+            return PRChecks(runs=[CheckRun(name="ci", state="IN_PROGRESS", bucket="pending")])
         return PRChecks(
             runs=[CheckRun(name="ci", state="FAILURE", bucket="fail")]
         )

@@ -82,7 +82,7 @@ async def _sim_aware_push(
         if commit_timestamps is not None:
             commit_timestamps.setdefault(head_sha, sim.now_iso())
         for sim_pr in sim.prs.values():
-            if sim_pr.head == branch:
+            if sim_pr.head == branch and (pr_repo is None or sim_pr.repo == pr_repo):
                 sim_pr.head_sha = head_sha
                 break
 
@@ -213,7 +213,7 @@ class Harness:
 
     async def warmup(self) -> None:
         """Steppable startup work: cache states + run startup reconciles."""
-        await reconcile(self.conn, self.linear, bindings=self.config.repos)
+        await reconcile(self.conn, self.linear, bindings=self.config.repos, clock=self.clock)
         await self.orch.warmup()
         await self.orch._restore_operator_waits()  # noqa: SLF001
         await self.orch._reconcile_orphaned_merge_runs(reason="startup")  # noqa: SLF001
