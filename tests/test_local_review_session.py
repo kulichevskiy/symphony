@@ -1270,3 +1270,54 @@ async def test_safe_run_id_strips_unfriendly_chars(tmp_path: Path) -> None:
     )
     # The derived run_id stays log-filename safe.
     assert runner.specs[0].run_id == "weird-id-with-chars-rev-0"
+
+
+def test_reviewer_stream_error_unwraps_codex_turn_failed() -> None:
+    """A codex `turn.failed` wraps the real cause one JSON level deep; the
+    extractor returns the human message so a no-verdict run reports it."""
+    from symphony.pipeline.local_review_session import _reviewer_stream_error
+
+    inner = json.dumps(
+        {
+            "type": "error",
+            "status": 400,
+            "error": {
+                "type": "invalid_request_error",
+                "message": (
+                    "The 'gpt-5.1-codex' model is not supported when using "
+                    "Codex with a ChatGPT account."
+                ),
+            },
+        }
+    )
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "error", "message": inner}),
+            json.dumps({"type": "turn.failed", "error": {"message": inner}}),
+        ]
+    )
+    assert _reviewer_stream_error(stdout) == (
+        "The 'gpt-5.1-codex' model is not supported when using Codex "
+        "with a ChatGPT account."
+    )
+
+
+def test_reviewer_stream_error_none_on_clean_stream() -> None:
+    """A normal stream with no error/turn.failed event yields None."""
+    from symphony.pipeline.local_review_session import _reviewer_stream_error
+
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "t"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "i", "type": "agent_message", "text": "ok"},
+                }
+            ),
+            json.dumps({"type": "turn.completed"}),
+        ]
+    )
+    assert _reviewer_stream_error(stdout) is None

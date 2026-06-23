@@ -93,6 +93,62 @@ def _safe_run_id(parent_run_id: str, suffix: str) -> str:
     return f"{base}-{suffix}"
 
 
+def _inner_error_message(text: str) -> str | None:
+    """If `text` is itself an error JSON blob, dig out the human message.
+
+    Codex wraps the real cause one level deep: a `turn.failed` carries
+    `error.message` whose value is a JSON string like
+    `{"type":"error","error":{"message":"...not supported..."}}`.
+    """
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    nested = obj.get("error")
+    if isinstance(nested, dict) and isinstance(nested.get("message"), str):
+        return nested["message"].strip() or None
+    if isinstance(obj.get("message"), str):
+        return obj["message"].strip() or None
+    return None
+
+
+def _reviewer_stream_error(stdout: str) -> str | None:
+    """Extract a human error from a reviewer's JSONL stream when a turn failed.
+
+    The reviewer process can exit 0 having emitted only a `turn.failed` /
+    `error` event (e.g. an API 4xx such as an unsupported model) and no
+    verdict. Returns the last such error's message so the loop reports the real
+    cause instead of a generic "no verdict marker", or None when absent.
+    """
+    found: str | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or ('"error"' not in line and '"turn.failed"' not in line):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") not in (
+            "error",
+            "turn.failed",
+        ):
+            continue
+        err = event.get("error")
+        raw: str | None = None
+        if isinstance(err, dict) and isinstance(err.get("message"), str):
+            raw = err["message"]
+        elif isinstance(err, str):
+            raw = err
+        elif isinstance(event.get("message"), str):
+            raw = event["message"]
+        if raw and raw.strip():
+            found = _inner_error_message(raw) or raw.strip()
+    return found
+
+
 def _persist_runner_transcript(
     log_dir: Path, stem: str, collected: CollectedRunnerOutput
 ) -> None:
@@ -323,12 +379,15 @@ async def run_local_review_session(
         # A non-zero exit is *not* automatically failure — the reviewer
         # may still have emitted a usable agent_message before crashing.
         # The verdict parser decides; if the marker is missing the loop
-        # treats it as REVIEWER_FAILED.
+        # treats it as REVIEWER_FAILED — and surfaces `agent_error` (a
+        # `turn.failed`/`error` from the stream, e.g. an API 4xx) as the
+        # reason instead of a generic "no verdict marker".
         return ReviewerOutput(
             stdout=collected.stdout,
             head_sha=head_sha,
             last_message_file=last_message_text,
             ok=True,
+            agent_error=_reviewer_stream_error(collected.stdout),
             cost_usd=cost_delta,
             input_tokens=input_delta,
             output_tokens=output_delta,

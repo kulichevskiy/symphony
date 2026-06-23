@@ -65,6 +65,11 @@ class ReviewerOutput:
     last_message_file: str | None = None
     ok: bool = True
     error: str | None = None
+    # A human-readable error pulled from a `turn.failed`/`error` event in the
+    # reviewer's stream (e.g. an API 4xx). The reviewer process can exit 0 with
+    # only such an event and no verdict; surfacing this lets the loop report the
+    # real cause instead of a generic "no verdict marker".
+    agent_error: str | None = None
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -221,7 +226,7 @@ async def run_local_review_loop(
             return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
-                error=reviewer_error or "reviewer failed",
+                error=reviewer_error or out.agent_error or "reviewer failed",
             )
         verdicts.append(verdict)
 
@@ -247,7 +252,7 @@ async def run_local_review_loop(
             return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
-                error="reviewer emitted no verdict marker",
+                error=out.agent_error or "reviewer emitted no verdict marker",
             )
 
         # CHANGES_REQUESTED — gate on the merged-findings digest before paying
