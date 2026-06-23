@@ -120,15 +120,20 @@ def _build_runtime(
     conn: aiosqlite.Connection,
     sim: Sim,
     clock: ManualClock,
+    *,
+    existing_linear: FakeLinear | None = None,
+    existing_github: FakeGitHub | None = None,
+    existing_runner: FakeRunner | None = None,
 ) -> tuple[FakeLinear, FakeGitHub, FakeRunner, Orchestrator]:
     """Construct the fakes + a fresh Orchestrator over the given Sim/clock/conn.
 
     Shared by `create()` and `restart()` so a restart rebuilds the exact same
-    wiring on the reopened connection.
+    wiring on the reopened connection.  Pass existing fakes to preserve their
+    accumulated state across restarts (e.g. FakeGitHub._reviews).
     """
-    linear = FakeLinear(sim)
-    github = FakeGitHub(sim)
-    runner = FakeRunner()
+    linear = existing_linear if existing_linear is not None else FakeLinear(sim)
+    github = existing_github if existing_github is not None else FakeGitHub(sim)
+    runner = existing_runner if existing_runner is not None else FakeRunner()
 
     async def _push_fn(workspace_path: Path, branch: str) -> None:
         await _sim_aware_push(
@@ -280,8 +285,20 @@ class Harness:
         await self.conn.close()
 
         self.conn = await db.connect(self._db_path)
+
+        # Mark all pids from still-running rows as dead in the sim: after a
+        # restart every subprocess from the previous daemon generation is gone.
+        for run in await db.runs.list_live_with_pid(self.conn):
+            if run.pid is not None:
+                self.sim.kill_process(run.pid)
+
+        # Reuse existing fakes so accumulated GitHub state (_reviews,
+        # _pr_comments, _commit_timestamps, _workspace_repos) survives.
         self.linear, self.github, self.runner, self.orch = _build_runtime(
-            self.config, self.conn, self.sim, self.clock
+            self.config, self.conn, self.sim, self.clock,
+            existing_linear=self.linear,
+            existing_github=self.github,
+            existing_runner=self.runner,
         )
         await self.warmup()
 
