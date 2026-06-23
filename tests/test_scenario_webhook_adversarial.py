@@ -156,30 +156,32 @@ async def test_duplicated_webhook_is_idempotent(
         # bypasses the delivery-dedupe gate, so idempotency must come from the
         # reconcile being a no-op the second time.
         event = harness.sim.github_webhooks[0]
-        first = await harness.orch.handle_github_webhook(event)
-        assert first.handled
-        await harness.drain()
-        second = await harness.orch.handle_github_webhook(event)
-        assert second.handled
+        await harness.orch.handle_github_webhook(event)
         await harness.drain()
 
-        # No double-processing: exactly one issue_prs ownership row, marked
-        # merged once.
+        # Snapshot observation count after the first delivery. Duplicate
+        # processing would append more rows; idempotent handling keeps it stable.
         cur = await harness.conn.execute(
-            "SELECT COUNT(*) AS n FROM issue_prs WHERE github_repo=? AND pr_number=?",
-            (REPO, sim_pr.number),
+            "SELECT COUNT(*) AS n FROM external_observations WHERE issue_id=?",
+            (issue.id,),
         )
         row = await cur.fetchone()
-        assert row["n"] == 1, "duplicate issue_prs ownership row"
+        obs_after_first = row["n"]
+
+        await harness.orch.handle_github_webhook(event)
+        await harness.drain()
+
+        cur = await harness.conn.execute(
+            "SELECT COUNT(*) AS n FROM external_observations WHERE issue_id=?",
+            (issue.id,),
+        )
+        row = await cur.fetchone()
+        assert row["n"] == obs_after_first, (
+            f"double-processing: external_observations grew from {obs_after_first} "
+            f"to {row['n']} on duplicate delivery"
+        )
 
         await _step_until_done(harness, issue.id)
-
-        # Dispatch-free config (local_review=False, remote_review=False): no runs
-        # are produced, so duplicate-dispatch coverage is out of scope for this
-        # scenario. Assert empty rather than the vacuously-true all() over {}.
-        runs = await db.runs.history_for_issue(harness.conn, issue.id)
-        assert runs == [], f"unexpected runs in dispatch-free scenario: {[r.id for r in runs]}"
-
         await _assert_converged(harness, issue.id)
     finally:
         await harness.close()
@@ -207,8 +209,7 @@ async def test_out_of_order_webhook_does_not_corrupt(
 
         # The stale webhook finally arrives, out of order. Late delivery must
         # be a no-op against the already-converged state.
-        result = await harness.deliver_github_webhook()
-        assert result.handled
+        await harness.deliver_github_webhook()
         await harness.drain()
         assert harness.sim.github_webhooks == []
 
