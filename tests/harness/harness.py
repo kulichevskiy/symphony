@@ -156,7 +156,7 @@ def _build_runtime(
         linear,
         conn,
         runner=runner,
-        gh=github,  # type: ignore[arg-type]
+        gh=github,
         clock=clock,
         push_fn=_push_fn,
         force_push_fn=_force_push_fn,

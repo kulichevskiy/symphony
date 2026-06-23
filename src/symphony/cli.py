@@ -31,6 +31,7 @@ from .agent.codex_cli import (
 )
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
+from .ui.external import GitHubExternalClient
 from .config import Config, RepoBinding, RoleName, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -263,7 +264,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                     ui_external_config=cfg,
                     ui_external_linear=external_linear,
-                    ui_external_github=orch._gh,  # pylint: disable=protected-access
+                    ui_external_github=cast(GitHubExternalClient, orch._gh),
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
                     ),

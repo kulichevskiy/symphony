@@ -21,7 +21,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 MergeStrategy = Literal["squash", "merge", "rebase"]
 
@@ -79,6 +79,99 @@ class PRChecks:
     @property
     def pending(self) -> bool:
         return any(r.bucket == "pending" for r in self.runs)
+
+
+@runtime_checkable
+class GitHubClient(Protocol):
+    """The GitHub surface the orchestrator and reconciler call on `gh`.
+
+    Both the real `GitHub` client and the test `FakeGitHub` satisfy this
+    structurally, so a renamed/re-signatured method on the real client is
+    caught against the fake instead of drifting silently. Methods the
+    orchestrator never calls (e.g. `pr_create`, `branch_list`) are
+    intentionally omitted.
+    """
+
+    async def repo_clone(self, repo: str, dest: Path) -> None: ...
+
+    async def repo_default_branch(self, repo: str) -> str: ...
+
+    async def open_pr_for_head(
+        self, *, head: str, repo: str | None = None
+    ) -> dict[str, Any] | None: ...
+
+    async def ensure_pr(
+        self,
+        *,
+        title: str,
+        body: str,
+        base: str | None = None,
+        head: str,
+        repo: str | None = None,
+        linear_url: str | None = None,
+        draft: bool = False,
+    ) -> str: ...
+
+    async def pr_view(
+        self,
+        pr: int | str,
+        *,
+        repo: str | None = None,
+        include_status_checks: bool = False,
+    ) -> dict[str, Any]: ...
+
+    async def pr_comment(
+        self, pr: int | str, body: str, *, repo: str | None = None
+    ) -> None: ...
+
+    async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str: ...
+
+    async def pr_checks(
+        self, pr: int | str, *, repo: str | None = None
+    ) -> PRChecks: ...
+
+    async def pr_review_comments(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def pr_reviews(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def pr_issue_comments(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def pr_reactions(
+        self, pr: int | str, *, repo: str
+    ) -> list[dict[str, Any]]: ...
+
+    async def commit_committed_at(self, repo: str, sha: str) -> str: ...
+
+    async def check_log_tail(
+        self,
+        check: CheckRun,
+        *,
+        repo: str | None = None,
+        max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    ) -> str: ...
+
+    async def run_failed_log_tail(
+        self,
+        run_id: int | str,
+        *,
+        repo: str | None = None,
+        max_bytes: int = DEFAULT_LOG_TAIL_BYTES,
+    ) -> str: ...
+
+    async def pr_merge(
+        self,
+        pr: int | str,
+        *,
+        strategy: MergeStrategy,
+        auto: bool = False,
+        repo: str | None = None,
+    ) -> None: ...
 
 
 class GitHub:

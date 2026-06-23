@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, MutableMapping
 
-from .client import GitHub
+from .client import GitHub, GitHubClient
 
 RequiredContextCache = MutableMapping[tuple[str, str], tuple[str, ...]]
 
@@ -13,7 +13,7 @@ async def get_required_contexts(
     repo: str,
     pr: int | str,
     *,
-    gh: GitHub | None = None,
+    gh: GitHubClient | None = None,
     cache: RequiredContextCache | None = None,
 ) -> tuple[str, ...]:
     """Return required status-check contexts for repo/pr.

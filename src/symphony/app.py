@@ -25,7 +25,7 @@ from .github.webhook import (
 from .linear.client import Linear
 from .ui.api import CommandSink, create_api_router
 from .ui.db import ReadOnlyDbPool
-from .ui.external import ExternalSnapshotService
+from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
 from .ui.status import CanonicalState
 from .webhook import (
@@ -64,7 +64,7 @@ def create_app(
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     ui_external_config: Config | None = None,
     ui_external_linear: Linear | None = None,
-    ui_external_github: GitHub | None = None,
+    ui_external_github: GitHubExternalClient | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
