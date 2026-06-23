@@ -127,10 +127,13 @@ class Sim:
         # Keyed by (repo, branch) to avoid cross-repo collisions when two
         # repos share the same branch name.
         self.branch_head_shas: dict[tuple[str, str], str] = {}
-        # Pids the Sim has declared dead (a worker that died at host crash).
-        # The reconcile path consults pid_alive() instead of os.kill so the
-        # Sim — not a magic dead-PID convention — owns process liveness.
-        self._dead_pids: set[int] = set()
+        # Pids the Sim considers alive. Only explicitly registered pids are
+        # alive; everything else is dead. The reconcile path consults
+        # pid_alive() instead of os.kill so the Sim — not a magic dead-PID
+        # convention — owns process liveness. Using a live-set (vs a dead-set)
+        # means killed pids are never "permanently dead": reusing a pid after a
+        # restart cycle simply requires re-registering it.
+        self._live_pids: set[int] = set()
         self._pr_counter = itertools.count(1)
         self._comment_counter = itertools.count(1)
         self.linear = _LinearView(self)
@@ -174,12 +177,16 @@ class Sim:
 
     # --- process liveness (the reconcile pid_alive seam) ---
 
+    def register_pid(self, pid: int) -> None:
+        """Mark a pid alive (model a healthy worker in a pre-restart scenario)."""
+        self._live_pids.add(pid)
+
     def kill_process(self, pid: int) -> None:
         """Declare a pid dead, modelling a worker lost when the host crashed."""
-        self._dead_pids.add(pid)
+        self._live_pids.discard(pid)
 
     def pid_alive(self, pid: int) -> bool:
-        return pid not in self._dead_pids
+        return pid in self._live_pids
 
     def next_pr_number(self) -> int:
         return next(self._pr_counter)

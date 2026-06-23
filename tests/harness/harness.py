@@ -281,7 +281,11 @@ class Harness:
         run startup warmup/reconcile."""
         await self.orch.shutdown()
         await self.orch.drain_reconcile_event_tasks(cancel=True)
-        await self.orch.drain_dispatch_tasks(cancel=True)
+        # Crash simulation: skip drain_dispatch_tasks(cancel=True) — that path
+        # calls _kill_active_runner (graceful) and triggers _mark_cancelled_dispatch
+        # (writes cancelled status to DB). Neither happens in a real crash; reconcile
+        # on restart handles orphan cleanup instead. In practice _dispatch_tasks is
+        # always empty here because step() drains before returning.
         await self.conn.close()
 
         self.conn = await db.connect(self._db_path)
