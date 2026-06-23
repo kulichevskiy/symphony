@@ -11060,13 +11060,18 @@ class Orchestrator:
                 issue_id=issue_id,
                 current_run_id=run_id,
             )
-            delivery_terminal_kinds = {
+            # Terminal kinds proving the prior implement reached/passed the
+            # completion gate (commits are complete), so a resume can skip the
+            # agent and re-run the pre-push gates + publish: delivery failures
+            # (publish/deliver) and a reviewer-infra local-review failure.
+            agent_free_resume_kinds = {
                 db.runs.PUBLISH_FAILED_KIND,
                 db.operator_waits.KIND_DELIVER_FAILED,
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
             }
             previous_requires_agent = (
                 previous_terminal_kind is not None
-                and previous_terminal_kind not in delivery_terminal_kinds
+                and previous_terminal_kind not in agent_free_resume_kinds
             )
             branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
         except Exception as e:  # noqa: BLE001 — surface as failed run
@@ -12813,7 +12818,19 @@ class Orchestrator:
         result: LoopResult | None,
     ) -> None:
         reason = _local_review_termination_reason(result)
-        await self._fail_run(run_id, reason)
+        # A pure reviewer infra failure (reviewer ran but emitted no verdict)
+        # leaves the implement agent's commits intact — the completion gate
+        # already passed before local review ran. Tag the run so a $retry
+        # resumes agent-free (re-runs the gates) instead of re-dispatching the
+        # implementer, which finds nothing to do and trips "HEAD did not
+        # advance". Fix-run failures/blocks are left unticketed: they may
+        # legitimately want the agent on retry.
+        termination_kind = (
+            db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
+            if result is not None and result.outcome == LoopOutcome.REVIEWER_FAILED
+            else None
+        )
+        await self._fail_run(run_id, reason, termination_kind=termination_kind)
 
         tracker = self.tracker(binding)
         try:
