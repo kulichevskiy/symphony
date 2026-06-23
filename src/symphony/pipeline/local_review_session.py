@@ -432,6 +432,12 @@ async def run_local_review_session(
             # Propagate the finder failure (with its cost) to the loop;
             # no point paying for a verifier with nothing to verify.
             return finder_out
+        if finder_out.agent_error:
+            # Pass 1 exited 0 but emitted only a `turn.failed`/`error` (e.g. an
+            # API 4xx): it produced no real findings. Surface it as a failure
+            # rather than running the verifier against empty findings, which
+            # could APPROVE and mask the reviewer error.
+            return replace(finder_out, ok=False, error=finder_out.agent_error)
 
         pass_one_findings = extract_last_agent_message(
             agent=reviewer_agent,

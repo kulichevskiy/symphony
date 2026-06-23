@@ -87,6 +87,19 @@ def _ok_fix_stream() -> list[RunnerEvent]:
     ]
 
 
+def _turn_failed_stream(message: str) -> list[RunnerEvent]:
+    """A reviewer stream that exits 0 but emits only a `turn.failed` (e.g. an
+    API 4xx) and no agent_message / verdict."""
+    return [
+        RunnerEvent(kind="stdout", line=json.dumps({"type": "turn.started"})),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps({"type": "turn.failed", "error": {"message": message}}),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
 def _review_stream_with_transcript(
     *, agent: str, message: str, prefix: str, stderr: str
 ) -> tuple[list[RunnerEvent], str, str]:
@@ -837,6 +850,59 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
     assert verifier_spec.command[0] == implementer_agent
     # Pass-1 findings are injected into the verifier's prompt.
     assert "suspicion at foo.py:1" in verifier_spec.command[-1]
+
+
+@pytest.mark.asyncio
+async def test_two_pass_finder_stream_error_surfaces_without_verifier(
+    tmp_path: Path,
+) -> None:
+    """A pass-1 finder that exits 0 with only a `turn.failed` (API error)
+    produces no findings; the session must surface REVIEWER_FAILED with the
+    real error and never run the verifier (which could APPROVE empty findings
+    and mask the failure)."""
+    api_error = (
+        "The 'gpt-5.1-codex' model is not supported when using Codex "
+        "with a ChatGPT account."
+    )
+    # Both attempts (the loop retries the reviewer once) fail in pass 1; the
+    # verifier-approve script must never be reached.
+    runner = _ScriptedRunner(
+        scripts=[
+            _turn_failed_stream(api_error),
+            _turn_failed_stream(api_error),
+            _message_stream("claude", f"approved\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-2pass-err",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.error == api_error
+    # Only finder passes ran; the verifier was never spawned.
+    assert all(spec.run_id.endswith("-find") for spec in runner.specs)
 
 
 @pytest.mark.asyncio
