@@ -6161,6 +6161,11 @@ class Orchestrator:
             new_signature=signature,
         ):
             return False
+        # A prior review-fix run that hit a transient API error stays in the
+        # review state (not moved to Ready). Guard here so the merge loop does
+        # not immediately re-dispatch before the backoff window elapses.
+        if await self._agent_infra_retry_backoff_active(issue.id):
+            return True
         if has_hit_iteration_cap(
             iteration=state.iteration,
             cap=self.config.review_iteration_cap,
@@ -6197,10 +6202,10 @@ class Orchestrator:
             merge_run_id=merge_run_id,
             dispatch_capacity_held=dispatch_capacity_held,
         )
-        if dispatched:
+        if dispatched is True:
             await db.review_state.bump_iteration(self._conn, issue.id)
             await db.review_state.set_signature(self._conn, issue.id, signature)
-        return dispatched
+        return dispatched is not False
 
     async def _dispatch_merge_required_check_fix_run(
         self,
@@ -6216,7 +6221,7 @@ class Orchestrator:
         iteration: int,
         merge_run_id: str | None = None,
         dispatch_capacity_held: bool = False,
-    ) -> bool:
+    ) -> bool | None:
         action_log_tail = await self._merge_required_check_action_log_tail(
             repo=binding.github_repo,
             failing_checks=failing_checks,
@@ -6381,8 +6386,8 @@ class Orchestrator:
                 )
                 # Before escalating, check for a transient provider API error
                 # (exit 0, no HEAD advance). If transient, requeue with backoff;
-                # return True so the acceptance task treats this as "handled"
-                # (it checks `dispatched or operator_wait` before escalating).
+                # return None so the caller skips signature recording but still
+                # treats this as "handled" (no needs_approval escalation).
                 log_path = self.config.log_root / f"{fix_run_id}.log"
                 api_error = _read_run_stream_api_error_obj(log_path)
                 if await self._maybe_requeue_transient_agent_failure(
@@ -6393,8 +6398,9 @@ class Orchestrator:
                     api_error=api_error,
                     reason=reason,
                     termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+                    workspace_path=workspace_path,
                 ):
-                    return True
+                    return None
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
@@ -7419,21 +7425,17 @@ class Orchestrator:
         log_path = self.config.log_root / f"{fix_run_id}.log"
         api_error = _read_run_stream_api_error_obj(log_path)
         if await self._maybe_requeue_transient_agent_failure(
-            run_id=run.id,
+            run_id=fix_run_id,
             binding=binding,
             issue=issue,
             storage_issue_id=run.issue_id,
             api_error=api_error,
             reason=reason,
             termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+            workspace_path=workspace_path,
         ):
-            await db.runs.update_status(
-                self._conn,
-                fix_run_id,
-                "failed",
-                ended_at=self._now().isoformat(),
-                **_termination_kwargs(status="failed", reason=reason),
-            )
+            # _maybe_requeue_transient_agent_failure already stamped fix_run_id
+            # via _fail_run; just clear review rearm state and return.
             await self._clear_review_rearm_retry(run.id)
             self._clear_review_no_signal_rearm_heads(run.id)
             return ""
@@ -9846,6 +9848,7 @@ class Orchestrator:
         reason: str,
         returncode: int | None = None,
         termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
+        workspace_path: Path | None = None,
     ) -> bool:
         """Requeue an implement run that died on a *transient* provider API
         error instead of escalating, until the retry budget is spent.
@@ -9864,7 +9867,11 @@ class Orchestrator:
         `TRANSIENT_API_RETRY_KIND` for implement-phase failures (the default) and
         `LOCAL_REVIEW_TRANSIENT_RETRY_KIND` for local-review-phase failures. The
         re-dispatch resume logic reads this to decide whether to re-run the
-        implementer or short-circuit to the pre-push gates."""
+        implementer or short-circuit to the pre-push gates.
+
+        For `REVIEW_FIX_TRANSIENT_RETRY_KIND` the issue is NOT moved to Ready —
+        the existing PR is intact and the retry is driven by the merge/acceptance
+        loop once the backoff elapses."""
         if api_error is None or not api_error.transient:
             return False
         # The current run is still `running` (its marker is stamped below), so
@@ -9873,27 +9880,44 @@ class Orchestrator:
         prior = await self._agent_infra_retry_count(storage_issue_id)
         if prior >= AGENT_INFRA_RETRY_LIMIT:
             return False
-        try:
-            states = await self._states_for_binding(binding)
-        except LinearError as e:
-            log.warning(
-                "could not load states to requeue %s after transient API error: %s",
-                issue.identifier,
-                e,
-            )
-            return False
-        ready_id = states.get(binding.linear_states.ready)
-        if ready_id is None:
-            return False
-        try:
-            await self.tracker(binding).move_issue(issue.id, ready_id)
-        except LinearError as e:
-            log.warning(
-                "could not requeue %s to Ready after transient API error: %s",
-                issue.identifier,
-                e,
-            )
-            return False
+        # An agent can edit files before the provider 5xx fires. A dirty tree
+        # means work happened, so re-invoking is not safe — escalate instead.
+        if workspace_path is not None:
+            status = await _git_status_short(workspace_path)
+            if status:
+                log.warning(
+                    "workspace dirty after transient API error for %s — escalating: %s",
+                    issue.identifier,
+                    status[:200],
+                )
+                return False
+        if termination_kind == db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND:
+            # Review-fix retry: the PR and commits are intact; leave the issue
+            # in its current review state so the merge/acceptance loop drives
+            # the re-dispatch once the backoff window elapses.
+            pass
+        else:
+            try:
+                states = await self._states_for_binding(binding)
+            except LinearError as e:
+                log.warning(
+                    "could not load states to requeue %s after transient API error: %s",
+                    issue.identifier,
+                    e,
+                )
+                return False
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                return False
+            try:
+                await self.tracker(binding).move_issue(issue.id, ready_id)
+            except LinearError as e:
+                log.warning(
+                    "could not requeue %s to Ready after transient API error: %s",
+                    issue.identifier,
+                    e,
+                )
+                return False
         await self._fail_run(
             run_id,
             reason,
@@ -11628,6 +11652,7 @@ class Orchestrator:
                         api_error=api_error,
                         reason=reason,
                         returncode=final_returncode,
+                        workspace_path=workspace_path,
                     ):
                         return None
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
@@ -11726,6 +11751,7 @@ class Orchestrator:
                     ),
                     reason=_local_review_termination_reason(local_review_result),
                     termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+                    workspace_path=workspace_path,
                 ):
                     return False, local_review_result
                 await self._block_local_only_review_infra_failure(
