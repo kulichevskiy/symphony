@@ -23,7 +23,7 @@ import aiosqlite
 
 from .. import db
 from ..config import Config, RepoBinding
-from ..github.client import GitHub, GitHubError
+from ..github.client import GitHubClient, GitHubError
 from ..github.webhook import GitHubWebhookEvent
 from ..linear.client import LinearError
 from ..tracker import (
@@ -221,7 +221,7 @@ class Reconciler:
         config: Config,
         conn: aiosqlite.Connection,
         tracker_or_registry: IssueTracker | TrackerRegistry,
-        gh: GitHub,
+        gh: GitHubClient,
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:

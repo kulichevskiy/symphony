@@ -64,7 +64,13 @@ from ..agent.runners.local import LocalRunner
 from ..config import Config, RepoBinding
 from ..github.branch_protection import get_required_contexts
 from ..github.client import CheckRun as GitHubCheckRun
-from ..github.client import GitHub, GitHubError, PRChecks, _is_merge_conflict_error
+from ..github.client import (
+    GitHub,
+    GitHubClient,
+    GitHubError,
+    PRChecks,
+    _is_merge_conflict_error,
+)
 from ..github.webhook import GitHubWebhookEvent
 from ..linear import slash
 from ..linear.blockers import is_blocked, open_blocker_ids
@@ -948,7 +954,7 @@ def _has_codex_review_request_after_head(
 
 
 async def _commit_committed_at_or_empty(
-    gh: GitHub,
+    gh: GitHubClient,
     *,
     repo: str,
     sha: str,
@@ -1745,7 +1751,7 @@ class Orchestrator:
         conn: aiosqlite.Connection,
         *,
         runner: Runner | None = None,
-        gh: GitHub | None = None,
+        gh: GitHubClient | None = None,
         workspace: Workspace | None = None,
         push_fn: PushFn | None = None,
         force_push_fn: PushFn | None = None,
@@ -1767,7 +1773,7 @@ class Orchestrator:
         self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = (
             asyncio.Queue()
         )
-        self._gh: GitHub = gh if gh is not None else GitHub()
+        self._gh: GitHubClient = gh if gh is not None else GitHub()
         self._runner: Runner = runner if runner is not None else LocalRunner()
         self._workspace: Workspace = (
             workspace
