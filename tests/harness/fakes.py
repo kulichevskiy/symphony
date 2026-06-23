@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import os
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
@@ -58,13 +59,14 @@ class FakeRunner:
     """Deterministic `Runner` that never spawns real subprocesses.
 
     Each `run()` call pops one event sequence from `_queue`; if the queue is
-    empty it yields a default sequence that satisfies the implement completion
-    gate (SYMPHONY_DONE marker + HEAD advance) for implement-stage runs and a
-    bare success exit for all other stages.
+    empty it yields a default sequence mirroring a real run's lifecycle: a
+    `started` event carrying a synthetic PID, then (for mutating stages) a HEAD
+    advance, then a `SYMPHONY_DONE` completion marker and a `0` exit.
     """
 
     def __init__(self) -> None:
         self._queue: list[list[RunnerEvent]] = []
+        self._pid = itertools.count(10000)
 
     def enqueue(self, events: list[RunnerEvent]) -> None:
         """Pre-program the event sequence for the next `run()` call."""
@@ -80,6 +82,9 @@ class FakeRunner:
             yield ev
 
     async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        # Mirror a real run: announce the PID first so the orchestrator records
+        # it (db.runs.update_pid), exactly as LocalRunner does.
+        yield RunnerEvent(kind="started", pid=next(self._pid))
         # Only mutating stages (implement, review_fix) need a real HEAD advance;
         # read-only stages (review, local_review, acceptance, merge) must not
         # commit so the reviewed SHA stays stable.

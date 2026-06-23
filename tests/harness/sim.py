@@ -166,6 +166,38 @@ class Sim:
         if team_key not in self.viewer_teams:
             self.viewer_teams.append(team_key)
 
+    def seed_issue(
+        self,
+        *,
+        identifier: str,
+        team_key: str,
+        state_name: str,
+        title: str = "",
+        labels: list[str] | None = None,
+    ) -> SimIssue:
+        """Script an issue into a team's lane (e.g. the dispatch/ready lane).
+
+        Resolves `state_name` to its id/type via the team's seeded workflow, so
+        the orchestrator's state-driven scan and lane transitions see a faithful
+        issue. The synthetic `url` is what `ensure_pr` matches on to link the PR
+        back to this issue.
+        """
+        state_id = self.states.get(team_key, {}).get(state_name, "")
+        issue = SimIssue(
+            id=identifier,
+            identifier=identifier,
+            title=title,
+            url=f"https://linear.invalid/{identifier}",
+            state_id=state_id,
+            state_name=state_name,
+            state_type=self.state_type_for_id(team_key, state_id) or "",
+            team_key=team_key,
+            labels=list(labels or []),
+            updated_at=self.now_iso(),
+        )
+        self.issues[issue.id] = issue
+        return issue
+
     def state_name_for_id(self, team_key: str, state_id: str) -> str | None:
         for name, sid in self.states.get(team_key, {}).items():
             if sid == state_id:
