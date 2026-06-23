@@ -197,7 +197,10 @@ def _claude_synthetic_api_error(event: dict) -> StreamApiError | None:
     if not parts:
         return None
     text = "\n".join(parts)
-    return StreamApiError(message=text, status=_status_from_text(text))
+    status = _status_from_text(text)
+    if status is None:
+        return None
+    return StreamApiError(message=text, status=status)
 
 
 def _codex_event_api_error(event: dict) -> StreamApiError | None:
@@ -223,6 +226,8 @@ def _codex_event_api_error(event: dict) -> StreamApiError | None:
     if inner_status is not None:
         status = inner_status
     msg = inner_msg or raw.strip()
+    if status is None:
+        status = _status_from_text(msg)
     if status is not None and not msg.startswith("API Error:"):
         msg = f"API Error: {status} {msg}"
     return StreamApiError(message=msg, status=status)

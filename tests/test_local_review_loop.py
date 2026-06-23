@@ -11,6 +11,7 @@ from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
     VERDICT_CHANGES_REQUESTED_MARKER,
     LocalVerdict,
+    StreamApiError,
 )
 from symphony.pipeline.local_review_loop import (
     FixerOutput,
@@ -531,3 +532,38 @@ async def test_verdicts_collected_in_order() -> None:
     assert len(result.verdicts) == 3
     assert result.last_verdict is not None
     assert result.last_verdict.kind.value == "approved"
+
+
+@pytest.mark.asyncio
+async def test_transient_api_error_propagated_into_loop_result() -> None:
+    """When the reviewer exits with a transient API error and no verdict,
+    LoopResult.api_error carries the typed signal so callers can gate retries."""
+    api_err = StreamApiError(message="API Error: 500 overloaded", status=500)
+    reviewer = _ReviewerScript(
+        messages=["(no marker — provider returned 500)"],
+        agent_error="API Error: 500 overloaded",
+    )
+    # Inject the typed api_error onto ReviewerOutput by overriding __call__.
+    _inner = reviewer.__call__
+
+    async def _call_with_api_error(i: int) -> ReviewerOutput:
+        out = await _inner(i)
+        return ReviewerOutput(
+            stdout=out.stdout,
+            head_sha=out.head_sha,
+            ok=out.ok,
+            agent_error=out.agent_error,
+            api_error=api_err,
+        )
+
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=_call_with_api_error,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error == api_err
+    assert result.api_error is not None and result.api_error.transient is True
+    assert fixer.received == []

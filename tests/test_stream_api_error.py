@@ -114,3 +114,40 @@ def test_normal_assistant_message_is_not_an_error() -> None:
         }
     )
     assert classify_stream_api_error(stream) is None
+
+
+def test_synthetic_assistant_without_api_error_pattern_is_not_an_error() -> None:
+    """A <synthetic> message whose text is not 'API Error: <status>' must not
+    classify as an error — only genuine provider failures carry that prefix."""
+    stream = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "Something went wrong internally."}],
+            },
+        }
+    )
+    assert classify_stream_api_error(stream) is None
+
+
+def test_codex_raw_api_error_text_status_parsed() -> None:
+    """A codex error event whose raw message text is 'API Error: 500 …' (no
+    separate status field) must parse status=500 from the text."""
+    stream = json.dumps(
+        {"type": "turn.failed", "error": {"message": "API Error: 500 overloaded"}}
+    )
+    err = classify_stream_api_error(stream)
+    assert err is not None
+    assert err.status == 500
+    assert err.transient is True
+    assert "API Error: 500" in err.message
+
+
+def test_codex_raw_error_event_api_error_text_status_parsed() -> None:
+    """Same as above but via the top-level 'error' event type."""
+    stream = json.dumps({"type": "error", "message": "API Error: 503 service unavailable"})
+    err = classify_stream_api_error(stream)
+    assert err is not None
+    assert err.status == 503
+    assert err.transient is True
