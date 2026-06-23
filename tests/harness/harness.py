@@ -32,6 +32,7 @@ async def _sim_aware_push(
     branch: str,
     sim: "Sim",
     *,
+    repo: str | None = None,
     force: bool = False,
     commit_timestamps: "dict[str, str] | None" = None,
 ) -> None:
@@ -64,9 +65,18 @@ async def _sim_aware_push(
     sha_out, _ = await sha_proc.communicate()
     head_sha = sha_out.decode().strip()
     if head_sha:
-        # Always store the pushed SHA so ensure_pr (called after this push)
-        # can use the real git SHA instead of fabricating one.
-        sim.branch_head_shas[branch] = head_sha
+        # Store the pushed SHA keyed by (repo, branch) so ensure_pr can use
+        # the real git SHA without collisions across repos sharing a branch name.
+        # Fall back to inferring repo from an existing SimPR when the caller
+        # didn't supply it (single-repo scenarios before the first ensure_pr).
+        pr_repo = repo
+        if pr_repo is None:
+            for sim_pr in sim.prs.values():
+                if sim_pr.head == branch:
+                    pr_repo = sim_pr.repo
+                    break
+        if pr_repo is not None:
+            sim.branch_head_shas[(pr_repo, branch)] = head_sha
         # Stamp the commit timestamp at push time so commit_committed_at()
         # never returns a lazily-assigned future clock value.
         if commit_timestamps is not None:
@@ -163,10 +173,19 @@ class Harness:
         runner = FakeRunner()
 
         async def _push_fn(workspace_path: Path, branch: str) -> None:
-            await _sim_aware_push(workspace_path, branch, sim, commit_timestamps=github._commit_timestamps)
+            await _sim_aware_push(
+                workspace_path, branch, sim,
+                repo=github._workspace_repos.get(workspace_path),
+                commit_timestamps=github._commit_timestamps,
+            )
 
         async def _force_push_fn(workspace_path: Path, branch: str) -> None:
-            await _sim_aware_push(workspace_path, branch, sim, force=True, commit_timestamps=github._commit_timestamps)
+            await _sim_aware_push(
+                workspace_path, branch, sim,
+                repo=github._workspace_repos.get(workspace_path),
+                force=True,
+                commit_timestamps=github._commit_timestamps,
+            )
 
         orch = Orchestrator(
             config,

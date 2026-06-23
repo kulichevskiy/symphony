@@ -80,9 +80,10 @@ class FakeRunner:
             yield ev
 
     async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
-        # Merge-stage runs must not commit: the PR head must stay at the
-        # already-reviewed SHA so _merge_approved_pr sees a consistent headRefOid.
-        if spec.stage != "merge":
+        # Only mutating stages (implement, review_fix) need a real HEAD advance;
+        # read-only stages (review, local_review, acceptance, merge) must not
+        # commit so the reviewed SHA stays stable.
+        if spec.stage in ("implement", "review_fix"):
             env = {
                 **os.environ,
                 "GIT_CONFIG_NOSYSTEM": "1",
@@ -157,6 +158,8 @@ class FakeLinear:
         return out
 
     async def post_comment(self, issue_uuid: str, body: str) -> str:
+        if issue_uuid not in self._sim.issues:
+            raise LinearError(f"no such issue: {issue_uuid}")
         comment = SimComment(
             id=self._sim.next_comment_id(),
             issue_id=issue_uuid,
@@ -202,6 +205,9 @@ class FakeGitHub:
         self._pr_comments: dict[tuple[str, int], list[dict[str, Any]]] = {}
         # sha → ISO timestamp recorded at PR creation time
         self._commit_timestamps: dict[str, str] = {}
+        # workspace_path → github_repo — populated by repo_clone so push
+        # closures can scope branch_head_shas by (repo, branch).
+        self._workspace_repos: dict[Path, str] = {}
 
     def add_pr_review(
         self,
@@ -230,6 +236,7 @@ class FakeGitHub:
 
     async def repo_clone(self, repo: str, dest: Path) -> None:
         """Create a minimal real git repo so workspace git operations succeed."""
+        self._workspace_repos[dest] = repo
         env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
         git_env = {**env, "GIT_AUTHOR_NAME": "sim", "GIT_AUTHOR_EMAIL": "sim@test",
                    "GIT_COMMITTER_NAME": "sim", "GIT_COMMITTER_EMAIL": "sim@test"}
@@ -305,8 +312,10 @@ class FakeGitHub:
                     break
         # Prefer the SHA already pushed to the fake origin; fall back to a
         # deterministic fabrication only when no push has been recorded.
+        # Keyed by (repo, branch) to avoid cross-repo collisions when two
+        # repos share the same branch name.
         head_sha = (
-            self._sim.branch_head_shas.get(head)
+            self._sim.branch_head_shas.get((key_repo, head))
             or hashlib.sha1(f"{key_repo}:{head}:{number}".encode()).hexdigest()
         )
         self._commit_timestamps.setdefault(head_sha, self._sim.now_iso())
@@ -360,11 +369,20 @@ class FakeGitHub:
         }
         if include_status_checks:
             if checks_ok:
-                check_node = {
+                check_node: dict[str, Any] = {
                     "__typename": "CheckRun",
                     "name": "ci",
                     "status": "COMPLETED",
                     "conclusion": "SUCCESS",
+                }
+            elif sim_pr.auto_merge_enabled:
+                # Checks are pending (queued for auto-merge but not yet green);
+                # IN_PROGRESS is neither a failure nor a success so the
+                # orchestrator correctly treats the rollup as still pending.
+                check_node = {
+                    "__typename": "CheckRun",
+                    "name": "ci",
+                    "status": "IN_PROGRESS",
                 }
             else:
                 check_node = {

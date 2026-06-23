@@ -112,3 +112,20 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
                 f"issue_prs records PR ({repo!r}, {number}) under issue "
                 f"{db_issue_id!r} but Sim has it under {sim_pr.issue_id!r}"
             )
+
+    # 5c. No duplicate PR ownership: the same (github_repo, pr_number) must not
+    #     appear under two different issues. The schema allows this (PK is
+    #     (issue_id, github_repo)) but it would corrupt ownership invariants.
+    dup_cur = await conn.execute(
+        "SELECT github_repo, pr_number, COUNT(DISTINCT issue_id) AS n "
+        "FROM issue_prs "
+        "GROUP BY github_repo, pr_number "
+        "HAVING n > 1"
+    )
+    duplicates = await dup_cur.fetchall()
+    assert not duplicates, (
+        "issue_prs has duplicate ownership rows for: "
+        + ", ".join(
+            f"({row['github_repo']!r}, {row['pr_number']})" for row in duplicates
+        )
+    )
