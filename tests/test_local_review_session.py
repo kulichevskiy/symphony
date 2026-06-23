@@ -906,6 +906,65 @@ async def test_two_pass_finder_stream_error_surfaces_without_verifier(
 
 
 @pytest.mark.asyncio
+async def test_two_pass_finder_with_findings_and_stray_error_still_verifies(
+    tmp_path: Path,
+) -> None:
+    """A finder that produced usable findings is not dropped just because the
+    stream also carried an error event — only an error-only (empty-findings)
+    finder fails. The verifier still runs."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    # A stray error event early in the stream, then the finder's real findings
+    # as the final agent message — extract_last_agent_message still returns them.
+    finder_stream = [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps({"type": "error", "message": "transient blip"}),
+        ),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps({"type": "result", "result": finder_text}),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+    runner = _ScriptedRunner(
+        scripts=[
+            finder_stream,
+            _message_stream("claude", f"held\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-2pass-findings",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(runner.specs) == 2
+    # The findings reached the verifier prompt despite the stray error event.
+    assert "suspicion at foo.py:1" in runner.specs[1].command[-1]
+
+
+@pytest.mark.asyncio
 async def test_finder_uses_sonnet_verifier_stays_on_opus(
     tmp_path: Path,
 ) -> None:
