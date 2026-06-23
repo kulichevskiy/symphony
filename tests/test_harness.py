@@ -19,6 +19,7 @@ from tests.harness import (
     Harness,
     ManualClock,
     Sim,
+    SimIssue,
     assert_consistent,
 )
 
@@ -83,6 +84,58 @@ async def test_shared_clock_threaded_into_orchestrator_and_reconciler(
         sim_after = harness.sim.now()
         assert after == recon_after == sim_after
         assert (after - before).total_seconds() == 120
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_reopens_db_and_recovers_orphaned_run(tmp_path: Path) -> None:
+    """A `running` run whose pid the Sim reports dead is an orphan from a host
+    crash. `restart()` closes + reopens the DB, builds a fresh Orchestrator on
+    the same Sim + clock, and reconcile flips the orphan `interrupted` and
+    comments — without drift."""
+    harness = await Harness.create(tmp_path)
+    try:
+        # Seed the issue in the Sim (so the Linear comment lands) and the DB
+        # (so reconcile finds the run's issue), plus a running implement run
+        # whose pid the Sim reports dead.
+        harness.sim.issues["iss-dead"] = SimIssue(
+            id="iss-dead", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.issues.upsert(
+            harness.conn, id="iss-dead", identifier="ENG-1", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            harness.conn,
+            id="dead",
+            issue_id="iss-dead",
+            stage="implement",
+            status="running",
+            pid=4242,
+            started_at="2026-01-01T00:00:00+00:00",
+        )
+        harness.sim.kill_process(4242)
+
+        old_conn = harness.conn
+        await harness.restart()
+        # The conn was reopened on the same file, not reused.
+        assert harness.conn is not old_conn
+
+        cur = await harness.conn.execute(
+            "SELECT status, ended_at, termination_kind FROM runs WHERE id=?",
+            ("dead",),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row["status"] == db.runs.INTERRUPTED_STATUS
+        assert row["ended_at"] is not None
+        assert row["termination_kind"] == "orphaned"
+
+        comments = harness.sim.comments.get("iss-dead", [])
+        assert len(comments) == 1
+        assert "Host restarted" in comments[0].body
+
+        await harness.assert_consistent()
     finally:
         await harness.close()
 
