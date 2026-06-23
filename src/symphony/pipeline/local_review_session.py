@@ -548,6 +548,19 @@ async def run_local_review_session(
         )
         head_after = await head_sha_provider(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
+        if not head_advanced:
+            api_error = classify_stream_api_error(collected.stdout)
+            if api_error is not None and api_error.transient:
+                return FixerOutput(
+                    ok=False,
+                    error=api_error.message,
+                    api_error=api_error,
+                    cost_usd=cost_delta,
+                    input_tokens=input_delta,
+                    output_tokens=output_delta,
+                    cache_write_tokens=cache_write_delta,
+                    cache_read_tokens=cache_read_delta,
+                )
         completion = classify_implement_completion(
             final_message=final_message, head_advanced=head_advanced
         )

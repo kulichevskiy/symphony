@@ -201,13 +201,16 @@ ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
 AGENT_INFRA_RETRY_LIMIT = 5
 ACCEPTANCE_FIX_ITERATION_CAP = 1
-# Both transient-retry kinds share the same retry budget and backoff logic.
+# All transient-retry kinds share the same retry budget and backoff logic.
 # TRANSIENT_API_RETRY_KIND: implement-phase failure (no work done, HEAD unchanged).
 # LOCAL_REVIEW_TRANSIENT_RETRY_KIND: local-review-phase failure (implement succeeded,
 #   commits intact, but reviewer got a transient 500 before verdicting).
+# REVIEW_FIX_TRANSIENT_RETRY_KIND: review-stage fix agent failure (PR exists, commits
+#   intact, but fix agent got a transient 500 and made no HEAD advance).
 _AGENT_INFRA_RETRY_KINDS: frozenset[str] = frozenset({
     db.runs.TRANSIENT_API_RETRY_KIND,
     db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+    db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
 })
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
@@ -6372,6 +6375,26 @@ class Orchestrator:
             pushed_sha = await _workspace_head_sha(workspace_path)
             if not pushed_sha or pushed_sha == start_sha:
                 short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
+                reason = (
+                    "required-check fix-run completed without advancing "
+                    f"{branch}; HEAD stayed at {short_sha}"
+                )
+                # Before escalating, check for a transient provider API error
+                # (exit 0, no HEAD advance). If transient, requeue with backoff;
+                # return True so the acceptance task treats this as "handled"
+                # (it checks `dispatched or operator_wait` before escalating).
+                log_path = self.config.log_root / f"{fix_run_id}.log"
+                api_error = _read_run_stream_api_error_obj(log_path)
+                if await self._maybe_requeue_transient_agent_failure(
+                    run_id=fix_run_id,
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue.id,
+                    api_error=api_error,
+                    reason=reason,
+                    termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+                ):
+                    return True
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
@@ -6379,20 +6402,14 @@ class Orchestrator:
                     ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
-                        reason=(
-                            "required-check fix-run completed without advancing "
-                            f"{branch}; HEAD stayed at {short_sha}"
-                        ),
+                        reason=reason,
                     ),
                 )
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
-                    reason=(
-                        "required-check fix-run completed without advancing "
-                        f"{branch}; HEAD stayed at {short_sha}"
-                    ),
+                    reason=reason,
                     merge_run_id=merge_run_id,
                 )
                 return False
@@ -7391,6 +7408,35 @@ class Orchestrator:
         short_sha = (current_sha or start_sha)[:12] or "(unknown)"
         status_short = await _git_status_short(workspace_path)
         last_log = f"git status --short:\n{status_short}" if status_short else ""
+        reason = (
+            f"review fix-run completed without advancing {branch}; "
+            f"HEAD stayed at {short_sha}"
+        )
+        # Before escalating to operator wait, check whether the fix agent hit a
+        # transient provider API error (exit 0, no HEAD advance). If so, requeue
+        # with backoff instead of parking the issue — the review polling loop
+        # will re-dispatch the fix once the backoff window elapses.
+        log_path = self.config.log_root / f"{fix_run_id}.log"
+        api_error = _read_run_stream_api_error_obj(log_path)
+        if await self._maybe_requeue_transient_agent_failure(
+            run_id=run.id,
+            binding=binding,
+            issue=issue,
+            storage_issue_id=run.issue_id,
+            api_error=api_error,
+            reason=reason,
+            termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+        ):
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "failed",
+                ended_at=self._now().isoformat(),
+                **_termination_kwargs(status="failed", reason=reason),
+            )
+            await self._clear_review_rearm_retry(run.id)
+            self._clear_review_no_signal_rearm_heads(run.id)
+            return ""
         await db.runs.update_status(
             self._conn,
             fix_run_id,
@@ -7398,20 +7444,14 @@ class Orchestrator:
             ended_at=self._now().isoformat(),
             **_termination_kwargs(
                 status="failed",
-                reason=(
-                    f"review fix-run completed without advancing {branch}; "
-                    f"HEAD stayed at {short_sha}"
-                ),
+                reason=reason,
             ),
         )
         await self._fail_review_run(
             run=run,
             binding=binding,
             issue=issue,
-            error=(
-                f"review fix-run completed without advancing {branch}; "
-                f"HEAD stayed at {short_sha}"
-            ),
+            error=reason,
             last_log=last_log,
             auto_retry=False,
             operator_wait=True,
@@ -8602,8 +8642,15 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
-            if await self._agent_infra_retry_backoff_active(issue.id):
-                # A prior implement run hit a transient API error and is inside
+            # Resolve the storage issue id (db.issues.upsert may assign a
+            # different id when two tracker sites share the same raw issue id).
+            # Runs are stored under the storage id, so the backoff check must
+            # use it — otherwise the backoff window is invisible to the gate.
+            _storage_id = await self._storage_issue_id_for_tracker_issue(
+                issue.id, _tracker_context_for_binding(binding)
+            )
+            if await self._agent_infra_retry_backoff_active(_storage_id):
+                # A prior run hit a transient API error and is inside
                 # its capped backoff window — re-dispatch once it elapses.
                 return None
             pr = await db.issue_prs.get(
@@ -9729,20 +9776,28 @@ class Orchestrator:
         return self._now() < ended_at + timedelta(seconds=backoff_secs)
 
     async def _agent_infra_retry_count(self, issue_id: str) -> int:
-        """Consecutive most-recent *terminated* implement runs requeued on a
-        transient API error. Derived from the durable runs history (survives a
-        restart): count back from the latest terminated implement run until one
-        without the `transient_api_retry` marker. A still-`running` implement
-        run (the in-flight attempt whose failure is being classified) is skipped
-        so the count reflects only prior attempts. This is the retry-attempt
-        counter the backoff window and the escalation cutoff both read."""
+        """Consecutive most-recent *terminated* runs requeued on a transient API
+        error, across all stages. Derived from the durable runs history (survives
+        a restart): count back from the latest terminated run until one without a
+        retry marker. Still-`running` runs (the in-flight attempt whose failure
+        is being classified) are skipped so the count reflects only prior
+        attempts. This is the retry-attempt counter the backoff window and the
+        escalation cutoff both read.
+
+        Counting across implement and review_fix stages (the only stages that
+        carry retry markers) lets a shared budget cap repeated failures
+        regardless of which stage retried, and correctly tracks review-fix
+        transient retries (REVIEW_FIX_TRANSIENT_RETRY_KIND) alongside implement
+        and local-review retries. Sub-runs (local_review, local_review_fix, …)
+        are skipped — they never carry retry markers but interleave in history
+        and would otherwise break the consecutive count."""
         history = await db.runs.history_for_issue(self._conn, issue_id)
         count = 0
         for run in reversed(history):
-            if run.stage != "implement":
-                continue
             if run.status in db.runs.LIVE_STATUSES:
                 continue
+            if run.stage not in ("implement", "review_fix"):
+                continue  # sub-runs never carry retry markers; skip, don't break
             if run.termination_kind in _AGENT_INFRA_RETRY_KINDS:
                 count += 1
             else:
@@ -9750,26 +9805,31 @@ class Orchestrator:
         return count
 
     async def _agent_infra_retry_backoff_active(self, issue_id: str) -> bool:
-        """True while a transiently-failed implement run is still inside its
-        capped backoff window — the poll loop must not re-dispatch yet. Mirrors
+        """True while a transiently-failed run is still inside its capped
+        backoff window — the poll loop must not re-dispatch yet. Mirrors
         `_acceptance_infra_retry_backoff_active` but reads the marker + ended_at
-        off the latest implement run rather than acceptance_state."""
-        latest = await db.runs.latest_for_issue_stage(
-            self._conn,
-            issue_id=issue_id,
-            stage="implement",
-        )
-        if (
-            latest is None
-            or latest.termination_kind not in _AGENT_INFRA_RETRY_KINDS
-            or latest.ended_at is None
-        ):
+        off the latest run with a retry marker (across all stages) rather than
+        acceptance_state. Checks all stages so review-fix retries
+        (REVIEW_FIX_TRANSIENT_RETRY_KIND) are covered alongside implement and
+        local-review retries. Sub-runs (local_review, local_review_fix, …) are
+        skipped — they never carry retry markers."""
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        latest_retry: db.runs.Run | None = None
+        for run in reversed(history):
+            if run.status in db.runs.LIVE_STATUSES:
+                continue
+            if run.stage not in ("implement", "review_fix"):
+                continue  # sub-runs never carry retry markers
+            if run.termination_kind in _AGENT_INFRA_RETRY_KINDS and run.ended_at is not None:
+                latest_retry = run
+                break
+        if latest_retry is None:
             return False
         count = await self._agent_infra_retry_count(issue_id)
         if count <= 0:
             return False
         try:
-            ended_at = _parse_rfc3339(latest.ended_at)
+            ended_at = _parse_rfc3339(latest_retry.ended_at)  # type: ignore[arg-type]
         except ValueError:
             return False
         backoff_secs = _infra_retry_backoff_secs(min(count, AGENT_INFRA_RETRY_LIMIT))
