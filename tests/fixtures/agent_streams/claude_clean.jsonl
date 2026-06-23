@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","session_id":"sess-1","model":"claude-opus-4-8"}
+{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"Looks fine. No findings."}],"stop_reason":"end_turn"},"session_id":"sess-1"}
+{"type":"result","subtype":"success","is_error":false,"result":"Looks fine. No findings.","duration_ms":900,"num_turns":1,"session_id":"sess-1","total_cost_usd":0.01}

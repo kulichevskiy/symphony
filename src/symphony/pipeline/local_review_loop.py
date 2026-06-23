@@ -45,6 +45,7 @@ from .local_review import (
     LocalVerdict,
     LocalVerdictKind,
     ReviewerAgent,
+    StreamApiError,
     parse_local_review_output,
 )
 
@@ -70,6 +71,11 @@ class ReviewerOutput:
     # only such an event and no verdict; surfacing this lets the loop report the
     # real cause instead of a generic "no verdict marker".
     agent_error: str | None = None
+    # The same error as a typed signal when it is a provider API error
+    # (`api_error.transient` distinguishes a retryable 5xx/429 from a
+    # deterministic 4xx). `agent_error` carries its message for operators;
+    # `api_error` is the gate downstream retry logic reads.
+    api_error: StreamApiError | None = None
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -100,6 +106,10 @@ class LoopResult:
     iterations: int
     verdicts: tuple[LocalVerdict, ...]
     error: str | None = None
+    # The typed API error from the last reviewer turn that produced no verdict,
+    # when one was present in the stream. Callers gate retry logic on
+    # `api_error.transient`; `error` carries the human-readable message.
+    api_error: StreamApiError | None = None
     # Sum of reviewer+fixer subprocess costs across every iteration.
     # Recorded on the issue's `runs.cost_usd` for the audit trail; it no
     # longer gates the loop.
@@ -180,12 +190,14 @@ async def run_local_review_loop(
         outcome: LoopOutcome,
         iterations: int,
         error: str | None = None,
+        api_error: StreamApiError | None = None,
     ) -> LoopResult:
         return LoopResult(
             outcome=outcome,
             iterations=iterations,
             verdicts=tuple(verdicts),
             error=error,
+            api_error=api_error,
             total_cost_usd=total_cost,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
@@ -201,11 +213,14 @@ async def run_local_review_loop(
         # unparseable final attempt still reports the real cause rather than
         # the generic marker message.
         stream_error: str | None = None
+        stream_api_error: StreamApiError | None = None
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
             _record_usage(out)
             if out.agent_error:
                 stream_error = out.agent_error
+            if out.api_error is not None:
+                stream_api_error = out.api_error
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
                 if attempt < REVIEWER_FAILURE_RETRIES:
@@ -214,6 +229,7 @@ async def run_local_review_loop(
                     outcome=LoopOutcome.REVIEWER_FAILED,
                     iterations=i + 1,
                     error=reviewer_error,
+                    api_error=stream_api_error,
                 )
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
@@ -234,6 +250,7 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
                 error=reviewer_error or stream_error or "reviewer failed",
+                api_error=stream_api_error,
             )
         verdicts.append(verdict)
 
@@ -260,6 +277,7 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
                 error=stream_error or "reviewer emitted no verdict marker",
+                api_error=stream_api_error,
             )
 
         # CHANGES_REQUESTED — gate on the merged-findings digest before paying

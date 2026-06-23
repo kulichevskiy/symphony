@@ -578,6 +578,75 @@ async def test_reviewer_stall_returns_reviewer_failed(tmp_path: Path) -> None:
     assert [spec.run_id for spec in runner.specs] == ["run-1-rev-0", "run-1-rev-0"]
 
 
+def _claude_api_error_stream(status: int) -> list[RunnerEvent]:
+    """A claude reviewer stream that exits 0 carrying only a transient provider
+    API error (synthetic assistant + `is_error`/`api_error_status` result) and
+    no verdict marker."""
+    text = f"API Error: {status} {{\"type\":\"error\"}}"
+    return [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "model": "<synthetic>",
+                        "content": [{"type": "text", "text": text}],
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "error_during_execution",
+                    "is_error": True,
+                    "result": text,
+                    "api_error_status": status,
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_claude_transient_api_error_surfaces_as_reviewer_failed(
+    tmp_path: Path,
+) -> None:
+    """A claude reviewer that exits 0 with only an `API Error: 500` (no verdict)
+    surfaces the real message — not the generic "no verdict marker"."""
+    runner = _ScriptedRunner(
+        scripts=[_claude_api_error_stream(500), _claude_api_error_stream(500)],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-1",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="claude",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.error is not None
+    assert result.error.startswith("API Error: 500")
+
+
 @pytest.mark.asyncio
 async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
@@ -1399,8 +1468,8 @@ async def test_safe_run_id_strips_unfriendly_chars(tmp_path: Path) -> None:
 
 def test_reviewer_stream_error_unwraps_codex_turn_failed() -> None:
     """A codex `turn.failed` wraps the real cause one JSON level deep; the
-    extractor returns the human message so a no-verdict run reports it."""
-    from symphony.pipeline.local_review_session import _reviewer_stream_error
+    extractor surfaces the status-prefixed message so a no-verdict run reports it."""
+    from symphony.pipeline.local_review import classify_stream_api_error
 
     inner = json.dumps(
         {
@@ -1423,15 +1492,17 @@ def test_reviewer_stream_error_unwraps_codex_turn_failed() -> None:
             json.dumps({"type": "turn.failed", "error": {"message": inner}}),
         ]
     )
-    assert _reviewer_stream_error(stdout) == (
-        "The 'gpt-5.1-codex' model is not supported when using Codex "
-        "with a ChatGPT account."
+    err = classify_stream_api_error(stdout)
+    assert err is not None
+    assert err.message == (
+        "API Error: 400 The 'gpt-5.1-codex' model is not supported when using "
+        "Codex with a ChatGPT account."
     )
 
 
 def test_reviewer_stream_error_none_on_clean_stream() -> None:
     """A normal stream with no error/turn.failed event yields None."""
-    from symphony.pipeline.local_review_session import _reviewer_stream_error
+    from symphony.pipeline.local_review import classify_stream_api_error
 
     stdout = "\n".join(
         [
@@ -1445,4 +1516,4 @@ def test_reviewer_stream_error_none_on_clean_stream() -> None:
             json.dumps({"type": "turn.completed"}),
         ]
     )
-    assert _reviewer_stream_error(stdout) is None
+    assert classify_stream_api_error(stdout) is None

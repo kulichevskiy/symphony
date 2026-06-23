@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"thr-1"}
+{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":500,\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":500,\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}"}}
