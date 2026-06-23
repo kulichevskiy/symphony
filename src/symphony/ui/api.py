@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 
 import aiosqlite
 from fastapi import APIRouter, HTTPException, Query
@@ -599,7 +599,7 @@ def _week_start(day: date) -> date:
 
 
 def _build_stage_series(
-    rows: list[dict[str, object]],
+    rows: list[dict[str, Any]],
     date_from: str | None,
     date_to: str | None,
 ) -> StageSeries:
@@ -660,8 +660,8 @@ def _build_stage_series(
 
 
 def _build_per_provider(
-    model_rows: list[dict[str, object]],
-    provider_issue_rows: list[dict[str, object]],
+    model_rows: list[dict[str, Any]],
+    provider_issue_rows: list[dict[str, Any]],
 ) -> list[ProviderSpend]:
     provider_issues = {
         str(row["provider"]): int(row["issues"] or 0) for row in provider_issue_rows
@@ -721,12 +721,12 @@ def _build_per_provider(
 
 
 def _build_spend_summary(
-    rows: list[dict[str, object]],
-    model_rows: list[dict[str, object]] | None = None,
-    provider_issue_rows: list[dict[str, object]] | None = None,
+    rows: list[dict[str, Any]],
+    model_rows: list[dict[str, Any]] | None = None,
+    provider_issue_rows: list[dict[str, Any]] | None = None,
     teams: list[str] | None = None,
-    models: list[dict[str, object]] | None = None,
-    stage_rows: list[dict[str, object]] | None = None,
+    models: list[dict[str, Any]] | None = None,
+    stage_rows: list[dict[str, Any]] | None = None,
 ) -> SpendSummary:
     per_team: list[TeamSpend] = []
     acc = {
@@ -1013,7 +1013,7 @@ def create_api_router(
             # Keep only canonically-done issues whose completion lands inside the
             # window, newest first. The window is open-ended when a bound is
             # omitted (all-time done by default).
-            kept: list[tuple[dict[str, object], object, str]] = []
+            kept: list[tuple[dict[str, Any], Any, str | None]] = []
             for issue, status in statuses:
                 if status.state != "done":
                     continue
