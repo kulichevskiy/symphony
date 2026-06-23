@@ -16,7 +16,9 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
+from symphony.github.webhook import GitHubWebhookEvent
 from symphony.tracker import Blocker
 
 from .clock import ManualClock
@@ -136,6 +138,13 @@ class Sim:
         self._live_pids: set[int] = set()
         self._pr_counter = itertools.count(1)
         self._comment_counter = itertools.count(1)
+        self._delivery_counter = itertools.count(1)
+        # Pending webhook payloads. A Sim mutation ENQUEUES the corresponding
+        # payload here; the harness delivers it explicitly via
+        # deliver_*_webhook so ordering stays deterministic (the
+        # deliver → drain → assert rhythm). Mutations never auto-deliver.
+        self.github_webhooks: list[GitHubWebhookEvent] = []
+        self.linear_webhooks: list[dict[str, Any]] = []
         self.linear = _LinearView(self)
         self.github = _GitHubView(self)
 
@@ -225,3 +234,71 @@ class Sim:
 
     def next_comment_id(self) -> str:
         return f"sim-comment-{next(self._comment_counter)}"
+
+    def next_delivery_id(self) -> str:
+        return f"sim-delivery-{next(self._delivery_counter)}"
+
+    # --- external mutations that enqueue (but never deliver) webhooks ---
+
+    def _find_pr(self, pr: int | str, repo: str | None) -> SimPR | None:
+        number = int(pr)
+        if repo is not None:
+            return self.prs.get((repo, number))
+        for (_repo, num), sim_pr in self.prs.items():
+            if num == number:
+                return sim_pr
+        return None
+
+    def merge_pr(self, pr: int | str, *, repo: str | None = None) -> SimPR:
+        """Merge a PR in the canonical reality and ENQUEUE the GitHub merge
+        webhook. Models an out-of-band merge (e.g. while Symphony is down):
+        the payload waits in `github_webhooks` until the harness delivers it."""
+        sim_pr = self._find_pr(pr, repo)
+        if sim_pr is None:
+            raise KeyError(f"no such PR: {pr!r}")
+        sim_pr.state = PR_MERGED
+        sim_pr.merged_at = self.now_iso()
+        self.github_webhooks.append(
+            GitHubWebhookEvent(
+                event_type="pull_request",
+                action="closed",
+                repo=sim_pr.repo,
+                delivery_id=self.next_delivery_id(),
+                pr_number=sim_pr.number,
+                merged=True,
+                merged_at=sim_pr.merged_at,
+            )
+        )
+        return sim_pr
+
+    def operator_comment(
+        self, issue_id: str, body: str, *, author_name: str = "operator"
+    ) -> SimComment:
+        """Post an operator comment to a Linear issue and ENQUEUE the Linear
+        comment webhook. The Linear analog of `merge_pr`: delivery is explicit
+        via `harness.deliver_linear_webhook()`."""
+        if issue_id not in self.issues:
+            raise KeyError(f"no such issue: {issue_id!r}")
+        comment = SimComment(
+            id=self.next_comment_id(),
+            issue_id=issue_id,
+            body=body,
+            created_at=self.now_iso(),
+            author_name=author_name,
+            author_is_me=False,
+        )
+        self.comments.setdefault(issue_id, []).append(comment)
+        self.linear_webhooks.append(
+            {
+                "type": "Comment",
+                "action": "create",
+                "webhookTimestamp": int(self.now().timestamp() * 1000),
+                "data": {
+                    "id": comment.id,
+                    "body": body,
+                    "createdAt": comment.created_at,
+                    "issueId": issue_id,
+                },
+            }
+        )
+        return comment
