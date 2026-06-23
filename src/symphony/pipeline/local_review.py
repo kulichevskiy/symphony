@@ -102,6 +102,168 @@ _CLAUDE_VERIFIER_DISALLOWED_TOOLS = ",".join(
 )
 
 
+# Provider API statuses we treat as transient: a retry can plausibly clear
+# them (server overload / rate limit / gateway), unlike a deterministic 4xx
+# such as 400 (bad request) or 404. Used to tell a genuine transient apart
+# from a clean no-verdict stream so downstream retry logic only retries the
+# former.
+TRANSIENT_API_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 529})
+
+_API_ERROR_STATUS_RE = re.compile(r"API Error:\s*(\d{3})")
+
+
+@dataclass(frozen=True)
+class StreamApiError:
+    """A provider API error recovered from an agent's terminal JSONL stream.
+
+    `message` is the human-readable cause (e.g. "API Error: 500 …"); `status`
+    is the HTTP-ish status when the stream carried one. `transient` is True
+    when `status` is one a retry can plausibly clear — the typed signal
+    downstream retry logic gates on. A clean no-verdict stream classifies to
+    `None` (not a non-transient error), so it is never mistaken for a retryable
+    failure.
+    """
+
+    message: str
+    status: int | None = None
+
+    @property
+    def transient(self) -> bool:
+        return self.status in TRANSIENT_API_STATUSES
+
+
+def _status_from_text(text: str) -> int | None:
+    match = _API_ERROR_STATUS_RE.search(text)
+    return int(match.group(1)) if match else None
+
+
+def _unwrap_codex_error(text: str) -> tuple[str | None, int | None]:
+    """Dig the real message + status out of codex's one-level-nested error.
+
+    A `turn.failed` carries `error.message` whose value is itself a JSON string
+    like `{"type":"error","status":500,"error":{"message":"…"}}`. Returns
+    `(message, status)`, either of which may be None when absent.
+    """
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(obj, dict):
+        return None, None
+    status = obj.get("status") if isinstance(obj.get("status"), int) else None
+    message: str | None = None
+    nested = obj.get("error")
+    if isinstance(nested, dict):
+        if isinstance(nested.get("message"), str):
+            message = nested["message"].strip() or None
+        if status is None and isinstance(nested.get("status"), int):
+            status = nested["status"]
+    if message is None and isinstance(obj.get("message"), str):
+        message = obj["message"].strip() or None
+    return message, status
+
+
+def _claude_result_api_error(event: dict) -> StreamApiError | None:
+    """A claude terminal `result` with `is_error: true` (e.g. `api_error_status`
+    500 + an `API Error: …` result text)."""
+    status = event.get("api_error_status")
+    status = status if isinstance(status, int) else None
+    text = event.get("result")
+    message = text.strip() if isinstance(text, str) and text.strip() else None
+    if message is None and status is not None:
+        message = f"API Error: {status}"
+    if message is None:
+        return None
+    if status is None:
+        status = _status_from_text(message)
+    return StreamApiError(message=message, status=status)
+
+
+def _claude_synthetic_api_error(event: dict) -> StreamApiError | None:
+    """A claude `model:"<synthetic>"` assistant message whose text reads
+    `API Error: <status> …` (the placeholder claude emits in place of the model
+    turn when the provider call fails)."""
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("model") != "<synthetic>":
+        return None
+    parts: list[str] = []
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    if not parts:
+        return None
+    text = "\n".join(parts)
+    return StreamApiError(message=text, status=_status_from_text(text))
+
+
+def _codex_event_api_error(event: dict) -> StreamApiError | None:
+    """A codex `error` / `turn.failed` event (the real cause is one JSON level
+    deep in `error.message`)."""
+    err = event.get("error")
+    raw: str | None = None
+    status: int | None = None
+    if isinstance(err, dict):
+        if isinstance(err.get("message"), str):
+            raw = err["message"]
+        if isinstance(err.get("status"), int):
+            status = err["status"]
+    elif isinstance(err, str):
+        raw = err
+    if raw is None and isinstance(event.get("message"), str):
+        raw = event["message"]
+    if status is None and isinstance(event.get("status"), int):
+        status = event["status"]
+    if raw is None or not raw.strip():
+        return None
+    inner_msg, inner_status = _unwrap_codex_error(raw)
+    if inner_status is not None:
+        status = inner_status
+    return StreamApiError(message=inner_msg or raw.strip(), status=status)
+
+
+def classify_stream_api_error(stdout: str) -> StreamApiError | None:
+    """Recover a provider API error from an agent's terminal JSONL stream.
+
+    Both providers can exit 0 carrying only an error and no verdict / completion
+    marker:
+
+    * claude emits a terminal `result` with `is_error: true` +
+      `api_error_status` (e.g. 500) and a synthetic `model:"<synthetic>"`
+      assistant message whose text is `"API Error: 500 …"`.
+    * codex emits an `error` / `turn.failed` event whose (one-level-nested)
+      payload carries the message and a `status`.
+
+    Returns the last such error with its real message + status, or None for a
+    clean stream. Callers read `.transient` to gate retries; because a clean
+    no-verdict stream returns None (not a non-transient error), it never retries.
+    """
+    found: StreamApiError | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        if etype == "result" and event.get("is_error") is True:
+            err = _claude_result_api_error(event)
+        elif etype == "assistant":
+            err = _claude_synthetic_api_error(event)
+        elif etype in ("error", "turn.failed"):
+            err = _codex_event_api_error(event)
+        else:
+            err = None
+        if err is not None:
+            found = err
+    return found
+
+
 class LocalVerdictKind(StrEnum):
     APPROVED = "approved"
     CHANGES_REQUESTED = "changes_requested"
@@ -687,13 +849,16 @@ def _stable_digest(text: str) -> str:
 __all__ = [
     "SMALL_DIFF_MAX_FILES",
     "SMALL_DIFF_MAX_LINES",
+    "TRANSIENT_API_STATUSES",
     "DiffSize",
     "LocalVerdict",
     "LocalVerdictKind",
     "ReviewerAgent",
+    "StreamApiError",
     "VERDICT_APPROVED_MARKER",
     "VERDICT_CHANGES_REQUESTED_MARKER",
     "build_local_review_command",
+    "classify_stream_api_error",
     "default_reviewer_agent",
     "extract_last_agent_message",
     "is_small_diff",

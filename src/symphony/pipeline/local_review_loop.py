@@ -45,6 +45,7 @@ from .local_review import (
     LocalVerdict,
     LocalVerdictKind,
     ReviewerAgent,
+    StreamApiError,
     parse_local_review_output,
 )
 
@@ -70,6 +71,11 @@ class ReviewerOutput:
     # only such an event and no verdict; surfacing this lets the loop report the
     # real cause instead of a generic "no verdict marker".
     agent_error: str | None = None
+    # The same error as a typed signal when it is a provider API error
+    # (`api_error.transient` distinguishes a retryable 5xx/429 from a
+    # deterministic 4xx). `agent_error` carries its message for operators;
+    # `api_error` is the gate downstream retry logic reads.
+    api_error: StreamApiError | None = None
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0

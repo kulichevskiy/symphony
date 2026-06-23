@@ -636,6 +636,69 @@ async def test_implement_blocked_classifier_fallback_for_mch14(tmp_path: Path) -
         await conn.close()
 
 
+def _api_error_runner(status: int) -> _FakeRunner:
+    """An implement runner that exits 0 carrying only a transient provider API
+    error (claude synthetic assistant + `is_error`/`api_error_status` result)
+    and no completion marker — HEAD never advances."""
+    text = f'API Error: {status} {{"type":"error","error":{{"message":"overloaded"}}}}'
+    return _FakeRunner(
+        [
+            RunnerEvent(kind="started", pid=4242),
+            RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "model": "<synthetic>",
+                            "content": [{"type": "text", "text": text}],
+                        },
+                    }
+                ),
+            ),
+            RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "result": text,
+                        "api_error_status": status,
+                    }
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ],
+        commit_on_implement=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_implement_transient_api_error_surfaces_in_termination_detail(
+    tmp_path: Path,
+) -> None:
+    """An implement run that exits 0 with only an `API Error: 500` fails the
+    completion gate, and the termination detail carries the real cause instead
+    of the generic completion-contract text."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        runner = _api_error_runner(500)
+        gh, push_fn = await _run_blocked_dispatch(tmp_path, conn, runner)
+
+        gh.ensure_pr.assert_not_awaited()
+        push_fn.assert_not_awaited()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert len(history) == 1
+        assert history[0].stage == "implement"
+        assert history[0].status == "failed"
+        assert history[0].termination_detail.startswith("API Error: 500")
+        assert "completion contract" not in history[0].termination_detail
+    finally:
+        await conn.close()
+
+
 def _head_sha(workspace_path: Path) -> str:
     return subprocess.run(
         ["git", "rev-parse", "HEAD"],

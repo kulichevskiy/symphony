@@ -119,6 +119,7 @@ from ..pipeline.cost_guard import (
 from ..pipeline.local_review import (
     DiffSize,
     LocalVerdict,
+    classify_stream_api_error,
     extract_last_agent_message,
     parse_diff_numstat,
 )
@@ -1440,6 +1441,22 @@ def _read_run_final_message(log_path: Path, *, agent: str) -> str:
         "claude" if agent == "claude" else "codex"
     )
     return extract_last_agent_message(agent=reviewer_agent, stdout=stdout)
+
+
+def _read_run_stream_api_error(log_path: Path) -> str | None:
+    """Real provider API-error message from a stage run log, or None.
+
+    An rc=0 implement run can carry only a transient provider API error
+    (claude `is_error`/`api_error_status` or codex `turn.failed`/`error`) and no
+    completion marker. Surfacing that message in the termination detail beats
+    the generic "did not satisfy the completion contract" text.
+    """
+    try:
+        stdout = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    err = classify_stream_api_error(stdout)
+    return err.message if err is not None else None
 
 
 async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
@@ -11377,6 +11394,12 @@ class Orchestrator:
                     "contract: HEAD did not advance and no SYMPHONY_DONE marker "
                     "could be confirmed as done"
                 )
+                # A run that ended only on a provider API error (e.g. 500)
+                # exits 0 with no marker — surface the real "API Error: …"
+                # cause instead of the generic completion-contract text.
+                api_error = _read_run_stream_api_error(log_path)
+                if api_error:
+                    reason = api_error
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
             await self._fail_run_and_reset_issue(
                 run_id,

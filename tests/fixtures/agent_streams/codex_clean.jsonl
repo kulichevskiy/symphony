@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"thr-1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Looks fine. No findings."}}
+{"type":"turn.completed"}
