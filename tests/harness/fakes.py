@@ -357,6 +357,7 @@ class FakeGitHub:
             url=url,
             issue_id=issue_id,
             head_sha=head_sha,
+            is_draft=draft,
         )
         return url
 
@@ -373,9 +374,9 @@ class FakeGitHub:
         # Simulate GitHub auto-merge: when auto-merge is queued and checks pass,
         # GitHub merges the PR in the background before the next poll.
         # Closed PRs are never auto-merged (they were closed before checks passed).
-        # Draft PRs, conflicting PRs, and those with a blocking merge_state_status
-        # (BEHIND/DIRTY/BLOCKED) are also skipped — real GitHub refuses these even
-        # with auto-merge queued.
+        # Draft PRs, conflicting PRs, those with a blocking merge_state_status
+        # (BEHIND/DIRTY/BLOCKED), and UNKNOWN mergeability are skipped — real
+        # GitHub refuses these even with auto-merge queued.
         _auto_blocking = sim_pr.merge_state_status
         if (
             sim_pr.auto_merge_enabled
@@ -383,8 +384,8 @@ class FakeGitHub:
             and not sim_pr.merged
             and sim_pr.state != PR_CLOSED
             and not sim_pr.is_draft
-            and sim_pr.mergeable.upper() != "CONFLICTING"
-            and _auto_blocking not in {"BEHIND", "DIRTY", "BLOCKED"}
+            and sim_pr.mergeable.upper() not in {"CONFLICTING", "UNKNOWN"}
+            and _auto_blocking not in {"BEHIND", "DIRTY", "BLOCKED", "UNKNOWN"}
         ):
             sim_pr.state = PR_MERGED
             sim_pr.merged_at = self._sim.now_iso()
@@ -568,23 +569,26 @@ class FakeGitHub:
             raise GitHubError(f"PR {pr} is already closed")
         # Real `gh pr merge` refuses a PR that GitHub does not consider
         # mergeable: a draft, a conflicting/dirty tree, a behind-base branch
-        # (when "require up to date" protection is on), or any BLOCKED state.
-        # Auto-merge can still be *queued* against a not-yet-green PR, but not
-        # against a structurally un-mergeable one.
+        # (when "require up to date" protection is on).  BLOCKED (pending/
+        # failing checks) prevents an immediate merge but auto-merge can still
+        # be *queued* — GitHub merges once checks go green.
         blocking_state = (
             sim_pr.merge_state_status
             if sim_pr.merge_state_status is not None
             else ("DRAFT" if sim_pr.is_draft else None)
         )
+        # Hard structural blocks reject both direct and auto-merge.
+        hard_blocks = {"DIRTY", "BEHIND"}
         if sim_pr.is_draft:
             raise GitHubError(f"PR {pr} is not mergeable: pull request is in draft state")
-        if sim_pr.mergeable.upper() == "CONFLICTING" or blocking_state in {
-            "DIRTY",
-            "BEHIND",
-            "BLOCKED",
-        }:
+        if sim_pr.mergeable.upper() == "CONFLICTING" or blocking_state in hard_blocks:
             raise GitHubError(
                 f"PR {pr} is not mergeable: merge state is {blocking_state or sim_pr.mergeable}"
+            )
+        # BLOCKED (checks pending/failing) blocks direct merge but not auto-merge queueing.
+        if not auto and blocking_state == "BLOCKED":
+            raise GitHubError(
+                f"PR {pr} is not mergeable: merge state is BLOCKED"
             )
         if auto and not self._required_checks_passed(sim_pr):
             # Queue auto-merge; GitHub merges later when checks go green.
