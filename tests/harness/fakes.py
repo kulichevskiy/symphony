@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import itertools
+import json
 import os
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
@@ -95,6 +96,45 @@ class FakeRunner:
     def enqueue(self, events: list[RunnerEvent]) -> None:
         """Pre-program the event sequence for the next `run()` call."""
         self._queue.append(events)
+
+    def enqueue_transient_api_error(self, *, status: int = 500) -> None:
+        """Pre-program the next `run()` to emit a transient provider API-error
+        stream: a synthetic `assistant` message plus a terminal `result` with
+        `is_error`/`api_error_status`, then a clean `exit 0` — the shape a real
+        agent emits when a 5xx/429 ends the turn with no verdict and no work
+        done (HEAD never advances). Lets scenarios drive the transient-error
+        retry path (SYM-141); the default stream cannot express it."""
+        text = f'API Error: {status} {{"type":"overloaded_error"}}'
+        self._queue.append(
+            [
+                RunnerEvent(kind="started", pid=next(self._pid)),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "model": "<synthetic>",
+                                "content": [{"type": "text", "text": text}],
+                            },
+                        }
+                    ),
+                ),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "error_during_execution",
+                            "is_error": True,
+                            "result": text,
+                            "api_error_status": status,
+                        }
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         if self._queue:

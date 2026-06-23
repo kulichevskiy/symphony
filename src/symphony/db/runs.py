@@ -40,6 +40,13 @@ PUBLISH_FAILED_KIND: str = "publish_failed"
 # gates) instead of re-dispatching the implementer — which would find nothing
 # to do and fail the "HEAD did not advance" completion contract.
 LOCAL_REVIEW_INFRA_FAILED_KIND: str = "local_review_infra_failed"
+# termination_kind stamped on an implement run that died on a *transient*
+# provider API error (a clean 5xx/429 with no verdict and no HEAD advance —
+# SYM-140's typed signal). It means no work happened, so the run is safe to
+# re-dispatch: the poll loop requeues the issue after a capped backoff window
+# (poll.py _agent_infra_retry_backoff_active) up to AGENT_INFRA_RETRY_LIMIT
+# attempts before falling through to the normal infra-failure escalation.
+TRANSIENT_API_RETRY_KIND: str = "transient_api_retry"
 TERMINATION_DETAIL_MAX_BYTES: int = 4096
 TERMINATION_DETAIL_MAX_LINES: int = 80
 

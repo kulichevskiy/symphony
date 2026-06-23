@@ -119,6 +119,7 @@ from ..pipeline.cost_guard import (
 from ..pipeline.local_review import (
     DiffSize,
     LocalVerdict,
+    StreamApiError,
     classify_stream_api_error,
     extract_last_agent_message,
     parse_diff_numstat,
@@ -192,8 +193,13 @@ _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
 ACCEPTANCE_INFRA_RETRY_LIMIT = 2
+# Shared, capped exponential-backoff knobs for every requeue-based infra-error
+# retry path (acceptance + the agent stages). `AGENT_INFRA_RETRY_LIMIT` is the
+# transient-API-error retry budget for reviewer/implement/fix runs before they
+# fall through to the existing infra-failure escalation.
 ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
+AGENT_INFRA_RETRY_LIMIT = 5
 ACCEPTANCE_FIX_ITERATION_CAP = 1
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
@@ -802,6 +808,19 @@ def _parse_rfc3339(s: str) -> datetime:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s)
+
+
+def _infra_retry_backoff_secs(attempt: int) -> int:
+    """Capped exponential backoff for the `attempt`-th infra retry (>= 1).
+
+    Shared by the acceptance and agent-run transient-error requeue paths so all
+    stages back off identically off the same knobs."""
+    return int(
+        min(
+            ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS * (2 ** (attempt - 1)),
+            ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS,
+        )
+    )
 
 
 def _user_login(entry: dict[str, object]) -> str:
@@ -1443,19 +1462,29 @@ def _read_run_final_message(log_path: Path, *, agent: str) -> str:
     return extract_last_agent_message(agent=reviewer_agent, stdout=stdout)
 
 
-def _read_run_stream_api_error(log_path: Path) -> str | None:
-    """Real provider API-error message from a stage run log, or None.
+def _read_run_stream_api_error_obj(log_path: Path) -> StreamApiError | None:
+    """The typed provider API error recovered from a stage run log, or None.
 
     An rc=0 implement run can carry only a transient provider API error
     (claude `is_error`/`api_error_status` or codex `turn.failed`/`error`) and no
-    completion marker. Surfacing that message in the termination detail beats
-    the generic "did not satisfy the completion contract" text.
+    completion marker. Returning the typed signal lets the completion gate both
+    surface the real message *and* gate the transient-error retry path on
+    `.transient`.
     """
     try:
         stdout = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    err = classify_stream_api_error(stdout)
+    return classify_stream_api_error(stdout)
+
+
+def _read_run_stream_api_error(log_path: Path) -> str | None:
+    """The provider API-error *message* from a stage run log, or None.
+
+    Surfacing it in the termination detail beats the generic "did not satisfy
+    the completion contract" text.
+    """
+    err = _read_run_stream_api_error_obj(log_path)
     return err.message if err is not None else None
 
 
@@ -8575,6 +8604,10 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
+            if await self._agent_infra_retry_backoff_active(issue.id):
+                # A prior implement run hit a transient API error and is inside
+                # its capped backoff window — re-dispatch once it elapses.
+                return None
             pr = await db.issue_prs.get(
                 self._conn,
                 issue_id=issue.id,
@@ -9694,11 +9727,125 @@ class Orchestrator:
         except ValueError:
             return False
         retry_count = min(state.infra_retries, ACCEPTANCE_INFRA_RETRY_LIMIT)
-        backoff_secs = min(
-            ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS * (2 ** (retry_count - 1)),
-            ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS,
-        )
+        backoff_secs = _infra_retry_backoff_secs(retry_count)
         return self._now() < ended_at + timedelta(seconds=backoff_secs)
+
+    async def _agent_infra_retry_count(self, issue_id: str) -> int:
+        """Consecutive most-recent *terminated* implement runs requeued on a
+        transient API error. Derived from the durable runs history (survives a
+        restart): count back from the latest terminated implement run until one
+        without the `transient_api_retry` marker. A still-`running` implement
+        run (the in-flight attempt whose failure is being classified) is skipped
+        so the count reflects only prior attempts. This is the retry-attempt
+        counter the backoff window and the escalation cutoff both read."""
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        count = 0
+        for run in reversed(history):
+            if run.stage != "implement":
+                continue
+            if run.status in db.runs.LIVE_STATUSES:
+                continue
+            if run.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND:
+                count += 1
+            else:
+                break
+        return count
+
+    async def _agent_infra_retry_backoff_active(self, issue_id: str) -> bool:
+        """True while a transiently-failed implement run is still inside its
+        capped backoff window — the poll loop must not re-dispatch yet. Mirrors
+        `_acceptance_infra_retry_backoff_active` but reads the marker + ended_at
+        off the latest implement run rather than acceptance_state."""
+        latest = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=issue_id,
+            stage="implement",
+        )
+        if (
+            latest is None
+            or latest.termination_kind != db.runs.TRANSIENT_API_RETRY_KIND
+            or latest.ended_at is None
+        ):
+            return False
+        count = await self._agent_infra_retry_count(issue_id)
+        if count <= 0:
+            return False
+        try:
+            ended_at = _parse_rfc3339(latest.ended_at)
+        except ValueError:
+            return False
+        backoff_secs = _infra_retry_backoff_secs(min(count, AGENT_INFRA_RETRY_LIMIT))
+        return self._now() < ended_at + timedelta(seconds=backoff_secs)
+
+    async def _maybe_requeue_transient_agent_failure(
+        self,
+        *,
+        run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        api_error: StreamApiError | None,
+        reason: str,
+        returncode: int | None = None,
+    ) -> bool:
+        """Requeue an implement run that died on a *transient* provider API
+        error instead of escalating, until the retry budget is spent.
+
+        A clean 5xx/429 means the agent did no work, so re-invoking is safe. The
+        run is marked failed with a durable `transient_api_retry` marker +
+        `ended_at` and the issue is moved back to its Ready lane; the poll loop
+        re-dispatches once the per-attempt backoff window elapses
+        (`_agent_infra_retry_backoff_active`) — no workspace slot is held during
+        the wait. Returns True when it handled the failure this way (the caller
+        must skip escalation). Returns False — the caller escalates exactly as
+        today — for a non-transient error, no API error, or once
+        `AGENT_INFRA_RETRY_LIMIT` consecutive retries have already happened."""
+        if api_error is None or not api_error.transient:
+            return False
+        # The current run is still `running` (its marker is stamped below), so
+        # `_agent_infra_retry_count` skips it and counts only the *prior*
+        # requeued attempts.
+        prior = await self._agent_infra_retry_count(storage_issue_id)
+        if prior >= AGENT_INFRA_RETRY_LIMIT:
+            return False
+        try:
+            states = await self._states_for_binding(binding)
+        except LinearError as e:
+            log.warning(
+                "could not load states to requeue %s after transient API error: %s",
+                issue.identifier,
+                e,
+            )
+            return False
+        ready_id = states.get(binding.linear_states.ready)
+        if ready_id is None:
+            return False
+        await self._fail_run(
+            run_id,
+            reason,
+            returncode=returncode,
+            termination_kind=db.runs.TRANSIENT_API_RETRY_KIND,
+            termination_detail=reason,
+        )
+        try:
+            await self.tracker(binding).move_issue(issue.id, ready_id)
+        except LinearError as e:
+            log.warning(
+                "could not requeue %s to Ready after transient API error: %s",
+                issue.identifier,
+                e,
+            )
+        attempt = prior + 1
+        log.info(
+            "requeueing %s after transient API error "
+            "(attempt %d/%d, backoff %ds): %s",
+            issue.identifier,
+            attempt,
+            AGENT_INFRA_RETRY_LIMIT,
+            _infra_retry_backoff_secs(min(attempt, AGENT_INFRA_RETRY_LIMIT)),
+            reason,
+        )
+        return True
 
     def _schedule_acceptance(
         self,
@@ -11396,10 +11543,21 @@ class Orchestrator:
                 )
                 # A run that ended only on a provider API error (e.g. 500)
                 # exits 0 with no marker — surface the real "API Error: …"
-                # cause instead of the generic completion-contract text.
-                api_error = _read_run_stream_api_error(log_path)
-                if api_error:
-                    reason = api_error
+                # cause instead of the generic completion-contract text, and
+                # (when transient) requeue with backoff instead of escalating.
+                api_error = _read_run_stream_api_error_obj(log_path)
+                if api_error is not None:
+                    reason = api_error.message
+                    if await self._maybe_requeue_transient_agent_failure(
+                        run_id=run_id,
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=issue_id,
+                        api_error=api_error,
+                        reason=reason,
+                        returncode=final_returncode,
+                    ):
+                        return None
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
             await self._fail_run_and_reset_issue(
                 run_id,
@@ -11477,6 +11635,22 @@ class Orchestrator:
                 allow_fixes=allow_fixes,
             )
             if _local_review_infra_failed(local_review_result):
+                # A transient provider API error in the reviewer/fix turn left
+                # the agent's commits intact and did no further work — requeue
+                # with backoff instead of escalating, until the budget is spent.
+                if await self._maybe_requeue_transient_agent_failure(
+                    run_id=run_id,
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    api_error=(
+                        local_review_result.api_error
+                        if local_review_result is not None
+                        else None
+                    ),
+                    reason=_local_review_termination_reason(local_review_result),
+                ):
+                    return False, local_review_result
                 await self._block_local_only_review_infra_failure(
                     binding=binding,
                     issue=issue,
