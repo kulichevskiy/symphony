@@ -1859,7 +1859,7 @@ class Orchestrator:
     def _now(self) -> datetime:
         if self._clock is not None:
             return self._clock()
-        return datetime.now(UTC)
+        return datetime.now(UTC)  # noqa: clock — sanctioned wall-clock entry point
 
     def tracker(self, ctx: TrackerContext | RepoBinding | None = None) -> IssueTracker:
         if isinstance(ctx, RepoBinding):
@@ -2104,7 +2104,7 @@ class Orchestrator:
         intent = SlashIntent(
             kind=kind,
             comment_id=f"web-{command_id}",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
         )
         await self._handle_slash_intent(issue_id, run_id, intent)
 
@@ -3016,7 +3016,7 @@ class Orchestrator:
 
     async def _stop_review_monitor(self, issue_id: str, run_id: str) -> None:
         log.info("$stop received for review monitor %s (issue %s)", run_id, issue_id)
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         fix_run_id = self._dispatch_run_ids.get(issue_id)
         if fix_run_id is not None and fix_run_id != run_id:
             log.info(
@@ -3116,7 +3116,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -3230,7 +3230,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -3557,7 +3557,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -3577,7 +3577,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -3835,7 +3835,7 @@ class Orchestrator:
             self._conn,
             run_id,
             "completed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
         )
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
@@ -3848,7 +3848,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -4673,7 +4673,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "completed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
         self._clear_review_no_signal_rearm_heads(run.id)
@@ -4688,7 +4688,7 @@ class Orchestrator:
         if not live_review_runs:
             return
 
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         closed_run_ids: set[str] = set()
         for run in live_review_runs:
             await db.runs.update_status(
@@ -4729,7 +4729,7 @@ class Orchestrator:
         if not live_review_runs:
             return
 
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         closed_run_ids: set[str] = set()
         for run in live_review_runs:
             await db.runs.update_status(
@@ -5285,7 +5285,7 @@ class Orchestrator:
                 stage="review_fix",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -5305,7 +5305,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         exc=e,
@@ -5337,7 +5337,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     transition.next_run_status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status=transition.next_run_status,
                         final_kind=final_kind,
@@ -5370,7 +5370,7 @@ class Orchestrator:
                 self._conn,
                 fix_run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
 
             local_review_result: LoopResult | None = None
@@ -5775,7 +5775,7 @@ class Orchestrator:
                 stage="review_fix",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -5795,7 +5795,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         exc=e,
@@ -5827,7 +5827,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     transition.next_run_status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status=transition.next_run_status,
                         final_kind=final_kind,
@@ -5860,7 +5860,7 @@ class Orchestrator:
                 self._conn,
                 fix_run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
 
             try:
@@ -6063,7 +6063,7 @@ class Orchestrator:
         self, *, issue: LinearIssue, merge_run_id: str | None
     ) -> db.runs.Run:
         run_id = merge_run_id or str(uuid.uuid4())
-        started_at = datetime.now(UTC).isoformat()
+        started_at = self._now().isoformat()
         if merge_run_id is None:
             await db.runs.create(
                 self._conn,
@@ -6244,7 +6244,7 @@ class Orchestrator:
                 stage="review_fix",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -6270,7 +6270,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         exc=e,
@@ -6302,7 +6302,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     transition.next_run_status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status=transition.next_run_status,
                         final_kind=final_kind,
@@ -6326,7 +6326,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         reason=(
@@ -6351,7 +6351,7 @@ class Orchestrator:
                 self._conn,
                 fix_run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
 
             local_review_result: LoopResult | None = None
@@ -6551,7 +6551,7 @@ class Orchestrator:
                 stage="review_fix",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
             if on_started is not None:
@@ -6601,7 +6601,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         exc=e,
@@ -6633,7 +6633,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     transition.next_run_status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status=transition.next_run_status,
                         final_kind=final_kind,
@@ -6657,7 +6657,7 @@ class Orchestrator:
                 self._conn,
                 fix_run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
             fixed_head_sha = ""
             try:
@@ -6677,7 +6677,7 @@ class Orchestrator:
                 github_repo=binding.github_repo,
                 pr_number=pr_number,
                 head_sha=fixed_head_sha,
-                marked_at=datetime.now(UTC).isoformat(),
+                marked_at=self._now().isoformat(),
             )
             if not marked:
                 log.warning(
@@ -7075,7 +7075,7 @@ class Orchestrator:
                 stage="review_fix",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -7125,7 +7125,7 @@ class Orchestrator:
                             self._conn,
                             fix_run_id,
                             "failed",
-                            ended_at=datetime.now(UTC).isoformat(),
+                            ended_at=self._now().isoformat(),
                             **_termination_kwargs(
                                 status="failed",
                                 exc=e,
@@ -7157,7 +7157,7 @@ class Orchestrator:
                             self._conn,
                             fix_run_id,
                             transition.next_run_status,
-                            ended_at=datetime.now(UTC).isoformat(),
+                            ended_at=self._now().isoformat(),
                             **_termination_kwargs(
                                 status=transition.next_run_status,
                                 final_kind=final_kind,
@@ -7192,7 +7192,7 @@ class Orchestrator:
                             self._conn,
                             fix_run_id,
                             "failed",
-                            ended_at=datetime.now(UTC).isoformat(),
+                            ended_at=self._now().isoformat(),
                             **_termination_kwargs(
                                 status="failed",
                                 exc=e,
@@ -7229,7 +7229,7 @@ class Orchestrator:
                                 self._conn,
                                 fix_run_id,
                                 "failed",
-                                ended_at=datetime.now(UTC).isoformat(),
+                                ended_at=self._now().isoformat(),
                                 **_termination_kwargs(
                                     status="failed",
                                     reason=error,
@@ -7267,7 +7267,7 @@ class Orchestrator:
                 self._conn,
                 fix_run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
 
             # Step 5: force-push the rebased branch.
@@ -7345,7 +7345,7 @@ class Orchestrator:
             self._conn,
             fix_run_id,
             "failed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
             **_termination_kwargs(
                 status="failed",
                 reason=(
@@ -7404,7 +7404,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -7424,7 +7424,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
@@ -7519,7 +7519,7 @@ class Orchestrator:
         tracker = self.tracker(binding)
         await self._clear_operator_wait(issue_id, run_id)
         new_run_id = str(uuid.uuid4())
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         await db.runs.create(
             self._conn,
             id=new_run_id,
@@ -7975,7 +7975,7 @@ class Orchestrator:
         )
         # Mark the review run completed and cancel its asyncio task immediately so
         # it cannot dispatch any more fix runs mid-iteration.
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         await db.runs.update_status(self._conn, monitor_run_id, "completed", ended_at=now)
         monitor_task = self._review_poll_run_tasks.pop(monitor_run_id, None)
         if monitor_task is not None and not monitor_task.done():
@@ -8082,7 +8082,7 @@ class Orchestrator:
         if last_review is not None and last_review.ended_at is not None:
             try:
                 elapsed = (
-                    datetime.now(UTC) - _parse_rfc3339(last_review.ended_at)
+                    self._now() - _parse_rfc3339(last_review.ended_at)
                 ).total_seconds()
                 if elapsed < REVIEW_RESURRECT_COOLDOWN_SECS:
                     return None
@@ -8133,7 +8133,7 @@ class Orchestrator:
                 issue.identifier,
                 pr.pr_number,
             )
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         review_run_id = str(uuid.uuid4())
         # DB rows (`runs`, `review_state`, `issue_prs`) are keyed on the storage
         # id `pr.issue_id`; `issue.id` is the tracker id (it can differ for
@@ -8204,7 +8204,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "failed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
             **_termination_kwargs(status="failed", reason=error),
         )
         await self._clear_review_rearm_retry(run.id)
@@ -8273,7 +8273,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "failed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
             **_termination_kwargs(status="failed", reason=error),
         )
         await self._clear_review_rearm_retry(run.id)
@@ -8355,7 +8355,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "completed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
 
@@ -9923,7 +9923,7 @@ class Orchestrator:
             stage="acceptance",
             status="running",
             pid=None,
-            started_at=datetime.now(UTC).isoformat(),
+            started_at=self._now().isoformat(),
             ignored_stage="review",
         )
         if not inserted:
@@ -10121,7 +10121,7 @@ class Orchestrator:
                 preview_url=verdict.preview_url,
             )
 
-            ended_at = datetime.now(UTC).isoformat()
+            ended_at = self._now().isoformat()
             if verdict.kind == "pass":
                 await db.runs.update_status(
                     self._conn,
@@ -10237,7 +10237,7 @@ class Orchestrator:
                 self._conn,
                 run_id,
                 "failed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
                 **_termination_kwargs(
                     status="failed",
                     exc=e,
@@ -10308,7 +10308,7 @@ class Orchestrator:
                 stage="acceptance_fix",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -10332,7 +10332,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         exc=e,
@@ -10356,7 +10356,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     transition.next_run_status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status=transition.next_run_status,
                         final_kind=final_kind,
@@ -10381,7 +10381,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         reason=(
@@ -10404,7 +10404,7 @@ class Orchestrator:
                     self._conn,
                     fix_run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
                         exc=e,
@@ -10417,7 +10417,7 @@ class Orchestrator:
                 self._conn,
                 fix_run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
             await self._run_acceptance_stage(
                 binding=binding,
@@ -10842,7 +10842,7 @@ class Orchestrator:
                     stage="merge",
                     status="running",
                     pid=None,
-                    started_at=datetime.now(UTC).isoformat(),
+                    started_at=self._now().isoformat(),
                     ignored_stage="review",
                 )
                 if not inserted:
@@ -10902,7 +10902,7 @@ class Orchestrator:
         window. The insert is atomic against a racing dispatch.
         """
         run_id = str(uuid.uuid4())
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
 
         issue_id = await db.issues.upsert(
             self._conn,
@@ -10991,7 +10991,7 @@ class Orchestrator:
                 self._conn,
                 run_id,
                 "failed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
                 **_termination_kwargs(
                     status="failed",
                     reason=f"post_comment failed: {e}",
@@ -11472,7 +11472,7 @@ class Orchestrator:
                     issue_id=issue_id,
                     github_repo=binding.github_repo,
                     head_sha=verified_head,
-                    marked_at=datetime.now(UTC).isoformat(),
+                    marked_at=self._now().isoformat(),
                 )
 
         # 4.8. Pre-push dirty-tree gate. Pushing only commits means any
@@ -11680,7 +11680,7 @@ class Orchestrator:
                 await db.runs.mark_stage_done_announced(
                     self._conn,
                     run_id,
-                    announced_at=datetime.now(UTC).isoformat(),
+                    announced_at=self._now().isoformat(),
                 )
                 try:
                     next_stage = (
@@ -11716,7 +11716,7 @@ class Orchestrator:
                 self._conn,
                 run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
 
         # Past the PR open the handoff (review-state writes, review-stage
@@ -11744,7 +11744,7 @@ class Orchestrator:
                 self._conn,
                 run_id,
                 "completed",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
             )
         return delivered_run_id
 
@@ -11787,7 +11787,7 @@ class Orchestrator:
                     binding_key=_binding_storage_key(binding),
                     pr_number=pr_number,
                     pr_url=pr_url,
-                    created_at=datetime.now(UTC).isoformat(),
+                    created_at=self._now().isoformat(),
                     review_bypassed=True,
                 )
             return run_id
@@ -11885,7 +11885,7 @@ class Orchestrator:
         on_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> str | None:
         run_id = str(uuid.uuid4())
-        now = datetime.now(UTC).isoformat()
+        now = self._now().isoformat()
         inserted = await db.runs.create_if_no_active(
             self._conn,
             id=run_id,
@@ -12193,7 +12193,7 @@ class Orchestrator:
                     self._conn,
                     run_id,
                     "completed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                 )
             return run_id
         finally:
@@ -12266,7 +12266,7 @@ class Orchestrator:
                 issue.identifier,
                 e,
             )
-        ended_at = datetime.now(UTC).isoformat()
+        ended_at = self._now().isoformat()
         await db.issue_prs.mark_merged(
             self._conn,
             issue_id=issue.id,
@@ -12319,7 +12319,7 @@ class Orchestrator:
                 stage="merge",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
                 ignored_stage="review",
             )
             if not inserted:
@@ -12378,7 +12378,7 @@ class Orchestrator:
                 self._conn,
                 run_id,
                 "needs_approval",
-                ended_at=datetime.now(UTC).isoformat(),
+                ended_at=self._now().isoformat(),
                 **_termination_kwargs(
                     status="needs_approval",
                     final_kind=final_kind,
@@ -12401,7 +12401,7 @@ class Orchestrator:
                     linear_team_key=binding.linear_team_key,
                     github_repo=binding.github_repo,
                     issue_label=binding.issue_label or "",
-                    created_at=datetime.now(UTC).isoformat(),
+                    created_at=self._now().isoformat(),
                     provider=binding.provider,
                     tracker_provider=binding.tracker_provider,
                     tracker_site=binding.tracker_site,
@@ -12490,7 +12490,7 @@ class Orchestrator:
                 stage="local_review",
                 status="running",
                 pid=None,
-                started_at=datetime.now(UTC).isoformat(),
+                started_at=self._now().isoformat(),
             )
 
             async def _on_iteration(
@@ -12615,14 +12615,14 @@ class Orchestrator:
                     self._conn,
                     run_id,
                     status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                 )
             else:
                 await db.runs.update_status(
                     self._conn,
                     run_id,
                     status,
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status=status,
                         reason=_local_review_termination_reason(result),
@@ -12912,7 +12912,7 @@ class Orchestrator:
             stage="verify",
             status="running",
             pid=None,
-            started_at=datetime.now(UTC).isoformat(),
+            started_at=self._now().isoformat(),
         )
         result: VerifyResult | None = None
         try:
@@ -12993,14 +12993,14 @@ class Orchestrator:
                     self._conn,
                     run_id,
                     "completed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                 )
             else:
                 await db.runs.update_status(
                     self._conn,
                     run_id,
                     "failed",
-                    ended_at=datetime.now(UTC).isoformat(),
+                    ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed", reason="verify_cmd failed"
                     ),
@@ -13158,7 +13158,7 @@ class Orchestrator:
             self._conn,
             run.id,
             "needs_approval",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
             **_termination_kwargs(status="needs_approval", reason=detail),
         )
         await self._clear_review_rearm_retry(run.id)
@@ -13194,7 +13194,7 @@ class Orchestrator:
             )
 
         review_run_id = str(uuid.uuid4())
-        started_at = datetime.now(UTC).isoformat()
+        started_at = self._now().isoformat()
 
         existing = await db.runs.latest_live_for_issue_stage(
             self._conn, issue_id=storage_issue_id, stage="review"
@@ -13358,7 +13358,7 @@ class Orchestrator:
         await db.review_state.set_codex_review_requested_at(
             self._conn,
             storage_issue_id,
-            datetime.now(UTC).isoformat(),
+            self._now().isoformat(),
         )
 
     async def _move_issue_to_local_code_review_state(
@@ -13887,7 +13887,7 @@ class Orchestrator:
             stage="implement_fix",
             status="running",
             pid=None,
-            started_at=datetime.now(UTC).isoformat(),
+            started_at=self._now().isoformat(),
         )
         command = build_fix_runner_command(
             binding.agent,
@@ -13922,7 +13922,7 @@ class Orchestrator:
             self._conn,
             fix_run_id,
             status,
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
         )
 
     async def _run_runner(
@@ -14047,7 +14047,7 @@ class Orchestrator:
             self._conn,
             run_id,
             "failed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
             **kwargs,
         )
 
@@ -14327,7 +14327,7 @@ class Orchestrator:
             self._conn,
             run_id,
             "completed",
-            ended_at=datetime.now(UTC).isoformat(),
+            ended_at=self._now().isoformat(),
         )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = implement_already_satisfied(
@@ -14489,7 +14489,7 @@ class Orchestrator:
             linear_team_key=binding.linear_team_key,
             github_repo=binding.github_repo,
             issue_label=binding.issue_label or "",
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=self._now().isoformat(),
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,

@@ -243,7 +243,7 @@ class Reconciler:
         if self._clock is not None:
             now = self._clock()
         else:
-            now = datetime.now(UTC)
+            now = datetime.now(UTC)  # noqa: clock — sanctioned wall-clock entry point
         if now.tzinfo is None:
             return now.replace(tzinfo=UTC)
         return now.astimezone(UTC)
