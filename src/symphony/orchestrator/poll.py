@@ -11305,11 +11305,19 @@ class Orchestrator:
         # advance, and fall back to a cheap classifier of the final message.
         head_after = await _workspace_head_sha(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
+        # A re-dispatched agent whose work a prior run already committed
+        # correctly no-ops (HEAD does not advance *this run*) and emits
+        # SYMPHONY_DONE. Without this signal the completion gate would fail it
+        # and trap the issue in an implement-retry loop; commits already ahead
+        # of the base are deliverable, so the gate treats them like a fresh
+        # advance and falls through to the pre-push gates / publish.
+        branch_ahead_of_base = await _branch_ahead_of_base(workspace_path, base_branch)
         log_path = self.config.log_root / f"{run_id}.log"
         final_message = _read_run_final_message(log_path, agent=binding.agent)
         completion = classify_implement_completion(
             final_message=final_message,
             head_advanced=head_advanced,
+            branch_ahead_of_base=branch_ahead_of_base,
         )
         if completion.outcome == "blocked":
             reason = (

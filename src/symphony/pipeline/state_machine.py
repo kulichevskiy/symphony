@@ -165,6 +165,7 @@ def classify_implement_completion(
     *,
     final_message: str,
     head_advanced: bool,
+    branch_ahead_of_base: bool = False,
     classifier: Callable[[str], tuple[ClassifierVerdict, str]] = (
         classify_blocked_final_message
     ),
@@ -185,6 +186,20 @@ def classify_implement_completion(
       a ``blocked`` ask is actionable. A ``done`` verdict here cannot mean
       completed (no commits to push), so done/ambiguous -> ``failed``.
 
+    ``branch_ahead_of_base`` is the resume-safety seam: when a *prior* run
+    committed the work but the pipeline never delivered it (e.g. it failed in
+    local review and was reset), a re-dispatched agent correctly no-ops and
+    emits ``SYMPHONY_DONE`` without advancing HEAD *this run*. Treating that as
+    ``failed`` traps the issue in an implement-retry loop. So commits already
+    sitting ahead of the base branch count as "something to push" exactly like a
+    fresh HEAD advance — but *only* when paired with an explicit
+    ``SYMPHONY_DONE``: the agent re-ran with the branch in view and affirmed it
+    is complete. That positive vouch is what separates this from blindly
+    publishing commits a dead fix-run left behind (those re-run the agent and
+    never reach here without a marker). The no-op guard is *not* weakened: a
+    branch not ahead of base, or a markerless run, still classifies as
+    ``failed``.
+
     The classifier fallback runs *only* in the last case (marker missing and
     HEAD did not advance).
     """
@@ -200,7 +215,9 @@ def classify_implement_completion(
             outcome="already_satisfied", already_satisfied_ref=marker.already_done_ref
         )
     if marker.kind == "done":
-        if head_advanced:
+        # A fresh HEAD advance OR commits already ahead of base both mean the
+        # branch carries deliverable work the agent just vouched for as done.
+        if head_advanced or branch_ahead_of_base:
             return ImplementCompletion(outcome="completed")
         return ImplementCompletion(outcome="failed")
     if head_advanced:
@@ -208,9 +225,10 @@ def classify_implement_completion(
     verdict, ask = classifier(final_message)
     if verdict == "blocked":
         return ImplementCompletion(outcome="blocked", blocked_reason=ask)
-    # No commits exist: a "done" verdict cannot mean completed (rc=0 without
-    # commits and without SYMPHONY_DONE never classifies as completed). Only a
-    # blocked ask is actionable here; everything else is a failure.
+    # No commits this run and no SYMPHONY_DONE: a "done" verdict cannot mean
+    # completed, and a branch merely ahead of base (without the agent's explicit
+    # marker) is not enough to publish — it may be a dead fix-run's partial
+    # commits. Only a blocked ask is actionable here; everything else fails.
     return ImplementCompletion(outcome="failed")
 
 
