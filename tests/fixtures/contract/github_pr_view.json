@@ -1,0 +1,21 @@
+{
+  "number": 4821,
+  "title": "Fix flaky merge gate",
+  "state": "OPEN",
+  "url": "https://github.com/acme/widgets/pull/4821",
+  "headRefName": "symphony/sym-42",
+  "headRefOid": "9f3a1c2e5b7d8a0f1234567890abcdef12345678",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "CLEAN",
+  "isDraft": false,
+  "mergedAt": null,
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "ci",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    }
+  ]
+}

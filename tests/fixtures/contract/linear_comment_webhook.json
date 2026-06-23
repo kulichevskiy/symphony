@@ -1,0 +1,16 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "createdAt": "2026-06-20T15:00:00.000Z",
+  "data": {
+    "id": "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
+    "body": "$approve",
+    "createdAt": "2026-06-20T15:00:00.000Z",
+    "issueId": "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b"
+  },
+  "actor": {
+    "id": "user-uuid",
+    "name": "Alex"
+  },
+  "webhookTimestamp": 1718895600000
+}

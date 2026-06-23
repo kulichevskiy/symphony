@@ -1,0 +1,22 @@
+{
+  "issue": {
+    "comments": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": null
+      },
+      "nodes": [
+        {
+          "id": "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8",
+          "body": "$approve",
+          "createdAt": "2026-06-20T15:00:00.000Z",
+          "user": {
+            "name": "Alex",
+            "isMe": false
+          },
+          "externalThread": null
+        }
+      ]
+    }
+  }
+}
