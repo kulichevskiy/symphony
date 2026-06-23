@@ -16,6 +16,7 @@ import aiosqlite
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.orchestrator.poll import Orchestrator
+from symphony.orchestrator.reconcile import reconcile
 
 from .clock import ManualClock
 from .fakes import FakeGitHub, FakeLinear, FakeRunner
@@ -24,6 +25,44 @@ from .sim import Sim
 
 DEFAULT_TEAM = "ENG"
 DEFAULT_REPO = "org/repo"
+
+
+async def _sim_aware_push(
+    workspace_path: Path, branch: str, sim: "Sim", *, force: bool = False
+) -> None:
+    """Push to the fake origin and update the matching SimPR's head_sha."""
+    cmd = (
+        ["git", "push", "--force-with-lease", "-u", "origin", branch]
+        if force
+        else ["git", "push", "-u", "origin", branch]
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git push failed: {stderr.decode(errors='replace').strip()}"
+        )
+    # Read the new HEAD SHA and propagate it to the SimPR so pr_view()
+    # returns the updated headRefOid on the next poll.
+    sha_proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "HEAD",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    sha_out, _ = await sha_proc.communicate()
+    head_sha = sha_out.decode().strip()
+    if head_sha:
+        for sim_pr in sim.prs.values():
+            if sim_pr.head == branch:
+                sim_pr.head_sha = head_sha
+                break
 
 
 def _states_from_binding(binding: RepoBinding) -> tuple[dict[str, str], dict[str, str]]:
@@ -110,6 +149,13 @@ class Harness:
         linear = FakeLinear(sim)
         github = FakeGitHub(sim)
         runner = FakeRunner()
+
+        async def _push_fn(workspace_path: Path, branch: str) -> None:
+            await _sim_aware_push(workspace_path, branch, sim)
+
+        async def _force_push_fn(workspace_path: Path, branch: str) -> None:
+            await _sim_aware_push(workspace_path, branch, sim, force=True)
+
         orch = Orchestrator(
             config,
             linear,
@@ -117,6 +163,8 @@ class Harness:
             runner=runner,
             gh=github,  # type: ignore[arg-type]
             clock=clock,
+            push_fn=_push_fn,
+            force_push_fn=_force_push_fn,
         )
         return cls(
             config=config,
@@ -134,6 +182,7 @@ class Harness:
 
     async def warmup(self) -> None:
         """Steppable startup work: cache states + run startup reconciles."""
+        await reconcile(self.conn, self.linear, bindings=self.config.repos)
         await self.orch.warmup()
         await self.orch._restore_operator_waits()  # noqa: SLF001
         await self.orch._reconcile_orphaned_merge_runs(reason="startup")  # noqa: SLF001

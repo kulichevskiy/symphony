@@ -80,28 +80,27 @@ class FakeRunner:
             yield ev
 
     async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
-        if spec.stage == "implement":
-            # The completion gate requires both a SYMPHONY_DONE marker in the
-            # log and a HEAD advance. Make an empty commit so HEAD moves.
-            env = {
-                **os.environ,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_AUTHOR_NAME": "sim",
-                "GIT_AUTHOR_EMAIL": "sim@test",
-                "GIT_COMMITTER_NAME": "sim",
-                "GIT_COMMITTER_EMAIL": "sim@test",
-            }
-            proc = await asyncio.create_subprocess_exec(
-                "git", "-C", str(spec.workspace_path),
-                "commit", "--allow-empty", "-m", "fake: implement",
-                env=env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            # Emit claude stream-json result event so _read_run_final_message
-            # extracts "SYMPHONY_DONE" via _claude_last_result_text.
-            yield RunnerEvent(kind="stdout", line='{"type":"result","result":"SYMPHONY_DONE"}')
+        # All stages need a HEAD advance so that git push has new work and the
+        # orchestrator can read the new headRefOid from pr_view().
+        env = {
+            **os.environ,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "sim",
+            "GIT_AUTHOR_EMAIL": "sim@test",
+            "GIT_COMMITTER_NAME": "sim",
+            "GIT_COMMITTER_EMAIL": "sim@test",
+        }
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(spec.workspace_path),
+            "commit", "--allow-empty", "-m", f"fake: {spec.stage or 'run'}",
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        # Emit claude stream-json result event so _read_run_final_message
+        # extracts "SYMPHONY_DONE" via _claude_last_result_text.
+        yield RunnerEvent(kind="stdout", line='{"type":"result","result":"SYMPHONY_DONE"}')
         yield RunnerEvent(kind="exit", returncode=0)
 
     async def kill(self, run_id: str) -> None:
@@ -213,8 +212,10 @@ class FakeGitHub:
     ) -> None:
         """Seed a review signal so `pr_reviews()` returns it."""
         number = int(pr)
+        sim_pr = self._sim.prs.get((repo, number))
+        commit_id = sim_pr.head_sha if sim_pr is not None else ""
         self._reviews.setdefault((repo, number), []).append(
-            {"state": state, "user": {"login": author}}
+            {"state": state, "user": {"login": author}, "commit_id": commit_id}
         )
 
     def _pr(self, pr: int | str, repo: str | None) -> SimPR | None:
