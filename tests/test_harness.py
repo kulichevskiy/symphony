@@ -141,6 +141,67 @@ async def test_restart_reopens_db_and_recovers_orphaned_run(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_merge_pr_enqueues_github_webhook_without_delivering(
+    tmp_path: Path,
+) -> None:
+    """`sim.merge_pr()` mutates reality and ENQUEUES the merge webhook; nothing
+    is delivered until the harness chooses to. `deliver_github_webhook()` then
+    routes the queued event into the real orchestrator handler."""
+    harness = await Harness.create(tmp_path)
+    try:
+        await harness.warmup()
+        url = await harness.github.ensure_pr(
+            title="t", body="", head="b", repo="org/repo"
+        )
+        assert url
+        pr = next(iter(harness.sim.prs.values()))
+
+        sim_pr = harness.sim.merge_pr(pr.number, repo=pr.repo)
+        # Mutation applied to canonical reality; webhook queued, not delivered.
+        assert sim_pr.merged
+        assert len(harness.sim.github_webhooks) == 1
+        assert harness.sim.github_webhooks[0].merged is True
+
+        result = await harness.deliver_github_webhook()
+        assert result.handled is True
+        await harness.drain()
+        assert harness.sim.github_webhooks == []
+        # Nothing else queued → delivering again is a hard error.
+        with pytest.raises(AssertionError):
+            await harness.deliver_github_webhook()
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_comment_enqueues_linear_webhook_for_explicit_delivery(
+    tmp_path: Path,
+) -> None:
+    """The Linear analog: `sim.operator_comment()` records the comment and
+    ENQUEUES the Linear webhook; `deliver_linear_webhook()` routes it into the
+    real handler. With no active run the handler reports `handled=False`, which
+    still proves the enqueue → deliver plumbing."""
+    harness = await Harness.create(tmp_path)
+    try:
+        await harness.warmup()
+        harness.sim.issues["iss-1"] = SimIssue(
+            id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
+        )
+
+        harness.sim.operator_comment("iss-1", "$stop")
+        assert harness.sim.comments["iss-1"][-1].body == "$stop"
+        assert len(harness.sim.linear_webhooks) == 1
+
+        result = await harness.deliver_linear_webhook()
+        assert result.kind == "comment"
+        assert harness.sim.linear_webhooks == []
+        with pytest.raises(AssertionError):
+            await harness.deliver_linear_webhook()
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_assert_consistent_passes_on_empty_state(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "empty.sqlite")
     try:

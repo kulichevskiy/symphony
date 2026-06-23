@@ -15,7 +15,8 @@ import aiosqlite
 
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
-from symphony.orchestrator.poll import Orchestrator
+from symphony.github.webhook import GitHubWebhookEvent
+from symphony.orchestrator.poll import Orchestrator, WebhookDispatchResult
 from symphony.orchestrator.reconcile import reconcile
 
 from .clock import ManualClock
@@ -254,7 +255,7 @@ class Harness:
         await self.orch._reconcile_auto_recoverable_merge_waits(  # noqa: SLF001
             reason="startup"
         )
-        await self._drain()
+        await self.drain()
 
     async def step(self) -> list[asyncio.Task[None]]:
         """Run one `_tick()` + one reconciler tick to quiescence."""
@@ -266,10 +267,35 @@ class Harness:
             for r in results:
                 if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
                     raise r
-        await self._drain()
+        await self.drain()
         return scheduled
 
-    async def _drain(self) -> None:
+    async def deliver_github_webhook(self) -> WebhookDispatchResult:
+        """Deliver the next queued GitHub webhook to the orchestrator.
+
+        Delivery is explicit so scenarios control ordering. The handler only
+        *schedules* fire-and-forget reconcile tasks — call `drain()` to run
+        them to quiescence before asserting (the deliver → drain → assert
+        rhythm)."""
+        if not self.sim.github_webhooks:
+            raise AssertionError("no GitHub webhook queued to deliver")
+        event: GitHubWebhookEvent = self.sim.github_webhooks.pop(0)
+        return await self.orch.handle_github_webhook(event)
+
+    async def deliver_linear_webhook(self) -> WebhookDispatchResult:
+        """Deliver the next queued Linear webhook to the orchestrator.
+
+        The Linear counterpart of `deliver_github_webhook`; same explicit
+        delivery contract — follow with `drain()` before asserting."""
+        if not self.sim.linear_webhooks:
+            raise AssertionError("no Linear webhook queued to deliver")
+        payload = self.sim.linear_webhooks.pop(0)
+        return await self.orch.handle_linear_webhook(payload)
+
+    async def drain(self) -> None:
+        """Run the fire-and-forget scheduled background tasks to quiescence:
+        the reconcile-event tasks webhook handlers spawn (poll.py
+        handle_*_webhook) plus dispatch tasks. Deterministic — no real sleeps."""
         await self.orch.drain_reconcile_event_tasks()
         await self.orch.drain_dispatch_tasks()
 
