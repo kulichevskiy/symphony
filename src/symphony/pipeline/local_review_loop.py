@@ -65,6 +65,11 @@ class ReviewerOutput:
     last_message_file: str | None = None
     ok: bool = True
     error: str | None = None
+    # A human-readable error pulled from a `turn.failed`/`error` event in the
+    # reviewer's stream (e.g. an API 4xx). The reviewer process can exit 0 with
+    # only such an event and no verdict; surfacing this lets the loop report the
+    # real cause instead of a generic "no verdict marker".
+    agent_error: str | None = None
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -191,9 +196,16 @@ async def run_local_review_loop(
     for i in range(cap):
         verdict: LocalVerdict | None = None
         reviewer_error: str | None = None
+        # The real stream error (an API/config failure) can surface on one
+        # attempt but not a later one; retain the last non-empty one so an
+        # unparseable final attempt still reports the real cause rather than
+        # the generic marker message.
+        stream_error: str | None = None
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
             _record_usage(out)
+            if out.agent_error:
+                stream_error = out.agent_error
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
                 if attempt < REVIEWER_FAILURE_RETRIES:
@@ -221,7 +233,7 @@ async def run_local_review_loop(
             return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
-                error=reviewer_error or "reviewer failed",
+                error=reviewer_error or stream_error or "reviewer failed",
             )
         verdicts.append(verdict)
 
@@ -247,7 +259,7 @@ async def run_local_review_loop(
             return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
-                error="reviewer emitted no verdict marker",
+                error=stream_error or "reviewer emitted no verdict marker",
             )
 
         # CHANGES_REQUESTED — gate on the merged-findings digest before paying

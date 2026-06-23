@@ -44,6 +44,8 @@ class _ReviewerScript:
     fail_on: set[int] = field(default_factory=set)
     fail_by_call: set[int] = field(default_factory=set)
     message_by_call: bool = False
+    agent_error: str | None = None
+    agent_errors: list[str | None] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
 
     async def __call__(self, i: int) -> ReviewerOutput:
@@ -53,11 +55,17 @@ class _ReviewerScript:
             return ReviewerOutput(
                 stdout="", head_sha="", ok=False, error="reviewer crashed"
             )
+        agent_error = (
+            self.agent_errors[message_index]
+            if self.agent_errors
+            else self.agent_error
+        )
         return ReviewerOutput(
             stdout=_codex_jsonl(self.messages[message_index]),
             head_sha=(
                 self.head_shas[message_index] if self.head_shas else f"sha{i}"
             ),
+            agent_error=agent_error,
         )
 
 
@@ -267,6 +275,57 @@ async def test_unparseable_review_treated_as_reviewer_failure() -> None:
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.iterations == 1
     assert result.error == "reviewer emitted no verdict marker"
+
+
+@pytest.mark.asyncio
+async def test_unparseable_review_surfaces_agent_stream_error() -> None:
+    """When the reviewer turn failed (e.g. an API 4xx) and so emitted no
+    verdict, the loop reports the real cause, not the generic marker message."""
+    reviewer = _ReviewerScript(
+        messages=["(no marker — the turn failed upstream)"],
+        agent_error=(
+            "The 'gpt-5.1-codex' model is not supported when using Codex "
+            "with a ChatGPT account."
+        ),
+    )
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.iterations == 1
+    assert result.error == (
+        "The 'gpt-5.1-codex' model is not supported when using Codex "
+        "with a ChatGPT account."
+    )
+    assert fixer.received == []
+
+
+@pytest.mark.asyncio
+async def test_stream_error_preserved_across_unparseable_retries() -> None:
+    """The real stream error can appear on the first attempt but not the retry;
+    the no-verdict result must still report it, not the generic marker."""
+    reviewer = _ReviewerScript(
+        messages=["turn failed, no marker", "still no marker"],
+        head_shas=["same-head", "same-head"],
+        message_by_call=True,
+        agent_errors=["model X not supported on this account", None],
+    )
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.iterations == 1
+    assert reviewer.calls == [0, 0]
+    assert result.error == "model X not supported on this account"
+    assert fixer.received == []
 
 
 @pytest.mark.asyncio
