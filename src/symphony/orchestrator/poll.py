@@ -11060,13 +11060,27 @@ class Orchestrator:
                 issue_id=issue_id,
                 current_run_id=run_id,
             )
-            delivery_terminal_kinds = {
+            # Delivery failures (publish/deliver) passed the completion gate
+            # AND local review, so a resume skips the agent and re-runs only
+            # the agent-free publish path.
+            delivery_resume_kinds = {
                 db.runs.PUBLISH_FAILED_KIND,
                 db.operator_waits.KIND_DELIVER_FAILED,
             }
+            # A local-review *infra* failure (no verdict / the session raised)
+            # also passed the completion gate, so the commits are complete —
+            # but local review never finished, so the resume re-runs the gates
+            # *with fixes enabled* (a re-review may now request changes). Only
+            # the explicit kind qualifies: it is stamped solely for
+            # reviewer-never-verdicted failures, never for fix-run failures
+            # (which may have left partial commits and must re-run the agent).
+            resume_after_local_review = (
+                previous_terminal_kind == db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
+            )
             previous_requires_agent = (
                 previous_terminal_kind is not None
-                and previous_terminal_kind not in delivery_terminal_kinds
+                and previous_terminal_kind not in delivery_resume_kinds
+                and not resume_after_local_review
             )
             branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
         except Exception as e:  # noqa: BLE001 — surface as failed run
@@ -11118,7 +11132,12 @@ class Orchestrator:
                     storage_issue_id=issue_id,
                     run_id=run_id,
                     workspace_path=workspace_path,
-                    allow_fixes=False,
+                    # Delivery resumes already passed review → fail closed (no
+                    # code-mutating fix turn). A local-review-infra resume never
+                    # got a verdict, so it must allow the normal fix loop;
+                    # otherwise a re-review requesting changes would park as
+                    # FIX_RUN_FAILED instead of being fixed.
+                    allow_fixes=resume_after_local_review,
                 )
             except Exception as e:  # noqa: BLE001 — fail closed before publish
                 log.exception(
@@ -12825,7 +12844,25 @@ class Orchestrator:
         result: LoopResult | None,
     ) -> None:
         reason = _local_review_termination_reason(result)
-        await self._fail_run(run_id, reason)
+        # Tag only failures where the reviewer never produced a verdict — a
+        # `REVIEWER_FAILED` (no marker / reviewer crashed) or `result is None`
+        # (the session raised). Both happen *after* the implement completion
+        # gate, with no fix attempted, so the agent's commits are intact and a
+        # $retry can safely resume agent-free. `FIX_RUN_FAILED`/`FIX_RUN_BLOCKED`
+        # are deliberately left untagged: a fixer can fail/block after leaving
+        # partial commits, so those must re-run the implementer.
+        reviewer_never_verdicted = (
+            result is None or result.outcome == LoopOutcome.REVIEWER_FAILED
+        )
+        await self._fail_run(
+            run_id,
+            reason,
+            termination_kind=(
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
+                if reviewer_never_verdicted
+                else None
+            ),
+        )
 
         tracker = self.tracker(binding)
         try:

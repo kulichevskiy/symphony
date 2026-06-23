@@ -2421,6 +2421,208 @@ async def test_branch_already_ahead_short_circuits_to_publish(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_local_review_infra_failure_retry_short_circuits_skips_agent(
+    tmp_path: Path,
+) -> None:
+    """A prior implement run that failed at the local-review gate for a
+    reviewer-infra reason (no verdict) is safe to resume agent-free: the
+    commits already passed the completion gate. The $retry re-dispatch must
+    skip the implementer (re-running it would find nothing to do and trip the
+    "HEAD did not advance" contract) and proceed straight to publish.
+
+    Regression for SYM-133: the reviewer 400'd, implement was re-dispatched,
+    and the agent re-run failed because HEAD could not advance."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        # Prior implement run: passed completion gate, then the local-review
+        # gate failed for a reviewer-infra reason — tagged accordingly.
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.runs.create(
+            conn,
+            id="local-review-infra-failed-run",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "local-review-infra-failed-run",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+            kind=db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
+            detail="reviewer emitted no verdict marker",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        # HEAD already carries the prior run's committed work, one ahead of base.
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior implement work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # The agent was NOT re-invoked despite the prior failed implement run.
+        assert runner.specs == []
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        # Prior failed run plus the resumed run that short-circuited to publish.
+        assert [r.stage for r in history] == ["implement", "implement"]
+        assert history[-1].status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_untagged_prior_failure_with_sibling_local_review_runs_agent(
+    tmp_path: Path,
+) -> None:
+    """An implement run that failed with an untagged/heuristic kind (e.g.
+    "unknown") is NOT treated as agent-free-resumable, even when a sibling
+    failed local-review run exists — only the explicit
+    LOCAL_REVIEW_INFRA_FAILED_KIND qualifies. A fix-run failure can leave
+    partial commits, so an untagged failure must re-run the implementer."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        # Prior implement run failed with a legacy/heuristic kind (no explicit
+        # LOCAL_REVIEW_INFRA_FAILED_KIND), as pre-fix rows were written.
+        await db.runs.create(
+            conn,
+            id="legacy-implement-run",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "legacy-implement-run",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+            kind="unknown",
+            detail="reviewer emitted no verdict marker",
+        )
+        # Its sibling local-review run, terminally failed — the durable signal.
+        await db.runs.create(
+            conn,
+            id="legacy-local-review-run",
+            issue_id=issue.id,
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "legacy-local-review-run",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior implement work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        runner = _RecordingRunner(
+            [RunnerEvent(kind="started", pid=4242), RunnerEvent(kind="exit", returncode=0)]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # Untagged failure → the implementer is re-dispatched (not skipped),
+        # and publish is not reached on this no-op recording run.
+        assert runner.specs != []
+        push_fn.assert_not_awaited()
+        gh.ensure_pr.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_branch_setup_failure_releases_workspace_and_fails_run(
     tmp_path: Path,
 ) -> None:

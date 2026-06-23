@@ -33,6 +33,13 @@ SUCCESS_STATUSES: frozenset[str] = frozenset({"completed", "done"})
 # (push / ensure_pr). Distinguishes a delivery failure — which is safe to
 # resume at publish — from an agent-stage failure that left partial work.
 PUBLISH_FAILED_KIND: str = "publish_failed"
+# termination_kind stamped on an implement run whose agent + completion gate
+# succeeded but whose local-review gate produced no verdict (reviewer infra
+# failure, not a rejection). Like PUBLISH_FAILED_KIND, the commits are intact
+# and trustworthy, so a $retry can resume agent-free (re-run the pre-push
+# gates) instead of re-dispatching the implementer — which would find nothing
+# to do and fail the "HEAD did not advance" completion contract.
+LOCAL_REVIEW_INFRA_FAILED_KIND: str = "local_review_infra_failed"
 TERMINATION_DETAIL_MAX_BYTES: int = 4096
 TERMINATION_DETAIL_MAX_LINES: int = 80
 
