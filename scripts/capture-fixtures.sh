@@ -58,7 +58,19 @@ if [[ -n "${GH_REPO:-}" && -n "${PR:-}" ]]; then
           {__typename, name: "ci", status, conclusion, state}
         ) else . end)
       ' > "$_tmp"; then
-    mv "$_tmp" "$OUT/github_pr_view.json"
+    # Reject if any statusCheckRollup entry is non-green: a pending/failing
+    # optional status would corrupt the "fully passing PR" contract fixture.
+    if jq -e '
+      .statusCheckRollup // [] | all(
+        (.conclusion == "SUCCESS" or .conclusion == null) and
+        (.state == "SUCCESS" or .state == null)
+      )
+    ' "$_tmp" > /dev/null 2>&1; then
+      mv "$_tmp" "$OUT/github_pr_view.json"
+    else
+      rm -f "$_tmp"
+      echo "warning: PR has non-green statusCheckRollup entries (pending/failing optional checks?); existing golden unchanged" >&2
+    fi
   else
     rm -f "$_tmp"
     echo "warning: gh pr view failed; existing golden unchanged" >&2
@@ -70,7 +82,14 @@ if [[ -n "${GH_REPO:-}" && -n "${PR:-}" ]]; then
   if gh pr checks "$PR" --repo "$GH_REPO" --required --json name,state,bucket,link \
       | jq 'map(.link = "https://github.com/acme/widgets/actions/runs/9876543210/job/12345678901")' \
       > "$_tmp"; then
-    mv "$_tmp" "$OUT/github_pr_checks_passing.json"
+    # Reject empty array: a PR with no required checks exits 0 with [] but would
+    # overwrite the fixture with a payload that fails the contract.
+    if jq -e 'type == "array" and length > 0' "$_tmp" > /dev/null 2>&1; then
+      mv "$_tmp" "$OUT/github_pr_checks_passing.json"
+    else
+      rm -f "$_tmp"
+      echo "warning: gh pr checks returned empty array (no required checks on PR?); existing golden unchanged" >&2
+    fi
   else
     rm -f "$_tmp"
     echo "warning: gh pr checks did not exit 0 (PR not fully green?); existing golden unchanged" >&2
@@ -242,9 +261,10 @@ if [[ -n "${LINEAR_COMMENT_DELIVERY:-}" && -f "${LINEAR_COMMENT_DELIVERY:-}" ]];
   echo "capturing linear_comment_webhook.json from $LINEAR_COMMENT_DELIVERY"
   _tmp=$(mktemp)
   if jq '
-    .data.id      = "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8" |
-    .data.body    = "$approve" |
-    .data.issueId = "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b" |
+    .data.id             = "c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8" |
+    .data.body           = "$approve" |
+    .data.issueId        = "8a1f0c2e-1b3d-4e5f-9a7b-0c1d2e3f4a5b" |
+    .data.externalThread = null |
     if .actor then .actor.id = "user-uuid" | .actor.name = "Alex" else . end
   ' "$LINEAR_COMMENT_DELIVERY" > "$_tmp"; then
     mv "$_tmp" "$OUT/linear_comment_webhook.json"
