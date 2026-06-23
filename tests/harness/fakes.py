@@ -61,7 +61,7 @@ def _check_bucket(check: SimCheck) -> str:
     """The `gh pr checks` bucket (pass|fail|pending) for a `SimCheck`."""
     if check.status != "COMPLETED":
         return "pending"
-    if check.conclusion == "SUCCESS":
+    if check.conclusion in ("SUCCESS", "SKIPPED", "NEUTRAL"):
         return "pass"
     if check.conclusion is None:
         return "pending"
@@ -373,15 +373,22 @@ class FakeGitHub:
         # Simulate GitHub auto-merge: when auto-merge is queued and checks pass,
         # GitHub merges the PR in the background before the next poll.
         # Closed PRs are never auto-merged (they were closed before checks passed).
+        # Draft PRs, conflicting PRs, and those with a blocking merge_state_status
+        # (BEHIND/DIRTY/BLOCKED) are also skipped — real GitHub refuses these even
+        # with auto-merge queued.
+        _auto_blocking = sim_pr.merge_state_status
         if (
             sim_pr.auto_merge_enabled
-            and sim_pr.checks_passed
+            and self._required_checks_passed(sim_pr)
             and not sim_pr.merged
             and sim_pr.state != PR_CLOSED
+            and not sim_pr.is_draft
+            and sim_pr.mergeable.upper() != "CONFLICTING"
+            and _auto_blocking not in {"BEHIND", "DIRTY", "BLOCKED"}
         ):
             sim_pr.state = PR_MERGED
             sim_pr.merged_at = self._sim.now_iso()
-        checks_ok = sim_pr.checks_passed
+        checks_ok = self._required_checks_passed(sim_pr)
         # mergeStateStatus: an explicit override (BEHIND/UNSTABLE/DIRTY/UNKNOWN)
         # wins; a draft PR with no override reports DRAFT (as real GitHub does);
         # otherwise the happy binary derived from CI.
@@ -452,6 +459,13 @@ class FakeGitHub:
         if check.conclusion is not None:
             node["conclusion"] = check.conclusion
         return node
+
+    @staticmethod
+    def _required_checks_passed(sim_pr: SimPR) -> bool:
+        """True iff all required checks have passed; falls back to checks_passed when no explicit list."""
+        if sim_pr.checks is None:
+            return sim_pr.checks_passed
+        return all(_check_bucket(c) == "pass" for c in sim_pr.checks if c.required)
 
     async def pr_comment(
         self, pr: int | str, body: str, *, repo: str | None = None
@@ -572,10 +586,10 @@ class FakeGitHub:
             raise GitHubError(
                 f"PR {pr} is not mergeable: merge state is {blocking_state or sim_pr.mergeable}"
             )
-        if auto and not sim_pr.checks_passed:
+        if auto and not self._required_checks_passed(sim_pr):
             # Queue auto-merge; GitHub merges later when checks go green.
             sim_pr.auto_merge_enabled = True
-        elif not sim_pr.checks_passed:
+        elif not self._required_checks_passed(sim_pr):
             raise GitHubError(f"PR {pr} cannot be merged: required status checks have not passed")
         else:
             sim_pr.state = PR_MERGED
