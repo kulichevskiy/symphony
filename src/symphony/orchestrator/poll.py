@@ -11868,7 +11868,9 @@ class Orchestrator:
             await self._post_local_review_pr_summary(
                 binding=binding,
                 pr_url=pr_url,
-                reviewer_agent=binding.resolved_reviewer_agent(),
+                reviewer_agent=binding.resolved_role(
+                    "review_find", self.config.roles
+                ).agent,
                 result=local_review_result,
             )
         return run_id
@@ -12452,8 +12454,18 @@ class Orchestrator:
                     )
                     base_branch = "main"
 
-            reviewer_agent = binding.resolved_reviewer_agent()
-            reviewer_codex_model = binding.resolved_reviewer_codex_model()
+            # Resolve the reviewer from the roles matrix (review_find), falling
+            # back through resolved_role to the legacy reviewer defaults when no
+            # `roles:` block is set. The legacy resolved_reviewer_agent() ignores
+            # the matrix, so a `roles: review_find/verify` block was silently
+            # dead config and the reviewer always defaulted to codex.
+            review_find_role = binding.resolved_role("review_find", self.config.roles)
+            reviewer_agent = review_find_role.agent
+            reviewer_codex_model = (
+                review_find_role.model
+                if reviewer_agent == "codex" and review_find_role.model
+                else binding.resolved_reviewer_codex_model()
+            )
             last_message_dir = (
                 self.config.log_root / "local_review" / parent_run_id
             )
