@@ -127,6 +127,10 @@ class Sim:
         # Keyed by (repo, branch) to avoid cross-repo collisions when two
         # repos share the same branch name.
         self.branch_head_shas: dict[tuple[str, str], str] = {}
+        # Pids the Sim has declared dead (a worker that died at host crash).
+        # The reconcile path consults pid_alive() instead of os.kill so the
+        # Sim — not a magic dead-PID convention — owns process liveness.
+        self._dead_pids: set[int] = set()
         self._pr_counter = itertools.count(1)
         self._comment_counter = itertools.count(1)
         self.linear = _LinearView(self)
@@ -167,6 +171,15 @@ class Sim:
 
     def state_type_for_id(self, team_key: str, state_id: str) -> str | None:
         return self.state_types.get(team_key, {}).get(state_id)
+
+    # --- process liveness (the reconcile pid_alive seam) ---
+
+    def kill_process(self, pid: int) -> None:
+        """Declare a pid dead, modelling a worker lost when the host crashed."""
+        self._dead_pids.add(pid)
+
+    def pid_alive(self, pid: int) -> bool:
+        return pid not in self._dead_pids
 
     def next_pr_number(self) -> int:
         return next(self._pr_counter)

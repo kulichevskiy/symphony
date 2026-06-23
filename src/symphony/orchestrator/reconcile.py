@@ -296,8 +296,13 @@ async def reconcile(
     bindings: Sequence[RepoBinding] | None = None,
     *,
     clock: Callable[[], datetime] | None = None,
+    pid_alive: Callable[[int], bool] = _process_alive,
 ) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
+
+    `pid_alive` is the process-liveness probe (default: `os.kill(pid, 0)`).
+    Tests inject a Sim-owned probe so liveness is deterministic rather than
+    relying on a magic dead-PID convention.
 
     Returns the number of rows flipped.
     """
@@ -307,7 +312,7 @@ async def reconcile(
     flipped = 0
     now = (clock() if clock is not None else datetime.now(UTC)).isoformat()  # noqa: clock
     for run in rows:
-        if run.pid is None or _process_alive(run.pid):
+        if run.pid is None or pid_alive(run.pid):
             continue
         log.info(
             "reconcile: run=%s issue=%s pid=%s is dead — marking interrupted",

@@ -115,6 +115,49 @@ def _states_from_binding(binding: RepoBinding) -> tuple[dict[str, str], dict[str
     return states, types
 
 
+def _build_runtime(
+    config: Config,
+    conn: aiosqlite.Connection,
+    sim: Sim,
+    clock: ManualClock,
+) -> tuple[FakeLinear, FakeGitHub, FakeRunner, Orchestrator]:
+    """Construct the fakes + a fresh Orchestrator over the given Sim/clock/conn.
+
+    Shared by `create()` and `restart()` so a restart rebuilds the exact same
+    wiring on the reopened connection.
+    """
+    linear = FakeLinear(sim)
+    github = FakeGitHub(sim)
+    runner = FakeRunner()
+
+    async def _push_fn(workspace_path: Path, branch: str) -> None:
+        await _sim_aware_push(
+            workspace_path, branch, sim,
+            repo=github._workspace_repos.get(workspace_path),
+            commit_timestamps=github._commit_timestamps,
+        )
+
+    async def _force_push_fn(workspace_path: Path, branch: str) -> None:
+        await _sim_aware_push(
+            workspace_path, branch, sim,
+            repo=github._workspace_repos.get(workspace_path),
+            force=True,
+            commit_timestamps=github._commit_timestamps,
+        )
+
+    orch = Orchestrator(
+        config,
+        linear,
+        conn,
+        runner=runner,
+        gh=github,  # type: ignore[arg-type]
+        clock=clock,
+        push_fn=_push_fn,
+        force_push_fn=_force_push_fn,
+    )
+    return linear, github, runner, orch
+
+
 def _default_config(tmp_path: Path) -> Config:
     return Config(
         workspace_root=tmp_path / "workspaces",
@@ -145,6 +188,7 @@ class Harness:
         github: FakeGitHub,
         runner: FakeRunner,
         orch: Orchestrator,
+        db_path: Path,
     ) -> None:
         self.config = config
         self.conn = conn
@@ -154,6 +198,7 @@ class Harness:
         self.github = github
         self.runner = runner
         self.orch = orch
+        self._db_path = db_path
 
     @classmethod
     async def create(
@@ -171,36 +216,9 @@ class Harness:
             states, types = _states_from_binding(binding)
             sim.seed_team(binding.linear_team_key, states, types)
 
-        conn = await db.connect(tmp_path / "symphony.sqlite")
-        linear = FakeLinear(sim)
-        github = FakeGitHub(sim)
-        runner = FakeRunner()
-
-        async def _push_fn(workspace_path: Path, branch: str) -> None:
-            await _sim_aware_push(
-                workspace_path, branch, sim,
-                repo=github._workspace_repos.get(workspace_path),
-                commit_timestamps=github._commit_timestamps,
-            )
-
-        async def _force_push_fn(workspace_path: Path, branch: str) -> None:
-            await _sim_aware_push(
-                workspace_path, branch, sim,
-                repo=github._workspace_repos.get(workspace_path),
-                force=True,
-                commit_timestamps=github._commit_timestamps,
-            )
-
-        orch = Orchestrator(
-            config,
-            linear,
-            conn,
-            runner=runner,
-            gh=github,  # type: ignore[arg-type]
-            clock=clock,
-            push_fn=_push_fn,
-            force_push_fn=_force_push_fn,
-        )
+        db_path = tmp_path / "symphony.sqlite"
+        conn = await db.connect(db_path)
+        linear, github, runner, orch = _build_runtime(config, conn, sim, clock)
         return cls(
             config=config,
             conn=conn,
@@ -210,6 +228,7 @@ class Harness:
             github=github,
             runner=runner,
             orch=orch,
+            db_path=db_path,
         )
 
     def advance(self, secs: float) -> None:
@@ -217,7 +236,13 @@ class Harness:
 
     async def warmup(self) -> None:
         """Steppable startup work: cache states + run startup reconciles."""
-        await reconcile(self.conn, self.linear, bindings=self.config.repos, clock=self.clock)
+        await reconcile(
+            self.conn,
+            self.linear,
+            bindings=self.config.repos,
+            clock=self.clock,
+            pid_alive=self.sim.pid_alive,
+        )
         await self.orch.warmup()
         await self.orch._restore_operator_waits()  # noqa: SLF001
         await self.orch._reconcile_orphaned_merge_runs(reason="startup")  # noqa: SLF001
@@ -242,6 +267,23 @@ class Harness:
     async def _drain(self) -> None:
         await self.orch.drain_reconcile_event_tasks()
         await self.orch.drain_dispatch_tasks()
+
+    async def restart(self) -> None:
+        """Model a host restart: shut the orchestrator down, **close + reopen**
+        the DB on the same temp file (a fresh connection — not the live one, so
+        WAL checkpoint / dropped caches / uncommitted-write rollback are
+        modelled), then build a fresh Orchestrator on the same Sim + clock and
+        run startup warmup/reconcile."""
+        await self.orch.shutdown()
+        await self.orch.drain_reconcile_event_tasks(cancel=True)
+        await self.orch.drain_dispatch_tasks(cancel=True)
+        await self.conn.close()
+
+        self.conn = await db.connect(self._db_path)
+        self.linear, self.github, self.runner, self.orch = _build_runtime(
+            self.config, self.conn, self.sim, self.clock
+        )
+        await self.warmup()
 
     async def assert_consistent(self) -> None:
         await assert_consistent(self.sim, self.conn)
