@@ -30,7 +30,7 @@ from symphony.github.client import (
 from symphony.linear.client import LinearError
 from symphony.tracker import Blocker, Comment, Issue
 
-from .sim import PR_CLOSED, PR_MERGED, Sim, SimComment, SimPR
+from .sim import PR_CLOSED, PR_MERGED, Sim, SimCheck, SimComment, SimPR
 
 
 def _to_issue(issue: object) -> Issue:
@@ -48,6 +48,24 @@ def _to_issue(issue: object) -> Issue:
         blocked_by=list(issue.blocked_by),  # type: ignore[attr-defined]
         updated_at=issue.updated_at,  # type: ignore[attr-defined]
     )
+
+
+def _check_state(check: SimCheck) -> str:
+    """The `gh pr checks` state string for a `SimCheck`."""
+    if check.status != "COMPLETED":
+        return check.status
+    return check.conclusion or "PENDING"
+
+
+def _check_bucket(check: SimCheck) -> str:
+    """The `gh pr checks` bucket (pass|fail|pending) for a `SimCheck`."""
+    if check.status != "COMPLETED":
+        return "pending"
+    if check.conclusion == "SUCCESS":
+        return "pass"
+    if check.conclusion is None:
+        return "pending"
+    return "fail"
 
 
 def _to_comment(comment: SimComment) -> Comment:
@@ -364,7 +382,15 @@ class FakeGitHub:
             sim_pr.state = PR_MERGED
             sim_pr.merged_at = self._sim.now_iso()
         checks_ok = sim_pr.checks_passed
-        merge_state = "CLEAN" if checks_ok else "BLOCKED"
+        # mergeStateStatus: an explicit override (BEHIND/UNSTABLE/DIRTY/UNKNOWN)
+        # wins; a draft PR with no override reports DRAFT (as real GitHub does);
+        # otherwise the happy binary derived from CI.
+        if sim_pr.merge_state_status is not None:
+            merge_state = sim_pr.merge_state_status
+        elif sim_pr.is_draft:
+            merge_state = "DRAFT"
+        else:
+            merge_state = "CLEAN" if checks_ok else "BLOCKED"
         view: dict[str, Any] = {
             "number": sim_pr.number,
             "title": sim_pr.title,
@@ -373,37 +399,59 @@ class FakeGitHub:
             "headRefName": sim_pr.head,
             "headRefOid": sim_pr.head_sha,
             "baseRefName": sim_pr.base,
-            "mergeable": "MERGEABLE",
+            "mergeable": sim_pr.mergeable,
             "mergeStateStatus": merge_state,
-            "isDraft": False,
+            "isDraft": sim_pr.is_draft,
             "mergedAt": sim_pr.merged_at,
         }
         if include_status_checks:
-            if checks_ok:
-                check_node: dict[str, Any] = {
+            view["statusCheckRollup"] = {"nodes": self._rollup_nodes(sim_pr)}
+        return view
+
+    @staticmethod
+    def _rollup_nodes(sim_pr: SimPR) -> list[dict[str, Any]]:
+        """The `statusCheckRollup` CheckRun nodes for *sim_pr*.
+
+        When `sim_pr.checks` is set the scenario controls the rollup explicitly
+        (multiple checks, required-vs-optional, in-flight); otherwise fall back
+        to the single synthetic "ci" check the fake has always modelled off
+        `checks_passed`/`auto_merge_enabled`.
+        """
+        if sim_pr.checks is not None:
+            return [FakeGitHub._check_node(c) for c in sim_pr.checks]
+        if sim_pr.checks_passed:
+            return [
+                {
                     "__typename": "CheckRun",
                     "name": "ci",
                     "status": "COMPLETED",
                     "conclusion": "SUCCESS",
                 }
-            elif sim_pr.auto_merge_enabled:
-                # Checks are pending (queued for auto-merge but not yet green);
-                # IN_PROGRESS is neither a failure nor a success so the
-                # orchestrator correctly treats the rollup as still pending.
-                check_node = {
-                    "__typename": "CheckRun",
-                    "name": "ci",
-                    "status": "IN_PROGRESS",
-                }
-            else:
-                check_node = {
-                    "__typename": "CheckRun",
-                    "name": "ci",
-                    "status": "COMPLETED",
-                    "conclusion": "FAILURE",
-                }
-            view["statusCheckRollup"] = {"nodes": [check_node]}
-        return view
+            ]
+        if sim_pr.auto_merge_enabled:
+            # Checks are pending (queued for auto-merge but not yet green);
+            # IN_PROGRESS is neither a failure nor a success so the
+            # orchestrator correctly treats the rollup as still pending.
+            return [{"__typename": "CheckRun", "name": "ci", "status": "IN_PROGRESS"}]
+        return [
+            {
+                "__typename": "CheckRun",
+                "name": "ci",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+            }
+        ]
+
+    @staticmethod
+    def _check_node(check: SimCheck) -> dict[str, Any]:
+        node: dict[str, Any] = {
+            "__typename": "CheckRun",
+            "name": check.name,
+            "status": check.status,
+        }
+        if check.conclusion is not None:
+            node["conclusion"] = check.conclusion
+        return node
 
     async def pr_comment(
         self, pr: int | str, body: str, *, repo: str | None = None
@@ -423,6 +471,22 @@ class FakeGitHub:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
             raise GitHubError(f"no such PR: {pr}")
+        if sim_pr.checks is not None:
+            # Mirror `gh pr checks --required`: only the required checks gate the
+            # merge, so the rollup's optional checks are filtered out here. This
+            # is the seam `get_required_contexts` reads to tell required from
+            # optional rollup failures.
+            return PRChecks(
+                runs=[
+                    CheckRun(
+                        name=c.name,
+                        state=_check_state(c),
+                        bucket=_check_bucket(c),
+                    )
+                    for c in sim_pr.checks
+                    if c.required
+                ]
+            )
         if sim_pr.checks_passed:
             # Empty runs have identical gate semantics to an all-green required-check
             # list (PRChecks.all_passed is True for empty runs). This models the
@@ -488,6 +552,26 @@ class FakeGitHub:
             raise GitHubError(f"no such PR: {pr}")
         if sim_pr.state == PR_CLOSED:
             raise GitHubError(f"PR {pr} is already closed")
+        # Real `gh pr merge` refuses a PR that GitHub does not consider
+        # mergeable: a draft, a conflicting/dirty tree, a behind-base branch
+        # (when "require up to date" protection is on), or any BLOCKED state.
+        # Auto-merge can still be *queued* against a not-yet-green PR, but not
+        # against a structurally un-mergeable one.
+        blocking_state = (
+            sim_pr.merge_state_status
+            if sim_pr.merge_state_status is not None
+            else ("DRAFT" if sim_pr.is_draft else None)
+        )
+        if sim_pr.is_draft:
+            raise GitHubError(f"PR {pr} is not mergeable: pull request is in draft state")
+        if sim_pr.mergeable.upper() == "CONFLICTING" or blocking_state in {
+            "DIRTY",
+            "BEHIND",
+            "BLOCKED",
+        }:
+            raise GitHubError(
+                f"PR {pr} is not mergeable: merge state is {blocking_state or sim_pr.mergeable}"
+            )
         if auto and not sim_pr.checks_passed:
             # Queue auto-merge; GitHub merges later when checks go green.
             sim_pr.auto_merge_enabled = True

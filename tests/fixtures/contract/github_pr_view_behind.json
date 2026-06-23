@@ -1,0 +1,21 @@
+{
+  "number": 4822,
+  "title": "Behind base branch",
+  "state": "OPEN",
+  "url": "https://github.com/acme/widgets/pull/4822",
+  "headRefName": "symphony/sym-43",
+  "headRefOid": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b",
+  "baseRefName": "main",
+  "mergeable": "MERGEABLE",
+  "mergeStateStatus": "BEHIND",
+  "isDraft": false,
+  "mergedAt": null,
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "ci",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    }
+  ]
+}

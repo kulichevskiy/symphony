@@ -1,0 +1,21 @@
+{
+  "number": 4824,
+  "title": "Dirty: merge conflict",
+  "state": "OPEN",
+  "url": "https://github.com/acme/widgets/pull/4824",
+  "headRefName": "symphony/sym-45",
+  "headRefOid": "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d",
+  "baseRefName": "main",
+  "mergeable": "CONFLICTING",
+  "mergeStateStatus": "DIRTY",
+  "isDraft": false,
+  "mergedAt": null,
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "ci",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    }
+  ]
+}

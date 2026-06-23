@@ -1,0 +1,21 @@
+{
+  "number": 4825,
+  "title": "Unknown: mergeability not yet computed",
+  "state": "OPEN",
+  "url": "https://github.com/acme/widgets/pull/4825",
+  "headRefName": "symphony/sym-46",
+  "headRefOid": "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e",
+  "baseRefName": "main",
+  "mergeable": "UNKNOWN",
+  "mergeStateStatus": "UNKNOWN",
+  "isDraft": false,
+  "mergedAt": null,
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "ci",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS"
+    }
+  ]
+}

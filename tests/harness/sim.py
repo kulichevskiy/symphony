@@ -57,6 +57,21 @@ class SimComment:
 
 
 @dataclass
+class SimCheck:
+    """One status check on a PR head, mirroring a `gh pr view` CheckRun node.
+
+    `required` flags whether branch protection gates merge on this check. It is
+    surfaced through `pr_checks` (which mirrors `gh pr checks --required`), not
+    the rollup — the rollup carries every check, required or not.
+    """
+
+    name: str
+    status: str = "COMPLETED"  # QUEUED | IN_PROGRESS | COMPLETED
+    conclusion: str | None = "SUCCESS"  # SUCCESS | FAILURE | None (in-flight)
+    required: bool = False
+
+
+@dataclass
 class SimPR:
     repo: str
     number: int
@@ -70,6 +85,17 @@ class SimPR:
     checks_passed: bool = True
     auto_merge_enabled: bool = False
     merged_at: str | None = None
+    # Real `gh pr view` edge states the merge gate must classify. Defaults keep
+    # the happy binary (CLEAN/BLOCKED derived from `checks_passed`); scenarios
+    # set these to model BEHIND / UNSTABLE / DIRTY / UNKNOWN / draft PRs.
+    mergeable: str = "MERGEABLE"  # MERGEABLE | CONFLICTING | UNKNOWN
+    # Explicit `mergeStateStatus` override. None → derive CLEAN/BLOCKED from
+    # `checks_passed` (or DRAFT when `is_draft`).
+    merge_state_status: str | None = None
+    is_draft: bool = False
+    # Explicit status-check list. None → the single synthetic "ci" check the
+    # fake has always modelled off `checks_passed`/`auto_merge_enabled`.
+    checks: list[SimCheck] | None = None
 
     @property
     def merged(self) -> bool:
