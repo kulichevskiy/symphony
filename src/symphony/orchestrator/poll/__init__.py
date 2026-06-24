@@ -57,14 +57,12 @@ from ...agent.prompt import (
     review_comment_fix_prompt,
     review_fix_prompt,
 )
-from ...agent.runner import Runner, RunnerSpec
+from ...agent.runner import RunnerSpec
 from ...agent.runners.acceptance import quick_skip_trivial_acceptance, run_acceptance
-from ...agent.runners.local import LocalRunner
 from ...config import Config, RepoBinding
 from ...github.branch_protection import get_required_contexts
 from ...github.client import CheckRun as GitHubCheckRun
 from ...github.client import (
-    GitHub,
     GitHubClient,
     GitHubError,
     PRChecks,
@@ -153,83 +151,197 @@ from ...pipeline.taste_guide import load_taste_guide
 from ...pipeline.verify import VerifyResult, run_verify_session
 from ...tokens import effective_tokens
 from ...tracker import (
-    DEFAULT_PROVIDER,
-    DEFAULT_SITE,
-    IssueTracker,
-    StateCacheKey,
-    TrackerContext,
-    TrackerRegistry,
-    context_for_binding,
-)
-from ...tracker import (
     Comment as LinearComment,
 )
 from ...tracker import (
     Issue as LinearIssue,
 )
-from ...workspace import Workspace
-from ..reconciler import Reconciler
+from ...tracker import (
+    TrackerContext,
+)
+
+# SYM-144: state + foundation methods live on `_OrchestratorBase`. The foundation
+# binding/tracker free helpers, the two state dataclasses, and the `PushFn` /
+# `BindingKey` aliases moved to `_base` too; re-exported here by explicit name so
+# `poll.<name>` keeps resolving for the Orchestrator, `cli`, and tests.
+from ._base import (
+    BindingKey as BindingKey,
+)
+from ._base import (
+    PushFn as PushFn,
+)
+from ._base import (
+    _ImplementHandoff as _ImplementHandoff,
+)
+from ._base import (
+    _OrchestratorBase as _OrchestratorBase,
+)
+from ._base import (
+    _PendingDelivery as _PendingDelivery,
+)
+from ._base import (
+    _register_configured_trackers as _register_configured_trackers,
+)
+from ._base import (
+    _state_cache_key as _state_cache_key,
+)
+from ._base import (
+    _tracker_context_for_binding as _tracker_context_for_binding,
+)
+
 # SYM-143: free functions moved to `_git` / `_helpers`; re-exported here by
 # explicit name (redundant aliases mark them as intentional re-exports) so the
 # Orchestrator, `cli`, and tests keep resolving `poll.<name>` unchanged.
 from ._git import (
     _branch_ahead_of_base as _branch_ahead_of_base,
+)
+from ._git import (
     _default_force_push as _default_force_push,
+)
+from ._git import (
     _default_push as _default_push,
+)
+from ._git import (
     _git_abort_rebase as _git_abort_rebase,
+)
+from ._git import (
     _git_add_and_continue_rebase as _git_add_and_continue_rebase,
+)
+from ._git import (
     _git_conflicted_files as _git_conflicted_files,
+)
+from ._git import (
     _git_fetch as _git_fetch,
+)
+from ._git import (
     _git_fetch_branch as _git_fetch_branch,
+)
+from ._git import (
     _git_rebase as _git_rebase,
+)
+from ._git import (
     _git_status_short as _git_status_short,
+)
+from ._git import (
     _sync_workspace_to_remote as _sync_workspace_to_remote,
+)
+from ._git import (
     _workspace_commits_ahead as _workspace_commits_ahead,
+)
+from ._git import (
     _workspace_diff_size as _workspace_diff_size,
+)
+from ._git import (
     _workspace_dirty_files as _workspace_dirty_files,
+)
+from ._git import (
     _workspace_head_sha as _workspace_head_sha,
+)
+from ._git import (
     _workspace_ref_is_ancestor as _workspace_ref_is_ancestor,
+)
+from ._git import (
     _workspace_ref_landed_in_base as _workspace_ref_landed_in_base,
+)
+from ._git import (
     _workspace_ref_sha as _workspace_ref_sha,
+)
+from ._git import (
     _workspace_scrub as _workspace_scrub,
 )
 from ._helpers import (
     _acceptance_degrade_note as _acceptance_degrade_note,
+)
+from ._helpers import (
     _acceptance_has_where_to_verify as _acceptance_has_where_to_verify,
+)
+from ._helpers import (
     _github_commit_url as _github_commit_url,
+)
+from ._helpers import (
     _no_signal_head_check_state as _no_signal_head_check_state,
+)
+from ._helpers import (
     _normalize_acceptance_section_heading as _normalize_acceptance_section_heading,
+)
+from ._helpers import (
     _parse_optional_datetime as _parse_optional_datetime,
+)
+from ._helpers import (
     _parse_rfc3339 as _parse_rfc3339,
+)
+from ._helpers import (
     _pr_base_ref_from_view as _pr_base_ref_from_view,
+)
+from ._helpers import (
     _pr_url_for_state as _pr_url_for_state,
+)
+from ._helpers import (
     _pr_view_has_merge_conflict as _pr_view_has_merge_conflict,
+)
+from ._helpers import (
     _pr_view_is_clean_mergeable as _pr_view_is_clean_mergeable,
+)
+from ._helpers import (
     _pr_view_is_closed as _pr_view_is_closed,
+)
+from ._helpers import (
     _pr_view_is_merged as _pr_view_is_merged,
+)
+from ._helpers import (
     _pr_view_skips_required_check_fix as _pr_view_skips_required_check_fix,
+)
+from ._helpers import (
     _required_check_detail as _required_check_detail,
+)
+from ._helpers import (
     _required_check_trigger_signature as _required_check_trigger_signature,
+)
+from ._helpers import (
     _status_check_failed as _status_check_failed,
+)
+from ._helpers import (
     _status_check_identity as _status_check_identity,
+)
+from ._helpers import (
     _status_check_names as _status_check_names,
+)
+from ._helpers import (
     _status_check_run_id as _status_check_run_id,
+)
+from ._helpers import (
     _status_check_sha as _status_check_sha,
+)
+from ._helpers import (
     _status_check_succeeded as _status_check_succeeded,
+)
+from ._helpers import (
     _status_rollup_nodes as _status_rollup_nodes,
+)
+from ._helpers import (
     _sum_usage as _sum_usage,
+)
+from ._helpers import (
     build_fix_runner_command as build_fix_runner_command,
+)
+from ._helpers import (
     build_merge_runner_command as build_merge_runner_command,
+)
+from ._helpers import (
     build_pr_body as build_pr_body,
+)
+from ._helpers import (
     build_pr_title as build_pr_title,
+)
+from ._helpers import (
     build_runner_command as build_runner_command,
+)
+from ._helpers import (
     pr_number_from_url as pr_number_from_url,
 )
 
 log = logging.getLogger(__name__)
 
-PushFn = Callable[[Path, str], Awaitable[None]]
-BindingKey = tuple[str, str, str, str, str]
 CI_FETCH_FAILURE_LIMIT = 5
 REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
@@ -479,45 +591,6 @@ class WebhookDispatchResult:
     detail: str = ""
 
 
-@dataclass(frozen=True)
-class _ImplementHandoff:
-    """Context carried from a blocked-run `$retry` to the fresh implement run."""
-
-    blocked_reason: str
-    operator_comment: str
-
-
-@dataclass(frozen=True)
-class _PendingDelivery:
-    """Inputs needed to (re)run the post-completion delivery path.
-
-    The completion gate has already passed, so the agent's work is final. A
-    delivery-step failure (push / `ensure_pr` / review handoff) parks a
-    ``deliver_failed`` operator wait keyed by ``run_id`` and stashes this
-    context so a `$retry` can resume delivery on the existing branch without
-    re-dispatching the agent or re-running the completion gate.
-    """
-
-    binding: RepoBinding
-    issue: LinearIssue
-    storage_issue_id: str
-    run_id: str
-    workspace_path: Path
-    branch: str
-    cumulative_usage: UsageDelta
-    local_review_result: LoopResult | None
-    # True when a deliver_failed `$retry` reacquired this workspace. Retry
-    # contexts must prove the branch still carries work before pushing because
-    # the original workspace was already released and may have been swept.
-    retry_workspace_acquired: bool = False
-    # True when rebuilt by `_resolve_pending_delivery` after a daemon restart
-    # lost the in-memory stash. The workspace was re-acquired (possibly
-    # re-cloned) and the live local-review verdict is gone, so the resume
-    # path treats the gate as already-passed and skips degenerate audit
-    # artifacts (e.g. an "iterations: 0" PR summary).
-    reconstructed: bool = False
-
-
 class _TerminationKwargs(TypedDict):
     kind: str
     detail: str
@@ -610,30 +683,6 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
 
 def _binding_storage_key(binding: RepoBinding) -> str:
     return json.dumps(_binding_key(binding), separators=(",", ":"))
-
-
-def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
-    return context_for_binding(binding)
-
-
-def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
-    return (binding.tracker_provider, binding.tracker_site, binding.linear_team_key)
-
-
-def _register_configured_trackers(
-    registry: TrackerRegistry,
-    config: Config,
-    tracker: IssueTracker,
-) -> None:
-    registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
-    for binding in config.repos:
-        ctx = _tracker_context_for_binding(binding)
-        registry.register(
-            ctx.provider,
-            ctx.site,
-            tracker,
-            project_key=ctx.project_key,
-        )
 
 
 def _binding_label_from_storage_key(binding_key: str) -> str | None:
@@ -1002,293 +1051,8 @@ def _unknown_head_ci_scope(checks: PRChecks) -> str:
     return f"unknown-head-{digest}"
 
 
-class Orchestrator:
+class Orchestrator(_OrchestratorBase):
     """Owns the poll loop. Dedupe is a SQLite query over the `runs` table."""
-
-    def __init__(
-        self,
-        config: Config,
-        tracker_or_registry: IssueTracker | TrackerRegistry,
-        conn: aiosqlite.Connection,
-        *,
-        runner: Runner | None = None,
-        gh: GitHubClient | None = None,
-        workspace: Workspace | None = None,
-        push_fn: PushFn | None = None,
-        force_push_fn: PushFn | None = None,
-        clock: Callable[[], datetime] | None = None,
-    ) -> None:
-        self.config = config
-        if isinstance(tracker_or_registry, TrackerRegistry):
-            self._trackers = tracker_or_registry
-        else:
-            self._trackers = TrackerRegistry()
-            _register_configured_trackers(self._trackers, config, tracker_or_registry)
-        self._conn = conn
-        self._shutdown = asyncio.Event()
-        # Operator commands submitted from the web UI. Enqueued by the HTTP
-        # handler, drained by the poll loop so they apply on the loop's turn
-        # (never concurrently with `_tick` on the shared connection). `_wake`
-        # interrupts the inter-tick sleep so a command applies near-instantly.
-        self._wake = asyncio.Event()
-        self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = (
-            asyncio.Queue()
-        )
-        self._gh: GitHubClient = gh if gh is not None else GitHub()
-        self._runner: Runner = runner if runner is not None else LocalRunner()
-        self._workspace: Workspace = (
-            workspace
-            if workspace is not None
-            else Workspace(root=config.workspace_root, clone_fn=self._gh.repo_clone)
-        )
-        self._push_fn: PushFn = push_fn if push_fn is not None else _default_push
-        self._force_push_fn: PushFn = (
-            force_push_fn if force_push_fn is not None else _default_force_push
-        )
-        self._clock = clock
-        # Cache of ((provider, site, team_key) -> {state_name: state_uuid}).
-        # Re-fetched on startup; never mutated at runtime.
-        self._states: dict[StateCacheKey, dict[str, str]] = {}
-        self._dispatch_tasks: set[asyncio.Task[None]] = set()
-        self._scheduled_issue_ids: set[str] = set()
-        self._known_waiting_issue_ids: set[str] = set()
-        self._scheduled_issue_refcounts: dict[str, int] = {}
-        self._scheduled_binding_counts: dict[BindingKey, int] = {}
-        self._schedule_lock = asyncio.Lock()
-        self._comment_event_lock = asyncio.Lock()
-        self._active_run_ids: set[str] = set()
-        self._dispatch_run_ids: dict[str, str] = {}
-        self._operator_wait_run_ids: set[str] = set()
-        self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
-        self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
-        self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
-        # Pending delivery contexts, keyed by run_id. Set when a post-completion
-        # delivery step fails and a `deliver_failed` wait is parked; consumed by
-        # a `$retry` to resume push + `ensure_pr` + handoff on the existing
-        # branch. In-memory only: if the daemon restarts, the `$retry` falls
-        # back to reconstructing the context from the wait + workspace.
-        self._pending_deliveries: dict[str, _PendingDelivery] = {}
-        # Pending blocked-resume handoffs, keyed by storage issue_id. Set when an
-        # operator `$retry`s an IMPLEMENT_BLOCKED wait; consumed by the next
-        # implement dispatch to seed the fresh run's prompt. In-memory only: if
-        # the daemon restarts between the `$retry` and the dispatch, the issue
-        # simply re-runs without the handoff block.
-        self._implement_handoffs: dict[str, _ImplementHandoff] = {}
-        self._review_failed_run_bindings: dict[str, RepoBinding] = {}
-        self._merge_needs_approval_bindings: dict[str, RepoBinding] = {}
-        self._acceptance_rejected_run_bindings: dict[str, RepoBinding] = {}
-        self._budget_exceeded_run_bindings: dict[str, RepoBinding] = {}
-        self._runs_moved_to_in_progress: set[str] = set()
-        self._review_poll_tasks: set[asyncio.Task[None]] = set()
-        self._review_poll_run_ids: set[str] = set()
-        # Maps issue_id → review poll run_id for issues in active review monitoring.
-        # Populated alongside _review_poll_run_ids so skip-review slash commands
-        # can be received even when no fix-run is active.
-        self._review_poll_issue_ids: dict[str, str] = {}
-        # Maps review monitor run_id → its asyncio Task so _handle_skip_review_intent
-        # can cancel the task immediately, preventing mid-iteration fix-run dispatch.
-        self._review_poll_run_tasks: dict[str, asyncio.Task[None]] = {}
-        self._merge_wait_reconcile_issue_ids: set[str] = set()
-        # Resurrected review monitors whose no-signal @codex re-arm hit a
-        # transient GitHub read/write failure and should be retried while live.
-        self._review_rearm_retry_run_ids: set[str] = set()
-        # Live review monitors that already attempted a no-signal @codex
-        # re-arm for the current PR head. Keyed by (run_id, head_sha) so a new
-        # commit naturally allows one fresh ping.
-        self._review_no_signal_rearm_heads: set[tuple[str, str]] = set()
-        self._parked_manual_merge_revival_issue_ids: set[str] = set()
-        self._merged_linear_state_reconcile_ticks = 0
-        self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
-        self._parked_closed_unmerged_comment_keys: set[tuple[str, str, int]] = set()
-        self._parked_closed_unmerged_lock = asyncio.Lock()
-        self._global_dispatch_sem = asyncio.Semaphore(
-            max(config.global_max_concurrent, 1)
-        )
-        self._binding_dispatch_sems: dict[BindingKey, asyncio.Semaphore] = {}
-        # Review fix-runs also reserve normal dispatch capacity so they outrank
-        # new implementation work, while this separate pool still lets us cap
-        # review-fix concurrency independently.
-        self._review_fix_sem = asyncio.Semaphore(
-            max(config.global_max_concurrent, 1)
-        )
-        self._review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore] = {}
-        self._reconciler = Reconciler(
-            config,
-            conn,
-            self._trackers,
-            self._gh,
-            clock=clock,
-        )
-        self._reconcile_task: asyncio.Task[None] | None = None
-        self._merge_wait_reconcile_task: asyncio.Task[None] | None = None
-        self._reconcile_event_tasks: set[asyncio.Task[None]] = set()
-
-    def _now(self) -> datetime:
-        if self._clock is not None:
-            return self._clock()
-        return datetime.now(UTC)  # noqa: clock — sanctioned wall-clock entry point
-
-    def tracker(self, ctx: TrackerContext | RepoBinding | None = None) -> IssueTracker:
-        if isinstance(ctx, RepoBinding):
-            ctx = _tracker_context_for_binding(ctx)
-        return self._trackers.resolve(ctx)
-
-    @property
-    def linear(self) -> IssueTracker:
-        return self.tracker(TrackerContext())
-
-    async def _stored_tracker_identity_for_issue(
-        self, issue_id: str
-    ) -> tuple[str, TrackerContext] | None:
-        cur = await self._conn.execute(
-            "SELECT tracker_issue_id, provider, site, team_key FROM issues WHERE id = ?",
-            (issue_id,),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        provider = str(row["provider"] or "")
-        site = str(row["site"] or "")
-        if not provider or not site:
-            return None
-        tracker_issue_id = str(row["tracker_issue_id"] or issue_id)
-        project_key = str(row["team_key"] or "") if provider == "jira" else ""
-        return tracker_issue_id, TrackerContext(
-            provider=provider,
-            site=site,
-            project_key=project_key,
-        )
-
-    async def _storage_issue_ids_for_tracker_issue(
-        self, issue_id: str, *, provider: str | None = None
-    ) -> list[str]:
-        query = """
-            SELECT id
-              FROM issues
-             WHERE (id = ? OR tracker_issue_id = ?)
-        """
-        params: list[str] = [issue_id, issue_id]
-        if provider is not None:
-            query += " AND provider = ?"
-            params.append(provider)
-        query += """
-             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, id
-        """
-        params.append(issue_id)
-        cur = await self._conn.execute(query, params)
-        rows = await cur.fetchall()
-        return [str(row["id"]) for row in rows]
-
-    async def _storage_issue_id_for_tracker_issue(
-        self, issue_id: str, tracker_ctx: TrackerContext
-    ) -> str:
-        cur = await self._conn.execute(
-            """
-            SELECT id
-              FROM issues
-             WHERE provider = ?
-               AND site = ?
-               AND (id = ? OR tracker_issue_id = ?)
-             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
-             LIMIT 1
-            """,
-            (
-                tracker_ctx.provider,
-                tracker_ctx.site,
-                issue_id,
-                issue_id,
-                issue_id,
-            ),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return issue_id
-        return str(row["id"])
-
-    async def _stored_tracker_context_for_issue(
-        self, issue_id: str, *, provider: str | None = None
-    ) -> TrackerContext | None:
-        if provider is None:
-            identity = await self._stored_tracker_identity_for_issue(issue_id)
-            if identity is None:
-                return None
-            return identity[1]
-
-        cur = await self._conn.execute(
-            """
-            SELECT provider, site, team_key
-              FROM issues
-             WHERE provider = ?
-               AND (id = ? OR tracker_issue_id = ?)
-             ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
-             LIMIT 1
-            """,
-            (provider, issue_id, issue_id, issue_id),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            return None
-        row_provider = str(row["provider"] or "")
-        site = str(row["site"] or "")
-        if not row_provider or not site:
-            return None
-        project_key = str(row["team_key"] or "") if row_provider == "jira" else ""
-        return TrackerContext(provider=row_provider, site=site, project_key=project_key)
-
-    async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
-        return await self._stored_tracker_context_for_issue(issue_id) or TrackerContext()
-
-    async def _tracker_identity_for_issue(
-        self, issue_id: str
-    ) -> tuple[str, TrackerContext]:
-        return await self._stored_tracker_identity_for_issue(issue_id) or (
-            issue_id,
-            TrackerContext(),
-        )
-
-    async def _tracker_for_issue_id(self, issue_id: str) -> IssueTracker:
-        return self.tracker(await self._tracker_context_for_issue(issue_id))
-
-    def _configured_tracker_contexts(
-        self, *, provider: str | None = None
-    ) -> list[TrackerContext]:
-        contexts: list[TrackerContext] = []
-        seen: set[TrackerContext] = set()
-        for binding in self.config.repos:
-            if provider is not None and binding.tracker_provider != provider:
-                continue
-            ctx = _tracker_context_for_binding(binding)
-            if ctx in seen:
-                continue
-            seen.add(ctx)
-            contexts.append(ctx)
-        if not contexts:
-            contexts.append(
-                TrackerContext(provider=provider or DEFAULT_PROVIDER, site=DEFAULT_SITE)
-            )
-        return contexts
-
-    async def _lookup_webhook_issue(
-        self, issue_id: str, *, provider: str | None = None
-    ) -> tuple[LinearIssue, TrackerContext]:
-        stored_ctx = await self._stored_tracker_context_for_issue(
-            issue_id, provider=provider
-        )
-        if stored_ctx is not None:
-            return await self.tracker(stored_ctx).lookup_issue(issue_id), stored_ctx
-
-        not_found: LinearError | None = None
-        for ctx in self._configured_tracker_contexts(provider=provider):
-            try:
-                return await self.tracker(ctx).lookup_issue(issue_id), ctx
-            except LinearError as exc:
-                if not str(exc).startswith(f"issue not found: {issue_id}"):
-                    raise
-                not_found = exc
-        if not_found is not None:
-            raise not_found
-        ctx = TrackerContext(provider=provider or DEFAULT_PROVIDER, site=DEFAULT_SITE)
-        return await self.tracker(ctx).lookup_issue(issue_id), ctx
 
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
@@ -1387,23 +1151,6 @@ class Orchestrator:
         if run_id is None or not self._slash_command_run_eligible(run_id):
             return None
         return run_id
-
-    async def _states_for_binding(self, binding: RepoBinding) -> dict[str, str]:
-        state_key = _state_cache_key(binding)
-        states = self._states.get(state_key)
-        if states is None:
-            # Older tests and long-lived in-process callers may have seeded
-            # the pre-refactor team-key cache directly. Normalize it on read.
-            legacy_states = cast(dict[object, dict[str, str]], self._states).get(
-                binding.linear_team_key
-            )
-            if isinstance(legacy_states, dict):
-                states = legacy_states
-                self._states[state_key] = states
-        if states is None:
-            states = await self.tracker(binding).team_states(binding.linear_team_key)
-            self._states[state_key] = states
-        return states
 
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
@@ -3629,45 +3376,6 @@ class Orchestrator:
             wait.run_id,
         )
         return True
-
-    def _binding_for_issue(
-        self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
-    ) -> RepoBinding | None:
-        for binding in self.config.repos:
-            if (
-                tracker_ctx is not None
-                and _tracker_context_for_binding(binding) != tracker_ctx
-            ):
-                continue
-            if binding.linear_team_key != issue.team_key:
-                continue
-            if binding.issue_label and binding.issue_label not in issue.labels:
-                continue
-            return binding
-        return None
-
-    def _binding_for_review(
-        self,
-        issue: LinearIssue,
-        state: db.review_state.ReviewState,
-        tracker_ctx: TrackerContext | None = None,
-    ) -> RepoBinding | None:
-        if state.github_repo:
-            for binding in self.config.repos:
-                if (
-                    tracker_ctx is not None
-                    and _tracker_context_for_binding(binding) != tracker_ctx
-                ):
-                    continue
-                if binding.linear_team_key != issue.team_key:
-                    continue
-                if binding.github_repo != state.github_repo:
-                    continue
-                if (binding.issue_label or "") != state.issue_label:
-                    continue
-                return binding
-            return None
-        return self._binding_for_issue(issue, tracker_ctx=tracker_ctx)
 
     def _schedule_review_poll(
         self, run: db.runs.Run, binding: RepoBinding, issue: LinearIssue
