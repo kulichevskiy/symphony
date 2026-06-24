@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144).
+"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`
@@ -7,11 +7,16 @@ re-exports the whole surface by explicit name so existing imports keep working.
 `_OrchestratorBase` (SYM-144) owns the `__init__`, all in-memory state, and the
 foundation methods (tracker/binding/state-resolve) that every domain calls;
 `Orchestrator` inherits it.
+
+`_DispatchMixin` (SYM-149) owns the dispatch domain (scan/schedule/capacity/
+slot/sem + the park guards); it extends `_OrchestratorBase` and `Orchestrator`
+inherits it.
 """
 
 from symphony.orchestrator import poll
-from symphony.orchestrator.poll import _base, _git, _helpers
+from symphony.orchestrator.poll import _base, _dispatch, _git, _helpers
 from symphony.orchestrator.poll._base import _OrchestratorBase
+from symphony.orchestrator.poll._dispatch import _DispatchMixin
 
 # Git/workspace primitives that must live in `_git.py`.
 _GIT_FUNCS = [
@@ -91,8 +96,8 @@ _BASE_METHODS = [
     "_binding_for_review",
 ]
 
-# Foundation module-level names relocated to `_base.py` (SYM-144), re-exported
-# from `__init__.py` by explicit name so existing imports keep working.
+# Foundation module-level names relocated to `_base.py` (SYM-144, SYM-149),
+# re-exported from `__init__.py` by explicit name so existing imports keep working.
 _BASE_NAMES = [
     "_tracker_context_for_binding",
     "_state_cache_key",
@@ -101,12 +106,56 @@ _BASE_NAMES = [
     "_ImplementHandoff",
     "PushFn",
     "BindingKey",
+    "_binding_key",
+]
+
+# Dispatch-domain methods that must live on `_DispatchMixin` (SYM-149):
+# scan/schedule/capacity/slot/sem logic plus the park guards.
+_DISPATCH_METHODS = [
+    "_scan_binding",
+    "_auto_unblock_waiting",
+    "_dispatch_capacity",
+    "_scheduled_slot_count",
+    "_reserve_scheduled_slot",
+    "_release_scheduled_slot",
+    "_review_fix_dispatch_slot",
+    "_schedule_ready_issue",
+    "_blocking_existing_pr",
+    "_park_already_has_pr",
+    "_park_blocked_by_deps",
+    "_ready_binding_for_issue",
+    "_schedule_dispatch",
+    "_dispatch_with_limits",
+    "_mark_cancelled_dispatch",
+    "_refresh_dispatch_candidate",
+    "_dispatch_task_done",
 ]
 
 
 def test_orchestrator_inherits_base() -> None:
     assert issubclass(poll.Orchestrator, _OrchestratorBase)
     assert poll.Orchestrator is not _OrchestratorBase
+
+
+def test_orchestrator_inherits_dispatch_mixin() -> None:
+    assert issubclass(poll.Orchestrator, _DispatchMixin)
+    assert issubclass(_DispatchMixin, _OrchestratorBase)
+    assert poll.Orchestrator is not _DispatchMixin
+
+
+def test_dispatch_methods_defined_on_mixin() -> None:
+    for name in _DISPATCH_METHODS:
+        member = getattr(poll.Orchestrator, name)
+        owner = (
+            member.fget.__qualname__
+            if isinstance(member, property)
+            else member.__qualname__
+        )
+        assert owner.startswith("_DispatchMixin."), name
+
+
+def test_dispatch_mixin_module() -> None:
+    assert _dispatch.__name__.endswith("poll._dispatch")
 
 
 def test_foundation_methods_defined_on_base() -> None:

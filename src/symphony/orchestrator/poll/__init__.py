@@ -25,13 +25,12 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, TypedDict
 
 import aiosqlite
 import httpx
@@ -70,7 +69,6 @@ from ...github.client import (
 )
 from ...github.webhook import GitHubWebhookEvent
 from ...linear import slash
-from ...linear.blockers import is_blocked, open_blocker_ids
 from ...linear.client import LinearError, comment_from_webhook_payload
 from ...linear.slash import SlashIntent, SlashKind
 from ...linear.templates import (
@@ -88,7 +86,6 @@ from ...linear.templates import (
     fixing_merge_conflict,
     implement_already_satisfied,
     implement_blocked,
-    moved_to_waiting,
     resumed,
     retry_acceptance_requested,
     review_retry_requested,
@@ -171,6 +168,9 @@ from ._base import (
     PushFn as PushFn,
 )
 from ._base import (
+    _binding_key as _binding_key,
+)
+from ._base import (
     _ImplementHandoff as _ImplementHandoff,
 )
 from ._base import (
@@ -187,6 +187,12 @@ from ._base import (
 )
 from ._base import (
     _tracker_context_for_binding as _tracker_context_for_binding,
+)
+
+# SYM-149: the dispatch domain lives on `_DispatchMixin(_OrchestratorBase)`;
+# `Orchestrator` inherits it. Re-exported by explicit name for tests.
+from ._dispatch import (
+    _DispatchMixin as _DispatchMixin,
 )
 
 # SYM-143: free functions moved to `_git` / `_helpers`; re-exported here by
@@ -671,16 +677,6 @@ def _local_review_failure_log(result: LoopResult | None) -> str:
     return "\n\n".join(parts)
 
 
-def _binding_key(binding: RepoBinding) -> BindingKey:
-    return (
-        binding.linear_team_key,
-        binding.github_repo,
-        binding.issue_label or "",
-        binding.tracker_provider,
-        binding.tracker_site,
-    )
-
-
 def _binding_storage_key(binding: RepoBinding) -> str:
     return json.dumps(_binding_key(binding), separators=(",", ":"))
 
@@ -1051,7 +1047,7 @@ def _unknown_head_ci_scope(checks: PRChecks) -> str:
     return f"unknown-head-{digest}"
 
 
-class Orchestrator(_OrchestratorBase):
+class Orchestrator(_DispatchMixin):
     """Owns the poll loop. Dedupe is a SQLite query over the `runs` table."""
 
     async def warmup(self) -> None:
@@ -7392,562 +7388,6 @@ class Orchestrator(_OrchestratorBase):
             ended_at=self._now().isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
-
-    async def _scan_binding(
-        self, binding: RepoBinding
-    ) -> list[asyncio.Task[None]]:
-        scheduled: list[asyncio.Task[None]] = []
-        ready_state = binding.linear_states.ready
-        waiting_state = binding.linear_states.waiting
-        waiting_issues: list[LinearIssue] = []
-        tracker = self.tracker(binding)
-        try:
-            if waiting_state is None:
-                issues = await tracker.issues_in_state(
-                    binding.linear_team_key, ready_state, binding.issue_label
-                )
-            else:
-                ready_result, waiting_result = await asyncio.gather(
-                    tracker.issues_in_state(
-                        binding.linear_team_key, ready_state, binding.issue_label
-                    ),
-                    tracker.issues_in_state(
-                        binding.linear_team_key, waiting_state, binding.issue_label
-                    ),
-                    return_exceptions=True,
-                )
-                scan_failed = False
-                for result in (ready_result, waiting_result):
-                    if isinstance(result, LinearError):
-                        log.warning("scan failed for %s: %s", binding.linear_team_key, result)
-                        scan_failed = True
-                    elif isinstance(result, BaseException):
-                        raise result
-                if scan_failed:
-                    return scheduled
-                issues = cast(list[LinearIssue], ready_result)
-                waiting_issues = cast(list[LinearIssue], waiting_result)
-                self._known_waiting_issue_ids = {issue.id for issue in waiting_issues}
-        except LinearError as e:
-            log.warning("scan failed for %s: %s", binding.linear_team_key, e)
-            return scheduled
-        log.info(
-            "scan %s: %d issue(s) in %s%s",
-            binding.linear_team_key,
-            len(issues),
-            ready_state,
-            f" with label '{binding.issue_label}'" if binding.issue_label else "",
-        )
-        await self._auto_unblock_waiting(binding, waiting_issues)
-        if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
-            log.info(
-                "scan %s: dispatch capacity is zero (global=%d, binding=%d)",
-                binding.linear_team_key,
-                self.config.global_max_concurrent,
-                binding.max_concurrent,
-            )
-            return scheduled
-        capacity = self._dispatch_capacity(binding)
-        if capacity <= 0:
-            log.info("scan %s: dispatch capacity is full", binding.linear_team_key)
-            return scheduled
-        for issue in issues:
-            task = await self._schedule_ready_issue(binding, issue)
-            if task is None:
-                continue
-            scheduled.append(task)
-            if len(scheduled) >= capacity:
-                break
-        return scheduled
-
-    async def _auto_unblock_waiting(
-        self, binding: RepoBinding, waiting_issues: list[LinearIssue]
-    ) -> None:
-        unblocked_issues = [issue for issue in waiting_issues if not is_blocked(issue)]
-        if not unblocked_issues:
-            return
-        try:
-            states = await self._states_for_binding(binding)
-        except LinearError as e:
-            log.warning(
-                "could not load states before auto-unblocking waiting issues for %s: %s",
-                binding.linear_team_key,
-                e,
-            )
-            return
-        ready_id = states.get(binding.linear_states.ready)
-        if ready_id is None:
-            log.warning(
-                "could not auto-unblock waiting issues for %s: missing Linear state %r",
-                binding.linear_team_key,
-                binding.linear_states.ready,
-            )
-            return
-
-        tracker = self.tracker(binding)
-        for issue in unblocked_issues:
-            try:
-                await tracker.move_issue(issue.id, ready_id)
-            except LinearError as e:
-                log.warning("could not auto-unblock %s to Ready: %s", issue.identifier, e)
-                continue
-            log.info("auto-unblocked %s -> Ready", issue.identifier)
-
-    def _dispatch_capacity(self, binding: RepoBinding) -> int:
-        if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
-            return 0
-        binding_key = _binding_key(binding)
-        return max(
-            0,
-            min(
-                self.config.global_max_concurrent - self._scheduled_slot_count(),
-                binding.max_concurrent
-                - self._scheduled_binding_counts.get(binding_key, 0),
-            ),
-        )
-
-    def _scheduled_slot_count(self) -> int:
-        return sum(self._scheduled_issue_refcounts.values())
-
-    def _reserve_scheduled_slot(
-        self, *, issue_id: str, binding_key: BindingKey
-    ) -> None:
-        self._scheduled_issue_refcounts[issue_id] = (
-            self._scheduled_issue_refcounts.get(issue_id, 0) + 1
-        )
-        self._scheduled_issue_ids.add(issue_id)
-        self._scheduled_binding_counts[binding_key] = (
-            self._scheduled_binding_counts.get(binding_key, 0) + 1
-        )
-
-    def _release_scheduled_slot(
-        self, *, issue_id: str, binding_key: BindingKey
-    ) -> None:
-        issue_count = self._scheduled_issue_refcounts.get(issue_id, 0)
-        if issue_count <= 1:
-            self._scheduled_issue_refcounts.pop(issue_id, None)
-            self._scheduled_issue_ids.discard(issue_id)
-        else:
-            self._scheduled_issue_refcounts[issue_id] = issue_count - 1
-        count = self._scheduled_binding_counts.get(binding_key, 0)
-        if count <= 1:
-            self._scheduled_binding_counts.pop(binding_key, None)
-        else:
-            self._scheduled_binding_counts[binding_key] = count - 1
-
-    @asynccontextmanager
-    async def _review_fix_dispatch_slot(
-        self,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        *,
-        dispatch_capacity_held: bool = False,
-    ) -> AsyncIterator[None]:
-        """Reserve priority capacity for a review-fix job.
-
-        Review monitors may run without consuming dispatch slots, but once a
-        monitor finds work that changes code, that work should sit ahead of new
-        implementation jobs in both the global and per-binding queues.
-        """
-        binding_key = _binding_key(binding)
-        binding_sem = self._binding_dispatch_sems.setdefault(
-            binding_key,
-            asyncio.Semaphore(max(binding.max_concurrent, 1)),
-        )
-        review_binding_sem = self._review_fix_binding_sems.setdefault(
-            binding_key,
-            asyncio.Semaphore(max(binding.max_concurrent, 1)),
-        )
-        if dispatch_capacity_held:
-            # The caller already holds normal dispatch capacity. Acquiring
-            # review-fix semaphores here would invert the order used below
-            # and can deadlock against an active review-fix waiting for the
-            # dispatch semaphores.
-            yield
-            return
-
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
-        try:
-            async with self._review_fix_sem, review_binding_sem:
-                async with self._global_dispatch_sem, binding_sem:
-                    yield
-        finally:
-            self._release_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
-
-    async def _schedule_ready_issue(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> asyncio.Task[None] | None:
-        async with self._schedule_lock:
-            if self._dispatch_capacity(binding) <= 0:
-                return None
-            if issue.id in self._scheduled_issue_ids:
-                return None
-            if issue.id in self._dispatch_run_ids:
-                return None
-            if await db.runs.has_running_or_completed(self._conn, issue.id):
-                return None
-            # Resolve the storage issue id (db.issues.upsert may assign a
-            # different id when two tracker sites share the same raw issue id).
-            # Runs are stored under the storage id, so the backoff check must
-            # use it — otherwise the backoff window is invisible to the gate.
-            _storage_id = await self._storage_issue_id_for_tracker_issue(
-                issue.id, _tracker_context_for_binding(binding)
-            )
-            if await self._agent_infra_retry_backoff_active(_storage_id):
-                # A prior run hit a transient API error and is inside
-                # its capped backoff window — re-dispatch once it elapses.
-                return None
-            pr = await db.issue_prs.get(
-                self._conn,
-                issue_id=issue.id,
-                github_repo=binding.github_repo,
-            )
-            if pr is not None:
-                blocking_pr, handled = await self._blocking_existing_pr(
-                    binding, issue, pr
-                )
-                if handled:
-                    return None
-                if blocking_pr is not None:
-                    await self._park_already_has_pr(binding, issue, blocking_pr)
-                    return None
-            if binding.linear_states.waiting is not None and is_blocked(issue):
-                await self._park_blocked_by_deps(binding, issue)
-                return None
-            return self._schedule_dispatch(binding, issue)
-
-    async def _blocking_existing_pr(
-        self,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr: db.issue_prs.IssuePR,
-    ) -> tuple[db.issue_prs.IssuePR | None, bool]:
-        if pr.merged_at is not None:
-            return pr, False
-
-        try:
-            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
-        except GitHubError as e:
-            log.warning(
-                "could not verify existing PR before ready dispatch for %s#%d: %s",
-                binding.github_repo,
-                pr.pr_number,
-                e,
-            )
-            return pr, False
-
-        if _pr_view_is_merged(view):
-            merged_at = str(view.get("mergedAt") or self._now().isoformat())
-            updated = await db.issue_prs.update_merged(
-                self._conn,
-                issue_id=issue.id,
-                github_repo=binding.github_repo,
-                pr_number=pr.pr_number,
-                merged_at=merged_at,
-            )
-            if not updated:
-                log.warning(
-                    "could not mark existing PR row merged before parking %s for %s#%d",
-                    issue.identifier,
-                    binding.github_repo,
-                    pr.pr_number,
-                )
-            return replace(pr, merged_at=merged_at), False
-
-        if _pr_view_is_closed(view):
-            if pr.parked_at is not None and not binding.auto_merge:
-                await self._mark_parked_closed_unmerged_pr_done(
-                    binding=binding,
-                    issue=issue,
-                    pr=pr,
-                )
-                return None, True
-            deleted = await db.issue_prs.delete(
-                self._conn,
-                issue_id=issue.id,
-                github_repo=binding.github_repo,
-                pr_number=pr.pr_number,
-            )
-            if not deleted:
-                log.warning(
-                    "could not delete closed unmerged PR row before ready dispatch "
-                    "for %s#%d",
-                    binding.github_repo,
-                    pr.pr_number,
-                )
-            return None, False
-
-        return pr, False
-
-    async def _park_already_has_pr(
-        self,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr: db.issue_prs.IssuePR,
-    ) -> None:
-        if pr.merged_at is not None:
-            target_state = binding.linear_states.done
-            body = (
-                f"🛑 Cannot re-implement: PR #{pr.pr_number} was already merged at "
-                f"{pr.merged_at}. Moving issue back to {target_state}. To genuinely "
-                "redo this work, revert the merge and remove the `issue_prs` row. "
-                f"{pr.pr_url}"
-            )
-        else:
-            target_state = binding.linear_states.in_progress
-            body = (
-                f"🛑 Cannot re-implement: PR #{pr.pr_number} is still open. Moving "
-                f"issue back to {target_state}. Close the PR via `gh pr close` if "
-                f"you want to abandon it. {pr.pr_url}"
-            )
-
-        try:
-            states = await self._states_for_binding(binding)
-        except LinearError as e:
-            log.warning(
-                "could not load states before parking %s with existing PR #%d: %s",
-                issue.identifier,
-                pr.pr_number,
-                e,
-            )
-            return
-        else:
-            target_id = states.get(target_state)
-            if target_id is None:
-                log.warning(
-                    "could not move %s after existing PR guard: missing Linear "
-                    "state %r for team %s",
-                    issue.identifier,
-                    target_state,
-                    binding.linear_team_key,
-                )
-                return
-            else:
-                tracker = self.tracker(binding)
-                try:
-                    await tracker.move_issue(issue.id, target_id)
-                except LinearError as e:
-                    log.warning(
-                        "could not move %s after existing PR guard for PR #%d: %s",
-                        issue.identifier,
-                        pr.pr_number,
-                        e,
-                    )
-                    return
-
-        try:
-            await self.tracker(binding).post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning(
-                "could not comment after existing PR guard for %s PR #%d: %s",
-                issue.identifier,
-                pr.pr_number,
-                e,
-            )
-
-    async def _park_blocked_by_deps(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> None:
-        blockers = open_blocker_ids(issue)
-        if not blockers:
-            return
-        waiting = binding.linear_states.waiting
-        if waiting is None:
-            return
-        try:
-            states = await self._states_for_binding(binding)
-        except LinearError as e:
-            log.warning(
-                "could not load states before moving %s to waiting for blockers %s: %s",
-                issue.identifier,
-                blockers,
-                e,
-            )
-            return
-
-        waiting_id = states.get(waiting)
-        if waiting_id is None:
-            log.warning(
-                "could not move %s to waiting: missing Linear state %r for team %s",
-                issue.identifier,
-                waiting,
-                binding.linear_team_key,
-            )
-            return
-        ready_id = states.get(binding.linear_states.ready)
-
-        tracker = self.tracker(binding)
-        try:
-            await tracker.move_issue(issue.id, waiting_id)
-        except LinearError as e:
-            log.warning(
-                "could not move %s to waiting for dependency blockers %s: %s",
-                issue.identifier,
-                blockers,
-                e,
-            )
-            return
-
-        body = moved_to_waiting(
-            CommentVars(
-                stage="implement",
-                repo=binding.github_repo,
-                issue=0,
-                next_stage=waiting,
-                linear_identifier=issue.identifier,
-            ),
-            blockers,
-        )
-        try:
-            await tracker.post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning(
-                "could not comment after moving %s to waiting for blockers %s: %s",
-                issue.identifier,
-                blockers,
-                e,
-            )
-            if ready_id is not None:
-                try:
-                    await tracker.move_issue(issue.id, ready_id)
-                except LinearError as rollback_error:
-                    log.warning(
-                        "could not move %s back to ready after waiting comment failed: %s",
-                        issue.identifier,
-                        rollback_error,
-                    )
-            return
-
-        log.info(
-            "moved %s to %s because it is blocked by %s",
-            issue.identifier,
-            waiting,
-            ", ".join(blockers),
-        )
-
-    def _ready_binding_for_issue(
-        self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
-    ) -> RepoBinding | None:
-        issue_labels = set(issue.labels)
-        for binding in self.config.repos:
-            if (
-                tracker_ctx is not None
-                and _tracker_context_for_binding(binding) != tracker_ctx
-            ):
-                continue
-            if binding.linear_team_key != issue.team_key:
-                continue
-            if issue.state_name != binding.linear_states.ready:
-                continue
-            if binding.issue_label and binding.issue_label not in issue_labels:
-                continue
-            return binding
-        return None
-
-    def _schedule_dispatch(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> asyncio.Task[None]:
-        binding_key = _binding_key(binding)
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
-        task = asyncio.create_task(self._dispatch_with_limits(binding, issue))
-        self._dispatch_tasks.add(task)
-        task.add_done_callback(
-            partial(
-                self._dispatch_task_done,
-                issue_id=issue.id,
-                binding_key=binding_key,
-            )
-        )
-        return task
-
-    async def _dispatch_with_limits(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> None:
-        key = _binding_key(binding)
-        binding_sem = self._binding_dispatch_sems.setdefault(
-            key,
-            asyncio.Semaphore(max(binding.max_concurrent, 1)),
-        )
-        try:
-            async with self._global_dispatch_sem:
-                async with binding_sem:
-                    current = await self._refresh_dispatch_candidate(binding, issue)
-                    if current is None:
-                        return
-                    await self._dispatch_one(binding, current)
-        except asyncio.CancelledError:
-            await self._mark_cancelled_dispatch(issue, binding)
-            raise
-        finally:
-            run_id = self._dispatch_run_ids.get(issue.id)
-            if run_id is not None:
-                if run_id not in self._operator_wait_run_ids:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._runs_moved_to_in_progress.discard(run_id)
-
-    async def _mark_cancelled_dispatch(
-        self, issue: LinearIssue, binding: RepoBinding | None = None
-    ) -> None:
-        run_id = self._dispatch_run_ids.get(issue.id)
-        if run_id is None:
-            return
-        log.info("dispatch cancelled for %s [run_id=%s]", issue.identifier, run_id)
-        if run_id in self._runs_moved_to_in_progress:
-            await self._fail_run_and_reset_issue(
-                run_id,
-                "dispatch cancelled",
-                issue=issue,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-            )
-        else:
-            await self._fail_run(run_id, "dispatch cancelled")
-
-    async def _refresh_dispatch_candidate(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> LinearIssue | None:
-        tracker = self.tracker(binding)
-        try:
-            current = await tracker.lookup_issue(issue.id)
-        except LinearError as e:
-            log.warning("could not revalidate %s before dispatch: %s", issue.identifier, e)
-            return None
-        if current.team_key != binding.linear_team_key:
-            log.info(
-                "skipping %s: team changed from %s to %s before dispatch",
-                issue.identifier,
-                binding.linear_team_key,
-                current.team_key,
-            )
-            return None
-        if current.state_name != binding.linear_states.ready:
-            log.info(
-                "skipping %s: state changed from %s to %s before dispatch",
-                issue.identifier,
-                binding.linear_states.ready,
-                current.state_name,
-            )
-            return None
-        if binding.issue_label and binding.issue_label not in current.labels:
-            log.info(
-                "skipping %s: label %r removed before dispatch",
-                issue.identifier,
-                binding.issue_label,
-            )
-            return None
-        return current
-
-    def _dispatch_task_done(
-        self, task: asyncio.Task[None], issue_id: str, binding_key: BindingKey
-    ) -> None:
-        self._dispatch_tasks.discard(task)
-        self._release_scheduled_slot(issue_id=issue_id, binding_key=binding_key)
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            log.exception("dispatch task crashed for issue_id=%s", issue_id)
 
     def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None:
         stored_label = _binding_label_from_storage_key(candidate.binding_key)
