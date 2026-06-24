@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146, SYM-147, SYM-148).
+"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146, SYM-147, SYM-148, SYM-150).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`
@@ -30,6 +30,9 @@ comment/upload/track/schedule helpers) plus the acceptance-only free helpers;
 it extends `_OrchestratorBase` and `Orchestrator` inherits it. The acceptance-
 slash handlers live on `_SlashCommandsMixin` and `_refresh_issue_for_acceptance_
 merge_handoff` on `_MergeMixin` — they are inherited, not duplicated.
+
+`_LifecycleMixin` (SYM-150) owns the run lifecycle domain
+(implement/deliver/verify/local_review/publish); `Orchestrator` inherits it.
 """
 
 from symphony.orchestrator import poll
@@ -39,6 +42,7 @@ from symphony.orchestrator.poll import (
     _dispatch,
     _git,
     _helpers,
+    _lifecycle,
     _merge,
     _review,
     _slash_commands,
@@ -46,6 +50,7 @@ from symphony.orchestrator.poll import (
 from symphony.orchestrator.poll._acceptance import _AcceptanceMixin
 from symphony.orchestrator.poll._base import _OrchestratorBase
 from symphony.orchestrator.poll._dispatch import _DispatchMixin
+from symphony.orchestrator.poll._lifecycle import _LifecycleMixin
 from symphony.orchestrator.poll._merge import _MergeMixin
 from symphony.orchestrator.poll._review import _ReviewMixin
 from symphony.orchestrator.poll._slash_commands import _SlashCommandsMixin
@@ -343,6 +348,32 @@ _ACCEPTANCE_NAMES = [
 ]
 
 
+# Run-lifecycle domain methods that must live on `_LifecycleMixin` (SYM-150):
+# implement / deliver / verify / local_review / publish.
+_LIFECYCLE_METHODS = [
+    "_dispatch_one",
+    "_previous_implement_terminal_kind",
+    "_resolve_base_branch",
+    "_run_implement_phase",
+    "_run_prepush_gates",
+    "_publish_stage",
+    "_delivery_handoff_started",
+    "_deliver_implement_run",
+    "_deliver_review_handoff",
+    "_run_local_review_phase",
+    "_finalize_local_review_run",
+    "_record_local_review_model_usage",
+    "_post_local_review_pr_summary",
+    "_post_local_review_starting_comment",
+    "_post_local_review_iteration_comment",
+    "_post_local_review_comment",
+    "_block_local_only_review_infra_failure",
+    "_run_verify_phase",
+    "_finalize_verify_run",
+    "_block_verify_failure",
+]
+
+
 def test_orchestrator_inherits_base() -> None:
     assert issubclass(poll.Orchestrator, _OrchestratorBase)
     assert poll.Orchestrator is not _OrchestratorBase
@@ -446,6 +477,22 @@ def test_review_methods_defined_on_mixin() -> None:
 
 def test_review_mixin_module() -> None:
     assert _review.__name__.endswith("poll._review")
+
+
+def test_orchestrator_inherits_lifecycle_mixin() -> None:
+    assert issubclass(poll.Orchestrator, _LifecycleMixin)
+    assert issubclass(_LifecycleMixin, _OrchestratorBase)
+    assert poll.Orchestrator is not _LifecycleMixin
+
+
+def test_lifecycle_methods_defined_on_mixin() -> None:
+    for name in _LIFECYCLE_METHODS:
+        member = getattr(poll.Orchestrator, name)
+        assert member.__qualname__.startswith("_LifecycleMixin."), name
+
+
+def test_lifecycle_mixin_module() -> None:
+    assert _lifecycle.__name__.endswith("poll._lifecycle")
 
 
 def test_foundation_methods_defined_on_base() -> None:

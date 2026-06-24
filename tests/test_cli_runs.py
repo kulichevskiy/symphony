@@ -73,8 +73,13 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
         return f"sha-{_fake_head_sha.calls}"  # type: ignore[attr-defined]
 
     _fake_head_sha.calls = 0  # type: ignore[attr-defined]
+    # SYM-150: the implement completion gate reads `_workspace_head_sha` from
+    # `poll._lifecycle`; other stages still read it from `poll`. Patch both.
     monkeypatch.setattr(
         "symphony.orchestrator.poll._workspace_head_sha", _fake_head_sha
+    )
+    monkeypatch.setattr(
+        "symphony.orchestrator.poll._lifecycle._workspace_head_sha", _fake_head_sha
     )
 
 
