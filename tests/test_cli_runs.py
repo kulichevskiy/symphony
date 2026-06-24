@@ -52,16 +52,18 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     fake_gh.repo_default_branch = AsyncMock(return_value="main")
     fake_runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
 
+    # SYM-144: the Orchestrator constructor lives on `_OrchestratorBase` in
+    # `poll._base`, so these defaults resolve in that module's namespace.
     monkeypatch.setattr(
-        "symphony.orchestrator.poll.LocalRunner", lambda: fake_runner
+        "symphony.orchestrator.poll._base.LocalRunner", lambda: fake_runner
     )
-    monkeypatch.setattr("symphony.orchestrator.poll.GitHub", lambda: fake_gh)
+    monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", lambda: fake_gh)
     monkeypatch.setattr(
-        "symphony.orchestrator.poll.Workspace",
+        "symphony.orchestrator.poll._base.Workspace",
         lambda root, clone_fn: fake_workspace,
     )
     monkeypatch.setattr(
-        "symphony.orchestrator.poll._default_push", AsyncMock()
+        "symphony.orchestrator.poll._base._default_push", AsyncMock()
     )
     # The workspace is a fake path (no git repo), so simulate the agent
     # advancing HEAD so the Implement completion gate sees commits and
