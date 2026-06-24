@@ -103,6 +103,16 @@ def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
     return (binding.tracker_provider, binding.tracker_site, binding.linear_team_key)
 
 
+def _binding_key(binding: RepoBinding) -> BindingKey:
+    return (
+        binding.linear_team_key,
+        binding.github_repo,
+        binding.issue_label or "",
+        binding.tracker_provider,
+        binding.tracker_site,
+    )
+
+
 def _register_configured_trackers(
     registry: TrackerRegistry,
     config: Config,
