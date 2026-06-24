@@ -1242,7 +1242,7 @@ function refLink(rel, line, label) {
 //  MODULE CATALOGUE
 // ============================================================
 const MODULES = {
-  "orchestrator/poll.py": {
+  "orchestrator/poll/__init__.py": {
     role: "Главный event-loop. Сюда стекаются все стадии: discovery, dispatch, review-poll, merge-poll, slash-команды, acceptance. ~9400 строк.",
     entrypoints: [
       ["_tick", 1280, "Один такт poll-цикла: merge → review → resurrect → scan → slash."],
@@ -1500,8 +1500,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 1280, fn: "_tick", desc: "Главный такт. Порядок: merge → review → resurrect → scan binding → slash."},
-          {file: "src/symphony/orchestrator/poll.py", line: 5352, fn: "_scan_binding", desc: "Загружает issues в ready (+waiting, если задано)."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1280, fn: "_tick", desc: "Главный такт. Порядок: merge → review → resurrect → scan binding → slash."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 5352, fn: "_scan_binding", desc: "Загружает issues в ready (+waiting, если задано)."},
         ],
         db: [
           {table: "runs", op: "select", row: {note: "has_running_or_completed(issue_id) ⇒ false"}},
@@ -1522,8 +1522,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 5531, fn: "_schedule_ready_issue", desc: "Capacity + дедуп + existing-PR check."},
-          {file: "src/symphony/orchestrator/poll.py", line: 5450, fn: "_dispatch_capacity", desc: "Считает свободные слоты по global_max_concurrent и binding.max_concurrent."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 5531, fn: "_schedule_ready_issue", desc: "Capacity + дедуп + existing-PR check."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 5450, fn: "_dispatch_capacity", desc: "Считает свободные слоты по global_max_concurrent и binding.max_concurrent."},
         ],
         db: [
           {table: "issue_prs", op: "select", row: {note: "по (issue_id, github_repo) ⇒ nothing"}},
@@ -1546,9 +1546,9 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 7410, fn: "_dispatch_one", desc: "Implement стадия от записи в БД до запуска агента."},
-          {file: "src/symphony/orchestrator/poll.py", line: 7491, fn: "starting comment", desc: "Использует шаблон run_started из linear/templates.py."},
-          {file: "src/symphony/orchestrator/poll.py", line: 7513, fn: "move_issue → In Progress", desc: "Linear API call."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7410, fn: "_dispatch_one", desc: "Implement стадия от записи в БД до запуска агента."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7491, fn: "starting comment", desc: "Использует шаблон run_started из linear/templates.py."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7513, fn: "move_issue → In Progress", desc: "Linear API call."},
         ],
         db: [
           {table: "issues", op: "insert", row: {id: "iss-001", identifier: "SYM-42", title: "Add foo", team_key: "SYM"}},
@@ -1570,8 +1570,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 8769, fn: "_run_agent", desc: "Spawn codex subprocess, stream JSONL, аккумулирует cost."},
-          {file: "src/symphony/orchestrator/poll.py", line: 8624, fn: "_record_activity_stdout", desc: "Парсит stream-json, копит активность для Linear-комментариев."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8769, fn: "_run_agent", desc: "Spawn codex subprocess, stream JSONL, аккумулирует cost."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8624, fn: "_record_activity_stdout", desc: "Парсит stream-json, копит активность для Linear-комментариев."},
           {file: "src/symphony/workspace.py", line: 1, fn: "Workspace", desc: "Управление per-issue git клонами."},
         ],
         db: [
@@ -1594,7 +1594,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push, ловит ошибки."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push, ловит ошибки."},
           {file: "src/symphony/pipeline/local_review_loop.py", line: 1, fn: "run_local_review_loop", desc: "Цикл codex review/fix до сходимости."},
           {file: "src/symphony/pipeline/local_review.py", line: 1, fn: "Local review session", desc: "Сессионная обёртка над codex CLI."},
         ],
@@ -1616,8 +1616,8 @@ const SCENARIOS = [
         </details>`,
         refs: [
           {file: "src/symphony/pipeline/state_machine.py", line: 27, fn: "on_runner_event", desc: "Pure transition: exit=0 → completed, иначе failed."},
-          {file: "src/symphony/orchestrator/poll.py", line: 716, fn: "_default_push", desc: "git push origin <branch>."},
-          {file: "src/symphony/orchestrator/poll.py", line: 311, fn: "build_pr_title", desc: "PR title из issue.identifier + title."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 716, fn: "_default_push", desc: "git push origin <branch>."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 311, fn: "build_pr_title", desc: "PR title из issue.identifier + title."},
         ],
         db: [
           {table: "runs", op: "update", row: {id: "run-impl-1", status: "completed", ended_at: "…", cost_usd: 0.42}},
@@ -1638,8 +1638,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 8469, fn: "_start_review_stage", desc: "Открывает review monitor и review_state."},
-          {file: "src/symphony/orchestrator/poll.py", line: 8544, fn: "_move_issue_to_review_state", desc: "Linear move."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8469, fn: "_start_review_stage", desc: "Открывает review monitor и review_state."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8544, fn: "_move_issue_to_review_state", desc: "Linear move."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-review-1", issue_id: "iss-001", stage: "review", status: "running"}},
@@ -1661,8 +1661,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 2663, fn: "_poll_review_runs", desc: "Главный review tick."},
-          {file: "src/symphony/orchestrator/poll.py", line: 2997, fn: "_poll_review_run", desc: "Один PR: fetch + classifier + (опц.) dispatch fix-run."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 2663, fn: "_poll_review_runs", desc: "Главный review tick."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 2997, fn: "_poll_review_run", desc: "Один PR: fetch + classifier + (опц.) dispatch fix-run."},
           {file: "src/symphony/pipeline/review_classifier.py", line: 178, fn: "review_classifier", desc: "9 правил в порядке приоритета."},
           {file: "src/symphony/pipeline/review_classifier.py", line: 49, fn: "CODEX_NO_ISSUES_MARKER", desc: '"any major issues" в Codex COMMENTED → approval.'},
         ],
@@ -1683,9 +1683,9 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6027, fn: "_poll_merge_candidates", desc: "Approved + mergeable → merge dispatch."},
-          {file: "src/symphony/orchestrator/poll.py", line: 7725, fn: "_merge_approved_pr", desc: "Создаёт merge run, синхронизирует workspace, запускает merge agent."},
-          {file: "src/symphony/orchestrator/poll.py", line: 8831, fn: "_run_merge_agent", desc: "Spawn merge codex."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6027, fn: "_poll_merge_candidates", desc: "Approved + mergeable → merge dispatch."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7725, fn: "_merge_approved_pr", desc: "Создаёт merge run, синхронизирует workspace, запускает merge agent."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8831, fn: "_run_merge_agent", desc: "Spawn merge codex."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-merge-1", issue_id: "iss-001", stage: "merge", status: "running"}},
@@ -1708,8 +1708,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 7989, fn: "_mark_merge_done", desc: "Завершает merge run; запускает acceptance handoff."},
-          {file: "src/symphony/orchestrator/poll.py", line: 6483, fn: "_run_acceptance_stage", desc: "Claude SDK с acceptance prompt."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7989, fn: "_mark_merge_done", desc: "Завершает merge run; запускает acceptance handoff."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6483, fn: "_run_acceptance_stage", desc: "Claude SDK с acceptance prompt."},
           {file: "src/symphony/pipeline/acceptance_classifier.py", line: 198, fn: "extract_acceptance_criteria", desc: "Парсит ### Acceptance Criteria / Checklist из description."},
         ],
         db: [
@@ -1737,7 +1737,7 @@ const SCENARIOS = [
         refs: [
           {file: "src/symphony/pipeline/acceptance_classifier.py", line: 125, fn: "acceptance_classifier", desc: "Парсит транскрипт, ищет footer, классифицирует."},
           {file: "src/symphony/pipeline/acceptance_classifier.py", line: 18, fn: "ACCEPTANCE_FOOTER_PASS", desc: "HTML-комментарий-маркер pass."},
-          {file: "src/symphony/orchestrator/poll.py", line: 6387, fn: "_post_acceptance_verdict_comment", desc: "Постит verdict в Linear."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6387, fn: "_post_acceptance_verdict_comment", desc: "Постит verdict в Linear."},
         ],
         db: [
           {table: "acceptance_state", op: "update", row: {issue_id: "iss-001", last_verdict: "pass"}},
@@ -1766,7 +1766,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8146, fn: "_run_local_review_phase", desc: "Запускает local review до push."},
         ],
         db: [],
       },
@@ -1784,7 +1784,7 @@ const SCENARIOS = [
         </details>`,
         refs: [
           {file: "src/symphony/pipeline/local_review_loop.py", line: 1, fn: "run_local_review_loop", desc: "Цикл review/fix iterations с cap."},
-          {file: "src/symphony/orchestrator/poll.py", line: 8411, fn: "_post_local_review_iteration_comment", desc: "Iteration update в Linear."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8411, fn: "_post_local_review_iteration_comment", desc: "Iteration update в Linear."},
         ],
         db: [],
       },
@@ -1800,8 +1800,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 322, fn: "_local_review_status_from_result", desc: "Mapping LoopResult → string status для Linear комментария."},
-          {file: "src/symphony/orchestrator/poll.py", line: 8312, fn: "_finalize_local_review_run", desc: "Финализирует local review run, постит summary."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 322, fn: "_local_review_status_from_result", desc: "Mapping LoopResult → string status для Linear комментария."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8312, fn: "_finalize_local_review_run", desc: "Финализирует local review run, постит summary."},
         ],
         db: [],
       },
@@ -1818,8 +1818,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 8389, fn: "_post_local_review_starting_comment", desc: "Анонс начала local review в Linear."},
-          {file: "src/symphony/orchestrator/poll.py", line: 339, fn: "_should_post_codex_review", desc: "Логика когда нужно явно запросить @codex review."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8389, fn: "_post_local_review_starting_comment", desc: "Анонс начала local review в Linear."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 339, fn: "_should_post_codex_review", desc: "Логика когда нужно явно запросить @codex review."},
         ],
         db: [
           {table: "issue_prs", op: "insert", row: {issue_id: "iss-002", pr_number: 124, merged_at: null}},
@@ -1884,7 +1884,7 @@ const SCENARIOS = [
         refs: [
           {file: "src/symphony/pipeline/review_classifier.py", line: 407, fn: "has_hit_iteration_cap", desc: "Кап 12 итераций."},
           {file: "src/symphony/pipeline/review_classifier.py", line: 53, fn: "DEFAULT_REVIEW_ITERATION_CAP", desc: "= 12 (PRD §pipeline)."},
-          {file: "src/symphony/orchestrator/poll.py", line: 5307, fn: "_park_review_for_approval", desc: "При cap → парковка."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 5307, fn: "_park_review_for_approval", desc: "При cap → парковка."},
         ],
         db: [],
       },
@@ -1902,9 +1902,9 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 3307, fn: "_dispatch_ci_fix_run", desc: "Codex fix-run по упавшему CI."},
-          {file: "src/symphony/orchestrator/poll.py", line: 4632, fn: "_failing_check_log_tail", desc: "Берёт хвост лога check'а для контекста codex."},
-          {file: "src/symphony/orchestrator/poll.py", line: 401, fn: "build_fix_runner_command", desc: "Прoмпт-команда для fix codex."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 3307, fn: "_dispatch_ci_fix_run", desc: "Codex fix-run по упавшему CI."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 4632, fn: "_failing_check_log_tail", desc: "Берёт хвост лога check'а для контекста codex."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 401, fn: "build_fix_runner_command", desc: "Прoмпт-команда для fix codex."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-rfix-1", stage: "review_fix", status: "running"}},
@@ -1923,7 +1923,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 4594, fn: "_validate_review_fix_advanced", desc: "Проверка что HEAD реально двинулся после fix."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 4594, fn: "_validate_review_fix_advanced", desc: "Проверка что HEAD реально двинулся после fix."},
         ],
         db: [
           {table: "runs", op: "update", row: {id: "run-rfix-1", status: "completed"}},
@@ -1984,10 +1984,10 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 3976, fn: "_dispatch_merge_conflict_rebase_fix_run", desc: "Авто rebase-fix."},
-          {file: "src/symphony/orchestrator/poll.py", line: 836, fn: "_git_rebase", desc: "git rebase wrapper."},
-          {file: "src/symphony/orchestrator/poll.py", line: 896, fn: "_git_add_and_continue_rebase", desc: "После resolve — continue."},
-          {file: "src/symphony/orchestrator/poll.py", line: 735, fn: "_default_force_push", desc: "git push --force-with-lease."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 3976, fn: "_dispatch_merge_conflict_rebase_fix_run", desc: "Авто rebase-fix."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 836, fn: "_git_rebase", desc: "git rebase wrapper."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 896, fn: "_git_add_and_continue_rebase", desc: "После resolve — continue."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 735, fn: "_default_force_push", desc: "git push --force-with-lease."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-rebase-1", stage: "review_fix", status: "running"}},
@@ -2005,7 +2005,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 3958, fn: "_mark_merge_conflict_fix_needs_approval", desc: "Вставляет marker в merge_conflict_fix_marks."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 3958, fn: "_mark_merge_conflict_fix_needs_approval", desc: "Вставляет marker в merge_conflict_fix_marks."},
           {file: "src/symphony/db/schema.sql", line: 62, fn: "merge_conflict_fix_marks", desc: "Маркер выживает рестарт."},
         ],
         db: [
@@ -2025,7 +2025,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 3495, fn: "_interrupt_stale_merge_needs_approval_for_state", desc: "Чистит stale waits для issue."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 3495, fn: "_interrupt_stale_merge_needs_approval_for_state", desc: "Чистит stale waits для issue."},
         ],
         db: [
           {table: "operator_waits", op: "delete", row: {issue_id: "iss-004", note: "если был старый merge wait"}},
@@ -2043,7 +2043,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6196, fn: "clear_conflict_fix_marker", desc: "Очистка marker после merge."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6196, fn: "clear_conflict_fix_marker", desc: "Очистка marker после merge."},
         ],
         db: [
           {table: "merge_conflict_fix_marks", op: "delete", row: {issue_id: "iss-004"}},
@@ -2072,7 +2072,7 @@ const SCENARIOS = [
         </details>`,
         refs: [
           {file: "src/symphony/pipeline/cost_guard.py", line: 1, fn: "cost_guard", desc: "Cap enforcement per-issue/per-binding."},
-          {file: "src/symphony/orchestrator/poll.py", line: 9047, fn: "_run_runner", desc: "Стримит stdout, аккумулирует cost, проверяет cap."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 9047, fn: "_run_runner", desc: "Стримит stdout, аккумулирует cost, проверяет cap."},
         ],
         db: [],
       },
@@ -2088,7 +2088,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 9130, fn: "_post_cost_warning", desc: "Постит warning один раз на issue."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 9130, fn: "_post_cost_warning", desc: "Постит warning один раз на issue."},
           {file: "src/symphony/db/schema.sql", line: 152, fn: "issue_cost_marks", desc: "Идемпотентность warning."},
         ],
         db: [
@@ -2108,7 +2108,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 9161, fn: "_handle_cap_breach", desc: "Парковка после превышения cap."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 9161, fn: "_handle_cap_breach", desc: "Парковка после превышения cap."},
           {file: "src/symphony/db/schema.sql", line: 178, fn: "operator_waits", desc: "kind COST_CAP сохраняется в БД."},
         ],
         db: [
@@ -2131,8 +2131,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 1445, fn: "_poll_slash_commands", desc: "Главный poll slash-команд."},
-          {file: "src/symphony/orchestrator/poll.py", line: 1548, fn: "_handle_slash_intent", desc: "Маршрутизатор: kind wait определяет хендлер."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1445, fn: "_poll_slash_commands", desc: "Главный poll slash-команд."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1548, fn: "_handle_slash_intent", desc: "Маршрутизатор: kind wait определяет хендлер."},
           {file: "src/symphony/linear/slash.py", line: 82, fn: "parse", desc: "Pure: list[LinearComment] → list[SlashIntent]."},
         ],
         db: [
@@ -2152,8 +2152,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 1883, fn: "_handle_cost_cap_slash_intent", desc: "Resume после $approve, или clear после $reject."},
-          {file: "src/symphony/orchestrator/poll.py", line: 2399, fn: "_clear_operator_wait", desc: "Удаляет operator_waits."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1883, fn: "_handle_cost_cap_slash_intent", desc: "Resume после $approve, или clear после $reject."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 2399, fn: "_clear_operator_wait", desc: "Удаляет operator_waits."},
         ],
         db: [
           {table: "operator_waits", op: "delete", row: {issue_id: "iss-005"}},
@@ -2197,7 +2197,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 1940, fn: "_track_implement_failed_wait", desc: "Парковка после implement fail."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1940, fn: "_track_implement_failed_wait", desc: "Парковка после implement fail."},
         ],
         db: [
           {table: "operator_waits", op: "insert", row: {issue_id: "iss-006", run_id: "run-impl-6", kind: "IMPLEMENT_FAILED"}},
@@ -2215,7 +2215,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 1957, fn: "_handle_implement_failed_slash_intent", desc: "Retry/reject для implement fail."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1957, fn: "_handle_implement_failed_slash_intent", desc: "Retry/reject для implement fail."},
         ],
         db: [
           {table: "operator_waits", op: "delete", row: {issue_id: "iss-006"}},
@@ -2244,8 +2244,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6027, fn: "_poll_merge_candidates", desc: "Merge dispatch loop."},
-          {file: "src/symphony/orchestrator/poll.py", line: 510, fn: "_needs_human_approval_label_present", desc: "Проверка лейбла на issue."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6027, fn: "_poll_merge_candidates", desc: "Merge dispatch loop."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 510, fn: "_needs_human_approval_label_present", desc: "Проверка лейбла на issue."},
         ],
         db: [],
       },
@@ -2262,8 +2262,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6010, fn: "_open_merge_wait_for_human_approval_label", desc: "Создаёт merge wait без запуска merge."},
-          {file: "src/symphony/orchestrator/poll.py", line: 8048, fn: "_mark_merge_needs_approval", desc: "create_run=True вставляет новый runs row."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6010, fn: "_open_merge_wait_for_human_approval_label", desc: "Создаёт merge wait без запуска merge."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 8048, fn: "_mark_merge_needs_approval", desc: "create_run=True вставляет новый runs row."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-merge-7", stage: "merge", status: "running"}},
@@ -2283,7 +2283,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 4782, fn: "_handle_merge_needs_approval_slash_intent", desc: "$approve/$retry на merge wait."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 4782, fn: "_handle_merge_needs_approval_slash_intent", desc: "$approve/$retry на merge wait."},
         ],
         db: [
           {table: "operator_waits", op: "delete", row: {issue_id: "iss-007"}},
@@ -2310,7 +2310,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 2663, fn: "_poll_review_runs", desc: "Review monitor loop."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 2663, fn: "_poll_review_runs", desc: "Review monitor loop."},
         ],
         db: [],
       },
@@ -2325,8 +2325,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 4980, fn: "_handle_skip_review_intent", desc: "Закрывает review monitor + merge dispatch."},
-          {file: "src/symphony/orchestrator/poll.py", line: 1801, fn: "_stop_review_monitor", desc: "Стопит monitor, ставит wait для recovery."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 4980, fn: "_handle_skip_review_intent", desc: "Закрывает review monitor + merge dispatch."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 1801, fn: "_stop_review_monitor", desc: "Стопит monitor, ставит wait для recovery."},
         ],
         db: [
           {table: "runs", op: "update", row: {id: "run-review-8", status: "completed", note: "stopped by $skip-review"}},
@@ -2345,8 +2345,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 7725, fn: "_merge_approved_pr", desc: "Параметр skip_review меняет dedup поведение."},
-          {file: "src/symphony/orchestrator/poll.py", line: 7745, fn: "ignored_stages", desc: "skip_review=True ⇒ игнорировать review_fix в дедуп проверке."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7725, fn: "_merge_approved_pr", desc: "Параметр skip_review меняет dedup поведение."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7745, fn: "ignored_stages", desc: "skip_review=True ⇒ игнорировать review_fix в дедуп проверке."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-merge-8", stage: "merge", status: "running"}},
@@ -2374,8 +2374,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6483, fn: "_run_acceptance_stage", desc: "Claude SDK acceptance stage."},
-          {file: "src/symphony/orchestrator/poll.py", line: 6366, fn: "_acceptance_pr_diff", desc: "Готовит diff для контекста."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6483, fn: "_run_acceptance_stage", desc: "Claude SDK acceptance stage."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6366, fn: "_acceptance_pr_diff", desc: "Готовит diff для контекста."},
         ],
         db: [
           {table: "acceptance_state", op: "update", row: {issue_id: "iss-009", extracted_criteria: '["foo must validate", "bar must log"]'}},
@@ -2415,8 +2415,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6858, fn: "_dispatch_acceptance_fix_run", desc: "Acceptance fix-run по reject verdict."},
-          {file: "src/symphony/orchestrator/poll.py", line: 51, fn: "ACCEPTANCE_FIX_PROMPT", desc: "Шаблон промпта для acceptance fix."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6858, fn: "_dispatch_acceptance_fix_run", desc: "Acceptance fix-run по reject verdict."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 51, fn: "ACCEPTANCE_FIX_PROMPT", desc: "Шаблон промпта для acceptance fix."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-afix-1", stage: "acceptance_fix", status: "running"}},
@@ -2436,7 +2436,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 7989, fn: "_mark_merge_done", desc: "Финальный success для (merged+accepted) issue."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 7989, fn: "_mark_merge_done", desc: "Финальный success для (merged+accepted) issue."},
         ],
         db: [
           {table: "runs", op: "insert", row: {id: "run-acc-2", stage: "acceptance", status: "running"}},
@@ -2498,7 +2498,7 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 6251, fn: "_acceptance_infra_retry_backoff_active", desc: "Backoff после infra_error."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 6251, fn: "_acceptance_infra_retry_backoff_active", desc: "Backoff после infra_error."},
           {file: "src/symphony/db/schema.sql", line: 138, fn: "acceptance_state.infra_retries", desc: "Счётчик infra-ошибок отдельный от обычных iterations."},
         ],
         db: [
@@ -2518,8 +2518,8 @@ const SCENARIOS = [
           </ul>
         </details>`,
         refs: [
-          {file: "src/symphony/orchestrator/poll.py", line: 2185, fn: "_track_acceptance_blocked_wait", desc: "ACCEPTANCE_BLOCKED wait."},
-          {file: "src/symphony/orchestrator/poll.py", line: 2269, fn: "_handle_acceptance_blocked_slash_intent", desc: "$retry-acceptance / $skip-acceptance handler."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 2185, fn: "_track_acceptance_blocked_wait", desc: "ACCEPTANCE_BLOCKED wait."},
+          {file: "src/symphony/orchestrator/poll/__init__.py", line: 2269, fn: "_handle_acceptance_blocked_slash_intent", desc: "$retry-acceptance / $skip-acceptance handler."},
         ],
         db: [
           {table: "operator_waits", op: "insert", row: {issue_id: "iss-010", kind: "ACCEPTANCE_BLOCKED"}},
@@ -2914,7 +2914,7 @@ function showNodeDrawer(nodeId) {
       <p>Для попадания в Ready: оператор переводит issue вручную или ставит лейбл <code>symphony</code> и переводит. Дополнительно может действовать <code>issue_label</code> фильтр в binding.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 5352, "_scan_binding", "Загружает issues_in_state(ready) и issues_in_state(waiting).")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 5352, "_scan_binding", "Загружает issues_in_state(ready) и issues_in_state(waiting).")}
         ${refRow("src/symphony/linear/queries.py", 1, "issues_in_state", "GraphQL запрос к Linear.")}
         ${refRow("src/symphony/config.py", 1, "RepoBinding", "ready_state, waiting_state, in_progress, etc.")}
       </ul>`,
@@ -2925,8 +2925,8 @@ function showNodeDrawer(nodeId) {
       <p>После успешного завершения — push + <code>gh pr create</code> и переход в <code>PR opened</code>.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 7410, "_dispatch_one", "Главная функция implement-стадии.")}
-        ${refRow("src/symphony/orchestrator/poll.py", 8769, "_run_agent", "Spawn codex subprocess, парсит stream-json.")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 7410, "_dispatch_one", "Главная функция implement-стадии.")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 8769, "_run_agent", "Spawn codex subprocess, парсит stream-json.")}
         ${refRow("src/symphony/agent/prompt.py", 1, "implement prompt template", "")}
         ${refRow("src/symphony/pipeline/cost_guard.py", 1, "cost_guard", "Cap enforcement.")}
       </ul>`,
@@ -2936,7 +2936,7 @@ function showNodeDrawer(nodeId) {
       body: `<p>Sub-стадия Implement. Codex запускается в режиме reviewer ДО открытия PR, итеративно review/fix внутри workspace. Не блокирует поток — даже при ошибке PR открывается, и remote @codex-review подхватит.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 8146, "_run_local_review_phase", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 8146, "_run_local_review_phase", "")}
         ${refRow("src/symphony/pipeline/local_review_loop.py", 1, "loop", "")}
         ${refRow("src/symphony/pipeline/local_review.py", 1, "session", "")}
         ${refRow("docs/local-review-flow.md", 1, "design doc", "")}
@@ -2951,8 +2951,8 @@ function showNodeDrawer(nodeId) {
       body: `<p>На каждом такте <code>_poll_review_run</code>: fetch checks/reviews/comments, classifier по 9 правилам, либо ничего (PENDING), либо fix-run dispatch (CHANGES_REQUESTED), либо merge dispatch (APPROVED).</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 2663, "_poll_review_runs", "")}
-        ${refRow("src/symphony/orchestrator/poll.py", 2997, "_poll_review_run", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 2663, "_poll_review_runs", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 2997, "_poll_review_run", "")}
         ${refRow("src/symphony/pipeline/review_classifier.py", 178, "review_classifier", "9 priority rules")}
       </ul>`,
     },
@@ -2961,9 +2961,9 @@ function showNodeDrawer(nodeId) {
       body: `<p>Codex с fix-prompt. Получает контекст: что не так (failing check log tail, codex comment body, или conflict info). Iteration cap = 12.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 3307, "_dispatch_ci_fix_run", "по упавшему CI")}
-        ${refRow("src/symphony/orchestrator/poll.py", 3705, "_dispatch_review_comment_fix_run", "по комментариям review")}
-        ${refRow("src/symphony/orchestrator/poll.py", 3976, "_dispatch_merge_conflict_rebase_fix_run", "по конфликту")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 3307, "_dispatch_ci_fix_run", "по упавшему CI")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 3705, "_dispatch_review_comment_fix_run", "по комментариям review")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 3976, "_dispatch_merge_conflict_rebase_fix_run", "по конфликту")}
       </ul>`,
     },
     merge: {
@@ -2971,9 +2971,9 @@ function showNodeDrawer(nodeId) {
       body: `<p>Codex с merge-prompt. Делает финальную проверку, <code>gh pr merge</code>. После успеха — acceptance handoff.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 7725, "_merge_approved_pr", "")}
-        ${refRow("src/symphony/orchestrator/poll.py", 8831, "_run_merge_agent", "")}
-        ${refRow("src/symphony/orchestrator/poll.py", 7989, "_mark_merge_done", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 7725, "_merge_approved_pr", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 8831, "_run_merge_agent", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 7989, "_mark_merge_done", "")}
       </ul>`,
     },
     acceptance: {
@@ -2981,7 +2981,7 @@ function showNodeDrawer(nodeId) {
       body: `<p>Claude SDK с acceptance-prompt. Mode: off / code_only / dev / preview. Проверяет соответствие diff acceptance criteria, возвращает verdict footer (pass/reject/infra_error).</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 6483, "_run_acceptance_stage", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 6483, "_run_acceptance_stage", "")}
         ${refRow("src/symphony/pipeline/acceptance_classifier.py", 125, "acceptance_classifier", "")}
         ${refRow("src/symphony/pipeline/acceptance_classifier.py", 198, "extract_acceptance_criteria", "из issue description")}
       </ul>`,
@@ -2991,8 +2991,8 @@ function showNodeDrawer(nodeId) {
       body: `<p>Codex с acceptance-fix-prompt. PR уже мержен, fix идёт прямой коммит в main. После — повторный acceptance run.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 6858, "_dispatch_acceptance_fix_run", "")}
-        ${refRow("src/symphony/orchestrator/poll.py", 9018, "_run_acceptance_fix_agent", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 6858, "_dispatch_acceptance_fix_run", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 9018, "_run_acceptance_fix_agent", "")}
       </ul>`,
     },
     done: {
@@ -3000,7 +3000,7 @@ function showNodeDrawer(nodeId) {
       body: `<p>Терминальный success. Issue в Done Linear state. Все runs закрыты (status=done или completed).</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 7989, "_mark_merge_done", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 7989, "_mark_merge_done", "")}
       </ul>`,
     },
     needs_approval: {
@@ -3009,8 +3009,8 @@ function showNodeDrawer(nodeId) {
       <p>Состояние переживает рестарт демона — <code>operator_waits</code> восстанавливается через <code>_restore_operator_waits</code> на старте.</p>
       <h4>Связанные файлы</h4>
       <ul class="refs">
-        ${refRow("src/symphony/orchestrator/poll.py", 8048, "_mark_merge_needs_approval", "")}
-        ${refRow("src/symphony/orchestrator/poll.py", 2043, "_restore_operator_waits", "восстановление после рестарта")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 8048, "_mark_merge_needs_approval", "")}
+        ${refRow("src/symphony/orchestrator/poll/__init__.py", 2043, "_restore_operator_waits", "восстановление после рестарта")}
         ${refRow("src/symphony/db/schema.sql", 178, "operator_waits", "")}
       </ul>`,
     },
@@ -3150,7 +3150,7 @@ function renderReference(key) {
           <li><code>external_thread_type ≠ None</code> — комментарий зеркалирован из GitHub, обработается с той стороны</li>
           <li><code>👍</code> alone — эквивалент <code>$approve</code> (с учётом variation selectors и skin tones)</li>
         </ul>
-        <p>Маршрутизация — <a class="ref-path mono" href="${vscLink("src/symphony/orchestrator/poll.py", 1548)}">poll.py:_handle_slash_intent</a>: тип <code>operator_waits.kind</code> определяет, какой хендлер вызвать.</p>
+        <p>Маршрутизация — <a class="ref-path mono" href="${vscLink("src/symphony/orchestrator/poll/__init__.py", 1548)}">poll.py:_handle_slash_intent</a>: тип <code>operator_waits.kind</code> определяет, какой хендлер вызвать.</p>
       </div>
     `;
   } else if (key === "verdicts") {
