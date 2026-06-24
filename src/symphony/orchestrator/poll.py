@@ -5194,6 +5194,8 @@ class Orchestrator:
                     trigger=verdict.trigger_signature,
                 )
                 return True
+            if await self._agent_infra_retry_backoff_active(storage_issue_id):
+                return False
             dispatched = await self._dispatch_merge_conflict_fix_run(
                 run=run,
                 binding=binding,
@@ -6168,6 +6170,11 @@ class Orchestrator:
         # review state (not moved to Ready). Guard here so the merge loop does
         # not immediately re-dispatch before the backoff window elapses.
         if await self._agent_infra_retry_backoff_active(issue.id):
+            if merge_run_id is not None:
+                await self._fail_run(
+                    merge_run_id,
+                    "required-check fix dispatch deferred: transient retry backoff active",
+                )
             return True
         if has_hit_iteration_cap(
             iteration=state.iteration,
@@ -7441,7 +7448,7 @@ class Orchestrator:
             run_id=fix_run_id,
             binding=binding,
             issue=issue,
-            storage_issue_id=run.issue_id,
+            storage_issue_id=issue.id,
             api_error=api_error,
             reason=reason,
             termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
@@ -11752,27 +11759,38 @@ class Orchestrator:
                 # so the re-dispatch resume logic recognises that the implement
                 # succeeded and short-circuits to the pre-push gates instead of
                 # re-running the implementer on an already-complete branch.
+                _lr_api_error = (
+                    local_review_result.api_error
+                    if local_review_result is not None
+                    else None
+                )
                 if await self._maybe_requeue_transient_agent_failure(
                     run_id=run_id,
                     binding=binding,
                     issue=issue,
                     storage_issue_id=issue_id,
-                    api_error=(
-                        local_review_result.api_error
-                        if local_review_result is not None
-                        else None
-                    ),
+                    api_error=_lr_api_error,
                     reason=_local_review_termination_reason(local_review_result),
                     termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
                 ):
                     return False, local_review_result
+                # Budget exhausted or non-transient error. When the api_error was
+                # transient and the workspace is still clean, the fixer did no work
+                # across all retries — stamp LOCAL_REVIEW_INFRA_FAILED_KIND so a
+                # $retry can resume agent-free from the pre-push gates.
+                _transient_clean = (
+                    _lr_api_error is not None
+                    and _lr_api_error.transient
+                    and not await _git_status_short(workspace_path)
+                )
                 await self._block_local_only_review_infra_failure(
                     binding=binding,
                     issue=issue,
                     storage_issue_id=issue_id,
                     run_id=run_id,
                     result=local_review_result,
+                    force_local_review_resume=_transient_clean,
                 )
                 return False, local_review_result
 
@@ -13169,6 +13187,7 @@ class Orchestrator:
         storage_issue_id: str,
         run_id: str,
         result: LoopResult | None,
+        force_local_review_resume: bool = False,
     ) -> None:
         reason = _local_review_termination_reason(result)
         # Tag only failures where the reviewer never produced a verdict — a
@@ -13178,8 +13197,13 @@ class Orchestrator:
         # $retry can safely resume agent-free. `FIX_RUN_FAILED`/`FIX_RUN_BLOCKED`
         # are deliberately left untagged: a fixer can fail/block after leaving
         # partial commits, so those must re-run the implementer.
+        # Exception: `force_local_review_resume` is set when the transient retry
+        # budget was exhausted with a clean workspace — the fixer did no work, so
+        # the resume marker is safe.
         reviewer_never_verdicted = (
-            result is None or result.outcome == LoopOutcome.REVIEWER_FAILED
+            force_local_review_resume
+            or result is None
+            or result.outcome == LoopOutcome.REVIEWER_FAILED
         )
         await self._fail_run(
             run_id,
