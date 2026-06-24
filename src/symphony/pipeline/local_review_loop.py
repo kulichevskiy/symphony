@@ -93,6 +93,7 @@ class FixerOutput:
     # `blocked` is independent of `ok`: a blocked run still exited 0.
     blocked: bool = False
     blocked_reason: str = ""
+    api_error: StreamApiError | None = None
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -310,6 +311,7 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.FIX_RUN_FAILED,
                 iterations=i + 1,
                 error=fix.error or "fix-run failed",
+                api_error=fix.api_error,
             )
 
     return _result(

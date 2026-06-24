@@ -119,6 +119,7 @@ from ..pipeline.cost_guard import (
 from ..pipeline.local_review import (
     DiffSize,
     LocalVerdict,
+    StreamApiError,
     classify_stream_api_error,
     extract_last_agent_message,
     parse_diff_numstat,
@@ -192,9 +193,25 @@ _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
 ACCEPTANCE_INFRA_RETRY_LIMIT = 2
+# Shared, capped exponential-backoff knobs for every requeue-based infra-error
+# retry path (acceptance + the agent stages). `AGENT_INFRA_RETRY_LIMIT` is the
+# transient-API-error retry budget for reviewer/implement/fix runs before they
+# fall through to the existing infra-failure escalation.
 ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
+AGENT_INFRA_RETRY_LIMIT = 5
 ACCEPTANCE_FIX_ITERATION_CAP = 1
+# All transient-retry kinds share the same retry budget and backoff logic.
+# TRANSIENT_API_RETRY_KIND: implement-phase failure (no work done, HEAD unchanged).
+# LOCAL_REVIEW_TRANSIENT_RETRY_KIND: local-review-phase failure (implement succeeded,
+#   commits intact, but reviewer got a transient 500 before verdicting).
+# REVIEW_FIX_TRANSIENT_RETRY_KIND: review-stage fix agent failure (PR exists, commits
+#   intact, but fix agent got a transient 500 and made no HEAD advance).
+_AGENT_INFRA_RETRY_KINDS: frozenset[str] = frozenset({
+    db.runs.TRANSIENT_API_RETRY_KIND,
+    db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+    db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+})
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
 
@@ -802,6 +819,19 @@ def _parse_rfc3339(s: str) -> datetime:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s)
+
+
+def _infra_retry_backoff_secs(attempt: int) -> int:
+    """Capped exponential backoff for the `attempt`-th infra retry (>= 1).
+
+    Shared by the acceptance and agent-run transient-error requeue paths so all
+    stages back off identically off the same knobs."""
+    return int(
+        min(
+            ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS * (2 ** (attempt - 1)),
+            ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS,
+        )
+    )
 
 
 def _user_login(entry: dict[str, object]) -> str:
@@ -1443,20 +1473,20 @@ def _read_run_final_message(log_path: Path, *, agent: str) -> str:
     return extract_last_agent_message(agent=reviewer_agent, stdout=stdout)
 
 
-def _read_run_stream_api_error(log_path: Path) -> str | None:
-    """Real provider API-error message from a stage run log, or None.
+def _read_run_stream_api_error_obj(log_path: Path) -> StreamApiError | None:
+    """The typed provider API error recovered from a stage run log, or None.
 
     An rc=0 implement run can carry only a transient provider API error
     (claude `is_error`/`api_error_status` or codex `turn.failed`/`error`) and no
-    completion marker. Surfacing that message in the termination detail beats
-    the generic "did not satisfy the completion contract" text.
+    completion marker. Returning the typed signal lets the completion gate both
+    surface the real message *and* gate the transient-error retry path on
+    `.transient`.
     """
     try:
         stdout = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    err = classify_stream_api_error(stdout)
-    return err.message if err is not None else None
+    return classify_stream_api_error(stdout)
 
 
 async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
@@ -5164,6 +5194,8 @@ class Orchestrator:
                     trigger=verdict.trigger_signature,
                 )
                 return True
+            if await self._agent_infra_retry_backoff_active(storage_issue_id):
+                return False
             dispatched = await self._dispatch_merge_conflict_fix_run(
                 run=run,
                 binding=binding,
@@ -5196,6 +5228,9 @@ class Orchestrator:
                 trigger=verdict.trigger_signature,
             )
             return True
+
+        if await self._agent_infra_retry_backoff_active(storage_issue_id):
+            return False
 
         iteration = state.iteration + 1
         if verdict.rule == "failing_ci":
@@ -6131,6 +6166,16 @@ class Orchestrator:
             new_signature=signature,
         ):
             return False
+        # A prior review-fix run that hit a transient API error stays in the
+        # review state (not moved to Ready). Guard here so the merge loop does
+        # not immediately re-dispatch before the backoff window elapses.
+        if await self._agent_infra_retry_backoff_active(issue.id):
+            if merge_run_id is not None:
+                await self._fail_run(
+                    merge_run_id,
+                    "required-check fix dispatch deferred: transient retry backoff active",
+                )
+            return True
         if has_hit_iteration_cap(
             iteration=state.iteration,
             cap=self.config.review_iteration_cap,
@@ -6167,10 +6212,10 @@ class Orchestrator:
             merge_run_id=merge_run_id,
             dispatch_capacity_held=dispatch_capacity_held,
         )
-        if dispatched:
+        if dispatched is True:
             await db.review_state.bump_iteration(self._conn, issue.id)
             await db.review_state.set_signature(self._conn, issue.id, signature)
-        return dispatched
+        return dispatched is not False
 
     async def _dispatch_merge_required_check_fix_run(
         self,
@@ -6186,7 +6231,7 @@ class Orchestrator:
         iteration: int,
         merge_run_id: str | None = None,
         dispatch_capacity_held: bool = False,
-    ) -> bool:
+    ) -> bool | None:
         action_log_tail = await self._merge_required_check_action_log_tail(
             repo=binding.github_repo,
             failing_checks=failing_checks,
@@ -6345,6 +6390,37 @@ class Orchestrator:
             pushed_sha = await _workspace_head_sha(workspace_path)
             if not pushed_sha or pushed_sha == start_sha:
                 short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
+                reason = (
+                    "required-check fix-run completed without advancing "
+                    f"{branch}; HEAD stayed at {short_sha}"
+                )
+                # Before escalating, check for a transient provider API error
+                # (exit 0, no HEAD advance). If transient, requeue with backoff;
+                # return None so the caller skips signature recording but still
+                # treats this as "handled" (no needs_approval escalation).
+                log_path = self.config.log_root / f"{fix_run_id}.log"
+                api_error = _read_run_stream_api_error_obj(log_path)
+                if await self._maybe_requeue_transient_agent_failure(
+                    run_id=fix_run_id,
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue.id,
+                    api_error=api_error,
+                    reason=reason,
+                    termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+                    workspace_path=workspace_path,
+                ):
+                    if merge_run_id is not None:
+                        running_interrupted = await db.runs.interrupt_running_merge(
+                            self._conn,
+                            merge_run_id,
+                        )
+                        if running_interrupted:
+                            log.info(
+                                "interrupted active merge run %s after required-check fix-run transient retry",
+                                merge_run_id,
+                            )
+                    return None
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
@@ -6352,20 +6428,14 @@ class Orchestrator:
                     ended_at=self._now().isoformat(),
                     **_termination_kwargs(
                         status="failed",
-                        reason=(
-                            "required-check fix-run completed without advancing "
-                            f"{branch}; HEAD stayed at {short_sha}"
-                        ),
+                        reason=reason,
                     ),
                 )
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
-                    reason=(
-                        "required-check fix-run completed without advancing "
-                        f"{branch}; HEAD stayed at {short_sha}"
-                    ),
+                    reason=reason,
                     merge_run_id=merge_run_id,
                 )
                 return False
@@ -7364,6 +7434,31 @@ class Orchestrator:
         short_sha = (current_sha or start_sha)[:12] or "(unknown)"
         status_short = await _git_status_short(workspace_path)
         last_log = f"git status --short:\n{status_short}" if status_short else ""
+        reason = (
+            f"review fix-run completed without advancing {branch}; "
+            f"HEAD stayed at {short_sha}"
+        )
+        # Before escalating to operator wait, check whether the fix agent hit a
+        # transient provider API error (exit 0, no HEAD advance). If so, requeue
+        # with backoff instead of parking the issue — the review polling loop
+        # will re-dispatch the fix once the backoff window elapses.
+        log_path = self.config.log_root / f"{fix_run_id}.log"
+        api_error = _read_run_stream_api_error_obj(log_path)
+        if await self._maybe_requeue_transient_agent_failure(
+            run_id=fix_run_id,
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            api_error=api_error,
+            reason=reason,
+            termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+            workspace_path=workspace_path,
+        ):
+            # _maybe_requeue_transient_agent_failure already stamped fix_run_id
+            # via _fail_run; just clear review rearm state and return.
+            await self._clear_review_rearm_retry(run.id)
+            self._clear_review_no_signal_rearm_heads(run.id)
+            return ""
         await db.runs.update_status(
             self._conn,
             fix_run_id,
@@ -7371,20 +7466,14 @@ class Orchestrator:
             ended_at=self._now().isoformat(),
             **_termination_kwargs(
                 status="failed",
-                reason=(
-                    f"review fix-run completed without advancing {branch}; "
-                    f"HEAD stayed at {short_sha}"
-                ),
+                reason=reason,
             ),
         )
         await self._fail_review_run(
             run=run,
             binding=binding,
             issue=issue,
-            error=(
-                f"review fix-run completed without advancing {branch}; "
-                f"HEAD stayed at {short_sha}"
-            ),
+            error=reason,
             last_log=last_log,
             auto_retry=False,
             operator_wait=True,
@@ -8575,6 +8664,17 @@ class Orchestrator:
                 return None
             if await db.runs.has_running_or_completed(self._conn, issue.id):
                 return None
+            # Resolve the storage issue id (db.issues.upsert may assign a
+            # different id when two tracker sites share the same raw issue id).
+            # Runs are stored under the storage id, so the backoff check must
+            # use it — otherwise the backoff window is invisible to the gate.
+            _storage_id = await self._storage_issue_id_for_tracker_issue(
+                issue.id, _tracker_context_for_binding(binding)
+            )
+            if await self._agent_infra_retry_backoff_active(_storage_id):
+                # A prior run hit a transient API error and is inside
+                # its capped backoff window — re-dispatch once it elapses.
+                return None
             pr = await db.issue_prs.get(
                 self._conn,
                 issue_id=issue.id,
@@ -9694,11 +9794,168 @@ class Orchestrator:
         except ValueError:
             return False
         retry_count = min(state.infra_retries, ACCEPTANCE_INFRA_RETRY_LIMIT)
-        backoff_secs = min(
-            ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS * (2 ** (retry_count - 1)),
-            ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS,
-        )
+        backoff_secs = _infra_retry_backoff_secs(retry_count)
         return self._now() < ended_at + timedelta(seconds=backoff_secs)
+
+    async def _agent_infra_retry_count(self, issue_id: str) -> int:
+        """Consecutive most-recent *terminated* runs requeued on a transient API
+        error, across all stages. Derived from the durable runs history (survives
+        a restart): count back from the latest terminated run until one without a
+        retry marker. Still-`running` runs (the in-flight attempt whose failure
+        is being classified) are skipped so the count reflects only prior
+        attempts. This is the retry-attempt counter the backoff window and the
+        escalation cutoff both read.
+
+        Counting across implement and review_fix stages (the only stages that
+        carry retry markers) lets a shared budget cap repeated failures
+        regardless of which stage retried, and correctly tracks review-fix
+        transient retries (REVIEW_FIX_TRANSIENT_RETRY_KIND) alongside implement
+        and local-review retries. Sub-runs (local_review, local_review_fix, …)
+        are skipped — they never carry retry markers but interleave in history
+        and would otherwise break the consecutive count."""
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        count = 0
+        for run in reversed(history):
+            if run.status in db.runs.LIVE_STATUSES:
+                continue
+            if run.stage not in ("implement", "review_fix"):
+                continue  # sub-runs never carry retry markers; skip, don't break
+            if run.termination_kind in _AGENT_INFRA_RETRY_KINDS:
+                count += 1
+            else:
+                break
+        return count
+
+    async def _agent_infra_retry_backoff_active(self, issue_id: str) -> bool:
+        """True while a transiently-failed run is still inside its capped
+        backoff window — the poll loop must not re-dispatch yet. Mirrors
+        `_acceptance_infra_retry_backoff_active` but reads the marker + ended_at
+        off the latest run with a retry marker (across all stages) rather than
+        acceptance_state. Checks all stages so review-fix retries
+        (REVIEW_FIX_TRANSIENT_RETRY_KIND) are covered alongside implement and
+        local-review retries. Sub-runs (local_review, local_review_fix, …) are
+        skipped — they never carry retry markers."""
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        latest_retry: db.runs.Run | None = None
+        for run in reversed(history):
+            if run.status in db.runs.LIVE_STATUSES:
+                continue
+            if run.stage not in ("implement", "review_fix"):
+                continue  # sub-runs never carry retry markers
+            if run.termination_kind in _AGENT_INFRA_RETRY_KINDS and run.ended_at is not None:
+                latest_retry = run
+                break
+        if latest_retry is None:
+            return False
+        count = await self._agent_infra_retry_count(issue_id)
+        if count <= 0:
+            return False
+        try:
+            ended_at = _parse_rfc3339(latest_retry.ended_at)  # type: ignore[arg-type]
+        except ValueError:
+            return False
+        backoff_secs = _infra_retry_backoff_secs(min(count, AGENT_INFRA_RETRY_LIMIT))
+        return self._now() < ended_at + timedelta(seconds=backoff_secs)
+
+    async def _maybe_requeue_transient_agent_failure(
+        self,
+        *,
+        run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        api_error: StreamApiError | None,
+        reason: str,
+        returncode: int | None = None,
+        termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
+        workspace_path: Path | None = None,
+    ) -> bool:
+        """Requeue an implement run that died on a *transient* provider API
+        error instead of escalating, until the retry budget is spent.
+
+        A clean 5xx/429 means the agent did no work, so re-invoking is safe. The
+        run is marked failed with a durable marker + `ended_at` and the issue is
+        moved back to its Ready lane; the poll loop re-dispatches once the
+        per-attempt backoff window elapses (`_agent_infra_retry_backoff_active`)
+        — no workspace slot is held during the wait. Returns True when it handled
+        the failure this way (the caller must skip escalation). Returns False —
+        the caller escalates exactly as today — for a non-transient error, no API
+        error, or once `AGENT_INFRA_RETRY_LIMIT` consecutive retries have already
+        happened.
+
+        `termination_kind` selects the durable marker stamped on the run:
+        `TRANSIENT_API_RETRY_KIND` for implement-phase failures (the default) and
+        `LOCAL_REVIEW_TRANSIENT_RETRY_KIND` for local-review-phase failures. The
+        re-dispatch resume logic reads this to decide whether to re-run the
+        implementer or short-circuit to the pre-push gates.
+
+        For `REVIEW_FIX_TRANSIENT_RETRY_KIND` the issue is NOT moved to Ready —
+        the existing PR is intact and the retry is driven by the merge/acceptance
+        loop once the backoff elapses."""
+        if api_error is None or not api_error.transient:
+            return False
+        # The current run is still `running` (its marker is stamped below), so
+        # `_agent_infra_retry_count` skips it and counts only the *prior*
+        # requeued attempts.
+        prior = await self._agent_infra_retry_count(storage_issue_id)
+        if prior >= AGENT_INFRA_RETRY_LIMIT:
+            return False
+        # An agent can edit files before the provider 5xx fires. A dirty tree
+        # means work happened, so re-invoking is not safe — escalate instead.
+        if workspace_path is not None:
+            status = await _git_status_short(workspace_path)
+            if status:
+                log.warning(
+                    "workspace dirty after transient API error for %s — escalating: %s",
+                    issue.identifier,
+                    status[:200],
+                )
+                return False
+        if termination_kind == db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND:
+            # Review-fix retry: the PR and commits are intact; leave the issue
+            # in its current review state so the merge/acceptance loop drives
+            # the re-dispatch once the backoff window elapses.
+            pass
+        else:
+            try:
+                states = await self._states_for_binding(binding)
+            except LinearError as e:
+                log.warning(
+                    "could not load states to requeue %s after transient API error: %s",
+                    issue.identifier,
+                    e,
+                )
+                return False
+            ready_id = states.get(binding.linear_states.ready)
+            if ready_id is None:
+                return False
+            try:
+                await self.tracker(binding).move_issue(issue.id, ready_id)
+            except LinearError as e:
+                log.warning(
+                    "could not requeue %s to Ready after transient API error: %s",
+                    issue.identifier,
+                    e,
+                )
+                return False
+        await self._fail_run(
+            run_id,
+            reason,
+            returncode=returncode,
+            termination_kind=termination_kind,
+            termination_detail=reason,
+        )
+        attempt = prior + 1
+        log.info(
+            "requeueing %s after transient API error "
+            "(attempt %d/%d, backoff %ds): %s",
+            issue.identifier,
+            attempt,
+            AGENT_INFRA_RETRY_LIMIT,
+            _infra_retry_backoff_secs(min(attempt, AGENT_INFRA_RETRY_LIMIT)),
+            reason,
+        )
+        return True
 
     def _schedule_acceptance(
         self,
@@ -11094,12 +11351,18 @@ class Orchestrator:
             # also passed the completion gate, so the commits are complete —
             # but local review never finished, so the resume re-runs the gates
             # *with fixes enabled* (a re-review may now request changes). Only
-            # the explicit kind qualifies: it is stamped solely for
+            # the explicit kinds qualify: they are stamped solely for
             # reviewer-never-verdicted failures, never for fix-run failures
             # (which may have left partial commits and must re-run the agent).
-            resume_after_local_review = (
-                previous_terminal_kind == db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
-            )
+            # LOCAL_REVIEW_TRANSIENT_RETRY_KIND is the backoff variant: the
+            # implement succeeded and the local-review phase got a transient 500,
+            # so the re-dispatch must also skip the implementer and re-run only
+            # the pre-push gates (with fixes allowed) rather than treating it
+            # like a plain implement failure that needs a full re-run.
+            resume_after_local_review = previous_terminal_kind in {
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
+                db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+            }
             previous_requires_agent = (
                 previous_terminal_kind is not None
                 and previous_terminal_kind not in delivery_resume_kinds
@@ -11396,10 +11659,22 @@ class Orchestrator:
                 )
                 # A run that ended only on a provider API error (e.g. 500)
                 # exits 0 with no marker — surface the real "API Error: …"
-                # cause instead of the generic completion-contract text.
-                api_error = _read_run_stream_api_error(log_path)
-                if api_error:
-                    reason = api_error
+                # cause instead of the generic completion-contract text, and
+                # (when transient) requeue with backoff instead of escalating.
+                api_error = _read_run_stream_api_error_obj(log_path)
+                if api_error is not None:
+                    reason = api_error.message
+                    if await self._maybe_requeue_transient_agent_failure(
+                        run_id=run_id,
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=issue_id,
+                        api_error=api_error,
+                        reason=reason,
+                        returncode=final_returncode,
+                        workspace_path=workspace_path,
+                    ):
+                        return None
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
             await self._fail_run_and_reset_issue(
                 run_id,
@@ -11477,12 +11752,45 @@ class Orchestrator:
                 allow_fixes=allow_fixes,
             )
             if _local_review_infra_failed(local_review_result):
+                # A transient provider API error in the reviewer/fix turn left
+                # the agent's commits intact and did no further work — requeue
+                # with backoff instead of escalating, until the budget is spent.
+                # LOCAL_REVIEW_TRANSIENT_RETRY_KIND is used (not TRANSIENT_API_RETRY_KIND)
+                # so the re-dispatch resume logic recognises that the implement
+                # succeeded and short-circuits to the pre-push gates instead of
+                # re-running the implementer on an already-complete branch.
+                _lr_api_error = (
+                    local_review_result.api_error
+                    if local_review_result is not None
+                    else None
+                )
+                if await self._maybe_requeue_transient_agent_failure(
+                    run_id=run_id,
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue_id,
+                    api_error=_lr_api_error,
+                    reason=_local_review_termination_reason(local_review_result),
+                    termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+                    workspace_path=workspace_path,
+                ):
+                    return False, local_review_result
+                # Budget exhausted or non-transient error. When the api_error was
+                # transient and the workspace is still clean, the fixer did no work
+                # across all retries — stamp LOCAL_REVIEW_INFRA_FAILED_KIND so a
+                # $retry can resume agent-free from the pre-push gates.
+                _transient_clean = (
+                    _lr_api_error is not None
+                    and _lr_api_error.transient
+                    and not await _git_status_short(workspace_path)
+                )
                 await self._block_local_only_review_infra_failure(
                     binding=binding,
                     issue=issue,
                     storage_issue_id=issue_id,
                     run_id=run_id,
                     result=local_review_result,
+                    force_local_review_resume=_transient_clean,
                 )
                 return False, local_review_result
 
@@ -11501,6 +11809,14 @@ class Orchestrator:
                 allow_fixes=allow_fixes,
             )
             if not verify_result.ok:
+                # Verify-gate and dirty-tree fix failures are intentionally not
+                # routed through _maybe_requeue_transient_agent_failure: VerifyResult
+                # does not carry an api_error field (the fix turn's transient signal
+                # is not surfaced), and dirty-tree fix failures are best-effort
+                # (any failure just leaves the tree dirty and the re-check fails
+                # closed). Both are treated as non-transient, fail-closed operator
+                # waits. Wiring transient retry here would require plumbing api_error
+                # through run_verify_session / _run_dirty_tree_fix_turn — out of scope.
                 await self._block_verify_failure(
                     binding=binding,
                     issue=issue,
@@ -12871,6 +13187,7 @@ class Orchestrator:
         storage_issue_id: str,
         run_id: str,
         result: LoopResult | None,
+        force_local_review_resume: bool = False,
     ) -> None:
         reason = _local_review_termination_reason(result)
         # Tag only failures where the reviewer never produced a verdict — a
@@ -12880,8 +13197,13 @@ class Orchestrator:
         # $retry can safely resume agent-free. `FIX_RUN_FAILED`/`FIX_RUN_BLOCKED`
         # are deliberately left untagged: a fixer can fail/block after leaving
         # partial commits, so those must re-run the implementer.
+        # Exception: `force_local_review_resume` is set when the transient retry
+        # budget was exhausted with a clean workspace — the fixer did no work, so
+        # the resume marker is safe.
         reviewer_never_verdicted = (
-            result is None or result.outcome == LoopOutcome.REVIEWER_FAILED
+            force_local_review_resume
+            or result is None
+            or result.outcome == LoopOutcome.REVIEWER_FAILED
         )
         await self._fail_run(
             run_id,

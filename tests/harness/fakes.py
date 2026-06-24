@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import itertools
+import json
 import os
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
@@ -82,21 +83,112 @@ def _to_comment(comment: SimComment) -> Comment:
 class FakeRunner:
     """Deterministic `Runner` that never spawns real subprocesses.
 
-    Each `run()` call pops one event sequence from `_queue`; if the queue is
-    empty it yields a default sequence mirroring a real run's lifecycle: a
+    Each `run()` call pops one event sequence from the stage-specific queue for
+    `spec.stage` (if any), then falls back to the global FIFO `_queue`, and
+    finally yields a default sequence mirroring a real run's lifecycle: a
     `started` event carrying a synthetic PID, then (for mutating stages) a HEAD
     advance, then a `SYMPHONY_DONE` completion marker and a `0` exit.
+
+    Stage-specific queues let scenarios inject errors into exactly one stage
+    (e.g. `local_review`) without affecting others (e.g. `implement`).
     """
 
     def __init__(self) -> None:
         self._queue: list[list[RunnerEvent]] = []
+        self._stage_queues: dict[str, list[list[RunnerEvent]]] = {}
         self._pid = itertools.count(10000)
 
     def enqueue(self, events: list[RunnerEvent]) -> None:
         """Pre-program the event sequence for the next `run()` call."""
         self._queue.append(events)
 
+    def enqueue_for_stage(self, stage: str, events: list[RunnerEvent]) -> None:
+        """Pre-program the next `run()` call for `stage` to emit `events`.
+
+        Stage-specific entries are consumed before the global FIFO queue, so
+        they never bleed into other stages (e.g. `local_review` errors won't
+        be consumed by the `implement` stage)."""
+        self._stage_queues.setdefault(stage, []).append(events)
+
+    def enqueue_local_review_approved(self) -> None:
+        """Pre-program the next local-review `run()` to emit a successful stream.
+
+        Emits a codex-format `item.completed` / `agent_message` event containing
+        `VERDICT_APPROVED_MARKER` so `parse_local_review_output` returns APPROVED.
+        Uses the stage-specific queue so it is consumed by the `local_review` stage
+        and not accidentally by the `implement` stage."""
+        from symphony.pipeline.local_review import VERDICT_APPROVED_MARKER
+
+        text = f"LGTM — no issues found.\n{VERDICT_APPROVED_MARKER}"
+        self.enqueue_for_stage(
+            "local_review",
+            [
+                RunnerEvent(kind="started", pid=next(self._pid)),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "i",
+                                "type": "agent_message",
+                                "text": text,
+                            },
+                        }
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+        )
+
+    def enqueue_transient_api_error(self, *, status: int = 500, stage: str | None = None) -> None:
+        """Pre-program the next `run()` to emit a transient provider API-error
+        stream: a synthetic `assistant` message plus a terminal `result` with
+        `is_error`/`api_error_status`, then a clean `exit 0` — the shape a real
+        agent emits when a 5xx/429 ends the turn with no verdict and no work
+        done (HEAD never advances). Lets scenarios drive the transient-error
+        retry path (SYM-141); the default stream cannot express it.
+
+        Pass `stage` to target a specific stage's queue (e.g. `"local_review"`),
+        preventing the error from being consumed by the `implement` stage instead."""
+        text = f'API Error: {status} {{"type":"overloaded_error"}}'
+        events = [
+            RunnerEvent(kind="started", pid=next(self._pid)),
+            RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "model": "<synthetic>",
+                            "content": [{"type": "text", "text": text}],
+                        },
+                    }
+                ),
+            ),
+            RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "result",
+                        "subtype": "error_during_execution",
+                        "is_error": True,
+                        "result": text,
+                        "api_error_status": status,
+                    }
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+        if stage is not None:
+            self.enqueue_for_stage(stage, events)
+        else:
+            self._queue.append(events)
+
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        stage_q = self._stage_queues.get(spec.stage)
+        if stage_q:
+            return self._aiter(stage_q.pop(0))
         if self._queue:
             return self._aiter(self._queue.pop(0))
         return self._default_aiter(spec)
