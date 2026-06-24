@@ -5227,6 +5227,9 @@ class Orchestrator:
             )
             return True
 
+        if await self._agent_infra_retry_backoff_active(storage_issue_id):
+            return False
+
         iteration = state.iteration + 1
         if verdict.rule == "failing_ci":
             dispatched = await self._dispatch_ci_fix_run(
@@ -6400,6 +6403,16 @@ class Orchestrator:
                     termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
                 ):
+                    if merge_run_id is not None:
+                        running_interrupted = await db.runs.interrupt_running_merge(
+                            self._conn,
+                            merge_run_id,
+                        )
+                        if running_interrupted:
+                            log.info(
+                                "interrupted active merge run %s after required-check fix-run transient retry",
+                                merge_run_id,
+                            )
                     return None
                 await db.runs.update_status(
                     self._conn,
