@@ -378,6 +378,54 @@ def test_classify_plain_done_no_commits_is_not_already_satisfied() -> None:
     assert completion.outcome == "failed"
 
 
+# --- branch-ahead resume: a re-dispatched agent no-ops on already-committed
+# work (HEAD does not advance this run) but the branch carries deliverable
+# commits ahead of base. That must complete (deliver the branch), not fail and
+# trap the issue in an implement-retry loop.
+def test_classify_done_marker_branch_ahead_no_head_advance_completes() -> None:
+    completion = classify_implement_completion(
+        final_message="Work was already committed on this branch.\n\nSYMPHONY_DONE",
+        head_advanced=False,
+        branch_ahead_of_base=True,
+    )
+    assert completion.outcome == "completed"
+
+
+# Restriction guard: branch-ahead rescues delivery ONLY with an explicit
+# SYMPHONY_DONE vouch. A markerless no-op on an ahead branch may be a dead
+# fix-run's partial commits the agent never re-affirmed — it must still fail,
+# not silently publish. (Mirrors the #248 untagged-failure protection.)
+def test_classify_no_marker_branch_ahead_without_vouch_still_fails() -> None:
+    completion = classify_implement_completion(
+        final_message="I looked around but did not commit or mark done.",
+        head_advanced=False,
+        branch_ahead_of_base=True,
+    )
+    assert completion.outcome == "failed"
+
+
+# No-op guard NOT weakened: SYMPHONY_DONE, no HEAD advance, AND nothing ahead
+# of base (genuinely nothing to push) still fails.
+def test_classify_done_marker_no_head_advance_not_ahead_still_fails() -> None:
+    completion = classify_implement_completion(
+        final_message="Claimed done but produced nothing.\n\nSYMPHONY_DONE",
+        head_advanced=False,
+        branch_ahead_of_base=False,
+    )
+    assert completion.outcome == "failed"
+
+
+# A blocked marker still wins over a branch that happens to be ahead of base:
+# the branch is waiting on a human action, not ready to deliver.
+def test_classify_blocked_marker_wins_over_branch_ahead() -> None:
+    completion = classify_implement_completion(
+        final_message="SYMPHONY_BLOCKED: need a secret",
+        head_advanced=False,
+        branch_ahead_of_base=True,
+    )
+    assert completion.outcome == "blocked"
+
+
 def test_classify_blocked_final_message_detects_human_action_ask() -> None:
     kind, reason = classify_blocked_final_message(MCH14_FINAL_MESSAGE)
     assert kind == "blocked"

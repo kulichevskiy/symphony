@@ -2686,6 +2686,122 @@ async def test_untagged_prior_failure_with_sibling_local_review_runs_agent(
 
 
 @pytest.mark.asyncio
+async def test_untagged_failure_noop_with_done_marker_delivers_branch_ahead(
+    tmp_path: Path,
+) -> None:
+    """SYM-133 stall: a prior implement run failed with an untagged kind
+    ("unknown"), so the re-dispatch is NOT short-circuited and the agent runs
+    again. The branch already carries the prior run's committed work, so the
+    agent correctly no-ops and emits SYMPHONY_DONE without advancing HEAD this
+    run. That explicit vouch on a branch ahead of base must complete and deliver
+    (push + ensure_pr) instead of failing the completion gate and trapping the
+    issue in an endless implement-retry loop.
+
+    Counterpart to test_untagged_prior_failure_with_sibling_local_review_runs_agent:
+    same untagged prior failure, but here the re-run agent emits a DONE marker,
+    which (with the branch ahead) is the agent affirming the branch is ready."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        # Prior implement run failed with an untagged/heuristic kind — NOT a
+        # delivery- or local-review-resume kind, so the short-circuit is skipped
+        # and the agent is re-dispatched.
+        await db.runs.create(
+            conn,
+            id="prior-noop-implement-run",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "prior-noop-implement-run",
+            "failed",
+            ended_at="2026-05-10T00:01:00+00:00",
+            kind="unknown",
+            detail=(
+                "implement run exited 0 but did not satisfy the completion "
+                "contract: HEAD did not advance"
+            ),
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        # HEAD carries the prior run's committed work, one ahead of base.
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior implement work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        push_fn = AsyncMock()
+        # The re-run agent does NOT advance HEAD (no on_run commit) but emits an
+        # explicit SYMPHONY_DONE: it re-ran with the branch in view and vouched.
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(
+                    kind="stdout",
+                    line=_done_result_line(
+                        "Work already committed on this branch.\n\nSYMPHONY_DONE"
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace, push_fn=push_fn
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        # The agent re-ran (not short-circuited), no-opped, but the branch-ahead
+        # vouch delivered: pushed + PR ensured, run completed, no operator wait.
+        assert [s.stage for s in runner.specs] == ["implement"]
+        push_fn.assert_awaited_once()
+        gh.ensure_pr.assert_awaited_once()
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [r.stage for r in history] == ["implement", "implement"]
+        assert history[-1].status == "completed"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_branch_setup_failure_releases_workspace_and_fails_run(
     tmp_path: Path,
 ) -> None:
