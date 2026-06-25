@@ -229,9 +229,11 @@ async def _git_add_and_continue_rebase(
 async def _rebase_had_recent_skips(workspace_path: Path) -> bool:
     """True if the most recently completed rebase used --skip for any commit.
 
-    Git writes ``rebase (skip) (finish): ...`` to HEAD's reflog when a rebase
-    finishes via --skip, versus plain ``rebase (finish): ...`` for a normal
-    completion.  Scanning the first finish-type entry detects this reliably.
+    Git version ≤2.37 writes ``rebase (skip) (finish): …`` (combined on one
+    line); newer git writes separate ``rebase (skip): …`` and ``rebase
+    (finish): …`` entries.  We handle both: check for ``(skip)`` on the finish
+    line, then scan between ``(finish)`` and ``(start)`` for a standalone skip
+    entry.
     """
     proc = await asyncio.create_subprocess_exec(
         "git", "reflog", "HEAD", "--format=%gs",
@@ -243,10 +245,19 @@ async def _rebase_had_recent_skips(workspace_path: Path) -> bool:
     stdout, _ = await proc.communicate()
     if proc.returncode != 0:
         return False
+    in_rebase = False
     for line in stdout.decode().splitlines():
         line = line.strip()
-        if line.startswith("rebase") and "(finish)" in line:
-            return "(skip)" in line
+        if not line.startswith("rebase"):
+            continue
+        if "(finish)" in line:
+            in_rebase = True
+            if "(skip)" in line:  # git ≤2.37: combined "rebase (skip) (finish): …"
+                return True
+        elif in_rebase and "(skip)" in line:  # newer git: separate "(skip)" entry
+            return True
+        elif in_rebase and "(start)" in line:
+            break
     return False
 
 
