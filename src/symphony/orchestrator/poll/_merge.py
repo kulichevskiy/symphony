@@ -125,7 +125,6 @@ from ._helpers import (
 )
 from . import (
     CODEX_NO_ISSUES_MARKER,
-    MANUAL_MERGE_PARKED_RUN_PREFIX,
     MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS,
     MERGE_WAIT_RECONCILE_INTERVAL_SECS,
     NEEDS_HUMAN_APPROVAL_LABEL,
@@ -161,14 +160,6 @@ async def _abort_rebase_safely(
             issue_identifier,
             e,
         )
-
-
-
-def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
-    return (
-        f"{MANUAL_MERGE_PARKED_RUN_PREFIX}"
-        f"{pr.issue_id}:{pr.github_repo}:{pr.pr_number}"
-    )
 
 
 
@@ -257,112 +248,6 @@ class _MergeMixin(_OrchestratorBase):
                 log.info(
                     "auto-recoverable merge wait reconcile dispatched %d recovery run(s)",
                     recovered,
-                )
-
-
-    async def _parked_manual_merge_slash_pairs(self) -> list[tuple[str, str]]:
-        pairs: list[tuple[str, str]] = []
-        for pr in await db.issue_prs.list_merge_candidates(self._conn):
-            if pr.parked_at is None:
-                continue
-            if self._binding_for_pr(pr) is None:
-                log.warning(
-                    "cannot watch parked manual-merge PR %s#%d: no binding",
-                    pr.github_repo,
-                    pr.pr_number,
-                )
-                continue
-            pairs.append((pr.issue_id, _manual_merge_parked_run_id(pr)))
-        return pairs
-
-
-    async def _parked_manual_merge_run_id_for_issue(
-        self, issue_id: str
-    ) -> str | None:
-        pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
-        if pr is None or pr.merged_at is not None or pr.parked_at is None:
-            return None
-        if self._binding_for_pr(pr) is None:
-            return None
-        return _manual_merge_parked_run_id(pr)
-
-
-    async def _manual_merge_parked_started_at(self, issue_id: str) -> datetime:
-        pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
-        if pr is None or not pr.parked_at:
-            return datetime(1970, 1, 1, tzinfo=UTC)
-        try:
-            return _parse_rfc3339(pr.parked_at)
-        except ValueError:
-            log.warning(
-                "invalid parked_at timestamp for manual-merge PR %s#%d: %r",
-                pr.github_repo,
-                pr.pr_number,
-                pr.parked_at,
-            )
-            return datetime(1970, 1, 1, tzinfo=UTC)
-
-
-    async def _handle_parked_manual_merge_slash_intent(
-        self,
-        issue_id: str,
-        intent: SlashIntent,
-        *,
-        binding: RepoBinding | None = None,
-        pr: db.issue_prs.IssuePR | None = None,
-    ) -> None:
-        if intent.kind is not SlashKind.APPROVE:
-            log.info(
-                "slash %s for parked manual-merge issue %s ignored",
-                intent.kind,
-                issue_id,
-            )
-            return
-        if pr is None:
-            pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
-        if pr is None or pr.merged_at is not None or pr.parked_at is None:
-            await self._post_command_rejected(
-                issue_id,
-                "$approve",
-                "manual-merge parking marker is no longer active",
-            )
-            return
-        if binding is None:
-            binding = self._binding_for_pr(pr)
-        if binding is None:
-            await self._post_command_rejected(
-                issue_id,
-                "$approve",
-                "no repository binding found for parked manual merge",
-            )
-            return
-        tracker = self.tracker(binding)
-        try:
-            await self._gh.pr_merge(
-                pr.pr_number,
-                strategy=binding.merge_strategy,
-                auto=False,
-                repo=binding.github_repo,
-            )
-        except GitHubError as e:
-            log.warning(
-                "manual merge failed for parked PR %s#%d on %s: %s",
-                binding.github_repo,
-                pr.pr_number,
-                pr.identifier,
-                e,
-            )
-            body = (
-                f"manual merge failed for {pr.pr_url}: {e}\n\n"
-                "The issue remains parked; reply with `$approve` to try again."
-            )
-            try:
-                await tracker.post_comment(issue_id, truncate_body(body))
-            except LinearError as comment_error:
-                log.warning(
-                    "could not post manual merge failure for %s: %s",
-                    pr.identifier,
-                    comment_error,
                 )
 
 

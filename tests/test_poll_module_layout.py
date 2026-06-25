@@ -184,10 +184,6 @@ _SLASH_NAMES = [
 # Merge-domain methods that must live on `_MergeMixin` (SYM-147).
 _MERGE_METHODS = [
     "_run_auto_recoverable_merge_wait_reconciler",
-    "_parked_manual_merge_slash_pairs",
-    "_parked_manual_merge_run_id_for_issue",
-    "_manual_merge_parked_started_at",
-    "_handle_parked_manual_merge_slash_intent",
     "_reconcile_orphaned_merge_runs",
     "_reconcile_auto_recoverable_merge_waits",
     "_reconcile_auto_recoverable_merge_wait",
@@ -241,7 +237,6 @@ _MERGE_METHODS = [
 # Merge-exclusive free functions co-located into `_merge.py` (SYM-147).
 _MERGE_FUNCS = [
     "_abort_rebase_safely",
-    "_manual_merge_parked_run_id",
     "_merge_issue_matches_binding",
     "_review_check_from_github",
 ]
