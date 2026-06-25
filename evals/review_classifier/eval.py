@@ -23,7 +23,6 @@ point doubles as a CI gate.
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -164,7 +163,10 @@ def main() -> int:
         print(f"GATE FAILED: {false_approves} false-approve(s) on the corpus.")
         return 1
     if failures:
-        print(f"GATE FAILED: {failures} case(s) mismatched (no false-approve, but curated truth must match).")
+        print(
+            f"GATE FAILED: {failures} case(s) mismatched "
+            "(no false-approve, but curated truth must match)."
+        )
         return 1
     print("GATE PASSED.")
     return 0

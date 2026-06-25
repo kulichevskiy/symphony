@@ -14,5 +14,6 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-extras --dev
+      - run: uv run ruff check
       - run: uv run mypy
       - run: uv run pytest -q

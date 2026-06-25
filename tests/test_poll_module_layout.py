@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146, SYM-147, SYM-148, SYM-150).
+"""Guards the poll/ package layout (SYM-143..151: poll.py split into domain mixins).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`

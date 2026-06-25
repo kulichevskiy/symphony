@@ -29,7 +29,7 @@ from symphony.github.client import (
     PRChecks,
 )
 from symphony.linear.client import LinearError
-from symphony.tracker import Blocker, Comment, Issue
+from symphony.tracker import Comment, Issue
 
 from .sim import PR_CLOSED, PR_MERGED, Sim, SimCheck, SimComment, SimPR
 
@@ -369,7 +369,7 @@ class FakeGitHub:
             env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await init_bare.wait()
-        dest.mkdir(parents=True, exist_ok=True)
+        dest.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 (test fake; local tmp dir)
         init = await asyncio.create_subprocess_exec(
             "git", "init", "-b", "main", str(dest),
             env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
@@ -555,7 +555,7 @@ class FakeGitHub:
 
     @staticmethod
     def _required_checks_passed(sim_pr: SimPR) -> bool:
-        """True iff all required checks have passed; falls back to checks_passed when no explicit list."""
+        """True iff all required checks passed; falls back to checks_passed when no list."""
         if sim_pr.checks is None:
             return sim_pr.checks_passed
         return all(_check_bucket(c) == "pass" for c in sim_pr.checks if c.required)

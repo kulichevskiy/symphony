@@ -31,11 +31,11 @@ DEFAULT_REPO = "org/repo"
 async def _sim_aware_push(
     workspace_path: Path,
     branch: str,
-    sim: "Sim",
+    sim: Sim,
     *,
     repo: str | None = None,
     force: bool = False,
-    commit_timestamps: "dict[str, str] | None" = None,
+    commit_timestamps: dict[str, str] | None = None,
 ) -> None:
     """Push to the fake origin and update the matching SimPR's head_sha."""
     cmd = (

@@ -104,7 +104,7 @@ async def test_transient_api_error_retries_then_escalates(
 
         escalated = False
         backoff_checked = False
-        for i in range(20):
+        for _ in range(20):
             await harness.step()
             if not backoff_checked:
                 # After the first requeue the issue is back in Ready but the
@@ -226,8 +226,10 @@ async def test_local_review_transient_api_error_recovers(
         # retry and surface REVIEWER_FAILED with api_error.transient=True.
         # stage="local_review" targets the stage-specific queue so the implement
         # stage (which runs first) uses the default stream and is not affected.
-        harness.runner.enqueue_transient_api_error(status=500, stage="local_review")  # dispatch 1, attempt 0
-        harness.runner.enqueue_transient_api_error(status=500, stage="local_review")  # dispatch 1, attempt 1
+        # dispatch 1, attempt 0
+        harness.runner.enqueue_transient_api_error(status=500, stage="local_review")
+        # dispatch 1, attempt 1
+        harness.runner.enqueue_transient_api_error(status=500, stage="local_review")
         harness.runner.enqueue_local_review_approved()  # dispatch 2, attempt 0
 
         for _ in range(40):

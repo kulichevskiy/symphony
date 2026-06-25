@@ -1060,7 +1060,8 @@ class _MergeMixin(_OrchestratorBase):
                         )
                         if running_interrupted:
                             log.info(
-                                "interrupted active merge run %s after required-check fix-run transient retry",
+                                "interrupted active merge run %s after required-check "
+                                "fix-run transient retry",
                                 merge_run_id,
                             )
                     return None

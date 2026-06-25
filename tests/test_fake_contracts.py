@@ -40,7 +40,6 @@ from symphony.orchestrator.poll import (
     _pr_view_is_merged,
 )
 from symphony.tracker import Comment
-
 from tests.harness.clock import ManualClock
 from tests.harness.fakes import FakeGitHub, FakeLinear
 from tests.harness.sim import PR_OPEN, Sim, SimCheck, SimComment, SimIssue, SimPR
