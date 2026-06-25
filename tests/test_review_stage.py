@@ -13,6 +13,7 @@ Acceptance criteria covered here:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -6376,5 +6377,112 @@ async def test_codex_lgtm_comment_survives_review_monitor_restart(
         linear.post_comment.assert_awaited_once()
         state = await db.review_state.get(conn, "iss-1")
         assert state.codex_lgtm_comment_id == "9999"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ci_fix_dispatch_creates_single_review_fix_run(
+    tmp_path: Path,
+) -> None:
+    """Two fix-run dispatches racing on one issue must yield exactly one live
+    ``review_fix`` run (SYM-152). The loser bails: it releases the workspace it
+    acquired and does not clobber ``_dispatch_run_ids``.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="lint failed")
+        push_fn = AsyncMock()
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        agent_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_agent(**_kwargs: object) -> tuple[UsageDelta, str, int]:
+            agent_entered.set()
+            await release.wait()
+            return (UsageDelta(cost_usd=0.01), "exit", 0)
+
+        orch._run_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=blocking_agent
+        )
+
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        run = next(r for r in history if r.id == "review-run")
+
+        async def dispatch() -> bool:
+            return await orch._dispatch_ci_fix_run(  # noqa: SLF001
+                run=run,
+                binding=binding,
+                issue=_issue_in_progress(),
+                checks=_failing_ci_checks(),
+                verdict=_failing_ci_verdict(),
+                iteration=1,
+            )
+
+        # First dispatch wins the atomic insert and parks in the blocked agent.
+        winner = asyncio.create_task(dispatch())
+        await agent_entered.wait()
+
+        # Second dispatch races in while the first review_fix run is still live.
+        # The fix makes it bail before the agent; without it the loser inserts a
+        # second run and blocks in the agent forever (caught here as a timeout
+        # rather than a hung suite).
+        loser_dispatched = await asyncio.wait_for(dispatch(), timeout=5)
+
+        assert loser_dispatched is False
+        # Loser released exactly the workspace it acquired (winner is still
+        # parked in the agent and has not released yet).
+        assert workspace.release.call_count == 1
+
+        live = [
+            r
+            for r in await db.runs.history_for_issue(conn, "iss-1")
+            if r.stage == "review_fix" and r.status == "running"
+        ]
+        assert len(live) == 1
+        # Loser did not clobber the winner's dispatch id.
+        assert orch._dispatch_run_ids["iss-1"] == live[0].id  # noqa: SLF001
+
+        winner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await winner
+
+        fix_runs = [
+            r
+            for r in await db.runs.history_for_issue(conn, "iss-1")
+            if r.stage == "review_fix"
+        ]
+        assert len(fix_runs) == 1
     finally:
         await conn.close()

@@ -1742,7 +1742,7 @@ class _ReviewMixin(_OrchestratorBase):
                 return False
 
             fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
+            inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=fix_run_id,
                 issue_id=issue.id,
@@ -1750,7 +1750,13 @@ class _ReviewMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                ignored_stage="review",
             )
+            if not inserted:
+                # Lost the race against a concurrent fix-run dispatch (SYM-152).
+                # Release the workspace and bail without clobbering dispatch ids.
+                self._workspace.release(binding, issue)
+                return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
@@ -2208,7 +2214,7 @@ class _ReviewMixin(_OrchestratorBase):
                 return False
 
             fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
+            inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=fix_run_id,
                 issue_id=issue.id,
@@ -2216,7 +2222,13 @@ class _ReviewMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                ignored_stage="review",
             )
+            if not inserted:
+                # Lost the race against a concurrent fix-run dispatch (SYM-152).
+                # Release the workspace and bail without clobbering dispatch ids.
+                self._workspace.release(binding, issue)
+                return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
@@ -2515,7 +2527,7 @@ class _ReviewMixin(_OrchestratorBase):
 
             # Create a review_fix row for cost tracking and dispatch_run_ids cleanup.
             fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
+            inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=fix_run_id,
                 issue_id=issue.id,
@@ -2523,7 +2535,13 @@ class _ReviewMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                ignored_stage="review",
             )
+            if not inserted:
+                # Lost the race against a concurrent fix-run dispatch (SYM-152).
+                # Release the workspace and bail without clobbering dispatch ids.
+                self._workspace.release(binding, issue)
+                return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
