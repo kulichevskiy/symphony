@@ -4900,7 +4900,7 @@ async def test_required_status_failure_precheck_dispatches_fix_run(
         orch._schedule_merge = MagicMock(return_value=scheduled_merge)  # type: ignore[method-assign]  # noqa: SLF001
         required_contexts = AsyncMock(return_value=("Vercel",))
         monkeypatch.setattr(
-            "symphony.orchestrator.poll.get_required_contexts",
+            "symphony.orchestrator.poll._merge.get_required_contexts",
             required_contexts,
             raising=False,
         )
@@ -4999,7 +4999,7 @@ async def test_required_status_failure_precheck_falls_back_when_deduped(
         orch._schedule_merge = MagicMock(return_value=scheduled_merge)  # type: ignore[method-assign]  # noqa: SLF001
         required_contexts = AsyncMock(return_value=("Vercel",))
         monkeypatch.setattr(
-            "symphony.orchestrator.poll.get_required_contexts",
+            "symphony.orchestrator.poll._merge.get_required_contexts",
             required_contexts,
             raising=False,
         )
@@ -5076,7 +5076,7 @@ async def test_optional_status_failure_precheck_preserves_merge_path(
         orch._schedule_merge = MagicMock(return_value=scheduled_merge)  # type: ignore[method-assign]  # noqa: SLF001
         required_contexts = AsyncMock(return_value=("ci",))
         monkeypatch.setattr(
-            "symphony.orchestrator.poll.get_required_contexts",
+            "symphony.orchestrator.poll._merge.get_required_contexts",
             required_contexts,
             raising=False,
         )
@@ -5140,15 +5140,15 @@ async def test_required_check_fix_reruns_local_review_before_push_for_local_only
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
         monkeypatch.setattr(
-            "symphony.orchestrator.poll._git_fetch_branch",
+            "symphony.orchestrator.poll._merge._git_fetch_branch",
             AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
-            "symphony.orchestrator.poll._workspace_ref_sha",
+            "symphony.orchestrator.poll._merge._workspace_ref_sha",
             AsyncMock(return_value="start-sha"),
         )
         monkeypatch.setattr(
-            "symphony.orchestrator.poll._workspace_head_sha",
+            "symphony.orchestrator.poll._merge._workspace_head_sha",
             AsyncMock(return_value="fixed-sha"),
         )
         orch._run_required_check_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
@@ -5292,15 +5292,15 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
         monkeypatch.setattr(
-            "symphony.orchestrator.poll._git_fetch_branch",
+            "symphony.orchestrator.poll._merge._git_fetch_branch",
             AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
-            "symphony.orchestrator.poll._workspace_ref_sha",
+            "symphony.orchestrator.poll._merge._workspace_ref_sha",
             AsyncMock(return_value="start-sha"),
         )
         monkeypatch.setattr(
-            "symphony.orchestrator.poll._workspace_head_sha",
+            "symphony.orchestrator.poll._merge._workspace_head_sha",
             AsyncMock(return_value="fixed-sha"),
         )
         orch._run_required_check_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
@@ -5561,7 +5561,7 @@ async def test_no_review_binding_red_ci_dispatches_required_check_fix(
         orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
         required_contexts = AsyncMock(return_value=("Vercel",))
         monkeypatch.setattr(
-            "symphony.orchestrator.poll.get_required_contexts",
+            "symphony.orchestrator.poll._merge.get_required_contexts",
             required_contexts,
             raising=False,
         )

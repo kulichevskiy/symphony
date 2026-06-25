@@ -32,6 +32,7 @@ from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
 from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator import poll as poll_module
+from symphony.orchestrator.poll import _merge as merge_module
 from symphony.orchestrator.poll import (
     Orchestrator,
     SlashHandlerFailure,
@@ -287,6 +288,11 @@ def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(poll_module, "_workspace_head_sha", fake_workspace_head_sha)
     monkeypatch.setattr(poll_module, "_workspace_ref_sha", fake_workspace_ref_sha)
     monkeypatch.setattr(poll_module, "_git_fetch_branch", fake_git_fetch_branch)
+    # Merge-domain methods resolve these free functions in `_merge`, so pin them
+    # there too (the names are imported into that module).
+    monkeypatch.setattr(merge_module, "_workspace_head_sha", fake_workspace_head_sha)
+    monkeypatch.setattr(merge_module, "_workspace_ref_sha", fake_workspace_ref_sha)
+    monkeypatch.setattr(merge_module, "_git_fetch_branch", fake_git_fetch_branch)
 
 
 def test_github_commit_url_uses_configured_host() -> None:
@@ -4901,23 +4907,23 @@ async def test_merge_conflict_fix_run_aborts_rebase_on_failure(
         gh.repo_default_branch = AsyncMock(return_value="main")
 
         sync_workspace = AsyncMock(return_value=None)
-        monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", sync_workspace)
-        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
-        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=False))
+        monkeypatch.setattr(merge_module, "_sync_workspace_to_remote", sync_workspace)
+        monkeypatch.setattr(merge_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(merge_module, "_git_rebase", AsyncMock(return_value=False))
         monkeypatch.setattr(
-            poll_module,
+            merge_module,
             "_git_conflicted_files",
             AsyncMock(return_value=["conflicted.py"]),
         )
         abort_rebase = AsyncMock(return_value=None)
-        monkeypatch.setattr(poll_module, "_git_abort_rebase", abort_rebase)
+        monkeypatch.setattr(merge_module, "_git_abort_rebase", abort_rebase)
         add_and_continue = AsyncMock(
             side_effect=RuntimeError("continue failed")
             if failure_mode == "continue"
             else None
         )
         monkeypatch.setattr(
-            poll_module,
+            merge_module,
             "_git_add_and_continue_rebase",
             add_and_continue,
         )
@@ -4990,21 +4996,21 @@ async def test_merge_conflict_fix_reports_status_when_rebase_has_no_unresolved_p
         gh.repo_default_branch = AsyncMock(return_value="main")
 
         sync_workspace = AsyncMock(return_value=None)
-        monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", sync_workspace)
-        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
-        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=False))
+        monkeypatch.setattr(merge_module, "_sync_workspace_to_remote", sync_workspace)
+        monkeypatch.setattr(merge_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(merge_module, "_git_rebase", AsyncMock(return_value=False))
         monkeypatch.setattr(
-            poll_module,
+            merge_module,
             "_git_conflicted_files",
             AsyncMock(return_value=[]),
         )
         monkeypatch.setattr(
-            poll_module,
+            merge_module,
             "_git_status_short",
             AsyncMock(return_value="M  ui/src/pages/GoalDashboard.test.tsx"),
         )
         abort_rebase = AsyncMock(return_value=None)
-        monkeypatch.setattr(poll_module, "_git_abort_rebase", abort_rebase)
+        monkeypatch.setattr(merge_module, "_git_abort_rebase", abort_rebase)
 
         runner = _FakeRunner([RunnerEvent(kind="exit", returncode=0)])
         orch = Orchestrator(
@@ -5077,11 +5083,15 @@ async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
         async def workspace_ref(_workspace_path: Path, _ref: str) -> str:
             return "remote-head-sha" if synced else "stale-local-sha"
 
-        monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", sync_workspace)
+        monkeypatch.setattr(merge_module, "_sync_workspace_to_remote", sync_workspace)
+        monkeypatch.setattr(merge_module, "_workspace_head_sha", workspace_head)
+        monkeypatch.setattr(merge_module, "_workspace_ref_sha", workspace_ref)
+        monkeypatch.setattr(merge_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(merge_module, "_git_rebase", AsyncMock(return_value=True))
+        # The noop baseline is verified by `_validate_review_fix_advanced`, which
+        # still lives on `Orchestrator` and resolves these names in `poll_module`.
         monkeypatch.setattr(poll_module, "_workspace_head_sha", workspace_head)
         monkeypatch.setattr(poll_module, "_workspace_ref_sha", workspace_ref)
-        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
-        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=True))
 
         force_push = AsyncMock()
         orch = Orchestrator(
@@ -5153,20 +5163,20 @@ async def test_merge_conflict_fix_run_continues_through_later_conflicts(
         gh.pr_comment = AsyncMock()
 
         sync_workspace = AsyncMock(return_value=None)
-        monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", sync_workspace)
-        monkeypatch.setattr(poll_module, "_git_fetch", AsyncMock(return_value=None))
-        monkeypatch.setattr(poll_module, "_git_rebase", AsyncMock(return_value=False))
+        monkeypatch.setattr(merge_module, "_sync_workspace_to_remote", sync_workspace)
+        monkeypatch.setattr(merge_module, "_git_fetch", AsyncMock(return_value=None))
+        monkeypatch.setattr(merge_module, "_git_rebase", AsyncMock(return_value=False))
         conflicted_files = AsyncMock(side_effect=[["first.py"], ["second.py"]])
         monkeypatch.setattr(
-            poll_module,
+            merge_module,
             "_git_conflicted_files",
             conflicted_files,
         )
         abort_rebase = AsyncMock(return_value=None)
-        monkeypatch.setattr(poll_module, "_git_abort_rebase", abort_rebase)
+        monkeypatch.setattr(merge_module, "_git_abort_rebase", abort_rebase)
         add_and_continue = AsyncMock(side_effect=[False, True])
         monkeypatch.setattr(
-            poll_module,
+            merge_module,
             "_git_add_and_continue_rebase",
             add_and_continue,
         )
