@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145).
+"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`
@@ -15,12 +15,18 @@ inherits it.
 `_SlashCommandsMixin` (SYM-145) owns the slash-command domain (web-commands /
 comment-cursor poll / `$intent` dispatch + the per-state handlers); it extends
 `_OrchestratorBase` and `Orchestrator` inherits it.
+
+`_ReviewMixin` (SYM-146) owns the review-monitoring domain (review-run polling,
+@codex verdict/retrigger/re-arm, the review fix-dispatch loop, review operator
+waits, resurrect/fail/park of review monitors); it extends `_OrchestratorBase`
+and `Orchestrator` inherits it.
 """
 
 from symphony.orchestrator import poll
-from symphony.orchestrator.poll import _base, _dispatch, _git, _helpers, _slash_commands
+from symphony.orchestrator.poll import _base, _dispatch, _git, _helpers, _review, _slash_commands
 from symphony.orchestrator.poll._base import _OrchestratorBase
 from symphony.orchestrator.poll._dispatch import _DispatchMixin
+from symphony.orchestrator.poll._review import _ReviewMixin
 from symphony.orchestrator.poll._slash_commands import _SlashCommandsMixin
 
 # Git/workspace primitives that must live in `_git.py`.
@@ -102,7 +108,7 @@ _BASE_METHODS = [
     "_binding_for_review",
 ]
 
-# Foundation module-level names relocated to `_base.py` (SYM-144, SYM-149),
+# Foundation module-level names relocated to `_base.py` (SYM-144, SYM-149, SYM-146),
 # re-exported from `__init__.py` by explicit name so existing imports keep working.
 _BASE_NAMES = [
     "_tracker_context_for_binding",
@@ -180,6 +186,55 @@ _SLASH_NAMES = [
     "_manual_merge_parked_run_id",
 ]
 
+# Review-monitoring methods that must live on `_ReviewMixin` (SYM-146).
+_REVIEW_METHODS = [
+    "_handle_active_review_retry_intent",
+    "_stop_review_monitor",
+    "_binding_for_review_issue_id",
+    "_poll_review_runs",
+    "_review_poll_deferred_by_deliver_failed_wait",
+    "_schedule_review_poll",
+    "_mark_review_rearm_retry",
+    "_clear_review_rearm_retry",
+    "_review_rearm_retry_pending",
+    "_clear_review_no_signal_rearm_heads",
+    "_local_review_approved_for_current_review",
+    "_latest_local_review_for_current_review",
+    "_local_review_permits_current_review",
+    "_review_retry_needs_local_gate",
+    "_local_review_completed_for_issue",
+    "_poll_review_run_with_limits",
+    "_refresh_review_poll_candidate",
+    "_review_poll_done",
+    "_close_review_run",
+    "_complete_review_monitors_for_merge",
+    "_terminate_deliver_failed_review_monitors",
+    "_cancel_deliver_failed_review_poll_tasks",
+    "_maybe_rearm_codex_review_for_no_signal",
+    "_poll_review_run",
+    "_dispatch_ci_fix_run",
+    "_failing_check_log_tail",
+    "_retrigger_codex_review_unless_approved",
+    "_review_verdict_and_head_for_pr",
+    "_retrigger_codex_review",
+    "_format_comment_trigger",
+    "_dispatch_review_comment_fix_run",
+    "_dispatch_merge_conflict_fix_run",
+    "_validate_review_fix_advanced",
+    "_track_review_failed_wait",
+    "_track_review_stopped_wait",
+    "_handle_review_failed_slash_intent",
+    "_resume_review_monitor",
+    "_handle_skip_review_intent",
+    "_resurrect_review_runs",
+    "_resurrect_one_review_monitor",
+    "_fail_review_run",
+    "_fail_orphaned_review_run",
+    "_park_review_for_approval",
+    "_maybe_post_codex_lgtm",
+    "_review_verdict_for_pr",
+]
+
 
 def test_orchestrator_inherits_base() -> None:
     assert issubclass(poll.Orchestrator, _OrchestratorBase)
@@ -231,6 +286,27 @@ def test_slash_mixin_module() -> None:
 def test_slash_names_relocated_and_reexported_by_identity() -> None:
     for name in _SLASH_NAMES:
         assert getattr(poll, name) is getattr(_slash_commands, name), name
+
+
+def test_orchestrator_inherits_review_mixin() -> None:
+    assert issubclass(poll.Orchestrator, _ReviewMixin)
+    assert issubclass(_ReviewMixin, _OrchestratorBase)
+    assert poll.Orchestrator is not _ReviewMixin
+
+
+def test_review_methods_defined_on_mixin() -> None:
+    for name in _REVIEW_METHODS:
+        member = getattr(poll.Orchestrator, name)
+        owner = (
+            member.fget.__qualname__
+            if isinstance(member, property)
+            else member.__qualname__
+        )
+        assert owner.startswith("_ReviewMixin."), name
+
+
+def test_review_mixin_module() -> None:
+    assert _review.__name__.endswith("poll._review")
 
 
 def test_foundation_methods_defined_on_base() -> None:
