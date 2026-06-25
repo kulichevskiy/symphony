@@ -14,11 +14,16 @@ import re
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
+import aiosqlite
+
+from ... import db
 from ...agent.codex_cli import build_codex_workspace_write_command
 from ...agent.codex_models import DEFAULT_CODEX_MODEL
 from ...pipeline.cost_guard import UsageDelta
+from ...pipeline.local_review_loop import LoopResult
+from ...pipeline.state_machine import classify_termination
 from ...tracker import Issue as LinearIssue
 
 _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
@@ -468,3 +473,48 @@ NEEDS_HUMAN_APPROVAL_LABEL = "needs-human-approval"
 
 def _needs_human_approval_label_present(issue: LinearIssue) -> bool:
     return NEEDS_HUMAN_APPROVAL_LABEL in issue.labels
+
+
+async def _add_run_usage(
+    conn: aiosqlite.Connection, run_id: str, usage: UsageDelta
+) -> None:
+    if not usage.has_usage():
+        return
+    await db.runs.add_usage(
+        conn,
+        run_id,
+        cost_usd=usage.cost_usd,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        cache_read_tokens=usage.cache_read_tokens,
+    )
+
+class _TerminationKwargs(TypedDict):
+    kind: str
+    detail: str
+    returncode: int | None
+
+def _termination_kwargs(
+    *,
+    status: str,
+    final_kind: str | None = None,
+    returncode: int | None = None,
+    exc: BaseException | str | None = None,
+    reason: str | None = None,
+) -> _TerminationKwargs:
+    kind, detail = classify_termination(
+        status=status,
+        final_kind=final_kind,
+        returncode=returncode,
+        exc=exc,
+        reason=reason,
+    )
+    return {"kind": kind, "detail": detail, "returncode": returncode}
+
+def _local_review_termination_reason(result: LoopResult | None) -> str:
+    if result is None:
+        return "local-review session failed"
+    if result.error:
+        return result.error
+    return f"local-review ended with {result.outcome.value}"

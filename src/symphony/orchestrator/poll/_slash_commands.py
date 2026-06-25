@@ -44,7 +44,14 @@ from ...linear.templates import (
 )
 from ...tracker import Comment as LinearComment
 from ...tracker import Issue as LinearIssue
-from ._base import _ImplementHandoff, _OrchestratorBase, _PendingDelivery
+from ._base import (
+    SlashHandlerFailure as SlashHandlerFailure,
+)
+from ._base import (
+    _ImplementHandoff,
+    _OrchestratorBase,
+    _PendingDelivery,
+)
 from ._helpers import (
     _needs_human_approval_label_present,
     _parse_rfc3339,
@@ -57,22 +64,6 @@ log = logging.getLogger(__name__)
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
 
-class SlashHandlerFailure(RuntimeError):
-    """Raised from a `_handle_*_slash_intent` when a critical Linear/GitHub
-    call fails mid-handler (e.g. `move_issue` cannot reach the target state).
-
-    The outer `_handle_unseen_slash_comment` catches this, posts a
-    `command_rejected` Linear comment with `reason`, and intentionally does
-    NOT mark the comment as seen so the next poll tick can retry. This
-    prevents the silent-drop family (SYM-32, #59, #104) where a slash command
-    is read off Linear, advances the cursor, but never triggers the
-    underlying state transition.
-    """
-
-    def __init__(self, slash_text: str, reason: str) -> None:
-        super().__init__(reason)
-        self.slash_text = slash_text
-        self.reason = reason
 
 
 def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
