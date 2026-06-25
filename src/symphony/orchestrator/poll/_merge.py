@@ -37,11 +37,9 @@ from datetime import (
 )
 from functools import partial
 from pathlib import Path
-from typing import Any
 
 from ... import db
 from ...agent.prompt import (
-    merge_conflict_fix_prompt,
     merge_conflict_rebase_fix_prompt,
     merge_prompt,
     merge_required_check_fix_prompt,
@@ -64,9 +62,6 @@ from ...linear.slash import (
 from ...linear.templates import (
     CommentVars,
     awaiting_approval,
-    codex_lgtm,
-    fix_pushed,
-    fixing_merge_conflict,
     resumed,
     stage_done,
     truncate_body,
@@ -77,15 +72,8 @@ from ...pipeline.local_review_loop import (
     LoopResult,
 )
 from ...pipeline.review_classifier import (
-    CheckRun as ReviewCheckRun,
-)
-from ...pipeline.review_classifier import (
-    ReviewSnapshot,
-    Verdict,
     VerdictKind,
     has_hit_iteration_cap,
-    is_codex_author,
-    review_classifier,
     should_dispatch_fix_run,
 )
 from ...pipeline.state_machine import on_runner_event
@@ -100,13 +88,7 @@ from ._base import (
     _OrchestratorBase,
 )
 from ._git import (
-    _git_abort_rebase,
-    _git_add_and_continue_rebase,
-    _git_conflicted_files,
-    _git_fetch,
     _git_fetch_branch,
-    _git_rebase,
-    _git_status_short,
     _sync_workspace_to_remote,
     _workspace_head_sha,
     _workspace_ref_sha,
@@ -114,13 +96,10 @@ from ._git import (
 from ._helpers import (
     NEEDS_HUMAN_APPROVAL_LABEL,
     _add_run_usage,
-    _github_commit_url,
     _local_review_termination_reason,
     _needs_human_approval_label_present,
     _no_signal_head_check_state,
-    _parse_rfc3339,
     _pr_base_ref_from_view,
-    _pr_url_for_state,
     _pr_view_has_merge_conflict,
     _pr_view_is_clean_mergeable,
     _pr_view_is_closed,
@@ -133,39 +112,18 @@ from ._helpers import (
     _status_check_names,
     _status_check_sha,
     _status_rollup_nodes,
-    _sum_usage,
     _termination_kwargs,
     build_fix_runner_command,
     build_merge_runner_command,
 )
 from ._review import (
     CODEX_NO_ISSUES_MARKER,
-    _codex_lgtm_reactions_from_issue_comments,
     _local_review_infra_failed,
     _local_review_needs_approval,
-    _reactions_from_github,
     _read_run_stream_api_error_obj,
-    _review_comments_from_github,
-    _reviews_from_github,
 )
 
 log = logging.getLogger(__name__)
-
-
-
-async def _abort_rebase_safely(
-    workspace_path: Path, *, issue_identifier: str, reason: str
-) -> None:
-    try:
-        await _git_abort_rebase(workspace_path)
-    except Exception as e:  # noqa: BLE001
-        log.warning(
-            "could not abort rebase after %s for %s: %s",
-            reason,
-            issue_identifier,
-            e,
-        )
-
 
 
 def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bool:
@@ -183,37 +141,6 @@ def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bo
         issue.team_key == binding.linear_team_key
         and issue.state_name in active_states
         and (binding.issue_label is None or binding.issue_label in issue.labels)
-    )
-
-
-
-def _review_check_from_github(run: GitHubCheckRun) -> ReviewCheckRun:
-    if run.bucket in ("pass", "skipping"):
-        return ReviewCheckRun(
-            name=run.name,
-            status="completed",
-            conclusion="success",
-            required=True,
-        )
-    if run.bucket == "cancel":
-        return ReviewCheckRun(
-            name=run.name,
-            status="completed",
-            conclusion="cancelled",
-            required=True,
-        )
-    if run.bucket == "fail":
-        return ReviewCheckRun(
-            name=run.name,
-            status="completed",
-            conclusion="failure",
-            required=True,
-        )
-    return ReviewCheckRun(
-        name=run.name,
-        status="in_progress",
-        conclusion=None,
-        required=True,
     )
 
 
@@ -540,46 +467,6 @@ class _MergeMixin(_OrchestratorBase):
             pass
         except Exception:
             log.exception("merge wait recovery task crashed for issue_id=%s", issue_id)
-
-
-    async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None:
-        """Retire review polling once a merge run owns the issue."""
-        live_review_runs = [
-            run
-            for run in await db.runs.list_live_by_stage(self._conn, stage="review")
-            if run.issue_id == issue.id
-        ]
-        if not live_review_runs:
-            return
-
-        now = self._now().isoformat()
-        closed_run_ids: set[str] = set()
-        for run in live_review_runs:
-            await db.runs.update_status(
-                self._conn,
-                run.id,
-                "completed",
-                ended_at=now,
-            )
-            closed_run_ids.add(run.id)
-            self._clear_review_no_signal_rearm_heads(run.id)
-            task = self._review_poll_run_tasks.pop(run.id, None)
-            if task is not None:
-                self._review_poll_tasks.discard(task)
-                if not task.done():
-                    task.cancel()
-            self._review_poll_run_ids.discard(run.id)
-            await self._clear_review_rearm_retry(run.id)
-
-        for mapped_issue_id, mapped_run_id in list(self._review_poll_issue_ids.items()):
-            if mapped_issue_id == issue.id or mapped_run_id in closed_run_ids:
-                self._review_poll_issue_ids.pop(mapped_issue_id, None)
-
-        log.info(
-            "completed review monitor(s) %s for %s before merge",
-            ", ".join(sorted(closed_run_ids)),
-            issue.identifier,
-        )
 
 
     async def _interrupt_stale_merge_needs_approval_for_state(
@@ -1670,430 +1557,6 @@ class _MergeMixin(_OrchestratorBase):
             )
 
 
-    async def _dispatch_merge_conflict_fix_run(
-        self,
-        *,
-        run: db.runs.Run,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        iteration: int,
-    ) -> bool:
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
-            return False
-        base_branch = binding.base_branch
-        if base_branch is None:
-            try:
-                base_branch = await self._gh.repo_default_branch(binding.github_repo)
-            except GitHubError as e:
-                log.warning(
-                    "repo_default_branch failed for %s; falling back to 'main': %s",
-                    issue.identifier,
-                    e,
-                )
-                base_branch = "main"
-
-        state = await db.review_state.get(self._conn, issue.id)
-        pr_url = _pr_url_for_state(
-            repo=binding.github_repo,
-            pr_number=state.pr_number,
-            pr_url=state.pr_url,
-        )
-        tracker = self.tracker(binding)
-
-        async with self._review_fix_dispatch_slot(binding, issue):
-            # Post the "fixing" comment once we have a slot.
-            v_start = CommentVars(
-                stage="review",
-                repo=binding.github_repo,
-                issue=state.pr_number or 0,
-                pr_url=pr_url,
-                review_iter=iteration,
-            )
-            try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(fixing_merge_conflict(v_start))
-                )
-            except LinearError as e:
-                log.warning(
-                    "could not post fixing_merge_conflict comment for %s: %s",
-                    issue.identifier,
-                    e,
-                )
-
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for merge-conflict fix-run %s",
-                    issue.identifier,
-                )
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace acquire failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            # Step 1: orchestrator fetches origin.
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            try:
-                await _sync_workspace_to_remote(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning("workspace sync failed for %s: %s", issue.identifier, e)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace sync failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
-            if not start_sha:
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"could not read review fix-run remote HEAD for {branch}",
-                    last_log="",
-                    auto_retry=False,
-                    operator_wait=True,
-                )
-                return False
-
-            try:
-                await _git_fetch(workspace_path)
-            except Exception as e:  # noqa: BLE001
-                log.warning("git fetch failed for %s: %s", issue.identifier, e)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"git fetch failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            # Step 2: orchestrator attempts the rebase.
-            upstream = f"origin/{base_branch or 'main'}"
-            try:
-                rebase_clean = await _git_rebase(workspace_path, upstream)
-            except Exception as e:  # noqa: BLE001
-                log.warning("git rebase failed for %s: %s", issue.identifier, e)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"git rebase failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            conflicted_files: list[str] = []
-            if not rebase_clean:
-                conflicted_files = await _git_conflicted_files(workspace_path)
-                if not conflicted_files:
-                    # Rebase exited non-zero but Git did not leave unresolved
-                    # paths. This commonly means a dirty workspace or another
-                    # non-content-conflict failure; surface status so operators
-                    # can debug the real state instead of seeing a blank error.
-                    status_short = await _git_status_short(workspace_path)
-                    log.warning(
-                        "rebase non-zero but no unresolved paths for %s; git status:\n%s",
-                        issue.identifier,
-                        status_short or "<clean>",
-                    )
-                    await _abort_rebase_safely(
-                        workspace_path,
-                        issue_identifier=issue.identifier,
-                        reason="rebase with no unresolved paths",
-                    )
-                    self._workspace.release(binding, issue)
-                    error = "rebase failed with no unresolved paths"
-                    if status_short:
-                        error += f"; git status: {status_short}"
-                    await self._fail_review_run(
-                        run=run,
-                        binding=binding,
-                        issue=issue,
-                        error=error,
-                        last_log=status_short,
-                    )
-                    return False
-
-            # Create a review_fix row for cost tracking and dispatch_run_ids cleanup.
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stage="review",
-            )
-            if not inserted:
-                # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Release the workspace and bail without clobbering dispatch ids.
-                self._workspace.release(binding, issue)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
-            try:
-                cumulative_usage = UsageDelta()
-                if rebase_clean:
-                    # No conflicts: skip the agent entirely.
-                    log.info(
-                        "rebase was clean for %s; skipping agent", issue.identifier
-                    )
-                while not rebase_clean:
-                    # Step 3: dispatch the agent to resolve conflict markers (no git cmds).
-                    prompt = merge_conflict_fix_prompt(
-                        issue_title=issue.title,
-                        issue_body=issue.description,
-                        labels=list(issue.labels),
-                        base_branch=base_branch or "main",
-                        conflicted_files=conflicted_files,
-                    )
-                    try:
-                        prior_total = (
-                            await db.runs.cost_for_issue(self._conn, issue.id)
-                        ) + cumulative_usage.cost_usd
-                        (
-                            run_usage,
-                            final_kind,
-                            final_returncode,
-                        ) = await self._run_fix_agent(
-                            binding=binding,
-                            issue=issue,
-                            run_id=fix_run_id,
-                            workspace_path=workspace_path,
-                            prompt=prompt,
-                            prior_total=prior_total,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        log.exception(
-                            "merge-conflict fix-run execution failed for %s",
-                            issue.identifier,
-                        )
-                        await _abort_rebase_safely(
-                            workspace_path,
-                            issue_identifier=issue.identifier,
-                            reason="merge-conflict fix-run execution failure",
-                        )
-                        await db.runs.update_status(
-                            self._conn,
-                            fix_run_id,
-                            "failed",
-                            ended_at=self._now().isoformat(),
-                            **_termination_kwargs(
-                                status="failed",
-                                exc=e,
-                                reason=f"merge-conflict fix-run execution failed: {e}",
-                            ),
-                        )
-                        await self._fail_review_run(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            error=f"merge-conflict fix-run execution failed: {e}",
-                            last_log=str(e),
-                        )
-                        return False
-                    cumulative_usage = _sum_usage(cumulative_usage, run_usage)
-
-                    transition = on_runner_event(
-                        stage="review",
-                        event_kind=final_kind,
-                        returncode=final_returncode,
-                    )
-                    if transition.next_run_status != "completed":
-                        await _abort_rebase_safely(
-                            workspace_path,
-                            issue_identifier=issue.identifier,
-                            reason=f"merge-conflict fix-run {final_kind}",
-                        )
-                        await db.runs.update_status(
-                            self._conn,
-                            fix_run_id,
-                            transition.next_run_status,
-                            ended_at=self._now().isoformat(),
-                            **_termination_kwargs(
-                                status=transition.next_run_status,
-                                final_kind=final_kind,
-                                returncode=final_returncode,
-                                reason=f"merge-conflict fix-run ended with {final_kind}",
-                            ),
-                        )
-                        await self._fail_review_run(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            error=f"merge-conflict fix-run ended with {final_kind}",
-                            last_log="",
-                        )
-                        return False
-
-                    # Step 4: stage resolved files and continue the rebase.
-                    try:
-                        rebase_clean = await _git_add_and_continue_rebase(
-                            workspace_path, conflicted_files
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        log.warning(
-                            "rebase --continue failed for %s: %s", issue.identifier, e
-                        )
-                        await _abort_rebase_safely(
-                            workspace_path,
-                            issue_identifier=issue.identifier,
-                            reason="rebase --continue failure",
-                        )
-                        await db.runs.update_status(
-                            self._conn,
-                            fix_run_id,
-                            "failed",
-                            ended_at=self._now().isoformat(),
-                            **_termination_kwargs(
-                                status="failed",
-                                exc=e,
-                                reason=f"rebase --continue failed: {e}",
-                            ),
-                        )
-                        await self._fail_review_run(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            error=f"rebase --continue failed: {e}",
-                            last_log=str(e),
-                        )
-                        return False
-                    if not rebase_clean:
-                        conflicted_files = await _git_conflicted_files(workspace_path)
-                        if not conflicted_files:
-                            status_short = await _git_status_short(workspace_path)
-                            log.warning(
-                                "rebase --continue non-zero but no unresolved paths "
-                                "for %s; git status:\n%s",
-                                issue.identifier,
-                                status_short or "<clean>",
-                            )
-                            await _abort_rebase_safely(
-                                workspace_path,
-                                issue_identifier=issue.identifier,
-                                reason="rebase --continue with no unresolved paths",
-                            )
-                            error = "rebase --continue failed with no unresolved paths"
-                            if status_short:
-                                error += f"; git status: {status_short}"
-                            await db.runs.update_status(
-                                self._conn,
-                                fix_run_id,
-                                "failed",
-                                ended_at=self._now().isoformat(),
-                                **_termination_kwargs(
-                                    status="failed",
-                                    reason=error,
-                                ),
-                            )
-                            await self._fail_review_run(
-                                run=run,
-                                binding=binding,
-                                issue=issue,
-                                error=error,
-                                last_log=status_short,
-                            )
-                            return False
-
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-
-            await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
-
-            pushed_sha = await self._validate_review_fix_advanced(
-                run=run,
-                fix_run_id=fix_run_id,
-                binding=binding,
-                issue=issue,
-                workspace_path=workspace_path,
-                branch=branch,
-                start_sha=start_sha,
-            )
-            if not pushed_sha:
-                return False
-
-            await db.runs.update_status(
-                self._conn,
-                fix_run_id,
-                "completed",
-                ended_at=self._now().isoformat(),
-            )
-
-            # Step 5: force-push the rebased branch.
-            try:
-                await self._force_push_fn(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "force-push failed for merge-conflict fix-run %s: %s",
-                    issue.identifier,
-                    e,
-                )
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"force-push failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
-            v_done = CommentVars(
-                stage="review",
-                repo=binding.github_repo,
-                issue=state.pr_number or 0,
-                pr_url=pr_url,
-                review_iter=iteration,
-                input_tokens=tokens.input_tokens,
-                output_tokens=tokens.output_tokens,
-                cache_write_tokens=tokens.cache_write_tokens,
-                cache_read_tokens=tokens.cache_read_tokens,
-                commit_url=_github_commit_url(binding.github_repo, pushed_sha),
-            )
-            try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(fix_pushed(v_done))
-                )
-            except LinearError as e:
-                log.warning(
-                    "could not post fix_pushed comment for %s: %s", issue.identifier, e
-                )
-
-            state = await db.review_state.get(self._conn, issue.id)
-            await self._retrigger_codex_review_unless_approved(
-                binding=binding,
-                issue=issue,
-                state=state,
-            )
-            await self._interrupt_stale_merge_needs_approval_for_state(
-                binding=binding,
-                issue=issue,
-                state=state,
-            )
-            return True
-
-
     async def _handle_merge_needs_approval_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -3077,188 +2540,6 @@ class _MergeMixin(_OrchestratorBase):
             )
             return None
         return current
-
-
-    async def _maybe_post_codex_lgtm(
-        self,
-        *,
-        run: db.runs.Run,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        state: db.review_state.ReviewState,
-        pr_number: int | None,
-        head_committed_at: str = "",
-        issue_comments: list[dict[str, object]] | None = None,
-    ) -> None:
-        """Fetch PR issue comments; if Codex posted a 'no issues' comment that
-        hasn't been announced in Linear yet, post the notification once."""
-        if pr_number is None:
-            return
-        if issue_comments is None:
-            try:
-                raw = await self._gh.pr_issue_comments(
-                    pr_number, repo=binding.github_repo
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch issue comments for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                return
-        else:
-            raw = issue_comments
-
-        lgtm_comment: dict[str, Any] | None = None
-        cycle_started_raw = run.started_at
-        issue_pr = await db.issue_prs.get(
-            self._conn,
-            issue_id=issue.id,
-            github_repo=binding.github_repo,
-        )
-        if issue_pr is not None:
-            cycle_started_raw = issue_pr.created_at
-        try:
-            cycle_started_at = _parse_rfc3339(cycle_started_raw)
-        except ValueError:
-            log.warning(
-                "could not parse review cycle start for %s: %s",
-                issue.identifier,
-                cycle_started_raw,
-            )
-            return
-        min_created_at = cycle_started_at
-        if head_committed_at:
-            try:
-                head_dt = _parse_rfc3339(head_committed_at)
-            except ValueError:
-                log.warning(
-                    "could not parse PR head commit time for %s: %s",
-                    issue.identifier,
-                    head_committed_at,
-                )
-            else:
-                min_created_at = max(min_created_at, head_dt)
-        for entry in raw:
-            user: dict[str, Any] = entry.get("user") or {}
-            login = str(user.get("login") or "")
-            body = str(entry.get("body") or "")
-            created_at_raw = str(entry.get("created_at") or entry.get("createdAt") or "")
-            if not created_at_raw:
-                continue
-            try:
-                created_at = _parse_rfc3339(created_at_raw)
-            except ValueError:
-                log.warning(
-                    "ignoring Codex LGTM comment with invalid created_at: %s",
-                    created_at_raw,
-                )
-                continue
-            if created_at < min_created_at:
-                continue
-            if is_codex_author(login) and self._CODEX_NO_ISSUES_MARKER in body.lower():
-                lgtm_comment = entry
-
-        if lgtm_comment is None:
-            return
-
-        comment_id = str(lgtm_comment.get("id") or "")
-        if not comment_id or comment_id == state.codex_lgtm_comment_id:
-            return
-
-        pr_url = state.pr_url or f"https://github.com/{binding.github_repo}/pull/{pr_number}"
-        v = CommentVars(
-            stage="review",
-            repo=binding.github_repo,
-            issue=pr_number,
-            pr_url=pr_url,
-            run_id=str(run.id),
-        )
-        tracker = self.tracker(binding)
-        try:
-            await tracker.post_comment(issue.id, codex_lgtm(v))
-        except LinearError as e:
-            log.warning(
-                "could not post codex_lgtm comment for %s: %s",
-                issue.identifier,
-                e,
-            )
-            return
-        await db.review_state.set_codex_lgtm_comment_id(self._conn, issue.id, comment_id)
-
-
-    async def _review_verdict_for_pr(
-        self,
-        *,
-        binding: RepoBinding,
-        pr_number: int,
-        view: dict[str, object] | None = None,
-    ) -> Verdict:
-        if view is None:
-            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
-        head_sha = str(view.get("headRefOid") or "")
-        if not head_sha:
-            raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
-
-        checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
-        ci = [_review_check_from_github(run) for run in checks.runs]
-        if not binding.resolved_remote_review():
-            human_reviews = tuple(
-                r
-                for r in _reviews_from_github(
-                    await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
-                )
-                if not is_codex_author(r.user_login)
-            )
-            return review_classifier(
-                comments=[],
-                ci=ci,
-                snapshot=ReviewSnapshot(
-                    head_sha=head_sha,
-                    head_committed_at="",
-                    reviews=human_reviews,
-                    reactions=(),
-                    mergeable=str(view.get("mergeable") or ""),
-                ),
-            )
-
-        comments = await self._gh.pr_review_comments(
-            pr_number,
-            repo=binding.github_repo,
-        )
-        reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
-        reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
-        try:
-            issue_comments = await self._gh.pr_issue_comments(
-                pr_number,
-                repo=binding.github_repo,
-            )
-        except GitHubError as e:
-            log.warning(
-                "could not fetch PR issue comments for %s#%d: %s",
-                binding.github_repo,
-                pr_number,
-                e,
-            )
-            issue_comments = []
-        committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
-
-        snapshot = ReviewSnapshot(
-            head_sha=head_sha,
-            head_committed_at=committed_at,
-            reactions=(
-                *_reactions_from_github(reactions),
-                *_codex_lgtm_reactions_from_issue_comments(issue_comments),
-            ),
-            reviews=_reviews_from_github(reviews),
-            mergeable=str(view.get("mergeable") or ""),
-        )
-        return review_classifier(
-            comments=_review_comments_from_github(comments),
-            ci=ci,
-            snapshot=snapshot,
-        )
 
 
     async def _poll_submitted_merge(
