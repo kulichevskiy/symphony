@@ -119,15 +119,16 @@ def _process_alive(pid: int) -> bool:
 
 
 def _terminate_pid(pid: int) -> None:
-    """Best-effort SIGTERM→SIGKILL on a duplicate run's subprocess. Both signals
-    are escalated unconditionally: SIGKILL on an already-exited pid raises
-    `ProcessLookupError`, which we swallow. `PermissionError` (foreign-owned pid)
-    means we can't signal it — also swallowed, the row is still marked
-    interrupted so the duplicate stops being treated as live."""
+    """Best-effort SIGTERM→SIGKILL on a duplicate run's process group. LocalRunner
+    uses start_new_session=True so the stored pid equals the process group id;
+    killpg reaches all child processes it spawned. Both signals are sent
+    unconditionally: SIGKILL on an already-exited group raises ProcessLookupError,
+    which we swallow. PermissionError (foreign-owned) is also swallowed — the row
+    is still marked superseded so the duplicate stops being treated as live."""
     with suppress(ProcessLookupError, PermissionError):
-        os.kill(pid, signal.SIGTERM)
+        os.killpg(pid, signal.SIGTERM)
     with suppress(ProcessLookupError, PermissionError):
-        os.kill(pid, signal.SIGKILL)
+        os.killpg(pid, signal.SIGKILL)
 
 
 def _tracker_resolver(tracker_or_resolver: TrackerInput) -> TrackerResolver:
@@ -420,8 +421,13 @@ async def _collapse_duplicate_live_runs(
 ) -> int:
     """Belt-and-suspenders behind SYM-152's dispatch-time dedup: if two live
     runs ever share the same `(issue_id, stage)` — a race, a crash, or a manual
-    dispatch — keep the oldest and collapse the rest. The younger duplicate's
-    process is terminated if alive and its row flipped `interrupted`.
+    dispatch — keep exactly one survivor and collapse the rest. The duplicate's
+    process is terminated if alive and its row marked superseded (not interrupted,
+    so it does not shadow the survivor in "latest-run" queries).
+
+    Survivor selection: prefer runs that have a pid (alive) over pidless/stale
+    rows; among equal pid-presence keep the oldest. This avoids keeping a stale
+    pidless row and terminating the newer run that actually has a live process.
 
     Runs after the orphan sweeps so it only sees genuinely-live survivors.
     Distinct stages for one issue (e.g. implement + local_review) never group
@@ -434,12 +440,13 @@ async def _collapse_duplicate_live_runs(
     for (issue_id, stage), group in groups.items():
         if len(group) < 2:
             continue
-        # list_live() already orders oldest-first; the head is the survivor.
-        survivor, *duplicates = group
+        # Prefer pid-having rows over pidless/stale; among ties keep oldest.
+        group_sorted = sorted(group, key=lambda r: (r.pid is None, r.started_at, r.id))
+        survivor, *duplicates = group_sorted
         for dup in duplicates:
             log.warning(
                 "reconcile: duplicate live run=%s issue=%s stage=%s "
-                "(keeping older run=%s) — terminating and marking interrupted",
+                "(keeping run=%s) — terminating and marking superseded",
                 dup.id,
                 issue_id,
                 stage,
@@ -450,12 +457,12 @@ async def _collapse_duplicate_live_runs(
             await db.runs.update_status(
                 conn,
                 dup.id,
-                db.runs.INTERRUPTED_STATUS,
+                db.runs.SUPERSEDED_STATUS,
                 ended_at=now,
                 kind=db.runs.DUPLICATE_STAGE_KIND,
                 detail=(
                     f"Duplicate live {stage} run for issue {issue_id}; "
-                    f"kept older run {survivor.id}"
+                    f"kept run {survivor.id}"
                 ),
             )
             flipped += 1

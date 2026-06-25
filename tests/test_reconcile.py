@@ -790,7 +790,7 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
         )
         row = await cur.fetchone()
         assert row is not None
-        assert row[0] == db.runs.INTERRUPTED_STATUS
+        assert row[0] == db.runs.SUPERSEDED_STATUS
         assert row[1] is not None
         assert row["termination_kind"] == db.runs.DUPLICATE_STAGE_KIND
         assert "older" in row["termination_detail"]

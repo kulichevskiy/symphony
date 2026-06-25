@@ -23,6 +23,11 @@ log = logging.getLogger(__name__)
 LIVE_STATUSES: tuple[str, ...] = ("running",)
 FAILED_STATUS: str = "failed"
 INTERRUPTED_STATUS: str = "interrupted"
+# Stamped by the startup reconcile on the younger of two duplicate live runs for
+# the same (issue_id, stage). Unlike INTERRUPTED_STATUS it is intentionally NOT
+# in TERMINAL_NON_SUCCESS_STATUSES — it is a bookkeeping close, not a failure,
+# and must not shadow the surviving run in "latest-run" queries.
+SUPERSEDED_STATUS: str = "superseded"
 NEEDS_APPROVAL_STATUS: str = "needs_approval"
 TERMINAL_NON_SUCCESS_STATUSES: frozenset[str] = frozenset(
     {FAILED_STATUS, INTERRUPTED_STATUS, NEEDS_APPROVAL_STATUS}
@@ -273,7 +278,7 @@ async def update_status(
         (run_id,),
     )
     run = await cur.fetchone()
-    if status in TERMINAL_NON_SUCCESS_STATUSES:
+    if status in TERMINAL_NON_SUCCESS_STATUSES or status == SUPERSEDED_STATUS:
         termination_kind = kind or "unknown"
         if kind is None:
             log.warning(
