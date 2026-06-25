@@ -23,6 +23,11 @@ log = logging.getLogger(__name__)
 LIVE_STATUSES: tuple[str, ...] = ("running",)
 FAILED_STATUS: str = "failed"
 INTERRUPTED_STATUS: str = "interrupted"
+# Stamped by the startup reconcile on the younger of two duplicate live runs for
+# the same (issue_id, stage). Unlike INTERRUPTED_STATUS it is intentionally NOT
+# in TERMINAL_NON_SUCCESS_STATUSES — it is a bookkeeping close, not a failure,
+# and must not shadow the surviving run in "latest-run" queries.
+SUPERSEDED_STATUS: str = "superseded"
 NEEDS_APPROVAL_STATUS: str = "needs_approval"
 TERMINAL_NON_SUCCESS_STATUSES: frozenset[str] = frozenset(
     {FAILED_STATUS, INTERRUPTED_STATUS, NEEDS_APPROVAL_STATUS}
@@ -62,6 +67,11 @@ LOCAL_REVIEW_TRANSIENT_RETRY_KIND: str = "local_review_transient_retry"
 # from the pre-push gates → publish → review monitoring. The fix is retried by
 # the next review poll cycle that detects the CI/check still failing.
 REVIEW_FIX_TRANSIENT_RETRY_KIND: str = "review_fix_transient_retry"
+# termination_kind stamped on the younger of two live runs that share the same
+# (issue_id, stage). Startup reconcile collapses such duplicates to a single
+# survivor (the oldest) — belt-and-suspenders behind SYM-152's dispatch-time
+# dedup, for races, crashes, or manual dispatches that slip past it.
+DUPLICATE_STAGE_KIND: str = "duplicate_stage"
 TERMINATION_DETAIL_MAX_BYTES: int = 4096
 TERMINATION_DETAIL_MAX_LINES: int = 80
 
@@ -268,7 +278,7 @@ async def update_status(
         (run_id,),
     )
     run = await cur.fetchone()
-    if status in TERMINAL_NON_SUCCESS_STATUSES:
+    if status in TERMINAL_NON_SUCCESS_STATUSES or status == SUPERSEDED_STATUS:
         termination_kind = kind or "unknown"
         if kind is None:
             log.warning(
@@ -790,6 +800,24 @@ async def list_live_local_review_without_pid(
     return [_row_to_run(r) for r in rows]
 
 
+async def list_live(conn: aiosqlite.Connection) -> list[Run]:
+    """All live runs, oldest first — input set for reconcile duplicate collapse."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+               termination_kind, termination_detail, exit_returncode
+        FROM runs
+        WHERE status IN ({placeholders})
+        ORDER BY started_at ASC, id ASC
+        """,
+        LIVE_STATUSES,
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run(r) for r in rows]
+
+
 async def list_live_by_stage(
     conn: aiosqlite.Connection, *, stage: str
 ) -> list[Run]:
@@ -916,7 +944,7 @@ async def latest_for_issue_stage(
                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
-        WHERE issue_id = ? AND stage = ?{started_filter}
+        WHERE issue_id = ? AND stage = ? AND status != 'superseded'{started_filter}
         ORDER BY started_at DESC
         LIMIT 1
         """,
@@ -1107,7 +1135,7 @@ async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
         """
         SELECT
             COALESCE(SUM(status = 'completed'), 0) AS completed,
-            COALESCE(SUM(status NOT IN ('completed', 'running')), 0) AS failed,
+            COALESCE(SUM(status NOT IN ('completed', 'running', 'superseded')), 0) AS failed,
             COALESCE(SUM(status = 'running'), 0) AS running,
             COALESCE(SUM(cost_usd), 0.0) AS total_cost,
             COALESCE(

@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -113,6 +115,25 @@ def _process_alive(pid: int) -> bool:
         return False
     except OSError:
         return True
+    return True
+
+
+def _terminate_pid(pid: int) -> bool:
+    """SIGTERM→SIGKILL on a duplicate run's process group.
+
+    Returns True when the process was successfully signalled or was already dead
+    (safe to mark the row superseded). Returns False when the signal could not be
+    sent because the process is alive but unowned (EPERM) or similarly unkillable —
+    in that case the caller must NOT mark the row superseded, since the duplicate
+    is still running."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True  # already dead
+    except OSError:
+        return False  # EPERM or similar — process is alive and we can't kill it
+    with suppress(OSError):  # ProcessLookupError = died after SIGTERM; others: best-effort
+        os.killpg(pid, signal.SIGKILL)
     return True
 
 
@@ -297,12 +318,16 @@ async def reconcile(
     *,
     clock: Callable[[], datetime] | None = None,
     pid_alive: Callable[[int], bool] = _process_alive,
+    terminate_pid: Callable[[int], bool] = _terminate_pid,
 ) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
 
     `pid_alive` is the process-liveness probe (default: `os.kill(pid, 0)`).
     Tests inject a Sim-owned probe so liveness is deterministic rather than
-    relying on a magic dead-PID convention.
+    relying on a magic dead-PID convention. `terminate_pid` (default:
+    SIGTERM→SIGKILL) kills the younger of any duplicate same-stage live runs;
+    it returns True on success/already-dead and False when the process could
+    not be killed (EPERM); tests inject a recorder so no real signals fly.
 
     Returns the number of rows flipped.
     """
@@ -391,4 +416,69 @@ async def reconcile(
             conn, tracker_for_context, run.issue_id, _LOCAL_REVIEW_REDISPATCH_BODY
         )
         flipped += 1
+
+    flipped += await _collapse_duplicate_live_runs(conn, now, terminate_pid)
+    return flipped
+
+
+async def _collapse_duplicate_live_runs(
+    conn: aiosqlite.Connection,
+    now: str,
+    terminate_pid: Callable[[int], bool],
+) -> int:
+    """Belt-and-suspenders behind SYM-152's dispatch-time dedup: if two live
+    runs ever share the same `(issue_id, stage)` — a race, a crash, or a manual
+    dispatch — keep exactly one survivor and collapse the rest. The duplicate's
+    process is terminated if alive and its row marked superseded (not interrupted,
+    so it does not shadow the survivor in "latest-run" queries).
+
+    Survivor selection: prefer runs that have a pid (alive) over pidless/stale
+    rows; among equal pid-presence keep the oldest. This avoids keeping a stale
+    pidless row and terminating the newer run that actually has a live process.
+
+    Runs after the orphan sweeps so it only sees genuinely-live survivors.
+    Distinct stages for one issue (e.g. implement + local_review) never group
+    together, so they are left untouched."""
+    groups: dict[tuple[str, str], list[db.runs.Run]] = {}
+    for run in await db.runs.list_live(conn):
+        groups.setdefault((run.issue_id, run.stage), []).append(run)
+
+    flipped = 0
+    for (issue_id, stage), group in groups.items():
+        if len(group) < 2:
+            continue
+        # Prefer pid-having rows over pidless/stale; among ties keep oldest.
+        group_sorted = sorted(group, key=lambda r: (r.pid is None, r.started_at, r.id))
+        survivor, *duplicates = group_sorted
+        for dup in duplicates:
+            log.warning(
+                "reconcile: duplicate live run=%s issue=%s stage=%s "
+                "(keeping run=%s) — terminating and marking superseded",
+                dup.id,
+                issue_id,
+                stage,
+                survivor.id,
+            )
+            if dup.pid is not None and dup.pid != survivor.pid:
+                if not terminate_pid(dup.pid):
+                    log.warning(
+                        "reconcile: could not terminate duplicate run=%s pid=%s "
+                        "(EPERM or similar) — skipping supersede to avoid masking "
+                        "a live process",
+                        dup.id,
+                        dup.pid,
+                    )
+                    continue
+            await db.runs.update_status(
+                conn,
+                dup.id,
+                db.runs.SUPERSEDED_STATUS,
+                ended_at=now,
+                kind=db.runs.DUPLICATE_STAGE_KIND,
+                detail=(
+                    f"Duplicate live {stage} run for issue {issue_id}; "
+                    f"kept run {survivor.id}"
+                ),
+            )
+            flipped += 1
     return flipped

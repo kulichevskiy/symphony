@@ -7,6 +7,7 @@
 --   needs_approval terminal operator handoff after an unrecoverable stage failure
 --   failed       finished with non-zero exit / spawn failure
 --   interrupted  marked dead by startup reconcile (host restarted)
+--   superseded   younger duplicate collapsed by startup reconcile (non-failing)
 
 CREATE TABLE IF NOT EXISTS repos (
     linear_team_key TEXT PRIMARY KEY,

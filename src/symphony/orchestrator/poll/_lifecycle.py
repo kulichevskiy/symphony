@@ -543,7 +543,9 @@ class _LifecycleMixin(_OrchestratorBase):
             (
                 run
                 for run in reversed(history)
-                if run.stage == "implement" and run.id != current_run_id
+                if run.stage == "implement"
+                and run.id != current_run_id
+                and run.status != db.runs.SUPERSEDED_STATUS
             ),
             None,
         )

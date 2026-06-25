@@ -736,6 +736,189 @@ async def test_reconcile_treats_unexpected_oserror_as_alive(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> None:
+    """Two live runs for the same (issue_id, stage) — a race past SYM-152, a
+    crash, or a manual dispatch. Reconcile keeps the oldest live, terminates the
+    younger's process and flips it `superseded` with a duplicate-stage kind."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-dup", identifier="ENG-10", title="t", team_key="ENG"
+        )
+        # Use distinct fake PIDs with an injected pid_alive so the orphan sweep
+        # leaves both alive and only the duplicate-collapse pass acts.
+        await db.runs.create(
+            conn,
+            id="older",
+            issue_id="iss-dup",
+            stage="implement",
+            status="running",
+            pid=101,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="younger",
+            issue_id="iss-dup",
+            stage="implement",
+            status="running",
+            pid=102,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+
+        terminated: list[int] = []
+
+        def _fake_terminate(pid: int) -> bool:
+            terminated.append(pid)
+            return True
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(
+            conn,
+            linear,
+            pid_alive=lambda _: True,
+            terminate_pid=_fake_terminate,
+        )
+        assert flipped == 1
+
+        # The younger duplicate's distinct pid was terminated.
+        assert terminated == [102]
+
+        # Exactly one live run remains — the oldest.
+        rows = await db.runs.list_live_with_pid(conn)
+        assert [r.id for r in rows] == ["older"]
+
+        cur = await conn.execute(
+            """
+            SELECT status, ended_at, termination_kind, termination_detail
+            FROM runs WHERE id=?
+            """,
+            ("younger",),
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.SUPERSEDED_STATUS
+        assert row[1] is not None
+        assert row["termination_kind"] == db.runs.DUPLICATE_STAGE_KIND
+        assert "older" in row["termination_detail"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_duplicate_shared_pid_skips_termination(tmp_path: Path) -> None:
+    """When both duplicate rows share the same PID, terminating it would kill the
+    survivor. Reconcile skips the kill but still marks the duplicate superseded."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-shared", identifier="ENG-20", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="older",
+            issue_id="iss-shared",
+            stage="implement",
+            status="running",
+            pid=101,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="younger",
+            issue_id="iss-shared",
+            stage="implement",
+            status="running",
+            pid=101,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+
+        terminated: list[int] = []
+
+        def _fake_terminate_shared(pid: int) -> bool:
+            terminated.append(pid)
+            return True
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(
+            conn,
+            linear,
+            pid_alive=lambda _: True,
+            terminate_pid=_fake_terminate_shared,
+        )
+        assert flipped == 1
+
+        # Shared PID must not be terminated — killing it would also kill the survivor.
+        assert terminated == []
+
+        rows = await db.runs.list_live_with_pid(conn)
+        assert [r.id for r in rows] == ["older"]
+
+        cur = await conn.execute(
+            "SELECT status, termination_kind FROM runs WHERE id=?", ("younger",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.SUPERSEDED_STATUS
+        assert row["termination_kind"] == db.runs.DUPLICATE_STAGE_KIND
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_distinct_stages_for_one_issue_untouched(
+    tmp_path: Path,
+) -> None:
+    """One issue with a live `implement` and a live `local_review` run is a
+    legitimate layout, not a duplicate — the collapse must not touch either."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-stages", identifier="ENG-11", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="implement",
+            issue_id="iss-stages",
+            stage="implement",
+            status="running",
+            pid=os.getpid(),
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="local-review",
+            issue_id="iss-stages",
+            stage="local_review",
+            status="running",
+            pid=os.getpid(),
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+
+        terminated: list[int] = []
+
+        def _fake_terminate_stages(pid: int) -> bool:
+            terminated.append(pid)
+            return True
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(conn, linear, terminate_pid=_fake_terminate_stages)
+        assert flipped == 0
+        assert terminated == []
+
+        rows = await db.runs.list_live_with_pid(conn)
+        assert sorted(r.id for r in rows) == ["implement", "local-review"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_no_live_runs_is_a_noop(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
