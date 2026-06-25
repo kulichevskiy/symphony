@@ -2327,7 +2327,8 @@ async def test_api_spend_stage_series_daily_buckets_short_window(
 
 @pytest.mark.asyncio
 async def test_api_spend_stage_series_weekly_for_long_window(tmp_path: Path) -> None:
-    from datetime import date as _date, timedelta as _td
+    from datetime import date as _date
+    from datetime import timedelta as _td
 
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)

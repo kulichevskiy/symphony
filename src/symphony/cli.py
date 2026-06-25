@@ -31,7 +31,6 @@ from .agent.codex_cli import (
 )
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
-from .ui.external import GitHubExternalClient
 from .config import Config, RepoBinding, RoleName, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -46,6 +45,7 @@ from .tracker import (
     context_for_binding,
     for_binding,
 )
+from .ui.external import GitHubExternalClient
 from .webhook import WebhookSettings
 
 _ANSI_RESET = "\x1b[0m"
