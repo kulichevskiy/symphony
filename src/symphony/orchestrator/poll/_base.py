@@ -2093,6 +2093,7 @@ class _OrchestratorBase:
             env=dict(binding.env),
             stall_secs=self.config.stall_timeout_secs,
             command_secs=self.config.command_timeout_secs,
+            wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
         )
 
@@ -2141,7 +2142,12 @@ class _OrchestratorBase:
                             issue=issue,
                             cumulative_usage=cumulative_usage,
                         )
-                    elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
+                    elif ev.kind in (
+                        "exit",
+                        "stall_timeout",
+                        "wall_clock_timeout",
+                        "spawn_failed",
+                    ):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
@@ -2281,6 +2287,7 @@ class _OrchestratorBase:
             env=dict(binding.env),
             stall_secs=self.config.stall_timeout_secs,
             command_secs=self.config.command_timeout_secs,
+            wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
         )
 
@@ -2330,7 +2337,12 @@ class _OrchestratorBase:
                             issue=issue,
                             cumulative_usage=cumulative_usage,
                         )
-                    elif ev.kind in ("exit", "stall_timeout", "spawn_failed"):
+                    elif ev.kind in (
+                        "exit",
+                        "stall_timeout",
+                        "wall_clock_timeout",
+                        "spawn_failed",
+                    ):
                         await self._flush_activity(
                             session=activity,
                             binding=binding,

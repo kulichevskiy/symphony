@@ -84,8 +84,10 @@ async def collect_runner_output(
             terminal_kind = "exit"
             returncode = event.returncode
             break
-        elif event.kind == "stall_timeout":
-            terminal_kind = "stall_timeout"
+        elif event.kind in ("stall_timeout", "wall_clock_timeout"):
+            # Both are watchdog kills (silence vs. absolute wall-clock cap);
+            # reuse the `stall_timeout` flag so the run fails closed.
+            terminal_kind = event.kind
             stall_timeout = True
             break
         elif event.kind == "spawn_failed":

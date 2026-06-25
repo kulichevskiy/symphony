@@ -695,6 +695,13 @@ class Config(BaseModel):
     # instead of `stall_timeout_secs`, so a long-but-healthy subprocess (broad
     # rg, pnpm install, pytest) isn't killed as a false-positive stall.
     command_timeout_secs: int = 1800
+    # Absolute wall-clock backstop from run start, independent of the stall and
+    # per-command heartbeats. A confused-but-chatty agent keeps emitting output
+    # (so `stall_timeout_secs` never trips) without any single command running
+    # long enough to hit `command_timeout_secs`, yet stays wedged for tens of
+    # minutes (incident SYM-148). This caps total run time regardless. Generous
+    # by default so it never kills a legitimately long implement/review_fix run.
+    wall_clock_timeout_secs: int = 3600
     activity_comments_enabled: bool = True
     activity_comment_interval_secs: int = Field(default=300, ge=1)
     activity_comment_min_interval_secs: int = Field(default=120, ge=1)

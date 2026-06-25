@@ -142,9 +142,14 @@ class LocalRunner:
                 _terminate_process_group(proc.pid)
         yield RunnerEvent(kind="started", pid=proc.pid)
         stalled = asyncio.Event()
+        wall_clock_hit = asyncio.Event()
         events: asyncio.Queue[RunnerEvent] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         hb = _Heartbeat(last_line=loop.time())
+        run_started = loop.time()
+        wall_clock_deadline = (
+            run_started + spec.wall_clock_secs if spec.wall_clock_secs > 0 else None
+        )
 
         async def pump(stream: asyncio.StreamReader | None, kind: str) -> None:
             if stream is None:
@@ -238,13 +243,24 @@ class LocalRunner:
                 if proc.returncode is not None:
                     return
                 now = loop.time()
-                deadline = hb.deadline(now, spec.stall_secs, spec.command_secs)
-                if now < deadline:
-                    continue
+                # Absolute wall-clock backstop takes precedence over the
+                # heartbeat: it fires even while output is fresh or a command
+                # is in flight (the heartbeat clauses can't catch a chatty but
+                # wedged agent — incident SYM-148).
+                wall_clock_breached = (
+                    wall_clock_deadline is not None and now >= wall_clock_deadline
+                )
+                if not wall_clock_breached:
+                    deadline = hb.deadline(now, spec.stall_secs, spec.command_secs)
+                    if now < deadline:
+                        continue
                 # PID-based liveness: don't trust status fields here.
                 if not _pid_alive(proc.pid):
                     return
-                stalled.set()
+                if wall_clock_breached:
+                    wall_clock_hit.set()
+                else:
+                    stalled.set()
                 _terminate_process_group(proc.pid)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5.0)
@@ -307,7 +323,9 @@ class LocalRunner:
             with suppress(asyncio.CancelledError):
                 await watch_task
 
-            if stalled.is_set():
+            if wall_clock_hit.is_set():
+                yield RunnerEvent(kind="wall_clock_timeout")
+            elif stalled.is_set():
                 yield RunnerEvent(kind="stall_timeout")
             else:
                 yield RunnerEvent(kind="exit", returncode=proc.returncode)
