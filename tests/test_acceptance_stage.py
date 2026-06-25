@@ -19,6 +19,7 @@ from symphony.github.client import CheckRun, GitHubError, PRChecks
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator import poll as poll_module
 from symphony.orchestrator.poll import Orchestrator, _binding_storage_key
+from symphony.orchestrator.poll import _acceptance as acceptance_module
 from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_INFRA_ERROR,
     ACCEPTANCE_FOOTER_PASS,
@@ -210,9 +211,7 @@ def _github() -> MagicMock:
     gh = MagicMock()
     # Green CI rollup matches `pr_checks` below: SYM-108 gates the no_signal
     # conflict-fix merge on the head's checks being green.
-    _green_rollup = [
-        {"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}
-    ]
+    _green_rollup = [{"__typename": "StatusContext", "context": "ci", "state": "SUCCESS"}]
     gh.pr_view = AsyncMock(
         side_effect=[
             {
@@ -253,9 +252,7 @@ def _github() -> MagicMock:
     gh.pr_reactions = AsyncMock(return_value=[])
     gh.pr_issue_comments = AsyncMock(return_value=[])
     gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
-    gh.pr_diff = AsyncMock(
-        return_value="diff --git a/auth.py b/auth.py\n+enable_oauth()\n"
-    )
+    gh.pr_diff = AsyncMock(return_value="diff --git a/auth.py b/auth.py\n+enable_oauth()\n")
     gh.pr_merge = AsyncMock()
     return gh
 
@@ -280,7 +277,7 @@ async def test_acceptance_mode_runs_code_only_runner_between_review_and_merge(
         )
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "load_taste_guide", fake_load_taste_guide)
+    monkeypatch.setattr(acceptance_module, "load_taste_guide", fake_load_taste_guide)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("code_only")
@@ -530,10 +527,7 @@ async def test_acceptance_publishes_extracted_criteria_before_checking(
         assert gh.pr_diff.await_count == 1
         assert runner.captured_specs[0].stage == "acceptance"
         acceptance_prompt = runner.captured_specs[0].command[-1]
-        assert (
-            "- OAuth login is implemented: GitHub OAuth is supported."
-            in acceptance_prompt
-        )
+        assert "- OAuth login is implemented: GitHub OAuth is supported." in acceptance_prompt
         assert "OAuth login is implemented" in bodies[verdict_index]
         assert (
             "- **OAuth login is implemented: GitHub OAuth is supported.**"
@@ -612,8 +606,7 @@ async def test_acceptance_degrades_missing_where_to_verify_to_code_only(
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         degrade_note = (
-            "Acceptance: degraded to code-only — no `Where to verify` "
-            "in ticket description"
+            "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
         )
         assert any(degrade_note in body for body in bodies)
         assert degrade_note in caplog.text
@@ -748,10 +741,7 @@ async def test_acceptance_quick_skip_posts_distinct_pass_and_still_merges(
         gh.pr_merge.assert_awaited_once()
 
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any(
-            body.startswith("**Acceptance: skipped - trivial change.**")
-            for body in bodies
-        )
+        assert any(body.startswith("**Acceptance: skipped - trivial change.**") for body in bodies)
         assert any("Reason: `quick_skip_trivial`" in body for body in bodies)
     finally:
         await conn.close()
@@ -916,9 +906,9 @@ async def test_acceptance_reject_dispatches_fix_then_rechecks(
         return "def456"
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "_git_fetch_branch", no_fetch)
-    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_sha)
-    monkeypatch.setattr(poll_module, "_workspace_head_sha", fixed_head_sha)
+    monkeypatch.setattr(acceptance_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(acceptance_module, "_workspace_ref_sha", remote_sha)
+    monkeypatch.setattr(acceptance_module, "_workspace_head_sha", fixed_head_sha)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("code_only")
@@ -1019,9 +1009,9 @@ async def test_acceptance_reject_after_fix_opens_operator_wait(
         return "def456"
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "_git_fetch_branch", no_fetch)
-    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_sha)
-    monkeypatch.setattr(poll_module, "_workspace_head_sha", fixed_head_sha)
+    monkeypatch.setattr(acceptance_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(acceptance_module, "_workspace_ref_sha", remote_sha)
+    monkeypatch.setattr(acceptance_module, "_workspace_head_sha", fixed_head_sha)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("code_only")
@@ -1113,10 +1103,10 @@ async def test_acceptance_fix_without_new_commit_opens_operator_wait(
         return ""
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "_git_fetch_branch", no_fetch)
-    monkeypatch.setattr(poll_module, "_workspace_ref_sha", remote_sha)
-    monkeypatch.setattr(poll_module, "_workspace_head_sha", unchanged_head_sha)
-    monkeypatch.setattr(poll_module, "_git_status_short", clean_status)
+    monkeypatch.setattr(acceptance_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(acceptance_module, "_workspace_ref_sha", remote_sha)
+    monkeypatch.setattr(acceptance_module, "_workspace_head_sha", unchanged_head_sha)
+    monkeypatch.setattr(acceptance_module, "_git_status_short", clean_status)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _binding("code_only")
@@ -1382,9 +1372,7 @@ async def test_preview_acceptance_resolves_url_runs_visual_flow_and_skips_dev_se
         return None
 
     async def fake_resolve_preview_url(**kwargs: object) -> str:
-        assert kwargs["acceptance"].preview_url_pattern == (
-            "https://vib-{pr_number}.vercel.app"
-        )
+        assert kwargs["acceptance"].preview_url_pattern == ("https://vib-{pr_number}.vercel.app")
         assert kwargs["pr_number"] == 42
         return preview_url
 
@@ -1416,8 +1404,8 @@ async def test_preview_acceptance_resolves_url_runs_visual_flow_and_skips_dev_se
         )
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "resolve_preview_url", fake_resolve_preview_url)
-    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    monkeypatch.setattr(acceptance_module, "resolve_preview_url", fake_resolve_preview_url)
+    monkeypatch.setattr(acceptance_module, "run_acceptance", fake_run_acceptance)
     preview_url = "https://vib-42.vercel.app"
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -1447,9 +1435,7 @@ async def test_preview_acceptance_resolves_url_runs_visual_flow_and_skips_dev_se
             )
         )
         linear.move_issue = AsyncMock()
-        linear.post_comment = AsyncMock(
-            side_effect=["criteria-cmt", "verdict-cmt", "merge-cmt"]
-        )
+        linear.post_comment = AsyncMock(side_effect=["criteria-cmt", "verdict-cmt", "merge-cmt"])
         linear.upload_issue_attachment = AsyncMock(
             return_value="https://uploads.linear.app/hero.png"
         )
@@ -1544,7 +1530,7 @@ async def test_dev_acceptance_sets_preview_url_uploads_screenshot_and_records_co
         )
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    monkeypatch.setattr(acceptance_module, "run_acceptance", fake_run_acceptance)
     port = _free_port()
     preview_url = f"http://127.0.0.1:{port}"
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -1660,7 +1646,7 @@ async def test_dev_acceptance_records_resolved_preview_url(
         )
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    monkeypatch.setattr(acceptance_module, "run_acceptance", fake_run_acceptance)
     configured_port = _free_port()
     resolved_port = _free_port()
     while resolved_port == configured_port:
@@ -1895,7 +1881,7 @@ async def test_dev_acceptance_records_hero_upload_when_verdict_comment_fails(
         )
 
     monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
-    monkeypatch.setattr(poll_module, "run_acceptance", fake_run_acceptance)
+    monkeypatch.setattr(acceptance_module, "run_acceptance", fake_run_acceptance)
     port = _free_port()
     preview_url = f"http://127.0.0.1:{port}"
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -1925,9 +1911,7 @@ async def test_dev_acceptance_records_hero_upload_when_verdict_comment_fails(
             )
         )
         linear.move_issue = AsyncMock()
-        linear.post_comment = AsyncMock(
-            side_effect=["criteria-cmt", LinearError("comment failed")]
-        )
+        linear.post_comment = AsyncMock(side_effect=["criteria-cmt", LinearError("comment failed")])
         linear.upload_issue_attachment = AsyncMock(
             return_value="https://uploads.linear.app/hero.png"
         )

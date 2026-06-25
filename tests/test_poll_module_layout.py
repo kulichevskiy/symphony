@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146, SYM-147).
+"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146, SYM-147, SYM-148).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`
@@ -24,10 +24,17 @@ and `Orchestrator` inherits it.
 `_MergeMixin` (SYM-147) owns the merge domain — merge-candidate polling, merge
 execution + fix-runs, manual-merge park/revival, merge-wait reconciliation —
 plus the merge-exclusive free functions. `Orchestrator` inherits it.
+
+`_AcceptanceMixin` (SYM-148) owns the acceptance domain (run/dispatch/post-
+comment/upload/track/schedule helpers) plus the acceptance-only free helpers;
+it extends `_OrchestratorBase` and `Orchestrator` inherits it. The acceptance-
+slash handlers live on `_SlashCommandsMixin` and `_refresh_issue_for_acceptance_
+merge_handoff` on `_MergeMixin` — they are inherited, not duplicated.
 """
 
 from symphony.orchestrator import poll
 from symphony.orchestrator.poll import (
+    _acceptance,
     _base,
     _dispatch,
     _git,
@@ -36,6 +43,7 @@ from symphony.orchestrator.poll import (
     _review,
     _slash_commands,
 )
+from symphony.orchestrator.poll._acceptance import _AcceptanceMixin
 from symphony.orchestrator.poll._base import _OrchestratorBase
 from symphony.orchestrator.poll._dispatch import _DispatchMixin
 from symphony.orchestrator.poll._merge import _MergeMixin
@@ -299,6 +307,42 @@ _MERGE_FUNCS = [
 ]
 
 
+# Acceptance-domain methods that must live on `_AcceptanceMixin` (SYM-148). The
+# acceptance-slash handlers and `_refresh_issue_for_acceptance_merge_handoff` are
+# owned by `_SlashCommandsMixin`/`_MergeMixin` respectively and inherited, so they
+# are intentionally absent here.
+_ACCEPTANCE_METHODS = [
+    "_track_acceptance_blocked_wait",
+    "_track_acceptance_rejected_wait",
+    "_acceptance_pr_url",
+    "_acceptance_passed_for_candidate",
+    "_acceptance_infra_retry_backoff_active",
+    "_schedule_acceptance",
+    "_acceptance_with_limits",
+    "_acceptance_preview_url",
+    "_acceptance_pr_diff",
+    "_post_acceptance_verdict_comment",
+    "_post_acceptance_criteria_comment",
+    "_upload_acceptance_screenshots",
+    "_run_acceptance_stage",
+    "_dispatch_acceptance_fix_run",
+    "_move_issue_to_acceptance_state",
+    "_run_acceptance_fix_agent",
+]
+
+# Acceptance-domain module-level names relocated to `_acceptance.py` (SYM-148),
+# re-exported from `__init__.py` by explicit name so existing imports keep
+# working.
+_ACCEPTANCE_NAMES = [
+    "_AcceptancePrDiffUnavailable",
+    "_with_acceptance_degrade_note",
+    "_acceptance_criterion_names",
+    "_acceptance_criterion_predicates",
+    "_replace_acceptance_criteria_labels",
+    "_acceptance_artifact_path",
+]
+
+
 def test_orchestrator_inherits_base() -> None:
     assert issubclass(poll.Orchestrator, _OrchestratorBase)
     assert poll.Orchestrator is not _OrchestratorBase
@@ -313,11 +357,7 @@ def test_orchestrator_inherits_dispatch_mixin() -> None:
 def test_dispatch_methods_defined_on_mixin() -> None:
     for name in _DISPATCH_METHODS:
         member = getattr(poll.Orchestrator, name)
-        owner = (
-            member.fget.__qualname__
-            if isinstance(member, property)
-            else member.__qualname__
-        )
+        owner = member.fget.__qualname__ if isinstance(member, property) else member.__qualname__
         assert owner.startswith("_DispatchMixin."), name
 
 
@@ -334,11 +374,7 @@ def test_orchestrator_inherits_slash_mixin() -> None:
 def test_slash_methods_defined_on_mixin() -> None:
     for name in _SLASH_METHODS:
         member = getattr(poll.Orchestrator, name)
-        owner = (
-            member.fget.__qualname__
-            if isinstance(member, property)
-            else member.__qualname__
-        )
+        owner = member.fget.__qualname__ if isinstance(member, property) else member.__qualname__
         assert owner.startswith("_SlashCommandsMixin."), name
 
 
@@ -349,6 +385,28 @@ def test_slash_mixin_module() -> None:
 def test_slash_names_relocated_and_reexported_by_identity() -> None:
     for name in _SLASH_NAMES:
         assert getattr(poll, name) is getattr(_slash_commands, name), name
+
+
+def test_orchestrator_inherits_acceptance_mixin() -> None:
+    assert issubclass(poll.Orchestrator, _AcceptanceMixin)
+    assert issubclass(_AcceptanceMixin, _OrchestratorBase)
+    assert poll.Orchestrator is not _AcceptanceMixin
+
+
+def test_acceptance_methods_defined_on_mixin() -> None:
+    for name in _ACCEPTANCE_METHODS:
+        member = getattr(poll.Orchestrator, name)
+        owner = member.fget.__qualname__ if isinstance(member, property) else member.__qualname__
+        assert owner.startswith("_AcceptanceMixin."), name
+
+
+def test_acceptance_mixin_module() -> None:
+    assert _acceptance.__name__.endswith("poll._acceptance")
+
+
+def test_acceptance_names_relocated_and_reexported_by_identity() -> None:
+    for name in _ACCEPTANCE_NAMES:
+        assert getattr(poll, name) is getattr(_acceptance, name), name
 
 
 def test_orchestrator_inherits_merge_mixin() -> None:
@@ -382,11 +440,7 @@ def test_orchestrator_inherits_review_mixin() -> None:
 def test_review_methods_defined_on_mixin() -> None:
     for name in _REVIEW_METHODS:
         member = getattr(poll.Orchestrator, name)
-        owner = (
-            member.fget.__qualname__
-            if isinstance(member, property)
-            else member.__qualname__
-        )
+        owner = member.fget.__qualname__ if isinstance(member, property) else member.__qualname__
         assert owner.startswith("_ReviewMixin."), name
 
 
