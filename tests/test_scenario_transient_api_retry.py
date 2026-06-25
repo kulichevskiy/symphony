@@ -89,7 +89,8 @@ async def test_transient_api_error_retries_then_escalates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Keep the test tight: 2 retries then escalate on the 3rd failure.
-    monkeypatch.setattr(poll_module, "AGENT_INFRA_RETRY_LIMIT", 2)
+    # SYM-151: the limit + its readers live on `poll._base`, so patch there.
+    monkeypatch.setattr(poll_module._base, "AGENT_INFRA_RETRY_LIMIT", 2)
     clock = ManualClock()
     harness = await Harness.create(tmp_path, config=_config(tmp_path), clock=clock)
     try:
@@ -159,7 +160,7 @@ async def test_transient_api_error_retries_then_escalates(
 async def test_transient_api_error_then_success_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(poll_module, "AGENT_INFRA_RETRY_LIMIT", 5)
+    monkeypatch.setattr(poll_module._base, "AGENT_INFRA_RETRY_LIMIT", 5)
     clock = ManualClock()
     harness = await Harness.create(tmp_path, config=_config(tmp_path), clock=clock)
     try:
@@ -208,7 +209,7 @@ async def test_local_review_transient_api_error_recovers(
     pre-push gates (does NOT re-run the implementer), reviewer approves on
     retry, PR merges. Tests the LOCAL_REVIEW_TRANSIENT_RETRY_KIND path and
     the resume_after_local_review branch of the dispatch logic."""
-    monkeypatch.setattr(poll_module, "AGENT_INFRA_RETRY_LIMIT", 5)
+    monkeypatch.setattr(poll_module._base, "AGENT_INFRA_RETRY_LIMIT", 5)
     clock = ManualClock()
     harness = await Harness.create(
         tmp_path, config=_local_review_config(tmp_path), clock=clock
@@ -272,7 +273,7 @@ async def test_local_review_transient_api_error_escalates(
     """Repeated reviewer 500s exhaust the shared retry budget and escalate via
     the existing local-review-infra operator wait (KIND_IMPLEMENT_FAILED),
     exactly as today — no change to the escalation path itself."""
-    monkeypatch.setattr(poll_module, "AGENT_INFRA_RETRY_LIMIT", 2)
+    monkeypatch.setattr(poll_module._base, "AGENT_INFRA_RETRY_LIMIT", 2)
     clock = ManualClock()
     harness = await Harness.create(
         tmp_path, config=_local_review_config(tmp_path), clock=clock

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from dataclasses import replace
 from datetime import timedelta
@@ -57,19 +58,7 @@ from ...pipeline.taste_guide import load_taste_guide
 from ...tracker import (
     Issue as LinearIssue,
 )
-
-# Shared infrastructure symbols still defined in `poll/__init__.py`. Imported
-# from the package (which is fully populated before it imports this module) so
-# the acceptance methods keep resolving them unchanged.
-from . import (  # noqa: E402  (intentional late, populated-package import)
-    _add_run_usage,
-    _binding_key,
-    _infra_retry_backoff_secs,
-    _needs_human_approval_label_present,
-    _termination_kwargs,
-    log,
-)
-from ._base import _OrchestratorBase
+from ._base import _binding_key, _infra_retry_backoff_secs, _OrchestratorBase
 from ._git import (
     _git_fetch_branch,
     _git_status_short,
@@ -78,7 +67,10 @@ from ._git import (
 )
 from ._helpers import (
     _acceptance_degrade_note,
+    _add_run_usage,
+    _needs_human_approval_label_present,
     _parse_rfc3339,
+    _termination_kwargs,
     build_fix_runner_command,
 )
 
@@ -88,6 +80,7 @@ if TYPE_CHECKING:
     from ...agent.codex_models import DEFAULT_CODEX_MODEL
     from ._base import BindingKey
 
+log = logging.getLogger(__name__)
 
 _CODE_ONLY_ACCEPTANCE_MODE = "code_only"
 ACCEPTANCE_INFRA_RETRY_LIMIT = 2

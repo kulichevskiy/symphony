@@ -34,10 +34,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    TypedDict,
 )
-
-import aiosqlite
 
 from ... import db
 from ...agent.prompt import (
@@ -100,7 +97,6 @@ from ...pipeline.review_classifier import (
     CheckRun as ReviewCheckRun,
 )
 from ...pipeline.state_machine import (
-    classify_termination,
     on_runner_event,
 )
 from ...tracker import (
@@ -109,6 +105,7 @@ from ...tracker import (
 from ...tracker import (
     TrackerContext,
 )
+from ._base import SlashHandlerFailure as SlashHandlerFailure
 from ._base import (
     _binding_key,
     _OrchestratorBase,
@@ -127,13 +124,15 @@ from ._git import (
     _workspace_ref_sha,
 )
 from ._helpers import (
+    _add_run_usage,
     _github_commit_url,
+    _local_review_termination_reason,
     _parse_optional_datetime,
     _parse_rfc3339,
     _pr_url_for_state,
     _sum_usage,
+    _termination_kwargs,
 )
-from ._slash_commands import SlashHandlerFailure as SlashHandlerFailure
 
 log = logging.getLogger(__name__)
 
@@ -148,26 +147,8 @@ REVIEW_RESURRECT_COOLDOWN_SECS = 120
 CODEX_NO_ISSUES_MARKER = "any major issues"
 
 
-async def _add_run_usage(
-    conn: aiosqlite.Connection, run_id: str, usage: UsageDelta
-) -> None:
-    if not usage.has_usage():
-        return
-    await db.runs.add_usage(
-        conn,
-        run_id,
-        cost_usd=usage.cost_usd,
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        cache_write_tokens=usage.cache_write_tokens,
-        cache_read_tokens=usage.cache_read_tokens,
-    )
 
 
-class _TerminationKwargs(TypedDict):
-    kind: str
-    detail: str
-    returncode: int | None
 
 
 def _local_review_needs_approval(result: LoopResult | None) -> bool:
@@ -195,30 +176,8 @@ def _local_review_permits_remote(result: LoopResult | None) -> bool:
     }
 
 
-def _termination_kwargs(
-    *,
-    status: str,
-    final_kind: str | None = None,
-    returncode: int | None = None,
-    exc: BaseException | str | None = None,
-    reason: str | None = None,
-) -> _TerminationKwargs:
-    kind, detail = classify_termination(
-        status=status,
-        final_kind=final_kind,
-        returncode=returncode,
-        exc=exc,
-        reason=reason,
-    )
-    return {"kind": kind, "detail": detail, "returncode": returncode}
 
 
-def _local_review_termination_reason(result: LoopResult | None) -> str:
-    if result is None:
-        return "local-review session failed"
-    if result.error:
-        return result.error
-    return f"local-review ended with {result.outcome.value}"
 
 
 def _local_review_failure_log(result: LoopResult | None) -> str:

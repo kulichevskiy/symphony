@@ -23,22 +23,21 @@ other strict check stays on.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import logging
+import uuid
 from collections.abc import (
     Awaitable,
     Callable,
 )
 from dataclasses import replace
 from datetime import (
-    UTC,
-    datetime,
     timedelta,
 )
 from functools import partial
 from pathlib import Path
 from typing import Any
-import asyncio
-import inspect
-import uuid
 
 from ... import db
 from ...agent.prompt import (
@@ -51,6 +50,8 @@ from ...config import RepoBinding
 from ...github.branch_protection import get_required_contexts
 from ...github.client import (
     CheckRun as GitHubCheckRun,
+)
+from ...github.client import (
     GitHubError,
     _is_merge_conflict_error,
 )
@@ -77,6 +78,8 @@ from ...pipeline.local_review_loop import (
 )
 from ...pipeline.review_classifier import (
     CheckRun as ReviewCheckRun,
+)
+from ...pipeline.review_classifier import (
     ReviewSnapshot,
     Verdict,
     VerdictKind,
@@ -87,8 +90,15 @@ from ...pipeline.review_classifier import (
 )
 from ...pipeline.state_machine import on_runner_event
 from ...tracker import Issue as LinearIssue
-
-from ._base import _OrchestratorBase
+from ._base import (
+    MERGE_WAIT_RECONCILE_INTERVAL_SECS,
+    MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS,
+    ORPHANED_MERGE_RUN_GRACE_SECS,
+    PARKED_CLOSED_UNMERGED_COMMENT,
+    SlashHandlerFailure,
+    _binding_key,
+    _OrchestratorBase,
+)
 from ._git import (
     _git_abort_rebase,
     _git_add_and_continue_rebase,
@@ -102,7 +112,11 @@ from ._git import (
     _workspace_ref_sha,
 )
 from ._helpers import (
+    NEEDS_HUMAN_APPROVAL_LABEL,
+    _add_run_usage,
     _github_commit_url,
+    _local_review_termination_reason,
+    _needs_human_approval_label_present,
     _no_signal_head_check_state,
     _parse_rfc3339,
     _pr_base_ref_from_view,
@@ -120,31 +134,22 @@ from ._helpers import (
     _status_check_sha,
     _status_rollup_nodes,
     _sum_usage,
+    _termination_kwargs,
     build_fix_runner_command,
     build_merge_runner_command,
 )
-from . import (
+from ._review import (
     CODEX_NO_ISSUES_MARKER,
-    MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS,
-    MERGE_WAIT_RECONCILE_INTERVAL_SECS,
-    NEEDS_HUMAN_APPROVAL_LABEL,
-    ORPHANED_MERGE_RUN_GRACE_SECS,
-    PARKED_CLOSED_UNMERGED_COMMENT,
-    SlashHandlerFailure,
-    _add_run_usage,
-    _binding_key,
     _codex_lgtm_reactions_from_issue_comments,
     _local_review_infra_failed,
     _local_review_needs_approval,
-    _local_review_termination_reason,
-    _needs_human_approval_label_present,
     _reactions_from_github,
     _read_run_stream_api_error_obj,
     _review_comments_from_github,
     _reviews_from_github,
-    _termination_kwargs,
-    log,
 )
+
+log = logging.getLogger(__name__)
 
 
 
