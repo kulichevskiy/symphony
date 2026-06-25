@@ -459,3 +459,12 @@ def _pr_url_for_state(
     if pr_number is not None:
         return f"https://github.com/{repo}/pull/{pr_number}"
     return "(no PR)"
+
+
+# SYM-145: relocated from `poll/__init__.py` so the slash-command mixin and the
+# package `__init__` can share it without a circular import.
+NEEDS_HUMAN_APPROVAL_LABEL = "needs-human-approval"
+
+
+def _needs_human_approval_label_present(issue: LinearIssue) -> bool:
+    return NEEDS_HUMAN_APPROVAL_LABEL in issue.labels
