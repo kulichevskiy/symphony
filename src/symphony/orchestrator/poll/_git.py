@@ -222,8 +222,34 @@ async def _git_add_and_continue_rebase(
     # unmerged paths), so it still reports failure.
     if not await _rebase_in_progress(workspace_path):
         if not await _git_conflicted_files(workspace_path):
-            return True
+            if not await _orig_head_exists(workspace_path):
+                return True
     return False
+
+
+async def _orig_head_exists(workspace_path: Path) -> bool:
+    """True if ORIG_HEAD resolves in *workspace_path*.
+
+    git sets ORIG_HEAD when a rebase (or merge/reset) starts and leaves it
+    after completion, including after --skip.  A fresh repo with no rebase
+    history has no ORIG_HEAD.  Checking its presence lets us distinguish a
+    truly-never-rebased working tree (benign already-resolved success) from
+    one where a rebase was started and may have completed via --skip.
+
+    Unlike reflog-based detection, this is reliable across all git versions:
+    it does not depend on the exact wording of reflog messages which vary
+    between git ≤2.37 (combined "rebase (skip) (finish)") and newer git
+    (which may omit the skip marker entirely when the commit never moved HEAD).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "--verify", "ORIG_HEAD",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
+    return proc.returncode == 0
 
 
 async def _rebase_in_progress(workspace_path: Path) -> bool:

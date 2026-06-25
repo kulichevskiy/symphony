@@ -75,3 +75,41 @@ def test_real_unresolved_conflict_returns_failure(tmp_path: Path) -> None:
     # Continue without resolving the conflict → still failing.
     result = asyncio.run(_git_add_and_continue_rebase(repo, []))
     assert result is False
+
+
+def test_skip_completed_rebase_returns_failure(tmp_path: Path) -> None:
+    """--skip completing a rebase must be rejected, not treated as benign."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "f.txt").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "f.txt").write_text("feature\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "feature change")
+
+    _git(repo, "checkout", "-q", "main")
+    (repo / "f.txt").write_text("main\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "main change")
+
+    _git(repo, "checkout", "-q", "feature")
+    subprocess.run(
+        ["git", "rebase", "main"],
+        cwd=str(repo),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Skip drops the conflicting commit and completes the rebase.
+    subprocess.run(
+        ["git", "rebase", "--skip"],
+        cwd=str(repo),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # No rebase in progress, no conflicted files, but a commit was silently dropped.
+    # ORIG_HEAD exists (set when rebase started), so we must not treat this as benign.
+    result = asyncio.run(_git_add_and_continue_rebase(repo, []))
+    assert result is False
