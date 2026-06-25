@@ -212,7 +212,41 @@ async def _git_add_and_continue_rebase(
         env=env,
     )
     await cont_proc.communicate()
-    return cont_proc.returncode == 0
+    if cont_proc.returncode == 0:
+        return True
+    # A non-zero exit is benign when the rebase has already reached its desired
+    # end state (SYM-148): a concurrent run may have completed it, so no rebase
+    # is in progress and the tree has no unmerged paths. Treat that as success.
+    # A genuine unresolved conflict leaves the rebase in progress (or leaves
+    # unmerged paths), so it still reports failure.
+    if not await _rebase_in_progress(workspace_path):
+        if not await _git_conflicted_files(workspace_path):
+            return True
+    return False
+
+
+async def _rebase_in_progress(workspace_path: Path) -> bool:
+    """True if a rebase is in progress in *workspace_path*.
+
+    Resolves the real git dir via ``git rev-parse --git-path`` so it works for
+    worktrees (where ``.git`` is a file, not a directory) as well as plain
+    clones, then checks for the ``rebase-merge`` / ``rebase-apply`` state dirs.
+    """
+    for name in ("rebase-merge", "rebase-apply"):
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--git-path", name,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            continue
+        rel = stdout.decode(errors="replace").strip()
+        if rel and (workspace_path / rel).exists():
+            return True
+    return False
 
 
 async def _workspace_head_sha(workspace_path: Path) -> str:
