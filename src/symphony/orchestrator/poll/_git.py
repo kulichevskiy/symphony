@@ -221,7 +221,32 @@ async def _git_add_and_continue_rebase(
     # unmerged paths), so it still reports failure.
     if not await _rebase_in_progress(workspace_path):
         if not await _git_conflicted_files(workspace_path):
-            return True
+            if not await _rebase_had_recent_skips(workspace_path):
+                return True
+    return False
+
+
+async def _rebase_had_recent_skips(workspace_path: Path) -> bool:
+    """True if the most recently completed rebase used --skip for any commit.
+
+    Git writes ``rebase (skip) (finish): ...`` to HEAD's reflog when a rebase
+    finishes via --skip, versus plain ``rebase (finish): ...`` for a normal
+    completion.  Scanning the first finish-type entry detects this reliably.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git", "reflog", "HEAD", "--format=%gs",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return False
+    for line in stdout.decode().splitlines():
+        line = line.strip()
+        if line.startswith("rebase") and "(finish)" in line:
+            return "(skip)" in line
     return False
 
 
