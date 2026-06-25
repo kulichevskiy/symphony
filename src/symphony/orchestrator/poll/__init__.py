@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiosqlite
-import httpx
 
 from ... import db
 from ...agent.activity import (
@@ -44,12 +43,8 @@ from ...agent.activity import (
 from ...agent.codex_models import DEFAULT_CODEX_MODEL
 from ...agent.model_usage import ModelUsage, parse_model_usage
 from ...agent.process import parse_event_line
-from ...agent.prompt import (
-    acceptance_fix_prompt,
-    implement_prompt,
-)
+from ...agent.prompt import implement_prompt
 from ...agent.runner import RunnerSpec
-from ...agent.runners.acceptance import quick_skip_trivial_acceptance, run_acceptance
 from ...config import Config, RepoBinding
 from ...github.client import GitHubError
 from ...github.webhook import GitHubWebhookEvent
@@ -57,8 +52,6 @@ from ...linear.client import LinearError, comment_from_webhook_payload
 from ...linear.slash import SlashIntent
 from ...linear.templates import (
     CommentVars,
-    acceptance_blocked,
-    acceptance_rejected,
     awaiting_approval,
     budget_exceeded,
     failed,
@@ -68,14 +61,6 @@ from ...linear.templates import (
     stage_done,
     truncate_body,
 )
-from ...pipeline.acceptance_classifier import (
-    AcceptanceScreenshot,
-    AcceptanceVerdict,
-    ExtractedCriterion,
-    extract_acceptance_criteria,
-    format_acceptance_criteria_comment,
-    format_acceptance_verdict_comment,
-)
 from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
@@ -83,13 +68,7 @@ from ...pipeline.cost_guard import (
 from ...pipeline.local_review import LocalVerdict, StreamApiError, extract_last_agent_message
 from ...pipeline.local_review_loop import LoopOutcome, LoopResult
 from ...pipeline.local_review_session import run_local_review_session
-from ...pipeline.preview_resolver import (
-    PreviewResolutionError,
-    render_preview_url,
-    resolve_preview_url,
-)
 from ...pipeline.state_machine import classify_implement_completion, on_runner_event
-from ...pipeline.taste_guide import load_taste_guide
 from ...pipeline.verify import VerifyResult, run_verify_session
 from ...tokens import effective_tokens
 from ...tracker import (
@@ -401,8 +380,6 @@ ORPHANED_MERGE_RUN_GRACE_SECS = 120
 MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL = 5
 MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS = 24
 PARKED_CLOSED_UNMERGED_COMMENT = "🛑 PR closed without merge — marking done"
-_CODE_ONLY_ACCEPTANCE_MODE = "code_only"
-ACCEPTANCE_INFRA_RETRY_LIMIT = 2
 # Shared, capped exponential-backoff knobs for every requeue-based infra-error
 # retry path (acceptance + the agent stages). `AGENT_INFRA_RETRY_LIMIT` is the
 # transient-API-error retry budget for reviewer/implement/fix runs before they
@@ -410,22 +387,19 @@ ACCEPTANCE_INFRA_RETRY_LIMIT = 2
 ACCEPTANCE_INFRA_RETRY_BASE_BACKOFF_SECS = 30
 ACCEPTANCE_INFRA_RETRY_MAX_BACKOFF_SECS = 120
 AGENT_INFRA_RETRY_LIMIT = 5
-ACCEPTANCE_FIX_ITERATION_CAP = 1
 # All transient-retry kinds share the same retry budget and backoff logic.
 # TRANSIENT_API_RETRY_KIND: implement-phase failure (no work done, HEAD unchanged).
 # LOCAL_REVIEW_TRANSIENT_RETRY_KIND: local-review-phase failure (implement succeeded,
 #   commits intact, but reviewer got a transient 500 before verdicting).
 # REVIEW_FIX_TRANSIENT_RETRY_KIND: review-stage fix agent failure (PR exists, commits
 #   intact, but fix agent got a transient 500 and made no HEAD advance).
-_AGENT_INFRA_RETRY_KINDS: frozenset[str] = frozenset({
-    db.runs.TRANSIENT_API_RETRY_KIND,
-    db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
-    db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
-})
-
-
-class _AcceptancePrDiffUnavailable(RuntimeError):
-    pass
+_AGENT_INFRA_RETRY_KINDS: frozenset[str] = frozenset(
+    {
+        db.runs.TRANSIENT_API_RETRY_KIND,
+        db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+        db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+    }
+)
 
 
 _UsageCostEstimator = UsageCostEstimator  # back-compat alias for internal callers
@@ -446,9 +420,7 @@ async def _record_run_model_usage(
     or DB error must never fail the run itself.
     """
     try:
-        text = await asyncio.to_thread(
-            log_path.read_text, encoding="utf-8", errors="replace"
-        )
+        text = await asyncio.to_thread(log_path.read_text, encoding="utf-8", errors="replace")
     except OSError:
         return
     usages = parse_model_usage(text.splitlines(), codex_model=codex_model)
@@ -490,71 +462,6 @@ def _parse_local_review_model_usage(
             continue
         usages.extend(parse_model_usage(text.splitlines(), codex_model=codex_model))
     return usages
-
-
-def _with_acceptance_degrade_note(
-    verdict: AcceptanceVerdict, degrade_note: str | None
-) -> AcceptanceVerdict:
-    if not degrade_note:
-        return verdict
-    details = verdict.details.strip()
-    if details.startswith(degrade_note):
-        return verdict
-    combined = degrade_note if not details else f"{degrade_note}\n\n{details}"
-    return replace(verdict, details=combined)
-
-
-def _acceptance_criterion_names(criteria: list[ExtractedCriterion]) -> list[str]:
-    return [item["name"] for item in criteria if item["name"].strip()]
-
-
-def _acceptance_criterion_predicates(criteria: list[ExtractedCriterion]) -> list[str]:
-    return [item["predicate"] for item in criteria if item["predicate"].strip()]
-
-
-def _replace_acceptance_criteria_labels(
-    *,
-    verdict: AcceptanceVerdict,
-    criteria_names: list[str],
-    criteria_predicates: list[str],
-) -> AcceptanceVerdict:
-    labels = dict(zip(criteria_predicates, criteria_names, strict=False))
-    criterion_results = tuple(
-        replace(
-            item,
-            criterion=labels.get(item.criterion, item.criterion),
-        )
-        for item in verdict.criterion_results
-    )
-    screenshots = tuple(
-        replace(
-            item,
-            label=labels.get(item.label, item.label),
-        )
-        for item in verdict.screenshots
-    )
-    return replace(
-        verdict,
-        criteria=criteria_names,
-        criterion_results=criterion_results,
-        screenshots=screenshots,
-    )
-
-
-def _acceptance_artifact_path(workspace_path: Path, raw_path: str) -> Path:
-    path = Path(raw_path)
-    if not path.is_absolute():
-        path = workspace_path / path
-    try:
-        resolved = path.resolve(strict=False)
-        workspace = workspace_path.resolve(strict=False)
-    except RuntimeError as e:
-        raise OSError(f"acceptance artifact path cannot be resolved: {raw_path}") from e
-    try:
-        resolved.relative_to(workspace)
-    except ValueError as e:
-        raise OSError(f"acceptance artifact path escapes workspace: {raw_path}") from e
-    return resolved
 
 
 def _activity_settings_for(config: Config, binding: RepoBinding) -> ActivitySettings:
@@ -666,9 +573,7 @@ def _read_run_final_message(log_path: Path, *, agent: str) -> str:
         stdout = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
-    reviewer_agent: Literal["claude", "codex"] = (
-        "claude" if agent == "claude" else "codex"
-    )
+    reviewer_agent: Literal["claude", "codex"] = "claude" if agent == "claude" else "codex"
     return extract_last_agent_message(agent=reviewer_agent, stdout=stdout)
 
 
@@ -705,14 +610,39 @@ def dirty_tree_fix_prompt(dirty_files: list[str]) -> str:
     )
 
 
-# SYM-147: the merge domain lives on `_MergeMixin`. Imported here — after
-# every shared module-level constant/helper/logger above is defined — so
-# `_merge`'s `from . import ...` resolves against the (still-initializing)
-# package.
+# SYM-147/SYM-148: the merge and acceptance domains live on `_MergeMixin` and
+# `_AcceptanceMixin`. Imported here — after every shared module-level
+# constant/helper/logger above is defined — so each mixin's `from . import ...`
+# back-references resolve against the (still-initializing) package. The
+# acceptance module-level helpers are re-exported by explicit name so
+# `poll.<name>` keeps resolving for callers and tests.
+from ._acceptance import (  # noqa: E402
+    _acceptance_artifact_path as _acceptance_artifact_path,
+)
+from ._acceptance import (  # noqa: E402
+    _acceptance_criterion_names as _acceptance_criterion_names,
+)
+from ._acceptance import (  # noqa: E402
+    _acceptance_criterion_predicates as _acceptance_criterion_predicates,
+)
+from ._acceptance import (  # noqa: E402
+    _AcceptanceMixin as _AcceptanceMixin,
+)
+from ._acceptance import (  # noqa: E402
+    _AcceptancePrDiffUnavailable as _AcceptancePrDiffUnavailable,
+)
+from ._acceptance import (  # noqa: E402
+    _replace_acceptance_criteria_labels as _replace_acceptance_criteria_labels,
+)
+from ._acceptance import (  # noqa: E402
+    _with_acceptance_degrade_note as _with_acceptance_degrade_note,
+)
 from ._merge import _MergeMixin  # noqa: E402
 
 
-class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixin):
+class Orchestrator(
+    _ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixin, _AcceptanceMixin
+):
     """Owns the poll loop. Dedupe is a SQLite query over the `runs` table."""
 
     async def warmup(self) -> None:
@@ -738,9 +668,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             )
             self._validate_waiting_state(binding, self._states[state_key])
 
-    def _validate_waiting_state(
-        self, binding: RepoBinding, states: dict[str, str]
-    ) -> None:
+    def _validate_waiting_state(self, binding: RepoBinding, states: dict[str, str]) -> None:
         waiting = binding.linear_states.waiting
         if waiting is None:
             return
@@ -756,7 +684,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         self._shutdown.set()
         self._wake.set()
 
-
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
@@ -766,9 +693,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         self._merge_wait_reconcile_task = asyncio.create_task(
             self._run_auto_recoverable_merge_wait_reconciler(self._shutdown)
         )
-        self._reconcile_task = asyncio.create_task(
-            self._reconciler.run(self._shutdown)
-        )
+        self._reconcile_task = asyncio.create_task(self._reconciler.run(self._shutdown))
         log.info("orchestrator entering poll loop (interval=%ds)", self.config.poll_interval_secs)
         try:
             while not self._shutdown.is_set():
@@ -805,20 +730,15 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             await self.drain_reconcile_event_tasks(cancel=True)
             await self.drain_dispatch_tasks(cancel=True)
 
-
     def _schedule_reconcile_task(
         self, awaitable: Awaitable[int], *, source: str
     ) -> asyncio.Task[None]:
-        task = asyncio.create_task(
-            self._run_reconcile_task(awaitable, source=source)
-        )
+        task = asyncio.create_task(self._run_reconcile_task(awaitable, source=source))
         self._reconcile_event_tasks.add(task)
         task.add_done_callback(self._reconcile_event_task_done)
         return task
 
-    async def _run_reconcile_task(
-        self, awaitable: Awaitable[int], *, source: str
-    ) -> None:
+    async def _run_reconcile_task(self, awaitable: Awaitable[int], *, source: str) -> None:
         try:
             observed = await awaitable
         except asyncio.CancelledError:
@@ -850,8 +770,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         await self._restore_operator_waits()
         self._merged_linear_state_reconcile_ticks += 1
         if (
-            self._merged_linear_state_reconcile_ticks
-            % MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL
+            self._merged_linear_state_reconcile_ticks % MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL
             == 0
         ):
             try:
@@ -904,9 +823,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             detail="ignored event type",
         )
 
-    async def handle_github_webhook(
-        self, event: GitHubWebhookEvent
-    ) -> WebhookDispatchResult:
+    async def handle_github_webhook(self, event: GitHubWebhookEvent) -> WebhookDispatchResult:
         """Accept a verified GitHub webhook event and audit external truth."""
         log.info(
             "github webhook event received: repo=%s type=%s action=%s pr=%s delivery=%s",
@@ -935,10 +852,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 self._reconcile_auto_recoverable_merge_waits(
                     reason=f"github_webhook:{event.event_type}.{event.action or 'unknown'}"
                 ),
-                source=(
-                    "merge_wait.github."
-                    f"{event.event_type}.{event.action or 'unknown'}"
-                ),
+                source=(f"merge_wait.github.{event.event_type}.{event.action or 'unknown'}"),
             )
         return WebhookDispatchResult(
             kind=f"github.{event.event_type}",
@@ -956,9 +870,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             )
         issue_id = _comment_issue_id_from_webhook_payload(payload)
         if issue_id is None:
-            return WebhookDispatchResult(
-                kind="comment", handled=False, detail="missing issue id"
-            )
+            return WebhookDispatchResult(kind="comment", handled=False, detail="missing issue id")
         candidate_issue_ids = await self._storage_issue_ids_for_tracker_issue(
             issue_id, provider=provider
         )
@@ -971,9 +883,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             candidate_run_id = self._dispatch_run_ids.get(
                 candidate_issue_id
             ) or self._review_poll_issue_ids.get(candidate_issue_id)
-            if candidate_run_id is None or not self._slash_command_run_eligible(
-                candidate_run_id
-            ):
+            if candidate_run_id is None or not self._slash_command_run_eligible(candidate_run_id):
                 continue
             storage_issue_id = candidate_issue_id
             run_id = candidate_run_id
@@ -991,13 +901,9 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 run_id = candidate_run_id
                 break
         if run_id is None:
-            return WebhookDispatchResult(
-                kind="comment", handled=False, detail="no active run"
-            )
+            return WebhookDispatchResult(kind="comment", handled=False, detail="no active run")
         try:
-            handled = await self._handle_unseen_slash_comment(
-                storage_issue_id, run_id, comment
-            )
+            handled = await self._handle_unseen_slash_comment(storage_issue_id, run_id, comment)
         except SlashHandlerFailure as exc:
             # Rejection has already been posted inside the lock, and the
             # comment was deliberately NOT marked seen so the next poll tick
@@ -1022,24 +928,16 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
     ) -> WebhookDispatchResult:
         action = str(payload.get("action") or "").casefold()
         if action and action not in {"create", "update"}:
-            return WebhookDispatchResult(
-                kind="issue", handled=False, detail="ignored action"
-            )
+            return WebhookDispatchResult(kind="issue", handled=False, detail="ignored action")
         data = payload.get("data")
         if not isinstance(data, Mapping):
-            return WebhookDispatchResult(
-                kind="issue", handled=False, detail="missing issue data"
-            )
+            return WebhookDispatchResult(kind="issue", handled=False, detail="missing issue data")
         issue_id = data.get("id")
         if not isinstance(issue_id, str) or not issue_id:
-            return WebhookDispatchResult(
-                kind="issue", handled=False, detail="missing issue id"
-            )
+            return WebhookDispatchResult(kind="issue", handled=False, detail="missing issue id")
         state_changed = _linear_issue_state_changed(payload)
         issue, tracker_ctx = await self._lookup_webhook_issue(issue_id, provider=provider)
-        storage_issue_id = await self._storage_issue_id_for_tracker_issue(
-            issue.id, tracker_ctx
-        )
+        storage_issue_id = await self._storage_issue_id_for_tracker_issue(issue.id, tracker_ctx)
         if state_changed:
             self._schedule_reconcile_task(
                 self._reconciler.reconcile_linear_issue_event(
@@ -1048,8 +946,8 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 ),
                 source=f"linear.issue.{action or 'update'}",
             )
-        old_state_id, old_state_name, new_state_id, new_state_name = (
-            _linear_issue_state_transition(payload)
+        old_state_id, old_state_name, new_state_id, new_state_name = _linear_issue_state_transition(
+            payload
         )
         revived = False
         if state_changed:
@@ -1068,11 +966,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             return WebhookDispatchResult(
                 kind="issue",
                 handled=revived,
-                detail=(
-                    "parked manual merge revived"
-                    if revived
-                    else "issue is not dispatchable"
-                ),
+                detail=("parked manual merge revived" if revived else "issue is not dispatchable"),
             )
         task = await self._schedule_ready_issue(binding, issue)
         return WebhookDispatchResult(
@@ -1080,7 +974,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             handled=task is not None or revived,
             detail="" if task is not None else "issue is already scheduled or active",
         )
-
 
     async def _track_implement_failed_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding
@@ -1102,7 +995,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             tracker_site=binding.tracker_site,
         )
 
-
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding
     ) -> None:
@@ -1122,7 +1014,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
-
 
     async def _blocked_reason_for_run(self, run_id: str) -> str:
         run = await db.runs.get_with_issue(self._conn, run_id)
@@ -1233,7 +1124,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         self._register_operator_wait_binding(wait, binding)
         return binding
 
-
     def _binding_for_operator_wait(
         self, wait: db.operator_waits.OperatorWait
     ) -> RepoBinding | None:
@@ -1248,98 +1138,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 return binding
         return None
 
-    async def _track_acceptance_blocked_wait(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-        run_id: str,
-        verdict: AcceptanceVerdict,
-    ) -> None:
-        states: dict[str, str] = {}
-        try:
-            states = await self._states_for_binding(binding)
-        except LinearError as e:
-            log.warning(
-                "could not load states while parking acceptance-blocked %s: %s",
-                issue.identifier,
-                e,
-            )
-        target_id = states.get(binding.linear_states.needs_approval) or states.get(
-            binding.linear_states.blocked
-        )
-        tracker = self.tracker(binding)
-        if target_id is not None:
-            try:
-                await tracker.move_issue(issue.id, target_id)
-            except LinearError as e:
-                log.warning(
-                    "could not park acceptance-blocked %s: %s",
-                    issue.identifier,
-                    e,
-                )
-
-        body = acceptance_blocked(
-            CommentVars(
-                stage="acceptance",
-                repo=binding.github_repo,
-                issue=pr_number,
-                pr_url=await self._acceptance_pr_url(issue.id),
-                run_id=run_id,
-                error=verdict.details,
-            )
-        )
-        try:
-            await tracker.post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning("acceptance blocked comment failed on %s: %s", issue.identifier, e)
-
-        self._dispatch_run_ids[issue.id] = run_id
-        self._operator_wait_run_ids.add(run_id)
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue.id,
-            run_id=run_id,
-            kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
-        )
-
-    async def _track_acceptance_rejected_wait(
-        self, issue_id: str, run_id: str, binding: RepoBinding
-    ) -> None:
-        self._dispatch_run_ids[issue_id] = run_id
-        self._operator_wait_run_ids.add(run_id)
-        self._acceptance_rejected_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
-            kind=db.operator_waits.KIND_ACCEPTANCE_REJECTED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
-        )
-
-    async def _acceptance_pr_url(self, issue_id: str) -> str:
-        state = await db.acceptance_state.get(self._conn, issue_id)
-        if state.pr_url:
-            return state.pr_url
-        if state.pr_number is not None:
-            return f"#{state.pr_number}"
-        return "(no PR yet)"
-
-
     async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
         if self._dispatch_run_ids.get(issue_id) == run_id:
             self._dispatch_run_ids.pop(issue_id, None)
@@ -1353,25 +1151,19 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         self._budget_exceeded_run_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id)
 
-    async def _token_budget_ceiling(
-        self, issue_id: str, binding: RepoBinding
-    ) -> float | None:
+    async def _token_budget_ceiling(self, issue_id: str, binding: RepoBinding) -> float | None:
         """Soft ceiling = `per_issue_token_budget + granted_token_budget`.
 
         Returns `None` when the gate is off for this binding (no global
         default and no per-binding override).
         """
-        budget = binding.resolved_per_issue_token_budget(
-            self.config.per_issue_token_budget
-        )
+        budget = binding.resolved_per_issue_token_budget(self.config.per_issue_token_budget)
         if budget is None:
             return None
         granted = await db.issues.get_granted_token_budget(self._conn, issue_id)
         return float(budget + granted)
 
-    async def _would_exceed_token_budget(
-        self, issue_id: str, binding: RepoBinding
-    ) -> bool:
+    async def _would_exceed_token_budget(self, issue_id: str, binding: RepoBinding) -> bool:
         """True when cumulative effective tokens have reached the ceiling.
 
         Soft gate: uses whatever token data is recorded; the ~40% of runs
@@ -1402,9 +1194,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
     ) -> None:
         ceiling = await self._token_budget_ceiling(issue_id, binding)
         tokens = await db.runs.tokens_for_issue(self._conn, issue_id)
-        breakdown = await db.runs.effective_tokens_by_stage_for_issue(
-            self._conn, issue_id
-        )
+        breakdown = await db.runs.effective_tokens_by_stage_for_issue(self._conn, issue_id)
         tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(binding)
         pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
@@ -1468,14 +1258,10 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             tracker_site=binding.tracker_site,
         )
 
-
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
             await asyncio.gather(
-                *(
-                    self._kill_active_runner(run_id)
-                    for run_id in tuple(self._active_run_ids)
-                ),
+                *(self._kill_active_runner(run_id) for run_id in tuple(self._active_run_ids)),
                 return_exceptions=True,
             )
             for task in tuple(self._dispatch_tasks):
@@ -1499,7 +1285,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         except Exception:
             log.exception("failed to kill runner for run_id=%s", run_id)
 
-
     def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None:
         stored_label = _binding_label_from_storage_key(candidate.binding_key)
         if candidate.binding_key:
@@ -1517,9 +1302,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         ]
         if stored_label is not None:
             labeled_matches = [
-                binding
-                for binding in matches
-                if (binding.issue_label or "") == stored_label
+                binding for binding in matches if (binding.issue_label or "") == stored_label
             ]
             if len(labeled_matches) == 1:
                 return labeled_matches[0]
@@ -1527,44 +1310,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         if len(matches) == 1:
             return matches[0]
         return None
-
-
-    async def _acceptance_passed_for_candidate(
-        self,
-        candidate: db.issue_prs.IssuePR,
-        binding: RepoBinding,
-        pr_head_sha: str,
-    ) -> bool:
-        if not pr_head_sha:
-            return False
-        state = await db.acceptance_state.get(self._conn, candidate.issue_id)
-        return (
-            state.pr_number == candidate.pr_number
-            and state.pr_url == candidate.pr_url
-            and state.pr_head_sha == pr_head_sha
-            and state.mode == binding.acceptance.mode
-            and state.last_verdict == "pass"
-        )
-
-
-    async def _acceptance_infra_retry_backoff_active(self, issue_id: str) -> bool:
-        state = await db.acceptance_state.get(self._conn, issue_id)
-        if state.last_verdict != "infra_error" or state.infra_retries <= 0:
-            return False
-        latest = await db.runs.latest_for_issue_stage(
-            self._conn,
-            issue_id=issue_id,
-            stage="acceptance",
-        )
-        if latest is None or latest.ended_at is None:
-            return False
-        try:
-            ended_at = _parse_rfc3339(latest.ended_at)
-        except ValueError:
-            return False
-        retry_count = min(state.infra_retries, ACCEPTANCE_INFRA_RETRY_LIMIT)
-        backoff_secs = _infra_retry_backoff_secs(retry_count)
-        return self._now() < ended_at + timedelta(seconds=backoff_secs)
 
     async def _agent_infra_retry_count(self, issue_id: str) -> int:
         """Consecutive most-recent *terminated* runs requeued on a transient API
@@ -1716,8 +1461,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         )
         attempt = prior + 1
         log.info(
-            "requeueing %s after transient API error "
-            "(attempt %d/%d, backoff %ds): %s",
+            "requeueing %s after transient API error (attempt %d/%d, backoff %ds): %s",
             issue.identifier,
             attempt,
             AGENT_INFRA_RETRY_LIMIT,
@@ -1726,764 +1470,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         )
         return True
 
-    def _schedule_acceptance(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-        pr_url: str,
-        pr_head_sha: str,
-    ) -> asyncio.Task[None]:
-        binding_key = _binding_key(binding)
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
-        task = asyncio.create_task(
-            self._acceptance_with_limits(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                pr_head_sha=pr_head_sha,
-            )
-        )
-        self._dispatch_tasks.add(task)
-        task.add_done_callback(
-            partial(
-                self._dispatch_task_done,
-                issue_id=issue.id,
-                binding_key=binding_key,
-            )
-        )
-        return task
-
-    async def _acceptance_with_limits(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-        pr_url: str,
-        pr_head_sha: str,
-    ) -> None:
-        key = _binding_key(binding)
-        binding_sem = self._binding_dispatch_sems.setdefault(
-            key,
-            asyncio.Semaphore(max(binding.max_concurrent, 1)),
-        )
-        try:
-            async with self._global_dispatch_sem:
-                async with binding_sem:
-                    current = await self._refresh_merge_candidate(binding, issue)
-                    if current is None:
-                        return
-                    await self._run_acceptance_stage(
-                        binding=binding,
-                        issue=current,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        pr_head_sha=pr_head_sha,
-                    )
-        except asyncio.CancelledError:
-            run_id = self._dispatch_run_ids.get(issue.id)
-            if run_id is not None:
-                await self._fail_run(run_id, "acceptance cancelled")
-            raise
-
-    def _acceptance_preview_url(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-        pr_url: str,
-    ) -> str:
-        if binding.acceptance.mode == "dev" and binding.acceptance.dev_port:
-            return f"http://127.0.0.1:{binding.acceptance.dev_port}"
-        pattern = binding.acceptance.preview_url_pattern
-        if not pattern:
-            return ""
-        try:
-            return render_preview_url(
-                acceptance=binding.acceptance,
-                issue_identifier=issue.identifier,
-                issue_id=issue.id,
-                pr_number=pr_number,
-                pr_url=pr_url,
-            )
-        except PreviewResolutionError as e:
-            log.warning(
-                "could not render acceptance preview URL for %s from %r: %s",
-                issue.identifier,
-                pattern,
-                e,
-            )
-            return ""
-
-    async def _acceptance_pr_diff(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-    ) -> str:
-        try:
-            return await self._gh.pr_diff(pr_number, repo=binding.github_repo)
-        except GitHubError as e:
-            log.warning(
-                "could not fetch acceptance PR diff for %s#%d on %s: %s",
-                binding.github_repo,
-                pr_number,
-                issue.identifier,
-                e,
-            )
-            raise _AcceptancePrDiffUnavailable(
-                f"Could not fetch PR diff for {binding.github_repo}#{pr_number}: {e}"
-            ) from e
-
-    async def _post_acceptance_verdict_comment(
-        self,
-        *,
-        binding: RepoBinding | None = None,
-        issue: LinearIssue,
-        pr_url: str,
-        verdict: AcceptanceVerdict,
-    ) -> str:
-        tracker = (
-            self.tracker(binding)
-            if binding is not None
-            else await self._tracker_for_issue_id(issue.id)
-        )
-        try:
-            body = format_acceptance_verdict_comment(
-                verdict=verdict,
-                pr_url=pr_url,
-            )
-            comment_id = await tracker.post_comment(issue.id, truncate_body(body))
-            if comment_id:
-                return f"{issue.url}#comment-{comment_id}"
-        except LinearError as e:
-            log.warning(
-                "acceptance verdict comment failed on %s: %s",
-                issue.identifier,
-                e,
-            )
-        return ""
-
-    async def _post_acceptance_criteria_comment(
-        self,
-        *,
-        binding: RepoBinding | None = None,
-        issue: LinearIssue,
-        criteria: list[ExtractedCriterion],
-    ) -> None:
-        tracker = (
-            self.tracker(binding)
-            if binding is not None
-            else await self._tracker_for_issue_id(issue.id)
-        )
-        try:
-            body = format_acceptance_criteria_comment(criteria)
-            await tracker.post_comment(issue.id, truncate_body(body))
-        except LinearError as e:
-            log.warning(
-                "acceptance criteria comment failed on %s: %s",
-                issue.identifier,
-                e,
-            )
-
-    async def _upload_acceptance_screenshots(
-        self,
-        *,
-        binding: RepoBinding | None = None,
-        issue: LinearIssue,
-        workspace_path: Path,
-        verdict: AcceptanceVerdict,
-    ) -> AcceptanceVerdict:
-        if verdict.kind not in {"pass", "reject"} or not verdict.screenshots:
-            return verdict
-
-        tracker = (
-            self.tracker(binding)
-            if binding is not None
-            else await self._tracker_for_issue_id(issue.id)
-        )
-        uploaded_by_path: dict[str, str] = {}
-        uploaded_screenshots: list[AcceptanceScreenshot] = []
-        for screenshot in verdict.screenshots:
-            try:
-                path = _acceptance_artifact_path(workspace_path, screenshot.path)
-                url = await tracker.upload_issue_attachment(
-                    issue_uuid=issue.id,
-                    path=path,
-                    title=f"Acceptance screenshot: {screenshot.label}",
-                )
-            except (LinearError, OSError, httpx.HTTPError) as e:
-                return replace(
-                    verdict,
-                    kind="infra_error",
-                    hero_screenshot_url="",
-                    screenshots=(),
-                    criterion_results=(),
-                    details=f"acceptance screenshot upload failed: {e}",
-                )
-            uploaded_by_path[screenshot.path] = url
-            uploaded_screenshots.append(replace(screenshot, url=url))
-
-        criterion_results = tuple(
-            replace(
-                result,
-                screenshot_url=uploaded_by_path.get(
-                    result.screenshot_path,
-                    result.screenshot_url,
-                ),
-            )
-            for result in verdict.criterion_results
-        )
-        hero_url = next(
-            (
-                item.url
-                for item in uploaded_screenshots
-                if item.kind == "hero" and item.url
-            ),
-            verdict.hero_screenshot_url,
-        )
-        return replace(
-            verdict,
-            hero_screenshot_url=hero_url,
-            screenshots=tuple(uploaded_screenshots),
-            criterion_results=criterion_results,
-        )
-
-    async def _run_acceptance_stage(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-        pr_url: str,
-        pr_head_sha: str,
-        reset_iteration: bool = True,
-    ) -> str | None:
-        run_id = str(uuid.uuid4())
-        inserted = await db.runs.create_if_no_active(
-            self._conn,
-            id=run_id,
-            issue_id=issue.id,
-            stage="acceptance",
-            status="running",
-            pid=None,
-            started_at=self._now().isoformat(),
-            ignored_stage="review",
-        )
-        if not inserted:
-            return None
-
-        self._dispatch_run_ids[issue.id] = run_id
-        try:
-            await self._complete_review_monitors_for_merge(issue)
-            degrade_note = (
-                _acceptance_degrade_note(issue.description)
-                if binding.acceptance.mode != _CODE_ONLY_ACCEPTANCE_MODE
-                else None
-            )
-            effective_mode = (
-                _CODE_ONLY_ACCEPTANCE_MODE if degrade_note else binding.acceptance.mode
-            )
-            if degrade_note:
-                log.info("%s for %s", degrade_note, issue.identifier)
-            preview_url = ""
-            preview_resolution_error = ""
-            if not degrade_note:
-                if (
-                    effective_mode == "preview"
-                    and binding.acceptance.preview_url_pattern
-                ):
-                    try:
-                        preview_url = render_preview_url(
-                            acceptance=binding.acceptance,
-                            issue_identifier=issue.identifier,
-                            issue_id=issue.id,
-                            pr_number=pr_number,
-                            pr_url=pr_url,
-                        )
-                    except PreviewResolutionError as e:
-                        preview_resolution_error = str(e)
-                        preview_url = e.url
-                else:
-                    preview_url = self._acceptance_preview_url(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                    )
-            extracted_criteria = extract_acceptance_criteria(issue.description)
-            criteria_names = _acceptance_criterion_names(extracted_criteria)
-            criteria_predicates = _acceptance_criterion_predicates(extracted_criteria)
-            await db.acceptance_state.begin_acceptance(
-                self._conn,
-                issue.id,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                pr_head_sha=pr_head_sha,
-                mode=binding.acceptance.mode,
-                preview_url=preview_url,
-                extracted_criteria=json.dumps(extracted_criteria),
-                reset_iteration=reset_iteration,
-            )
-            await self._post_acceptance_criteria_comment(
-                binding=binding,
-                issue=issue,
-                criteria=extracted_criteria,
-            )
-            await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
-
-            verdict: AcceptanceVerdict | None = None
-            if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev", "preview"}:
-                verdict = AcceptanceVerdict(
-                    kind="pass",
-                    criteria=criteria_names,
-                    cost=0.0,
-                    hero_screenshot_url="",
-                    details=(
-                        f"Acceptance mode {binding.acceptance.mode!r} is configured, "
-                        "but this mode does not have a real runner in this slice. "
-                        "Preserving pass-through acceptance behavior until that "
-                        "mode's runner is implemented."
-                    ),
-                )
-            elif preview_resolution_error:
-                verdict = AcceptanceVerdict(
-                    kind="infra_error",
-                    criteria=criteria_names,
-                    cost=0.0,
-                    hero_screenshot_url="",
-                    details=preview_resolution_error,
-                    preview_url=preview_url,
-                )
-            elif effective_mode == "preview":
-                try:
-                    preview_url = await resolve_preview_url(
-                        acceptance=binding.acceptance,
-                        pr_number=pr_number,
-                        issue_identifier=issue.identifier,
-                        issue_id=issue.id,
-                        pr_url=pr_url,
-                    )
-                except PreviewResolutionError as e:
-                    verdict = AcceptanceVerdict(
-                        kind="infra_error",
-                        criteria=criteria_names,
-                        cost=0.0,
-                        hero_screenshot_url="",
-                        details=str(e),
-                        preview_url=e.url,
-                    )
-
-            if verdict is None:
-                try:
-                    pr_diff_summary = await self._acceptance_pr_diff(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                    )
-                except _AcceptancePrDiffUnavailable as e:
-                    verdict = AcceptanceVerdict(
-                        kind="infra_error",
-                        criteria=criteria_names,
-                        cost=0.0,
-                        hero_screenshot_url="",
-                        details=str(e),
-                    )
-                else:
-                    quick_skip = (
-                        quick_skip_trivial_acceptance(
-                            linear_description=issue.description,
-                            pr_diff_summary=pr_diff_summary,
-                            criteria=criteria_names,
-                        )
-                        if effective_mode == _CODE_ONLY_ACCEPTANCE_MODE
-                        else None
-                    )
-                    if quick_skip is not None:
-                        verdict = quick_skip
-                    else:
-                        workspace_path = await self._workspace.acquire(binding, issue)
-                        try:
-                            verdict = await run_acceptance(
-                                runner=self._runner,
-                                run_id=run_id,
-                                workspace_path=workspace_path,
-                                mode=effective_mode,
-                                linear_description=issue.description,
-                                pr_diff_summary=pr_diff_summary,
-                                taste_guide=load_taste_guide(
-                                    binding_taste_guide=binding.acceptance.taste_guide,
-                                ),
-                                criteria=criteria_predicates,
-                                stall_secs=binding.acceptance.time_cap_minutes * 60,
-                                preview_url=preview_url,
-                                dev_command=binding.acceptance.dev_command,
-                                dev_port=binding.acceptance.dev_port,
-                            )
-                            verdict = _replace_acceptance_criteria_labels(
-                                verdict=verdict,
-                                criteria_names=criteria_names,
-                                criteria_predicates=criteria_predicates,
-                            )
-                            if effective_mode in {"dev", "preview"}:
-                                verdict = await self._upload_acceptance_screenshots(
-                                    binding=binding,
-                                    issue=issue,
-                                    workspace_path=workspace_path,
-                                    verdict=verdict,
-                                )
-                        finally:
-                            self._workspace.release(binding, issue)
-
-            verdict = _with_acceptance_degrade_note(verdict, degrade_note)
-
-            verdict_usage = verdict.usage
-            if verdict_usage.has_usage():
-                verdict_usage = UsageDelta(
-                    cost_usd=verdict.cost,
-                    input_tokens=verdict_usage.input_tokens,
-                    output_tokens=verdict_usage.output_tokens,
-                    cache_write_tokens=verdict_usage.cache_write_tokens,
-                    cache_read_tokens=verdict_usage.cache_read_tokens,
-                )
-            elif verdict.cost > 0:
-                verdict_usage = UsageDelta(cost_usd=verdict.cost)
-            if verdict_usage.has_usage():
-                await _add_run_usage(self._conn, run_id, verdict_usage)
-
-            comment_url = await self._post_acceptance_verdict_comment(
-                binding=binding,
-                issue=issue,
-                pr_url=pr_url,
-                verdict=verdict,
-            )
-            await db.acceptance_state.record_verdict(
-                self._conn,
-                issue.id,
-                verdict=verdict.kind,
-                artifacts_url=comment_url or verdict.hero_screenshot_url,
-                preview_url=verdict.preview_url,
-            )
-
-            ended_at = self._now().isoformat()
-            if verdict.kind == "pass":
-                await db.runs.update_status(
-                    self._conn,
-                    run_id,
-                    "completed",
-                    ended_at=ended_at,
-                )
-                if self._dispatch_run_ids.get(issue.id) == run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                merge_issue = await self._refresh_issue_for_acceptance_merge_handoff(
-                    binding, issue
-                )
-                if _needs_human_approval_label_present(merge_issue):
-                    await self._open_merge_wait_for_human_approval_label(
-                        binding=binding,
-                        issue=merge_issue,
-                        pr_url=pr_url,
-                    )
-                else:
-                    await self._merge_approved_pr(
-                        binding=binding,
-                        issue=merge_issue,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        approved_head_sha=pr_head_sha,
-                    )
-                return run_id
-
-            if verdict.kind == "infra_error":
-                state = await db.acceptance_state.get(self._conn, issue.id)
-                if state.infra_retries >= ACCEPTANCE_INFRA_RETRY_LIMIT:
-                    await db.runs.update_status(
-                        self._conn,
-                        run_id,
-                        "failed",
-                        ended_at=ended_at,
-                        **_termination_kwargs(
-                            status="failed",
-                            reason=f"acceptance infra_error: {verdict.details}",
-                        ),
-                    )
-                    await self._track_acceptance_blocked_wait(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                        run_id=run_id,
-                        verdict=verdict,
-                    )
-                    return run_id
-                await db.acceptance_state.bump_infra_retries(self._conn, issue.id)
-                await db.runs.update_status(
-                    self._conn,
-                    run_id,
-                    "failed",
-                    ended_at=ended_at,
-                    **_termination_kwargs(
-                        status="failed",
-                        reason=f"acceptance infra_error: {verdict.details}",
-                    ),
-                )
-                return run_id
-
-            state = await db.acceptance_state.get(self._conn, issue.id)
-            await db.runs.update_status(
-                self._conn,
-                run_id,
-                "failed",
-                ended_at=ended_at,
-                **_termination_kwargs(
-                    status="failed",
-                    reason=f"acceptance rejected: {verdict.details}",
-                ),
-            )
-            if state.iteration < ACCEPTANCE_FIX_ITERATION_CAP:
-                dispatched = await self._dispatch_acceptance_fix_run(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    pr_head_sha=pr_head_sha,
-                    verdict=verdict,
-                )
-                if dispatched:
-                    return run_id
-                log.warning(
-                    "acceptance fix-run did not advance %s; opening operator wait",
-                    issue.identifier,
-                )
-
-            await self._track_acceptance_rejected_wait(issue.id, run_id, binding)
-            body = acceptance_rejected(
-                CommentVars(
-                    stage="acceptance",
-                    repo=binding.github_repo,
-                    issue=pr_number,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                )
-            )
-            tracker = self.tracker(binding)
-            try:
-                await tracker.post_comment(issue.id, truncate_body(body))
-            except LinearError as e:
-                log.warning(
-                    "acceptance rejected wait comment failed on %s: %s",
-                    issue.identifier,
-                    e,
-                )
-            return run_id
-        except Exception as e:
-            log.exception("acceptance stage failed for %s", issue.identifier)
-            await db.runs.update_status(
-                self._conn,
-                run_id,
-                "failed",
-                ended_at=self._now().isoformat(),
-                **_termination_kwargs(
-                    status="failed",
-                    exc=e,
-                    reason=f"acceptance stage failed: {e}",
-                ),
-            )
-            return run_id
-        finally:
-            if (
-                self._dispatch_run_ids.get(issue.id) == run_id
-                and run_id not in self._operator_wait_run_ids
-            ):
-                self._dispatch_run_ids.pop(issue.id, None)
-
-    async def _dispatch_acceptance_fix_run(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        pr_number: int,
-        pr_url: str,
-        pr_head_sha: str,
-        verdict: AcceptanceVerdict,
-    ) -> bool:
-        await db.acceptance_state.bump_iteration(self._conn, issue.id)
-        prompt = acceptance_fix_prompt(
-            issue_title=issue.title,
-            issue_body=issue.description,
-            labels=list(issue.labels),
-            acceptance_verdict=format_acceptance_verdict_comment(
-                verdict=verdict,
-                pr_url=pr_url,
-            ),
-        )
-
-        try:
-            workspace_path = await self._workspace.acquire(binding, issue)
-        except Exception:  # noqa: BLE001
-            log.exception("workspace acquire failed for acceptance fix-run %s", issue.identifier)
-            return False
-
-        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-        try:
-            try:
-                await _git_fetch_branch(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "could not fetch acceptance fix-run remote HEAD for %s: %s",
-                    branch,
-                    e,
-                )
-                return False
-            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
-            if not start_sha:
-                start_sha = pr_head_sha
-            if not start_sha:
-                log.warning(
-                    "could not read acceptance fix-run remote HEAD for %s",
-                    branch,
-                )
-                return False
-
-            fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="acceptance_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-            )
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
-            try:
-                prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-                (
-                    usage_delta,
-                    final_kind,
-                    final_returncode,
-                ) = await self._run_acceptance_fix_agent(
-                    binding=binding,
-                    issue=issue,
-                    run_id=fix_run_id,
-                    workspace_path=workspace_path,
-                    prompt=prompt,
-                    prior_total=prior_total,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.exception("acceptance fix-run execution failed for %s", issue.identifier)
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"acceptance fix-run execution failed: {e}",
-                    ),
-                )
-                return False
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-
-            await _add_run_usage(self._conn, fix_run_id, usage_delta)
-
-            transition = on_runner_event(
-                stage="acceptance_fix",
-                event_kind=final_kind,
-                returncode=final_returncode,
-            )
-            if transition.next_run_status != "completed":
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    transition.next_run_status,
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status=transition.next_run_status,
-                        final_kind=final_kind,
-                        returncode=final_returncode,
-                        reason=f"acceptance fix-run ended with {final_kind}",
-                    ),
-                )
-                return False
-
-            pushed_sha = await _workspace_head_sha(workspace_path)
-            if not pushed_sha or pushed_sha == start_sha:
-                short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
-                status_short = await _git_status_short(workspace_path)
-                log.warning(
-                    "acceptance fix-run completed without advancing %s; "
-                    "HEAD stayed at %s; status=%s",
-                    branch,
-                    short_sha,
-                    status_short,
-                )
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        reason=(
-                            "acceptance fix-run completed without advancing "
-                            f"{branch}; HEAD stayed at {short_sha}; status={status_short}"
-                        ),
-                    ),
-                )
-                return False
-
-            try:
-                await self._push_fn(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "git push failed for acceptance fix-run %s: %s",
-                    issue.identifier,
-                    e,
-                )
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"push failed: {e}",
-                    ),
-                )
-                return False
-
-            await db.runs.update_status(
-                self._conn,
-                fix_run_id,
-                "completed",
-                ended_at=self._now().isoformat(),
-            )
-            await self._run_acceptance_stage(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                pr_head_sha=pushed_sha,
-                reset_iteration=False,
-            )
-            return True
-        finally:
-            self._workspace.release(binding, issue)
-
-
-    async def _dispatch_one(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> str | None:
+    async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> str | None:
         """Drive one issue end-to-end through the Implement stage.
 
         Persists first, announces second: if the host crashed after
@@ -2703,15 +1690,10 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         # deliverable commits before publish can be resumed; when the base is
         # unresolved, _branch_ahead_of_base deliberately cannot supply that
         # proof, so the run falls back to the agent/completion-gate path.
-        short_circuit = (
-            branch_ahead
-            and not pending_handoff
-            and not previous_requires_agent
-        )
+        short_circuit = branch_ahead and not pending_handoff and not previous_requires_agent
         if short_circuit:
             log.info(
-                "branch for %s already ahead of %s; skipping agent, "
-                "proceeding to publish",
+                "branch for %s already ahead of %s; skipping agent, proceeding to publish",
                 issue.identifier,
                 base_branch,
             )
@@ -2842,15 +1824,13 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         head_before = await _workspace_head_sha(workspace_path)
 
         try:
-            cumulative_usage, final_kind, final_returncode = (
-                await self._run_agent(
-                    binding=binding,
-                    issue=issue,
-                    storage_issue_id=issue_id,
-                    run_id=run_id,
-                    workspace_path=workspace_path,
-                    prior_total=prior_total,
-                )
+            cumulative_usage, final_kind, final_returncode = await self._run_agent(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                prior_total=prior_total,
             )
         except Exception as e:  # noqa: BLE001 — surface as failed run
             log.exception("agent execution failed for %s", issue.identifier)
@@ -2909,8 +1889,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         )
         if completion.outcome == "blocked":
             reason = (
-                completion.blocked_reason
-                or "agent blocked on a human action but gave no reason"
+                completion.blocked_reason or "agent blocked on a human action but gave no reason"
             )
             log.info("implement run %s classified blocked: %s", run_id, reason)
             # Captured verbatim on the run record (termination_kind="blocked",
@@ -3041,9 +2020,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         # has finished; if the issue has already crossed its budget, park
         # rather than spawning further fix turns. Evaluated only when fixes
         # could be dispatched (`allow_fixes`), never mid-run.
-        if allow_fixes and await self._maybe_park_for_token_budget(
-            issue_id, run_id, binding
-        ):
+        if allow_fixes and await self._maybe_park_for_token_budget(issue_id, run_id, binding):
             return False, None
 
         # 4.5. Local-review pre-flight. When `binding.local_review` is set,
@@ -3070,9 +2047,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 # succeeded and short-circuits to the pre-push gates instead of
                 # re-running the implementer on an already-complete branch.
                 _lr_api_error = (
-                    local_review_result.api_error
-                    if local_review_result is not None
-                    else None
+                    local_review_result.api_error if local_review_result is not None else None
                 )
                 if await self._maybe_requeue_transient_agent_failure(
                     run_id=run_id,
@@ -3157,8 +2132,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         dirty_files = await _workspace_dirty_files(workspace_path)
         if dirty_files and allow_fixes:
             log.warning(
-                "dirty working tree before push for %s (%d entries); "
-                "dispatching one fix turn",
+                "dirty working tree before push for %s (%d entries); dispatching one fix turn",
                 issue.identifier,
                 len(dirty_files),
             )
@@ -3224,13 +2198,9 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             base_branch=base_branch,
         )
 
-    async def _delivery_handoff_started(
-        self, *, ctx: _PendingDelivery, pr_url: str
-    ) -> bool:
+    async def _delivery_handoff_started(self, *, ctx: _PendingDelivery, pr_url: str) -> bool:
         """True once delivery reached durable PR/review handoff metadata."""
-        if await db.runs.has_live_stage(
-            self._conn, ctx.storage_issue_id, stage="review"
-        ):
+        if await db.runs.has_live_stage(self._conn, ctx.storage_issue_id, stage="review"):
             return True
 
         pr_number = pr_number_from_url(pr_url)
@@ -3336,12 +2306,8 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         # live review run; no-review handoff writes only review_state/issue_prs.
         # The Linear stage_done announcement has its own durable marker because
         # a handoff can fail before either PR/review metadata row exists.
-        first_handoff = not await self._delivery_handoff_started(
-            ctx=ctx, pr_url=pr_url
-        )
-        stage_done_announced = await db.runs.has_stage_done_announced(
-            self._conn, run_id
-        )
+        first_handoff = not await self._delivery_handoff_started(ctx=ctx, pr_url=pr_url)
+        stage_done_announced = await db.runs.has_stage_done_announced(self._conn, run_id)
 
         # The stage-transition comment is first-delivery only. The completed
         # write must happen before the first handoff so the review run can pass
@@ -3381,9 +2347,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                     )
                     await tracker.post_comment(issue.id, truncate_body(done_body))
                 except LinearError as e:
-                    log.warning(
-                        "stage_done comment failed on %s: %s", issue.identifier, e
-                    )
+                    log.warning("stage_done comment failed on %s: %s", issue.identifier, e)
 
             await self._track_delivery_handoff_recovery_wait(ctx)
             await db.runs.update_status(
@@ -3399,9 +2363,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         # rather than propagate and leave a completed run with no review
         # started and no operator wait.
         try:
-            delivered_run_id = await self._deliver_review_handoff(
-                ctx=ctx, pr_url=pr_url
-            )
+            delivered_run_id = await self._deliver_review_handoff(ctx=ctx, pr_url=pr_url)
         except Exception as e:  # noqa: BLE001
             log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
@@ -3422,9 +2384,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             )
         return delivered_run_id
 
-    async def _deliver_review_handoff(
-        self, *, ctx: _PendingDelivery, pr_url: str
-    ) -> str:
+    async def _deliver_review_handoff(self, *, ctx: _PendingDelivery, pr_url: str) -> str:
         """Post-PR handoff: register the merge candidate (no-review) or start
         the Review stage. Raises on unexpected DB/Linear faults so the caller
         can park `deliver_failed`."""
@@ -3434,10 +2394,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         run_id = ctx.run_id
         local_review_result = ctx.local_review_result
 
-        if (
-            not binding.resolved_local_review()
-            and not binding.resolved_remote_review()
-        ):
+        if not binding.resolved_local_review() and not binding.resolved_remote_review():
             pr_number = pr_number_from_url(pr_url)
             await db.review_state.begin_review(
                 self._conn,
@@ -3475,9 +2432,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             binding.resolved_local_review()
             and not _local_review_permits_remote(local_review_result)
         )
-        post_codex_review = (
-            binding.resolved_remote_review() and not local_review_blocks_remote
-        )
+        post_codex_review = binding.resolved_remote_review() and not local_review_blocks_remote
         review_run = await self._start_review_stage(
             binding=binding,
             issue=issue,
@@ -3485,10 +2440,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
-        if (
-            binding.resolved_local_review()
-            and _local_review_needs_approval(local_review_result)
-        ):
+        if binding.resolved_local_review() and _local_review_needs_approval(local_review_result):
             await self._park_local_only_review_needs_approval(
                 run=review_run,
                 binding=binding,
@@ -3504,10 +2456,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 binding.resolved_remote_review()
                 and _local_review_permits_remote(local_review_result)
             )
-            and (
-                local_review_result is None
-                or local_review_result.outcome != LoopOutcome.APPROVED
-            )
+            and (local_review_result is None or local_review_result.outcome != LoopOutcome.APPROVED)
         ):
             await self._fail_review_run(
                 run=review_run,
@@ -3542,13 +2491,10 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             await self._post_local_review_pr_summary(
                 binding=binding,
                 pr_url=pr_url,
-                reviewer_agent=binding.resolved_role(
-                    "review_find", self.config.roles
-                ).agent,
+                reviewer_agent=binding.resolved_role("review_find", self.config.roles).agent,
                 result=local_review_result,
             )
         return run_id
-
 
     async def _run_local_review_phase(
         self,
@@ -3577,9 +2523,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             base_branch = binding.base_branch
             if base_branch is None:
                 try:
-                    base_branch = await self._gh.repo_default_branch(
-                        binding.github_repo
-                    )
+                    base_branch = await self._gh.repo_default_branch(binding.github_repo)
                 except GitHubError as e:
                     log.warning(
                         "repo_default_branch failed during local review on %s: %s; "
@@ -3601,9 +2545,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 if reviewer_agent == "codex" and review_find_role.model
                 else binding.resolved_reviewer_codex_model()
             )
-            last_message_dir = (
-                self.config.log_root / "local_review" / parent_run_id
-            )
+            last_message_dir = self.config.log_root / "local_review" / parent_run_id
             # Local-review uses its own cap (default 3) which is
             # typically lower than `review_iteration_cap` (default 12)
             # used by the remote `@codex` loop. The two loops have
@@ -3613,9 +2555,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 self.config.local_review_iteration_cap
             )
 
-            await self._move_issue_to_local_code_review_state(
-                binding=binding, issue=issue
-            )
+            await self._move_issue_to_local_code_review_state(binding=binding, issue=issue)
             await self._post_local_review_starting_comment(
                 binding=binding,
                 issue=issue,
@@ -3640,9 +2580,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 started_at=self._now().isoformat(),
             )
 
-            async def _on_iteration(
-                i: int, verdict: LocalVerdict, _cost_so_far: float
-            ) -> None:
+            async def _on_iteration(i: int, verdict: LocalVerdict, _cost_so_far: float) -> None:
                 await self._post_local_review_iteration_comment(
                     binding=binding,
                     issue=issue,
@@ -3665,9 +2603,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                     reviewer_agent=reviewer_agent,
                     reviewer_codex_model=reviewer_codex_model,
                     local_review_claude_model=binding.local_review_claude_model,
-                    local_review_verifier_claude_model=(
-                        binding.local_review_verifier_claude_model
-                    ),
+                    local_review_verifier_claude_model=(binding.local_review_verifier_claude_model),
                     fix_claude_model=self._fix_claude_model(binding),
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
@@ -3676,9 +2612,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
-                    diff_size_provider=partial(
-                        _workspace_diff_size, base_branch=base_branch
-                    ),
+                    diff_size_provider=partial(_workspace_diff_size, base_branch=base_branch),
                     workspace_scrubber=_workspace_scrub,
                     on_iteration=_on_iteration,
                     allow_fixes=allow_fixes,
@@ -3693,17 +2627,14 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 )
 
             log.info(
-                "local-review phase for %s ended in %s (iterations=%d, "
-                "strategy=%s, reviewer=%s)",
+                "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",
                 issue.identifier,
                 result.outcome.value,
                 result.iterations,
                 binding.review_strategy,
                 reviewer_agent,
             )
-            await self._post_local_review_comment(
-                binding=binding, issue=issue, result=result
-            )
+            await self._post_local_review_comment(binding=binding, issue=issue, result=result)
             return result
         except Exception as e:  # noqa: BLE001
             # Never break the pipeline because of a local-review fault.
@@ -3831,8 +2762,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         pr_number = pr_number_from_url(pr_url)
         if pr_number is None:
             log.warning(
-                "could not parse PR number from %r — skipping local-review "
-                "PR summary",
+                "could not parse PR number from %r — skipping local-review PR summary",
                 pr_url,
             )
             return
@@ -3843,9 +2773,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             f"- strategy: `{binding.review_strategy}`\n"
         )
         try:
-            await self._gh.pr_comment(
-                pr_number, body, repo=binding.github_repo
-            )
+            await self._gh.pr_comment(pr_number, body, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not post local-review PR summary on %s#%d: %s",
@@ -3946,9 +2874,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         try:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
-            log.warning(
-                "local-review comment post failed on %s: %s", issue.identifier, e
-            )
+            log.warning("local-review comment post failed on %s: %s", issue.identifier, e)
 
     async def _block_local_only_review_infra_failure(
         self,
@@ -3980,9 +2906,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             run_id,
             reason,
             termination_kind=(
-                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
-                if reviewer_never_verdicted
-                else None
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND if reviewer_never_verdicted else None
             ),
         )
 
@@ -4071,9 +2995,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         # `UsageCostEstimator.delta` is threaded into the fix turn's
         # `collect_runner_output` to bill its tokens; the fix-turn stdout
         # is written to `verify_log_path` for per-model attribution.
-        cost_estimator = _UsageCostEstimator(
-            agent=binding.agent, codex_model=binding.codex_model
-        )
+        cost_estimator = _UsageCostEstimator(agent=binding.agent, codex_model=binding.codex_model)
         verify_run_id = str(uuid.uuid4())
         verify_log_path = self.config.log_root / f"{verify_run_id}.log"
         await db.runs.create(
@@ -4091,9 +3013,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 runner=self._runner,
                 workspace_path=workspace_path,
                 verify_cmd=verify_cmd,
-                timeout_secs=binding.resolved_verify_timeout_secs(
-                    self.config.command_timeout_secs
-                ),
+                timeout_secs=binding.resolved_verify_timeout_secs(self.config.command_timeout_secs),
                 parent_run_id=parent_run_id,
                 issue_title=issue.title,
                 issue_body=issue.description,
@@ -4155,9 +3075,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             )
         except Exception:  # noqa: BLE001
             log.warning("could not persist verify usage for run %s", run_id)
-        await _record_run_model_usage(
-            self._conn, run_id, log_path, codex_model=codex_model
-        )
+        await _record_run_model_usage(self._conn, run_id, log_path, codex_model=codex_model)
         try:
             if ok:
                 await db.runs.update_status(
@@ -4172,9 +3090,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                     run_id,
                     "failed",
                     ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed", reason="verify_cmd failed"
-                    ),
+                    **_termination_kwargs(status="failed", reason="verify_cmd failed"),
                 )
         except Exception:  # noqa: BLE001
             log.warning("could not finalize verify run %s", run_id)
@@ -4465,9 +3381,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                             storage_issue_id=storage_issue_id,
                             pr_number=pr_number,
                         )
-                    await self._move_issue_to_review_state(
-                        binding=binding, issue=issue
-                    )
+                    await self._move_issue_to_review_state(binding=binding, issue=issue)
                 return existing
             # Guard tripped on a live run in another stage, but no live Review
             # row exists to adopt: force-create so the returned Run is persisted.
@@ -4488,11 +3402,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 pr_number=pr_number,
             )
 
-        if (
-            created_review_run
-            and post_codex_review
-            and binding.resolved_remote_review()
-        ):
+        if created_review_run and post_codex_review and binding.resolved_remote_review():
             await self._move_issue_to_review_state(binding=binding, issue=issue)
         return db.runs.Run(
             id=review_run_id,
@@ -4592,36 +3502,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 e,
             )
 
-    async def _move_issue_to_acceptance_state(
-        self, *, binding: RepoBinding, issue: LinearIssue
-    ) -> None:
-        try:
-            states = await self._states_for_binding(binding)
-            acceptance_state_id = states.get(binding.linear_states.in_acceptance)
-        except LinearError as e:
-            log.warning(
-                "could not load states while moving %s to acceptance: %s",
-                issue.identifier,
-                e,
-            )
-            return
-        if acceptance_state_id is None:
-            log.warning(
-                "missing Linear acceptance state %r for %s",
-                binding.linear_states.in_acceptance,
-                issue.identifier,
-            )
-            return
-        try:
-            await self.tracker(binding).move_issue(issue.id, acceptance_state_id)
-        except LinearError as e:
-            log.warning(
-                "could not move %s to acceptance state %r: %s",
-                issue.identifier,
-                binding.linear_states.in_acceptance,
-                e,
-            )
-
     def _activity_session(
         self,
         *,
@@ -4662,11 +3542,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             occurred_at=now.isoformat(),
         )
         mark = await db.activity_comments.get(self._conn, session.run_id)
-        last_posted_at = (
-            _parse_optional_datetime(mark.last_posted_at)
-            if mark is not None
-            else None
-        )
+        last_posted_at = _parse_optional_datetime(mark.last_posted_at) if mark is not None else None
         reason = session.due_reason(now, last_posted_at=last_posted_at)
         if reason is not None:
             await self._publish_activity_digest(
@@ -4843,7 +3719,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             prior_total=prior_total,
         )
 
-
     async def _run_stage_command(
         self,
         *,
@@ -4924,9 +3799,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        await _record_run_model_usage(
-            self._conn, run_id, log_path, codex_model=binding.codex_model
-        )
+        await _record_run_model_usage(self._conn, run_id, log_path, codex_model=binding.codex_model)
         return cumulative_usage, final_kind, final_returncode
 
     def _fix_claude_model(self, binding: RepoBinding) -> str | None:
@@ -4968,36 +3841,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             binding=binding,
             issue=issue,
             activity_stage="review_fix",
-            prior_total=prior_total,
-        )
-
-    async def _run_acceptance_fix_agent(
-        self,
-        *,
-        binding: RepoBinding,
-        issue: LinearIssue,
-        run_id: str,
-        workspace_path: Path,
-        prompt: str,
-        prior_total: float,
-    ) -> tuple[UsageDelta, str, int | None]:
-        command = build_fix_runner_command(
-            binding.agent,
-            prompt,
-            codex_model=binding.codex_model,
-            workspace_path=workspace_path,
-            mcp_servers=binding.mcp_servers,
-        )
-        return await self._run_runner(
-            run_id=run_id,
-            workspace_path=workspace_path,
-            command=command,
-            stage="acceptance_fix",
-            agent=binding.agent,
-            codex_model=binding.codex_model,
-            binding=binding,
-            issue=issue,
-            activity_stage="acceptance_fix",
             prior_total=prior_total,
         )
 
@@ -5054,9 +3897,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             )
             status = transition.next_run_status
         except Exception as e:  # noqa: BLE001
-            log.warning(
-                "dirty-tree fix turn failed for %s: %s", issue.identifier, e
-            )
+            log.warning("dirty-tree fix turn failed for %s: %s", issue.identifier, e)
         await db.runs.update_status(
             self._conn,
             fix_run_id,
@@ -5149,9 +3990,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
-        await _record_run_model_usage(
-            self._conn, run_id, log_path, codex_model=codex_model
-        )
+        await _record_run_model_usage(self._conn, run_id, log_path, codex_model=codex_model)
         return cumulative_usage, final_kind, final_returncode
 
     async def _fail_run(
@@ -5344,9 +4183,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             tracker = self.tracker(binding)
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
-            log.warning(
-                "implement blocked comment post failed on %s: %s", issue.identifier, e
-            )
+            log.warning("implement blocked comment post failed on %s: %s", issue.identifier, e)
 
     async def _complete_already_satisfied_run(
         self,
@@ -5534,9 +4371,9 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 e,
             )
         else:
-            target_state_id = states.get(
-                binding.linear_states.needs_approval
-            ) or states.get(binding.linear_states.blocked)
+            target_state_id = states.get(binding.linear_states.needs_approval) or states.get(
+                binding.linear_states.blocked
+            )
             if target_state_id is not None and target_state_id != issue.state_id:
                 try:
                     await self.tracker(binding).move_issue(issue.id, target_state_id)
@@ -5555,9 +4392,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         # gate faithfully instead of assuming APPROVED. A needs-approval verdict
         # (EXHAUSTED / STUCK_LOOP) must stay parked, not silently ping @codex.
         local_review_outcome = (
-            ctx.local_review_result.outcome.value
-            if ctx.local_review_result is not None
-            else None
+            ctx.local_review_result.outcome.value if ctx.local_review_result is not None else None
         )
         await self._track_deliver_failed_wait(
             storage_issue_id,
@@ -5589,18 +4424,12 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         try:
             await self.tracker(binding).post_comment(issue.id, truncate_body(body))
         except LinearError as e:
-            log.warning(
-                "deliver_failed comment post failed on %s: %s", issue.identifier, e
-            )
+            log.warning("deliver_failed comment post failed on %s: %s", issue.identifier, e)
 
-    async def _track_delivery_handoff_recovery_wait(
-        self, ctx: _PendingDelivery
-    ) -> None:
+    async def _track_delivery_handoff_recovery_wait(self, ctx: _PendingDelivery) -> None:
         """Persist a temporary retry target before first review handoff."""
         local_review_outcome = (
-            ctx.local_review_result.outcome.value
-            if ctx.local_review_result is not None
-            else None
+            ctx.local_review_result.outcome.value if ctx.local_review_result is not None else None
         )
         await self._track_deliver_failed_wait(
             ctx.storage_issue_id,
@@ -5634,7 +4463,6 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
             tracker_site=binding.tracker_site,
             local_review_outcome=local_review_outcome,
         )
-
 
     async def _resolve_pending_delivery(
         self,
@@ -5677,9 +4505,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
         try:
             issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
         except LinearError as e:
-            log.warning(
-                "could not look up %s to resume delivery: %s", issue_id, e
-            )
+            log.warning("could not look up %s to resume delivery: %s", issue_id, e)
             await self._post_command_rejected(
                 issue_id,
                 self._slash_text(intent),
@@ -5714,16 +4540,12 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 cache_write_tokens=tokens.cache_write_tokens,
                 cache_read_tokens=tokens.cache_read_tokens,
             ),
-            local_review_result=await self._reconstructed_local_review_result(
-                run_id
-            ),
+            local_review_result=await self._reconstructed_local_review_result(run_id),
             reconstructed=True,
             retry_workspace_acquired=True,
         )
 
-    async def _reconstructed_local_review_result(
-        self, run_id: str
-    ) -> LoopResult | None:
+    async def _reconstructed_local_review_result(self, run_id: str) -> LoopResult | None:
         """Rebuild the local-review verdict for a restart-reconstructed resume.
 
         Reads the outcome persisted on the `deliver_failed` wait. A
@@ -5741,8 +4563,7 @@ class Orchestrator(_ReviewMixin, _MergeMixin, _SlashCommandsMixin, _DispatchMixi
                 outcome = LoopOutcome(wait.local_review_outcome)
             except ValueError:
                 log.warning(
-                    "unknown persisted local_review_outcome %r for run %s; "
-                    "treating as APPROVED",
+                    "unknown persisted local_review_outcome %r for run %s; treating as APPROVED",
                     wait.local_review_outcome,
                     run_id,
                 )
@@ -5771,8 +4592,7 @@ def _linear_issue_state_changed(payload: Mapping[str, Any]) -> bool:
         return False
     updated_from = payload.get("updatedFrom") or data.get("updatedFrom")
     if isinstance(updated_from, Mapping) and any(
-        key in updated_from
-        for key in ("state", "stateId", "state_id", "stateName", "state_name")
+        key in updated_from for key in ("state", "stateId", "state_id", "stateName", "state_name")
     ):
         return True
     return False
@@ -5830,7 +4650,5 @@ def _comment_issue_id_from_webhook_payload(payload: Mapping[str, Any]) -> str | 
     return None
 
 
-def _comment_from_webhook_payload(
-    payload: Mapping[str, Any]
-) -> LinearComment | None:
+def _comment_from_webhook_payload(payload: Mapping[str, Any]) -> LinearComment | None:
     return comment_from_webhook_payload(payload)
