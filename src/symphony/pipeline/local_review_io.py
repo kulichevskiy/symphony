@@ -24,7 +24,7 @@ class CollectedRunnerOutput:
     """Single-pass collection of a runner invocation.
 
     `terminal_kind` is the kind of the terminal event (one of
-    `exit | stall_timeout | spawn_failed`). The caller decides what
+    `exit | stall_timeout | wall_clock_timeout | spawn_failed`). The caller decides what
     counts as "ok" — for the reviewer, any terminal that produced a
     parseable verdict is fine; the loop's UNPARSEABLE fallback handles
     short-circuited runs.
