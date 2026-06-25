@@ -2222,17 +2222,16 @@ class _ReviewMixin(_OrchestratorBase):
                 trigger=verdict.trigger_signature[:80],
             )
             try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(reviewing_feedback(v))
-                )
-            except LinearError as e:
-                log.warning(
-                    "could not post reviewing_feedback comment for %s: %s",
-                    issue.identifier,
-                    e,
-                )
-
-            try:
+                try:
+                    await tracker.post_comment(
+                        issue.id, truncate_body(reviewing_feedback(v))
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "could not post reviewing_feedback comment for %s: %s",
+                        issue.identifier,
+                        e,
+                    )
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
                 usage_delta, final_kind, final_returncode = await self._run_fix_agent(
                     binding=binding,
@@ -2399,9 +2398,68 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
 
         async with self._review_fix_dispatch_slot(binding, issue):
-            # Dedup before workspace acquire: a concurrent fix-run dispatch for
-            # the same issue loses the race with no workspace state to undo
-            # (SYM-152).
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "workspace acquire failed for merge-conflict fix-run %s",
+                    issue.identifier,
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"workspace acquire failed: {e}",
+                    last_log=str(e),
+                )
+                return False
+
+            # Step 1: orchestrator fetches origin.
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _sync_workspace_to_remote(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                log.warning("workspace sync failed for %s: %s", issue.identifier, e)
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"workspace sync failed: {e}",
+                    last_log=str(e),
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not read review fix-run remote HEAD for {branch}",
+                    last_log="",
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            try:
+                await _git_fetch(workspace_path)
+            except Exception as e:  # noqa: BLE001
+                log.warning("git fetch failed for %s: %s", issue.identifier, e)
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"git fetch failed: {e}",
+                    last_log=str(e),
+                )
+                return False
+
+            # Dedup after workspace setup: no pidless row is left in the DB
+            # if setup fails or the host restarts mid-setup (SYM-152 P1).
             fix_run_id = str(uuid.uuid4())
             inserted = await db.runs.create_if_no_active(
                 self._conn,
@@ -2414,6 +2472,7 @@ class _ReviewMixin(_OrchestratorBase):
                 ignored_stage="review",
             )
             if not inserted:
+                self._workspace.release(binding, issue)
                 return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -2436,113 +2495,6 @@ class _ReviewMixin(_OrchestratorBase):
                     e,
                 )
 
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for merge-conflict fix-run %s",
-                    issue.identifier,
-                )
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"workspace acquire failed: {e}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace acquire failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            # Step 1: orchestrator fetches origin.
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            try:
-                await _sync_workspace_to_remote(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning("workspace sync failed for %s: %s", issue.identifier, e)
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"workspace sync failed: {e}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace sync failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
-            if not start_sha:
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        reason=f"could not read review fix-run remote HEAD for {branch}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"could not read review fix-run remote HEAD for {branch}",
-                    last_log="",
-                    auto_retry=False,
-                    operator_wait=True,
-                )
-                return False
-
-            try:
-                await _git_fetch(workspace_path)
-            except Exception as e:  # noqa: BLE001
-                log.warning("git fetch failed for %s: %s", issue.identifier, e)
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"git fetch failed: {e}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"git fetch failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
             # Step 2: orchestrator attempts the rebase.
             upstream = f"origin/{base_branch or 'main'}"
             try:
@@ -2560,7 +2512,8 @@ class _ReviewMixin(_OrchestratorBase):
                         reason=f"git rebase failed: {e}",
                     ),
                 )
-                self._dispatch_run_ids.pop(issue.id, None)
+                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2603,7 +2556,8 @@ class _ReviewMixin(_OrchestratorBase):
                             reason=error,
                         ),
                     )
-                    self._dispatch_run_ids.pop(issue.id, None)
+                    if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                        self._dispatch_run_ids.pop(issue.id, None)
                     self._workspace.release(binding, issue)
                     await self._fail_review_run(
                         run=run,
