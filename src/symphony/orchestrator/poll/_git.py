@@ -184,9 +184,10 @@ async def _git_add_and_continue_rebase(
 ) -> bool:
     """Stage *files* and run ``git rebase --continue``.
 
-    Returns ``True`` when the rebase completed. Returns ``False`` when Git
-    stopped again, which may be a later conflicting commit in a multi-commit
-    rebase.
+    Returns ``True`` when the rebase completed, or when no rebase is in
+    progress and the tree is clean (already-resolved — treat as benign no-op).
+    Returns ``False`` when Git stopped again, which may be a later conflicting
+    commit in a multi-commit rebase.
     """
     if files:
         add_proc = await asyncio.create_subprocess_exec(
@@ -221,53 +222,7 @@ async def _git_add_and_continue_rebase(
     # unmerged paths), so it still reports failure.
     if not await _rebase_in_progress(workspace_path):
         if not await _git_conflicted_files(workspace_path):
-            if not await _rebase_had_recent_skips(workspace_path):
-                return True
-    return False
-
-
-async def _rebase_had_recent_skips(workspace_path: Path) -> bool:
-    """True if the most recently completed rebase used --skip for any commit.
-
-    Uses two strategies to cover all known git reflog formats:
-
-    1. Explicit marker: git ≤2.37 writes ``rebase (skip) (finish): …``
-       (combined); newer git may write a separate ``rebase (skip): …`` entry
-       before the ``(finish)`` entry.
-    2. SHA fallback: when no explicit marker exists, compare the HEAD SHA at
-       ``(finish)`` with the SHA at the rebase start (``checkout``).  If they
-       are identical no commits were applied — all were dropped via --skip.
-    """
-    proc = await asyncio.create_subprocess_exec(
-        "git", "reflog", "HEAD", "--format=%H %gs",
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    stdout, _ = await proc.communicate()
-    if proc.returncode != 0:
-        return False
-    finish_sha: str | None = None
-    for raw in stdout.decode().splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        sha, _, subject = raw.partition(" ")
-        if not subject.startswith("rebase"):
-            if finish_sha is not None:
-                break  # left the rebase session without finding a checkout
-            continue
-        if "(finish)" in subject:
-            if "(skip)" in subject:
-                return True  # git ≤2.37: combined marker
-            finish_sha = sha
-        elif finish_sha is not None:
-            if "(skip)" in subject:
-                return True  # newer git: separate "(skip)" entry
-            if "checkout" in subject:
-                # start-of-rebase entry; sha == onto SHA
-                return finish_sha == sha
+            return True
     return False
 
 
