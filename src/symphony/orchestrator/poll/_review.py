@@ -2147,6 +2147,53 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
 
         async with self._review_fix_dispatch_slot(binding, issue):
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "workspace acquire failed for review fix-run %s", issue.identifier
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"workspace acquire failed: {e}",
+                    last_log=str(e),
+                )
+                return False
+
+            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+            try:
+                await _git_fetch_branch(workspace_path, branch)
+            except Exception as e:  # noqa: BLE001
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    last_log=str(e),
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
+            if not start_sha:
+                self._workspace.release(binding, issue)
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"could not read review fix-run remote HEAD for {branch}",
+                    last_log="",
+                    auto_retry=False,
+                    operator_wait=True,
+                )
+                return False
+
+            # Dedup after workspace setup: no pidless row is left in the DB
+            # if setup fails or the host restarts mid-setup (SYM-152 P1).
             fix_run_id = str(uuid.uuid4())
             inserted = await db.runs.create_if_no_active(
                 self._conn,
@@ -2160,7 +2207,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
             if not inserted:
                 # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Bail before posting any comment or acquiring the workspace.
+                self._workspace.release(binding, issue)
                 return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -2184,86 +2231,6 @@ class _ReviewMixin(_OrchestratorBase):
                     issue.identifier,
                     e,
                 )
-
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for review fix-run %s", issue.identifier
-                )
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"workspace acquire failed: {e}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace acquire failed: {e}",
-                    last_log=str(e),
-                )
-                return False
-
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            try:
-                await _git_fetch_branch(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
-                    last_log=str(e),
-                    auto_retry=False,
-                    operator_wait=True,
-                )
-                return False
-
-            start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
-            if not start_sha:
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        reason=f"could not read review fix-run remote HEAD for {branch}",
-                    ),
-                )
-                self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"could not read review fix-run remote HEAD for {branch}",
-                    last_log="",
-                    auto_retry=False,
-                    operator_wait=True,
-                )
-                return False
 
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
