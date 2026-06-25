@@ -2147,8 +2147,25 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
 
         async with self._review_fix_dispatch_slot(binding, issue):
-            # Post the "starting" comment once we have a slot — this ensures
-            # the message is accurate ("dispatching now", not "queued").
+            fix_run_id = str(uuid.uuid4())
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at=self._now().isoformat(),
+                ignored_stage="review",
+            )
+            if not inserted:
+                # Lost the race against a concurrent fix-run dispatch (SYM-152).
+                # Bail before posting any comment or acquiring the workspace.
+                return False
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            # Post the "starting" comment only after dedup succeeds so we do
+            # not announce a fix-run that will not execute (SYM-152).
             v = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
@@ -2174,6 +2191,18 @@ class _ReviewMixin(_OrchestratorBase):
                 log.exception(
                     "workspace acquire failed for review fix-run %s", issue.identifier
                 )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"workspace acquire failed: {e}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2187,6 +2216,18 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 await _git_fetch_branch(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2201,6 +2242,17 @@ class _ReviewMixin(_OrchestratorBase):
 
             start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        reason=f"could not read review fix-run remote HEAD for {branch}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2212,24 +2264,6 @@ class _ReviewMixin(_OrchestratorBase):
                     operator_wait=True,
                 )
                 return False
-
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stage="review",
-            )
-            if not inserted:
-                # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Release the workspace and bail without clobbering dispatch ids.
-                self._workspace.release(binding, issue)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
@@ -2398,7 +2432,25 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
 
         async with self._review_fix_dispatch_slot(binding, issue):
-            # Post the "fixing" comment once we have a slot.
+            # Dedup before workspace acquire: a concurrent fix-run dispatch for
+            # the same issue loses the race with no workspace state to undo
+            # (SYM-152).
+            fix_run_id = str(uuid.uuid4())
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at=self._now().isoformat(),
+                ignored_stage="review",
+            )
+            if not inserted:
+                return False
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            # Post the "fixing" comment once dedup has passed.
             v_start = CommentVars(
                 stage="review",
                 repo=binding.github_repo,
@@ -2424,6 +2476,18 @@ class _ReviewMixin(_OrchestratorBase):
                     "workspace acquire failed for merge-conflict fix-run %s",
                     issue.identifier,
                 )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"workspace acquire failed: {e}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2439,6 +2503,18 @@ class _ReviewMixin(_OrchestratorBase):
                 await _sync_workspace_to_remote(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
                 log.warning("workspace sync failed for %s: %s", issue.identifier, e)
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"workspace sync failed: {e}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2451,6 +2527,17 @@ class _ReviewMixin(_OrchestratorBase):
 
             start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        reason=f"could not read review fix-run remote HEAD for {branch}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2467,6 +2554,18 @@ class _ReviewMixin(_OrchestratorBase):
                 await _git_fetch(workspace_path)
             except Exception as e:  # noqa: BLE001
                 log.warning("git fetch failed for %s: %s", issue.identifier, e)
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"git fetch failed: {e}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2483,6 +2582,18 @@ class _ReviewMixin(_OrchestratorBase):
                 rebase_clean = await _git_rebase(workspace_path, upstream)
             except Exception as e:  # noqa: BLE001
                 log.warning("git rebase failed for %s: %s", issue.identifier, e)
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"git rebase failed: {e}",
+                    ),
+                )
+                self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2512,10 +2623,21 @@ class _ReviewMixin(_OrchestratorBase):
                         issue_identifier=issue.identifier,
                         reason="rebase with no unresolved paths",
                     )
-                    self._workspace.release(binding, issue)
                     error = "rebase failed with no unresolved paths"
                     if status_short:
                         error += f"; git status: {status_short}"
+                    await db.runs.update_status(
+                        self._conn,
+                        fix_run_id,
+                        "failed",
+                        ended_at=self._now().isoformat(),
+                        **_termination_kwargs(
+                            status="failed",
+                            reason=error,
+                        ),
+                    )
+                    self._dispatch_run_ids.pop(issue.id, None)
+                    self._workspace.release(binding, issue)
                     await self._fail_review_run(
                         run=run,
                         binding=binding,
@@ -2524,41 +2646,6 @@ class _ReviewMixin(_OrchestratorBase):
                         last_log=status_short,
                     )
                     return False
-
-            # Create a review_fix row for cost tracking and dispatch_run_ids cleanup.
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stage="review",
-            )
-            if not inserted:
-                # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Reset the workspace so the next user doesn't inherit a modified state.
-                if rebase_clean:
-                    # Rebase completed cleanly but we lost the race; undo it.
-                    try:
-                        await _sync_workspace_to_remote(workspace_path, branch)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning(
-                            "could not reset workspace after clean-rebase dedup loss for %s: %s",
-                            issue.identifier,
-                            e,
-                        )
-                else:
-                    await _abort_rebase_safely(
-                        workspace_path,
-                        issue_identifier=issue.identifier,
-                        reason="dedup loser; aborting in-progress rebase",
-                    )
-                self._workspace.release(binding, issue)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
                 cumulative_usage = UsageDelta()
