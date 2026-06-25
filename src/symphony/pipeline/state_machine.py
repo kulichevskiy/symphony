@@ -165,6 +165,8 @@ def classify_implement_completion(
     *,
     final_message: str,
     head_advanced: bool,
+    branch_ahead_of_base: bool = False,
+    tree_clean: bool = False,
     classifier: Callable[[str], tuple[ClassifierVerdict, str]] = (
         classify_blocked_final_message
     ),
@@ -178,8 +180,14 @@ def classify_implement_completion(
       truth). This is a distinct marker so a plain ``SYMPHONY_DONE`` without
       commits stays ``failed`` — the no-op guard is not weakened.
     * ``SYMPHONY_DONE`` + HEAD advanced -> ``completed`` (the happy path).
-    * ``SYMPHONY_DONE`` without commits -> ``failed`` (claimed done, produced
-      nothing to push).
+    * ``SYMPHONY_DONE`` + HEAD-not-advanced + ``branch_ahead_of_base`` +
+      ``tree_clean`` -> ``completed``. Converges a killed-then-redispatched
+      run: the conservative re-run re-confirms work already committed on the
+      branch (ahead of base, nothing uncommitted) but makes no *new* commit.
+      The no-op guard is not weakened — branch-not-ahead or a dirty tree still
+      falls through to ``failed``.
+    * ``SYMPHONY_DONE`` without commits and not ahead (or dirty) -> ``failed``
+      (claimed done, produced nothing to push).
     * No marker but HEAD advanced -> ``completed`` (commits are ground truth).
     * No marker AND no commits -> run ``classifier`` on the final message; only
       a ``blocked`` ask is actionable. A ``done`` verdict here cannot mean
@@ -201,6 +209,8 @@ def classify_implement_completion(
         )
     if marker.kind == "done":
         if head_advanced:
+            return ImplementCompletion(outcome="completed")
+        if branch_ahead_of_base and tree_clean:
             return ImplementCompletion(outcome="completed")
         return ImplementCompletion(outcome="failed")
     if head_advanced:
