@@ -31,7 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 
@@ -163,7 +163,7 @@ def _unwrap_codex_error(text: str) -> tuple[str | None, int | None]:
     return message, status
 
 
-def _claude_result_api_error(event: dict) -> StreamApiError | None:
+def _claude_result_api_error(event: dict[str, Any]) -> StreamApiError | None:
     """A claude terminal `result` with `is_error: true` (e.g. `api_error_status`
     500 + an `API Error: …` result text)."""
     status = event.get("api_error_status")
@@ -181,7 +181,7 @@ def _claude_result_api_error(event: dict) -> StreamApiError | None:
     return StreamApiError(message=message, status=status)
 
 
-def _claude_synthetic_api_error(event: dict) -> StreamApiError | None:
+def _claude_synthetic_api_error(event: dict[str, Any]) -> StreamApiError | None:
     """A claude `model:"<synthetic>"` assistant message whose text reads
     `API Error: <status> …` (the placeholder claude emits in place of the model
     turn when the provider call fails)."""
@@ -203,7 +203,7 @@ def _claude_synthetic_api_error(event: dict) -> StreamApiError | None:
     return StreamApiError(message=text, status=status)
 
 
-def _codex_event_api_error(event: dict) -> StreamApiError | None:
+def _codex_event_api_error(event: dict[str, Any]) -> StreamApiError | None:
     """A codex `error` / `turn.failed` event (the real cause is one JSON level
     deep in `error.message`)."""
     err = event.get("error")
