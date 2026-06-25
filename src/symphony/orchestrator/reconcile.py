@@ -123,11 +123,12 @@ def _terminate_pid(pid: int) -> None:
     uses start_new_session=True so the stored pid equals the process group id;
     killpg reaches all child processes it spawned. Both signals are sent
     unconditionally: SIGKILL on an already-exited group raises ProcessLookupError,
-    which we swallow. PermissionError (foreign-owned) is also swallowed — the row
-    is still marked superseded so the duplicate stops being treated as live."""
-    with suppress(ProcessLookupError, PermissionError):
+    which we swallow. All OSError subclasses (EPERM for foreign-owned, EINVAL for
+    reused/platform-specific PIDs) are also swallowed — the row is still marked
+    superseded so the duplicate stops being treated as live."""
+    with suppress(OSError):
         os.killpg(pid, signal.SIGTERM)
-    with suppress(ProcessLookupError, PermissionError):
+    with suppress(OSError):
         os.killpg(pid, signal.SIGKILL)
 
 
@@ -452,7 +453,7 @@ async def _collapse_duplicate_live_runs(
                 stage,
                 survivor.id,
             )
-            if dup.pid is not None:
+            if dup.pid is not None and dup.pid != survivor.pid:
                 terminate_pid(dup.pid)
             await db.runs.update_status(
                 conn,

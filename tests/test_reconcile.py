@@ -739,21 +739,21 @@ async def test_reconcile_treats_unexpected_oserror_as_alive(
 async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> None:
     """Two live runs for the same (issue_id, stage) — a race past SYM-152, a
     crash, or a manual dispatch. Reconcile keeps the oldest live, terminates the
-    younger's process and flips it `interrupted` with a duplicate-stage kind."""
+    younger's process and flips it `superseded` with a duplicate-stage kind."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await db.issues.upsert(
             conn, id="iss-dup", identifier="ENG-10", title="t", team_key="ENG"
         )
-        # Both alive (current process), so the pid sweep leaves them be — only
-        # the duplicate-collapse pass should act on them.
+        # Use distinct fake PIDs with an injected pid_alive so the orphan sweep
+        # leaves both alive and only the duplicate-collapse pass acts.
         await db.runs.create(
             conn,
             id="older",
             issue_id="iss-dup",
             stage="implement",
             status="running",
-            pid=os.getpid(),
+            pid=101,
             started_at="2026-05-10T00:00:00+00:00",
         )
         await db.runs.create(
@@ -762,7 +762,7 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
             issue_id="iss-dup",
             stage="implement",
             status="running",
-            pid=os.getpid(),
+            pid=102,
             started_at="2026-05-10T00:01:00+00:00",
         )
 
@@ -771,11 +771,16 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
-        flipped = await reconcile(conn, linear, terminate_pid=terminated.append)
+        flipped = await reconcile(
+            conn,
+            linear,
+            pid_alive=lambda _: True,
+            terminate_pid=terminated.append,
+        )
         assert flipped == 1
 
-        # The younger duplicate's pid was terminated.
-        assert terminated == [os.getpid()]
+        # The younger duplicate's distinct pid was terminated.
+        assert terminated == [102]
 
         # Exactly one live run remains — the oldest.
         rows = await db.runs.list_live_with_pid(conn)
@@ -794,6 +799,63 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
         assert row[1] is not None
         assert row["termination_kind"] == db.runs.DUPLICATE_STAGE_KIND
         assert "older" in row["termination_detail"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_duplicate_shared_pid_skips_termination(tmp_path: Path) -> None:
+    """When both duplicate rows share the same PID, terminating it would kill the
+    survivor. Reconcile skips the kill but still marks the duplicate superseded."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn, id="iss-shared", identifier="ENG-20", title="t", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="older",
+            issue_id="iss-shared",
+            stage="implement",
+            status="running",
+            pid=101,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="younger",
+            issue_id="iss-shared",
+            stage="implement",
+            status="running",
+            pid=101,
+            started_at="2026-05-10T00:01:00+00:00",
+        )
+
+        terminated: list[int] = []
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(
+            conn,
+            linear,
+            pid_alive=lambda _: True,
+            terminate_pid=terminated.append,
+        )
+        assert flipped == 1
+
+        # Shared PID must not be terminated — killing it would also kill the survivor.
+        assert terminated == []
+
+        rows = await db.runs.list_live_with_pid(conn)
+        assert [r.id for r in rows] == ["older"]
+
+        cur = await conn.execute(
+            "SELECT status, termination_kind FROM runs WHERE id=?", ("younger",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.SUPERSEDED_STATUS
+        assert row["termination_kind"] == db.runs.DUPLICATE_STAGE_KIND
     finally:
         await conn.close()
 

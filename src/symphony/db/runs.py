@@ -944,7 +944,7 @@ async def latest_for_issue_stage(
                input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
                termination_kind, termination_detail, exit_returncode
         FROM runs
-        WHERE issue_id = ? AND stage = ?{started_filter}
+        WHERE issue_id = ? AND stage = ? AND status != 'superseded'{started_filter}
         ORDER BY started_at DESC
         LIMIT 1
         """,
@@ -1135,7 +1135,7 @@ async def local_review_stats(conn: aiosqlite.Connection) -> LocalReviewStats:
         """
         SELECT
             COALESCE(SUM(status = 'completed'), 0) AS completed,
-            COALESCE(SUM(status NOT IN ('completed', 'running')), 0) AS failed,
+            COALESCE(SUM(status NOT IN ('completed', 'running', 'superseded')), 0) AS failed,
             COALESCE(SUM(status = 'running'), 0) AS running,
             COALESCE(SUM(cost_usd), 0.0) AS total_cost,
             COALESCE(
