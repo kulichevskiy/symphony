@@ -22,7 +22,8 @@ import json
 import logging
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -261,6 +262,16 @@ class _OrchestratorBase:
 
         async def _resurrect_review_runs(self) -> list[asyncio.Task[None]]:
             ...
+
+        @asynccontextmanager
+        async def _review_fix_dispatch_slot(
+            self,
+            binding: RepoBinding,
+            issue: LinearIssue,
+            *,
+            dispatch_capacity_held: bool = False,
+        ) -> AsyncIterator[None]:
+            yield
 
         async def _run_auto_recoverable_merge_wait_reconciler(
             self, shutdown: asyncio.Event
@@ -2207,6 +2218,87 @@ class _OrchestratorBase:
             activity_stage="review_fix",
             prior_total=prior_total,
         )
+
+    async def _run_fix_dispatch(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        ignored_stages: tuple[str, ...],
+        on_acquire_failure: Callable[[Exception], Awaitable[None]],
+        body: Callable[[Path, str], Awaitable[bool | None]],
+        setup: Callable[[Path], Awaitable[bool]] | None = None,
+        after_dedup: Callable[[str], Awaitable[None]] | None = None,
+        on_dedup_loss: Callable[[], Awaitable[bool | None]] | None = None,
+        dispatch_capacity_held: bool = False,
+    ) -> bool | None:
+        """Shared scaffolding for the `_dispatch_*_fix_run` family (SYM-157).
+
+        Owns the path every fix-run dispatch repeats: reserve the review-fix
+        slot, acquire the workspace, run optional pre-dedup ``setup`` (git
+        fetch/sync), atomically claim the ``review_fix`` run row (SYM-152
+        dedup), register the dispatch run id, then guarantee cleanup (drop the
+        dispatch id + release the workspace) once ``body`` returns.
+
+        Domain specifics stay in the thin wrappers via callbacks:
+
+        * ``on_acquire_failure`` — escalate when the workspace can't be
+          acquired (the workspace was never held, so no release is owed).
+        * ``setup`` — pre-dedup git work; return ``False`` after escalating to
+          abort (the helper releases the workspace and returns ``False``).
+        * ``after_dedup`` — fire-and-forget work once the run row is claimed
+          (e.g. an ``on_started`` callback or a "starting" comment).
+        * ``body`` — the actual agent run plus post-run validation/push; its
+          return value is the dispatch result.
+        * ``on_dedup_loss`` — value to return when another live ``review_fix``
+          already exists (defaults to ``False``).
+        """
+        async with self._review_fix_dispatch_slot(
+            binding,
+            issue,
+            dispatch_capacity_held=dispatch_capacity_held,
+        ):
+            try:
+                workspace_path = await self._workspace.acquire(binding, issue)
+            except Exception as e:  # noqa: BLE001
+                log.exception(
+                    "workspace acquire failed for fix-run %s", issue.identifier
+                )
+                await on_acquire_failure(e)
+                return False
+
+            if setup is not None and not await setup(workspace_path):
+                self._workspace.release(binding, issue)
+                return False
+
+            fix_run_id = str(uuid.uuid4())
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at=self._now().isoformat(),
+                ignored_stages=ignored_stages,
+            )
+            if not inserted:
+                # Lost the race: another live review_fix already exists (SYM-152).
+                self._workspace.release(binding, issue)
+                if on_dedup_loss is not None:
+                    return await on_dedup_loss()
+                return False
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            if after_dedup is not None:
+                await after_dedup(fix_run_id)
+
+            try:
+                return await body(workspace_path, fix_run_id)
+            finally:
+                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
+                self._workspace.release(binding, issue)
 
     async def _run_dirty_tree_fix_turn(
         self,
