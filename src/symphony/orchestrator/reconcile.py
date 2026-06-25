@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -114,6 +116,18 @@ def _process_alive(pid: int) -> bool:
     except OSError:
         return True
     return True
+
+
+def _terminate_pid(pid: int) -> None:
+    """Best-effort SIGTERM→SIGKILL on a duplicate run's subprocess. Both signals
+    are escalated unconditionally: SIGKILL on an already-exited pid raises
+    `ProcessLookupError`, which we swallow. `PermissionError` (foreign-owned pid)
+    means we can't signal it — also swallowed, the row is still marked
+    interrupted so the duplicate stops being treated as live."""
+    with suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGTERM)
+    with suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGKILL)
 
 
 def _tracker_resolver(tracker_or_resolver: TrackerInput) -> TrackerResolver:
@@ -297,12 +311,15 @@ async def reconcile(
     *,
     clock: Callable[[], datetime] | None = None,
     pid_alive: Callable[[int], bool] = _process_alive,
+    terminate_pid: Callable[[int], None] = _terminate_pid,
 ) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
 
     `pid_alive` is the process-liveness probe (default: `os.kill(pid, 0)`).
     Tests inject a Sim-owned probe so liveness is deterministic rather than
-    relying on a magic dead-PID convention.
+    relying on a magic dead-PID convention. `terminate_pid` (default:
+    SIGTERM→SIGKILL) kills the younger of any duplicate same-stage live runs;
+    tests inject a recorder so no real signals fly.
 
     Returns the number of rows flipped.
     """
@@ -391,4 +408,55 @@ async def reconcile(
             conn, tracker_for_context, run.issue_id, _LOCAL_REVIEW_REDISPATCH_BODY
         )
         flipped += 1
+
+    flipped += await _collapse_duplicate_live_runs(conn, now, terminate_pid)
+    return flipped
+
+
+async def _collapse_duplicate_live_runs(
+    conn: aiosqlite.Connection,
+    now: str,
+    terminate_pid: Callable[[int], None],
+) -> int:
+    """Belt-and-suspenders behind SYM-152's dispatch-time dedup: if two live
+    runs ever share the same `(issue_id, stage)` — a race, a crash, or a manual
+    dispatch — keep the oldest and collapse the rest. The younger duplicate's
+    process is terminated if alive and its row flipped `interrupted`.
+
+    Runs after the orphan sweeps so it only sees genuinely-live survivors.
+    Distinct stages for one issue (e.g. implement + local_review) never group
+    together, so they are left untouched."""
+    groups: dict[tuple[str, str], list[db.runs.Run]] = {}
+    for run in await db.runs.list_live(conn):
+        groups.setdefault((run.issue_id, run.stage), []).append(run)
+
+    flipped = 0
+    for (issue_id, stage), group in groups.items():
+        if len(group) < 2:
+            continue
+        # list_live() already orders oldest-first; the head is the survivor.
+        survivor, *duplicates = group
+        for dup in duplicates:
+            log.warning(
+                "reconcile: duplicate live run=%s issue=%s stage=%s "
+                "(keeping older run=%s) — terminating and marking interrupted",
+                dup.id,
+                issue_id,
+                stage,
+                survivor.id,
+            )
+            if dup.pid is not None:
+                terminate_pid(dup.pid)
+            await db.runs.update_status(
+                conn,
+                dup.id,
+                db.runs.INTERRUPTED_STATUS,
+                ended_at=now,
+                kind=db.runs.DUPLICATE_STAGE_KIND,
+                detail=(
+                    f"Duplicate live {stage} run for issue {issue_id}; "
+                    f"kept older run {survivor.id}"
+                ),
+            )
+            flipped += 1
     return flipped
