@@ -113,3 +113,22 @@ def test_real_unresolved_conflict_returns_failure(tmp_path: Path) -> None:
     assert result is False
 
 
+def test_already_resolved_with_stale_files_returns_success(tmp_path: Path) -> None:
+    """No rebase in progress + clean tree → success even when files list is non-empty.
+
+    Covers the pre-staging short-circuit: if a concurrent run already finished
+    the rebase, we must return True *before* calling ``git add`` on stale paths.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "f.txt").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+
+    # Tree is clean, no rebase in progress. Pass a file that exists but needs
+    # no action — simulates the caller passing stale conflict paths after a
+    # concurrent run already resolved them.
+    result = asyncio.run(_git_add_and_continue_rebase(repo, ["f.txt"]))
+    assert result is True
+
+

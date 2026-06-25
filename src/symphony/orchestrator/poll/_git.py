@@ -179,6 +179,19 @@ async def _git_conflicted_files(workspace_path: Path) -> list[str]:
     return [p for p in stdout.decode().splitlines() if p]
 
 
+async def _git_tree_is_clean(workspace_path: Path) -> bool:
+    """True if the working tree has no staged or unstaged changes to tracked files."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "status", "--porcelain", "--untracked-files=no",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    return proc.returncode == 0 and not stdout.strip()
+
+
 async def _git_add_and_continue_rebase(
     workspace_path: Path, files: list[str]
 ) -> bool:
@@ -189,6 +202,11 @@ async def _git_add_and_continue_rebase(
     Returns ``False`` when Git stopped again, which may be a later conflicting
     commit in a multi-commit rebase.
     """
+    # Fast-path: if no rebase is in progress and the tree is clean, the rebase
+    # was already completed (SYM-148). Return success before staging stale paths.
+    if not await _rebase_in_progress(workspace_path):
+        if await _git_tree_is_clean(workspace_path):
+            return True
     if files:
         add_proc = await asyncio.create_subprocess_exec(
             "git", "add", "--", *files,
@@ -215,15 +233,12 @@ async def _git_add_and_continue_rebase(
     await cont_proc.communicate()
     if cont_proc.returncode == 0:
         return True
-    # A non-zero exit is benign when the rebase has already reached its desired
-    # end state (SYM-148): a concurrent run may have completed it, so no rebase
-    # is in progress and the tree has no unmerged paths. Treat that as success.
-    # A genuine unresolved conflict leaves the rebase in progress (or leaves
-    # unmerged paths), so it still reports failure.
-    # Note: ORIG_HEAD persists after a completed rebase so we must NOT check it
-    # here — its presence does not indicate a skip-completed rebase.
+    # A non-zero exit may still be benign: the rebase completed between our
+    # pre-check and this call (SYM-148). Require both no rebase in progress
+    # AND a fully clean tree — not just absence of unmerged paths — to avoid
+    # masking genuine failures with staged-but-non-conflict changes.
     if not await _rebase_in_progress(workspace_path):
-        if not await _git_conflicted_files(workspace_path):
+        if await _git_tree_is_clean(workspace_path):
             return True
     return False
 
