@@ -1383,6 +1383,8 @@ class _OrchestratorBase:
         for run in reversed(history):
             if run.status in db.runs.LIVE_STATUSES:
                 continue
+            if run.status == db.runs.SUPERSEDED_STATUS:
+                continue  # bookkeeping close; not a real attempt
             if run.stage not in ("implement", "review_fix"):
                 continue  # sub-runs never carry retry markers; skip, don't break
             if run.termination_kind in _AGENT_INFRA_RETRY_KINDS:
@@ -1405,6 +1407,8 @@ class _OrchestratorBase:
         for run in reversed(history):
             if run.status in db.runs.LIVE_STATUSES:
                 continue
+            if run.status == db.runs.SUPERSEDED_STATUS:
+                continue  # bookkeeping close; not a real attempt
             if run.stage not in ("implement", "review_fix"):
                 continue  # sub-runs never carry retry markers
             if run.termination_kind in _AGENT_INFRA_RETRY_KINDS and run.ended_at is not None:

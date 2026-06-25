@@ -368,7 +368,7 @@ async def compute_canonical_status(
         """
         SELECT stage, status, started_at, ended_at, termination_kind
         FROM runs
-        WHERE issue_id = ?
+        WHERE issue_id = ? AND status != 'superseded'
         ORDER BY started_at DESC, COALESCE(ended_at, '') DESC, id DESC
         LIMIT 1
         """,

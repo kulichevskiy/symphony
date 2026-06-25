@@ -768,6 +768,10 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
 
         terminated: list[int] = []
 
+        def _fake_terminate(pid: int) -> bool:
+            terminated.append(pid)
+            return True
+
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -775,7 +779,7 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
             conn,
             linear,
             pid_alive=lambda _: True,
-            terminate_pid=terminated.append,
+            terminate_pid=_fake_terminate,
         )
         assert flipped == 1
 
@@ -832,6 +836,11 @@ async def test_reconcile_duplicate_shared_pid_skips_termination(tmp_path: Path) 
         )
 
         terminated: list[int] = []
+
+        def _fake_terminate_shared(pid: int) -> bool:
+            terminated.append(pid)
+            return True
+
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -839,7 +848,7 @@ async def test_reconcile_duplicate_shared_pid_skips_termination(tmp_path: Path) 
             conn,
             linear,
             pid_alive=lambda _: True,
-            terminate_pid=terminated.append,
+            terminate_pid=_fake_terminate_shared,
         )
         assert flipped == 1
 
@@ -891,10 +900,15 @@ async def test_reconcile_leaves_distinct_stages_for_one_issue_untouched(
         )
 
         terminated: list[int] = []
+
+        def _fake_terminate_stages(pid: int) -> bool:
+            terminated.append(pid)
+            return True
+
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
-        flipped = await reconcile(conn, linear, terminate_pid=terminated.append)
+        flipped = await reconcile(conn, linear, terminate_pid=_fake_terminate_stages)
         assert flipped == 0
         assert terminated == []
 

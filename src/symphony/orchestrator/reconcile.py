@@ -118,18 +118,23 @@ def _process_alive(pid: int) -> bool:
     return True
 
 
-def _terminate_pid(pid: int) -> None:
-    """Best-effort SIGTERM→SIGKILL on a duplicate run's process group. LocalRunner
-    uses start_new_session=True so the stored pid equals the process group id;
-    killpg reaches all child processes it spawned. Both signals are sent
-    unconditionally: SIGKILL on an already-exited group raises ProcessLookupError,
-    which we swallow. All OSError subclasses (EPERM for foreign-owned, EINVAL for
-    reused/platform-specific PIDs) are also swallowed — the row is still marked
-    superseded so the duplicate stops being treated as live."""
-    with suppress(OSError):
+def _terminate_pid(pid: int) -> bool:
+    """SIGTERM→SIGKILL on a duplicate run's process group.
+
+    Returns True when the process was successfully signalled or was already dead
+    (safe to mark the row superseded). Returns False when the signal could not be
+    sent because the process is alive but unowned (EPERM) or similarly unkillable —
+    in that case the caller must NOT mark the row superseded, since the duplicate
+    is still running."""
+    try:
         os.killpg(pid, signal.SIGTERM)
-    with suppress(OSError):
+    except ProcessLookupError:
+        return True  # already dead
+    except OSError:
+        return False  # EPERM or similar — process is alive and we can't kill it
+    with suppress(OSError):  # ProcessLookupError = died after SIGTERM; others: best-effort
         os.killpg(pid, signal.SIGKILL)
+    return True
 
 
 def _tracker_resolver(tracker_or_resolver: TrackerInput) -> TrackerResolver:
@@ -313,7 +318,7 @@ async def reconcile(
     *,
     clock: Callable[[], datetime] | None = None,
     pid_alive: Callable[[int], bool] = _process_alive,
-    terminate_pid: Callable[[int], None] = _terminate_pid,
+    terminate_pid: Callable[[int], bool] = _terminate_pid,
 ) -> int:
     """Walk live runs; flip orphaned ones to `interrupted`.
 
@@ -321,7 +326,8 @@ async def reconcile(
     Tests inject a Sim-owned probe so liveness is deterministic rather than
     relying on a magic dead-PID convention. `terminate_pid` (default:
     SIGTERM→SIGKILL) kills the younger of any duplicate same-stage live runs;
-    tests inject a recorder so no real signals fly.
+    it returns True on success/already-dead and False when the process could
+    not be killed (EPERM); tests inject a recorder so no real signals fly.
 
     Returns the number of rows flipped.
     """
@@ -418,7 +424,7 @@ async def reconcile(
 async def _collapse_duplicate_live_runs(
     conn: aiosqlite.Connection,
     now: str,
-    terminate_pid: Callable[[int], None],
+    terminate_pid: Callable[[int], bool],
 ) -> int:
     """Belt-and-suspenders behind SYM-152's dispatch-time dedup: if two live
     runs ever share the same `(issue_id, stage)` — a race, a crash, or a manual
@@ -454,7 +460,15 @@ async def _collapse_duplicate_live_runs(
                 survivor.id,
             )
             if dup.pid is not None and dup.pid != survivor.pid:
-                terminate_pid(dup.pid)
+                if not terminate_pid(dup.pid):
+                    log.warning(
+                        "reconcile: could not terminate duplicate run=%s pid=%s "
+                        "(EPERM or similar) — skipping supersede to avoid masking "
+                        "a live process",
+                        dup.id,
+                        dup.pid,
+                    )
+                    continue
             await db.runs.update_status(
                 conn,
                 dup.id,
