@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149).
+"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`
@@ -11,12 +11,17 @@ foundation methods (tracker/binding/state-resolve) that every domain calls;
 `_DispatchMixin` (SYM-149) owns the dispatch domain (scan/schedule/capacity/
 slot/sem + the park guards); it extends `_OrchestratorBase` and `Orchestrator`
 inherits it.
+
+`_SlashCommandsMixin` (SYM-145) owns the slash-command domain (web-commands /
+comment-cursor poll / `$intent` dispatch + the per-state handlers); it extends
+`_OrchestratorBase` and `Orchestrator` inherits it.
 """
 
 from symphony.orchestrator import poll
-from symphony.orchestrator.poll import _base, _dispatch, _git, _helpers
+from symphony.orchestrator.poll import _base, _dispatch, _git, _helpers, _slash_commands
 from symphony.orchestrator.poll._base import _OrchestratorBase
 from symphony.orchestrator.poll._dispatch import _DispatchMixin
+from symphony.orchestrator.poll._slash_commands import _SlashCommandsMixin
 
 # Git/workspace primitives that must live in `_git.py`.
 _GIT_FUNCS = [
@@ -73,6 +78,7 @@ _HELPER_FUNCS = [
     "_acceptance_has_where_to_verify",
     "_normalize_acceptance_section_heading",
     "_acceptance_degrade_note",
+    "_needs_human_approval_label_present",
 ]
 
 
@@ -132,6 +138,49 @@ _DISPATCH_METHODS = [
 ]
 
 
+# Slash-command-domain methods that must live on `_SlashCommandsMixin` (SYM-145):
+# web-commands, the comment-cursor poll, the `$intent` dispatcher, and the
+# per-state `_handle_*_slash_intent` handlers.
+_SLASH_METHODS = [
+    "enqueue_web_command",
+    "_drain_web_commands",
+    "_apply_web_command",
+    "_web_command_run_id",
+    "_slash_command_run_eligible",
+    "_parked_manual_merge_slash_pairs",
+    "_parked_manual_merge_run_id_for_issue",
+    "_poll_slash_commands",
+    "_handle_unseen_slash_comment",
+    "_handle_slash_comments",
+    "_advance_comment_cursor",
+    "_resolve_comment_cursor",
+    "_run_started_at",
+    "_manual_merge_parked_started_at",
+    "_handle_slash_intent",
+    "_slash_text",
+    "_post_command_rejected",
+    "_handle_parked_manual_merge_slash_intent",
+    "_handle_active_review_retry_intent",
+    "_handle_implement_failed_slash_intent",
+    "_handle_implement_blocked_slash_intent",
+    "_handle_acceptance_blocked_slash_intent",
+    "_handle_budget_exceeded_slash_intent",
+    "_handle_review_failed_slash_intent",
+    "_handle_merge_needs_approval_slash_intent",
+    "_handle_acceptance_rejected_slash_intent",
+    "_handle_skip_review_intent",
+    "_handle_deliver_failed_slash_intent",
+]
+
+# Slash-domain module-level names relocated to `_slash_commands.py` (SYM-145),
+# re-exported from `__init__.py` by explicit name so existing imports keep working.
+_SLASH_NAMES = [
+    "SlashHandlerFailure",
+    "MANUAL_MERGE_PARKED_RUN_PREFIX",
+    "_manual_merge_parked_run_id",
+]
+
+
 def test_orchestrator_inherits_base() -> None:
     assert issubclass(poll.Orchestrator, _OrchestratorBase)
     assert poll.Orchestrator is not _OrchestratorBase
@@ -156,6 +205,32 @@ def test_dispatch_methods_defined_on_mixin() -> None:
 
 def test_dispatch_mixin_module() -> None:
     assert _dispatch.__name__.endswith("poll._dispatch")
+
+
+def test_orchestrator_inherits_slash_mixin() -> None:
+    assert issubclass(poll.Orchestrator, _SlashCommandsMixin)
+    assert issubclass(_SlashCommandsMixin, _OrchestratorBase)
+    assert poll.Orchestrator is not _SlashCommandsMixin
+
+
+def test_slash_methods_defined_on_mixin() -> None:
+    for name in _SLASH_METHODS:
+        member = getattr(poll.Orchestrator, name)
+        owner = (
+            member.fget.__qualname__
+            if isinstance(member, property)
+            else member.__qualname__
+        )
+        assert owner.startswith("_SlashCommandsMixin."), name
+
+
+def test_slash_mixin_module() -> None:
+    assert _slash_commands.__name__.endswith("poll._slash_commands")
+
+
+def test_slash_names_relocated_and_reexported_by_identity() -> None:
+    for name in _SLASH_NAMES:
+        assert getattr(poll, name) is getattr(_slash_commands, name), name
 
 
 def test_foundation_methods_defined_on_base() -> None:
