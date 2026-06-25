@@ -2539,9 +2539,18 @@ class _ReviewMixin(_OrchestratorBase):
             )
             if not inserted:
                 # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Abort any in-progress rebase before releasing the workspace so
-                # the next user of the workspace doesn't inherit a conflicted state.
-                if not rebase_clean:
+                # Reset the workspace so the next user doesn't inherit a modified state.
+                if rebase_clean:
+                    # Rebase completed cleanly but we lost the race; undo it.
+                    try:
+                        await _sync_workspace_to_remote(workspace_path, branch)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(
+                            "could not reset workspace after clean-rebase dedup loss for %s: %s",
+                            issue.identifier,
+                            e,
+                        )
+                else:
                     await _abort_rebase_safely(
                         workspace_path,
                         issue_identifier=issue.identifier,

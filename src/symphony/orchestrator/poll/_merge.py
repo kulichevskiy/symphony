@@ -960,9 +960,10 @@ class _MergeMixin(_OrchestratorBase):
             )
             if not inserted:
                 # Lost the race: an existing review_fix is already running.
-                # Return None so the caller treats this as "handled" (not a
-                # failure) — prevents a spurious needs-approval escalation.
+                # Interrupt the parent merge so it doesn't stay stuck in "running".
                 self._workspace.release(binding, issue)
+                if merge_run_id is not None:
+                    await db.runs.interrupt_running_merge(self._conn, merge_run_id)
                 return None
             self._dispatch_run_ids[issue.id] = fix_run_id
 
@@ -1302,13 +1303,13 @@ class _MergeMixin(_OrchestratorBase):
             )
             if not inserted:
                 # Lost the race: an existing review_fix is already running.
-                # Terminate the parent merge run (if any) so it doesn't stay
-                # stuck in "running" — the winner's fix will push and the merge
-                # retries on the next poll tick.
+                # Interrupt the parent merge so it doesn't stay stuck in "running".
+                # Return False so callers don't clear operator waits for a fix that
+                # was never started (e.g. the reconcile-merge-wait path).
                 self._workspace.release(binding, issue)
                 if merge_run_id is not None:
                     await db.runs.interrupt_running_merge(self._conn, merge_run_id)
-                return merge_run_id is not None
+                return False
             self._dispatch_run_ids[issue.id] = fix_run_id
             if on_started is not None:
                 try:
