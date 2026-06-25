@@ -1,4 +1,4 @@
-"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146).
+"""Guards the poll/ package layout (SYM-143, SYM-144, SYM-149, SYM-145, SYM-146, SYM-147).
 
 Free module-level functions live in `_git.py` (git/workspace primitives) and
 `_helpers.py` (cross-cutting + domain-shaped pure helpers). `poll/__init__.py`
@@ -20,12 +20,25 @@ comment-cursor poll / `$intent` dispatch + the per-state handlers); it extends
 @codex verdict/retrigger/re-arm, the review fix-dispatch loop, review operator
 waits, resurrect/fail/park of review monitors); it extends `_OrchestratorBase`
 and `Orchestrator` inherits it.
+
+`_MergeMixin` (SYM-147) owns the merge domain — merge-candidate polling, merge
+execution + fix-runs, manual-merge park/revival, merge-wait reconciliation —
+plus the merge-exclusive free functions. `Orchestrator` inherits it.
 """
 
 from symphony.orchestrator import poll
-from symphony.orchestrator.poll import _base, _dispatch, _git, _helpers, _review, _slash_commands
+from symphony.orchestrator.poll import (
+    _base,
+    _dispatch,
+    _git,
+    _helpers,
+    _merge,
+    _review,
+    _slash_commands,
+)
 from symphony.orchestrator.poll._base import _OrchestratorBase
 from symphony.orchestrator.poll._dispatch import _DispatchMixin
+from symphony.orchestrator.poll._merge import _MergeMixin
 from symphony.orchestrator.poll._review import _ReviewMixin
 from symphony.orchestrator.poll._slash_commands import _SlashCommandsMixin
 
@@ -153,15 +166,12 @@ _SLASH_METHODS = [
     "_apply_web_command",
     "_web_command_run_id",
     "_slash_command_run_eligible",
-    "_parked_manual_merge_slash_pairs",
-    "_parked_manual_merge_run_id_for_issue",
     "_poll_slash_commands",
     "_handle_unseen_slash_comment",
     "_handle_slash_comments",
     "_advance_comment_cursor",
     "_resolve_comment_cursor",
     "_run_started_at",
-    "_manual_merge_parked_started_at",
     "_handle_slash_intent",
     "_slash_text",
     "_post_command_rejected",
@@ -170,7 +180,6 @@ _SLASH_METHODS = [
     "_handle_implement_blocked_slash_intent",
     "_handle_acceptance_blocked_slash_intent",
     "_handle_budget_exceeded_slash_intent",
-    "_handle_merge_needs_approval_slash_intent",
     "_handle_acceptance_rejected_slash_intent",
     "_handle_deliver_failed_slash_intent",
 ]
@@ -186,8 +195,6 @@ _SLASH_NAMES = [
 # Review-monitoring methods that must live on `_ReviewMixin` (SYM-146).
 _REVIEW_METHODS = [
     "_handle_active_review_retry_intent",
-    "_handle_review_failed_slash_intent",
-    "_handle_skip_review_intent",
     "_stop_review_monitor",
     "_binding_for_review_issue_id",
     "_poll_review_runs",
@@ -232,6 +239,63 @@ _REVIEW_METHODS = [
     "_park_review_for_approval",
     "_maybe_post_codex_lgtm",
     "_review_verdict_for_pr",
+]
+
+
+# Merge-domain methods that must live on `_MergeMixin` (SYM-147).
+_MERGE_METHODS = [
+    "_run_auto_recoverable_merge_wait_reconciler",
+    "_reconcile_orphaned_merge_runs",
+    "_reconcile_auto_recoverable_merge_waits",
+    "_reconcile_auto_recoverable_merge_wait",
+    "_repo_view_for_merge_wait_reconcile",
+    "_schedule_reconciled_merge_conflict_rebase_fix",
+    "_merge_wait_reconcile_task_done",
+    "_interrupt_stale_merge_needs_approval_for_state",
+    "_resolve_pr_base_ref",
+    "_required_check_failures_for_view",
+    "_merge_required_check_fix_should_dispatch",
+    "_merge_required_check_action_log_tail",
+    "_mark_merge_required_check_fix_needs_approval",
+    "_merge_required_check_terminal_run",
+    "_dispatch_merge_required_check_fix_if_allowed",
+    "_dispatch_merge_required_check_fix_run",
+    "_run_required_check_fix_agent",
+    "_mark_merge_conflict_fix_needs_approval",
+    "_dispatch_merge_conflict_rebase_fix_run",
+    "_schedule_parked_manual_merge_revival_for_issue_event",
+    "_schedule_parked_manual_merge_revival_if_requested",
+    "_parked_manual_merge_transition_matches",
+    "_schedule_parked_manual_merge_revival",
+    "_parked_manual_merge_revival_task_done",
+    "_handle_merge_needs_approval_slash_intent",
+    "_parked_closed_unmerged_pr_for_event",
+    "_reconcile_parked_closed_unmerged_pr_event",
+    "_mark_parked_closed_unmerged_pr_done",
+    "_reconcile_merged_issues_linear_state",
+    "_refresh_issue_for_acceptance_merge_handoff",
+    "_open_merge_wait_for_human_approval_label",
+    "_park_pr_for_manual_merge",
+    "_poll_merge_candidates",
+    "_schedule_merge_conflict_rebase_fix",
+    "_schedule_merge_required_check_fix",
+    "_schedule_merge",
+    "_merge_with_limits",
+    "_refresh_merge_candidate",
+    "_poll_submitted_merge",
+    "_finalize_pr_if_closed",
+    "_merge_approved_pr",
+    "_mark_merge_done_if_merged",
+    "_mark_merge_done",
+    "_mark_merge_needs_approval",
+    "_run_merge_agent",
+]
+
+# Merge-exclusive free functions co-located into `_merge.py` (SYM-147).
+_MERGE_FUNCS = [
+    "_abort_rebase_safely",
+    "_merge_issue_matches_binding",
+    "_review_check_from_github",
 ]
 
 
@@ -285,6 +349,28 @@ def test_slash_mixin_module() -> None:
 def test_slash_names_relocated_and_reexported_by_identity() -> None:
     for name in _SLASH_NAMES:
         assert getattr(poll, name) is getattr(_slash_commands, name), name
+
+
+def test_orchestrator_inherits_merge_mixin() -> None:
+    assert issubclass(poll.Orchestrator, _MergeMixin)
+    assert poll.Orchestrator is not _MergeMixin
+
+
+def test_merge_mixin_extends_base() -> None:
+    assert issubclass(_MergeMixin, _OrchestratorBase)
+
+
+def test_merge_methods_defined_on_mixin() -> None:
+    for name in _MERGE_METHODS:
+        member = getattr(poll.Orchestrator, name)
+        owner = member.fget.__qualname__ if isinstance(member, property) else member.__qualname__
+        assert owner.startswith("_MergeMixin."), name
+
+
+def test_merge_free_functions_live_in_merge_module() -> None:
+    for name in _MERGE_FUNCS:
+        fn = getattr(_merge, name)
+        assert fn.__module__.endswith("poll._merge"), name
 
 
 def test_orchestrator_inherits_review_mixin() -> None:
