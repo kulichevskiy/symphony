@@ -167,6 +167,7 @@ async def run_local_review_session(
     cap: int,
     stall_secs: int,
     command_secs: int = 1800,
+    wall_clock_secs: int = 0,
     binding_env: dict[str, str] | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
     last_message_dir: Path,
@@ -266,6 +267,7 @@ async def run_local_review_session(
             command=command,
             stall_secs=stall_secs,
             command_secs=command_secs,
+            wall_clock_secs=wall_clock_secs,
             stage="local_review",
         )
         cost_before = estimator.total_cost_usd
@@ -483,6 +485,7 @@ async def run_local_review_session(
             command=command,
             stall_secs=stall_secs,
             command_secs=command_secs,
+            wall_clock_secs=wall_clock_secs,
             stage="local_review_fix",
             # The fixer is change-driving: inject the binding's resolved
             # env: secrets (e.g. SUPABASE_ACCESS_TOKEN) so schema fixes use
@@ -518,9 +521,14 @@ async def run_local_review_session(
                 cache_read_tokens=cache_read_delta,
             )
         if collected.stall_timeout:
+            stall_error = (
+                "fix-run exceeded wall-clock cap"
+                if collected.terminal_kind == "wall_clock_timeout"
+                else "fix-run stalled"
+            )
             return FixerOutput(
                 ok=False,
-                error="fix-run stalled",
+                error=stall_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,

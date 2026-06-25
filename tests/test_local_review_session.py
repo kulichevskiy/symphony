@@ -1517,3 +1517,47 @@ def test_reviewer_stream_error_none_on_clean_stream() -> None:
         ]
     )
     assert classify_stream_api_error(stdout) is None
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_secs_wired_to_specs_and_distinguishes_error(
+    tmp_path: Path,
+) -> None:
+    """wall_clock_secs must be threaded into every RunnerSpec (reviewer and
+    fixer), and a wall_clock_timeout terminal event must produce
+    "fix-run exceeded wall-clock cap" — not the stall message."""
+    changes_text = f"bug found\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("codex", changes_text),
+            [RunnerEvent(kind="wall_clock_timeout")],
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-wc",
+        issue_title="Test",
+        issue_body="Test",
+        labels=[],
+        implementer_agent="claude",
+        implementer_codex_model="gpt-5.1-codex",
+        reviewer_agent="codex",
+        reviewer_codex_model="gpt-5.1-codex",
+        cap=5,
+        stall_secs=300,
+        wall_clock_secs=2,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.error == "fix-run exceeded wall-clock cap"
+    reviewer_spec, fixer_spec = runner.specs
+    assert reviewer_spec.wall_clock_secs == 2
+    assert fixer_spec.wall_clock_secs == 2

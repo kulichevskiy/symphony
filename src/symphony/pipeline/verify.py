@@ -111,6 +111,7 @@ async def run_verify_session(
     fix_claude_model: str | None = None,
     stall_secs: int,
     command_secs: int = 1800,
+    wall_clock_secs: int = 0,
     command_runner: VerifyCommandRunner = run_verify_command,
     usage_handler: Callable[[Usage], object] | None = None,
     fix_log_path: Path | None = None,
@@ -152,6 +153,7 @@ async def run_verify_session(
         ),
         stall_secs=stall_secs,
         command_secs=command_secs,
+        wall_clock_secs=wall_clock_secs,
         stage="verify_fix",
     )
     collected = await collect_runner_output(

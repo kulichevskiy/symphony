@@ -33,6 +33,12 @@ class RunnerSpec:
     # instead of `stall_secs`, so a long-but-healthy subprocess (broad rg,
     # pnpm install, pytest) isn't killed as a false-positive stall.
     command_secs: float = 1800
+    # Absolute wall-clock backstop measured from run start, independent of the
+    # stall/per-command heartbeat. A confused-but-chatty agent keeps fresh
+    # output flowing — so `stall_secs` never trips and there's no in-flight
+    # command to hit `command_secs` — yet stays wedged indefinitely (incident
+    # SYM-148). This cap kills it regardless. 0 disables (no cap).
+    wall_clock_secs: float = 0
     stage: str = ""  # implement|review|merge — telemetry only
 
 
@@ -45,6 +51,7 @@ class RunnerEvent:
         "tick",
         "exit",
         "stall_timeout",
+        "wall_clock_timeout",
         "spawn_failed",
     ]
     line: str | None = None

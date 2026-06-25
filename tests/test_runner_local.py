@@ -383,6 +383,46 @@ async def test_runner_stalls_when_command_exceeds_command_secs(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_runner_kills_on_wall_clock_cap_despite_fresh_output(tmp_path: Path) -> None:
+    # A confused-but-chatty agent keeps emitting output, so the silence-based
+    # stall watchdog never trips and no command is in flight to hit command_secs.
+    # The absolute wall-clock backstop must still terminate it (SYM-153 /
+    # incident SYM-148: a review_fix agent looped for 28+ minutes).
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-wallclock",
+        workspace_path=tmp_path,
+        command=["sh", "-c", "while true; do printf 'tick\\n'; sleep 0.2; done"],
+        stall_secs=30,
+        command_secs=30,
+        wall_clock_secs=2,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=20)
+    kinds = [e.kind for e in events]
+    assert "wall_clock_timeout" in kinds
+    assert "stall_timeout" not in kinds
+    # The agent was chatty right up to the kill — fresh output kept the
+    # heartbeat alive, which is exactly why the stall watchdog couldn't help.
+    assert any(e.kind == "stdout" and e.line == "tick" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_runner_wall_clock_cap_disabled_by_default(tmp_path: Path) -> None:
+    # Unset (0) means no absolute cap: a short clean run exits normally.
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-no-wallclock",
+        workspace_path=tmp_path,
+        command=["sh", "-c", "printf 'hi\\n'; exit 0"],
+        stall_secs=10,
+    )
+    events = await asyncio.wait_for(_collect_events(runner, spec), timeout=10)
+    assert "wall_clock_timeout" not in [e.kind for e in events]
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+
+
+@pytest.mark.asyncio
 async def test_runner_kill_terminates(tmp_path: Path) -> None:
     runner = LocalRunner()
     spec = RunnerSpec(

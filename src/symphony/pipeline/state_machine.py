@@ -275,6 +275,8 @@ def classify_termination(
 
     if final_kind == "stall_timeout":
         return "stall_timeout", detail
+    if final_kind == "wall_clock_timeout":
+        return "wall_clock_timeout", detail
     if final_kind == "spawn_failed":
         return "spawn_failed", detail
     if final_kind == "exit" and returncode not in (None, 0):

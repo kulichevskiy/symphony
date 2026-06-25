@@ -24,7 +24,7 @@ class CollectedRunnerOutput:
     """Single-pass collection of a runner invocation.
 
     `terminal_kind` is the kind of the terminal event (one of
-    `exit | stall_timeout | spawn_failed`). The caller decides what
+    `exit | stall_timeout | wall_clock_timeout | spawn_failed`). The caller decides what
     counts as "ok" — for the reviewer, any terminal that produced a
     parseable verdict is fine; the loop's UNPARSEABLE fallback handles
     short-circuited runs.
@@ -84,8 +84,10 @@ async def collect_runner_output(
             terminal_kind = "exit"
             returncode = event.returncode
             break
-        elif event.kind == "stall_timeout":
-            terminal_kind = "stall_timeout"
+        elif event.kind in ("stall_timeout", "wall_clock_timeout"):
+            # Both are watchdog kills (silence vs. absolute wall-clock cap);
+            # reuse the `stall_timeout` flag so the run fails closed.
+            terminal_kind = event.kind
             stall_timeout = True
             break
         elif event.kind == "spawn_failed":
