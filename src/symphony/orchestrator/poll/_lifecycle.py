@@ -657,9 +657,17 @@ class _LifecycleMixin(_OrchestratorBase):
         head_advanced = bool(head_after) and head_after != head_before
         log_path = self.config.log_root / f"{run_id}.log"
         final_message = _read_run_final_message(log_path, agent=binding.agent)
+        # A killed-then-redispatched run re-runs the agent conservatively; it
+        # re-confirms (SYMPHONY_DONE) without a *new* commit. If the branch
+        # already carries deliverable commits (ahead of base) on a clean tree,
+        # that confirmation completes the run instead of re-parking it (SYM-161).
+        branch_ahead_after = await _branch_ahead_of_base(workspace_path, base_branch)
+        tree_clean_after = not await _workspace_dirty_files(workspace_path)
         completion = classify_implement_completion(
             final_message=final_message,
             head_advanced=head_advanced,
+            branch_ahead_of_base=branch_ahead_after,
+            tree_clean=tree_clean_after,
         )
         if completion.outcome == "blocked":
             reason = (

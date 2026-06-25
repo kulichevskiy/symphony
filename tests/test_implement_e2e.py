@@ -881,6 +881,88 @@ async def test_already_satisfied_dirty_tree_does_not_close(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_redispatched_reconfirmed_branch_advances_to_review(
+    tmp_path: Path,
+) -> None:
+    """SYM-161 regression: a killed-then-redispatched implement re-runs the
+    agent conservatively (a prior `cancelled` terminal kind is not resume-safe,
+    so the branch-ahead short-circuit is suppressed). The agent re-confirms the
+    work (SYMPHONY_DONE) but makes no *new* commit. Because the branch already
+    carries deliverable commits (ahead of base) on a clean tree, the completion
+    gate must complete the run and advance to publish — not re-park
+    implement_failed."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        # The earlier (killed) run had already committed deliverable work: the
+        # branch sits one commit ahead of base before this re-dispatch.
+        advance_head(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        # Seed the prior implement run that died with a non-resume-safe
+        # `cancelled` kind, forcing this re-dispatch down the agent path.
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add authentication",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn, id="prev-run", issue_id="iss-1", stage="implement",
+            status="running", pid=None, started_at="2026-01-01T00:00:00Z",
+        )
+        await db.runs.update_status(
+            conn, "prev-run", "failed", ended_at="2026-01-01T00:01:00Z",
+            kind="cancelled", detail="dispatch cancelled",
+        )
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        # Re-confirms done, makes NO new commit, leaves a clean tree.
+        runner = _blocked_runner("Re-confirmed: 216 tests pass.\n\nSYMPHONY_DONE")
+
+        orch = Orchestrator(
+            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        await _scan_and_wait(orch, binding)
+
+        # Advanced to publish: PR opened, branch pushed.
+        gh.ensure_pr.assert_awaited_once()
+        push_fn.assert_awaited()
+
+        # The re-dispatched implement run completed (not re-parked).
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        implement_runs = [r for r in history if r.id != "prev-run"]
+        assert len(implement_runs) == 1
+        assert implement_runs[0].status == "completed"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
     tmp_path: Path,
 ) -> None:

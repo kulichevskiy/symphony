@@ -378,6 +378,44 @@ def test_classify_plain_done_no_commits_is_not_already_satisfied() -> None:
     assert completion.outcome == "failed"
 
 
+# --- re-confirmed branch (SYM-161): conservative re-run convergence ---------
+# A killed-then-redispatched implement re-runs the agent; it re-confirms the
+# work (SYMPHONY_DONE) but makes no new commit (HEAD not advanced). When the
+# branch already carries deliverable commits (ahead of base) on a clean tree,
+# that confirmation must complete the run instead of re-parking it.
+def test_classify_done_not_advanced_branch_ahead_clean_completes() -> None:
+    completion = classify_implement_completion(
+        final_message="Re-confirmed: 216 tests pass.\n\nSYMPHONY_DONE",
+        head_advanced=False,
+        branch_ahead_of_base=True,
+        tree_clean=True,
+    )
+    assert completion.outcome == "completed"
+
+
+# No-op guard preserved: branch NOT ahead -> still failed (claimed done,
+# produced nothing on the branch).
+def test_classify_done_not_advanced_branch_not_ahead_fails() -> None:
+    completion = classify_implement_completion(
+        final_message="SYMPHONY_DONE",
+        head_advanced=False,
+        branch_ahead_of_base=False,
+        tree_clean=True,
+    )
+    assert completion.outcome == "failed"
+
+
+# Dirty tree owns the dirty case: branch ahead but tree dirty -> still failed.
+def test_classify_done_not_advanced_branch_ahead_dirty_fails() -> None:
+    completion = classify_implement_completion(
+        final_message="SYMPHONY_DONE",
+        head_advanced=False,
+        branch_ahead_of_base=True,
+        tree_clean=False,
+    )
+    assert completion.outcome == "failed"
+
+
 def test_classify_blocked_final_message_detects_human_action_ask() -> None:
     kind, reason = classify_blocked_final_message(MCH14_FINAL_MESSAGE)
     assert kind == "blocked"
