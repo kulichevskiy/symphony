@@ -39,7 +39,7 @@ packages = ["src/symphony"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src"]
 addopts = ["-m", "not eval"]
 markers = [
     "eval: dataset-backed eval over a corpus (see evals/), not a unit test",

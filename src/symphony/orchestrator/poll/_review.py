@@ -1742,7 +1742,7 @@ class _ReviewMixin(_OrchestratorBase):
                 return False
 
             fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
+            inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=fix_run_id,
                 issue_id=issue.id,
@@ -1750,7 +1750,13 @@ class _ReviewMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                ignored_stage="review",
             )
+            if not inserted:
+                # Lost the race against a concurrent fix-run dispatch (SYM-152).
+                # Release the workspace and bail without clobbering dispatch ids.
+                self._workspace.release(binding, issue)
+                return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
@@ -2141,27 +2147,6 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
 
         async with self._review_fix_dispatch_slot(binding, issue):
-            # Post the "starting" comment once we have a slot — this ensures
-            # the message is accurate ("dispatching now", not "queued").
-            v = CommentVars(
-                stage="review",
-                repo=binding.github_repo,
-                issue=state.pr_number or 0,
-                pr_url=pr_url,
-                review_iter=iteration,
-                trigger=verdict.trigger_signature[:80],
-            )
-            try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(reviewing_feedback(v))
-                )
-            except LinearError as e:
-                log.warning(
-                    "could not post reviewing_feedback comment for %s: %s",
-                    issue.identifier,
-                    e,
-                )
-
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
             except Exception as e:  # noqa: BLE001
@@ -2207,8 +2192,10 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
+            # Dedup after workspace setup: no pidless row is left in the DB
+            # if setup fails or the host restarts mid-setup (SYM-152 P1).
             fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
+            inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=fix_run_id,
                 issue_id=issue.id,
@@ -2216,10 +2203,35 @@ class _ReviewMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                ignored_stage="review",
             )
+            if not inserted:
+                # Lost the race against a concurrent fix-run dispatch (SYM-152).
+                self._workspace.release(binding, issue)
+                return False
             self._dispatch_run_ids[issue.id] = fix_run_id
 
+            # Post the "starting" comment only after dedup succeeds so we do
+            # not announce a fix-run that will not execute (SYM-152).
+            v = CommentVars(
+                stage="review",
+                repo=binding.github_repo,
+                issue=state.pr_number or 0,
+                pr_url=pr_url,
+                review_iter=iteration,
+                trigger=verdict.trigger_signature[:80],
+            )
             try:
+                try:
+                    await tracker.post_comment(
+                        issue.id, truncate_body(reviewing_feedback(v))
+                    )
+                except LinearError as e:
+                    log.warning(
+                        "could not post reviewing_feedback comment for %s: %s",
+                        issue.identifier,
+                        e,
+                    )
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
                 usage_delta, final_kind, final_returncode = await self._run_fix_agent(
                     binding=binding,
@@ -2386,25 +2398,6 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
 
         async with self._review_fix_dispatch_slot(binding, issue):
-            # Post the "fixing" comment once we have a slot.
-            v_start = CommentVars(
-                stage="review",
-                repo=binding.github_repo,
-                issue=state.pr_number or 0,
-                pr_url=pr_url,
-                review_iter=iteration,
-            )
-            try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(fixing_merge_conflict(v_start))
-                )
-            except LinearError as e:
-                log.warning(
-                    "could not post fixing_merge_conflict comment for %s: %s",
-                    issue.identifier,
-                    e,
-                )
-
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
             except Exception as e:  # noqa: BLE001
@@ -2465,12 +2458,62 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
+            # Dedup after workspace setup: no pidless row is left in the DB
+            # if setup fails or the host restarts mid-setup (SYM-152 P1).
+            fix_run_id = str(uuid.uuid4())
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=fix_run_id,
+                issue_id=issue.id,
+                stage="review_fix",
+                status="running",
+                pid=None,
+                started_at=self._now().isoformat(),
+                ignored_stage="review",
+            )
+            if not inserted:
+                self._workspace.release(binding, issue)
+                return False
+            self._dispatch_run_ids[issue.id] = fix_run_id
+
+            # Post the "fixing" comment once dedup has passed.
+            v_start = CommentVars(
+                stage="review",
+                repo=binding.github_repo,
+                issue=state.pr_number or 0,
+                pr_url=pr_url,
+                review_iter=iteration,
+            )
+            try:
+                await tracker.post_comment(
+                    issue.id, truncate_body(fixing_merge_conflict(v_start))
+                )
+            except LinearError as e:
+                log.warning(
+                    "could not post fixing_merge_conflict comment for %s: %s",
+                    issue.identifier,
+                    e,
+                )
+
             # Step 2: orchestrator attempts the rebase.
             upstream = f"origin/{base_branch or 'main'}"
             try:
                 rebase_clean = await _git_rebase(workspace_path, upstream)
             except Exception as e:  # noqa: BLE001
                 log.warning("git rebase failed for %s: %s", issue.identifier, e)
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"git rebase failed: {e}",
+                    ),
+                )
+                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                    self._dispatch_run_ids.pop(issue.id, None)
                 self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
@@ -2500,10 +2543,22 @@ class _ReviewMixin(_OrchestratorBase):
                         issue_identifier=issue.identifier,
                         reason="rebase with no unresolved paths",
                     )
-                    self._workspace.release(binding, issue)
                     error = "rebase failed with no unresolved paths"
                     if status_short:
                         error += f"; git status: {status_short}"
+                    await db.runs.update_status(
+                        self._conn,
+                        fix_run_id,
+                        "failed",
+                        ended_at=self._now().isoformat(),
+                        **_termination_kwargs(
+                            status="failed",
+                            reason=error,
+                        ),
+                    )
+                    if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                        self._dispatch_run_ids.pop(issue.id, None)
+                    self._workspace.release(binding, issue)
                     await self._fail_review_run(
                         run=run,
                         binding=binding,
@@ -2512,19 +2567,6 @@ class _ReviewMixin(_OrchestratorBase):
                         last_log=status_short,
                     )
                     return False
-
-            # Create a review_fix row for cost tracking and dispatch_run_ids cleanup.
-            fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-            )
-            self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
                 cumulative_usage = UsageDelta()
