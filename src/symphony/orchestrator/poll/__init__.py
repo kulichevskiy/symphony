@@ -242,13 +242,7 @@ from ._helpers import (
 )
 from ._lifecycle import _LifecycleMixin as _LifecycleMixin
 from ._merge import (
-    _abort_rebase_safely as _abort_rebase_safely,
-)
-from ._merge import (
     _MergeMixin as _MergeMixin,
-)
-from ._merge import (
-    _review_check_from_github as _review_check_from_github,
 )
 from ._review import (
     _CODEX_REVIEWED_COMMIT_RE as _CODEX_REVIEWED_COMMIT_RE,
@@ -261,6 +255,9 @@ from ._review import (
 )
 from ._review import (
     REVIEW_RESURRECT_COOLDOWN_SECS as REVIEW_RESURRECT_COOLDOWN_SECS,
+)
+from ._review import (
+    _abort_rebase_safely as _abort_rebase_safely,
 )
 from ._review import (
     _codex_lgtm_reactions_from_issue_comments as _codex_lgtm_reactions_from_issue_comments,
@@ -291,6 +288,9 @@ from ._review import (
 )
 from ._review import (
     _review_check_from_gh as _review_check_from_gh,
+)
+from ._review import (
+    _review_check_from_github as _review_check_from_github,
 )
 from ._review import (
     _review_comments_from_github as _review_comments_from_github,

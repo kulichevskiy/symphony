@@ -33,7 +33,16 @@ merge_handoff` on `_MergeMixin` — they are inherited, not duplicated.
 
 `_LifecycleMixin` (SYM-150) owns the run lifecycle domain
 (implement/deliver/verify/local_review/publish); `Orchestrator` inherits it.
+
+SYM-156 (Phase 2) removed the cross-mixin shadowed copies the stacked split left
+behind, so each method/free-function now has exactly one real definition. The
+merge↔review free functions `_abort_rebase_safely` / `_review_check_from_github`
+live in `_review.py` (the lower module: `_merge` imports from `_review`, so the
+copies they call cannot live in `_merge`).
 """
+
+import ast
+from pathlib import Path
 
 from symphony.orchestrator import poll
 from symphony.orchestrator.poll import (
@@ -306,9 +315,29 @@ _MERGE_METHODS = [
 
 # Merge-exclusive free functions co-located into `_merge.py` (SYM-147).
 _MERGE_FUNCS = [
-    "_abort_rebase_safely",
     "_merge_issue_matches_binding",
+]
+
+# Free functions called by `_review.py` (and formerly duplicated in `_merge.py`);
+# they must live in `_review.py` because `_merge` imports from `_review` (SYM-156).
+_REVIEW_FUNCS = [
+    "_abort_rebase_safely",
     "_review_check_from_github",
+]
+
+# Methods/free functions that the stacked split (SYM-145..150) copied into two
+# mixins; SYM-156 removed the shadowed copy so each has exactly one real def.
+_DEDUPED_NAMES = [
+    "_dispatch_merge_conflict_fix_run",
+    "_complete_review_monitors_for_merge",
+    "_maybe_post_codex_lgtm",
+    "_review_verdict_for_pr",
+    "_handle_active_review_retry_intent",
+    "_handle_review_failed_slash_intent",
+    "_handle_skip_review_intent",
+    "_handle_merge_needs_approval_slash_intent",
+    "_review_check_from_github",
+    "_abort_rebase_safely",
 ]
 
 
@@ -460,6 +489,40 @@ def test_merge_free_functions_live_in_merge_module() -> None:
     for name in _MERGE_FUNCS:
         fn = getattr(_merge, name)
         assert fn.__module__.endswith("poll._merge"), name
+
+
+def test_review_free_functions_live_in_review_module() -> None:
+    for name in _REVIEW_FUNCS:
+        fn = getattr(_review, name)
+        assert fn.__module__.endswith("poll._review"), name
+
+
+def _is_stub(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """A TYPE_CHECKING/protocol stub: body is only docstrings, `...`, or `pass`."""
+    for stmt in node.body:
+        if isinstance(stmt, ast.Pass):
+            continue
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            continue  # docstring or `...`
+        return False
+    return True
+
+
+def test_deduped_names_defined_in_exactly_one_module() -> None:
+    poll_dir = Path(poll.__file__).parent
+    owners: dict[str, list[str]] = {name: [] for name in _DEDUPED_NAMES}
+    for path in sorted(poll_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name in owners
+                and not _is_stub(node)
+            ):
+                owners[node.name].append(path.name)
+    for name, modules in owners.items():
+        assert modules == sorted(set(modules)), f"{name} duplicated in {modules}"
+        assert len(modules) == 1, f"{name} defined in {modules}, expected exactly one"
 
 
 def test_orchestrator_inherits_review_mixin() -> None:

@@ -37,9 +37,7 @@ from ...linear.templates import (
     command_rejected,
     resumed,
     retry_acceptance_requested,
-    review_retry_requested,
     skip_acceptance_forced,
-    skip_review_forced,
     truncate_body,
 )
 from ...tracker import Comment as LinearComment
@@ -62,8 +60,6 @@ log = logging.getLogger(__name__)
 
 
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
-
-
 
 
 def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
@@ -93,6 +89,20 @@ class _SlashCommandsMixin(_OrchestratorBase):
         async def _deliver_implement_run(
             self, *, ctx: _PendingDelivery, base_branch: str | None = None
         ) -> str: ...
+
+        async def _handle_active_review_retry_intent(
+            self, issue_id: str, run_id: str, intent: SlashIntent
+        ) -> None: ...
+
+        async def _handle_merge_needs_approval_slash_intent(
+            self, issue_id: str, run_id: str, intent: SlashIntent
+        ) -> None: ...
+
+        async def _handle_review_failed_slash_intent(
+            self, issue_id: str, run_id: str, intent: SlashIntent
+        ) -> None: ...
+
+        async def _handle_skip_review_intent(self, issue_id: str, run_id: str) -> None: ...
 
         async def _open_merge_wait_for_human_approval_label(
             self,
@@ -667,76 +677,6 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     comment_error,
                 )
 
-    async def _handle_active_review_retry_intent(
-        self, issue_id: str, run_id: str, intent: SlashIntent
-    ) -> None:
-        state = await db.review_state.get(self._conn, issue_id)
-        binding = await self._binding_for_review_issue_id(issue_id, state=state)
-        if binding is None:
-            await self._post_command_rejected(
-                issue_id,
-                "$retry",
-                "no repository binding found for the active review monitor",
-            )
-            return
-        if state.pr_number is None:
-            await self._post_command_rejected(
-                issue_id,
-                "$retry",
-                "no PR found for the active review monitor",
-            )
-            return
-
-        pr_url = _pr_url_for_state(
-            repo=binding.github_repo,
-            pr_number=state.pr_number,
-            pr_url=state.pr_url,
-        )
-        # Only ping the remote bot when `remote_review` is enabled. Local-only
-        # and no-review bindings must never fire `@codex review` — the manual
-        # retry just re-arms the monitor without a remote ping.
-        if binding.resolved_remote_review():
-            try:
-                await self._gh.pr_comment(
-                    state.pr_number, "@codex review", repo=binding.github_repo
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not re-post @codex review for active monitor %s#%d: %s",
-                    binding.github_repo,
-                    state.pr_number,
-                    e,
-                )
-                await self._post_command_rejected(
-                    issue_id,
-                    "$retry",
-                    f"could not re-post @codex review: {e}",
-                )
-                return
-
-        signature = f"manual_retry:{run_id}:{intent.comment_id}"
-        await db.review_state.set_signature(self._conn, issue_id, signature)
-        log.info(
-            "$retry received for active review monitor %s (issue %s); "
-            "re-triggered @codex review",
-            run_id,
-            issue_id,
-        )
-        body = review_retry_requested(
-            CommentVars(
-                stage="review",
-                repo=binding.github_repo,
-                issue=state.pr_number,
-                pr_url=pr_url,
-                run_id=run_id,
-            )
-        )
-        tracker = self.tracker(binding)
-        try:
-            await tracker.post_comment(issue_id, truncate_body(body))
-        except LinearError as e:
-            log.warning("active review retry comment failed for %s: %s", issue_id, e)
-
     async def _handle_implement_failed_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -1190,193 +1130,6 @@ class _SlashCommandsMixin(_OrchestratorBase):
             run_id,
         )
 
-    async def _handle_review_failed_slash_intent(
-        self, issue_id: str, run_id: str, intent: SlashIntent
-    ) -> None:
-        binding = self._review_failed_run_bindings.get(run_id)
-        if binding is None:
-            binding = await self._restore_operator_wait_binding(
-                issue_id,
-                run_id,
-                intent,
-                expected_kinds=(
-                    db.operator_waits.KIND_REVIEW_FAILED,
-                    db.operator_waits.KIND_REVIEW_STOPPED,
-                ),
-            )
-            if binding is None:
-                return
-        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
-        tracker = self.tracker(binding)
-        if intent.kind not in (SlashKind.RETRY, SlashKind.APPROVE):
-            if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
-                states = await self._states_for_binding(binding)
-                blocked_id = states.get(binding.linear_states.blocked)
-                try:
-                    issue = await tracker.lookup_issue(tracker_issue_id)
-                except LinearError as e:
-                    log.warning("could not look up %s for reject: %s", issue_id, e)
-                    raise SlashHandlerFailure(
-                        slash_text=self._slash_text(intent),
-                        reason=f"could not look up issue for reject: {e}",
-                    ) from e
-                if blocked_id is not None:
-                    try:
-                        await tracker.move_issue(tracker_issue_id, blocked_id)
-                    except LinearError as e:
-                        log.warning(
-                            "could not move %s to blocked: %s", issue.identifier, e
-                        )
-                        raise SlashHandlerFailure(
-                            slash_text=self._slash_text(intent),
-                            reason=f"could not move issue to blocked state: {e}",
-                        ) from e
-                await self._clear_operator_wait(issue_id, run_id)
-            else:
-                log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
-            return
-
-        # $retry or $approve: restart review. Local-only retries must produce
-        # a fresh local-review approval before the passive monitor can help.
-        # Look up the issue BEFORE clearing the operator wait — if lookup
-        # fails we want the wait (and its `_dispatch_run_ids` entry) to
-        # survive so the next poll tick can retry. Clearing first would
-        # make the issue invisible to slash polling on the retry.
-        try:
-            issue = await tracker.lookup_issue(tracker_issue_id)
-        except LinearError as e:
-            log.warning("could not look up %s for retry: %s", issue_id, e)
-            raise SlashHandlerFailure(
-                slash_text=self._slash_text(intent),
-                reason=f"could not look up issue for retry: {e}",
-            ) from e
-        await self._resume_review_monitor(
-            binding=binding,
-            issue=issue,
-            issue_id=issue_id,
-            tracker_issue_id=tracker_issue_id,
-            run_id=run_id,
-        )
-
-    async def _handle_merge_needs_approval_slash_intent(
-        self, issue_id: str, run_id: str, intent: SlashIntent
-    ) -> None:
-        """Handle `$approve`/`$reject`/`$stop` on a merge `needs_approval` run."""
-        binding = self._merge_needs_approval_bindings.get(run_id)
-        if binding is None:
-            binding = await self._restore_operator_wait_binding(
-                issue_id,
-                run_id,
-                intent,
-                expected_kinds=(db.operator_waits.KIND_MERGE,),
-            )
-            if binding is None:
-                return
-        tracker = self.tracker(binding)
-        if intent.kind is SlashKind.APPROVE:
-            parked_pr = await db.issue_prs.get(
-                self._conn,
-                issue_id=issue_id,
-                github_repo=binding.github_repo,
-            )
-            if (
-                parked_pr is not None
-                and parked_pr.merged_at is None
-                and parked_pr.parked_at is not None
-            ):
-                await self._handle_parked_manual_merge_slash_intent(
-                    issue_id,
-                    intent,
-                    binding=binding,
-                    pr=parked_pr,
-                )
-                return
-        if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
-            states = await self._states_for_binding(binding)
-            blocked_id = states.get(binding.linear_states.blocked)
-            try:
-                issue = await tracker.lookup_issue(issue_id)
-            except LinearError as e:
-                log.warning("could not look up %s for merge reject: %s", issue_id, e)
-                raise SlashHandlerFailure(
-                    slash_text=self._slash_text(intent),
-                    reason=f"could not look up issue for merge reject: {e}",
-                ) from e
-            if blocked_id is not None:
-                try:
-                    await tracker.move_issue(issue_id, blocked_id)
-                except LinearError as e:
-                    log.warning(
-                        "could not move %s to blocked after merge reject: %s",
-                        issue.identifier,
-                        e,
-                    )
-                    raise SlashHandlerFailure(
-                        slash_text=self._slash_text(intent),
-                        reason=f"could not move issue to blocked state: {e}",
-                    ) from e
-            await self._clear_operator_wait(issue_id, run_id)
-            return
-        if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
-            log.info("slash %s for merge-needs-approval run %s ignored", intent.kind, run_id)
-            return
-
-        # $approve or $retry: re-dispatch the merge.
-        try:
-            issue = await tracker.lookup_issue(issue_id)
-        except LinearError as e:
-            log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
-            raise SlashHandlerFailure(
-                slash_text=self._slash_text(intent),
-                reason=f"could not look up issue for merge re-dispatch: {e}",
-            ) from e
-        state = await db.review_state.get(self._conn, issue_id)
-        if state.pr_number is None:
-            log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
-            return
-        pr_number = state.pr_number
-        pr_url = state.pr_url or (
-            f"https://github.com/{binding.github_repo}/pull/{pr_number}"
-        )
-        log.info(
-            "merge re-dispatch: scheduling merge for %s (PR #%d)",
-            issue.identifier,
-            pr_number,
-        )
-
-        async def on_merge_started(new_run_id: str) -> None:
-            await self._clear_operator_wait(issue_id, run_id)
-            try:
-                await tracker.post_comment(
-                    issue_id,
-                    truncate_body(
-                        resumed(
-                            CommentVars(
-                                stage="merge",
-                                repo=binding.github_repo,
-                                issue=pr_number,
-                                pr_url=pr_url,
-                                run_id=new_run_id,
-                                next_stage="merge",
-                            )
-                        )
-                    ),
-                )
-            except LinearError as e:
-                log.warning(
-                    "merge re-dispatch comment failed for %s: %s",
-                    issue.identifier,
-                    e,
-                )
-
-        self._schedule_merge(
-            binding=binding,
-            issue=issue,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            on_started=on_merge_started,
-        )
-
     async def _handle_acceptance_rejected_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -1489,153 +1242,6 @@ class _SlashCommandsMixin(_OrchestratorBase):
         except LinearError as e:
             log.warning("retry-acceptance comment failed for %s: %s", issue_id, e)
 
-    async def _handle_skip_review_intent(self, issue_id: str, run_id: str) -> None:
-        """Handle `$skip-review`: stop the review monitor and dispatch merge directly.
-
-        This bypasses the Codex review verdict and is useful when the operator
-        trusts the PR as-is. Valid whenever a review monitor is active for the
-        issue — even if a concurrent review_fix run is the active dispatch run.
-        """
-        # A review_fix run may be active at the same time as the review monitor.
-        # run_id may point to the fix run, not the monitor. Always look up the
-        # monitor run ID directly so skip-review works regardless.
-        monitor_run_id = self._review_poll_issue_ids.get(issue_id)
-        if monitor_run_id is None or monitor_run_id not in self._review_poll_run_ids:
-            try:
-                tracker = await self._tracker_for_issue_id(issue_id)
-                await tracker.post_comment(
-                    issue_id,
-                    truncate_body(
-                        command_rejected(
-                            "$skip-review",
-                            "no active review monitor — cannot skip",
-                        )
-                    ),
-                )
-            except LinearError as e:
-                log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
-            return
-
-        tracker_ctx = await self._tracker_context_for_issue(issue_id)
-        issue_tracker = self.tracker(tracker_ctx)
-        try:
-            issue = await issue_tracker.lookup_issue(issue_id)
-        except LinearError as e:
-            log.warning("could not look up %s for skip-review: %s", issue_id, e)
-            return
-
-        state = await db.review_state.get(self._conn, issue_id)
-        if state.pr_number is None:
-            try:
-                await issue_tracker.post_comment(
-                    issue_id,
-                    truncate_body(
-                        command_rejected("$skip-review", "no PR found for this issue")
-                    ),
-                )
-            except LinearError as e:
-                log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
-            return
-
-        binding = self._binding_for_review(issue, state, tracker_ctx=tracker_ctx)
-        if binding is None:
-            log.warning("no binding for skip-review on %s", issue.identifier)
-            return
-        tracker = self.tracker(binding)
-
-        # A review_fix run might have been dispatched concurrently (or just
-        # dispatched by the monitor task before it noticed the DB change).
-        # Kill it before completing the monitor; if the process cannot be
-        # stopped, leave Review active and do not race Merge against it.
-        fix_run_id = self._dispatch_run_ids.get(issue_id)
-        if fix_run_id is not None and fix_run_id != monitor_run_id:
-            log.info(
-                "skip-review: killing concurrent review_fix run %s for %s",
-                fix_run_id,
-                issue.identifier,
-            )
-            try:
-                await self._runner.kill(fix_run_id)
-            except Exception:  # noqa: BLE001
-                log.exception("skip-review: could not kill fix run %s", fix_run_id)
-                try:
-                    await tracker.post_comment(
-                        issue_id,
-                        truncate_body(
-                            command_rejected(
-                                "$skip-review",
-                                "could not stop active review fix-run",
-                            )
-                        ),
-                    )
-                except LinearError as e:
-                    log.warning(
-                        "could not post skip-review rejection for %s: %s",
-                        issue.identifier,
-                        e,
-                    )
-                return
-
-        # Durably record the bypass *before* completing the monitor, so a
-        # restart in the window before the merge run is created cannot let the
-        # review-monitor resurrection re-open the feedback the operator skipped.
-        await db.issue_prs.mark_review_bypassed(
-            self._conn,
-            issue_id=issue_id,
-            github_repo=binding.github_repo,
-            pr_number=state.pr_number,
-        )
-        # Mark the review run completed and cancel its asyncio task immediately so
-        # it cannot dispatch any more fix runs mid-iteration.
-        now = self._now().isoformat()
-        await db.runs.update_status(self._conn, monitor_run_id, "completed", ended_at=now)
-        monitor_task = self._review_poll_run_tasks.pop(monitor_run_id, None)
-        if monitor_task is not None and not monitor_task.done():
-            monitor_task.cancel()
-        self._review_poll_run_ids.discard(monitor_run_id)
-        await self._clear_review_rearm_retry(monitor_run_id)
-        if self._review_poll_issue_ids.get(issue_id) == monitor_run_id:
-            self._review_poll_issue_ids.pop(issue_id, None)
-
-        if fix_run_id is not None and fix_run_id != monitor_run_id:
-            await db.runs.update_status(
-                self._conn,
-                fix_run_id,
-                "interrupted",
-                ended_at=now,
-                kind="cancelled",
-                detail="$approve interrupted active review fix-run for merge",
-            )
-            self._dispatch_run_ids.pop(issue_id, None)
-            self._active_run_ids.discard(fix_run_id)
-
-        # Dispatch merge directly, bypassing the review verdict check.
-        self._schedule_merge(
-            binding=binding,
-            issue=issue,
-            pr_number=state.pr_number,
-            pr_url=state.pr_url,
-            skip_review=True,
-        )
-        log.info(
-            "skip-review: advancing %s (PR #%d) directly to merge",
-            issue.identifier,
-            state.pr_number,
-        )
-
-        v = CommentVars(
-            stage="review",
-            repo=binding.github_repo,
-            issue=state.pr_number,
-            pr_url=state.pr_url,
-            run_id=monitor_run_id,
-            next_stage="merge",
-        )
-        try:
-            await tracker.post_comment(issue_id, truncate_body(skip_review_forced(v)))
-        except LinearError as e:
-            log.warning("could not post skip-review comment for %s: %s", issue.identifier, e)
-
     async def _handle_deliver_failed_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -1712,4 +1318,3 @@ class _SlashCommandsMixin(_OrchestratorBase):
         finally:
             if ctx.retry_workspace_acquired:
                 self._workspace.release(ctx.binding, ctx.issue)
-
