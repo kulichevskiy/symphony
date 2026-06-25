@@ -166,15 +166,12 @@ _SLASH_METHODS = [
     "_slash_text",
     "_post_command_rejected",
     "_handle_parked_manual_merge_slash_intent",
-    "_handle_active_review_retry_intent",
     "_handle_implement_failed_slash_intent",
     "_handle_implement_blocked_slash_intent",
     "_handle_acceptance_blocked_slash_intent",
     "_handle_budget_exceeded_slash_intent",
-    "_handle_review_failed_slash_intent",
     "_handle_merge_needs_approval_slash_intent",
     "_handle_acceptance_rejected_slash_intent",
-    "_handle_skip_review_intent",
     "_handle_deliver_failed_slash_intent",
 ]
 
@@ -189,6 +186,8 @@ _SLASH_NAMES = [
 # Review-monitoring methods that must live on `_ReviewMixin` (SYM-146).
 _REVIEW_METHODS = [
     "_handle_active_review_retry_intent",
+    "_handle_review_failed_slash_intent",
+    "_handle_skip_review_intent",
     "_stop_review_monitor",
     "_binding_for_review_issue_id",
     "_poll_review_runs",

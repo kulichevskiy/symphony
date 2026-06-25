@@ -24,10 +24,11 @@ import logging
 import re
 import uuid
 from collections.abc import (
+    AsyncIterator,
     Awaitable,
     Callable,
 )
-from contextlib import AbstractAsyncContextManager
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -132,6 +133,7 @@ from ._helpers import (
     _pr_url_for_state,
     _sum_usage,
 )
+from ._slash_commands import SlashHandlerFailure as SlashHandlerFailure
 
 log = logging.getLogger(__name__)
 
@@ -144,24 +146,6 @@ REVIEW_RESURRECT_COOLDOWN_SECS = 120
 
 
 CODEX_NO_ISSUES_MARKER = "any major issues"
-
-
-class SlashHandlerFailure(RuntimeError):
-    """Raised from a `_handle_*_slash_intent` when a critical Linear/GitHub
-    call fails mid-handler (e.g. `move_issue` cannot reach the target state).
-
-    The outer `_handle_unseen_slash_comment` catches this, posts a
-    `command_rejected` Linear comment with `reason`, and intentionally does
-    NOT mark the comment as seen so the next poll tick can retry. This
-    prevents the silent-drop family (SYM-32, #59, #104) where a slash command
-    is read off Linear, advances the cursor, but never triggers the
-    underlying state transition.
-    """
-
-    def __init__(self, slash_text: str, reason: str) -> None:
-        super().__init__(reason)
-        self.slash_text = slash_text
-        self.reason = reason
 
 
 async def _add_run_usage(
@@ -593,14 +577,15 @@ class _ReviewMixin(_OrchestratorBase):
         ) -> RepoBinding | None:
             ...
 
-        def _review_fix_dispatch_slot(
+        @asynccontextmanager
+        async def _review_fix_dispatch_slot(
             self,
             binding: RepoBinding,
             issue: LinearIssue,
             *,
             dispatch_capacity_held: bool = False,
-        ) -> AbstractAsyncContextManager[None]:
-            ...
+        ) -> AsyncIterator[None]:
+            yield
 
         async def _run_fix_agent(
             self,
