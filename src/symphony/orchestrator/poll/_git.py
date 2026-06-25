@@ -179,15 +179,34 @@ async def _git_conflicted_files(workspace_path: Path) -> list[str]:
     return [p for p in stdout.decode().splitlines() if p]
 
 
+async def _git_tree_is_clean(workspace_path: Path) -> bool:
+    """True if the working tree has no staged, unstaged, or untracked changes."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "status", "--porcelain",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    return proc.returncode == 0 and not stdout.strip()
+
+
 async def _git_add_and_continue_rebase(
     workspace_path: Path, files: list[str]
 ) -> bool:
     """Stage *files* and run ``git rebase --continue``.
 
-    Returns ``True`` when the rebase completed. Returns ``False`` when Git
-    stopped again, which may be a later conflicting commit in a multi-commit
-    rebase.
+    Returns ``True`` when the rebase completed, or when no rebase is in
+    progress and the tree is clean (already-resolved — treat as benign no-op).
+    Returns ``False`` when Git stopped again, which may be a later conflicting
+    commit in a multi-commit rebase.
     """
+    # Fast-path: if no rebase is in progress and the tree is clean, the rebase
+    # was already completed (SYM-148). Return success before staging stale paths.
+    if not await _rebase_in_progress(workspace_path):
+        if await _git_tree_is_clean(workspace_path):
+            return True
     if files:
         add_proc = await asyncio.create_subprocess_exec(
             "git", "add", "--", *files,
@@ -212,7 +231,40 @@ async def _git_add_and_continue_rebase(
         env=env,
     )
     await cont_proc.communicate()
-    return cont_proc.returncode == 0
+    if cont_proc.returncode == 0:
+        return True
+    # A non-zero exit may still be benign: the rebase completed between our
+    # pre-check and this call (SYM-148). Require both no rebase in progress
+    # AND a fully clean tree — not just absence of unmerged paths — to avoid
+    # masking genuine failures with staged-but-non-conflict changes.
+    if not await _rebase_in_progress(workspace_path):
+        if await _git_tree_is_clean(workspace_path):
+            return True
+    return False
+
+
+async def _rebase_in_progress(workspace_path: Path) -> bool:
+    """True if a rebase is in progress in *workspace_path*.
+
+    Resolves the real git dir via ``git rev-parse --git-path`` so it works for
+    worktrees (where ``.git`` is a file, not a directory) as well as plain
+    clones, then checks for the ``rebase-merge`` / ``rebase-apply`` state dirs.
+    """
+    for name in ("rebase-merge", "rebase-apply"):
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--git-path", name,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            continue
+        rel = stdout.decode(errors="replace").strip()
+        if rel and (workspace_path / rel).exists():
+            return True
+    return False
 
 
 async def _workspace_head_sha(workspace_path: Path) -> str:
