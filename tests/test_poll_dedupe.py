@@ -103,7 +103,12 @@ def _advancing_head(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _head(workspace_path: object) -> str:
         return f"sha-{next(counter)}"
 
+    # SYM-150: the implement completion gate reads `_workspace_head_sha` from
+    # `poll._lifecycle`; other stages still read it from `poll`. Patch both.
     monkeypatch.setattr("symphony.orchestrator.poll._workspace_head_sha", _head)
+    monkeypatch.setattr(
+        "symphony.orchestrator.poll._lifecycle._workspace_head_sha", _head
+    )
 
 
 def _make_orch(

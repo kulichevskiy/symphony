@@ -561,14 +561,16 @@ async def test_verify_session_crash_fails_closed(tmp_path: Path) -> None:
         async def _exploding_session(**_: object) -> VerifyResult:
             raise RuntimeError("verify machinery blew up")
 
-        import symphony.orchestrator.poll as poll_mod
+        # SYM-150: the verify phase moved to `poll._lifecycle`, which is where
+        # `run_verify_session` is now looked up.
+        from symphony.orchestrator.poll import _lifecycle as lifecycle_mod
 
-        original = poll_mod.run_verify_session
-        poll_mod.run_verify_session = _exploding_session  # type: ignore[assignment]
+        original = lifecycle_mod.run_verify_session
+        lifecycle_mod.run_verify_session = _exploding_session  # type: ignore[assignment]
         try:
             await _scan_and_wait(orch, binding)
         finally:
-            poll_mod.run_verify_session = original  # type: ignore[assignment]
+            lifecycle_mod.run_verify_session = original  # type: ignore[assignment]
 
         push_fn.assert_not_awaited()
         gh.ensure_pr.assert_not_awaited()

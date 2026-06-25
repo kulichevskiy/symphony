@@ -1464,13 +1464,15 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
     should return `None`. With `remote_review: false` (local-only mode), that
     is an infrastructure failure: no PR is opened and the issue is blocked.
     """
-    import symphony.orchestrator.poll as poll_mod
+    # SYM-150: the local-review phase moved to `poll._lifecycle`, which is where
+    # `run_local_review_session` is now looked up.
+    from symphony.orchestrator.poll import _lifecycle as lifecycle_mod
 
     async def _exploding_session(**_: object) -> None:
         raise RuntimeError("local-review session blew up")
 
     monkeypatch.setattr(
-        poll_mod, "run_local_review_session", _exploding_session
+        lifecycle_mod, "run_local_review_session", _exploding_session
     )
 
     conn = await db.connect(tmp_path / "s.sqlite")

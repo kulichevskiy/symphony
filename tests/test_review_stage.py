@@ -289,6 +289,10 @@ def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(module, "_workspace_head_sha", fake_workspace_head_sha)
         monkeypatch.setattr(module, "_workspace_ref_sha", fake_workspace_ref_sha)
         monkeypatch.setattr(module, "_git_fetch_branch", fake_git_fetch_branch)
+    # SYM-150: the implement/deliver stages read these from `poll._lifecycle`.
+    monkeypatch.setattr(
+        poll_module._lifecycle, "_workspace_head_sha", fake_workspace_head_sha
+    )
 
 
 def test_github_commit_url_uses_configured_host() -> None:
@@ -328,6 +332,8 @@ async def test_implement_success_posts_codex_review_and_records_review_handoff(
         return next(_head_shas, "advanced-sha")
 
     monkeypatch.setattr(poll_module, "_workspace_head_sha", _advancing_head)
+    # SYM-150: lifecycle methods read _workspace_head_sha from _lifecycle's namespace.
+    monkeypatch.setattr(poll_module._lifecycle, "_workspace_head_sha", _advancing_head)
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(

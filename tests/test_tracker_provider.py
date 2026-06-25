@@ -537,7 +537,9 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
         # `_run_agent` is mocked, so simulate the agent advancing HEAD so the
         # completion gate classifies the run as completed.
         with patch(
-            "symphony.orchestrator.poll._workspace_head_sha",
+            # SYM-150: the completion gate reads `_workspace_head_sha` from
+            # `poll._lifecycle`, where `_dispatch_one` now lives.
+            "symphony.orchestrator.poll._lifecycle._workspace_head_sha",
             AsyncMock(side_effect=["base-sha", "advanced-sha"]),
         ):
             run_id = await orch._dispatch_one(secondary_binding, issue)  # noqa: SLF001
