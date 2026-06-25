@@ -2226,7 +2226,7 @@ class _OrchestratorBase:
         issue: LinearIssue,
         ignored_stages: tuple[str, ...],
         on_acquire_failure: Callable[[Exception], Awaitable[None]],
-        body: Callable[[Path, str], Awaitable[bool | None]],
+        body: Callable[[Path, str, Callable[[], None]], Awaitable[bool | None]],
         setup: Callable[[Path], Awaitable[bool]] | None = None,
         after_dedup: Callable[[str], Awaitable[None]] | None = None,
         on_dedup_loss: Callable[[], Awaitable[bool | None]] | None = None,
@@ -2248,8 +2248,11 @@ class _OrchestratorBase:
           abort (the helper releases the workspace and returns ``False``).
         * ``after_dedup`` — fire-and-forget work once the run row is claimed
           (e.g. an ``on_started`` callback or a "starting" comment).
-        * ``body`` — the actual agent run plus post-run validation/push; its
-          return value is the dispatch result.
+        * ``body(workspace_path, fix_run_id, drop_dispatch_id)`` — the actual
+          agent run plus post-run validation/push. ``drop_dispatch_id`` must be
+          called as soon as the runner subprocess exits (before any post-run
+          work) so the dispatch slot is freed at the right time. The helper's
+          ``finally`` block calls it again as a safety net (idempotent).
         * ``on_dedup_loss`` — value to return when another live ``review_fix``
           already exists (defaults to ``False``).
         """
@@ -2293,11 +2296,20 @@ class _OrchestratorBase:
             if after_dedup is not None:
                 await after_dedup(fix_run_id)
 
-            try:
-                return await body(workspace_path, fix_run_id)
-            finally:
+            _id_dropped = False
+
+            def _drop_dispatch_id() -> None:
+                nonlocal _id_dropped
+                if _id_dropped:
+                    return
+                _id_dropped = True
                 if self._dispatch_run_ids.get(issue.id) == fix_run_id:
                     self._dispatch_run_ids.pop(issue.id, None)
+
+            try:
+                return await body(workspace_path, fix_run_id, _drop_dispatch_id)
+            finally:
+                _drop_dispatch_id()  # no-op if body already called it
                 self._workspace.release(binding, issue)
 
     async def _run_dirty_tree_fix_turn(

@@ -829,7 +829,11 @@ class _MergeMixin(_OrchestratorBase):
                 return False
             return True
 
-        async def body(workspace_path: Path, fix_run_id: str) -> bool | None:
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool | None:
             prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
             try:
                 (
@@ -869,6 +873,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
                 return False
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -1171,7 +1176,11 @@ class _MergeMixin(_OrchestratorBase):
                     fix_run_id,
                 )
 
-        async def body(workspace_path: Path, fix_run_id: str) -> bool:
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
             prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
             prompt = merge_conflict_rebase_fix_prompt(
                 issue_title=issue.title,
@@ -1225,6 +1234,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
                 return False
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(

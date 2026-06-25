@@ -1736,7 +1736,11 @@ class _ReviewMixin(_OrchestratorBase):
                 return False
             return True
 
-        async def body(workspace_path: Path, fix_run_id: str) -> bool:
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
                 usage_delta, final_kind, final_returncode = await self._run_fix_agent(
@@ -1769,6 +1773,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -2171,7 +2176,11 @@ class _ReviewMixin(_OrchestratorBase):
                 return False
             return True
 
-        async def body(workspace_path: Path, fix_run_id: str) -> bool:
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
             nonlocal state
             # Post the "starting" comment only after dedup succeeds so we do
             # not announce a fix-run that will not execute (SYM-152).
@@ -2225,6 +2234,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -2439,7 +2449,11 @@ class _ReviewMixin(_OrchestratorBase):
                     e,
                 )
 
-        async def body(workspace_path: Path, fix_run_id: str) -> bool:
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
             nonlocal state
             # Step 2: orchestrator attempts the rebase.
             upstream = f"origin/{base_branch or 'main'}"
@@ -2670,6 +2684,7 @@ class _ReviewMixin(_OrchestratorBase):
                         )
                         return False
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
 
             pushed_sha = await self._validate_review_fix_advanced(
