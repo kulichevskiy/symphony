@@ -2539,7 +2539,14 @@ class _ReviewMixin(_OrchestratorBase):
             )
             if not inserted:
                 # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Release the workspace and bail without clobbering dispatch ids.
+                # Abort any in-progress rebase before releasing the workspace so
+                # the next user of the workspace doesn't inherit a conflicted state.
+                if not rebase_clean:
+                    await _abort_rebase_safely(
+                        workspace_path,
+                        issue_identifier=issue.identifier,
+                        reason="dedup loser; aborting in-progress rebase",
+                    )
                 self._workspace.release(binding, issue)
                 return False
             self._dispatch_run_ids[issue.id] = fix_run_id
