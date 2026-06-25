@@ -180,9 +180,9 @@ async def _git_conflicted_files(workspace_path: Path) -> list[str]:
 
 
 async def _git_tree_is_clean(workspace_path: Path) -> bool:
-    """True if the working tree has no staged or unstaged changes to tracked files."""
+    """True if the working tree has no staged, unstaged, or untracked changes."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "status", "--porcelain", "--untracked-files=no",
+        "git", "status", "--porcelain",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,

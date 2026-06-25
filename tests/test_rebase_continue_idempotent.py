@@ -11,7 +11,10 @@ import asyncio
 import subprocess
 from pathlib import Path
 
-from symphony.orchestrator.poll._git import _git_add_and_continue_rebase
+from symphony.orchestrator.poll._git import (
+    _git_add_and_continue_rebase,
+    _git_tree_is_clean,
+)
 
 
 def _git(cwd: Path, *args: str) -> None:
@@ -111,6 +114,31 @@ def test_real_unresolved_conflict_returns_failure(tmp_path: Path) -> None:
     # Continue without resolving the conflict → still failing.
     result = asyncio.run(_git_add_and_continue_rebase(repo, []))
     assert result is False
+
+
+def test_tree_is_clean_false_when_untracked_files_present(tmp_path: Path) -> None:
+    """Untracked files make the working tree not clean."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "f.txt").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+
+    (repo / "untracked.txt").write_text("not tracked\n")
+    result = asyncio.run(_git_tree_is_clean(repo))
+    assert result is False
+
+
+def test_tree_is_clean_true_when_no_untracked_files(tmp_path: Path) -> None:
+    """Clean committed repo with no untracked files is clean."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    (repo / "f.txt").write_text("base\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+
+    result = asyncio.run(_git_tree_is_clean(repo))
+    assert result is True
 
 
 def test_already_resolved_with_stale_files_returns_success(tmp_path: Path) -> None:
