@@ -2270,46 +2270,46 @@ class _OrchestratorBase:
                 await on_acquire_failure(e)
                 return False
 
-            if setup is not None and not await setup(workspace_path):
-                self._workspace.release(binding, issue)
-                return False
-
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stages=ignored_stages,
-            )
-            if not inserted:
-                # Lost the race: another live review_fix already exists (SYM-152).
-                self._workspace.release(binding, issue)
-                if on_dedup_loss is not None:
-                    return await on_dedup_loss()
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
-            if after_dedup is not None:
-                await after_dedup(fix_run_id)
-
-            _id_dropped = False
-
-            def _drop_dispatch_id() -> None:
-                nonlocal _id_dropped
-                if _id_dropped:
-                    return
-                _id_dropped = True
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-
             try:
-                return await body(workspace_path, fix_run_id, _drop_dispatch_id)
+                if setup is not None and not await setup(workspace_path):
+                    return False
+
+                fix_run_id = str(uuid.uuid4())
+                inserted = await db.runs.create_if_no_active(
+                    self._conn,
+                    id=fix_run_id,
+                    issue_id=issue.id,
+                    stage="review_fix",
+                    status="running",
+                    pid=None,
+                    started_at=self._now().isoformat(),
+                    ignored_stages=ignored_stages,
+                )
+                if not inserted:
+                    # Lost the race: another live review_fix already exists (SYM-152).
+                    if on_dedup_loss is not None:
+                        return await on_dedup_loss()
+                    return False
+                self._dispatch_run_ids[issue.id] = fix_run_id
+
+                if after_dedup is not None:
+                    await after_dedup(fix_run_id)
+
+                _id_dropped = False
+
+                def _drop_dispatch_id() -> None:
+                    nonlocal _id_dropped
+                    if _id_dropped:
+                        return
+                    _id_dropped = True
+                    if self._dispatch_run_ids.get(issue.id) == fix_run_id:
+                        self._dispatch_run_ids.pop(issue.id, None)
+
+                try:
+                    return await body(workspace_path, fix_run_id, _drop_dispatch_id)
+                finally:
+                    _drop_dispatch_id()  # no-op if body already called it
             finally:
-                _drop_dispatch_id()  # no-op if body already called it
                 self._workspace.release(binding, issue)
 
     async def _run_dirty_tree_fix_turn(
