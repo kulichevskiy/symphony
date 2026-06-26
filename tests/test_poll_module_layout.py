@@ -302,6 +302,14 @@ _MERGE_METHODS = [
     "_refresh_issue_for_acceptance_merge_handoff",
     "_open_merge_wait_for_human_approval_label",
     "_park_pr_for_manual_merge",
+    # SYM-159: _merge_approved_pr decomposed into named sub-steps.
+    "_acquire_merge_workspace",
+    "_sync_merge_workspace",
+    "_run_merge_agent_step",
+    "_push_merge_branch",
+    "_verify_premerge_head",
+    "_execute_pr_merge",
+    "_finalize_merge",
     "_poll_merge_candidates",
     # SYM-158: _poll_merge_candidates decomposed into named sub-steps.
     "_process_merge_candidate",
@@ -371,6 +379,10 @@ _ACCEPTANCE_METHODS = [
     "_post_acceptance_criteria_comment",
     "_upload_acceptance_screenshots",
     "_run_acceptance_stage",
+    # SYM-159: _run_acceptance_stage decomposed into named sub-steps.
+    "_begin_acceptance_run",
+    "_compute_acceptance_verdict",
+    "_finalize_acceptance_verdict",
     "_dispatch_acceptance_fix_run",
     "_move_issue_to_acceptance_state",
     "_run_acceptance_fix_agent",
@@ -393,6 +405,12 @@ _ACCEPTANCE_NAMES = [
 # implement / deliver / verify / local_review / publish.
 _LIFECYCLE_METHODS = [
     "_dispatch_one",
+    # SYM-159: _dispatch_one decomposed into named sub-steps.
+    "_resolve_dispatch_states",
+    "_announce_dispatch",
+    "_acquire_implement_workspace",
+    "_plan_implement_dispatch",
+    "_run_implement_or_resume",
     "_previous_implement_terminal_kind",
     "_resolve_base_branch",
     "_run_implement_phase",

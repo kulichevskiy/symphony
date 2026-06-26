@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -274,12 +275,126 @@ class _LifecycleMixin(_OrchestratorBase):
             return None
         self._dispatch_run_ids[issue_id] = run_id
 
+        in_progress_id = await self._resolve_dispatch_states(
+            binding=binding,
+            issue=issue,
+            run_id=run_id,
+        )
+        if in_progress_id is None:
+            return run_id
+
+        log.info(
+            "dispatching %s (%s) -> %s [run_id=%s]",
+            issue.identifier,
+            issue.title,
+            binding.github_repo,
+            run_id,
+        )
+
+        # 1-2. Announce the run (🚀 comment) and move the issue to In Progress.
+        if await self._announce_dispatch(
+            binding=binding,
+            issue=issue,
+            run_id=run_id,
+            in_progress_id=in_progress_id,
+        ):
+            return run_id
+
+        # 3. Acquire a per-issue workspace clone.
+        workspace_path = await self._acquire_implement_workspace(
+            binding=binding,
+            issue=issue,
+            issue_id=issue_id,
+            run_id=run_id,
+        )
+        if workspace_path is None:
+            return run_id
+
+        workspace_released = False
+
+        def release_workspace() -> None:
+            nonlocal workspace_released
+            if not workspace_released:
+                self._workspace.release(binding, issue)
+                workspace_released = True
+
+        # 3.5. Resolve the delivery base and the resume plan; releasing the
+        # workspace on a setup failure mirrors the implement path.
+        release_on_setup_failure = False
+        try:
+            base_branch, short_circuit, resume_after_local_review = (
+                await self._plan_implement_dispatch(
+                    binding=binding,
+                    issue=issue,
+                    issue_id=issue_id,
+                    run_id=run_id,
+                    workspace_path=workspace_path,
+                )
+            )
+        except Exception as e:  # noqa: BLE001 — surface as failed run
+            release_on_setup_failure = True
+            log.exception("implement dispatch setup failed for %s", issue.identifier)
+            await self._fail_run_and_reset_issue(
+                run_id,
+                f"implement dispatch setup failed: {e}",
+                issue=issue,
+                storage_issue_id=issue_id,
+                rollback_state_id=issue.state_id,
+                binding=binding,
+                exc=e,
+            )
+            return run_id
+        finally:
+            if release_on_setup_failure:
+                release_workspace()
+
+        # 4. Run the implementer (or resume straight to the pre-push gates when
+        # the branch is already ahead), then publish.
+        plan = await self._run_implement_or_resume(
+            binding=binding,
+            issue=issue,
+            issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            base_branch=base_branch,
+            short_circuit=short_circuit,
+            resume_after_local_review=resume_after_local_review,
+            release_workspace=release_workspace,
+        )
+        if plan is None:
+            # A gate or the agent step halted the run; state is already recorded.
+            return run_id
+        cumulative_usage, local_review_result = plan
+
+        return await self._publish_stage(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue_id,
+            run_id=run_id,
+            workspace_path=workspace_path,
+            base_branch=base_branch,
+            cumulative_usage=cumulative_usage,
+            local_review_result=local_review_result,
+        )
+
+    async def _resolve_dispatch_states(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+    ) -> str | None:
+        """Load the team states and resolve the In Progress id.
+
+        Fails the run when states cannot be loaded or a required state is
+        missing. Returns the In Progress state id, or None when the run halted.
+        """
         try:
             states = await self._states_for_binding(binding)
         except LinearError as e:
             log.warning("could not load states for %s: %s", binding.linear_team_key, e)
             await self._fail_run(run_id, f"team_states failed: {e}")
-            return run_id
+            return None
 
         ready_id = states.get(binding.linear_states.ready)
         in_progress_id = states.get(binding.linear_states.in_progress)
@@ -305,19 +420,23 @@ class _LifecycleMixin(_OrchestratorBase):
                 run_id,
                 f"missing Linear state: {missing_state}",
             )
-            return run_id
+            return None
         assert ready_id is not None
         assert in_progress_id is not None
+        return in_progress_id
 
-        log.info(
-            "dispatching %s (%s) -> %s [run_id=%s]",
-            issue.identifier,
-            issue.title,
-            binding.github_repo,
-            run_id,
-        )
+    async def _announce_dispatch(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        in_progress_id: str,
+    ) -> bool:
+        """Post the 🚀 starting comment and move the issue to In Progress.
 
-        # 1. 🚀 "starting" Linear comment.
+        Returns True if the run halted (caller returns the run id).
+        """
         tracker = self.tracker(binding)
         starting = run_started(
             CommentVars(
@@ -341,9 +460,8 @@ class _LifecycleMixin(_OrchestratorBase):
                     reason=f"post_comment failed: {e}",
                 ),
             )
-            return run_id
+            return True
 
-        # 2. Move the Linear issue to In Progress.
         try:
             await tracker.move_issue(issue.id, in_progress_id)
         except LinearError as e:
@@ -354,12 +472,22 @@ class _LifecycleMixin(_OrchestratorBase):
                 e,
             )
             await self._fail_run(run_id, f"move_issue failed: {e}")
-            return run_id
+            return True
         self._runs_moved_to_in_progress.add(run_id)
+        return False
 
-        # 3. Acquire a per-issue workspace clone.
+    async def _acquire_implement_workspace(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        issue_id: str,
+        run_id: str,
+    ) -> Path | None:
+        """Acquire the per-issue workspace clone; on failure fail the run, reset
+        the issue, and return None so the caller halts."""
         try:
-            workspace_path = await self._workspace.acquire(binding, issue)
+            return await self._workspace.acquire(binding, issue)
         except Exception as e:  # noqa: BLE001 — surface as failed run
             log.exception("workspace acquire failed for %s", issue.identifier)
             await self._fail_run_and_reset_issue(
@@ -371,87 +499,70 @@ class _LifecycleMixin(_OrchestratorBase):
                 binding=binding,
                 exc=e,
             )
-            return run_id
+            return None
 
-        workspace_released = False
+    async def _plan_implement_dispatch(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+    ) -> tuple[str | None, bool, bool]:
+        """Resolve the delivery base and the resume plan.
 
-        def release_workspace() -> None:
-            nonlocal workspace_released
-            if not workspace_released:
-                self._workspace.release(binding, issue)
-                workspace_released = True
+        Returns ``(base_branch, short_circuit, resume_after_local_review)``.
+        Raises on any failure so the caller can fail-and-reset the run.
+        """
+        base_branch = await self._resolve_base_branch(binding)
 
-        # 3.5. Resolve the delivery base once; both the branch-already-ahead
-        # short-circuit and ensure_pr use it.
-        release_on_setup_failure = False
-        try:
-            base_branch = await self._resolve_base_branch(binding)
-
-            # Branch-already-ahead short-circuit: when HEAD already contains
-            # commits over the delivery base, skip the implementer and its
-            # completion gate and go straight to the agent-free publish path.
-            # The pre-push gates (local-review / verify / dirty-tree) still
-            # run against the reused workspace so the resume records the
-            # verify SHA, guards the dirty tree, and feeds publish a real
-            # local-review verdict — not the `None` its handoff would mis-read
-            # as "did not approve". A pending operator `$retry` handoff
-            # (`_implement_handoffs`) likewise forces the agent path so the
-            # handoff is consumed (poll.py:_run_agent) instead of silently
-            # dropped. Previous non-publish implement failures are unsafe to
-            # publish blindly because the agent may have left partial commits.
-            pending_handoff = self._implement_handoffs.get(issue_id) is not None
-            previous_terminal_kind = await self._previous_implement_terminal_kind(
-                issue_id=issue_id,
-                current_run_id=run_id,
-            )
-            # Delivery failures (publish/deliver) passed the completion gate
-            # AND local review, so a resume skips the agent and re-runs only
-            # the agent-free publish path.
-            delivery_resume_kinds = {
-                db.runs.PUBLISH_FAILED_KIND,
-                db.operator_waits.KIND_DELIVER_FAILED,
-            }
-            # A local-review *infra* failure (no verdict / the session raised)
-            # also passed the completion gate, so the commits are complete —
-            # but local review never finished, so the resume re-runs the gates
-            # *with fixes enabled* (a re-review may now request changes). Only
-            # the explicit kinds qualify: they are stamped solely for
-            # reviewer-never-verdicted failures, never for fix-run failures
-            # (which may have left partial commits and must re-run the agent).
-            # LOCAL_REVIEW_TRANSIENT_RETRY_KIND is the backoff variant: the
-            # implement succeeded and the local-review phase got a transient 500,
-            # so the re-dispatch must also skip the implementer and re-run only
-            # the pre-push gates (with fixes allowed) rather than treating it
-            # like a plain implement failure that needs a full re-run.
-            resume_after_local_review = previous_terminal_kind in {
-                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
-                db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
-            }
-            previous_requires_agent = (
-                previous_terminal_kind is not None
-                and previous_terminal_kind not in delivery_resume_kinds
-                and not resume_after_local_review
-            )
-            branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
-        except Exception as e:  # noqa: BLE001 — surface as failed run
-            release_on_setup_failure = True
-            log.exception("implement dispatch setup failed for %s", issue.identifier)
-            await self._fail_run_and_reset_issue(
-                run_id,
-                f"implement dispatch setup failed: {e}",
-                issue=issue,
-                storage_issue_id=issue_id,
-                rollback_state_id=issue.state_id,
-                binding=binding,
-                exc=e,
-            )
-            return run_id
-        finally:
-            if release_on_setup_failure:
-                release_workspace()
-
-        cumulative_usage: UsageDelta
-        local_review_result: LoopResult | None
+        # Branch-already-ahead short-circuit: when HEAD already contains
+        # commits over the delivery base, skip the implementer and its
+        # completion gate and go straight to the agent-free publish path.
+        # The pre-push gates (local-review / verify / dirty-tree) still
+        # run against the reused workspace so the resume records the
+        # verify SHA, guards the dirty tree, and feeds publish a real
+        # local-review verdict — not the `None` its handoff would mis-read
+        # as "did not approve". A pending operator `$retry` handoff
+        # (`_implement_handoffs`) likewise forces the agent path so the
+        # handoff is consumed (poll.py:_run_agent) instead of silently
+        # dropped. Previous non-publish implement failures are unsafe to
+        # publish blindly because the agent may have left partial commits.
+        pending_handoff = self._implement_handoffs.get(issue_id) is not None
+        previous_terminal_kind = await self._previous_implement_terminal_kind(
+            issue_id=issue_id,
+            current_run_id=run_id,
+        )
+        # Delivery failures (publish/deliver) passed the completion gate
+        # AND local review, so a resume skips the agent and re-runs only
+        # the agent-free publish path.
+        delivery_resume_kinds = {
+            db.runs.PUBLISH_FAILED_KIND,
+            db.operator_waits.KIND_DELIVER_FAILED,
+        }
+        # A local-review *infra* failure (no verdict / the session raised)
+        # also passed the completion gate, so the commits are complete —
+        # but local review never finished, so the resume re-runs the gates
+        # *with fixes enabled* (a re-review may now request changes). Only
+        # the explicit kinds qualify: they are stamped solely for
+        # reviewer-never-verdicted failures, never for fix-run failures
+        # (which may have left partial commits and must re-run the agent).
+        # LOCAL_REVIEW_TRANSIENT_RETRY_KIND is the backoff variant: the
+        # implement succeeded and the local-review phase got a transient 500,
+        # so the re-dispatch must also skip the implementer and re-run only
+        # the pre-push gates (with fixes allowed) rather than treating it
+        # like a plain implement failure that needs a full re-run.
+        resume_after_local_review = previous_terminal_kind in {
+            db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND,
+            db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+        }
+        previous_requires_agent = (
+            previous_terminal_kind is not None
+            and previous_terminal_kind not in delivery_resume_kinds
+            and not resume_after_local_review
+        )
+        branch_ahead = await _branch_ahead_of_base(workspace_path, base_branch)
         # A prior delivery-failure marker proves only that an earlier checkout
         # reached delivery. The current checkout still needs its own proof of
         # deliverable commits before publish can be resumed; when the base is
@@ -462,6 +573,29 @@ class _LifecycleMixin(_OrchestratorBase):
             and not pending_handoff
             and not previous_requires_agent
         )
+        return base_branch, short_circuit, resume_after_local_review
+
+    async def _run_implement_or_resume(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        issue_id: str,
+        run_id: str,
+        workspace_path: Path,
+        base_branch: str | None,
+        short_circuit: bool,
+        resume_after_local_review: bool,
+        release_workspace: Callable[[], None],
+    ) -> tuple[UsageDelta, LoopResult | None] | None:
+        """Resume straight to the pre-push gates (branch already ahead) or run
+        the full implement phase.
+
+        Returns ``(cumulative_usage, local_review_result)``, or None when the
+        run halted (a gate or the agent step recorded the state).
+        """
+        cumulative_usage: UsageDelta
+        local_review_result: LoopResult | None
         if short_circuit:
             log.info(
                 "branch for %s already ahead of %s; skipping agent, "
@@ -503,10 +637,10 @@ class _LifecycleMixin(_OrchestratorBase):
                     binding=binding,
                     exc=e,
                 )
-                return run_id
+                return None
             if not proceed:
                 # A gate halted the run; state is already recorded.
-                return run_id
+                return None
         else:
             phase = await self._run_implement_phase(
                 binding=binding,
@@ -519,19 +653,10 @@ class _LifecycleMixin(_OrchestratorBase):
             if phase is None:
                 # The agent step halted (failed / blocked / parked); the run
                 # state is already recorded. Never reaches publish.
-                return run_id
+                return None
             cumulative_usage, local_review_result = phase
 
-        return await self._publish_stage(
-            binding=binding,
-            issue=issue,
-            storage_issue_id=issue_id,
-            run_id=run_id,
-            workspace_path=workspace_path,
-            base_branch=base_branch,
-            cumulative_usage=cumulative_usage,
-            local_review_result=local_review_result,
-        )
+        return cumulative_usage, local_review_result
 
     async def _previous_implement_terminal_kind(
         self, *, issue_id: str, current_run_id: str
