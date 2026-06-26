@@ -54,17 +54,14 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
 
     # SYM-144: the Orchestrator constructor lives on `_OrchestratorBase` in
     # `poll._base`, so these defaults resolve in that module's namespace.
-    monkeypatch.setattr(
-        "symphony.orchestrator.poll._base.LocalRunner", lambda: fake_runner
-    )
+    monkeypatch.setattr("symphony.orchestrator.poll._base.LocalRunner", lambda: fake_runner)
     monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", lambda: fake_gh)
     monkeypatch.setattr(
         "symphony.orchestrator.poll._base.Workspace",
         lambda root, clone_fn: fake_workspace,
     )
-    monkeypatch.setattr(
-        "symphony.orchestrator.poll._base._default_push", AsyncMock()
-    )
+    monkeypatch.setattr("symphony.orchestrator.poll._base._default_push", AsyncMock())
+
     # The workspace is a fake path (no git repo), so simulate the agent
     # advancing HEAD so the Implement completion gate sees commits and
     # classifies the run as completed.
@@ -75,24 +72,16 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     _fake_head_sha.calls = 0  # type: ignore[attr-defined]
     # SYM-150: the implement completion gate reads `_workspace_head_sha` from
     # `poll._lifecycle`; other stages still read it from `poll`. Patch both.
-    monkeypatch.setattr(
-        "symphony.orchestrator.poll._workspace_head_sha", _fake_head_sha
-    )
-    monkeypatch.setattr(
-        "symphony.orchestrator.poll._lifecycle._workspace_head_sha", _fake_head_sha
-    )
+    monkeypatch.setattr("symphony.orchestrator.poll._workspace_head_sha", _fake_head_sha)
+    monkeypatch.setattr("symphony.orchestrator.poll._lifecycle._workspace_head_sha", _fake_head_sha)
 
 
 def _populate(p: Path) -> None:
     async def _do() -> None:
         conn = await db.connect(p)
         try:
-            await db.issues.upsert(
-                conn, id="iss-1", identifier="ENG-1", title="t1", team_key="ENG"
-            )
-            await db.issues.upsert(
-                conn, id="iss-2", identifier="ENG-2", title="t2", team_key="ENG"
-            )
+            await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t1", team_key="ENG")
+            await db.issues.upsert(conn, id="iss-2", identifier="ENG-2", title="t2", team_key="ENG")
             await db.runs.create(
                 conn,
                 id="run-a",
@@ -187,10 +176,7 @@ def test_runs_ls_surfaces_termination_kind_for_non_success(
         "started_at",
     ]
     # Effective tokens (run-a = 162), not the former `$1.50` cost headline.
-    assert (
-        "run-a\tENG-1\timplement\tfailed\tagent_nonzero_exit\t162"
-        in result.output
-    )
+    assert "run-a\tENG-1\timplement\tfailed\tagent_nonzero_exit\t162" in result.output
     # run-b has no recorded usage → 0 effective tokens.
     assert "run-b\tENG-2\treview\tcompleted\t\t0" in result.output
     assert "$" not in result.output
@@ -276,9 +262,7 @@ def test_runs_local_review_trace_headlines_effective_tokens(
     async def _seed() -> None:
         conn = await db.connect(p)
         try:
-            await db.issues.upsert(
-                conn, id="iss-1", identifier="ENG-1", title="t1", team_key="ENG"
-            )
+            await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t1", team_key="ENG")
             await db.runs.create(
                 conn,
                 id="lr-1",
@@ -303,9 +287,7 @@ def test_runs_local_review_trace_headlines_effective_tokens(
 
     asyncio.run(_seed())
 
-    result = CliRunner().invoke(
-        main, ["runs", "local-review-trace", "ENG-1", "--db", str(p)]
-    )
+    result = CliRunner().invoke(main, ["runs", "local-review-trace", "ENG-1", "--db", str(p)])
     assert result.exit_code == 0, result.output
     out = result.output
     assert "lr-1" in out
@@ -388,9 +370,7 @@ repos:
 """
 
 
-def test_once_drains_scheduled_dispatch_before_exit(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_once_drains_scheduled_dispatch_before_exit(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
     cfg_path = tmp_path / "cfg.yaml"
@@ -475,9 +455,7 @@ def _install_fake_linear(monkeypatch, fake: _FakeLinear) -> None:  # type: ignor
     monkeypatch.setattr("symphony.cli.for_binding", _for_binding)
 
 
-def test_dispatch_creates_run_for_known_team_binding(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_creates_run_for_known_team_binding(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
     cfg_path = tmp_path / "cfg.yaml"
@@ -498,9 +476,7 @@ def test_dispatch_creates_run_for_known_team_binding(
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "ENG-42", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "ENG-42", "--config", str(cfg_path)])
     assert result.exit_code == 0, result.output
 
     async def _check() -> None:
@@ -544,9 +520,7 @@ def test_runs_ls_rejects_directory_for_db_path(tmp_path: Path) -> None:
     assert "directory" in result.output.lower()
 
 
-def test_dispatch_first_matching_binding_in_cfg_order_wins(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_first_matching_binding_in_cfg_order_wins(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Mirror the poll loop's first-come-first-serve precedence: when a
     catch-all binding is listed before a labeled one, the poll loop's
     catch-all scan would claim the issue first. The CLI must pick the same
@@ -597,18 +571,14 @@ repos:
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "ENG-200", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "ENG-200", "--config", str(cfg_path)])
     assert result.exit_code == 0, result.output
     # cfg order wins: catch-all (listed first) claims it, not the labeled binding.
     assert "org/catchall" in result.output
     assert "org/web-app" not in result.output
 
 
-def test_dispatch_picks_binding_by_issue_label(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_picks_binding_by_issue_label(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """When one Linear team is fanned out to multiple repos via `issue_label`,
     the CLI must pick the repo whose label is on the issue — selecting by
     `linear_team_key` alone routes the run to the wrong repo and posts the
@@ -634,18 +604,14 @@ def test_dispatch_picks_binding_by_issue_label(
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "ENG-100", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "ENG-100", "--config", str(cfg_path)])
     assert result.exit_code == 0, result.output
     # The success message names the repo, so it doubles as a routing assertion.
     assert "org/web-app" in result.output
     assert "org/api-svc" not in result.output
 
 
-def test_dispatch_errors_when_no_binding_label_matches(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_errors_when_no_binding_label_matches(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """If every binding for the team is label-scoped and none of the issue's
     labels match, dispatch must refuse — silently picking an arbitrary
     binding would route the run to a repo that isn't supposed to handle it.
@@ -670,9 +636,7 @@ def test_dispatch_errors_when_no_binding_label_matches(
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "ENG-101", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "ENG-101", "--config", str(cfg_path)])
     assert result.exit_code != 0, result.output
     assert "ENG-101" in result.output
 
@@ -687,9 +651,7 @@ def test_dispatch_rejects_directory_for_config_path(tmp_path: Path) -> None:
     assert "directory" in result.output.lower()
 
 
-def test_dispatch_refuses_when_issue_already_has_active_run(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_refuses_when_issue_already_has_active_run(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """`dispatch` must respect the same dedupe oracle as the poll loop;
     otherwise an operator retrying it for an issue that's already mid-run
     creates a duplicate `running` row and a duplicate "starting" comment."""
@@ -737,9 +699,7 @@ def test_dispatch_refuses_when_issue_already_has_active_run(
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "ENG-50", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "ENG-50", "--config", str(cfg_path)])
     assert result.exit_code != 0, result.output
     assert "ENG-50" in result.output
     # No new comment posted (the existing run already announced).
@@ -749,9 +709,7 @@ def test_dispatch_refuses_when_issue_already_has_active_run(
     async def _check() -> None:
         conn = await db.connect(db_path)
         try:
-            cur = await conn.execute(
-                "SELECT COUNT(*) FROM runs WHERE issue_id = ?", (issue.id,)
-            )
+            cur = await conn.execute("SELECT COUNT(*) FROM runs WHERE issue_id = ?", (issue.id,))
             (count,) = await cur.fetchone()  # type: ignore[misc]
             assert count == 1
         finally:
@@ -760,9 +718,7 @@ def test_dispatch_refuses_when_issue_already_has_active_run(
     asyncio.run(_check())
 
 
-def test_dispatch_errors_when_announce_comment_fails(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_errors_when_announce_comment_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """If the Linear announce comment raises, the run row is flipped to
     `failed` and the CLI must exit non-zero — otherwise an operator running
     `dispatch` during a Linear outage sees a green success message while no
@@ -793,9 +749,7 @@ def test_dispatch_errors_when_announce_comment_fails(
     fake = _BrokenAnnounce(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "ENG-77", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "ENG-77", "--config", str(cfg_path)])
     assert result.exit_code != 0, result.output
     # The error must be on stderr/output and identify the issue so the
     # operator knows which dispatch did not actually start.
@@ -812,9 +766,7 @@ def test_dispatch_errors_when_announce_comment_fails(
     asyncio.run(_check())
 
 
-def test_dispatch_errors_when_no_binding_matches_team_key(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_errors_when_no_binding_matches_team_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
     cfg_path = tmp_path / "cfg.yaml"
@@ -834,12 +786,11 @@ def test_dispatch_errors_when_no_binding_matches_team_key(
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(
-        main, ["dispatch", "WEB-99", "--config", str(cfg_path)]
-    )
+    result = CliRunner().invoke(main, ["dispatch", "WEB-99", "--config", str(cfg_path)])
     assert result.exit_code != 0
     # Error must name the unmatched team key so the operator can fix the config.
     assert "WEB" in result.output
+
     # And no run row should have been written.
     async def _check() -> None:
         conn = await db.connect(db_path)

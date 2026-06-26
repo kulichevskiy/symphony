@@ -25,9 +25,7 @@ def _row_to_observation(row: aiosqlite.Row) -> ExternalObservation:
         source=str(row["source"]),
         observed_at=str(row["observed_at"]),
         payload_json=str(row["payload_json"]),
-        drift_kind=(
-            str(row["drift_kind"]) if row["drift_kind"] is not None else None
-        ),
+        drift_kind=(str(row["drift_kind"]) if row["drift_kind"] is not None else None),
         action_taken=str(row["action_taken"]),
     )
 

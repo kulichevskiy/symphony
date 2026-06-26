@@ -11,12 +11,15 @@ from symphony.tokens import (
 
 def test_effective_tokens_weights_cache_traffic() -> None:
     # input + output + cache_write*1.25 + cache_read*0.1
-    assert effective_tokens(
-        input_tokens=10,
-        output_tokens=20,
-        cache_write_tokens=8,
-        cache_read_tokens=10,
-    ) == 10 + 20 + 8 * 1.25 + 10 * 0.1  # == 41.0
+    assert (
+        effective_tokens(
+            input_tokens=10,
+            output_tokens=20,
+            cache_write_tokens=8,
+            cache_read_tokens=10,
+        )
+        == 10 + 20 + 8 * 1.25 + 10 * 0.1
+    )  # == 41.0
 
 
 def test_effective_tokens_all_zero_is_zero() -> None:

@@ -699,9 +699,7 @@ async def test_orchestrator_tick_caches_heartbeat_marks_between_repeats(
             ActivityEvent(kind="command_started", item_id="cmd-1", command="pytest"),
             start,
         )
-        heartbeat_marks = AsyncMock(
-            return_value={"cmd-1": "2026-05-11T10:05:00+00:00"}
-        )
+        heartbeat_marks = AsyncMock(return_value={"cmd-1": "2026-05-11T10:05:00+00:00"})
         monkeypatch.setattr(db.activity_comments, "heartbeat_marks", heartbeat_marks)
 
         await orch._record_activity_tick(  # noqa: SLF001

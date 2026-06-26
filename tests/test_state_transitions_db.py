@@ -13,9 +13,7 @@ async def test_state_transitions_roll_back_with_parent_transaction(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO review_state (

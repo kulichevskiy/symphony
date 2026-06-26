@@ -36,9 +36,7 @@ async def fetch_claude_effort_capabilities(model: str) -> list[str]:
             f"validate claude model {model!r}"
         )
     try:
-        async with httpx.AsyncClient(
-            base_url=CLAUDE_MODELS_API_BASE, timeout=30
-        ) as client:
+        async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
             resp = await client.get(
                 f"/v1/models/{model}",
                 headers={
@@ -55,8 +53,7 @@ async def fetch_claude_effort_capabilities(model: str) -> list[str]:
         ) from e
     except httpx.HTTPError as e:
         raise ValueError(
-            f"could not reach the Models API to validate claude model "
-            f"{model!r}: {e}"
+            f"could not reach the Models API to validate claude model {model!r}: {e}"
         ) from e
     effort_tree = (data.get("capabilities") or {}).get("effort") or {}
     if not effort_tree:

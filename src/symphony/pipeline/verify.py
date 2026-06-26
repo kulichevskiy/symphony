@@ -74,9 +74,7 @@ async def run_verify_command(
         start_new_session=True,
     )
     try:
-        stdout, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_secs
-        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except TimeoutError:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -156,9 +154,7 @@ async def run_verify_session(
         wall_clock_secs=wall_clock_secs,
         stage="verify_fix",
     )
-    collected = await collect_runner_output(
-        runner, spec, usage_handler=usage_handler
-    )
+    collected = await collect_runner_output(runner, spec, usage_handler=usage_handler)
     if fix_log_path is not None:
         try:
             fix_log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240

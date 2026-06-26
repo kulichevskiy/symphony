@@ -57,9 +57,7 @@ class _DispatchMixin(_OrchestratorBase):
             pr: db.issue_prs.IssuePR,
         ) -> bool: ...
 
-        async def _dispatch_one(
-            self, binding: RepoBinding, issue: LinearIssue
-        ) -> str | None: ...
+        async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> str | None: ...
 
         async def _fail_run(
             self,
@@ -89,9 +87,7 @@ class _DispatchMixin(_OrchestratorBase):
             termination_detail: str | None = None,
         ) -> None: ...
 
-    async def _scan_binding(
-        self, binding: RepoBinding
-    ) -> list[asyncio.Task[None]]:
+    async def _scan_binding(self, binding: RepoBinding) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
         ready_state = binding.linear_states.ready
         waiting_state = binding.linear_states.waiting
@@ -197,17 +193,14 @@ class _DispatchMixin(_OrchestratorBase):
             0,
             min(
                 self.config.global_max_concurrent - self._scheduled_slot_count(),
-                binding.max_concurrent
-                - self._scheduled_binding_counts.get(binding_key, 0),
+                binding.max_concurrent - self._scheduled_binding_counts.get(binding_key, 0),
             ),
         )
 
     def _scheduled_slot_count(self) -> int:
         return sum(self._scheduled_issue_refcounts.values())
 
-    def _reserve_scheduled_slot(
-        self, *, issue_id: str, binding_key: BindingKey
-    ) -> None:
+    def _reserve_scheduled_slot(self, *, issue_id: str, binding_key: BindingKey) -> None:
         self._scheduled_issue_refcounts[issue_id] = (
             self._scheduled_issue_refcounts.get(issue_id, 0) + 1
         )
@@ -216,9 +209,7 @@ class _DispatchMixin(_OrchestratorBase):
             self._scheduled_binding_counts.get(binding_key, 0) + 1
         )
 
-    def _release_scheduled_slot(
-        self, *, issue_id: str, binding_key: BindingKey
-    ) -> None:
+    def _release_scheduled_slot(self, *, issue_id: str, binding_key: BindingKey) -> None:
         issue_count = self._scheduled_issue_refcounts.get(issue_id, 0)
         if issue_count <= 1:
             self._scheduled_issue_refcounts.pop(issue_id, None)
@@ -299,9 +290,7 @@ class _DispatchMixin(_OrchestratorBase):
                 github_repo=binding.github_repo,
             )
             if pr is not None:
-                blocking_pr, handled = await self._blocking_existing_pr(
-                    binding, issue, pr
-                )
+                blocking_pr, handled = await self._blocking_existing_pr(binding, issue, pr)
                 if handled:
                     return None
                 if blocking_pr is not None:
@@ -366,8 +355,7 @@ class _DispatchMixin(_OrchestratorBase):
             )
             if not deleted:
                 log.warning(
-                    "could not delete closed unmerged PR row before ready dispatch "
-                    "for %s#%d",
+                    "could not delete closed unmerged PR row before ready dispatch for %s#%d",
                     binding.github_repo,
                     pr.pr_number,
                 )
@@ -441,9 +429,7 @@ class _DispatchMixin(_OrchestratorBase):
                 e,
             )
 
-    async def _park_blocked_by_deps(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> None:
+    async def _park_blocked_by_deps(self, binding: RepoBinding, issue: LinearIssue) -> None:
         blockers = open_blocker_ids(issue)
         if not blockers:
             return
@@ -526,10 +512,7 @@ class _DispatchMixin(_OrchestratorBase):
     ) -> RepoBinding | None:
         issue_labels = set(issue.labels)
         for binding in self.config.repos:
-            if (
-                tracker_ctx is not None
-                and _tracker_context_for_binding(binding) != tracker_ctx
-            ):
+            if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if binding.linear_team_key != issue.team_key:
                 continue
@@ -540,9 +523,7 @@ class _DispatchMixin(_OrchestratorBase):
             return binding
         return None
 
-    def _schedule_dispatch(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> asyncio.Task[None]:
+    def _schedule_dispatch(self, binding: RepoBinding, issue: LinearIssue) -> asyncio.Task[None]:
         binding_key = _binding_key(binding)
         self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
         task = asyncio.create_task(self._dispatch_with_limits(binding, issue))
@@ -556,9 +537,7 @@ class _DispatchMixin(_OrchestratorBase):
         )
         return task
 
-    async def _dispatch_with_limits(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> None:
+    async def _dispatch_with_limits(self, binding: RepoBinding, issue: LinearIssue) -> None:
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
             key,

@@ -214,8 +214,13 @@ class FakeRunner:
                 "GIT_COMMITTER_EMAIL": "sim@test",
             }
             proc = await asyncio.create_subprocess_exec(
-                "git", "-C", str(spec.workspace_path),
-                "commit", "--allow-empty", "-m", f"fake: {spec.stage or 'run'}",
+                "git",
+                "-C",
+                str(spec.workspace_path),
+                "commit",
+                "--allow-empty",
+                "-m",
+                f"fake: {spec.stage or 'run'}",
                 env=env,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -269,9 +274,7 @@ class FakeLinear:
             and (not label or label in issue.labels)
         ]
 
-    async def comments_since(
-        self, issue_uuid: str, after: datetime
-    ) -> Sequence[Comment]:
+    async def comments_since(self, issue_uuid: str, after: datetime) -> Sequence[Comment]:
         out: list[Comment] = []
         for comment in self._sim.comments.get(issue_uuid, []):
             if datetime.fromisoformat(comment.created_at) >= after:
@@ -309,9 +312,7 @@ class FakeLinear:
         if stype is not None:
             issue.state_type = stype
 
-    async def upload_issue_attachment(
-        self, *, issue_uuid: str, path: Path, title: str
-    ) -> str:
+    async def upload_issue_attachment(self, *, issue_uuid: str, path: Path, title: str) -> str:
         return f"https://sim.invalid/attachments/{issue_uuid}/{title}"
 
 
@@ -359,35 +360,75 @@ class FakeGitHub:
         """Create a minimal real git repo so workspace git operations succeed."""
         self._workspace_repos[dest] = repo
         env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
-        git_env = {**env, "GIT_AUTHOR_NAME": "sim", "GIT_AUTHOR_EMAIL": "sim@test",
-                   "GIT_COMMITTER_NAME": "sim", "GIT_COMMITTER_EMAIL": "sim@test"}
+        git_env = {
+            **env,
+            "GIT_AUTHOR_NAME": "sim",
+            "GIT_AUTHOR_EMAIL": "sim@test",
+            "GIT_COMMITTER_NAME": "sim",
+            "GIT_COMMITTER_EMAIL": "sim@test",
+        }
         # Create a bare origin so `git push -u origin <branch>` succeeds.
         origin = dest.parent / (dest.name + "-origin.git")
         origin.mkdir(parents=True, exist_ok=True)
         init_bare = await asyncio.create_subprocess_exec(
-            "git", "init", "--bare", str(origin),
-            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "git",
+            "init",
+            "--bare",
+            str(origin),
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await init_bare.wait()
         dest.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 (test fake; local tmp dir)
         init = await asyncio.create_subprocess_exec(
-            "git", "init", "-b", "main", str(dest),
-            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "git",
+            "init",
+            "-b",
+            "main",
+            str(dest),
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await init.wait()
         commit = await asyncio.create_subprocess_exec(
-            "git", "-C", str(dest), "commit", "--allow-empty", "-m", "init",
-            env=git_env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "git",
+            "-C",
+            str(dest),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+            env=git_env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await commit.wait()
         remote = await asyncio.create_subprocess_exec(
-            "git", "-C", str(dest), "remote", "add", "origin", str(origin),
-            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "git",
+            "-C",
+            str(dest),
+            "remote",
+            "add",
+            "origin",
+            str(origin),
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await remote.wait()
         push = await asyncio.create_subprocess_exec(
-            "git", "-C", str(dest), "push", "-u", "origin", "main",
-            env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            "git",
+            "-C",
+            str(dest),
+            "push",
+            "-u",
+            "origin",
+            "main",
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
         await push.wait()
 
@@ -560,9 +601,7 @@ class FakeGitHub:
             return sim_pr.checks_passed
         return all(_check_bucket(c) == "pass" for c in sim_pr.checks if c.required)
 
-    async def pr_comment(
-        self, pr: int | str, body: str, *, repo: str | None = None
-    ) -> None:
+    async def pr_comment(self, pr: int | str, body: str, *, repo: str | None = None) -> None:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
             raise GitHubError(f"no such PR: {pr}")
@@ -603,21 +642,15 @@ class FakeGitHub:
             return PRChecks(runs=[])
         if sim_pr.auto_merge_enabled:
             return PRChecks(runs=[CheckRun(name="ci", state="IN_PROGRESS", bucket="pending")])
-        return PRChecks(
-            runs=[CheckRun(name="ci", state="FAILURE", bucket="fail")]
-        )
+        return PRChecks(runs=[CheckRun(name="ci", state="FAILURE", bucket="fail")])
 
-    async def pr_review_comments(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]:
+    async def pr_review_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         return []
 
     async def pr_reviews(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         return list(self._reviews.get((repo, int(pr)), []))
 
-    async def pr_issue_comments(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]:
+    async def pr_issue_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         return list(self._pr_comments.get((repo, int(pr)), []))
 
     async def pr_reactions(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
@@ -679,9 +712,7 @@ class FakeGitHub:
             )
         # BLOCKED (checks pending/failing) blocks direct merge but not auto-merge queueing.
         if not auto and blocking_state == "BLOCKED":
-            raise GitHubError(
-                f"PR {pr} is not mergeable: merge state is BLOCKED"
-            )
+            raise GitHubError(f"PR {pr} is not mergeable: merge state is BLOCKED")
         if auto and not self._required_checks_passed(sim_pr):
             # Queue auto-merge; GitHub merges later when checks go green.
             sim_pr.auto_merge_enabled = True

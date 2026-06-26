@@ -77,10 +77,9 @@ async def test_happy_path_dispatch_to_merge(tmp_path: Path) -> None:
         assert sim_pr.head_sha, "PR head SHA was never recorded by the sim-aware push"
         # The merged head is the synthetic SHA the sim-aware push recorded for
         # the branch — not ensure_pr's fabricated fallback.
-        assert (
-            harness.sim.branch_head_shas.get((sim_pr.repo, sim_pr.head))
-            == sim_pr.head_sha
-        ), "PR head SHA did not come from the recorded branch→head push"
+        assert harness.sim.branch_head_shas.get((sim_pr.repo, sim_pr.head)) == sim_pr.head_sha, (
+            "PR head SHA did not come from the recorded branch→head push"
+        )
 
         # Issue landed in the Done/merged lane.
         assert harness.sim.issues[issue.id].state_name == DONE

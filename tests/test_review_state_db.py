@@ -22,9 +22,7 @@ from symphony.db import review_state
 async def test_review_state_starts_at_zero(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         state = await review_state.get(conn, "iss-1")
         assert state.iteration == 0
         assert state.last_trigger_signature == ""
@@ -42,9 +40,7 @@ async def test_review_state_bump_iteration_persists(tmp_path: Path) -> None:
     db_path = tmp_path / "s.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await review_state.bump_iteration(conn, "iss-1")
         await review_state.bump_iteration(conn, "iss-1")
         await review_state.bump_iteration(conn, "iss-1")
@@ -68,9 +64,7 @@ async def test_review_state_bump_iteration_records_transition(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO review_state (
@@ -96,9 +90,7 @@ async def test_review_state_bump_iteration_records_transition(
 async def test_review_state_signature_persists(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await review_state.set_signature(conn, "iss-1", "ci:lint")
         s = await review_state.get(conn, "iss-1")
         assert s.last_trigger_signature == "ci:lint"
@@ -115,9 +107,7 @@ async def test_review_state_reset_clears_counter(tmp_path: Path) -> None:
     """After a stage transition (e.g. Review → Merge) the counter resets."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await review_state.bump_iteration(conn, "iss-1")
         await review_state.bump_iteration(conn, "iss-1")
         await review_state.set_signature(conn, "iss-1", "ci:lint")
@@ -138,9 +128,7 @@ async def test_review_state_reset_clears_counter(tmp_path: Path) -> None:
 async def test_review_state_begin_review_records_pr_metadata(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await review_state.begin_review(
             conn,
             "iss-1",
@@ -167,9 +155,7 @@ async def test_review_state_refresh_pr_metadata_preserves_cycle_state(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await review_state.begin_review(
             conn,
             "iss-1",
@@ -210,9 +196,7 @@ async def test_review_state_ci_fetch_failures_persist_and_reset(tmp_path: Path) 
     db_path = tmp_path / "s.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         assert await review_state.bump_ci_fetch_failures(conn, "iss-1") == 1
         assert await review_state.bump_ci_fetch_failures(conn, "iss-1") == 2
     finally:

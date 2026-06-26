@@ -744,11 +744,14 @@ async def test_no_progress_warning_respects_threshold_and_pr_open_state(
     finally:
         await conn.close()
 
-    assert issue_warnings(
-        status,
-        latest_activity_age_secs=latest_activity_age_secs,
-        pr_no_progress_threshold=timedelta(hours=2),
-    ) == expected
+    assert (
+        issue_warnings(
+            status,
+            latest_activity_age_secs=latest_activity_age_secs,
+            pr_no_progress_threshold=timedelta(hours=2),
+        )
+        == expected
+    )
 
 
 @pytest.mark.asyncio

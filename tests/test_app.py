@@ -53,9 +53,7 @@ class _FakeExternalService:
 def _dist(tmp_path: Path) -> Path:
     dist = tmp_path / "dist"
     dist.mkdir()
-    (dist / "index.html").write_text(
-        "<!doctype html><html><body>symphony UI v0</body></html>"
-    )
+    (dist / "index.html").write_text("<!doctype html><html><body>symphony UI v0</body></html>")
     return dist
 
 
@@ -651,8 +649,7 @@ async def test_api_issues_filters_by_provider(tmp_path: Path) -> None:
         )
         # Both issues are active via review_state (iteration > 0, no PRs).
         await conn.execute(
-            "INSERT INTO review_state (issue_id, iteration) "
-            "VALUES ('spans', 1), ('codex-only', 1)"
+            "INSERT INTO review_state (issue_id, iteration) VALUES ('spans', 1), ('codex-only', 1)"
         )
         await conn.commit()
         # spans: implement on claude, review on codex. codex-only: codex only.
@@ -699,9 +696,7 @@ async def test_api_issues_filters_by_provider(tmp_path: Path) -> None:
     assert {k: codex_rows["spans"][k] for k in _token_totals()} == _token_totals(
         input_tokens=10, output_tokens=2, cache_write_tokens=0, cache_read_tokens=3
     )
-    assert {
-        k: codex_rows["codex-only"][k] for k in _token_totals()
-    } == _token_totals(
+    assert {k: codex_rows["codex-only"][k] for k in _token_totals()} == _token_totals(
         input_tokens=50, output_tokens=5, cache_write_tokens=5, cache_read_tokens=5
     )
 
@@ -1086,9 +1081,7 @@ async def test_api_issues_maps_canonical_status_db_errors_to_503(
             title="First issue",
             team_key="ENG",
         )
-        await conn.execute(
-            "INSERT INTO review_state (issue_id, iteration) VALUES ('issue-a', 1)"
-        )
+        await conn.execute("INSERT INTO review_state (issue_id, iteration) VALUES ('issue-a', 1)")
         await conn.commit()
         app = create_app(
             _Handler(),
@@ -1420,9 +1413,7 @@ async def test_issue_detail_include_external_promotes_latest_drift(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            detail_response = await client.get(
-                "/api/issues/iss-drift?include_external=1"
-            )
+            detail_response = await client.get("/api/issues/iss-drift?include_external=1")
             plain_response = await client.get("/api/issues/iss-drift")
             list_response = await client.get("/api/issues?scope=active")
     finally:
@@ -1501,9 +1492,7 @@ async def test_issue_detail_include_external_keeps_warning_flags_out_of_status(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.get(
-                "/api/issues/iss-check-warning?include_external=1"
-            )
+            response = await client.get("/api/issues/iss-check-warning?include_external=1")
     finally:
         await conn.close()
 
@@ -1915,9 +1904,7 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
             ("b", "ENG-2", "ENG"),
             ("c", "WEB-1", "WEB"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd,
@@ -1949,8 +1936,12 @@ async def test_api_spend_summary_aggregates_per_team_sorted(tmp_path: Path) -> N
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             response = await client.get("/api/spend/summary")
@@ -1987,9 +1978,7 @@ async def test_api_spend_summary_per_provider_nested_per_model(
     conn = await db.connect(db_path)
     try:
         for iid, ident, team in (("a", "ENG-1", "ENG"), ("b", "ENG-2", "ENG")):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2011,8 +2000,12 @@ async def test_api_spend_summary_per_provider_nested_per_model(
             conn, "r3", [ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             response = await client.get("/api/spend/summary")
@@ -2057,9 +2050,7 @@ async def test_api_spend_summary_scoped_by_provider_reconciles(
             ("b", "ENG-2", "ENG"),
             ("c", "WEB-1", "WEB"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2096,8 +2087,12 @@ async def test_api_spend_summary_scoped_by_provider_reconciles(
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             all_resp = await client.get("/api/spend/summary?provider=all")
@@ -2125,9 +2120,7 @@ async def test_api_spend_summary_scoped_by_provider_reconciles(
 
     # Tokens reconcile exactly: all == codex + claude, for totals and per team.
     for key in token_keys:
-        assert all_body["totals"][key] == (
-            claude_body["totals"][key] + codex_body["totals"][key]
-        )
+        assert all_body["totals"][key] == (claude_body["totals"][key] + codex_body["totals"][key])
 
     def teams(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
         return {t["key"]: t for t in body["per_team"]}
@@ -2140,9 +2133,7 @@ async def test_api_spend_summary_scoped_by_provider_reconciles(
     assert set(all_teams) == {"ENG", "WEB"}
     for team in ("ENG", "WEB"):
         for key in token_keys:
-            assert all_teams[team][key] == (
-                claude_teams[team][key] + codex_teams[team][key]
-            )
+            assert all_teams[team][key] == (claude_teams[team][key] + codex_teams[team][key])
 
     # Spot-check the scoped values.
     assert all_teams["ENG"]["output_tokens"] == 67
@@ -2174,9 +2165,7 @@ async def test_api_spend_summary_per_stage_reconciles_and_scopes(
             ("b", "ENG-2", "ENG"),
             ("c", "WEB-1", "WEB"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2203,8 +2192,12 @@ async def test_api_spend_summary_per_stage_reconciles_and_scopes(
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             resp = await client.get("/api/spend/summary")
@@ -2271,12 +2264,8 @@ async def test_api_spend_stage_series_daily_buckets_short_window(
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="b", identifier="ENG-2", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="a", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issues.upsert(conn, id="b", identifier="ENG-2", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2298,13 +2287,15 @@ async def test_api_spend_stage_series_daily_buckets_short_window(
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            resp = await client.get(
-                "/api/spend/stage-series?from=2026-05-10&to=2026-05-17"
-            )
+            resp = await client.get("/api/spend/stage-series?from=2026-05-10&to=2026-05-17")
     finally:
         await conn.close()
 
@@ -2333,9 +2324,7 @@ async def test_api_spend_stage_series_weekly_for_long_window(tmp_path: Path) -> 
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="a", identifier="ENG-1", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2356,13 +2345,15 @@ async def test_api_spend_stage_series_weekly_for_long_window(tmp_path: Path) -> 
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            resp = await client.get(
-                "/api/spend/stage-series?from=2026-03-01&to=2026-05-17"
-            )
+            resp = await client.get("/api/spend/stage-series?from=2026-03-01&to=2026-05-17")
     finally:
         await conn.close()
 
@@ -2389,9 +2380,7 @@ async def test_api_spend_stage_series_unfiltered_spans_history_and_scopes(
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="a", identifier="ENG-1", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2408,8 +2397,12 @@ async def test_api_spend_stage_series_unfiltered_spans_history_and_scopes(
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             allr = await client.get("/api/spend/stage-series")
@@ -2422,9 +2415,7 @@ async def test_api_spend_stage_series_unfiltered_spans_history_and_scopes(
     assert body["bucket"] == "week"
     assert body["start"] == "2026-01-05"
     assert body["end"] == "2026-05-15"
-    series_out = sum(
-        v for b in body["buckets"] for v in b["output_tokens"].values()
-    )
+    series_out = sum(v for b in body["buckets"] for v in b["output_tokens"].values())
     assert series_out == 50  # 10 + 40
     # Provider filter scopes the series like every other grouping.
     cbody = claude.json()
@@ -2437,12 +2428,8 @@ async def test_api_spend_stage_series_by_team_and_model(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="VIB-1", title="t", team_key="VIB"
-        )
-        await db.issues.upsert(
-            conn, id="b", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="a", identifier="VIB-1", title="t", team_key="VIB")
+        await db.issues.upsert(conn, id="b", identifier="ENG-1", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2459,13 +2446,15 @@ async def test_api_spend_stage_series_by_team_and_model(tmp_path: Path) -> None:
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            team = await client.get(
-                "/api/spend/stage-series?by=team&from=2026-05-10&to=2026-05-17"
-            )
+            team = await client.get("/api/spend/stage-series?by=team&from=2026-05-10&to=2026-05-17")
             model = await client.get(
                 "/api/spend/stage-series?by=model&from=2026-05-10&to=2026-05-17"
             )
@@ -2495,12 +2484,8 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="b", identifier="ENG-2", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="a", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issues.upsert(conn, id="b", identifier="ENG-2", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd,
@@ -2518,8 +2503,12 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             response = await client.get("/api/spend/heatmap?days=60")
@@ -2533,13 +2522,19 @@ async def test_api_spend_heatmap_buckets_by_day(tmp_path: Path) -> None:
     assert "2024-01-01" not in by_day
     assert by_day["2026-05-17"] == {
         "date": "2026-05-17",
-        "input_tokens": 150, "output_tokens": 0,
-        "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 2,
+        "input_tokens": 150,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "issues": 2,
     }
     assert by_day["2026-05-16"] == {
         "date": "2026-05-16",
-        "input_tokens": 10, "output_tokens": 0,
-        "cache_write_tokens": 0, "cache_read_tokens": 0, "issues": 1,
+        "input_tokens": 10,
+        "output_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 0,
+        "issues": 1,
     }
     assert body["end"] == "2026-05-17"
 
@@ -2549,12 +2544,8 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="b", identifier="ENG-2", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="a", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issues.upsert(conn, id="b", identifier="ENG-2", title="t", team_key="ENG")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2576,8 +2567,12 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
             conn, "r3", [ModelUsage("codex", "gpt-5.5", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             claude_resp = await client.get("/api/spend/heatmap?days=60&provider=claude")
@@ -2590,8 +2585,11 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
     # Only claude's single run on 05-17; 05-16 has no claude rows.
     assert claude_days["2026-05-17"] == {
         "date": "2026-05-17",
-        "input_tokens": 100, "output_tokens": 20,
-        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_write_tokens": 30,
+        "cache_read_tokens": 40,
+        "issues": 1,
     }
     assert "2026-05-16" not in claude_days
 
@@ -2599,13 +2597,19 @@ async def test_api_spend_heatmap_filters_by_provider(tmp_path: Path) -> None:
     codex_days = {d["date"]: d for d in codex_resp.json()["days"]}
     assert codex_days["2026-05-17"] == {
         "date": "2026-05-17",
-        "input_tokens": 50, "output_tokens": 5,
-        "cache_write_tokens": 5, "cache_read_tokens": 5, "issues": 1,
+        "input_tokens": 50,
+        "output_tokens": 5,
+        "cache_write_tokens": 5,
+        "cache_read_tokens": 5,
+        "issues": 1,
     }
     assert codex_days["2026-05-16"] == {
         "date": "2026-05-16",
-        "input_tokens": 10, "output_tokens": 2,
-        "cache_write_tokens": 0, "cache_read_tokens": 3, "issues": 1,
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3,
+        "issues": 1,
     }
 
 
@@ -2619,9 +2623,7 @@ async def test_api_issues_filters_by_teams(tmp_path: Path) -> None:
             ("a", "ADJ-1", "ADJ"),
             ("s", "SYM-1", "SYM"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
@@ -2636,8 +2638,7 @@ async def test_api_issues_filters_by_teams(tmp_path: Path) -> None:
             """
         )
         await conn.execute(
-            "INSERT INTO review_state (issue_id, iteration) "
-            "VALUES ('v', 1), ('a', 1), ('s', 1)"
+            "INSERT INTO review_state (issue_id, iteration) VALUES ('v', 1), ('a', 1), ('s', 1)"
         )
         await conn.commit()
         # VIB on claude, ADJ on codex — lets us prove teams AND provider.
@@ -2651,17 +2652,19 @@ async def test_api_issues_filters_by_teams(tmp_path: Path) -> None:
             conn, "rs", [ModelUsage("claude", "claude-opus-4-8", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             one = await client.get("/api/issues?scope=active&teams=VIB")
             multi = await client.get("/api/issues?scope=active&teams=VIB,ADJ")
             unknown = await client.get("/api/issues?scope=active&teams=NOPE")
             none = await client.get("/api/issues?scope=active")
-            combo = await client.get(
-                "/api/issues?scope=active&teams=VIB,ADJ&provider=claude"
-            )
+            combo = await client.get("/api/issues?scope=active&teams=VIB,ADJ&provider=claude")
     finally:
         await conn.close()
 
@@ -2688,9 +2691,7 @@ async def test_api_spend_summary_filters_by_teams(tmp_path: Path) -> None:
             ("b", "ADJ-1", "ADJ"),
             ("c", "SYM-1", "SYM"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2711,8 +2712,12 @@ async def test_api_spend_summary_filters_by_teams(tmp_path: Path) -> None:
             conn, "r3", [ModelUsage("claude", "claude-opus-4-8", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             multi = await client.get("/api/spend/summary?teams=VIB,ADJ")
@@ -2747,9 +2752,7 @@ async def test_api_spend_summary_returns_unscoped_teams_from_config(
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="VIB-1", title="t", team_key="VIB"
-        )
+        await db.issues.upsert(conn, id="a", identifier="VIB-1", title="t", team_key="VIB")
         await conn.execute(
             "INSERT INTO runs (id, issue_id, stage, status, pid, started_at) "
             "VALUES ('r1', 'a', 'implement', 'completed', NULL, '2026-05-17T10:00:00Z')"
@@ -2766,8 +2769,12 @@ async def test_api_spend_summary_returns_unscoped_teams_from_config(
             ]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
             ui_external_config=config,
         )
         async with await _client(app) as client:
@@ -2793,9 +2800,7 @@ async def test_api_spend_heatmap_filters_by_teams(tmp_path: Path) -> None:
             ("b", "ADJ-1", "ADJ"),
             ("c", "SYM-1", "SYM"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
@@ -2811,8 +2816,12 @@ async def test_api_spend_heatmap_filters_by_teams(tmp_path: Path) -> None:
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             one = await client.get("/api/spend/heatmap?days=60&teams=VIB")
@@ -2824,8 +2833,11 @@ async def test_api_spend_heatmap_filters_by_teams(tmp_path: Path) -> None:
     one_days = {d["date"]: d for d in one.json()["days"]}
     assert one_days["2026-05-17"] == {
         "date": "2026-05-17",
-        "input_tokens": 100, "output_tokens": 20,
-        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_write_tokens": 30,
+        "cache_read_tokens": 40,
+        "issues": 1,
     }
     # SYM's 05-16 row is excluded.
     assert "2026-05-16" not in one_days
@@ -2846,9 +2858,7 @@ async def test_api_issues_filters_by_models(tmp_path: Path) -> None:
             ("a", "ADJ-1", "ADJ"),
             ("s", "SYM-1", "SYM"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at,
@@ -2863,8 +2873,7 @@ async def test_api_issues_filters_by_models(tmp_path: Path) -> None:
             """
         )
         await conn.execute(
-            "INSERT INTO review_state (issue_id, iteration) "
-            "VALUES ('v', 1), ('a', 1), ('s', 1)"
+            "INSERT INTO review_state (issue_id, iteration) VALUES ('v', 1), ('a', 1), ('s', 1)"
         )
         await conn.commit()
         await db.run_model_usage.replace_for_run(
@@ -2877,8 +2886,12 @@ async def test_api_issues_filters_by_models(tmp_path: Path) -> None:
             conn, "rs", [ModelUsage("claude", "sonnet-4-6", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             one = await client.get("/api/issues?scope=active&models=claude:opus-4.1")
@@ -2888,8 +2901,7 @@ async def test_api_issues_filters_by_models(tmp_path: Path) -> None:
             unknown = await client.get("/api/issues?scope=active&models=claude:nope")
             none = await client.get("/api/issues?scope=active")
             combo = await client.get(
-                "/api/issues?scope=active"
-                "&models=claude:opus-4.1,codex:gpt-5-codex&teams=VIB"
+                "/api/issues?scope=active&models=claude:opus-4.1,codex:gpt-5-codex&teams=VIB"
             )
     finally:
         await conn.close()
@@ -2917,9 +2929,7 @@ async def test_api_spend_summary_filters_by_models(tmp_path: Path) -> None:
             ("b", "ADJ-1", "ADJ"),
             ("c", "SYM-1", "SYM"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -2940,16 +2950,17 @@ async def test_api_spend_summary_filters_by_models(tmp_path: Path) -> None:
             conn, "r3", [ModelUsage("claude", "sonnet-4-6", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            multi = await client.get(
-                "/api/spend/summary?models=claude:opus-4.1,codex:gpt-5-codex"
-            )
+            multi = await client.get("/api/spend/summary?models=claude:opus-4.1,codex:gpt-5-codex")
             combo = await client.get(
-                "/api/spend/summary?models=claude:opus-4.1,claude:sonnet-4-6"
-                "&provider=claude"
+                "/api/spend/summary?models=claude:opus-4.1,claude:sonnet-4-6&provider=claude"
             )
     finally:
         await conn.close()
@@ -2978,12 +2989,8 @@ async def test_api_spend_summary_returns_unscoped_models(tmp_path: Path) -> None
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="VIB-1", title="t", team_key="VIB"
-        )
-        await db.issues.upsert(
-            conn, id="b", identifier="ADJ-1", title="t", team_key="ADJ"
-        )
+        await db.issues.upsert(conn, id="a", identifier="VIB-1", title="t", team_key="VIB")
+        await db.issues.upsert(conn, id="b", identifier="ADJ-1", title="t", team_key="ADJ")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -3000,8 +3007,12 @@ async def test_api_spend_summary_returns_unscoped_models(tmp_path: Path) -> None
             conn, "r2", [ModelUsage("codex", "gpt-5-codex", 50, 5, 5, 5)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
             unfiltered = await client.get("/api/spend/summary")
@@ -3030,9 +3041,7 @@ async def test_api_spend_heatmap_filters_by_models(tmp_path: Path) -> None:
             ("b", "ADJ-1", "ADJ"),
             ("c", "SYM-1", "SYM"),
         ):
-            await db.issues.upsert(
-                conn, id=iid, identifier=ident, title=ident, team_key=team
-            )
+            await db.issues.upsert(conn, id=iid, identifier=ident, title=ident, team_key=team)
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -3053,13 +3062,15 @@ async def test_api_spend_heatmap_filters_by_models(tmp_path: Path) -> None:
             conn, "r3", [ModelUsage("claude", "sonnet-4-6", 10, 2, 0, 3)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            one = await client.get(
-                "/api/spend/heatmap?days=60&models=claude:opus-4.1"
-            )
+            one = await client.get("/api/spend/heatmap?days=60&models=claude:opus-4.1")
             multi = await client.get(
                 "/api/spend/heatmap?days=60&models=claude:opus-4.1,codex:gpt-5-codex"
             )
@@ -3070,8 +3081,11 @@ async def test_api_spend_heatmap_filters_by_models(tmp_path: Path) -> None:
     one_days = {d["date"]: d for d in one.json()["days"]}
     assert one_days["2026-05-17"] == {
         "date": "2026-05-17",
-        "input_tokens": 100, "output_tokens": 20,
-        "cache_write_tokens": 30, "cache_read_tokens": 40, "issues": 1,
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_write_tokens": 30,
+        "cache_read_tokens": 40,
+        "issues": 1,
     }
     # SYM's sonnet-4-6 row on 05-16 is excluded.
     assert "2026-05-16" not in one_days
@@ -3092,9 +3106,7 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
             conn, id="done-recent", identifier="ENG-1", title="recent", team_key="ENG"
         )
         # Merged 16 days ago -> done, outside 7d window.
-        await db.issues.upsert(
-            conn, id="done-old", identifier="ENG-2", title="old", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="done-old", identifier="ENG-2", title="old", team_key="ENG")
         # Running -> not done.
         await db.issues.upsert(
             conn, id="active", identifier="ENG-3", title="active", team_key="ENG"
@@ -3125,16 +3137,16 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            wk = await client.get(
-                "/api/issues?scope=done&from=2026-05-10&to=2026-05-17"
-            )
-            mo = await client.get(
-                "/api/issues?scope=done&from=2026-04-25&to=2026-05-17"
-            )
+            wk = await client.get("/api/issues?scope=done&from=2026-05-10&to=2026-05-17")
+            mo = await client.get("/api/issues?scope=done&from=2026-04-25&to=2026-05-17")
             allt = await client.get("/api/issues?scope=done")
     finally:
         await conn.close()
@@ -3158,12 +3170,8 @@ async def test_api_issues_active_scope_filters_by_date_window(tmp_path: Path) ->
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="act-new", identifier="ENG-1", title="new", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="act-old", identifier="ENG-2", title="old", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="act-new", identifier="ENG-1", title="new", team_key="ENG")
+        await db.issues.upsert(conn, id="act-old", identifier="ENG-2", title="old", team_key="ENG")
         # Both are active (running runs); their last activity is the run start.
         await conn.execute(
             """
@@ -3175,13 +3183,15 @@ async def test_api_issues_active_scope_filters_by_date_window(tmp_path: Path) ->
         )
         await conn.commit()
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            win = await client.get(
-                "/api/issues?scope=active&from=2026-05-10&to=2026-05-17"
-            )
+            win = await client.get("/api/issues?scope=active&from=2026-05-10&to=2026-05-17")
             allt = await client.get("/api/issues?scope=active")
     finally:
         await conn.close()
@@ -3198,12 +3208,8 @@ async def test_api_spend_summary_filters_by_date_window(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="a", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="b", identifier="WEB-1", title="t", team_key="WEB"
-        )
+        await db.issues.upsert(conn, id="a", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issues.upsert(conn, id="b", identifier="WEB-1", title="t", team_key="WEB")
         await conn.execute(
             """
             INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
@@ -3224,13 +3230,15 @@ async def test_api_spend_summary_filters_by_date_window(tmp_path: Path) -> None:
             conn, "r-old", [ModelUsage("claude", "claude-opus-4-8", 999, 99, 99, 99)]
         )
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), clock=lambda: UI_NOW,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
         )
         async with await _client(app) as client:
-            windowed = await client.get(
-                "/api/spend/summary?from=2026-05-16&to=2026-05-17"
-            )
+            windowed = await client.get("/api/spend/summary?from=2026-05-16&to=2026-05-17")
             allt = await client.get("/api/spend/summary")
     finally:
         await conn.close()
@@ -3267,30 +3275,24 @@ async def test_api_issue_command_accepts_and_enqueues(tmp_path: Path) -> None:
     conn = await db.connect(db_path)
     sink = _FakeCommandSink()
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
-            ui_dist_dir=_dist(tmp_path), ui_command_sink=sink,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_command_sink=sink,
         )
         async with await _client(app) as client:
-            ok = await client.post(
-                "/api/issues/iss-1/command", json={"command": "approve"}
-            )
-            bad = await client.post(
-                "/api/issues/iss-1/command", json={"command": "nope"}
-            )
-            missing = await client.post(
-                "/api/issues/ghost/command", json={"command": "approve"}
-            )
+            ok = await client.post("/api/issues/iss-1/command", json={"command": "approve"})
+            bad = await client.post("/api/issues/iss-1/command", json={"command": "nope"})
+            missing = await client.post("/api/issues/ghost/command", json={"command": "approve"})
     finally:
         await conn.close()
 
     assert ok.status_code == 200
-    assert ok.json() == {
-        "status": "accepted", "command_id": "cmd-123", "command": "$approve"
-    }
+    assert ok.json() == {"status": "accepted", "command_id": "cmd-123", "command": "$approve"}
     assert sink.calls == [("iss-1", SlashKind.APPROVE)]
     assert bad.status_code == 400
     assert missing.status_code == 404
@@ -3301,17 +3303,16 @@ async def test_api_issue_command_503_without_sink(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         app = create_app(
-            _Handler(), conn, ui_enabled=True, ui_db_path=db_path,
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
             ui_dist_dir=_dist(tmp_path),
         )
         async with await _client(app) as client:
-            response = await client.post(
-                "/api/issues/iss-1/command", json={"command": "approve"}
-            )
+            response = await client.post("/api/issues/iss-1/command", json={"command": "approve"})
     finally:
         await conn.close()
 

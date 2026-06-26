@@ -142,12 +142,9 @@ class Workspace:
             async with self._hold_lock(candidate):
                 if candidate.exists():
                     if await self._has_unsaved_work(candidate):
-                        dest = await asyncio.to_thread(
-                            self._archive, candidate, issue_id
-                        )
+                        dest = await asyncio.to_thread(self._archive, candidate, issue_id)
                         log.warning(
-                            "workspace %s has uncommitted or unpushed work; "
-                            "archived to %s",
+                            "workspace %s has uncommitted or unpushed work; archived to %s",
                             candidate,
                             dest,
                         )
@@ -258,9 +255,7 @@ class Workspace:
                 continue
         return mtime
 
-    async def run_sweeper(
-        self, *, interval_secs: int = DEFAULT_SWEEP_INTERVAL_SECS
-    ) -> None:
+    async def run_sweeper(self, *, interval_secs: int = DEFAULT_SWEEP_INTERVAL_SECS) -> None:
         """Sweep at startup, then every `interval_secs`. Cancellation-safe."""
         while True:
             try:
@@ -287,7 +282,8 @@ class Workspace:
 
     async def _git(self, cwd: Path, *args: str) -> None:
         proc = await asyncio.create_subprocess_exec(
-            "git", *args,
+            "git",
+            *args,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -302,7 +298,8 @@ class Workspace:
 
     async def _git_out(self, cwd: Path, *args: str) -> str:
         proc = await asyncio.create_subprocess_exec(
-            "git", *args,
+            "git",
+            *args,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -318,7 +315,8 @@ class Workspace:
 
     async def _git_ok(self, cwd: Path, *args: str) -> bool:
         proc = await asyncio.create_subprocess_exec(
-            "git", *args,
+            "git",
+            *args,
             cwd=str(cwd),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,

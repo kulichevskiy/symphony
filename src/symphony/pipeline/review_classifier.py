@@ -183,9 +183,7 @@ def _latest_reviews_by_author(reviews: Iterable[Review]) -> list[Review]:
     latest: dict[str, Review] = {}
     latest_seen_at: dict[str, datetime] = {}
     for review in reviews:
-        submitted_at = _parse_iso(review.submitted_at) or datetime.min.replace(
-            tzinfo=UTC
-        )
+        submitted_at = _parse_iso(review.submitted_at) or datetime.min.replace(tzinfo=UTC)
         previous_at = latest_seen_at.get(review.user_login)
         if previous_at is None or submitted_at >= previous_at:
             latest[review.user_login] = review
@@ -252,13 +250,9 @@ def review_classifier(
         signal_dt = _parse_iso(ts)
         return signal_dt is None or signal_dt >= head_dt
 
-    fresh_reviews = [
-        r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha
-    ]
+    fresh_reviews = [r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha]
     latest_human_reviews = [
-        r
-        for r in _latest_reviews_by_author(fresh_reviews)
-        if not is_codex_author(r.user_login)
+        r for r in _latest_reviews_by_author(fresh_reviews) if not is_codex_author(r.user_login)
     ]
 
     def codex_review_has_no_issues_marker(r: Review) -> bool:
@@ -310,9 +304,7 @@ def review_classifier(
             # authorize an auto-merge of a never-reviewed HEAD. Genuine
             # GitHub reactions carry no SHA and stay time-validated. Codex
             # abbreviates the SHA, so match it as a prefix of the full OID.
-            if rxn.commit_sha and not _sha_refers_to(
-                rxn.commit_sha, snapshot.head_sha
-            ):
+            if rxn.commit_sha and not _sha_refers_to(rxn.commit_sha, snapshot.head_sha):
                 continue
             record_codex_approval_time(
                 rxn.created_at,
@@ -375,11 +367,7 @@ def review_classifier(
         )
 
     # Rule 6 — human `CHANGES_REQUESTED` on HEAD.
-    human_cr = [
-        r
-        for r in latest_human_reviews
-        if r.state == "CHANGES_REQUESTED"
-    ]
+    human_cr = [r for r in latest_human_reviews if r.state == "CHANGES_REQUESTED"]
     if human_cr:
         logins = sorted({r.user_login for r in human_cr})
         return Verdict(
@@ -395,9 +383,7 @@ def review_classifier(
     codex_approved = codex_approval_at is not None or codex_no_issues or codex_emoji_approve
 
     # Rule 8 — human `APPROVED`.
-    human_approved = any(
-        r.state == "APPROVED" for r in latest_human_reviews
-    )
+    human_approved = any(r.state == "APPROVED" for r in latest_human_reviews)
     approved = codex_approved or human_approved
 
     if approved:
@@ -408,19 +394,13 @@ def review_classifier(
                 kind=VerdictKind.PENDING,
                 rule="approved_unknown_mergeable",
             )
-        rule_name = (
-            "codex_approved"
-            if codex_approved
-            else "human_approved"
-        )
+        rule_name = "codex_approved" if codex_approved else "human_approved"
         return Verdict(kind=VerdictKind.APPROVED, rule=rule_name)
 
     return Verdict(kind=VerdictKind.PENDING, rule="no_signal")
 
 
-def should_dispatch_fix_run(
-    *, prev_signature: str, new_signature: str
-) -> bool:
+def should_dispatch_fix_run(*, prev_signature: str, new_signature: str) -> bool:
     """Dedup gate over consecutive fix-runs.
 
     True iff `new_signature` is non-empty and differs from
@@ -433,9 +413,7 @@ def should_dispatch_fix_run(
     return new_signature != prev_signature
 
 
-def has_hit_iteration_cap(
-    *, iteration: int, cap: int = DEFAULT_REVIEW_ITERATION_CAP
-) -> bool:
+def has_hit_iteration_cap(*, iteration: int, cap: int = DEFAULT_REVIEW_ITERATION_CAP) -> bool:
     """True once `iteration` reaches the cap (12 by default)."""
     return iteration >= cap
 

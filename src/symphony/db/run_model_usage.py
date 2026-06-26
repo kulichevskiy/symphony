@@ -59,9 +59,7 @@ async def replace_for_run(
     await conn.commit()
 
 
-async def list_for_run(
-    conn: aiosqlite.Connection, run_id: str
-) -> list[RunModelUsageRow]:
+async def list_for_run(conn: aiosqlite.Connection, run_id: str) -> list[RunModelUsageRow]:
     cur = await conn.execute(
         """
         SELECT run_id, provider, model,

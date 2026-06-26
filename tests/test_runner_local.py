@@ -69,11 +69,7 @@ async def test_runner_exits_when_child_holds_pipe_open(tmp_path: Path) -> None:
         command=[
             sys.executable,
             "-c",
-            (
-                "import subprocess; "
-                "print('tail', flush=True); "
-                "subprocess.Popen(['sleep', '30'])"
-            ),
+            ("import subprocess; print('tail', flush=True); subprocess.Popen(['sleep', '30'])"),
         ],
         stall_secs=60,
     )
@@ -335,12 +331,8 @@ async def test_runner_recognises_legacy_command_execution_shape(tmp_path: Path) 
     # of `item.type`. activity.parse_codex_activity_line already accepts that;
     # the watchdog must too, or a legacy-shape tool call falls back to
     # stall_secs and gets killed by the very false-positive this PR fixes.
-    started = (
-        '{"type":"item.started","item":{"id":"c1","item_type":"command_execution"}}'
-    )
-    completed = (
-        '{"type":"item.completed","item":{"id":"c1","item_type":"command_execution"}}'
-    )
+    started = '{"type":"item.started","item":{"id":"c1","item_type":"command_execution"}}'
+    completed = '{"type":"item.completed","item":{"id":"c1","item_type":"command_execution"}}'
     runner = LocalRunner()
     spec = RunnerSpec(
         run_id="r-legacy",

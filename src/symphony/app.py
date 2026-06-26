@@ -71,11 +71,7 @@ def create_app(
     ui_webhook_public_url: str | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
-    ui_pool = (
-        ReadOnlyDbPool(ui_db_path)
-        if ui_enabled and ui_db_path is not None
-        else None
-    )
+    ui_pool = ReadOnlyDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
     external_service = ui_external_service
     if (
         external_service is None
@@ -119,9 +115,7 @@ def create_app(
         resolved_github_handler = github_handler
         if resolved_github_handler is None:
             if not isinstance(handler, GitHubWebhookHandler):
-                raise TypeError(
-                    "github webhook settings require a GitHub webhook handler"
-                )
+                raise TypeError("github webhook settings require a GitHub webhook handler")
             resolved_github_handler = handler
         app.include_router(
             create_github_webhook_router(

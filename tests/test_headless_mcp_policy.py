@@ -54,9 +54,7 @@ def _change_prompts() -> list[str]:
         review_fix_prompt(**common, trigger="CI red", failing_check_log_tail="boom"),
         review_comment_fix_prompt(**common, trigger="reviewer comment"),
         acceptance_fix_prompt(**common, acceptance_verdict="rejected"),
-        merge_conflict_fix_prompt(
-            **common, base_branch="main", conflicted_files=["a.py"]
-        ),
+        merge_conflict_fix_prompt(**common, base_branch="main", conflicted_files=["a.py"]),
         merge_conflict_rebase_fix_prompt(**common, pr_number=7, base_ref="main"),
         merge_required_check_fix_prompt(
             **common,
@@ -131,9 +129,7 @@ def test_codex_runner_command_ignores_mcp_allowlist(tmp_path: Path) -> None:
 
 
 def test_local_review_fix_command_is_strict_mcp() -> None:
-    argv = _build_fix_command(
-        agent="claude", codex_model="gpt-5.1-codex", prompt="fix it"
-    )
+    argv = _build_fix_command(agent="claude", codex_model="gpt-5.1-codex", prompt="fix it")
     assert "--strict-mcp-config" in argv
     assert "--mcp-config" not in argv
     assert argv[-1] == "fix it"
@@ -332,9 +328,7 @@ async def test_implement_spawn_injects_binding_env_and_strict_mcp(
         assert "--strict-mcp-config" in spec.command
         config_json = spec.command[spec.command.index("--mcp-config") + 1]
         assert json.loads(config_json) == {
-            "mcpServers": {
-                "supabase": {"type": "http", "url": "https://mcp.example"}
-            }
+            "mcpServers": {"supabase": {"type": "http", "url": "https://mcp.example"}}
         }
     finally:
         await conn.close()

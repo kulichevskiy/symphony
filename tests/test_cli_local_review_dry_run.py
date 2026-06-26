@@ -35,9 +35,7 @@ def _fake_runner_factory(captured: _CapturedSpec, final_text: str):
             # path that prefers the file picks it up.
             if "-o" in spec.command:
                 idx = spec.command.index("-o")
-                Path(spec.command[idx + 1]).write_text(
-                    final_text, encoding="utf-8"
-                )
+                Path(spec.command[idx + 1]).write_text(final_text, encoding="utf-8")
 
             async def gen() -> AsyncIterator[RunnerEvent]:
                 yield RunnerEvent(
@@ -63,18 +61,14 @@ def _fake_runner_factory(captured: _CapturedSpec, final_text: str):
     return lambda: _FakeRunner()
 
 
-def test_dry_run_approved_prints_verdict_and_no_findings(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_approved_prints_verdict_and_no_findings(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     workspace = tmp_path / "ws"
     workspace.mkdir()
     captured = _CapturedSpec()
     monkeypatch.setattr(
         cli_module,
         "_DRY_RUN_RUNNER_FACTORY",
-        _fake_runner_factory(
-            captured, f"looks clean\n{VERDICT_APPROVED_MARKER}"
-        ),
+        _fake_runner_factory(captured, f"looks clean\n{VERDICT_APPROVED_MARKER}"),
     )
 
     result = CliRunner().invoke(
@@ -106,16 +100,12 @@ def test_dry_run_approved_prints_verdict_and_no_findings(
     assert "read-only" in captured.spec.command
 
 
-def test_dry_run_changes_requested_prints_findings(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_changes_requested_prints_findings(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     workspace = tmp_path / "ws"
     workspace.mkdir()
     captured = _CapturedSpec()
     findings_body = (
-        "## Findings\n"
-        "- `add.py:6` - missing zero check.\n\n"
-        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+        f"## Findings\n- `add.py:6` - missing zero check.\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     )
     monkeypatch.setattr(
         cli_module,
@@ -137,9 +127,7 @@ def test_dry_run_changes_requested_prints_findings(
     assert "missing zero check" in result.output
 
 
-def test_dry_run_claude_reviewer_uses_print_argv(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_claude_reviewer_uses_print_argv(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     workspace = tmp_path / "ws"
     workspace.mkdir()
     captured = _CapturedSpec()
@@ -167,9 +155,7 @@ def test_dry_run_claude_reviewer_uses_print_argv(
     assert "-o" not in captured.spec.command
 
 
-def test_dry_run_codex_without_model_strips_model_flag(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_codex_without_model_strips_model_flag(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """No `--reviewer-model` → strip `--model` from argv so codex uses
     the operator's account default. Critical: real ChatGPT accounts
     reject the default model literal otherwise (iter 5 lesson)."""
@@ -197,9 +183,7 @@ def test_dry_run_codex_without_model_strips_model_flag(
     assert "--model" not in captured.spec.command
 
 
-def test_dry_run_codex_with_model_keeps_flag(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_codex_with_model_keeps_flag(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     workspace = tmp_path / "ws"
     workspace.mkdir()
     captured = _CapturedSpec()
@@ -224,15 +208,10 @@ def test_dry_run_codex_with_model_keeps_flag(
     assert result.exit_code == 0, result.output
     assert captured.spec is not None
     assert "--model" in captured.spec.command
-    assert (
-        captured.spec.command[captured.spec.command.index("--model") + 1]
-        == "gpt-5.1-codex"
-    )
+    assert captured.spec.command[captured.spec.command.index("--model") + 1] == "gpt-5.1-codex"
 
 
-def test_dry_run_threads_issue_context_into_prompt(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_threads_issue_context_into_prompt(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     workspace = tmp_path / "ws"
     workspace.mkdir()
     captured = _CapturedSpec()
@@ -266,18 +245,14 @@ def test_dry_run_threads_issue_context_into_prompt(
     assert "auth" in prompt
 
 
-def test_dry_run_unparseable_message_surfaces_raw_text(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_dry_run_unparseable_message_surfaces_raw_text(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     workspace = tmp_path / "ws"
     workspace.mkdir()
     captured = _CapturedSpec()
     monkeypatch.setattr(
         cli_module,
         "_DRY_RUN_RUNNER_FACTORY",
-        _fake_runner_factory(
-            captured, "I have thoughts but forgot the marker."
-        ),
+        _fake_runner_factory(captured, "I have thoughts but forgot the marker."),
     )
 
     result = CliRunner().invoke(

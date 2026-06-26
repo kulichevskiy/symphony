@@ -517,9 +517,7 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
             cfg,
             linear,
             conn,
-            runner=_FakeRunner(
-                [RunnerEvent(kind="exit", returncode=0)], commit_on_implement=True
-            ),
+            runner=_FakeRunner([RunnerEvent(kind="exit", returncode=0)], commit_on_implement=True),
             gh=gh,
             workspace=workspace,
             push_fn=AsyncMock(),
@@ -540,9 +538,7 @@ async def test_implement_dispatch_falls_back_when_base_lookup_fails(
 
 
 def _blocked_runner(message: str) -> _FakeRunner:
-    result_line = json.dumps(
-        {"type": "result", "subtype": "success", "result": message}
-    )
+    result_line = json.dumps({"type": "result", "subtype": "success", "result": message})
     return _FakeRunner(
         [
             RunnerEvent(kind="started", pid=4242),
@@ -554,9 +550,7 @@ def _blocked_runner(message: str) -> _FakeRunner:
     )
 
 
-async def _run_blocked_dispatch(
-    tmp_path: Path, conn: object, runner: _FakeRunner
-) -> object:
+async def _run_blocked_dispatch(tmp_path: Path, conn: object, runner: _FakeRunner) -> object:
     cfg = Config(
         repos=[_binding()],
         log_root=tmp_path / "logs",
@@ -920,16 +914,28 @@ async def test_redispatched_reconfirmed_branch_advances_to_review(
         # Seed the prior implement run that died with a non-resume-safe
         # `cancelled` kind, forcing this re-dispatch down the agent path.
         await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="Add authentication",
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add authentication",
             team_key="ENG",
         )
         await db.runs.create(
-            conn, id="prev-run", issue_id="iss-1", stage="implement",
-            status="running", pid=None, started_at="2026-01-01T00:00:00Z",
+            conn,
+            id="prev-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-01-01T00:00:00Z",
         )
         await db.runs.update_status(
-            conn, "prev-run", "failed", ended_at="2026-01-01T00:01:00Z",
-            kind="cancelled", detail="dispatch cancelled",
+            conn,
+            "prev-run",
+            "failed",
+            ended_at="2026-01-01T00:01:00Z",
+            kind="cancelled",
+            detail="dispatch cancelled",
         )
 
         gh = MagicMock()
@@ -942,7 +948,12 @@ async def test_redispatched_reconfirmed_branch_advances_to_review(
         runner = _blocked_runner("Re-confirmed: 216 tests pass.\n\nSYMPHONY_DONE")
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -1198,9 +1209,7 @@ async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(
         assert any(expected_error_text in body for body in posted)
 
         # --- `$retry` resumes delivery; pr_create now succeeds. ---
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
 
         await orch._handle_slash_intent(  # noqa: SLF001
             "iss-1",
@@ -1401,10 +1410,7 @@ async def test_in_memory_deliver_retry_reacquires_and_reparks_stale_workspace(
         assert wait is not None
         assert wait.kind == db.operator_waits.KIND_DELIVER_FAILED
         posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
-        assert any(
-            "refusing to deliver without proving branch work" in body
-            for body in posted
-        )
+        assert any("refusing to deliver without proving branch work" in body for body in posted)
         assert len([s for s in runner.specs if s.stage == "implement"]) == 1
     finally:
         await conn.close()
@@ -1843,7 +1849,12 @@ async def test_implement_dispatch_marks_failed_on_runner_error(tmp_path: Path) -
         runner = _FakeRunner(events)
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=AsyncMock(),
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -2253,8 +2264,10 @@ def _git(workspace: Path, *args: str) -> None:
     subprocess.run(
         [
             "git",
-            "-c", "user.name=t",
-            "-c", "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
             *args,
         ],
         cwd=workspace,
@@ -2471,9 +2484,7 @@ def _done_result_line(message: str) -> str:
     return json.dumps({"type": "result", "subtype": "success", "result": message})
 
 
-async def _seed_publish_failed_implement_run(
-    conn, *, run_id: str = "publish-failed-run"
-) -> None:
+async def _seed_publish_failed_implement_run(conn, *, run_id: str = "publish-failed-run") -> None:
     issue = _issue()
     await db.issues.upsert(
         conn,
@@ -2806,7 +2817,12 @@ async def test_branch_setup_failure_releases_workspace_and_fails_run(
         )
         push_fn = AsyncMock()
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -2888,7 +2904,12 @@ async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
         )
         push_fn = AsyncMock()
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -3098,7 +3119,12 @@ async def test_resume_at_publish_after_delivery_failure_skips_agent(
         linear1.post_comment = AsyncMock(return_value="cmt-1")
         linear1.move_issue = AsyncMock()
         orch1 = Orchestrator(
-            cfg, linear1, conn, runner=runner1, gh=gh, workspace=workspace,
+            cfg,
+            linear1,
+            conn,
+            runner=runner1,
+            gh=gh,
+            workspace=workspace,
             push_fn=failing_push,
         )
         orch1._states = {"ENG": _states()}  # noqa: SLF001
@@ -3122,7 +3148,12 @@ async def test_resume_at_publish_after_delivery_failure_skips_agent(
         linear2.post_comment = AsyncMock(return_value="cmt-2")
         linear2.move_issue = AsyncMock()
         orch2 = Orchestrator(
-            cfg, linear2, conn, runner=runner2, gh=gh, workspace=workspace,
+            cfg,
+            linear2,
+            conn,
+            runner=runner2,
+            gh=gh,
+            workspace=workspace,
             push_fn=good_push,
         )
         orch2._states = {"ENG": _states()}  # noqa: SLF001
@@ -3179,7 +3210,12 @@ async def test_publish_failed_retry_without_resolved_base_runs_agent_not_publish
         linear.post_comment = AsyncMock(return_value="cmt-1")
         linear.move_issue = AsyncMock()
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -3237,7 +3273,12 @@ async def test_publish_failed_retry_with_base_and_no_ahead_runs_agent_not_publis
         linear.post_comment = AsyncMock(return_value="cmt-1")
         linear.move_issue = AsyncMock()
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -3327,16 +3368,19 @@ async def test_branch_ahead_short_circuit_reruns_local_review_not_parked(
         linear.move_issue = AsyncMock()
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
         # The reused branch is re-reviewed; drive it to APPROVED so the
         # routing decision under test is exercised without a real reviewer.
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
-            return_value=LoopResult(
-                outcome=LoopOutcome.APPROVED, iterations=1, verdicts=()
-            )
+            return_value=LoopResult(outcome=LoopOutcome.APPROVED, iterations=1, verdicts=())
         )
 
         await orch._dispatch_one(binding, _issue())  # noqa: SLF001
@@ -3420,7 +3464,12 @@ async def test_branch_ahead_short_circuit_records_verify_pass(
         linear.move_issue = AsyncMock()
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -3482,7 +3531,12 @@ async def test_branch_ahead_short_circuit_dirty_tree_fails_without_fix_turn(
         linear.move_issue = AsyncMock()
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
@@ -3554,7 +3608,12 @@ async def test_branch_ahead_short_circuit_verify_failure_skips_fix_turn(
         linear.move_issue = AsyncMock()
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh, workspace=workspace,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
             push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001

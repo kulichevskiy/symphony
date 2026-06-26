@@ -14,9 +14,7 @@ from symphony.cli import main
 
 
 class _FakeLinear:
-    def __init__(
-        self, viewer_keys: list[str], states: dict[str, dict[str, str]]
-    ) -> None:
+    def __init__(self, viewer_keys: list[str], states: dict[str, dict[str, str]]) -> None:
         self._viewer_keys = viewer_keys
         self._states = states
 
@@ -77,13 +75,9 @@ def _yaml_with_review_lanes(
     code_review: str | None = "In Review",
     local_code_review: str | None = "Local Code Review",
 ) -> str:
-    code_review_line = (
-        f"      code_review: {code_review}\n" if code_review is not None else ""
-    )
+    code_review_line = f"      code_review: {code_review}\n" if code_review is not None else ""
     local_code_review_line = (
-        f"      local_code_review: {local_code_review}\n"
-        if local_code_review is not None
-        else ""
+        f"      local_code_review: {local_code_review}\n" if local_code_review is not None else ""
     )
     return f"""
 repos:
@@ -209,16 +203,12 @@ async def test_fetch_claude_effort_capabilities_http_error_raises_valueerror(
         await fetch_claude_effort_capabilities("sonnet")
 
 
-def test_preflight_exits_cleanly_when_fetcher_http_errors(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_exits_cleanly_when_fetcher_http_errors(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """An httpx error from the fetcher must not escape as a traceback — preflight
     exits 2 with a message via the re-raised ValueError."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
-    _install_fake(
-        monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES})
-    )
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
 
     async def _raise(_model: str) -> list[str]:
         raise ValueError("Models API returned HTTP 401 for claude model 'sonnet'")
@@ -239,9 +229,7 @@ def _fake_claude_caps(monkeypatch, supported: list[str]) -> None:  # type: ignor
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
 
 
-def test_preflight_accepts_supported_model_effort_pair(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_accepts_supported_model_effort_pair(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
@@ -253,9 +241,7 @@ def test_preflight_accepts_supported_model_effort_pair(
     assert "claude model 'sonnet' supports effort 'high'" in result.output
 
 
-def test_preflight_rejects_unsupported_model_effort_pair(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
@@ -270,9 +256,7 @@ def test_preflight_rejects_unsupported_model_effort_pair(
     )
 
 
-def test_preflight_checks_codex_pair_via_family_enum(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Codex (model, effort) pairs are checked against the fixed family enum,
     not the Models API — the claude fetcher is never called."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
@@ -316,9 +300,7 @@ def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     assert "codex permissions profile not required" in result.output
 
 
-def test_preflight_allows_jira_binding_without_linear_key(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_allows_jira_binding_without_linear_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.delenv("LINEAR_API_KEY", raising=False)
     monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
     monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
@@ -391,20 +373,14 @@ def test_preflight_creates_codex_profile_when_local_reviewer_uses_codex(
     )
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_ready("Todo").replace(
-            "review_strategy: remote", "local_review: true"
-        )
-    )
+    p.write_text(_yaml_with_ready("Todo").replace("review_strategy: remote", "local_review: true"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert (codex_home / "config.toml").exists()
     assert "symphony-git" in result.output
 
 
-def test_preflight_fails_when_ready_not_in_team_states(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_fails_when_ready_not_in_team_states(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """If the binding's `ready` name is not in the team's workflow, fail loudly."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
@@ -429,9 +405,7 @@ def test_preflight_fails_when_ready_not_in_team_states(
     assert "Backlog" in result.output
 
 
-def test_preflight_fails_when_waiting_not_in_team_states(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_fails_when_waiting_not_in_team_states(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
     fake = _FakeLinear(
@@ -556,9 +530,7 @@ def test_preflight_allows_omitted_review_lanes_when_both_reviews_disabled(
     assert "ENG → org/api-svc: states ok" in result.output
 
 
-def test_preflight_allows_local_only_without_code_review_lane(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_allows_local_only_without_code_review_lane(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
     fake = _FakeLinear(

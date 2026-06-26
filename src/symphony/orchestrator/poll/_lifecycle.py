@@ -228,17 +228,13 @@ class _LifecycleMixin(_OrchestratorBase):
             post_codex_review: bool = True,
         ) -> db.runs.Run: ...
 
-        async def _track_delivery_handoff_recovery_wait(
-            self, ctx: _PendingDelivery
-        ) -> None: ...
+        async def _track_delivery_handoff_recovery_wait(self, ctx: _PendingDelivery) -> None: ...
 
         async def _track_implement_failed_wait(
             self, issue_id: str, run_id: str, binding: RepoBinding
         ) -> None: ...
 
-    async def _dispatch_one(
-        self, binding: RepoBinding, issue: LinearIssue
-    ) -> str | None:
+    async def _dispatch_one(self, binding: RepoBinding, issue: LinearIssue) -> str | None:
         """Drive one issue end-to-end through the Implement stage.
 
         Persists first, announces second: if the host crashed after
@@ -322,14 +318,16 @@ class _LifecycleMixin(_OrchestratorBase):
         # workspace on a setup failure mirrors the implement path.
         release_on_setup_failure = False
         try:
-            base_branch, short_circuit, resume_after_local_review = (
-                await self._plan_implement_dispatch(
-                    binding=binding,
-                    issue=issue,
-                    issue_id=issue_id,
-                    run_id=run_id,
-                    workspace_path=workspace_path,
-                )
+            (
+                base_branch,
+                short_circuit,
+                resume_after_local_review,
+            ) = await self._plan_implement_dispatch(
+                binding=binding,
+                issue=issue,
+                issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
             )
         except Exception as e:  # noqa: BLE001 — surface as failed run
             release_on_setup_failure = True
@@ -568,11 +566,7 @@ class _LifecycleMixin(_OrchestratorBase):
         # deliverable commits before publish can be resumed; when the base is
         # unresolved, _branch_ahead_of_base deliberately cannot supply that
         # proof, so the run falls back to the agent/completion-gate path.
-        short_circuit = (
-            branch_ahead
-            and not pending_handoff
-            and not previous_requires_agent
-        )
+        short_circuit = branch_ahead and not pending_handoff and not previous_requires_agent
         return base_branch, short_circuit, resume_after_local_review
 
     async def _run_implement_or_resume(
@@ -598,8 +592,7 @@ class _LifecycleMixin(_OrchestratorBase):
         local_review_result: LoopResult | None
         if short_circuit:
             log.info(
-                "branch for %s already ahead of %s; skipping agent, "
-                "proceeding to publish",
+                "branch for %s already ahead of %s; skipping agent, proceeding to publish",
                 issue.identifier,
                 base_branch,
             )
@@ -723,15 +716,13 @@ class _LifecycleMixin(_OrchestratorBase):
         head_before = await _workspace_head_sha(workspace_path)
 
         try:
-            cumulative_usage, final_kind, final_returncode = (
-                await self._run_agent(
-                    binding=binding,
-                    issue=issue,
-                    storage_issue_id=issue_id,
-                    run_id=run_id,
-                    workspace_path=workspace_path,
-                    prior_total=prior_total,
-                )
+            cumulative_usage, final_kind, final_returncode = await self._run_agent(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                prior_total=prior_total,
             )
         except Exception as e:  # noqa: BLE001 — surface as failed run
             log.exception("agent execution failed for %s", issue.identifier)
@@ -798,8 +789,7 @@ class _LifecycleMixin(_OrchestratorBase):
         )
         if completion.outcome == "blocked":
             reason = (
-                completion.blocked_reason
-                or "agent blocked on a human action but gave no reason"
+                completion.blocked_reason or "agent blocked on a human action but gave no reason"
             )
             log.info("implement run %s classified blocked: %s", run_id, reason)
             # Captured verbatim on the run record (termination_kind="blocked",
@@ -930,9 +920,7 @@ class _LifecycleMixin(_OrchestratorBase):
         # has finished; if the issue has already crossed its budget, park
         # rather than spawning further fix turns. Evaluated only when fixes
         # could be dispatched (`allow_fixes`), never mid-run.
-        if allow_fixes and await self._maybe_park_for_token_budget(
-            issue_id, run_id, binding
-        ):
+        if allow_fixes and await self._maybe_park_for_token_budget(issue_id, run_id, binding):
             return False, None
 
         # 4.5. Local-review pre-flight. When `binding.local_review` is set,
@@ -959,9 +947,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 # succeeded and short-circuits to the pre-push gates instead of
                 # re-running the implementer on an already-complete branch.
                 _lr_api_error = (
-                    local_review_result.api_error
-                    if local_review_result is not None
-                    else None
+                    local_review_result.api_error if local_review_result is not None else None
                 )
                 if await self._maybe_requeue_transient_agent_failure(
                     run_id=run_id,
@@ -1046,8 +1032,7 @@ class _LifecycleMixin(_OrchestratorBase):
         dirty_files = await _workspace_dirty_files(workspace_path)
         if dirty_files and allow_fixes:
             log.warning(
-                "dirty working tree before push for %s (%d entries); "
-                "dispatching one fix turn",
+                "dirty working tree before push for %s (%d entries); dispatching one fix turn",
                 issue.identifier,
                 len(dirty_files),
             )
@@ -1113,13 +1098,9 @@ class _LifecycleMixin(_OrchestratorBase):
             base_branch=base_branch,
         )
 
-    async def _delivery_handoff_started(
-        self, *, ctx: _PendingDelivery, pr_url: str
-    ) -> bool:
+    async def _delivery_handoff_started(self, *, ctx: _PendingDelivery, pr_url: str) -> bool:
         """True once delivery reached durable PR/review handoff metadata."""
-        if await db.runs.has_live_stage(
-            self._conn, ctx.storage_issue_id, stage="review"
-        ):
+        if await db.runs.has_live_stage(self._conn, ctx.storage_issue_id, stage="review"):
             return True
 
         pr_number = pr_number_from_url(pr_url)
@@ -1225,12 +1206,8 @@ class _LifecycleMixin(_OrchestratorBase):
         # live review run; no-review handoff writes only review_state/issue_prs.
         # The Linear stage_done announcement has its own durable marker because
         # a handoff can fail before either PR/review metadata row exists.
-        first_handoff = not await self._delivery_handoff_started(
-            ctx=ctx, pr_url=pr_url
-        )
-        stage_done_announced = await db.runs.has_stage_done_announced(
-            self._conn, run_id
-        )
+        first_handoff = not await self._delivery_handoff_started(ctx=ctx, pr_url=pr_url)
+        stage_done_announced = await db.runs.has_stage_done_announced(self._conn, run_id)
 
         # The stage-transition comment is first-delivery only. The completed
         # write must happen before the first handoff so the review run can pass
@@ -1270,9 +1247,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     )
                     await tracker.post_comment(issue.id, truncate_body(done_body))
                 except LinearError as e:
-                    log.warning(
-                        "stage_done comment failed on %s: %s", issue.identifier, e
-                    )
+                    log.warning("stage_done comment failed on %s: %s", issue.identifier, e)
 
             await self._track_delivery_handoff_recovery_wait(ctx)
             await db.runs.update_status(
@@ -1288,9 +1263,7 @@ class _LifecycleMixin(_OrchestratorBase):
         # rather than propagate and leave a completed run with no review
         # started and no operator wait.
         try:
-            delivered_run_id = await self._deliver_review_handoff(
-                ctx=ctx, pr_url=pr_url
-            )
+            delivered_run_id = await self._deliver_review_handoff(ctx=ctx, pr_url=pr_url)
         except Exception as e:  # noqa: BLE001
             log.warning("delivery handoff failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
@@ -1311,9 +1284,7 @@ class _LifecycleMixin(_OrchestratorBase):
             )
         return delivered_run_id
 
-    async def _deliver_review_handoff(
-        self, *, ctx: _PendingDelivery, pr_url: str
-    ) -> str:
+    async def _deliver_review_handoff(self, *, ctx: _PendingDelivery, pr_url: str) -> str:
         """Post-PR handoff: register the merge candidate (no-review) or start
         the Review stage. Raises on unexpected DB/Linear faults so the caller
         can park `deliver_failed`."""
@@ -1323,10 +1294,7 @@ class _LifecycleMixin(_OrchestratorBase):
         run_id = ctx.run_id
         local_review_result = ctx.local_review_result
 
-        if (
-            not binding.resolved_local_review()
-            and not binding.resolved_remote_review()
-        ):
+        if not binding.resolved_local_review() and not binding.resolved_remote_review():
             pr_number = pr_number_from_url(pr_url)
             await db.review_state.begin_review(
                 self._conn,
@@ -1364,9 +1332,7 @@ class _LifecycleMixin(_OrchestratorBase):
             binding.resolved_local_review()
             and not _local_review_permits_remote(local_review_result)
         )
-        post_codex_review = (
-            binding.resolved_remote_review() and not local_review_blocks_remote
-        )
+        post_codex_review = binding.resolved_remote_review() and not local_review_blocks_remote
         review_run = await self._start_review_stage(
             binding=binding,
             issue=issue,
@@ -1374,10 +1340,7 @@ class _LifecycleMixin(_OrchestratorBase):
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
-        if (
-            binding.resolved_local_review()
-            and _local_review_needs_approval(local_review_result)
-        ):
+        if binding.resolved_local_review() and _local_review_needs_approval(local_review_result):
             await self._park_local_only_review_needs_approval(
                 run=review_run,
                 binding=binding,
@@ -1393,10 +1356,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 binding.resolved_remote_review()
                 and _local_review_permits_remote(local_review_result)
             )
-            and (
-                local_review_result is None
-                or local_review_result.outcome != LoopOutcome.APPROVED
-            )
+            and (local_review_result is None or local_review_result.outcome != LoopOutcome.APPROVED)
         ):
             await self._fail_review_run(
                 run=review_run,
@@ -1431,9 +1391,7 @@ class _LifecycleMixin(_OrchestratorBase):
             await self._post_local_review_pr_summary(
                 binding=binding,
                 pr_url=pr_url,
-                reviewer_agent=binding.resolved_role(
-                    "review_find", self.config.roles
-                ).agent,
+                reviewer_agent=binding.resolved_role("review_find", self.config.roles).agent,
                 result=local_review_result,
             )
         return run_id
@@ -1465,9 +1423,7 @@ class _LifecycleMixin(_OrchestratorBase):
             base_branch = binding.base_branch
             if base_branch is None:
                 try:
-                    base_branch = await self._gh.repo_default_branch(
-                        binding.github_repo
-                    )
+                    base_branch = await self._gh.repo_default_branch(binding.github_repo)
                 except GitHubError as e:
                     log.warning(
                         "repo_default_branch failed during local review on %s: %s; "
@@ -1489,9 +1445,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 if reviewer_agent == "codex" and review_find_role.model
                 else binding.resolved_reviewer_codex_model()
             )
-            last_message_dir = (
-                self.config.log_root / "local_review" / parent_run_id
-            )
+            last_message_dir = self.config.log_root / "local_review" / parent_run_id
             # Local-review uses its own cap (default 3) which is
             # typically lower than `review_iteration_cap` (default 12)
             # used by the remote `@codex` loop. The two loops have
@@ -1501,9 +1455,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 self.config.local_review_iteration_cap
             )
 
-            await self._move_issue_to_local_code_review_state(
-                binding=binding, issue=issue
-            )
+            await self._move_issue_to_local_code_review_state(binding=binding, issue=issue)
             await self._post_local_review_starting_comment(
                 binding=binding,
                 issue=issue,
@@ -1528,9 +1480,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 started_at=self._now().isoformat(),
             )
 
-            async def _on_iteration(
-                i: int, verdict: LocalVerdict, _cost_so_far: float
-            ) -> None:
+            async def _on_iteration(i: int, verdict: LocalVerdict, _cost_so_far: float) -> None:
                 await self._post_local_review_iteration_comment(
                     binding=binding,
                     issue=issue,
@@ -1553,9 +1503,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_agent=reviewer_agent,
                     reviewer_codex_model=reviewer_codex_model,
                     local_review_claude_model=binding.local_review_claude_model,
-                    local_review_verifier_claude_model=(
-                        binding.local_review_verifier_claude_model
-                    ),
+                    local_review_verifier_claude_model=(binding.local_review_verifier_claude_model),
                     fix_claude_model=self._fix_claude_model(binding),
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
@@ -1565,9 +1513,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
-                    diff_size_provider=partial(
-                        _workspace_diff_size, base_branch=base_branch
-                    ),
+                    diff_size_provider=partial(_workspace_diff_size, base_branch=base_branch),
                     workspace_scrubber=_workspace_scrub,
                     on_iteration=_on_iteration,
                     allow_fixes=allow_fixes,
@@ -1582,17 +1528,14 @@ class _LifecycleMixin(_OrchestratorBase):
                 )
 
             log.info(
-                "local-review phase for %s ended in %s (iterations=%d, "
-                "strategy=%s, reviewer=%s)",
+                "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",
                 issue.identifier,
                 result.outcome.value,
                 result.iterations,
                 binding.review_strategy,
                 reviewer_agent,
             )
-            await self._post_local_review_comment(
-                binding=binding, issue=issue, result=result
-            )
+            await self._post_local_review_comment(binding=binding, issue=issue, result=result)
             return result
         except Exception as e:  # noqa: BLE001
             # Never break the pipeline because of a local-review fault.
@@ -1720,8 +1663,7 @@ class _LifecycleMixin(_OrchestratorBase):
         pr_number = pr_number_from_url(pr_url)
         if pr_number is None:
             log.warning(
-                "could not parse PR number from %r — skipping local-review "
-                "PR summary",
+                "could not parse PR number from %r — skipping local-review PR summary",
                 pr_url,
             )
             return
@@ -1732,9 +1674,7 @@ class _LifecycleMixin(_OrchestratorBase):
             f"- strategy: `{binding.review_strategy}`\n"
         )
         try:
-            await self._gh.pr_comment(
-                pr_number, body, repo=binding.github_repo
-            )
+            await self._gh.pr_comment(pr_number, body, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not post local-review PR summary on %s#%d: %s",
@@ -1835,9 +1775,7 @@ class _LifecycleMixin(_OrchestratorBase):
         try:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
-            log.warning(
-                "local-review comment post failed on %s: %s", issue.identifier, e
-            )
+            log.warning("local-review comment post failed on %s: %s", issue.identifier, e)
 
     async def _block_local_only_review_infra_failure(
         self,
@@ -1869,9 +1807,7 @@ class _LifecycleMixin(_OrchestratorBase):
             run_id,
             reason,
             termination_kind=(
-                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND
-                if reviewer_never_verdicted
-                else None
+                db.runs.LOCAL_REVIEW_INFRA_FAILED_KIND if reviewer_never_verdicted else None
             ),
         )
 
@@ -1960,9 +1896,7 @@ class _LifecycleMixin(_OrchestratorBase):
         # `UsageCostEstimator.delta` is threaded into the fix turn's
         # `collect_runner_output` to bill its tokens; the fix-turn stdout
         # is written to `verify_log_path` for per-model attribution.
-        cost_estimator = _UsageCostEstimator(
-            agent=binding.agent, codex_model=binding.codex_model
-        )
+        cost_estimator = _UsageCostEstimator(agent=binding.agent, codex_model=binding.codex_model)
         verify_run_id = str(uuid.uuid4())
         verify_log_path = self.config.log_root / f"{verify_run_id}.log"
         await db.runs.create(
@@ -1980,9 +1914,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 runner=self._runner,
                 workspace_path=workspace_path,
                 verify_cmd=verify_cmd,
-                timeout_secs=binding.resolved_verify_timeout_secs(
-                    self.config.command_timeout_secs
-                ),
+                timeout_secs=binding.resolved_verify_timeout_secs(self.config.command_timeout_secs),
                 parent_run_id=parent_run_id,
                 issue_title=issue.title,
                 issue_body=issue.description,
@@ -2045,9 +1977,7 @@ class _LifecycleMixin(_OrchestratorBase):
             )
         except Exception:  # noqa: BLE001
             log.warning("could not persist verify usage for run %s", run_id)
-        await _record_run_model_usage(
-            self._conn, run_id, log_path, codex_model=codex_model
-        )
+        await _record_run_model_usage(self._conn, run_id, log_path, codex_model=codex_model)
         try:
             if ok:
                 await db.runs.update_status(
@@ -2062,9 +1992,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     run_id,
                     "failed",
                     ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed", reason="verify_cmd failed"
-                    ),
+                    **_termination_kwargs(status="failed", reason="verify_cmd failed"),
                 )
         except Exception:  # noqa: BLE001
             log.warning("could not finalize verify run %s", run_id)

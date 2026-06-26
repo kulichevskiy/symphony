@@ -120,31 +120,19 @@ class GitHubClient(Protocol):
         include_status_checks: bool = False,
     ) -> dict[str, Any]: ...
 
-    async def pr_comment(
-        self, pr: int | str, body: str, *, repo: str | None = None
-    ) -> None: ...
+    async def pr_comment(self, pr: int | str, body: str, *, repo: str | None = None) -> None: ...
 
     async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str: ...
 
-    async def pr_checks(
-        self, pr: int | str, *, repo: str | None = None
-    ) -> PRChecks: ...
+    async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks: ...
 
-    async def pr_review_comments(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]: ...
+    async def pr_review_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]: ...
 
-    async def pr_reviews(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]: ...
+    async def pr_reviews(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]: ...
 
-    async def pr_issue_comments(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]: ...
+    async def pr_issue_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]: ...
 
-    async def pr_reactions(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]: ...
+    async def pr_reactions(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]: ...
 
     async def commit_committed_at(self, repo: str, sha: str) -> str: ...
 
@@ -262,9 +250,7 @@ class GitHub:
             return ["--hostname", host], f"{owner}/{name}"
         if len(parts) == 2:
             return [], repo
-        raise GitHubError(
-            f"invalid repo {repo!r} (expected [HOST/]OWNER/REPO)"
-        )
+        raise GitHubError(f"invalid repo {repo!r} (expected [HOST/]OWNER/REPO)")
 
     # ---- high-level ----
 
@@ -272,13 +258,9 @@ class GitHub:
         await self._run(["repo", "clone", repo, str(dest)])
 
     async def repo_default_branch(self, repo: str) -> str:
-        result = await self._run_json(
-            ["repo", "view", repo, "--json", "defaultBranchRef"]
-        )
+        result = await self._run_json(["repo", "view", repo, "--json", "defaultBranchRef"])
         if not isinstance(result, dict):
-            raise GitHubError(
-                f"repo view: expected object, got {type(result).__name__}"
-            )
+            raise GitHubError(f"repo view: expected object, got {type(result).__name__}")
         default_ref = result.get("defaultBranchRef")
         if not isinstance(default_ref, dict) or not default_ref.get("name"):
             raise GitHubError(f"repo view: missing default branch for {repo}")
@@ -286,13 +268,9 @@ class GitHub:
 
     async def repo_view(self, repo: str) -> dict[str, Any]:
         host_args, owner_repo = self._api_repo(repo)
-        result = await self._run_json(
-            ["api", *host_args, f"repos/{owner_repo}"]
-        )
+        result = await self._run_json(["api", *host_args, f"repos/{owner_repo}"])
         if not isinstance(result, dict):
-            raise GitHubError(
-                f"repo view: expected object, got {type(result).__name__}"
-            )
+            raise GitHubError(f"repo view: expected object, got {type(result).__name__}")
         payload = dict(result)
         if "allow_auto_merge" in payload:
             payload.setdefault(
@@ -362,17 +340,13 @@ class GitHub:
             ]
         )
         if not isinstance(result, list):
-            raise GitHubError(
-                f"pr list: expected array, got {type(result).__name__}"
-            )
+            raise GitHubError(f"pr list: expected array, got {type(result).__name__}")
         for entry in result:
             if isinstance(entry, dict) and entry.get("url"):
                 return {"number": int(entry["number"]), "url": str(entry["url"])}
         return None
 
-    async def pr_for_head(
-        self, *, head: str, repo: str | None = None
-    ) -> str | None:
+    async def pr_for_head(self, *, head: str, repo: str | None = None) -> str | None:
         """Return the URL of the open PR for `head`, or None if none exists."""
         pr = await self.open_pr_for_head(head=head, repo=repo)
         return pr["url"] if pr is not None else None
@@ -484,9 +458,7 @@ class GitHub:
             comments = []
             comments_error = str(exc)
         comments.sort(
-            key=lambda comment: str(
-                comment.get("updated_at") or comment.get("created_at") or ""
-            ),
+            key=lambda comment: str(comment.get("updated_at") or comment.get("created_at") or ""),
             reverse=True,
         )
         merged_by = view.get("mergedBy")
@@ -497,11 +469,7 @@ class GitHub:
             "mergeable": view.get("mergeable"),
             "merge_state_status": view.get("mergeStateStatus"),
             "merged_at": view.get("mergedAt"),
-            "merged_by": (
-                merged_by.get("login")
-                if isinstance(merged_by, dict)
-                else merged_by
-            ),
+            "merged_by": (merged_by.get("login") if isinstance(merged_by, dict) else merged_by),
             "check_summary": _status_check_summary(view.get("statusCheckRollup")),
             "comments": [
                 {
@@ -545,8 +513,7 @@ class GitHub:
         # Both exit 1; exit 8 means checks are still pending.
         output = f"{stderr}\n{stdout}".casefold()
         if returncode == 1 and (
-            "no checks reported" in output
-            or "no required checks reported" in output
+            "no checks reported" in output or "no required checks reported" in output
         ):
             return PRChecks()
         if returncode not in (0, 1, 8):
@@ -575,9 +542,7 @@ class GitHub:
             )
         return PRChecks(runs=runs)
 
-    async def pr_review_comments(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]:
+    async def pr_review_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         host_args, owner_repo = self._api_repo(repo)
         result = await self._run_paginated_list(
             [
@@ -610,9 +575,7 @@ class GitHub:
             )
         return [entry for entry in result if isinstance(entry, dict)]
 
-    async def pr_reviews(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]:
+    async def pr_reviews(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         host_args, owner_repo = self._api_repo(repo)
         result = await self._run_paginated_list(
             [
@@ -623,9 +586,7 @@ class GitHub:
         )
         return result
 
-    async def pr_issue_comments(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]:
+    async def pr_issue_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         """Regular PR comments (issue comments), not inline review comments."""
         host_args, owner_repo = self._api_repo(repo)
         result = await self._run_paginated_list(
@@ -637,9 +598,7 @@ class GitHub:
         )
         return result
 
-    async def pr_reactions(
-        self, pr: int | str, *, repo: str
-    ) -> list[dict[str, Any]]:
+    async def pr_reactions(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]:
         host_args, owner_repo = self._api_repo(repo)
         result = await self._run_paginated_list(
             [
@@ -662,9 +621,7 @@ class GitHub:
             ]
         )
         if not isinstance(result, list):
-            raise GitHubError(
-                f"paginated api: expected array, got {type(result).__name__}"
-            )
+            raise GitHubError(f"paginated api: expected array, got {type(result).__name__}")
         flattened: list[dict[str, Any]] = []
         for page in result:
             if isinstance(page, list):
@@ -683,9 +640,7 @@ class GitHub:
             ]
         )
         if not isinstance(result, dict):
-            raise GitHubError(
-                f"commit view: expected object, got {type(result).__name__}"
-            )
+            raise GitHubError(f"commit view: expected object, got {type(result).__name__}")
         commit = result.get("commit")
         if not isinstance(commit, dict):
             raise GitHubError("commit view: missing commit object")
@@ -743,9 +698,7 @@ class GitHub:
         # `--auto` requires repo-level auto-merge to be enabled, so callers
         # opt in explicitly when they want merge-on-green.
         argv = ["pr", "merge", str(pr), f"--{strategy}", *self._repo_args(repo)]
-        use_auto = auto and (
-            repo is None or repo not in self._auto_merge_disabled_repos
-        )
+        use_auto = auto and (repo is None or repo not in self._auto_merge_disabled_repos)
         if use_auto:
             argv.append("--auto")
         try:
@@ -824,10 +777,7 @@ def _status_check_summary(raw: object) -> dict[str, object]:
     details: list[dict[str, object]] = []
     for check in checks:
         state = str(
-            check.get("state")
-            or check.get("status")
-            or check.get("__typename")
-            or ""
+            check.get("state") or check.get("status") or check.get("__typename") or ""
         ).upper()
         conclusion = str(check.get("conclusion") or "").upper()
         if conclusion in {

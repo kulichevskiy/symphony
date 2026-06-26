@@ -237,9 +237,7 @@ def _optional_int(value: object) -> int | None:
 DAY_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
 
-def _started_at_window(
-    date_from: str | None, date_to: str | None
-) -> tuple[list[str], list[str]]:
+def _started_at_window(date_from: str | None, date_to: str | None) -> tuple[list[str], list[str]]:
     """SQL conditions + params windowing `runs.started_at` to a UTC-day range.
     Timestamps are stored as UTC ISO strings, so the first 10 chars are the
     calendar day and a lexicographic compare is date-correct."""
@@ -301,9 +299,7 @@ def _parse_models(value: str | None) -> list[tuple[str, str]]:
 
 def _model_in_clause(models: list[tuple[str, str]]) -> str:
     """Row-value `IN (VALUES (?,?), …)` over (provider, model) pairs."""
-    return (
-        f"(u.provider, u.model) IN (VALUES {','.join('(?,?)' for _ in models)})"
-    )
+    return f"(u.provider, u.model) IN (VALUES {','.join('(?,?)' for _ in models)})"
 
 
 def _model_params(models: list[tuple[str, str]]) -> list[str]:
@@ -472,10 +468,7 @@ def _spend_per_stage_query(
 # Always-unscoped distinct (provider, model) pairs from run_model_usage, used to
 # populate the Models filter popover. Never narrowed by an active filter.
 def _spend_models_query() -> str:
-    return (
-        "SELECT DISTINCT provider, model FROM run_model_usage "
-        "ORDER BY provider, model"
-    )
+    return "SELECT DISTINCT provider, model FROM run_model_usage ORDER BY provider, model"
 
 
 # Bucket spend by UTC day. Timestamps are stored as UTC ISO strings, so the
@@ -519,7 +512,7 @@ def _spend_heatmap_query(
             COALESCE(SUM({token_alias}.cache_read_tokens), 0) AS cache_read_tokens,
             COUNT(DISTINCT r.issue_id) AS issues
         {from_sql}
-        WHERE {' AND '.join(cond)}
+        WHERE {" AND ".join(cond)}
         GROUP BY day
         ORDER BY day
         """,
@@ -612,9 +605,7 @@ def _build_stage_series(
     start = date_from or (observed[0] if observed else None)
     end = date_to or (observed[-1] if observed else None)
     if start is None or end is None or start > end:
-        return StageSeries(
-            buckets=[], bucket="day", stages=[], start=start, end=end
-        )
+        return StageSeries(buckets=[], bucket="day", stages=[], start=start, end=end)
 
     granularity = _series_granularity(start, end)
 
@@ -654,18 +645,14 @@ def _build_stage_series(
         )
         for s in starts
     ]
-    return StageSeries(
-        buckets=buckets, bucket=granularity, stages=stages, start=start, end=end
-    )
+    return StageSeries(buckets=buckets, bucket=granularity, stages=stages, start=start, end=end)
 
 
 def _build_per_provider(
     model_rows: list[dict[str, Any]],
     provider_issue_rows: list[dict[str, Any]],
 ) -> list[ProviderSpend]:
-    provider_issues = {
-        str(row["provider"]): int(row["issues"] or 0) for row in provider_issue_rows
-    }
+    provider_issues = {str(row["provider"]): int(row["issues"] or 0) for row in provider_issue_rows}
     models_by_provider: dict[str, list[ModelSpend]] = {}
     acc_by_provider: dict[str, dict[str, int]] = {}
     for row in model_rows:
@@ -765,9 +752,7 @@ def _build_spend_summary(
         cache_read_tokens=acc["cache_read_tokens"],
         issues=acc["issues"],
     )
-    per_provider = _build_per_provider(
-        model_rows or [], provider_issue_rows or []
-    )
+    per_provider = _build_per_provider(model_rows or [], provider_issue_rows or [])
     per_stage = [
         StageSpend(
             key=str(r["stage"]),
@@ -786,8 +771,7 @@ def _build_spend_summary(
         per_stage=per_stage,
         teams=teams or [],
         models=[
-            ModelRef(provider=str(r["provider"]), model=str(r["model"]))
-            for r in (models or [])
+            ModelRef(provider=str(r["provider"]), model=str(r["model"])) for r in (models or [])
         ],
     )
 
@@ -830,9 +814,7 @@ def _list_issues_query(
 
     normalized_q = q.strip().lower() if q is not None else ""
     if normalized_q:
-        where.append(
-            "(instr(lower(i.identifier), ?) > 0 OR instr(lower(i.title), ?) > 0)"
-        )
+        where.append("(instr(lower(i.identifier), ?) > 0 OR instr(lower(i.title), ?) > 0)")
         where_params.extend([normalized_q, normalized_q])
 
     if teams:
@@ -945,9 +927,7 @@ def create_api_router(
     config_teams = sorted(teams or [])
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
     pr_no_progress_threshold = (
-        DEFAULT_PR_NO_PROGRESS_THRESHOLD
-        if no_progress_threshold is None
-        else no_progress_threshold
+        DEFAULT_PR_NO_PROGRESS_THRESHOLD if no_progress_threshold is None else no_progress_threshold
     )
 
     def now() -> datetime:
@@ -1017,9 +997,7 @@ def create_api_router(
             for issue, status in statuses:
                 if status.state != "done":
                     continue
-                completed_at = issue.get("max_merged_at") or issue.get(
-                    "latest_activity_ts"
-                )
+                completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
                 if completed_at is None:
                     continue
                 completed_day = str(completed_at)[:10]
@@ -1046,9 +1024,7 @@ def create_api_router(
         for issue, status, completed_at in triples:
             warnings = issue_warnings(
                 status,
-                latest_activity_age_secs=_optional_int(
-                    issue["latest_activity_age_secs"]
-                ),
+                latest_activity_age_secs=_optional_int(issue["latest_activity_age_secs"]),
                 pr_no_progress_threshold=pr_no_progress_threshold,
             )
             payload: dict[str, object] = {
@@ -1083,10 +1059,8 @@ def create_api_router(
         model_query, model_params = _spend_per_model_query(
             team_filter, model_filter, date_from, date_to
         )
-        provider_issues_query, provider_issues_params = (
-            _spend_per_provider_issues_query(
-                team_filter, model_filter, date_from, date_to
-            )
+        provider_issues_query, provider_issues_params = _spend_per_provider_issues_query(
+            team_filter, model_filter, date_from, date_to
         )
         stage_query, stage_params = _spend_per_stage_query(
             provider_filter, team_filter, model_filter, date_from, date_to
@@ -1105,9 +1079,7 @@ def create_api_router(
             cur = await conn.execute(models_query)
             available_models = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
-            raise HTTPException(
-                status_code=503, detail="UI database is not available"
-            ) from exc
+            raise HTTPException(status_code=503, detail="UI database is not available") from exc
         return _build_spend_summary(
             rows,
             model_rows,
@@ -1139,9 +1111,7 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
-            raise HTTPException(
-                status_code=503, detail="UI database is not available"
-            ) from exc
+            raise HTTPException(status_code=503, detail="UI database is not available") from exc
         return SpendHeatmap(
             days=[
                 HeatmapDay(
@@ -1181,49 +1151,35 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = [dict(row) for row in await cur.fetchall()]
         except aiosqlite.Error as exc:
-            raise HTTPException(
-                status_code=503, detail="UI database is not available"
-            ) from exc
+            raise HTTPException(status_code=503, detail="UI database is not available") from exc
         return _build_stage_series(rows, date_from, date_to)
 
     @router.post("/issues/{issue_id}/command", response_model=CommandAccepted)
     async def issue_command(issue_id: str, body: CommandRequest) -> CommandAccepted:
         if command_sink is None:
-            raise HTTPException(
-                status_code=503, detail="commands are not available"
-            )
+            raise HTTPException(status_code=503, detail="commands are not available")
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
         try:
             kind = SlashKind(body.command)
         except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail=f"unknown command: {body.command}"
-            ) from exc
+            raise HTTPException(status_code=400, detail=f"unknown command: {body.command}") from exc
         try:
             conn = await ui_db_pool.connection()
-            cur = await conn.execute(
-                "SELECT 1 FROM issues WHERE id = ?", (issue_id,)
-            )
+            cur = await conn.execute("SELECT 1 FROM issues WHERE id = ?", (issue_id,))
             exists = await cur.fetchone() is not None
         except aiosqlite.Error as exc:
-            raise HTTPException(
-                status_code=503, detail="UI database is not available"
-            ) from exc
+            raise HTTPException(status_code=503, detail="UI database is not available") from exc
         if not exists:
             raise HTTPException(status_code=404, detail="issue not found")
         command_id = command_sink.enqueue_web_command(issue_id, kind)
-        return CommandAccepted(
-            status="accepted", command_id=command_id, command=f"${kind.value}"
-        )
+        return CommandAccepted(status="accepted", command_id=command_id, command=f"${kind.value}")
 
     @router.get("/meta", response_model=Meta, response_model_exclude_defaults=True)
     async def meta() -> Meta:
         return Meta(
             tunnel_url=webhook_base,
-            linear_webhook_url=(
-                f"{webhook_base}/linear/webhook" if webhook_base else None
-            ),
+            linear_webhook_url=(f"{webhook_base}/linear/webhook" if webhook_base else None),
         )
 
     @router.api_route(

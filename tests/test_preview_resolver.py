@@ -25,9 +25,7 @@ async def test_preview_resolver_substitutes_placeholders_and_waits_for_200() -> 
 
     acceptance = AcceptanceConfig(
         mode="preview",
-        preview_url_pattern=(
-            "https://vib-{pr_number}-{issue}-{issue_id}.vercel.app?pr={pr_url}"
-        ),
+        preview_url_pattern=("https://vib-{pr_number}-{issue}-{issue_id}.vercel.app?pr={pr_url}"),
         preview_wait_timeout_secs=30.0,
     )
 
@@ -41,10 +39,7 @@ async def test_preview_resolver_substitutes_placeholders_and_waits_for_200() -> 
         sleep=fake_sleep,
     )
 
-    assert url == (
-        "https://vib-42-ENG-1-iss-1.vercel.app"
-        "?pr=https://github.com/org/repo/pull/42"
-    )
+    assert url == ("https://vib-42-ENG-1-iss-1.vercel.app?pr=https://github.com/org/repo/pull/42")
     assert attempts == [url, url, url]
     assert sleeps == [1.0, 2.0]
 

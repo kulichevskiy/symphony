@@ -47,9 +47,7 @@ _TRACKED_FIELDS = (
 )
 
 
-async def _get_existing(
-    conn: aiosqlite.Connection, issue_id: str
-) -> AcceptanceState | None:
+async def _get_existing(conn: aiosqlite.Connection, issue_id: str) -> AcceptanceState | None:
     cur = await conn.execute(
         """
         SELECT

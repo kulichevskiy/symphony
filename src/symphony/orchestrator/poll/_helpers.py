@@ -117,9 +117,7 @@ def build_runner_command(
             "--strict-mcp-config",
         ]
         if mcp_servers:
-            command.extend(
-                ["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})]
-            )
+            command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])
         if claude_model is not None:
             command.extend(["--model", claude_model])
         if effort is not None:
@@ -227,28 +225,19 @@ def _pr_view_is_closed(view: dict[str, object]) -> bool:
 
 def _pr_view_has_merge_conflict(view: dict[str, object]) -> bool:
     mergeable = str(view.get("mergeable") or "").upper()
-    merge_state = str(
-        view.get("mergeStateStatus") or view.get("merge_state_status") or ""
-    ).upper()
+    merge_state = str(view.get("mergeStateStatus") or view.get("merge_state_status") or "").upper()
     return mergeable == "CONFLICTING" or merge_state == "DIRTY"
 
 
 def _pr_view_skips_required_check_fix(view: dict[str, object]) -> bool:
     mergeable = str(view.get("mergeable") or "").upper()
-    merge_state = str(
-        view.get("mergeStateStatus") or view.get("merge_state_status") or ""
-    ).upper()
-    return (
-        mergeable == "CONFLICTING"
-        or merge_state in {"BEHIND", "CONFLICTING", "DIRTY"}
-    )
+    merge_state = str(view.get("mergeStateStatus") or view.get("merge_state_status") or "").upper()
+    return mergeable == "CONFLICTING" or merge_state in {"BEHIND", "CONFLICTING", "DIRTY"}
 
 
 def _pr_view_is_clean_mergeable(view: dict[str, object]) -> bool:
     mergeable = str(view.get("mergeable") or "").upper()
-    merge_state = str(
-        view.get("mergeStateStatus") or view.get("merge_state_status") or ""
-    ).upper()
+    merge_state = str(view.get("mergeStateStatus") or view.get("merge_state_status") or "").upper()
     return mergeable == "MERGEABLE" and merge_state == "CLEAN"
 
 
@@ -324,14 +313,9 @@ def _status_check_sha(check: Mapping[str, object]) -> str:
 
 
 def _status_check_failed(check: Mapping[str, object]) -> bool:
-    state = str(
-        check.get("state") or check.get("status") or check.get("__typename") or ""
-    ).upper()
+    state = str(check.get("state") or check.get("status") or check.get("__typename") or "").upper()
     conclusion = str(check.get("conclusion") or "").upper()
-    return (
-        state in _REQUIRED_CHECK_FAILURE_STATES
-        or conclusion in _REQUIRED_CHECK_FAILURE_STATES
-    )
+    return state in _REQUIRED_CHECK_FAILURE_STATES or conclusion in _REQUIRED_CHECK_FAILURE_STATES
 
 
 # Terminal-success states across both rollup shapes: a `StatusContext` reports
@@ -456,9 +440,7 @@ def _github_commit_url(repo: str, sha: str) -> str:
     return f"https://{host}/{owner}/{name}/commit/{sha}"
 
 
-def _pr_url_for_state(
-    *, repo: str, pr_number: int | None, pr_url: str
-) -> str:
+def _pr_url_for_state(*, repo: str, pr_number: int | None, pr_url: str) -> str:
     if pr_url:
         return pr_url
     if pr_number is not None:
@@ -475,9 +457,7 @@ def _needs_human_approval_label_present(issue: LinearIssue) -> bool:
     return NEEDS_HUMAN_APPROVAL_LABEL in issue.labels
 
 
-async def _add_run_usage(
-    conn: aiosqlite.Connection, run_id: str, usage: UsageDelta
-) -> None:
+async def _add_run_usage(conn: aiosqlite.Connection, run_id: str, usage: UsageDelta) -> None:
     if not usage.has_usage():
         return
     await db.runs.add_usage(
@@ -490,10 +470,12 @@ async def _add_run_usage(
         cache_read_tokens=usage.cache_read_tokens,
     )
 
+
 class _TerminationKwargs(TypedDict):
     kind: str
     detail: str
     returncode: int | None
+
 
 def _termination_kwargs(
     *,
@@ -511,6 +493,7 @@ def _termination_kwargs(
         reason=reason,
     )
     return {"kind": kind, "detail": detail, "returncode": returncode}
+
 
 def _local_review_termination_reason(result: LoopResult | None) -> str:
     if result is None:

@@ -37,9 +37,7 @@ def test_budget_exceeded_shows_effective_tokens_ceiling_and_breakdown() -> None:
 
 
 def test_run_started_comment_uses_emoji_marker() -> None:
-    body = run_started(
-        CommentVars(stage="implement", repo="org/repo", issue=0, run_id="run-1")
-    )
+    body = run_started(CommentVars(stage="implement", repo="org/repo", issue=0, run_id="run-1"))
 
     assert body.startswith("🚀 **Implement starting**")
 
@@ -103,9 +101,7 @@ def test_implement_blocked_comment_states_verbatim_ask_and_retry() -> None:
 
 
 def test_failed_comment_only_promises_retry_when_enabled() -> None:
-    no_retry = failed(
-        CommentVars(stage="implement", repo="org/repo", issue=0, error="boom")
-    )
+    no_retry = failed(CommentVars(stage="implement", repo="org/repo", issue=0, error="boom"))
     retry = failed(
         CommentVars(
             stage="review",

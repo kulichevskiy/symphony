@@ -185,9 +185,7 @@ def _classify_run_termination(
     )
 
 
-def _log_path_for_row(
-    *, conn: sqlite3.Connection, log_root: Path, row: sqlite3.Row
-) -> Path:
+def _log_path_for_row(*, conn: sqlite3.Connection, log_root: Path, row: sqlite3.Row) -> Path:
     run_id = str(row["id"])
     if str(row["stage"]) != "local_review":
         return log_root / f"{run_id}.log"
@@ -198,9 +196,7 @@ def _log_path_for_row(
     return log_root / "local_review" / run_id
 
 
-def _local_review_parent_run_id(
-    *, conn: sqlite3.Connection, row: sqlite3.Row
-) -> str | None:
+def _local_review_parent_run_id(*, conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
     parent = conn.execute(
         """
         SELECT id
@@ -227,11 +223,7 @@ def _read_log_text(log_path: Path) -> str:
 def _read_log_directory(log_path: Path) -> str:
     parts: list[str] = []
     for child in sorted(
-        (
-            path
-            for path in log_path.iterdir()
-            if path.is_file() and path.name.endswith(".log")
-        ),
+        (path for path in log_path.iterdir() if path.is_file() and path.name.endswith(".log")),
         key=_local_review_log_sort_key,
     ):
         text = child.read_text(encoding="utf-8", errors="replace").rstrip()

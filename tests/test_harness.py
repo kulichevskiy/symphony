@@ -150,9 +150,7 @@ async def test_merge_pr_enqueues_github_webhook_without_delivering(
     harness = await Harness.create(tmp_path)
     try:
         await harness.warmup()
-        url = await harness.github.ensure_pr(
-            title="t", body="", head="b", repo="org/repo"
-        )
+        url = await harness.github.ensure_pr(title="t", body="", head="b", repo="org/repo")
         assert url
         pr = next(iter(harness.sim.prs.values()))
 
@@ -241,13 +239,9 @@ async def test_assert_consistent_flags_zombie_running_run(tmp_path: Path) -> Non
     try:
         sim = Sim(ManualClock())
         issue_id = await _seed_issue(conn)
-        await _seed_run(
-            conn, run_id="r1", issue_id=issue_id, stage="implement", pid=None
-        )
+        await _seed_run(conn, run_id="r1", issue_id=issue_id, stage="implement", pid=None)
         # A run marked running but already ended is a zombie.
-        await db.runs.update_status(
-            conn, "r1", "running", ended_at="2026-01-01T00:00:00+00:00"
-        )
+        await db.runs.update_status(conn, "r1", "running", ended_at="2026-01-01T00:00:00+00:00")
         with pytest.raises(AssertionError):
             await assert_consistent(sim, conn)
     finally:
@@ -262,9 +256,7 @@ async def test_assert_consistent_flags_two_active_runs_for_one_issue(
     try:
         sim = Sim(ManualClock())
         issue_id = await _seed_issue(conn)
-        await _seed_run(
-            conn, run_id="r1", issue_id=issue_id, stage="implement", pid=1
-        )
+        await _seed_run(conn, run_id="r1", issue_id=issue_id, stage="implement", pid=1)
         await _seed_run(conn, run_id="r2", issue_id=issue_id, stage="review", pid=2)
         with pytest.raises(AssertionError):
             await assert_consistent(sim, conn)

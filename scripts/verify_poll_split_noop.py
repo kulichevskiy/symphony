@@ -70,10 +70,7 @@ def _load_original() -> str:
 
 
 def _load_package() -> str:
-    return "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in sorted(PACKAGE_DIR.glob("*.py"))
-    )
+    return "\n".join(path.read_text(encoding="utf-8") for path in sorted(PACKAGE_DIR.glob("*.py")))
 
 
 def main() -> int:

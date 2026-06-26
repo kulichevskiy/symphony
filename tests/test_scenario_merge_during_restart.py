@@ -109,14 +109,10 @@ async def test_pr_merged_during_restart_converges(
         # retires the orphan. The PR is still locally unmerged in the DB.
         await harness.restart()
         retired = [
-            r
-            for r in await db.runs.history_for_issue(harness.conn, issue.id)
-            if r.id == "merge-1"
+            r for r in await db.runs.history_for_issue(harness.conn, issue.id) if r.id == "merge-1"
         ]
         assert retired and retired[0].status not in LIVE_STATUSES
-        db_pr = await db.issue_prs.get(
-            harness.conn, issue_id=issue.id, github_repo=REPO
-        )
+        db_pr = await db.issue_prs.get(harness.conn, issue_id=issue.id, github_repo=REPO)
         assert db_pr is not None and db_pr.merged_at is None
 
         # Enable active reconcile so the reconciler writes merged_at to the DB
@@ -129,9 +125,7 @@ async def test_pr_merged_during_restart_converges(
         assert result.handled
         await harness.drain()
         assert harness.sim.github_webhooks == []
-        db_pr = await db.issue_prs.get(
-            harness.conn, issue_id=issue.id, github_repo=REPO
-        )
+        db_pr = await db.issue_prs.get(harness.conn, issue_id=issue.id, github_repo=REPO)
         assert db_pr is not None and db_pr.merged_at is not None
 
         # Step the poll loop: the merged-state reconcile re-homes the issue into

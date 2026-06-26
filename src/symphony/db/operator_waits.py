@@ -198,16 +198,12 @@ async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
         issue_label=str(row["issue_label"] or ""),
         created_at=str(row["created_at"]),
         local_review_outcome=(
-            str(row["local_review_outcome"])
-            if row["local_review_outcome"] is not None
-            else None
+            str(row["local_review_outcome"]) if row["local_review_outcome"] is not None else None
         ),
     )
 
 
-async def get_by_run_id(
-    conn: aiosqlite.Connection, run_id: str
-) -> OperatorWait | None:
+async def get_by_run_id(conn: aiosqlite.Connection, run_id: str) -> OperatorWait | None:
     cur = await conn.execute(
         """
         SELECT
@@ -242,9 +238,7 @@ async def get_by_run_id(
         issue_label=str(row["issue_label"] or ""),
         created_at=str(row["created_at"]),
         local_review_outcome=(
-            str(row["local_review_outcome"])
-            if row["local_review_outcome"] is not None
-            else None
+            str(row["local_review_outcome"]) if row["local_review_outcome"] is not None else None
         ),
     )
 
@@ -258,9 +252,7 @@ async def delete(
 ) -> None:
     old = await get(conn, issue_id)
     if run_id is None:
-        cur = await conn.execute(
-            "DELETE FROM operator_waits WHERE issue_id = ?", (issue_id,)
-        )
+        cur = await conn.execute("DELETE FROM operator_waits WHERE issue_id = ?", (issue_id,))
     else:
         cur = await conn.execute(
             "DELETE FROM operator_waits WHERE issue_id = ? AND run_id = ?",

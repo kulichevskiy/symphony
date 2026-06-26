@@ -60,9 +60,7 @@ def _is_thumbs_up(body: str) -> bool:
     if body in _THUMBS_UP:
         return True
     normalized = "".join(
-        ch
-        for ch in body
-        if ch not in _VARIATION_SELECTORS and not 0x1F3FB <= ord(ch) <= 0x1F3FF
+        ch for ch in body if ch not in _VARIATION_SELECTORS and not 0x1F3FB <= ord(ch) <= 0x1F3FF
     )
     return normalized == _THUMBS_UP_EMOJI
 

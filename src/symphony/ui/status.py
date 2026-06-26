@@ -169,11 +169,7 @@ def _run_supersedes_operator_wait(
     run_progressed = _parse_timestamp(_as_str(run.get("ended_at"))) or _parse_timestamp(
         _as_str(run.get("started_at"))
     )
-    return (
-        wait_created is not None
-        and run_progressed is not None
-        and run_progressed > wait_created
-    )
+    return wait_created is not None and run_progressed is not None and run_progressed > wait_created
 
 
 async def _operator_wait_superseding_run(
@@ -407,8 +403,7 @@ async def compute_canonical_status(
                 subtitle = stage
             return _status(
                 CanonicalState.FAILED,
-                since=_as_str(latest_run["ended_at"])
-                or _as_str(latest_run["started_at"]),
+                since=_as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"]),
                 subtitle=subtitle,
                 now=effective_now,
                 thresholds=thresholds,

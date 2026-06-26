@@ -284,9 +284,7 @@ async def run_acceptance(
             hero_screenshot_url="",
             details=_failed_run_details(
                 collected,
-                parsed_details=(
-                    parsed.details if parsed.kind == "infra_error" else ""
-                ),
+                parsed_details=(parsed.details if parsed.kind == "infra_error" else ""),
                 time_cap_secs=stall_secs,
             ),
             usage=usage,
@@ -477,9 +475,7 @@ async def _run_playwright_acceptance(
             hero_screenshot_url="",
             details=_failed_run_details(
                 collected,
-                parsed_details=(
-                    parsed.details if parsed.kind == "infra_error" else ""
-                ),
+                parsed_details=(parsed.details if parsed.kind == "infra_error" else ""),
                 time_cap_secs=stall_secs,
             ),
             preview_url=preview_url,
@@ -588,9 +584,7 @@ async def _collect_acceptance_output(
         if remaining <= 0:
             return await abort(_time_cap_exceeded_details(wall_clock_secs))
 
-        next_event: asyncio.Task[RunnerEvent] = asyncio.create_task(
-            _next_runner_event(iterator)
-        )
+        next_event: asyncio.Task[RunnerEvent] = asyncio.create_task(_next_runner_event(iterator))
         done, _pending = await asyncio.wait({next_event}, timeout=remaining)
         if not done:
             await runner.kill(spec.run_id)
@@ -869,9 +863,7 @@ def _validate_dev_artifacts(
             )
         reported = {item.criterion.casefold() for item in verdict.criterion_results}
         missing = [
-            criterion
-            for criterion in expected_criteria
-            if criterion.casefold() not in reported
+            criterion for criterion in expected_criteria if criterion.casefold() not in reported
         ]
         if missing:
             return AcceptanceVerdict(
@@ -879,10 +871,7 @@ def _validate_dev_artifacts(
                 criteria=expected_criteria,
                 cost=verdict.cost,
                 hero_screenshot_url="",
-                details=(
-                    "dev acceptance pass did not report criteria: "
-                    f"{', '.join(missing)}"
-                ),
+                details=(f"dev acceptance pass did not report criteria: {', '.join(missing)}"),
                 preview_url=verdict.preview_url,
             )
         failed = [item.criterion for item in verdict.criterion_results if not item.passed]
@@ -892,10 +881,7 @@ def _validate_dev_artifacts(
                 criteria=list(criteria or []),
                 cost=verdict.cost,
                 hero_screenshot_url="",
-                details=(
-                    "dev acceptance pass reported failed criteria: "
-                    f"{', '.join(failed)}"
-                ),
+                details=(f"dev acceptance pass reported failed criteria: {', '.join(failed)}"),
                 preview_url=verdict.preview_url,
             )
     if verdict.kind == "reject":
@@ -1157,14 +1143,12 @@ def quick_skip_trivial_acceptance(
     lower_description = description.casefold()
     if all(_is_doc_path(path) for path in paths):
         return _quick_skip_verdict(criteria)
-    if (
-        all(_is_dependency_path(path) for path in paths)
-        and _DEPENDENCY_DESCRIPTION_RE.search(lower_description)
+    if all(_is_dependency_path(path) for path in paths) and _DEPENDENCY_DESCRIPTION_RE.search(
+        lower_description
     ):
         return _quick_skip_verdict(criteria)
-    if (
-        _INTERNAL_ONLY_DESCRIPTION_RE.search(lower_description)
-        and not any(_looks_user_facing_path(path) for path in paths)
+    if _INTERNAL_ONLY_DESCRIPTION_RE.search(lower_description) and not any(
+        _looks_user_facing_path(path) for path in paths
     ):
         return _quick_skip_verdict(criteria)
     return None

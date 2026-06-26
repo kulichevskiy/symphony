@@ -83,9 +83,7 @@ async def test_valid_webhook_is_hmac_verified_and_handled(tmp_path: Path) -> Non
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            response = await client.post(
-                "/linear/webhook", content=body, headers=_headers(body)
-            )
+            response = await client.post("/linear/webhook", content=body, headers=_headers(body))
 
         assert response.status_code == 200
         assert response.json()["handled"] is True
@@ -135,12 +133,15 @@ async def test_pending_delivery_id_is_retryable_without_handling(
             WebhookSettings(secret=SECRET),
             clock=lambda: NOW,
         )
-        assert await db.webhook_deliveries.begin(
-            conn,
-            "evt-pending",
-            received_at=NOW,
-            ttl_secs=600,
-        ) == "new"
+        assert (
+            await db.webhook_deliveries.begin(
+                conn,
+                "evt-pending",
+                received_at=NOW,
+                ttl_secs=600,
+            )
+            == "new"
+        )
 
         body = _body(_payload())
         headers = _headers(body, delivery="evt-pending")
@@ -150,9 +151,7 @@ async def test_pending_delivery_id_is_retryable_without_handling(
         ) as client:
             pending = await client.post("/linear/webhook", content=body, headers=headers)
             await db.webhook_deliveries.finish(conn, "evt-pending")
-            duplicate = await client.post(
-                "/linear/webhook", content=body, headers=headers
-            )
+            duplicate = await client.post("/linear/webhook", content=body, headers=headers)
 
         assert pending.status_code == 503
         assert duplicate.status_code == 200
@@ -419,9 +418,9 @@ async def test_webhook_comment_swallows_slash_handler_failure(tmp_path: Path) ->
         assert result.handled is True
         # Rejection was posted to Linear.
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any(
-            "$retry" in body and "ignored" in body for body in bodies
-        ), f"expected a command_rejected body, got {bodies!r}"
+        assert any("$retry" in body and "ignored" in body for body in bodies), (
+            f"expected a command_rejected body, got {bodies!r}"
+        )
         # Operator wait survives — the next poll tick retries.
         assert await db.operator_waits.get(conn, "iss-1") is not None
     finally:
@@ -668,9 +667,7 @@ async def test_ready_issue_schedule_claim_is_atomic(tmp_path: Path) -> None:
         issue = _issue()
         release = asyncio.Event()
 
-        async def hold_dispatch(
-            _binding: RepoBinding, _issue: LinearIssue
-        ) -> None:
+        async def hold_dispatch(_binding: RepoBinding, _issue: LinearIssue) -> None:
             await release.wait()
 
         orch._dispatch_with_limits = hold_dispatch  # type: ignore[method-assign]  # noqa: SLF001

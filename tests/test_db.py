@@ -102,9 +102,7 @@ async def test_ui_read_only_pool_rejects_writes(tmp_path: Path) -> None:
 async def test_indices_present_for_active_and_cost_lookups(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        cur = await conn.execute(
-            "SELECT name, tbl_name FROM sqlite_master WHERE type='index'"
-        )
+        cur = await conn.execute("SELECT name, tbl_name FROM sqlite_master WHERE type='index'")
         rows = await cur.fetchall()
     finally:
         await conn.close()
@@ -215,9 +213,7 @@ async def test_runs_schema_has_usage_columns_and_migrates_existing_rows(
 async def test_runs_add_usage_accumulates_all_buckets(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="r1",
@@ -267,17 +263,11 @@ async def test_granted_token_budget_defaults_zero_and_accumulates(
     path = tmp_path / "s.sqlite"
     conn = await db.connect(path)
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         assert await db.issues.get_granted_token_budget(conn, "iss-1") == 0
-        assert await db.issues.add_granted_token_budget(conn, "iss-1", 20_000_000) == (
-            20_000_000
-        )
+        assert await db.issues.add_granted_token_budget(conn, "iss-1", 20_000_000) == (20_000_000)
         # Repeatable: each approval grants one more window.
-        assert await db.issues.add_granted_token_budget(conn, "iss-1", 20_000_000) == (
-            40_000_000
-        )
+        assert await db.issues.add_granted_token_budget(conn, "iss-1", 20_000_000) == (40_000_000)
     finally:
         await conn.close()
 
@@ -297,9 +287,7 @@ async def test_effective_tokens_weighting_and_per_stage_breakdown(
     summed across ALL of an issue's runs and broken down per stage."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="r-impl",
@@ -358,9 +346,7 @@ async def test_update_status_persists_unknown_for_unclassified_terminal_status(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="r1",
@@ -372,9 +358,7 @@ async def test_update_status_persists_unknown_for_unclassified_terminal_status(
         )
 
         with caplog.at_level(logging.WARNING):
-            await db.runs.update_status(
-                conn, "r1", "failed", ended_at="2026-05-10T00:01:00+00:00"
-            )
+            await db.runs.update_status(conn, "r1", "failed", ended_at="2026-05-10T00:01:00+00:00")
 
         cur = await conn.execute(
             """
@@ -400,9 +384,7 @@ async def test_update_status_truncates_termination_detail_tail_first(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="r1",
@@ -412,10 +394,7 @@ async def test_update_status_truncates_termination_detail_tail_first(
             pid=None,
             started_at="2026-05-10T00:00:00+00:00",
         )
-        detail = "\n".join(
-            f"line {i:03d} " + ("x" * 120)
-            for i in range(200)
-        )
+        detail = "\n".join(f"line {i:03d} " + ("x" * 120) for i in range(200))
 
         await db.runs.update_status(
             conn,
@@ -454,9 +433,7 @@ async def test_update_status_success_leaves_termination_columns_empty(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="r1",
@@ -466,9 +443,7 @@ async def test_update_status_success_leaves_termination_columns_empty(
             pid=None,
             started_at="2026-05-10T00:00:00+00:00",
         )
-        await db.runs.update_status(
-            conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00"
-        )
+        await db.runs.update_status(conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00")
 
         cur = await conn.execute(
             """
@@ -491,12 +466,8 @@ async def test_update_status_success_leaves_termination_columns_empty(
 async def test_issues_upsert_is_idempotent(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="first", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="second", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="first", team_key="ENG")
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="second", team_key="ENG")
         cur = await conn.execute("SELECT count(*), title FROM issues WHERE id=?", ("iss-1",))
         row = await cur.fetchone()
         assert row is not None
@@ -510,9 +481,7 @@ async def test_issues_upsert_is_idempotent(tmp_path: Path) -> None:
 async def test_runs_create_and_has_active(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         assert await db.runs.has_active(conn, "iss-1") is False
 
         await db.runs.create(
@@ -526,9 +495,7 @@ async def test_runs_create_and_has_active(tmp_path: Path) -> None:
         )
         assert await db.runs.has_active(conn, "iss-1") is True
 
-        await db.runs.update_status(
-            conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00"
-        )
+        await db.runs.update_status(conn, "r1", "completed", ended_at="2026-05-10T00:01:00+00:00")
         assert await db.runs.has_active(conn, "iss-1") is False
 
         await db.runs.create(
@@ -541,10 +508,7 @@ async def test_runs_create_and_has_active(tmp_path: Path) -> None:
             started_at="2026-05-10T00:02:00+00:00",
         )
         assert await db.runs.has_active(conn, "iss-1") is True
-        assert (
-            await db.runs.has_active(conn, "iss-1", ignored_stage="review")
-            is False
-        )
+        assert await db.runs.has_active(conn, "iss-1", ignored_stage="review") is False
     finally:
         await conn.close()
 
@@ -553,9 +517,7 @@ async def test_runs_create_and_has_active(tmp_path: Path) -> None:
 async def test_runs_list_live_with_pid_filters_correctly(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         # Live with pid — should be returned.
         await db.runs.create(
             conn,
@@ -601,9 +563,7 @@ async def test_runs_list_live_review_without_pid_filters_correctly(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         # Live review without pid: should be returned.
         await db.runs.create(
             conn,
@@ -658,12 +618,8 @@ async def test_runs_list_live_review_without_pid_filters_correctly(
 async def test_runs_cost_aggregation_per_issue(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="iss-2", identifier="ENG-2", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issues.upsert(conn, id="iss-2", identifier="ENG-2", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="r1",
@@ -697,9 +653,7 @@ async def test_runs_cost_aggregation_per_issue(tmp_path: Path) -> None:
         assert await db.runs.cost_for_issue(conn, "iss-1") == pytest.approx(2.25)
         assert await db.runs.cost_for_issue(conn, "iss-2") == pytest.approx(9.0)
         # Issue with no runs aggregates to 0.0.
-        await db.issues.upsert(
-            conn, id="iss-3", identifier="ENG-3", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-3", identifier="ENG-3", title="t", team_key="ENG")
         assert await db.runs.cost_for_issue(conn, "iss-3") == pytest.approx(0.0)
     finally:
         await conn.close()
@@ -709,9 +663,7 @@ async def test_runs_cost_aggregation_per_issue(tmp_path: Path) -> None:
 async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -948,9 +900,7 @@ async def test_supersede_skips_rejected_merge_without_later_run(
     # not be retired — that would silently re-open a rejected merge.
     conn = await db.connect(tmp_path / "reject.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1018,9 +968,7 @@ async def test_supersede_skips_stopped_merge_retry(tmp_path: Path) -> None:
     # stay — retiring it would undo the operator's stop and re-enable merge.
     conn = await db.connect(tmp_path / "stopped.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1128,9 +1076,7 @@ async def test_issue_prs_scopes_candidates_to_current_pr_cycle(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1282,9 +1228,7 @@ async def test_orphaned_review_prs_require_latest_review_run_dead(
 async def test_completed_review_prs_without_monitor(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1344,9 +1288,7 @@ async def test_completed_review_prs_without_monitor_excludes_dead_and_merging(
     # A dead latest review run belongs to list_orphaned_review_prs, not here.
     conn = await db.connect(tmp_path / "dead.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1371,9 +1313,7 @@ async def test_completed_review_prs_without_monitor_excludes_dead_and_merging(
     # A submitted merge (completed) means the PR has progressed past review.
     conn = await db.connect(tmp_path / "merging.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1414,9 +1354,7 @@ async def test_completed_review_prs_without_monitor_excludes_bypassed(
     # window before the merge run exists).
     conn = await db.connect(tmp_path / "bypass.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1436,8 +1374,7 @@ async def test_completed_review_prs_without_monitor_excludes_bypassed(
         )
         # Selected before the bypass is recorded...
         assert [
-            c.pr_number
-            for c in await db.issue_prs.list_completed_review_prs_without_monitor(conn)
+            c.pr_number for c in await db.issue_prs.list_completed_review_prs_without_monitor(conn)
         ] == [42]
         # ...and excluded once $skip-review marks it bypassed.
         assert await db.issue_prs.mark_review_bypassed(
@@ -1454,9 +1391,7 @@ async def test_latest_for_issue_stage_can_scope_to_current_cycle(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="old-merge",
@@ -1504,9 +1439,7 @@ async def test_interrupt_stale_merge_needs_approval_only_touches_stale_waits(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -1581,18 +1514,12 @@ async def test_interrupt_stale_merge_needs_approval_only_touches_stale_waits(
 async def test_comment_cursor_advance(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         assert await db.comment_cursors.get(conn, "iss-1") is None
-        await db.comment_cursors.set(
-            conn, "iss-1", "2026-05-10T00:00:00+00:00", ["c1"]
-        )
+        await db.comment_cursors.set(conn, "iss-1", "2026-05-10T00:00:00+00:00", ["c1"])
         got = await db.comment_cursors.get(conn, "iss-1")
         assert got == ("2026-05-10T00:00:00+00:00", ["c1"])
-        await db.comment_cursors.set(
-            conn, "iss-1", "2026-05-10T01:00:00+00:00", ["c2", "c3"]
-        )
+        await db.comment_cursors.set(conn, "iss-1", "2026-05-10T01:00:00+00:00", ["c2", "c3"])
         got = await db.comment_cursors.get(conn, "iss-1")
         assert got == ("2026-05-10T01:00:00+00:00", ["c2", "c3"])
     finally:
@@ -1603,9 +1530,7 @@ async def test_comment_cursor_advance(tmp_path: Path) -> None:
 async def test_operator_waits_persist_and_delete(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="run-1",
@@ -1761,9 +1686,7 @@ async def test_completed_remediation_run_clears_older_matching_wait(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="wait-run",
@@ -1811,10 +1734,7 @@ async def test_completed_remediation_run_clears_older_matching_wait(
         "kind",
         wait_kind,
         None,
-    ) in [
-        (t.table_name, t.field, t.old_value, t.new_value)
-        for t in transitions
-    ]
+    ) in [(t.table_name, t.field, t.old_value, t.new_value) for t in transitions]
 
 
 @pytest.mark.asyncio
@@ -1826,9 +1746,7 @@ async def test_create_if_no_active_is_atomic_dedupe(tmp_path: Path) -> None:
     """
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
 
         first = await db.runs.create_if_no_active(
             conn,
@@ -1906,9 +1824,7 @@ async def test_create_if_not_dispatched_allows_completed_reruns(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="done",
@@ -1941,9 +1857,7 @@ async def test_list_recent_keeps_active_runs_outside_limit(tmp_path: Path) -> No
     live run is the most important row to see."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         # An older run that is still live.
         await db.runs.create(
             conn,

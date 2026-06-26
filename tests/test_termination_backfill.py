@@ -79,9 +79,7 @@ def _write_log(log_root: Path, run_id: str, *events: object) -> None:
     (log_root / f"{run_id}.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_local_review_log(
-    log_root: Path, parent_run_id: str, name: str, *events: object
-) -> None:
+def _write_local_review_log(log_root: Path, parent_run_id: str, name: str, *events: object) -> None:
     log_dir = log_root / "local_review" / parent_run_id
     log_dir.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -293,9 +291,7 @@ async def test_backfill_local_review_without_transcript_is_unknown(
     assert result.updated == 1
     rows = _rows(db_path)
     assert rows["local-review-row"]["termination_kind"] == "unknown"
-    assert "spawn failed before stdout" in rows["local-review-row"][
-        "termination_detail"
-    ]
+    assert "spawn failed before stdout" in rows["local-review-row"]["termination_detail"]
 
 
 def test_backfilled_detail_keeps_prefix_and_live_termination_cap(tmp_path: Path) -> None:

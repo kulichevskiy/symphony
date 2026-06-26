@@ -132,9 +132,7 @@ async def test_dropped_webhook_poll_self_heals(
         # The dropped webhook is still sitting undelivered in the queue.
         assert len(harness.sim.github_webhooks) == 1
 
-        db_pr = await db.issue_prs.get(
-            harness.conn, issue_id=issue.id, github_repo=REPO
-        )
+        db_pr = await db.issue_prs.get(harness.conn, issue_id=issue.id, github_repo=REPO)
         assert db_pr is not None and db_pr.merged_at is not None
         await _assert_converged(harness, issue.id)
     finally:

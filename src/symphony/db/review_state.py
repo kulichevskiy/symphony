@@ -42,9 +42,7 @@ _TRACKED_FIELDS = (
 )
 
 
-async def _get_existing(
-    conn: aiosqlite.Connection, issue_id: str
-) -> ReviewState | None:
+async def _get_existing(conn: aiosqlite.Connection, issue_id: str) -> ReviewState | None:
     cur = await conn.execute(
         """
         SELECT
@@ -217,9 +215,7 @@ async def bump_iteration(conn: aiosqlite.Connection, issue_id: str) -> int:
     return int(row["iteration"])
 
 
-async def set_signature(
-    conn: aiosqlite.Connection, issue_id: str, signature: str
-) -> None:
+async def set_signature(conn: aiosqlite.Connection, issue_id: str, signature: str) -> None:
     old = await _get_existing(conn, issue_id)
     await conn.execute(
         """
@@ -264,9 +260,7 @@ async def bump_ci_fetch_failures(conn: aiosqlite.Connection, issue_id: str) -> i
     return int(row["ci_fetch_failures"])
 
 
-async def reset_ci_fetch_failures(
-    conn: aiosqlite.Connection, issue_id: str
-) -> None:
+async def reset_ci_fetch_failures(conn: aiosqlite.Connection, issue_id: str) -> None:
     old = await _get_existing(conn, issue_id)
     await conn.execute(
         """

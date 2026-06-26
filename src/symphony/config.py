@@ -119,9 +119,7 @@ def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) 
     return model in CLAUDE_MODEL_ALIASES
 
 
-def _role_effort_in_family(
-    agent: Literal["claude", "codex"], effort: str | None
-) -> bool:
+def _role_effort_in_family(agent: Literal["claude", "codex"], effort: str | None) -> bool:
     if effort is None:
         return True
     if agent == "codex":
@@ -179,9 +177,7 @@ class TrackerStates(BaseModel):
     @classmethod
     def _derive_legacy_code_review(cls, data: Any) -> Any:
         if isinstance(data, dict) and "code_review" not in data:
-            needs_approval = data.get(
-                "needs_approval", cls.model_fields["needs_approval"].default
-            )
+            needs_approval = data.get("needs_approval", cls.model_fields["needs_approval"].default)
             return {**data, "code_review": needs_approval}
         return data
 
@@ -199,9 +195,7 @@ class RepoBinding(BaseModel):
     """
 
     provider: Literal["linear", "jira"] = "linear"
-    project_key: str = Field(
-        validation_alias=AliasChoices("project_key", "linear_team_key")
-    )
+    project_key: str = Field(validation_alias=AliasChoices("project_key", "linear_team_key"))
     github_repo: str
     tracker_provider: str = ""
     tracker_site: str = ""
@@ -308,18 +302,14 @@ class RepoBinding(BaseModel):
     roles: dict[RoleName, RoleConfig] = Field(default_factory=dict)
     states: TrackerStates = Field(validation_alias=AliasChoices("states", "linear_states"))
 
-    def _apply_tracker_context_defaults(
-        self, *, jira_base_url: str | None = None
-    ) -> None:
+    def _apply_tracker_context_defaults(self, *, jira_base_url: str | None = None) -> None:
         if not self.tracker_provider:
             self.tracker_provider = self.provider
         default_site = "default"
         if self.provider == "jira":
             default_site = (self.base_url or jira_base_url or "default").rstrip("/")
         if not self.tracker_site or (
-            self.provider == "jira"
-            and self.tracker_site == "default"
-            and default_site != "default"
+            self.provider == "jira" and self.tracker_site == "default" and default_site != "default"
         ):
             self.tracker_site = default_site
 
@@ -362,9 +352,7 @@ class RepoBinding(BaseModel):
             return data
         if strategy not in cls._LEGACY_REVIEW_STRATEGY:
             supported = ", ".join(sorted(cls._LEGACY_REVIEW_STRATEGY))
-            raise ValueError(
-                f"unknown review_strategy {strategy!r}; supported: {supported}"
-            )
+            raise ValueError(f"unknown review_strategy {strategy!r}; supported: {supported}")
         warnings.warn(
             "`review_strategy` is deprecated; use the `local_review` and "
             "`remote_review` booleans instead.",
@@ -432,9 +420,7 @@ class RepoBinding(BaseModel):
     def linear_states(self, value: TrackerStates) -> None:
         self.states = value
 
-    def model_copy(
-        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
-    ) -> Self:
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
         if update is not None:
             normalized = dict(update)
             if "linear_team_key" in normalized and "project_key" not in normalized:
@@ -461,9 +447,7 @@ class RepoBinding(BaseModel):
             return None
         if value not in SUPPORTED_CODEX_MODELS:
             supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
-            raise ValueError(
-                f"unknown reviewer Codex model {value!r}; supported: {supported}"
-            )
+            raise ValueError(f"unknown reviewer Codex model {value!r}; supported: {supported}")
         return value
 
     def resolved_local_review(self) -> bool:
@@ -492,9 +476,7 @@ class RepoBinding(BaseModel):
             else global_cap
         )
 
-    def resolved_per_issue_token_budget(
-        self, global_default: int | None
-    ) -> int | None:
+    def resolved_per_issue_token_budget(self, global_default: int | None) -> int | None:
         """Per-binding override wins; falls back to the global default.
 
         `None` from both means the soft token gate is off for this binding.
@@ -513,20 +495,14 @@ class RepoBinding(BaseModel):
 
     def resolved_verify_timeout_secs(self, global_default: int) -> int:
         """Per-binding override wins; falls back to `command_timeout_secs`."""
-        return (
-            self.verify_timeout_secs
-            if self.verify_timeout_secs is not None
-            else global_default
-        )
+        return self.verify_timeout_secs if self.verify_timeout_secs is not None else global_default
 
     def _default_role_agent(self, name: RoleName) -> Literal["claude", "codex"]:
         if name in _BUILDER_ROLES:
             return self.agent
         return self.resolved_reviewer_agent()
 
-    def _default_role_model(
-        self, name: RoleName, agent: Literal["claude", "codex"]
-    ) -> str | None:
+    def _default_role_model(self, name: RoleName, agent: Literal["claude", "codex"]) -> str | None:
         """Back-compat model default for a role given its resolved agent.
 
         Maps the legacy top-level fields into the matrix so a config with no
@@ -592,12 +568,8 @@ class Secrets(BaseSettings):
     )
 
     linear_api_key: str = Field(default="", validation_alias="LINEAR_API_KEY")
-    linear_webhook_secret: str = Field(
-        default="", validation_alias="LINEAR_WEBHOOK_SECRET"
-    )
-    github_webhook_secret: str = Field(
-        default="", validation_alias="GITHUB_WEBHOOK_SECRET"
-    )
+    linear_webhook_secret: str = Field(default="", validation_alias="LINEAR_WEBHOOK_SECRET")
+    github_webhook_secret: str = Field(default="", validation_alias="GITHUB_WEBHOOK_SECRET")
     jira_base_url: str = Field(default="", validation_alias="JIRA_BASE_URL")
     jira_email: str = Field(default="", validation_alias="JIRA_EMAIL")
     jira_api_token: str = Field(default="", validation_alias="JIRA_API_TOKEN")
@@ -621,9 +593,7 @@ class UIStatusThresholds(BaseModel):
     def to_timedeltas(self) -> dict[CanonicalState, timedelta]:
         return {
             CanonicalState.PAUSED: timedelta(seconds=self.paused_secs),
-            CanonicalState.AWAITING_MERGE: timedelta(
-                seconds=self.awaiting_merge_secs
-            ),
+            CanonicalState.AWAITING_MERGE: timedelta(seconds=self.awaiting_merge_secs),
             CanonicalState.RUNNING: timedelta(seconds=self.running_secs),
             CanonicalState.AWAITING_REVIEW_TRIGGER: timedelta(
                 seconds=self.awaiting_review_trigger_secs
@@ -639,9 +609,7 @@ class UIConfig(BaseModel):
     """Web UI exposure knobs."""
 
     enabled: bool = True
-    status_stuck_thresholds: UIStatusThresholds = Field(
-        default_factory=UIStatusThresholds
-    )
+    status_stuck_thresholds: UIStatusThresholds = Field(default_factory=UIStatusThresholds)
 
 
 class Config(BaseModel):
@@ -753,9 +721,9 @@ class Config(BaseModel):
             for name in declared:
                 binding_role = binding.roles.get(name)
                 global_role = self.roles.get(name)
-                explicit_model = (
-                    binding_role is not None and binding_role.model is not None
-                ) or (global_role is not None and global_role.model is not None)
+                explicit_model = (binding_role is not None and binding_role.model is not None) or (
+                    global_role is not None and global_role.model is not None
+                )
                 explicit_effort = (
                     binding_role is not None and binding_role.effort is not None
                 ) or (global_role is not None and global_role.effort is not None)
@@ -784,13 +752,9 @@ class Config(BaseModel):
                         )
                     if not _role_effort_in_family(role.agent, role.effort):
                         if role.agent == "codex":
-                            family, supported = "Codex", sorted(
-                                SUPPORTED_CODEX_EFFORTS
-                            )
+                            family, supported = "Codex", sorted(SUPPORTED_CODEX_EFFORTS)
                         else:
-                            family, supported = "Claude", sorted(
-                                SUPPORTED_CLAUDE_EFFORTS
-                            )
+                            family, supported = "Claude", sorted(SUPPORTED_CLAUDE_EFFORTS)
                         raise ValueError(
                             f"role {name!r}: unknown {family} effort "
                             f"{role.effort!r}; supported: "

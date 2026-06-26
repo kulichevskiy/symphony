@@ -294,11 +294,7 @@ async def test_operator_wait_handlers_lazy_restore_binding_and_dispatch(
             stage = "deliver"
         else:
             stage = "implement"
-        status = (
-            "needs_approval"
-            if wait_kind == db.operator_waits.KIND_MERGE
-            else "failed"
-        )
+        status = "needs_approval" if wait_kind == db.operator_waits.KIND_MERGE else "failed"
         await _seed_operator_wait(
             conn,
             kind=wait_kind,
@@ -455,9 +451,7 @@ async def test_approve_on_parked_manual_merge_pr_merges_once(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(
-            update={"auto_merge": False, "merge_strategy": "merge"}
-        )
+        binding = _binding().model_copy(update={"auto_merge": False, "merge_strategy": "merge"})
         cfg = Config(repos=[binding])
         linear = AsyncMock()
         linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
@@ -479,9 +473,7 @@ async def test_approve_on_parked_manual_merge_pr_merges_once(
         )
         orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
         linear.post_comment.assert_not_awaited()
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at == "2026-05-10T00:05:00+00:00"
         assert await db.comment_events.seen(conn, "c1")
@@ -519,9 +511,7 @@ async def test_approve_on_parked_manual_merge_pr_reports_merge_error(
         assert len(bodies) == 1
         assert "manual merge failed" in bodies[0]
         assert "branch protection blocked" in bodies[0]
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at == "2026-05-10T00:05:00+00:00"
         assert await db.comment_events.seen(conn, "c1")
@@ -591,9 +581,7 @@ async def test_merge_approve_dispatches_when_operator_shares_linear_identity(
             }
         )
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(
-            return_value=[operator_approve, symphony_rejection]
-        )
+        linear.comments_since = AsyncMock(return_value=[operator_approve, symphony_rejection])
         linear.lookup_issue = AsyncMock(return_value=_issue())
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -810,12 +798,8 @@ async def test_stale_cursor_clamped_to_run_start(tmp_path: Path) -> None:
 
         orch = _make_orch(cfg, linear, conn)
         # Seed a stored cursor from run A that predates run B's start.
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.comment_cursors.set(
-            conn, "iss-1", "2026-05-10T08:00:00+00:00", ["old"]
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
+        await db.comment_cursors.set(conn, "iss-1", "2026-05-10T08:00:00+00:00", ["old"])
         # Run B starts at T2; the stale /stop sits between cursor and run start.
         await db.runs.create(
             conn,
@@ -930,9 +914,7 @@ async def test_self_authored_stop_is_ignored(tmp_path: Path) -> None:
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.comments_since = AsyncMock(
-            return_value=[_comment("$stop", is_me=True)]
-        )
+        linear.comments_since = AsyncMock(return_value=[_comment("$stop", is_me=True)])
         linear.move_issue = AsyncMock()
 
         orch = _make_orch(cfg, linear, conn)
@@ -954,9 +936,7 @@ async def test_mirrored_from_github_stop_is_ignored(tmp_path: Path) -> None:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
         linear.comments_since = AsyncMock(
-            return_value=[
-                _comment("$stop", external_thread_type="githubPullRequest")
-            ]
+            return_value=[_comment("$stop", external_thread_type="githubPullRequest")]
         )
         linear.move_issue = AsyncMock()
 
@@ -1026,9 +1006,7 @@ async def test_self_authored_rejection_comment_does_not_advance_cursor_past_fail
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        retry = _comment(
-            "$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00"
-        )
+        retry = _comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00")
         rejection = _comment(
             "🚫 `$retry` ignored: could not move ...",
             cid="c-rejection",
@@ -1212,9 +1190,7 @@ async def test_implement_failed_retry_failure_posts_rejection_and_retries_next_t
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
         linear.comments_since = AsyncMock(
-            return_value=[
-                _comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00")
-            ]
+            return_value=[_comment("$retry", cid="c-retry", created_at="2026-05-10T01:30:00+00:00")]
         )
         linear.move_issue = AsyncMock(side_effect=[LinearError("upstream 503"), None])
         linear.post_comment = AsyncMock(return_value="cmt-1")
@@ -1235,8 +1211,7 @@ async def test_implement_failed_retry_failure_posts_rejection_and_retries_next_t
         assert linear.move_issue.await_count == 1
         rejection_bodies = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any(
-            "$retry" in body and "ignored" in body and "ready" in body
-            for body in rejection_bodies
+            "$retry" in body and "ignored" in body and "ready" in body for body in rejection_bodies
         ), f"expected a command_rejected body, got {rejection_bodies!r}"
         assert await db.operator_waits.get(conn, "iss-1") is not None
         assert not await db.comment_events.seen(conn, "c-retry")
@@ -1268,9 +1243,7 @@ async def test_active_review_retry_skips_codex_when_remote_review_disabled(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         cfg = Config(repos=[binding])
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
@@ -1305,9 +1278,7 @@ async def test_review_failed_retry_skips_codex_when_remote_review_disabled(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         cfg = Config(repos=[binding])
         linear = AsyncMock()
         linear.move_issue = AsyncMock()
@@ -1375,9 +1346,7 @@ async def test_review_failed_retry_reparks_when_local_only_push_fails(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         cfg = Config(repos=[binding])
         linear = AsyncMock()
         linear.move_issue = AsyncMock()
@@ -1428,9 +1397,7 @@ async def test_review_failed_retry_reparks_when_local_only_review_fails(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         cfg = Config(repos=[binding])
         linear = AsyncMock()
         linear.move_issue = AsyncMock()

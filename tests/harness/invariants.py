@@ -18,8 +18,7 @@ from .sim import PR_CLOSED, Sim
 async def _live_run_rows(conn: aiosqlite.Connection) -> list[aiosqlite.Row]:
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
-        f"SELECT id, issue_id, status, stage, ended_at FROM runs "
-        f"WHERE status IN ({placeholders})",
+        f"SELECT id, issue_id, status, stage, ended_at FROM runs WHERE status IN ({placeholders})",
         LIVE_STATUSES,
     )
     return list(await cur.fetchall())
@@ -45,9 +44,7 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
     assert not overloaded, f"multiple active runs per issue: {overloaded}"
 
     # 3. No orphan operator_waits: every wait points at an existing run.
-    run_ids = {row["id"] for row in await (
-        await conn.execute("SELECT id FROM runs")
-    ).fetchall()}
+    run_ids = {row["id"] for row in await (await conn.execute("SELECT id FROM runs")).fetchall()}
     for wait in await db.operator_waits.list_all(conn):
         assert wait.run_id in run_ids, (
             f"orphan operator_wait {wait.kind} for issue {wait.issue_id}: "
@@ -79,20 +76,15 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
 
     # 5. issue_prs agrees with Sim: every tracked PR exists in Sim with a
     #    matching merge status.
-    cur = await conn.execute(
-        "SELECT issue_id, github_repo, pr_number, merged_at FROM issue_prs"
-    )
+    cur = await conn.execute("SELECT issue_id, github_repo, pr_number, merged_at FROM issue_prs")
     db_pr_rows = await cur.fetchall()
     for row in db_pr_rows:
         key = (row["github_repo"], row["pr_number"])
         sim_pr = sim.prs.get(key)
-        assert sim_pr is not None, (
-            f"issue_prs tracks PR {key} that does not exist in Sim"
-        )
+        assert sim_pr is not None, f"issue_prs tracks PR {key} that does not exist in Sim"
         db_merged = row["merged_at"] is not None
         assert db_merged == sim_pr.merged, (
-            f"issue_prs merge state for PR {key} ({db_merged}) disagrees with "
-            f"Sim ({sim_pr.merged})"
+            f"issue_prs merge state for PR {key} ({db_merged}) disagrees with Sim ({sim_pr.merged})"
         )
 
     # 5b. Every Sim PR with an issue_id must be recorded in issue_prs under the
@@ -123,9 +115,6 @@ async def assert_consistent(sim: Sim, conn: aiosqlite.Connection) -> None:
         "HAVING n > 1"
     )
     duplicates = await dup_cur.fetchall()
-    assert not duplicates, (
-        "issue_prs has duplicate ownership rows for: "
-        + ", ".join(
-            f"({row['github_repo']!r}, {row['pr_number']})" for row in duplicates
-        )
+    assert not duplicates, "issue_prs has duplicate ownership rows for: " + ", ".join(
+        f"({row['github_repo']!r}, {row['pr_number']})" for row in duplicates
     )

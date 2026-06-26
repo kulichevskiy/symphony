@@ -16,9 +16,7 @@ from collections.abc import Iterable
 import aiosqlite
 
 
-async def get(
-    conn: aiosqlite.Connection, issue_id: str
-) -> tuple[str, list[str]] | None:
+async def get(conn: aiosqlite.Connection, issue_id: str) -> tuple[str, list[str]] | None:
     cur = await conn.execute(
         "SELECT last_seen_at, last_seen_ids FROM comment_cursors WHERE issue_id = ?",
         (issue_id,),

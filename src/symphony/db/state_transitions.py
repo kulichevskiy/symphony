@@ -63,9 +63,7 @@ async def record_transition(
     )
 
 
-async def list_for_issue(
-    conn: aiosqlite.Connection, issue_id: str
-) -> list[StateTransition]:
+async def list_for_issue(conn: aiosqlite.Connection, issue_id: str) -> list[StateTransition]:
     cur = await conn.execute(
         """
         SELECT id, issue_id, table_name, field, old_value, new_value, ts

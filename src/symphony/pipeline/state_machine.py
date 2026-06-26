@@ -44,9 +44,7 @@ ClassifierVerdict = Literal["done", "blocked", "ambiguous"]
 MarkerKind = Literal["done", "blocked", "already_done"]
 
 _DONE_MARKER_RE = re.compile(rf"(?m)^[ \t>*-]*{SYMPHONY_DONE_MARKER}\s*$")
-_BLOCKED_MARKER_RE = re.compile(
-    rf"(?m)^[ \t>*-]*{SYMPHONY_BLOCKED_PREFIX}\s*(?P<reason>.*?)\s*$"
-)
+_BLOCKED_MARKER_RE = re.compile(rf"(?m)^[ \t>*-]*{SYMPHONY_BLOCKED_PREFIX}\s*(?P<reason>.*?)\s*$")
 _ALREADY_DONE_MARKER_RE = re.compile(
     rf"(?m)^[ \t>*-]*{SYMPHONY_ALREADY_DONE_PREFIX}\s*(?P<ref>.*?)\s*$"
 )
@@ -167,9 +165,7 @@ def classify_implement_completion(
     head_advanced: bool,
     branch_ahead_of_base: bool = False,
     tree_clean: bool = False,
-    classifier: Callable[[str], tuple[ClassifierVerdict, str]] = (
-        classify_blocked_final_message
-    ),
+    classifier: Callable[[str], tuple[ClassifierVerdict, str]] = (classify_blocked_final_message),
 ) -> ImplementCompletion:
     """Classify an rc=0 Implement run into completed / blocked / failed.
 
@@ -224,17 +220,11 @@ def classify_implement_completion(
     return ImplementCompletion(outcome="failed")
 
 
-def on_runner_event(
-    *, stage: str, event_kind: str, returncode: int | None
-) -> Transition:
+def on_runner_event(*, stage: str, event_kind: str, returncode: int | None) -> Transition:
     if event_kind == "exit" and returncode == 0:
         if stage == "implement":
-            return Transition(
-                next_run_status="completed", next_linear_state=None, halt=True
-            )
-        return Transition(
-            next_run_status="completed", next_linear_state=None, halt=True
-        )
+            return Transition(next_run_status="completed", next_linear_state=None, halt=True)
+        return Transition(next_run_status="completed", next_linear_state=None, halt=True)
     return Transition(next_run_status="failed", next_linear_state=None, halt=True)
 
 
@@ -285,15 +275,12 @@ def classify_termination(
         return "awaiting_human_merge", detail
     if "superseded" in text or "stale merge" in text:
         return "superseded", detail
-    if (
-        status == "interrupted"
-        and (
-            "host restarted" in text
-            or "startup reconcile" in text
-            or "pidless" in text
-            or "orphan" in text
-            or "pid " in text
-        )
+    if status == "interrupted" and (
+        "host restarted" in text
+        or "startup reconcile" in text
+        or "pidless" in text
+        or "orphan" in text
+        or "pid " in text
     ):
         return "orphaned", detail
     if (
@@ -345,8 +332,10 @@ def _termination_detail(
     exc: BaseException | str | None,
     reason: str | None,
 ) -> str:
-    if final_kind == "exit" and returncode is not None and (
-        not reason or reason == "runner ended with exit"
+    if (
+        final_kind == "exit"
+        and returncode is not None
+        and (not reason or reason == "runner ended with exit")
     ):
         return f"runner exited with return code {returncode}"
     if reason:

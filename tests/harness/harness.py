@@ -52,13 +52,13 @@ async def _sim_aware_push(
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git push failed: {stderr.decode(errors='replace').strip()}"
-        )
+        raise RuntimeError(f"git push failed: {stderr.decode(errors='replace').strip()}")
     # Read the new HEAD SHA and propagate it to the SimPR so pr_view()
     # returns the updated headRefOid on the next poll.
     sha_proc = await asyncio.create_subprocess_exec(
-        "git", "rev-parse", "HEAD",
+        "git",
+        "rev-parse",
+        "HEAD",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -138,14 +138,18 @@ def _build_runtime(
 
     async def _push_fn(workspace_path: Path, branch: str) -> None:
         await _sim_aware_push(
-            workspace_path, branch, sim,
+            workspace_path,
+            branch,
+            sim,
             repo=github._workspace_repos.get(workspace_path),
             commit_timestamps=github._commit_timestamps,
         )
 
     async def _force_push_fn(workspace_path: Path, branch: str) -> None:
         await _sim_aware_push(
-            workspace_path, branch, sim,
+            workspace_path,
+            branch,
+            sim,
             repo=github._workspace_repos.get(workspace_path),
             force=True,
             commit_timestamps=github._commit_timestamps,
@@ -325,7 +329,10 @@ class Harness:
         # Reuse existing fakes so accumulated GitHub state (_reviews,
         # _pr_comments, _commit_timestamps, _workspace_repos) survives.
         self.linear, self.github, self.runner, self.orch = _build_runtime(
-            self.config, self.conn, self.sim, self.clock,
+            self.config,
+            self.conn,
+            self.sim,
+            self.clock,
             existing_linear=self.linear,
             existing_github=self.github,
             existing_runner=self.runner,

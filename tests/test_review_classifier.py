@@ -115,9 +115,7 @@ def test_rule_1_blocking_required_ci_conclusions_win_over_approval(
             required=True,
         ),
     ]
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     v = review_classifier(comments=[], ci=ci, snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.rule == "failing_ci"
@@ -198,9 +196,7 @@ def test_rule_2_pending_unknown_required_ci_marks_pending() -> None:
     ci = [
         CheckRun(name="unit", status="in_progress", conclusion=None, required=None),
     ]
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     v = review_classifier(comments=[], ci=ci, snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.PENDING
     assert v.rule == "pending_ci"
@@ -409,18 +405,14 @@ def test_rule_5_dismissed_latest_human_review_clears_prior_request() -> None:
 
 
 def test_rule_6_codex_plus_one_after_head_commit_marks_approved() -> None:
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.APPROVED
     assert v.rule == "codex_approved"
 
 
 def test_rule_6_codex_plus_one_before_head_commit_is_stale() -> None:
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=EARLIER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=EARLIER),)
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind != VerdictKind.APPROVED
 
@@ -490,9 +482,7 @@ def test_rule_3_conflict_beats_codex_inline_comments() -> None:
 
 
 def test_rule_7_approved_but_conflicting_marks_changes_requested() -> None:
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     snap = _snap(reactions=reactions, mergeable="CONFLICTING")
     v = review_classifier(comments=[], ci=[], snapshot=snap)
     assert v.kind == VerdictKind.CHANGES_REQUESTED
@@ -505,18 +495,14 @@ def test_rule_7_approved_but_conflicting_marks_changes_requested() -> None:
 
 
 def test_rule_8_approved_but_unknown_mergeable_stays_pending() -> None:
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     snap = _snap(reactions=reactions, mergeable="UNKNOWN")
     v = review_classifier(comments=[], ci=[], snapshot=snap)
     assert v.kind == VerdictKind.PENDING
 
 
 def test_rule_8_approved_but_unset_mergeable_stays_pending() -> None:
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     snap = _snap(reactions=reactions, mergeable=None)
     v = review_classifier(comments=[], ci=[], snapshot=snap)
     assert v.kind == VerdictKind.PENDING
@@ -682,9 +668,7 @@ def test_codex_reaction_naming_stale_commit_does_not_approve() -> None:
 
 def test_codex_reaction_without_sha_stays_time_validated() -> None:
     """Genuine GitHub reactions carry no commit ref and keep the time gate."""
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     v = review_classifier(comments=[], ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.APPROVED
     assert v.rule == "codex_approved"
@@ -701,9 +685,7 @@ def test_later_codex_approval_supersedes_older_inline_comment() -> None:
             line=42,
         ),
     ]
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER_STILL),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER_STILL),)
     v = review_classifier(comments=comments, ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.APPROVED
     assert v.rule == "codex_approved"
@@ -721,9 +703,7 @@ def test_newer_codex_inline_comment_still_blocks_prior_approval() -> None:
             line=42,
         ),
     ]
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER),)
     v = review_classifier(comments=comments, ci=[], snapshot=_snap(reactions=reactions))
     assert v.kind == VerdictKind.CHANGES_REQUESTED
     assert v.rule == "codex_inline"
@@ -741,9 +721,7 @@ def test_codex_reaction_does_not_approve_when_head_time_is_unknown() -> None:
             line=42,
         ),
     ]
-    reactions = (
-        Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER_STILL),
-    )
+    reactions = (Reaction(user_login=CODEX_BOT_LOGIN, content="+1", created_at=LATER_STILL),)
     v = review_classifier(
         comments=comments,
         ci=[],

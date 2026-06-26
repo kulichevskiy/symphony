@@ -20,9 +20,7 @@ AcceptanceScreenshotKind = Literal["hero", "criterion"]
 
 ACCEPTANCE_FOOTER_PASS = "<!-- symphony-acceptance-verdict: pass -->"
 ACCEPTANCE_FOOTER_REJECT = "<!-- symphony-acceptance-verdict: reject -->"
-ACCEPTANCE_FOOTER_INFRA_ERROR = (
-    "<!-- symphony-acceptance-verdict: infra_error -->"
-)
+ACCEPTANCE_FOOTER_INFRA_ERROR = "<!-- symphony-acceptance-verdict: infra_error -->"
 ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL = "quick_skip_trivial"
 
 _FOOTER_RE = re.compile(
@@ -38,13 +36,9 @@ _ARTIFACTS_RE = re.compile(
 _COMMENT_DETAILS_LIMIT = 2500
 ACCEPTANCE_CRITERIA_COMMENT_HEADER = "### Symphony extracted acceptance criteria"
 ACCEPTANCE_CRITERIA_COMMENT_MARKER = "<!-- symphony-acceptance-criteria -->"
-_CHECKBOX_RE = re.compile(
-    r"^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s+(?P<text>.+?)\s*$"
-)
+_CHECKBOX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s+(?P<text>.+?)\s*$")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>.+?)\s*$")
-_HEADING_RE = re.compile(
-    r"^\s{0,3}(?P<marker>#{1,6})\s+(?P<title>.+?)\s*#*\s*$"
-)
+_HEADING_RE = re.compile(r"^\s{0,3}(?P<marker>#{1,6})\s+(?P<title>.+?)\s*#*\s*$")
 _SETEXT_HEADING_UNDERLINE_RE = re.compile(r"^\s{0,3}(?P<marker>=+|-+)\s*$")
 _CRITERIA_HEADING_RE = re.compile(
     r"^(?:acceptance\s+criteria|acceptance\s+checklist|criteria|checklist)"
@@ -149,8 +143,7 @@ def acceptance_classifier(
             cost=verdict_cost,
             hero_screenshot_url="",
             details=(
-                parsed.infra_error_details
-                or "Acceptance agent did not emit a final message."
+                parsed.infra_error_details or "Acceptance agent did not emit a final message."
             ),
         )
     verdict_text = parsed.message
@@ -163,8 +156,7 @@ def acceptance_classifier(
             cost=verdict_cost,
             hero_screenshot_url="",
             details=(
-                parsed.infra_error_details
-                or "Acceptance agent did not emit a verdict footer."
+                parsed.infra_error_details or "Acceptance agent did not emit a verdict footer."
             ),
         )
     kind = match[-1].group("kind").lower()
@@ -315,17 +307,12 @@ def format_acceptance_criteria_comment(
     return f"{body}\n{ACCEPTANCE_CRITERIA_COMMENT_MARKER}"
 
 
-def format_acceptance_verdict_comment(
-    *, verdict: AcceptanceVerdict, pr_url: str
-) -> str:
+def format_acceptance_verdict_comment(*, verdict: AcceptanceVerdict, pr_url: str) -> str:
     details = verdict.details.strip()
     if len(details) > _COMMENT_DETAILS_LIMIT:
         details = details[:_COMMENT_DETAILS_LIMIT] + "\n...[truncated]"
     prefix = ""
-    if (
-        verdict.kind == "pass"
-        and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL
-    ):
+    if verdict.kind == "pass" and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL:
         prefix = "**Acceptance: skipped - trivial change.**\n\n"
     usage = verdict.usage
     eff = effective_tokens(
@@ -698,10 +685,7 @@ def _criteria_breakdown(verdict: AcceptanceVerdict) -> str:
     criteria = verdict.criteria
     if not criteria:
         return body + "- No verifiable criteria - falling back to description match.\n"
-    if (
-        verdict.kind == "pass"
-        and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL
-    ):
+    if verdict.kind == "pass" and verdict.reason == ACCEPTANCE_REASON_QUICK_SKIP_TRIVIAL:
         for criterion in criteria:
             body += f"- **{criterion}**: not checked because acceptance was skipped as trivial.\n"
         return body
@@ -713,9 +697,7 @@ def _criteria_breakdown(verdict: AcceptanceVerdict) -> str:
             )
         return body
     if verdict.criterion_results:
-        by_criterion = {
-            item.criterion.casefold(): item for item in verdict.criterion_results
-        }
+        by_criterion = {item.criterion.casefold(): item for item in verdict.criterion_results}
         for criterion in criteria:
             result = by_criterion.get(criterion.casefold())
             if result is None:

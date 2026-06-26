@@ -158,5 +158,3 @@ def test_already_resolved_with_stale_files_returns_success(tmp_path: Path) -> No
     # concurrent run already resolved them.
     result = asyncio.run(_git_add_and_continue_rebase(repo, ["f.txt"]))
     assert result is True
-
-

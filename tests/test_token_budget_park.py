@@ -140,12 +140,8 @@ async def test_guard_trips_at_boundary_and_parks(tmp_path: Path) -> None:
         orch = _make_orch(cfg, linear, conn)
         await _seed_issue(conn)
         # implement 700 effective + review_fix 400 effective = 1100 >= 1000.
-        await _seed_run_with_tokens(
-            conn, run_id="r-impl", stage="implement", input_tokens=700
-        )
-        await _seed_run_with_tokens(
-            conn, run_id="r-fix", stage="review_fix", input_tokens=400
-        )
+        await _seed_run_with_tokens(conn, run_id="r-impl", stage="implement", input_tokens=700)
+        await _seed_run_with_tokens(conn, run_id="r-fix", stage="review_fix", input_tokens=400)
         # The boundary run (e.g. the live review monitor) is not killed.
         await db.runs.create(
             conn,
@@ -188,9 +184,7 @@ async def test_guard_under_budget_does_not_park(tmp_path: Path) -> None:
         cfg = Config(repos=[_binding(per_issue_token_budget=_BUDGET)])
         orch = _make_orch(cfg, AsyncMock(), conn)
         await _seed_issue(conn)
-        await _seed_run_with_tokens(
-            conn, run_id="r-impl", stage="implement", input_tokens=500
-        )
+        await _seed_run_with_tokens(conn, run_id="r-impl", stage="implement", input_tokens=500)
         parked = await orch._maybe_park_for_token_budget(  # noqa: SLF001
             "iss-1", "r-monitor", cfg.repos[0]
         )

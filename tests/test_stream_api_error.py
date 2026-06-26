@@ -134,9 +134,7 @@ def test_synthetic_assistant_without_api_error_pattern_is_not_an_error() -> None
 def test_codex_raw_api_error_text_status_parsed() -> None:
     """A codex error event whose raw message text is 'API Error: 500 …' (no
     separate status field) must parse status=500 from the text."""
-    stream = json.dumps(
-        {"type": "turn.failed", "error": {"message": "API Error: 500 overloaded"}}
-    )
+    stream = json.dumps({"type": "turn.failed", "error": {"message": "API Error: 500 overloaded"}})
     err = classify_stream_api_error(stream)
     assert err is not None
     assert err.status == 500
