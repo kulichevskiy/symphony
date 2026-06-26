@@ -721,9 +721,7 @@ async def list_merge_candidates(conn: aiosqlite.Connection) -> list[IssuePR]:
     return [_row_to_issue_pr(r) for r in rows]
 
 
-async def list_recent_merged(
-    conn: aiosqlite.Connection, *, since: datetime
-) -> list[IssuePR]:
+async def list_recent_merged(conn: aiosqlite.Connection, *, since: datetime) -> list[IssuePR]:
     cur = await conn.execute(
         """
         SELECT p.issue_id, i.identifier, i.title, i.team_key, p.github_repo,

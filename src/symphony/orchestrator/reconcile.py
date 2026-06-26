@@ -77,8 +77,7 @@ async def _preserve_pidless_review_retry_path(
     row = await cur.fetchone()
     if row is None:
         log.warning(
-            "could not preserve retry path for pidless review run=%s issue=%s: "
-            "missing issue row",
+            "could not preserve retry path for pidless review run=%s issue=%s: missing issue row",
             run.id,
             run.issue_id,
         )
@@ -227,8 +226,7 @@ async def _redispatch_orphaned_local_review(
     Code Review" with no live run and no working retry handler."""
     if not bindings:
         log.warning(
-            "cannot re-dispatch orphaned local_review run=%s issue=%s: "
-            "no bindings provided",
+            "cannot re-dispatch orphaned local_review run=%s issue=%s: no bindings provided",
             run.id,
             run.issue_id,
         )
@@ -241,8 +239,7 @@ async def _redispatch_orphaned_local_review(
     row = await cur.fetchone()
     if row is None:
         log.warning(
-            "cannot re-dispatch orphaned local_review run=%s issue=%s: "
-            "missing issue row",
+            "cannot re-dispatch orphaned local_review run=%s issue=%s: missing issue row",
             run.id,
             run.issue_id,
         )
@@ -475,10 +472,7 @@ async def _collapse_duplicate_live_runs(
                 db.runs.SUPERSEDED_STATUS,
                 ended_at=now,
                 kind=db.runs.DUPLICATE_STAGE_KIND,
-                detail=(
-                    f"Duplicate live {stage} run for issue {issue_id}; "
-                    f"kept run {survivor.id}"
-                ),
+                detail=(f"Duplicate live {stage} run for issue {issue_id}; kept run {survivor.id}"),
             )
             flipped += 1
     return flipped

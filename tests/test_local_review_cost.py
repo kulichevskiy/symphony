@@ -144,14 +144,10 @@ async def test_collect_runner_output_invokes_usage_handler_on_result_event(
         }
     )
     runner = _ScriptedRunner(_events(result_event))
-    spec = RunnerSpec(
-        run_id="r1", workspace_path=tmp_path, command=["x"], stall_secs=10
-    )
+    spec = RunnerSpec(run_id="r1", workspace_path=tmp_path, command=["x"], stall_secs=10)
 
     captured: list[Usage] = []
-    out = await collect_runner_output(
-        runner, spec, usage_handler=captured.append
-    )
+    out = await collect_runner_output(runner, spec, usage_handler=captured.append)
     assert out.ok_exit
     assert len(captured) == 1
     assert captured[0].cost_usd == pytest.approx(0.42)
@@ -163,9 +159,7 @@ async def test_collect_runner_output_skips_non_usage_lines(
     tmp_path: Path,
 ) -> None:
     runner = _ScriptedRunner(_events("not-json", json.dumps({"type": "system"})))
-    spec = RunnerSpec(
-        run_id="r1", workspace_path=tmp_path, command=["x"], stall_secs=10
-    )
+    spec = RunnerSpec(run_id="r1", workspace_path=tmp_path, command=["x"], stall_secs=10)
     captured: list[Usage] = []
     await collect_runner_output(runner, spec, usage_handler=captured.append)
     assert captured == []
@@ -197,9 +191,7 @@ class _ReviewerScript:
         )
         return ReviewerOutput(
             stdout=stdout,
-            head_sha=(
-                self.head_shas[message_index] if self.head_shas else f"sha{i}"
-            ),
+            head_sha=(self.head_shas[message_index] if self.head_shas else f"sha{i}"),
             cost_usd=self.costs[message_index],
         )
 

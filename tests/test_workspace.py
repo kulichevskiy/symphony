@@ -116,8 +116,11 @@ async def test_acquire_clones_and_checks_out_branch(tmp_path: Path) -> None:
     assert (path / "README.md").exists()
 
     proc = await asyncio.create_subprocess_exec(
-        "git", "branch", "--show-current",
-        cwd=path, stdout=asyncio.subprocess.PIPE,
+        "git",
+        "branch",
+        "--show-current",
+        cwd=path,
+        stdout=asyncio.subprocess.PIPE,
     )
     out, _ = await proc.communicate()
     assert out.decode().strip() == "symphony/eng-123"

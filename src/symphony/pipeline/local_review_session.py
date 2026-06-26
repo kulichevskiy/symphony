@@ -94,16 +94,9 @@ def _safe_run_id(parent_run_id: str, suffix: str) -> str:
     return f"{base}-{suffix}"
 
 
-
-def _persist_runner_transcript(
-    log_dir: Path, stem: str, collected: CollectedRunnerOutput
-) -> None:
-    (log_dir / f"{stem}.out.log").write_text(
-        collected.stdout, encoding="utf-8", errors="replace"
-    )
-    (log_dir / f"{stem}.err.log").write_text(
-        collected.stderr, encoding="utf-8", errors="replace"
-    )
+def _persist_runner_transcript(log_dir: Path, stem: str, collected: CollectedRunnerOutput) -> None:
+    (log_dir / f"{stem}.out.log").write_text(collected.stdout, encoding="utf-8", errors="replace")
+    (log_dir / f"{stem}.err.log").write_text(collected.stderr, encoding="utf-8", errors="replace")
 
 
 def _build_fix_command(
@@ -135,9 +128,7 @@ def _build_fix_command(
         if claude_model is not None:
             command.extend(["--model", claude_model])
         if mcp_servers:
-            command.extend(
-                ["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})]
-            )
+            command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])
         command.append(prompt)
         return command
     if agent == "codex":
@@ -256,9 +247,7 @@ async def run_local_review_session(
             base_branch=base_branch,
             codex_model=codex_model or DEFAULT_CODEX_MODEL,
             claude_model=claude_model,
-            last_message_path=(
-                str(last_message_path) if agent == "codex" else None
-            ),
+            last_message_path=(str(last_message_path) if agent == "codex" else None),
             pass_two=pass_two,
         )
         spec = RunnerSpec(
@@ -275,26 +264,18 @@ async def run_local_review_session(
         output_before = estimator.total_output_tokens
         cache_write_before = estimator.total_cache_write_tokens
         cache_read_before = estimator.total_cache_read_tokens
-        collected = await collect_runner_output(
-            runner, spec, usage_handler=estimator.delta
-        )
+        collected = await collect_runner_output(runner, spec, usage_handler=estimator.delta)
         _persist_runner_transcript(last_message_dir, stem, collected)
         cost_delta = estimator.total_cost_usd - cost_before
         input_delta = estimator.total_input_tokens - input_before
         output_delta = estimator.total_output_tokens - output_before
-        cache_write_delta = (
-            estimator.total_cache_write_tokens - cache_write_before
-        )
-        cache_read_delta = (
-            estimator.total_cache_read_tokens - cache_read_before
-        )
+        cache_write_delta = estimator.total_cache_write_tokens - cache_write_before
+        cache_read_delta = estimator.total_cache_read_tokens - cache_read_before
 
         last_message_text: str | None = None
         if last_message_path.exists():
             try:
-                last_message_text = last_message_path.read_text(
-                    encoding="utf-8", errors="replace"
-                )
+                last_message_text = last_message_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 last_message_text = None
 
@@ -445,25 +426,16 @@ async def run_local_review_session(
             last_message_file=verifier_message,
             cost_usd=verifier_out.cost_usd + finder_out.cost_usd,
             input_tokens=verifier_out.input_tokens + finder_out.input_tokens,
-            output_tokens=(
-                verifier_out.output_tokens + finder_out.output_tokens
-            ),
-            cache_write_tokens=(
-                verifier_out.cache_write_tokens + finder_out.cache_write_tokens
-            ),
-            cache_read_tokens=(
-                verifier_out.cache_read_tokens + finder_out.cache_read_tokens
-            ),
+            output_tokens=(verifier_out.output_tokens + finder_out.output_tokens),
+            cache_write_tokens=(verifier_out.cache_write_tokens + finder_out.cache_write_tokens),
+            cache_read_tokens=(verifier_out.cache_read_tokens + finder_out.cache_read_tokens),
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
         if not allow_fixes:
             return FixerOutput(
                 ok=False,
-                error=(
-                    "local-review requested changes; "
-                    "fix turn disabled for publish resume"
-                ),
+                error=("local-review requested changes; fix turn disabled for publish resume"),
             )
         head_before = await head_sha_provider(workspace_path)
         prompt = review_comment_fix_prompt(
@@ -497,18 +469,12 @@ async def run_local_review_session(
         output_before = fixer_estimator.total_output_tokens
         cache_write_before = fixer_estimator.total_cache_write_tokens
         cache_read_before = fixer_estimator.total_cache_read_tokens
-        collected = await collect_runner_output(
-            runner, spec, usage_handler=fixer_estimator.delta
-        )
-        _persist_runner_transcript(
-            last_message_dir, f"fix-{iteration}", collected
-        )
+        collected = await collect_runner_output(runner, spec, usage_handler=fixer_estimator.delta)
+        _persist_runner_transcript(last_message_dir, f"fix-{iteration}", collected)
         cost_delta = fixer_estimator.total_cost_usd - cost_before
         input_delta = fixer_estimator.total_input_tokens - input_before
         output_delta = fixer_estimator.total_output_tokens - output_before
-        cache_write_delta = (
-            fixer_estimator.total_cache_write_tokens - cache_write_before
-        )
+        cache_write_delta = fixer_estimator.total_cache_write_tokens - cache_write_before
         cache_read_delta = fixer_estimator.total_cache_read_tokens - cache_read_before
         if collected.terminal_kind == "spawn_failed":
             return FixerOutput(
@@ -551,9 +517,7 @@ async def run_local_review_session(
         # gate — `SYMPHONY_BLOCKED` marker, else no-marker + no-HEAD-advance
         # classifier — and halt the loop on a blocked verdict. Other outcomes
         # keep rc=0 == ok: the loop's own re-review / dedup handles them.
-        final_message = extract_last_agent_message(
-            agent=implementer_agent, stdout=collected.stdout
-        )
+        final_message = extract_last_agent_message(agent=implementer_agent, stdout=collected.stdout)
         head_after = await head_sha_provider(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
         if not head_advanced:

@@ -91,9 +91,7 @@ def _model_rows(db_path: Path) -> dict[str, dict[tuple[str, str], tuple[int, ...
         conn.close()
     out: dict[str, dict[tuple[str, str], tuple[int, ...]]] = {}
     for row in rows:
-        out.setdefault(str(row["run_id"]), {})[
-            (str(row["provider"]), str(row["model"]))
-        ] = (
+        out.setdefault(str(row["run_id"]), {})[(str(row["provider"]), str(row["model"]))] = (
             int(row["input_tokens"]),
             int(row["output_tokens"]),
             int(row["cache_write_tokens"]),

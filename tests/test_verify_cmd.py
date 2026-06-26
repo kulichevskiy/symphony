@@ -54,9 +54,7 @@ class _StagedRunner:
             advance_head(spec.workspace_path)
         bucket = self._scripts.get(spec.stage)
         if not bucket:
-            raise AssertionError(
-                f"unexpected stage {spec.stage!r}; remaining={self._scripts}"
-            )
+            raise AssertionError(f"unexpected stage {spec.stage!r}; remaining={self._scripts}")
         events = bucket.pop(0)
 
         async def gen() -> AsyncIterator[RunnerEvent]:
@@ -152,15 +150,11 @@ def _session_kwargs(runner: _StagedRunner, command_runner) -> dict:  # type: ign
 
 @pytest.mark.asyncio
 async def test_verify_session_green_first_run_skips_fix_turn() -> None:
-    async def command_runner(
-        path: Path, cmd: str, timeout_secs: int
-    ) -> tuple[bool, str]:
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return True, "all green"
 
     runner = _StagedRunner({})
-    result = await run_verify_session(
-        **_session_kwargs(runner, command_runner)
-    )
+    result = await run_verify_session(**_session_kwargs(runner, command_runner))
     assert result.ok
     assert not result.fix_attempted
     assert runner.captured == []
@@ -170,9 +164,7 @@ async def test_verify_session_green_first_run_skips_fix_turn() -> None:
 async def test_verify_session_red_then_fix_then_green() -> None:
     outcomes = [(False, "FAIL src/a.test.ts\nbuild error TS2345"), (True, "ok")]
 
-    async def command_runner(
-        path: Path, cmd: str, timeout_secs: int
-    ) -> tuple[bool, str]:
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return outcomes.pop(0)
 
     runner = _StagedRunner(
@@ -185,9 +177,7 @@ async def test_verify_session_red_then_fix_then_green() -> None:
             ]
         }
     )
-    result = await run_verify_session(
-        **_session_kwargs(runner, command_runner)
-    )
+    result = await run_verify_session(**_session_kwargs(runner, command_runner))
     assert result.ok
     assert result.fix_attempted
     assert [s.stage for s in runner.captured] == ["verify_fix"]
@@ -203,9 +193,7 @@ async def test_verify_session_fix_turn_carries_fix_role_model() -> None:
     into the fix-turn argv; unset → no `--model`."""
     outcomes = [(False, "build error TS2345"), (True, "ok")]
 
-    async def command_runner(
-        path: Path, cmd: str, timeout_secs: int
-    ) -> tuple[bool, str]:
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return outcomes.pop(0)
 
     runner = _StagedRunner(
@@ -232,9 +220,7 @@ async def test_verify_session_fix_turn_omits_model_when_unset() -> None:
     """Default `None` → no `--model` (CLI default; no behavior change)."""
     outcomes = [(False, "build error TS2345"), (True, "ok")]
 
-    async def command_runner(
-        path: Path, cmd: str, timeout_secs: int
-    ) -> tuple[bool, str]:
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return outcomes.pop(0)
 
     runner = _StagedRunner(
@@ -256,9 +242,7 @@ async def test_verify_session_fix_turn_omits_model_when_unset() -> None:
 async def test_verify_session_still_red_after_fix_fails_closed() -> None:
     outcomes = [(False, "first failure"), (False, "still red: TS2345 tail")]
 
-    async def command_runner(
-        path: Path, cmd: str, timeout_secs: int
-    ) -> tuple[bool, str]:
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return outcomes.pop(0)
 
     runner = _StagedRunner(
@@ -271,9 +255,7 @@ async def test_verify_session_still_red_after_fix_fails_closed() -> None:
             ]
         }
     )
-    result = await run_verify_session(
-        **_session_kwargs(runner, command_runner)
-    )
+    result = await run_verify_session(**_session_kwargs(runner, command_runner))
     assert not result.ok
     assert result.fix_attempted
     assert "still red: TS2345 tail" in result.tail
@@ -282,17 +264,11 @@ async def test_verify_session_still_red_after_fix_fails_closed() -> None:
 
 @pytest.mark.asyncio
 async def test_verify_session_fix_run_spawn_failure_fails_closed() -> None:
-    async def command_runner(
-        path: Path, cmd: str, timeout_secs: int
-    ) -> tuple[bool, str]:
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return False, "red output"
 
-    runner = _StagedRunner(
-        {"verify_fix": [[RunnerEvent(kind="spawn_failed", error="no claude")]]}
-    )
-    result = await run_verify_session(
-        **_session_kwargs(runner, command_runner)
-    )
+    runner = _StagedRunner({"verify_fix": [[RunnerEvent(kind="spawn_failed", error="no claude")]]})
+    result = await run_verify_session(**_session_kwargs(runner, command_runner))
     assert not result.ok
     assert result.fix_attempted
     assert "red output" in result.tail
@@ -375,21 +351,15 @@ def _init_git_workspace(path: Path) -> str:
         ["git", "add", "f.txt"],
         ["git", "commit", "-q", "-m", "init"],
     ):
-        subprocess.run(
-            cmd, cwd=path, check=True, env={**os.environ, **env}, capture_output=True
-        )
-    out = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True
-    )
+        subprocess.run(cmd, cwd=path, check=True, env={**os.environ, **env}, capture_output=True)
+    out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True)
     return out.stdout.decode().strip()
 
 
 def _workspace_head(path: Path) -> str:
     """Return *path*'s current HEAD SHA (sync, to stay off the async loop)."""
     return (
-        subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True
-        )
+        subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True)
         .stdout.decode()
         .strip()
     )
@@ -434,9 +404,7 @@ async def test_failing_verify_cmd_blocks_push_and_pr(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _verify_binding("echo BUILD_BROKEN_MARKER; exit 1")
-        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
-            tmp_path, binding
-        )
+        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(tmp_path, binding)
         runner = _StagedRunner(
             {
                 "implement": [_implement_script()],
@@ -494,9 +462,7 @@ async def test_passing_verify_cmd_push_proceeds(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _verify_binding("true")
-        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
-            tmp_path, binding
-        )
+        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(tmp_path, binding)
         # A real git workspace with a clean base commit. The implement run
         # advances HEAD (the completion gate requires it), so the green-gate
         # recording (poll.py:_dispatch_one) keys the verify-pass mark on the
@@ -543,9 +509,7 @@ async def test_verify_session_crash_fails_closed(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _verify_binding("true")
-        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
-            tmp_path, binding
-        )
+        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(tmp_path, binding)
         runner = _StagedRunner({"implement": [_implement_script()]})
         orch = Orchestrator(
             cfg,
@@ -640,9 +604,7 @@ async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
             "else touch .sym_verified; echo VERIFY_RED_THEN_GREEN; exit 1; fi"
         )
         binding = _local_and_verify_binding(verify_cmd)
-        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(
-            tmp_path, binding
-        )
+        cfg, linear, workspace_path, workspace, gh, push_fn = _orch_fixtures(tmp_path, binding)
         # The implement turn's commit (completion gate) gitignores the verify
         # sentinel so it never trips the pre-push dirty-tree gate.
         (workspace_path / ".gitignore").write_text(".sym_verified\n")
@@ -666,8 +628,7 @@ async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
                 "local_review": [
                     [
                         _codex_agent_message(
-                            "## Findings\n- needs a tweak\n"
-                            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+                            f"## Findings\n- needs a tweak\n{VERDICT_CHANGES_REQUESTED_MARKER}"
                         ),
                         RunnerEvent(kind="exit", returncode=0),
                     ],
@@ -715,9 +676,7 @@ async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
         # The verify gate's fix turn runs strictly after the local-review
         # fix loop's last mutation.
         last_mutation = max(
-            i
-            for i, s in enumerate(stages)
-            if s in ("local_review", "local_review_fix")
+            i for i, s in enumerate(stages) if s in ("local_review", "local_review_fix")
         )
         assert stages.index("verify_fix") > last_mutation
 

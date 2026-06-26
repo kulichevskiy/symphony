@@ -63,10 +63,7 @@ MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
 
 
 def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
-    return (
-        f"{MANUAL_MERGE_PARKED_RUN_PREFIX}"
-        f"{pr.issue_id}:{pr.github_repo}:{pr.pr_number}"
-    )
+    return f"{MANUAL_MERGE_PARKED_RUN_PREFIX}{pr.issue_id}:{pr.github_repo}:{pr.pr_number}"
 
 
 class _SlashCommandsMixin(_OrchestratorBase):
@@ -191,13 +188,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
             try:
                 await self._apply_web_command(issue_id, kind, command_id)
             except Exception:  # noqa: BLE001 — a bad command must not kill the loop
-                log.exception(
-                    "web command failed (issue=%s kind=%s)", issue_id, kind
-                )
+                log.exception("web command failed (issue=%s kind=%s)", issue_id, kind)
 
-    async def _apply_web_command(
-        self, issue_id: str, kind: SlashKind, command_id: str
-    ) -> None:
+    async def _apply_web_command(self, issue_id: str, kind: SlashKind, command_id: str) -> None:
         run_id = await self._web_command_run_id(issue_id)
         if run_id is None:
             log.warning(
@@ -214,9 +207,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
         await self._handle_slash_intent(issue_id, run_id, intent)
 
     async def _web_command_run_id(self, issue_id: str) -> str | None:
-        run_id = self._dispatch_run_ids.get(
-            issue_id
-        ) or self._review_poll_issue_ids.get(issue_id)
+        run_id = self._dispatch_run_ids.get(issue_id) or self._review_poll_issue_ids.get(issue_id)
         if run_id is None:
             for iid, rid in await self._parked_manual_merge_slash_pairs():
                 if iid == issue_id:
@@ -249,9 +240,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             pairs.append((pr.issue_id, _manual_merge_parked_run_id(pr)))
         return pairs
 
-    async def _parked_manual_merge_run_id_for_issue(
-        self, issue_id: str
-    ) -> str | None:
+    async def _parked_manual_merge_run_id_for_issue(self, issue_id: str) -> str | None:
         pr = await db.issue_prs.get_for_issue(self._conn, issue_id=issue_id)
         if pr is None or pr.merged_at is not None or pr.parked_at is None:
             return None
@@ -292,13 +281,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
             except Exception:  # noqa: BLE001 — keep loop alive
                 log.exception("failed to resolve cursor for issue %s", issue_id)
                 continue
-            tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
-                issue_id
-            )
+            tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(issue_id)
             try:
-                comments = await self.tracker(tracker_ctx).comments_since(
-                    tracker_issue_id, after
-                )
+                comments = await self.tracker(tracker_ctx).comments_since(tracker_issue_id, after)
             except LinearError as e:
                 log.warning("comments_since failed for %s: %s", issue_id, e)
                 continue
@@ -380,9 +365,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     issue_id,
                     exc.reason,
                 )
-                await self._post_command_rejected(
-                    issue_id, exc.slash_text, exc.reason
-                )
+                await self._post_command_rejected(issue_id, exc.slash_text, exc.reason)
                 raise
             await db.comment_events.mark(
                 self._conn,
@@ -440,9 +423,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
         return stored_dt, set(stored_ids)
 
     async def _run_started_at(self, run_id: str) -> datetime:
-        cur = await self._conn.execute(
-            "SELECT started_at FROM runs WHERE id = ?", (run_id,)
-        )
+        cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
         row = await cur.fetchone()
         if row is not None and row[0]:
             return _parse_rfc3339(row[0])
@@ -463,9 +444,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             )
             return datetime(1970, 1, 1, tzinfo=UTC)
 
-    async def _handle_slash_intent(
-        self, issue_id: str, run_id: str, intent: SlashIntent
-    ) -> None:
+    async def _handle_slash_intent(self, issue_id: str, run_id: str, intent: SlashIntent) -> None:
         if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
             await self._handle_parked_manual_merge_slash_intent(issue_id, intent)
             return
@@ -493,19 +472,13 @@ class _SlashCommandsMixin(_OrchestratorBase):
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if wait is not None:
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
-                await self._handle_implement_failed_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
-                await self._handle_implement_blocked_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
-                await self._handle_deliver_failed_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_deliver_failed_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind in (
                 db.operator_waits.KIND_REVIEW_FAILED,
@@ -514,24 +487,16 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_MERGE:
-                await self._handle_merge_needs_approval_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED:
-                await self._handle_acceptance_blocked_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_acceptance_blocked_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
-                await self._handle_acceptance_rejected_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_acceptance_rejected_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_BUDGET_EXCEEDED:
-                await self._handle_budget_exceeded_slash_intent(
-                    issue_id, run_id, intent
-                )
+                await self._handle_budget_exceeded_slash_intent(issue_id, run_id, intent)
                 return
             await self._post_command_rejected(
                 issue_id,
@@ -549,9 +514,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if intent.kind is SlashKind.RETRY:
             monitor_run_id = self._review_poll_issue_ids.get(issue_id)
             if monitor_run_id is not None and monitor_run_id in self._review_poll_run_ids:
-                await self._handle_active_review_retry_intent(
-                    issue_id, monitor_run_id, intent
-                )
+                await self._handle_active_review_retry_intent(issue_id, monitor_run_id, intent)
                 return
         if intent.kind is SlashKind.STOP:
             monitor_run_id = self._review_poll_issue_ids.get(issue_id)
@@ -598,9 +561,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
     def _slash_text(intent: SlashIntent) -> str:
         return f"${intent.kind.value}"
 
-    async def _post_command_rejected(
-        self, issue_id: str, slash_text: str, reason: str
-    ) -> None:
+    async def _post_command_rejected(self, issue_id: str, slash_text: str, reason: str) -> None:
         tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(tracker_ctx)
         try:
@@ -723,9 +684,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             try:
                 await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
-                log.warning(
-                    "implement retry comment failed for issue %s: %s", issue_id, e
-                )
+                log.warning("implement retry comment failed for issue %s: %s", issue_id, e)
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -826,9 +785,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             try:
                 await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
-                log.warning(
-                    "implement resume comment failed for issue %s: %s", issue_id, e
-                )
+                log.warning("implement resume comment failed for issue %s: %s", issue_id, e)
             await self._clear_operator_wait(issue_id, run_id)
             return
 
@@ -929,8 +886,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 await self._post_command_rejected(
                     issue_id,
                     self._slash_text(intent),
-                    "could not move issue to an active Linear state; "
-                    "keeping acceptance blocked",
+                    "could not move issue to an active Linear state; keeping acceptance blocked",
                 )
                 return
             await db.acceptance_state.reset(self._conn, issue_id)
@@ -1029,13 +985,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
             # Grant one more budget window (repeatable). Raising the ceiling
             # before re-dispatch keeps the guard from immediately re-parking.
-            budget = binding.resolved_per_issue_token_budget(
-                self.config.per_issue_token_budget
-            )
+            budget = binding.resolved_per_issue_token_budget(self.config.per_issue_token_budget)
             if budget is not None:
-                await db.issues.add_granted_token_budget(
-                    self._conn, issue_id, budget
-                )
+                await db.issues.add_granted_token_budget(self._conn, issue_id, budget)
             # If the parked boundary already has an open PR (any review/merge
             # boundary), re-dispatch the review monitor directly. Routing
             # through the ready scan would hit `_blocking_existing_pr` /

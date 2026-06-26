@@ -206,62 +206,45 @@ class _OrchestratorBase:
         # Sibling-domain methods provided by the concrete `Orchestrator`
         # (defined on the mixins it is assembled from). Declared here so
         # `mypy --strict` resolves the cross-domain calls the poll loop makes.
-        def _cancel_deliver_failed_review_poll_tasks(self, issue_id: str) -> None:
-            ...
+        def _cancel_deliver_failed_review_poll_tasks(self, issue_id: str) -> None: ...
 
-        async def _clear_review_rearm_retry(self, run_id: str) -> None:
-            ...
+        async def _clear_review_rearm_retry(self, run_id: str) -> None: ...
 
-        async def _drain_web_commands(self) -> None:
-            ...
+        async def _drain_web_commands(self) -> None: ...
 
         async def _handle_unseen_slash_comment(
             self, issue_id: str, run_id: str, comment: LinearComment
-        ) -> bool:
-            ...
+        ) -> bool: ...
 
-        async def _parked_manual_merge_run_id_for_issue(
-            self, issue_id: str
-        ) -> str | None:
-            ...
+        async def _parked_manual_merge_run_id_for_issue(self, issue_id: str) -> str | None: ...
 
-        async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
-            ...
+        async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]: ...
 
-        async def _poll_review_runs(self) -> list[asyncio.Task[None]]:
-            ...
+        async def _poll_review_runs(self) -> list[asyncio.Task[None]]: ...
 
-        async def _poll_slash_commands(self) -> None:
-            ...
+        async def _poll_slash_commands(self) -> None: ...
 
         async def _post_command_rejected(
             self, issue_id: str, slash_text: str, reason: str
-        ) -> None:
-            ...
+        ) -> None: ...
 
         def _ready_binding_for_issue(
             self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
-        ) -> RepoBinding | None:
-            ...
+        ) -> RepoBinding | None: ...
 
         async def _reconcile_auto_recoverable_merge_waits(
             self, *, reason: str = "manual"
-        ) -> int:
-            ...
+        ) -> int: ...
 
-        async def _reconcile_merged_issues_linear_state(self) -> int:
-            ...
+        async def _reconcile_merged_issues_linear_state(self) -> int: ...
 
-        async def _reconcile_orphaned_merge_runs(self, *, reason: str = "manual") -> int:
-            ...
+        async def _reconcile_orphaned_merge_runs(self, *, reason: str = "manual") -> int: ...
 
         async def _reconcile_parked_closed_unmerged_pr_event(
             self, event: GitHubWebhookEvent
-        ) -> int:
-            ...
+        ) -> int: ...
 
-        async def _resurrect_review_runs(self) -> list[asyncio.Task[None]]:
-            ...
+        async def _resurrect_review_runs(self) -> list[asyncio.Task[None]]: ...
 
         @asynccontextmanager
         async def _review_fix_dispatch_slot(
@@ -275,13 +258,9 @@ class _OrchestratorBase:
 
         async def _run_auto_recoverable_merge_wait_reconciler(
             self, shutdown: asyncio.Event
-        ) -> None:
-            ...
+        ) -> None: ...
 
-        async def _scan_binding(
-            self, binding: RepoBinding
-        ) -> list[asyncio.Task[None]]:
-            ...
+        async def _scan_binding(self, binding: RepoBinding) -> list[asyncio.Task[None]]: ...
 
         async def _schedule_parked_manual_merge_revival_for_issue_event(
             self,
@@ -291,25 +270,20 @@ class _OrchestratorBase:
             old_state_name: str | None,
             new_state_id: str | None,
             new_state_name: str | None,
-        ) -> asyncio.Task[None] | None:
-            ...
+        ) -> asyncio.Task[None] | None: ...
 
         async def _schedule_ready_issue(
             self, binding: RepoBinding, issue: LinearIssue
-        ) -> asyncio.Task[None] | None:
-            ...
+        ) -> asyncio.Task[None] | None: ...
 
-        def _slash_command_run_eligible(self, run_id: str) -> bool:
-            ...
+        def _slash_command_run_eligible(self, run_id: str) -> bool: ...
 
         @staticmethod
-        def _slash_text(intent: SlashIntent) -> str:
-            ...
+        def _slash_text(intent: SlashIntent) -> str: ...
 
         async def _track_review_failed_wait(
             self, issue_id: str, run_id: str, binding: RepoBinding
-        ) -> None:
-            ...
+        ) -> None: ...
 
     # --- attribute annotations (single source of truth for the whole class) ---
     config: Config
@@ -392,9 +366,7 @@ class _OrchestratorBase:
         # (never concurrently with `_tick` on the shared connection). `_wake`
         # interrupts the inter-tick sleep so a command applies near-instantly.
         self._wake = asyncio.Event()
-        self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = (
-            asyncio.Queue()
-        )
+        self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = asyncio.Queue()
         self._gh: GitHubClient = gh if gh is not None else GitHub()
         self._runner: Runner = runner if runner is not None else LocalRunner()
         self._workspace: Workspace = (
@@ -462,16 +434,12 @@ class _OrchestratorBase:
         self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
         self._parked_closed_unmerged_comment_keys: set[tuple[str, str, int]] = set()
         self._parked_closed_unmerged_lock = asyncio.Lock()
-        self._global_dispatch_sem = asyncio.Semaphore(
-            max(config.global_max_concurrent, 1)
-        )
+        self._global_dispatch_sem = asyncio.Semaphore(max(config.global_max_concurrent, 1))
         self._binding_dispatch_sems: dict[BindingKey, asyncio.Semaphore] = {}
         # Review fix-runs also reserve normal dispatch capacity so they outrank
         # new implementation work, while this separate pool still lets us cap
         # review-fix concurrency independently.
-        self._review_fix_sem = asyncio.Semaphore(
-            max(config.global_max_concurrent, 1)
-        )
+        self._review_fix_sem = asyncio.Semaphore(max(config.global_max_concurrent, 1))
         self._review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore] = {}
         self._reconciler = Reconciler(
             config,
@@ -599,9 +567,7 @@ class _OrchestratorBase:
     async def _tracker_context_for_issue(self, issue_id: str) -> TrackerContext:
         return await self._stored_tracker_context_for_issue(issue_id) or TrackerContext()
 
-    async def _tracker_identity_for_issue(
-        self, issue_id: str
-    ) -> tuple[str, TrackerContext]:
+    async def _tracker_identity_for_issue(self, issue_id: str) -> tuple[str, TrackerContext]:
         return await self._stored_tracker_identity_for_issue(issue_id) or (
             issue_id,
             TrackerContext(),
@@ -610,9 +576,7 @@ class _OrchestratorBase:
     async def _tracker_for_issue_id(self, issue_id: str) -> IssueTracker:
         return self.tracker(await self._tracker_context_for_issue(issue_id))
 
-    def _configured_tracker_contexts(
-        self, *, provider: str | None = None
-    ) -> list[TrackerContext]:
+    def _configured_tracker_contexts(self, *, provider: str | None = None) -> list[TrackerContext]:
         contexts: list[TrackerContext] = []
         seen: set[TrackerContext] = set()
         for binding in self.config.repos:
@@ -632,9 +596,7 @@ class _OrchestratorBase:
     async def _lookup_webhook_issue(
         self, issue_id: str, *, provider: str | None = None
     ) -> tuple[LinearIssue, TrackerContext]:
-        stored_ctx = await self._stored_tracker_context_for_issue(
-            issue_id, provider=provider
-        )
+        stored_ctx = await self._stored_tracker_context_for_issue(issue_id, provider=provider)
         if stored_ctx is not None:
             return await self.tracker(stored_ctx).lookup_issue(issue_id), stored_ctx
 
@@ -672,10 +634,7 @@ class _OrchestratorBase:
         self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
     ) -> RepoBinding | None:
         for binding in self.config.repos:
-            if (
-                tracker_ctx is not None
-                and _tracker_context_for_binding(binding) != tracker_ctx
-            ):
+            if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if binding.linear_team_key != issue.team_key:
                 continue
@@ -692,10 +651,7 @@ class _OrchestratorBase:
     ) -> RepoBinding | None:
         if state.github_repo:
             for binding in self.config.repos:
-                if (
-                    tracker_ctx is not None
-                    and _tracker_context_for_binding(binding) != tracker_ctx
-                ):
+                if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                     continue
                 if binding.linear_team_key != issue.team_key:
                     continue
@@ -2264,9 +2220,7 @@ class _OrchestratorBase:
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
             except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for fix-run %s", issue.identifier
-                )
+                log.exception("workspace acquire failed for fix-run %s", issue.identifier)
                 await on_acquire_failure(e)
                 return False
 

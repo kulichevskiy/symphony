@@ -53,19 +53,11 @@ class _ReviewerScript:
         self.calls.append(i)
         message_index = len(self.calls) - 1 if self.message_by_call else i
         if i in self.fail_on or len(self.calls) - 1 in self.fail_by_call:
-            return ReviewerOutput(
-                stdout="", head_sha="", ok=False, error="reviewer crashed"
-            )
-        agent_error = (
-            self.agent_errors[message_index]
-            if self.agent_errors
-            else self.agent_error
-        )
+            return ReviewerOutput(stdout="", head_sha="", ok=False, error="reviewer crashed")
+        agent_error = self.agent_errors[message_index] if self.agent_errors else self.agent_error
         return ReviewerOutput(
             stdout=_codex_jsonl(self.messages[message_index]),
-            head_sha=(
-                self.head_shas[message_index] if self.head_shas else f"sha{i}"
-            ),
+            head_sha=(self.head_shas[message_index] if self.head_shas else f"sha{i}"),
             agent_error=agent_error,
         )
 
@@ -263,9 +255,7 @@ async def test_unparseable_review_treated_as_reviewer_failure() -> None:
 
     Better to escalate than to silently approve or guess.
     """
-    reviewer = _ReviewerScript(
-        messages=["I have opinions but forgot the marker."]
-    )
+    reviewer = _ReviewerScript(messages=["I have opinions but forgot the marker."])
     fixer = _FixerScript()
     result = await run_local_review_loop(
         reviewer_agent="codex",
@@ -285,8 +275,7 @@ async def test_unparseable_review_surfaces_agent_stream_error() -> None:
     reviewer = _ReviewerScript(
         messages=["(no marker — the turn failed upstream)"],
         agent_error=(
-            "The 'gpt-5.1-codex' model is not supported when using Codex "
-            "with a ChatGPT account."
+            "The 'gpt-5.1-codex' model is not supported when using Codex with a ChatGPT account."
         ),
     )
     fixer = _FixerScript()
@@ -299,8 +288,7 @@ async def test_unparseable_review_surfaces_agent_stream_error() -> None:
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.iterations == 1
     assert result.error == (
-        "The 'gpt-5.1-codex' model is not supported when using Codex "
-        "with a ChatGPT account."
+        "The 'gpt-5.1-codex' model is not supported when using Codex with a ChatGPT account."
     )
     assert fixer.received == []
 

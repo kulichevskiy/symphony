@@ -68,18 +68,12 @@ class CaseResult:
     @property
     def is_false_approve(self) -> bool:
         # Truth says block, classifier let it through. The expensive error.
-        return (
-            self.expected_kind in _BLOCKING_KINDS
-            and self.actual_kind not in _BLOCKING_KINDS
-        )
+        return self.expected_kind in _BLOCKING_KINDS and self.actual_kind not in _BLOCKING_KINDS
 
     @property
     def is_false_block(self) -> bool:
         # Truth says merge-ok, classifier blocked it. Wasteful, not unsafe.
-        return (
-            self.expected_kind not in _BLOCKING_KINDS
-            and self.actual_kind in _BLOCKING_KINDS
-        )
+        return self.expected_kind not in _BLOCKING_KINDS and self.actual_kind in _BLOCKING_KINDS
 
 
 def load_corpus(path: Path = CORPUS_PATH) -> list[dict]:

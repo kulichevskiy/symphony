@@ -406,11 +406,7 @@ def compute_drift(
                     source_value=state,
                     source_name="GitHub",
                     flagged_at=merged_at
-                    or (
-                        _as_str(pr_row.get("created_at"))
-                        if pr_row is not None
-                        else None
-                    ),
+                    or (_as_str(pr_row.get("created_at")) if pr_row is not None else None),
                 )
             )
         if merged_at is not None and sqlite_merged_at is None:
@@ -496,9 +492,7 @@ class ExternalSnapshotService:
             for flag in compute_drift(
                 sqlite_view,
                 payload,
-                linear_done_state=(
-                    binding.linear_states.done if binding is not None else "Done"
-                ),
+                linear_done_state=(binding.linear_states.done if binding is not None else "Done"),
             )
         ]
         self.cache.remember_payload(issue_id, fetched_at=now, payload=payload)

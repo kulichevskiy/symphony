@@ -14,9 +14,7 @@ from symphony.db import acceptance_state
 async def test_acceptance_state_starts_at_zero(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
 
         state = await acceptance_state.get(conn, "iss-1")
 
@@ -39,9 +37,7 @@ async def test_acceptance_state_begin_and_verdict_persist(tmp_path: Path) -> Non
     db_path = tmp_path / "s.sqlite"
     conn = await db.connect(db_path)
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await acceptance_state.begin_acceptance(
             conn,
             "iss-1",
@@ -81,9 +77,7 @@ async def test_acceptance_state_begin_and_verdict_persist(tmp_path: Path) -> Non
 async def test_acceptance_state_infra_retries_cap_at_two(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
 
         assert await acceptance_state.bump_infra_retries(conn, "iss-1") == 1
         assert await acceptance_state.bump_infra_retries(conn, "iss-1") == 2

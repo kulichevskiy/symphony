@@ -91,9 +91,7 @@ class UsageCostEstimator:
             self.total_cache_write_tokens += delta.cache_write_tokens
             self.total_cache_read_tokens += delta.cache_read_tokens
             return delta
-        input_delta = max(
-            usage.input_tokens - self.last_estimated_input_tokens, 0
-        )
+        input_delta = max(usage.input_tokens - self.last_estimated_input_tokens, 0)
         cache_write_delta = max(
             usage.cache_write_tokens - self.last_estimated_cache_write_tokens,
             0,
@@ -102,12 +100,8 @@ class UsageCostEstimator:
             usage.cache_read_tokens - self.last_estimated_cache_read_tokens,
             0,
         )
-        output_delta = max(
-            usage.output_tokens - self.last_estimated_output_tokens, 0
-        )
-        self.last_estimated_input_tokens = max(
-            self.last_estimated_input_tokens, usage.input_tokens
-        )
+        output_delta = max(usage.output_tokens - self.last_estimated_output_tokens, 0)
+        self.last_estimated_input_tokens = max(self.last_estimated_input_tokens, usage.input_tokens)
         self.last_estimated_cache_write_tokens = max(
             self.last_estimated_cache_write_tokens,
             usage.cache_write_tokens,

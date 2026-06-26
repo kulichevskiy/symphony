@@ -253,9 +253,7 @@ def _model_usages_for_row(
     return usages
 
 
-def _local_review_model_usages(
-    paths: tuple[Path, ...], *, codex: CodexModels
-) -> list[ModelUsage]:
+def _local_review_model_usages(paths: tuple[Path, ...], *, codex: CodexModels) -> list[ModelUsage]:
     """Parse local-review role transcripts into per-(provider, model) usage.
 
     `fix-*.out.log` are implementer turns, `review-*.out.log` reviewer
@@ -285,9 +283,7 @@ def _read_lines(path: Path) -> list[str] | None:
         return None
 
 
-def _replace_model_usage(
-    conn: sqlite3.Connection, run_id: str, usages: list[ModelUsage]
-) -> None:
+def _replace_model_usage(conn: sqlite3.Connection, run_id: str, usages: list[ModelUsage]) -> None:
     """Rewrite all `run_model_usage` rows for `run_id` (same-key rows merged)."""
     merged: dict[tuple[str, str], list[int]] = {}
     for usage in usages:
@@ -332,11 +328,7 @@ def _index_logs(
         if not path.is_file():
             continue
         relative_parts = path.relative_to(log_root).parts
-        if (
-            len(relative_parts) >= 3
-            and relative_parts[0] == "local_review"
-            and relative_parts[1]
-        ):
+        if len(relative_parts) >= 3 and relative_parts[0] == "local_review" and relative_parts[1]:
             if path.name.endswith(_OUT_LOG_SUFFIX):
                 local_review_by_parent.setdefault(relative_parts[1], []).append(path)
             continue
@@ -381,9 +373,7 @@ def _paths_for_row(
     return paths_by_run_id.get(run_id, ())
 
 
-def _local_review_parent_run_id(
-    *, conn: sqlite3.Connection, row: sqlite3.Row
-) -> str | None:
+def _local_review_parent_run_id(*, conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
     parent = conn.execute(
         """
         SELECT id
@@ -506,12 +496,8 @@ def _cumulative_delta(previous: TokenUsage, current: TokenUsage) -> TokenUsage:
     return TokenUsage(
         input_tokens=max(current.input_tokens - previous.input_tokens, 0),
         output_tokens=max(current.output_tokens - previous.output_tokens, 0),
-        cache_write_tokens=max(
-            current.cache_write_tokens - previous.cache_write_tokens, 0
-        ),
-        cache_read_tokens=max(
-            current.cache_read_tokens - previous.cache_read_tokens, 0
-        ),
+        cache_write_tokens=max(current.cache_write_tokens - previous.cache_write_tokens, 0),
+        cache_read_tokens=max(current.cache_read_tokens - previous.cache_read_tokens, 0),
     )
 
 

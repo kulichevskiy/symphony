@@ -106,9 +106,7 @@ def _advancing_head(monkeypatch: pytest.MonkeyPatch) -> None:
     # SYM-150: the implement completion gate reads `_workspace_head_sha` from
     # `poll._lifecycle`; other stages still read it from `poll`. Patch both.
     monkeypatch.setattr("symphony.orchestrator.poll._workspace_head_sha", _head)
-    monkeypatch.setattr(
-        "symphony.orchestrator.poll._lifecycle._workspace_head_sha", _head
-    )
+    monkeypatch.setattr("symphony.orchestrator.poll._lifecycle._workspace_head_sha", _head)
 
 
 def _make_orch(
@@ -152,17 +150,13 @@ async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
     try:
         cfg = Config(repos=[_binding()])
         linear = AsyncMock()
-        linear.issues_in_state = AsyncMock(
-            return_value=[_issue(), _issue("iss-2", "ENG-2")]
-        )
+        linear.issues_in_state = AsyncMock(return_value=[_issue(), _issue("iss-2", "ENG-2")])
 
         orch = _make_orch(cfg, linear, conn)
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def _slow_dispatch(
-            binding: RepoBinding, issue: LinearIssue
-        ) -> str | None:
+        async def _slow_dispatch(binding: RepoBinding, issue: LinearIssue) -> str | None:
             started.set()
             await release.wait()
             return issue.id
@@ -234,9 +228,7 @@ async def test_queued_dispatch_revalidates_ready_state_before_running(
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def _slow_dispatch(
-            binding: RepoBinding, issue: LinearIssue
-        ) -> str | None:
+        async def _slow_dispatch(binding: RepoBinding, issue: LinearIssue) -> str | None:
             started.set()
             await release.wait()
             return issue.id
@@ -296,9 +288,7 @@ async def test_scan_caps_scheduled_tasks_to_available_slots(
         started = asyncio.Event()
         release = asyncio.Event()
 
-        async def _slow_dispatch(
-            binding: RepoBinding, issue: LinearIssue
-        ) -> str | None:
+        async def _slow_dispatch(binding: RepoBinding, issue: LinearIssue) -> str | None:
             started.set()
             await release.wait()
             return issue.id
@@ -327,9 +317,7 @@ async def test_scan_skips_issues_with_running_run(tmp_path: Path) -> None:
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
         orch = _make_orch(cfg, linear, conn)
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="running",
@@ -449,10 +437,7 @@ async def test_schedule_ready_issue_ignores_pr_exists_for_other_repo(
         orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
         linear.move_issue.assert_not_awaited()
         linear.post_comment.assert_not_awaited()
-        assert (
-            await db.issue_prs.get(conn, issue_id=issue.id, github_repo=pr_repo)
-            is not None
-        )
+        assert await db.issue_prs.get(conn, issue_id=issue.id, github_repo=pr_repo) is not None
     finally:
         await conn.close()
 
@@ -500,10 +485,7 @@ async def test_schedule_ready_issue_ignores_closed_unmerged_pr_row(
             107, repo=binding.github_repo
         )
         assert (
-            await db.issue_prs.get(
-                conn, issue_id=issue.id, github_repo=binding.github_repo
-            )
-            is None
+            await db.issue_prs.get(conn, issue_id=issue.id, github_repo=binding.github_repo) is None
         )
         orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
         linear.move_issue.assert_not_awaited()
@@ -688,9 +670,7 @@ async def test_failed_announce_clears_dedupe_so_next_tick_retries(
         linear = AsyncMock()
         linear.issues_in_state = AsyncMock(return_value=[_issue()])
         # First scan's 🚀 comment raises; second scan succeeds.
-        linear.post_comment = AsyncMock(
-            side_effect=[LinearError("boom"), "cmt-1", "cmt-2"]
-        )
+        linear.post_comment = AsyncMock(side_effect=[LinearError("boom"), "cmt-1", "cmt-2"])
 
         orch = _make_orch(cfg, linear, conn)
 

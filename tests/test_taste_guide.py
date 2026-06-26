@@ -19,8 +19,7 @@ def test_load_taste_guide_concatenates_global_then_binding(tmp_path: Path) -> No
         encoding="utf-8",
     )
     binding_guide.write_text(
-        "## Hard rules (acceptance must reject if violated)\n\n"
-        "- Binding hard rule.\n",
+        "## Hard rules (acceptance must reject if violated)\n\n- Binding hard rule.\n",
         encoding="utf-8",
     )
 

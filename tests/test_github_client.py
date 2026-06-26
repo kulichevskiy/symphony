@@ -34,9 +34,7 @@ from symphony.github.client import (
 )
 
 
-def _make_fake_gh(
-    tmp_path: Path, responses: dict[str, list[object]]
-) -> tuple[Path, Path]:
+def _make_fake_gh(tmp_path: Path, responses: dict[str, list[object]]) -> tuple[Path, Path]:
     """Write a fake `gh` to a temp dir and return (bin_dir, calls_log).
 
     `responses` maps a substring of the joined argv to `[exit_code, stdout]`.
@@ -183,9 +181,7 @@ async def test_pr_for_head_lists_open_pr_for_branch(fake_gh) -> None:  # type: i
     payload = json.dumps([{"number": 7, "url": "https://github.com/org/r/pull/7"}])
     log = fake_gh({"pr list": [0, payload]})
     gh = GitHub()
-    assert await gh.pr_for_head(head="feat/x", repo="org/r") == (
-        "https://github.com/org/r/pull/7"
-    )
+    assert await gh.pr_for_head(head="feat/x", repo="org/r") == ("https://github.com/org/r/pull/7")
     argv = _calls(log)[0]["argv"]
     assert isinstance(argv, list)
     assert argv[:2] == ["pr", "list"]
@@ -206,9 +202,7 @@ async def test_ensure_pr_adopts_existing_open_pr(fake_gh) -> None:  # type: igno
     payload = json.dumps([{"number": 7, "url": "https://github.com/org/r/pull/7"}])
     log = fake_gh({"pr list": [0, payload]})
     gh = GitHub()
-    url = await gh.ensure_pr(
-        title="t", body="b", base="main", head="feat/x", repo="org/r"
-    )
+    url = await gh.ensure_pr(title="t", body="b", base="main", head="feat/x", repo="org/r")
     assert url == "https://github.com/org/r/pull/7"
     joined = [" ".join(c["argv"]) for c in _calls(log)]  # type: ignore[arg-type]
     assert not any("pr create" in j for j in joined)
@@ -223,9 +217,7 @@ async def test_ensure_pr_creates_when_absent(fake_gh) -> None:  # type: ignore[n
         }
     )
     gh = GitHub()
-    url = await gh.ensure_pr(
-        title="t", body="b", base="main", head="feat/x", repo="org/r"
-    )
+    url = await gh.ensure_pr(title="t", body="b", base="main", head="feat/x", repo="org/r")
     assert url == "https://github.com/org/r/pull/9"
     joined = [" ".join(c["argv"]) for c in _calls(log)]  # type: ignore[arg-type]
     assert any("pr create" in j for j in joined)
@@ -244,17 +236,13 @@ async def test_ensure_pr_recovers_from_create_race(
         return next(list_results)
 
     async def fake_pr_create(**kwargs: object) -> str:
-        raise GitHubError(
-            "gh pr create exited 1: a pull request already exists for org:feat/x"
-        )
+        raise GitHubError("gh pr create exited 1: a pull request already exists for org:feat/x")
 
     gh = GitHub()
     monkeypatch.setattr(gh, "pr_for_head", fake_pr_for_head)
     monkeypatch.setattr(gh, "pr_create", fake_pr_create)
 
-    url = await gh.ensure_pr(
-        title="t", body="b", base="main", head="feat/x", repo="org/r"
-    )
+    url = await gh.ensure_pr(title="t", body="b", base="main", head="feat/x", repo="org/r")
     assert url == existing
 
 
@@ -419,9 +407,7 @@ async def test_pr_checks_raises_on_json_parse_failure(fake_gh) -> None:  # type:
 
 async def test_pr_checks_accepts_exit_code_8_pending(fake_gh) -> None:  # type: ignore[no-untyped-def]
     # `gh pr checks` exits 8 when checks are still pending but still emits JSON.
-    payload = json.dumps(
-        [{"name": "build", "state": "PENDING", "bucket": "pending", "link": None}]
-    )
+    payload = json.dumps([{"name": "build", "state": "PENDING", "bucket": "pending", "link": None}])
     fake_gh({"pr checks": [8, payload]})
     gh = GitHub()
     result = await gh.pr_checks(11, repo="org/r")

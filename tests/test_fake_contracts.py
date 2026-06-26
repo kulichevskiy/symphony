@@ -266,9 +266,7 @@ async def test_github_pr_webhook_fake_matches_recorded_real_payload() -> None:
     real_payload = _load("github_pr_webhook.json")  # merged pull_request delivery
 
     # Real parsing path: the webhook receiver's event parser.
-    real_event = _parse_event(
-        "pull_request", real_payload, delivery_id="recorded-delivery"
-    )
+    real_event = _parse_event("pull_request", real_payload, delivery_id="recorded-delivery")
     assert real_event is not None
 
     # Fake path: `Sim.merge_pr` fabricates the GitHubWebhookEvent the

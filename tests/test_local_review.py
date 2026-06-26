@@ -49,9 +49,7 @@ def test_local_review_prompt_is_deterministic() -> None:
 def test_local_review_prompt_demands_actionable_findings() -> None:
     """Smoke runs (iter 6) showed vague findings hurt downstream
     fix-runs. The prompt must explicitly require file:line citations."""
-    prompt = local_review_prompt(
-        issue_title="t", issue_body="b", labels=[], base_branch="main"
-    )
+    prompt = local_review_prompt(issue_title="t", issue_body="b", labels=[], base_branch="main")
     # path:line example present.
     assert "file:line" in prompt or "foo.py:42" in prompt
     # Junior-engineer framing forces concrete-edit-only findings.
@@ -62,9 +60,7 @@ def test_local_review_prompt_is_adversarial_and_lensed() -> None:
     """SYM-89: the single reviewer must dig harder — adversarial stance,
     explicit lenses applied to the touched files, and an asymmetric
     approval bar that forbids a bare 'looks good'."""
-    prompt = local_review_prompt(
-        issue_title="t", issue_body="b", labels=[], base_branch="main"
-    )
+    prompt = local_review_prompt(issue_title="t", issue_body="b", labels=[], base_branch="main")
     lower = prompt.lower()
     # 1. Adversarial stance: assume a bug exists; try to break it.
     assert "assume a bug exists" in lower
@@ -85,9 +81,7 @@ def test_local_review_prompt_handles_missing_origin_ref() -> None:
     """Iter 6 smoke: scratch repos without `origin` made the reviewer
     narrate "I used main...HEAD instead" in findings. The prompt now
     instructs a silent fallback."""
-    prompt = local_review_prompt(
-        issue_title="t", issue_body="b", labels=[], base_branch="trunk"
-    )
+    prompt = local_review_prompt(issue_title="t", issue_body="b", labels=[], base_branch="trunk")
     # Fallback ref documented.
     assert "trunk...HEAD" in prompt
     # And instructed not to narrate.
@@ -172,15 +166,10 @@ def test_build_local_review_command_claude_isolates_reviewer_environment() -> No
     assert "--tools" in argv
     assert argv[argv.index("--tools") + 1] == "Bash,Read,Grep,Glob,LS"
     assert "--allowedTools" in argv
-    assert (
-        argv[argv.index("--allowedTools") + 1]
-        == "Bash(git diff *),Read,Grep,Glob,LS"
-    )
+    assert argv[argv.index("--allowedTools") + 1] == "Bash(git diff *),Read,Grep,Glob,LS"
     assert "--disallowedTools" in argv
     disallowed_tools = argv[argv.index("--disallowedTools") + 1].split(",")
-    assert {"Edit", "Write", "MultiEdit", "WebFetch", "Task"}.issubset(
-        disallowed_tools
-    )
+    assert {"Edit", "Write", "MultiEdit", "WebFetch", "Task"}.issubset(disallowed_tools)
     # Read-only repo search is now part of the reviewer surface, not banned.
     assert {"Grep", "Glob", "LS"}.isdisjoint(disallowed_tools)
     tools = argv[argv.index("--tools") + 1].split(",")
@@ -294,15 +283,11 @@ def test_build_local_review_command_claude_pass_two_grants_tier_b_tools() -> Non
 def test_build_local_review_command_pass_one_and_single_pass_stay_read_only() -> None:
     """Pass 1 and the single-pass fallback (pass_two=False) keep the
     read-only surface: no exec/write for codex or claude."""
-    codex_argv = build_local_review_command(
-        agent="codex", prompt="p", base_branch="main"
-    )
+    codex_argv = build_local_review_command(agent="codex", prompt="p", base_branch="main")
     assert codex_argv[codex_argv.index("--sandbox") + 1] == "read-only"
     assert "workspace-write" not in codex_argv
 
-    claude_argv = build_local_review_command(
-        agent="claude", prompt="p", base_branch="main"
-    )
+    claude_argv = build_local_review_command(agent="claude", prompt="p", base_branch="main")
     tools = claude_argv[claude_argv.index("--tools") + 1].split(",")
     disallowed = claude_argv[claude_argv.index("--disallowedTools") + 1].split(",")
     assert {"Write", "Edit"}.isdisjoint(tools)
@@ -346,18 +331,13 @@ def _codex_jsonl_with_final_message(text: str) -> str:
 
 def test_extract_last_agent_message_codex_picks_last_agent_message() -> None:
     stdout = _codex_jsonl_with_final_message("final reviewer text")
-    assert (
-        extract_last_agent_message(agent="codex", stdout=stdout)
-        == "final reviewer text"
-    )
+    assert extract_last_agent_message(agent="codex", stdout=stdout) == "final reviewer text"
 
 
 def test_extract_last_agent_message_prefers_last_message_file() -> None:
     stdout = _codex_jsonl_with_final_message("stdout text")
     assert (
-        extract_last_agent_message(
-            agent="codex", stdout=stdout, last_message_file="file text"
-        )
+        extract_last_agent_message(agent="codex", stdout=stdout, last_message_file="file text")
         == "file text"
     )
 
@@ -372,10 +352,7 @@ def test_extract_last_agent_message_claude_picks_result_event() -> None:
         {"type": "result", "result": "the final result"},
     ]
     stdout = "\n".join(json.dumps(e) for e in events)
-    assert (
-        extract_last_agent_message(agent="claude", stdout=stdout)
-        == "the final result"
-    )
+    assert extract_last_agent_message(agent="claude", stdout=stdout) == "the final result"
 
 
 def test_extract_last_agent_message_claude_falls_back_to_last_assistant() -> None:
@@ -390,10 +367,7 @@ def test_extract_last_agent_message_claude_falls_back_to_last_assistant() -> Non
         },
     ]
     stdout = "\n".join(json.dumps(e) for e in events)
-    assert (
-        extract_last_agent_message(agent="claude", stdout=stdout)
-        == "second"
-    )
+    assert extract_last_agent_message(agent="claude", stdout=stdout) == "second"
 
 
 def test_extract_last_agent_message_skips_garbage_lines() -> None:
@@ -406,10 +380,7 @@ def test_extract_last_agent_message_skips_garbage_lines() -> None:
             }
         ),
     ]
-    assert (
-        extract_last_agent_message(agent="codex", stdout="\n".join(events))
-        == "ok"
-    )
+    assert extract_last_agent_message(agent="codex", stdout="\n".join(events)) == "ok"
 
 
 # --- verdict classification ---------------------------------------------
@@ -418,9 +389,7 @@ def test_extract_last_agent_message_skips_garbage_lines() -> None:
 def test_parse_local_review_output_approved() -> None:
     message = f"Looks good.\n\n{VERDICT_APPROVED_MARKER}\n"
     stdout = _codex_jsonl_with_final_message(message)
-    verdict = parse_local_review_output(
-        agent="codex", stdout=stdout, head_sha="abc123"
-    )
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
     assert verdict.kind == LocalVerdictKind.APPROVED
     assert verdict.findings == ""
     assert verdict.trigger_signature == "local_approved:abc123"
@@ -436,9 +405,7 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
         f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
     )
     stdout = _codex_jsonl_with_final_message(message)
-    verdict = parse_local_review_output(
-        agent="codex", stdout=stdout, head_sha="abc123"
-    )
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
     assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
     assert "a.py:42" in verdict.findings
     assert "empty-input" in verdict.findings
@@ -478,9 +445,7 @@ def test_parse_local_review_output_unparseable_when_no_marker() -> None:
     stdout = _codex_jsonl_with_final_message(
         "I think this is fine but I forgot to emit the marker."
     )
-    verdict = parse_local_review_output(
-        agent="codex", stdout=stdout, head_sha="abc123"
-    )
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
     assert verdict.kind == LocalVerdictKind.UNPARSEABLE
     assert verdict.findings == ""
     assert verdict.trigger_signature == ""
@@ -488,9 +453,7 @@ def test_parse_local_review_output_unparseable_when_no_marker() -> None:
 
 def test_parse_local_review_output_unparseable_when_empty_message() -> None:
     stdout = ""
-    verdict = parse_local_review_output(
-        agent="codex", stdout=stdout, head_sha="abc"
-    )
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc")
     assert verdict.kind == LocalVerdictKind.UNPARSEABLE
 
 
@@ -503,23 +466,16 @@ def test_parse_local_review_uses_last_marker_if_quoted_earlier() -> None:
         f"My actual verdict: {VERDICT_APPROVED_MARKER}"
     )
     stdout = _codex_jsonl_with_final_message(message)
-    verdict = parse_local_review_output(
-        agent="codex", stdout=stdout, head_sha="abc"
-    )
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc")
     assert verdict.kind == LocalVerdictKind.APPROVED
 
 
 def test_parse_local_review_findings_falls_back_when_no_heading() -> None:
     # If the agent forgets the `## Findings` heading, we still feed the
     # body before the marker into the next fix-run prompt.
-    message = (
-        "The new function ignores the timeout argument.\n"
-        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
-    )
+    message = f"The new function ignores the timeout argument.\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     stdout = _codex_jsonl_with_final_message(message)
-    verdict = parse_local_review_output(
-        agent="codex", stdout=stdout, head_sha="abc"
-    )
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc")
     assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
     assert "timeout" in verdict.findings
 
@@ -595,9 +551,7 @@ def test_verifier_prompt_is_finding_triggered_and_caps_runs() -> None:
 def test_single_pass_and_finder_prompts_stay_read_only() -> None:
     """Only pass 2 may write/execute; the single-pass reviewer and pass-1
     finder must keep the explicit no-mutation instruction."""
-    single = local_review_prompt(
-        issue_title="t", issue_body="b", labels=[], base_branch="main"
-    )
+    single = local_review_prompt(issue_title="t", issue_body="b", labels=[], base_branch="main")
     finder = local_review_finder_prompt(
         issue_title="t", issue_body="b", labels=[], base_branch="main"
     )

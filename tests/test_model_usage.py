@@ -216,7 +216,5 @@ def test_ignores_non_usage_and_garbage_lines() -> None:
 
 
 def test_result_without_model_usage_yields_nothing() -> None:
-    line = json.dumps(
-        {"type": "result", "total_cost_usd": 0.1, "usage": {"input_tokens": 5}}
-    )
+    line = json.dumps({"type": "result", "total_cost_usd": 0.1, "usage": {"input_tokens": 5}})
     assert parse_model_usage([line], codex_model="gpt-5.1-codex") == []

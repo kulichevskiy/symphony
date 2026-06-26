@@ -206,9 +206,7 @@ def classify_github_drift(
     valid_prs = [pr for pr in prs if pr.error is None]
     if has_merge_wait and any(pr.merged for pr in valid_prs):
         return DRIFT_MERGE_ZOMBIE
-    if has_merge_wait and any(
-        pr.state.upper() == "CLOSED" and not pr.merged for pr in valid_prs
-    ):
+    if has_merge_wait and any(pr.state.upper() == "CLOSED" and not pr.merged for pr in valid_prs):
         return DRIFT_PR_CLOSED_NO_MERGE
     if any(pr.merged for pr in valid_prs):
         return DRIFT_PR_LOCALLY_MERGED
@@ -260,9 +258,7 @@ class Reconciler:
             except Exception:  # noqa: BLE001
                 log.exception("external reconcile tick failed")
             try:
-                await asyncio.wait_for(
-                    shutdown.wait(), timeout=self.config.reconcile_interval_secs
-                )
+                await asyncio.wait_for(shutdown.wait(), timeout=self.config.reconcile_interval_secs)
             except TimeoutError:
                 pass
 
@@ -395,11 +391,7 @@ class Reconciler:
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=drift_prs,
         )
-        if (
-            github_drift is None
-            and linear_drift != DRIFT_LINEAR_STATE_DONE
-            and orphans
-        ):
+        if github_drift is None and linear_drift != DRIFT_LINEAR_STATE_DONE and orphans:
             github_drift = DRIFT_ORPHAN_PR_OPEN
         active = reconcile_auto_clear_enabled()
         remaining = action_budget_remaining
@@ -624,9 +616,7 @@ class Reconciler:
                 team_key=str(row["team_key"]),
                 first_candidate_at=str(row["first_candidate_at"]),
                 last_observed_at=(
-                    str(row["last_observed_at"])
-                    if row["last_observed_at"] is not None
-                    else None
+                    str(row["last_observed_at"]) if row["last_observed_at"] is not None else None
                 ),
             )
             for row in rows
@@ -780,14 +770,10 @@ class Reconciler:
             seen_repos.add(repo_key)
             head = f"{binding.branch_prefix}/{identifier}"
             try:
-                found = await self._gh.open_pr_for_head(
-                    head=head, repo=binding.github_repo
-                )
+                found = await self._gh.open_pr_for_head(head=head, repo=binding.github_repo)
             except GitHubError as exc:
                 if _should_backoff(str(exc)):
-                    raise _BackoffRequested(
-                        source=SOURCE_GITHUB, error=str(exc)
-                    ) from exc
+                    raise _BackoffRequested(source=SOURCE_GITHUB, error=str(exc)) from exc
                 continue
             if found is None:
                 continue
@@ -842,9 +828,7 @@ class Reconciler:
         obs = orphan.observation
         local_review_configured = binding.resolved_local_review()
         remote_review_configured = binding.resolved_remote_review()
-        review_configured = (
-            local_review_configured or remote_review_configured
-        )
+        review_configured = local_review_configured or remote_review_configured
         local_only_review_ready = True
         if local_review_configured and not remote_review_configured:
             local_only_review_ready = await self._local_review_completed_for_adoption(
@@ -920,9 +904,7 @@ class Reconciler:
             state_name=target_state,
         )
         if wait is not None and not (
-            local_review_configured
-            and not remote_review_configured
-            and not local_only_review_ready
+            local_review_configured and not remote_review_configured and not local_only_review_ready
         ):
             await db.operator_waits.delete(
                 self._conn,
@@ -948,9 +930,9 @@ class Reconciler:
             issue_id=issue_id,
             stage="implement",
         )
-        if latest_implement is None or _parse_rfc3339(
-            latest_implement.started_at
-        ) > _parse_rfc3339(pr_created_at):
+        if latest_implement is None or _parse_rfc3339(latest_implement.started_at) > _parse_rfc3339(
+            pr_created_at
+        ):
             return False
         latest_local_review = await db.runs.latest_for_issue_stage(
             self._conn,
@@ -958,19 +940,16 @@ class Reconciler:
             stage="local_review",
             started_at_gte=latest_implement.started_at,
         )
-        if (
-            latest_local_review is None
-            or latest_local_review.status != "completed"
-        ):
+        if latest_local_review is None or latest_local_review.status != "completed":
             return False
         latest_fix = await db.runs.latest_for_issue_stage(
             self._conn,
             issue_id=issue_id,
             stage="review_fix",
         )
-        if latest_fix is not None and _parse_rfc3339(
-            latest_fix.started_at
-        ) > _parse_rfc3339(latest_local_review.started_at):
+        if latest_fix is not None and _parse_rfc3339(latest_fix.started_at) > _parse_rfc3339(
+            latest_local_review.started_at
+        ):
             return False
         return True
 
@@ -996,8 +975,7 @@ class Reconciler:
         """
         if not state_name:
             raise LinearError(
-                f"missing Linear state {state_name!r} for {tracker_issue_id} "
-                "during adoption"
+                f"missing Linear state {state_name!r} for {tracker_issue_id} during adoption"
             )
         tracker = self.tracker(tracker_ctx)
         try:
@@ -1009,8 +987,7 @@ class Reconciler:
         state_id = states.get(state_name)
         if state_id is None:
             raise LinearError(
-                f"missing Linear state {state_name!r} for {tracker_issue_id} "
-                "during adoption"
+                f"missing Linear state {state_name!r} for {tracker_issue_id} during adoption"
             )
         try:
             await tracker.move_issue(tracker_issue_id, state_id)
@@ -1063,11 +1040,7 @@ class Reconciler:
         )
         stored_label = _label_from_binding_key(pr.binding_key)
         if stored_label is not None:
-            return [
-                binding
-                for binding in matches
-                if (binding.issue_label or "") == stored_label
-            ]
+            return [binding for binding in matches if (binding.issue_label or "") == stored_label]
         if len(matches) == 1:
             return matches
         return []
@@ -1091,11 +1064,7 @@ class Reconciler:
         return bindings
 
     def _done_state_names(self, bindings: list[RepoBinding]) -> set[str]:
-        names = {
-            binding.linear_states.done
-            for binding in bindings
-            if binding.reconcile_enabled
-        }
+        names = {binding.linear_states.done for binding in bindings if binding.reconcile_enabled}
         return names or {"Done"}
 
     async def _note_external_state_change(
@@ -1146,8 +1115,7 @@ class Reconciler:
                 )
                 if not deleted:
                     raise RuntimeError(
-                        "could not delete closed PR row for "
-                        f"{pr.github_repo}#{pr.pr_number}"
+                        f"could not delete closed PR row for {pr.github_repo}#{pr.pr_number}"
                     )
             return
 
@@ -1180,8 +1148,7 @@ class Reconciler:
             )
             if not updated:
                 raise RuntimeError(
-                    "could not update merged_at for "
-                    f"{pr.github_repo}#{pr.pr_number}"
+                    f"could not update merged_at for {pr.github_repo}#{pr.pr_number}"
                 )
 
 
@@ -1259,21 +1226,13 @@ def _github_prs_for_drift(
 ) -> list[GithubPrObservation]:
     if wait is None or wait.kind != db.operator_waits.KIND_MERGE:
         return github_prs
-    return [
-        pr
-        for pr in github_prs
-        if pr.github_repo.casefold() == wait.github_repo.casefold()
-    ]
+    return [pr for pr in github_prs if pr.github_repo.casefold() == wait.github_repo.casefold()]
 
 
 def _merged_prs_with_timestamps(
     github_prs: list[GithubPrObservation],
 ) -> list[GithubPrObservation]:
-    return [
-        pr
-        for pr in github_prs
-        if pr.error is None and pr.merged and pr.merged_at is not None
-    ]
+    return [pr for pr in github_prs if pr.error is None and pr.merged and pr.merged_at is not None]
 
 
 def _closed_unmerged_prs(
@@ -1292,10 +1251,7 @@ def _json_payload(payload: Mapping[str, object]) -> str:
 
 def _should_backoff(message: str) -> bool:
     text = message.casefold()
-    if any(
-        marker in text
-        for marker in ("rate limit", "secondary rate", "too many requests")
-    ):
+    if any(marker in text for marker in ("rate limit", "secondary rate", "too many requests")):
         return True
     return _TRANSIENT_STATUS_RE.search(message) is not None
 

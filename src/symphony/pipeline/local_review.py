@@ -445,10 +445,7 @@ def _issue_block(issue_title: str, issue_body: str, labels: list[str]) -> str:
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
     return (
-        "# Issue\n\n"
-        f"## Title\n{issue_title}\n\n"
-        f"## Labels\n{label_line}\n\n"
-        f"## Description\n{body}\n"
+        f"# Issue\n\n## Title\n{issue_title}\n\n## Labels\n{label_line}\n\n## Description\n{body}\n"
     )
 
 
@@ -847,7 +844,7 @@ def _extract_findings(*, message: str, verdict_index: int) -> str:
     m = _FINDINGS_HEADING_RE.search(head)
     if m is None:
         return head.strip()
-    return head[m.end():].strip()
+    return head[m.end() :].strip()
 
 
 def _stable_digest(text: str) -> str:

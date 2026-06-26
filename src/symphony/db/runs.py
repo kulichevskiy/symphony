@@ -118,21 +118,11 @@ def _row_to_run(row: aiosqlite.Row) -> Run:
         cost_usd=row["cost_usd"],
         input_tokens=(row["input_tokens"] if "input_tokens" in keys else 0),
         output_tokens=(row["output_tokens"] if "output_tokens" in keys else 0),
-        cache_write_tokens=(
-            row["cache_write_tokens"] if "cache_write_tokens" in keys else 0
-        ),
-        cache_read_tokens=(
-            row["cache_read_tokens"] if "cache_read_tokens" in keys else 0
-        ),
-        termination_kind=(
-            row["termination_kind"] if "termination_kind" in keys else ""
-        ),
-        termination_detail=(
-            row["termination_detail"] if "termination_detail" in keys else ""
-        ),
-        exit_returncode=(
-            row["exit_returncode"] if "exit_returncode" in keys else None
-        ),
+        cache_write_tokens=(row["cache_write_tokens"] if "cache_write_tokens" in keys else 0),
+        cache_read_tokens=(row["cache_read_tokens"] if "cache_read_tokens" in keys else 0),
+        termination_kind=(row["termination_kind"] if "termination_kind" in keys else ""),
+        termination_detail=(row["termination_detail"] if "termination_detail" in keys else ""),
+        exit_returncode=(row["exit_returncode"] if "exit_returncode" in keys else None),
     )
 
 
@@ -337,10 +327,7 @@ def _truncate_termination_detail(
 ) -> str:
     text = str(detail)
     original_bytes = text.encode("utf-8", errors="replace")
-    if (
-        len(original_bytes) <= max_bytes
-        and len(text.splitlines()) <= max_lines
-    ):
+    if len(original_bytes) <= max_bytes and len(text.splitlines()) <= max_lines:
         return text
 
     line_tail = text
@@ -356,18 +343,14 @@ def _truncate_termination_detail(
         budget = max(0, max_bytes - len(marker_bytes))
         kept_tail_bytes = tail_bytes[-budget:] if budget else b""
         kept_tail = kept_tail_bytes.decode("utf-8", errors="ignore")
-        new_truncated_bytes = len(original_bytes) - len(
-            kept_tail.encode("utf-8", errors="replace")
-        )
+        new_truncated_bytes = len(original_bytes) - len(kept_tail.encode("utf-8", errors="replace"))
         if new_truncated_bytes == truncated_bytes:
             break
         truncated_bytes = new_truncated_bytes
 
     marker = f"…[truncated {truncated_bytes} bytes]"
     if not kept_tail:
-        return marker.encode("utf-8")[:max_bytes].decode(
-            "utf-8", errors="ignore"
-        )
+        return marker.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
     return f"{kept_tail}\n{marker}"
 
 
@@ -459,10 +442,7 @@ async def interrupt_stale_merge_needs_approval(
             INTERRUPTED_STATUS,
             ended_at=ended_at,
             kind="superseded",
-            detail=(
-                "superseded stale merge needs_approval by newer PR "
-                f"{github_repo}#{pr_number}"
-            ),
+            detail=(f"superseded stale merge needs_approval by newer PR {github_repo}#{pr_number}"),
         )
         interrupted += 1
     return interrupted
@@ -548,8 +528,7 @@ async def supersede_orphaned_merge_needs_approval(
             ended_at=ended_at,
             kind="superseded",
             detail=(
-                "orphaned merge needs_approval (operator wait cleared) — "
-                "re-opening merge candidacy"
+                "orphaned merge needs_approval (operator wait cleared) — re-opening merge candidacy"
             ),
         )
         issue_ids.append(str(row["issue_id"]))
@@ -586,9 +565,7 @@ async def update_pid(conn: aiosqlite.Connection, run_id: str, pid: int | None) -
     await conn.commit()
 
 
-async def has_stage_done_announced(
-    conn: aiosqlite.Connection, run_id: str
-) -> bool:
+async def has_stage_done_announced(conn: aiosqlite.Connection, run_id: str) -> bool:
     cur = await conn.execute(
         """
         SELECT 1
@@ -655,9 +632,7 @@ async def add_usage(
     await conn.commit()
 
 
-async def add_cost(
-    conn: aiosqlite.Connection, run_id: str, cost_usd: float
-) -> None:
+async def add_cost(conn: aiosqlite.Connection, run_id: str, cost_usd: float) -> None:
     await add_usage(conn, run_id, cost_usd=cost_usd)
 
 
@@ -818,9 +793,7 @@ async def list_live(conn: aiosqlite.Connection) -> list[Run]:
     return [_row_to_run(r) for r in rows]
 
 
-async def list_live_by_stage(
-    conn: aiosqlite.Connection, *, stage: str
-) -> list[Run]:
+async def list_live_by_stage(conn: aiosqlite.Connection, *, stage: str) -> list[Run]:
     """Live runs for one stage, oldest first."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
@@ -848,9 +821,7 @@ def _row_to_run_with_issue(row: aiosqlite.Row) -> RunWithIssue:
     return RunWithIssue(run=_row_to_run(row), identifier=row["identifier"])
 
 
-async def list_recent(
-    conn: aiosqlite.Connection, *, limit: int = 50
-) -> list[RunWithIssue]:
+async def list_recent(conn: aiosqlite.Connection, *, limit: int = 50) -> list[RunWithIssue]:
     """Inspection-side view: every live run + the most recent terminated
     runs up to `limit`, joined with their issue identifier, ordered by
     `started_at` DESC.
@@ -885,9 +856,7 @@ async def list_recent(
     return [_row_to_run_with_issue(r) for r in rows]
 
 
-async def get_with_issue(
-    conn: aiosqlite.Connection, run_id: str
-) -> RunWithIssue | None:
+async def get_with_issue(conn: aiosqlite.Connection, run_id: str) -> RunWithIssue | None:
     cur = await conn.execute(
         """
         SELECT r.id, r.issue_id, r.stage, r.status, r.pid, r.started_at,
@@ -906,9 +875,7 @@ async def get_with_issue(
     return _row_to_run_with_issue(row)
 
 
-async def history_for_issue(
-    conn: aiosqlite.Connection, issue_id: str
-) -> list[Run]:
+async def history_for_issue(conn: aiosqlite.Connection, issue_id: str) -> list[Run]:
     """Stage history: all runs for an issue, oldest first."""
     cur = await conn.execute(
         """
@@ -933,11 +900,7 @@ async def latest_for_issue_stage(
     started_at_gte: str | None = None,
 ) -> Run | None:
     started_filter = "" if started_at_gte is None else " AND started_at >= ?"
-    params = (
-        (issue_id, stage)
-        if started_at_gte is None
-        else (issue_id, stage, started_at_gte)
-    )
+    params = (issue_id, stage) if started_at_gte is None else (issue_id, stage, started_at_gte)
     cur = await conn.execute(
         f"""
         SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
@@ -1071,9 +1034,7 @@ async def effective_tokens_by_stage_for_issue(
     return breakdown
 
 
-async def tokens_for_issue(
-    conn: aiosqlite.Connection, issue_id: str
-) -> IssueTokens:
+async def tokens_for_issue(conn: aiosqlite.Connection, issue_id: str) -> IssueTokens:
     cur = await conn.execute(
         """
         SELECT COALESCE(SUM(input_tokens), 0),

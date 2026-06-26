@@ -50,10 +50,7 @@ class GitHubWebhookSettings:
         object.__setattr__(
             self,
             "repo_secrets",
-            {
-                _normalize_repo(repo): secret
-                for repo, secret in self.repo_secrets.items()
-            },
+            {_normalize_repo(repo): secret for repo, secret in self.repo_secrets.items()},
         )
         if self.enabled_repos is not None:
             object.__setattr__(
@@ -63,9 +60,7 @@ class GitHubWebhookSettings:
             )
         if self.secret or self.enabled_repos is None:
             return
-        missing = sorted(
-            repo for repo in self.enabled_repos if not self.repo_secrets.get(repo)
-        )
+        missing = sorted(repo for repo in self.enabled_repos if not self.repo_secrets.get(repo))
         if missing:
             raise ValueError(
                 "GITHUB_WEBHOOK_SECRET is empty and enabled repos lack "

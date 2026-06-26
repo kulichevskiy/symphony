@@ -274,24 +274,12 @@ async def test_persists_transcripts_for_review_and_fix_iterations(
     )
 
     assert result.outcome == LoopOutcome.APPROVED
-    assert (
-        (log_dir / "review-0.out.log").read_text(encoding="utf-8")
-        == review_0_out
-    )
-    assert (
-        (log_dir / "review-0.err.log").read_text(encoding="utf-8")
-        == review_0_err
-    )
+    assert (log_dir / "review-0.out.log").read_text(encoding="utf-8") == review_0_out
+    assert (log_dir / "review-0.err.log").read_text(encoding="utf-8") == review_0_err
     assert (log_dir / "fix-0.out.log").read_text(encoding="utf-8") == fix_0_out
     assert (log_dir / "fix-0.err.log").read_text(encoding="utf-8") == fix_0_err
-    assert (
-        (log_dir / "review-1.out.log").read_text(encoding="utf-8")
-        == review_1_out
-    )
-    assert (
-        (log_dir / "review-1.err.log").read_text(encoding="utf-8")
-        == review_1_err
-    )
+    assert (log_dir / "review-1.out.log").read_text(encoding="utf-8") == review_1_out
+    assert (log_dir / "review-1.err.log").read_text(encoding="utf-8") == review_1_err
 
 
 @pytest.mark.asyncio
@@ -404,11 +392,7 @@ async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
     for spec in runner.specs:
         argv = spec.command
         assert argv[0] == "claude"
-        expected = (
-            "claude-opus-4-6"
-            if spec.stage == "local_review_fix"
-            else "claude-sonnet-4-6"
-        )
+        expected = "claude-opus-4-6" if spec.stage == "local_review_fix" else "claude-sonnet-4-6"
         assert argv[argv.index("--model") + 1] == expected
 
 
@@ -582,7 +566,7 @@ def _claude_api_error_stream(status: int) -> list[RunnerEvent]:
     """A claude reviewer stream that exits 0 carrying only a transient provider
     API error (synthetic assistant + `is_error`/`api_error_status` result) and
     no verdict marker."""
-    text = f"API Error: {status} {{\"type\":\"error\"}}"
+    text = f'API Error: {status} {{"type":"error"}}'
     return [
         RunnerEvent(
             kind="stdout",
@@ -651,9 +635,7 @@ async def test_claude_transient_api_error_surfaces_as_reviewer_failed(
 async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
         scripts=[
-            _codex_message_stream(
-                f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
-            ),
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
             [RunnerEvent(kind="stall_timeout")],
         ],
     )
@@ -761,14 +743,10 @@ async def test_reviewer_prefers_last_message_file_over_stdout(
             assert "-o" in spec.command
             last_path = spec.command[spec.command.index("-o") + 1]
             captured_paths.append(last_path)
-            Path(last_path).write_text(
-                f"file-source\n{VERDICT_APPROVED_MARKER}", encoding="utf-8"
-            )
+            Path(last_path).write_text(f"file-source\n{VERDICT_APPROVED_MARKER}", encoding="utf-8")
 
             async def gen() -> AsyncIterator[RunnerEvent]:
-                yield RunnerEvent(
-                    kind="stdout", line='{"type":"turn.completed"}'
-                )
+                yield RunnerEvent(kind="stdout", line='{"type":"turn.completed"}')
                 yield RunnerEvent(kind="exit", returncode=0)
 
             return gen()
@@ -930,8 +908,7 @@ async def test_two_pass_finder_stream_error_surfaces_without_verifier(
     real error and never run the verifier (which could APPROVE empty findings
     and mask the failure)."""
     api_error = (
-        "The 'gpt-5.1-codex' model is not supported when using Codex "
-        "with a ChatGPT account."
+        "The 'gpt-5.1-codex' model is not supported when using Codex with a ChatGPT account."
     )
     # Both attempts (the loop retries the reviewer once) fail in pass 1; the
     # verifier-approve script must never be reached.
@@ -1139,10 +1116,7 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
     suspicions. Pass 2 requests changes, so the loop dispatches a fixer
     with pass-2's findings as the trigger."""
     finder_text = "## Findings\n- suspicion at foo.py:1"
-    verifier_text = (
-        f"## Findings\n- confirmed bug at foo.py:1\n"
-        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
-    )
+    verifier_text = f"## Findings\n- confirmed bug at foo.py:1\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
             _message_stream("codex", finder_text),  # pass 1 (reviewer)
@@ -1252,9 +1226,7 @@ async def test_no_diff_size_provider_defaults_to_single_pass(
 ) -> None:
     """Without a measurement callback the session can't size the diff, so
     it stays single-pass (back-compat / cheaper default)."""
-    runner = _ScriptedRunner(
-        scripts=[_message_stream("codex", f"ok\n{VERDICT_APPROVED_MARKER}")]
-    )
+    runner = _ScriptedRunner(scripts=[_message_stream("codex", f"ok\n{VERDICT_APPROVED_MARKER}")])
 
     async def head_sha(_: Path) -> str:
         return "sha-1"
@@ -1382,9 +1354,7 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
                     yield RunnerEvent(kind="stdout", line=finder_line)
                 elif stage == "local_review_fix":
                     events.append(("fix_saw_throwaway", throwaway.exists()))
-                    yield RunnerEvent(
-                        kind="stdout", line='{"type":"turn.completed"}'
-                    )
+                    yield RunnerEvent(kind="stdout", line='{"type":"turn.completed"}')
                 yield RunnerEvent(kind="exit", returncode=0)
 
             return gen()

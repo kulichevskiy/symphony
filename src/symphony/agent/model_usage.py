@@ -77,9 +77,7 @@ def _codex_tokens(usage: dict[str, object]) -> tuple[int, int, int, int]:
     )
 
 
-def parse_model_usage(
-    lines: Iterable[str], *, codex_model: str | None
-) -> list[ModelUsage]:
+def parse_model_usage(lines: Iterable[str], *, codex_model: str | None) -> list[ModelUsage]:
     """Return per-(provider, model) usage for one run's stream-json log."""
     claude: dict[str, list[int]] = {}
     codex_sum = [0, 0, 0, 0]

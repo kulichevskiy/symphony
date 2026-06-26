@@ -128,9 +128,7 @@ async def _latest_activity(
     if row is None:
         return None, None
     latest_activity_ts = (
-        str(row["latest_activity_ts"])
-        if row["latest_activity_ts"] is not None
-        else None
+        str(row["latest_activity_ts"]) if row["latest_activity_ts"] is not None else None
     )
     return latest_activity_ts, _age_seconds(latest_activity_ts, request_now)
 
@@ -260,9 +258,7 @@ def create_issue_detail_router(
     router = APIRouter(prefix="/api")
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
     pr_no_progress_threshold = (
-        DEFAULT_PR_NO_PROGRESS_THRESHOLD
-        if no_progress_threshold is None
-        else no_progress_threshold
+        DEFAULT_PR_NO_PROGRESS_THRESHOLD if no_progress_threshold is None else no_progress_threshold
     )
 
     def now() -> datetime:

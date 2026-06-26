@@ -143,9 +143,7 @@ async def test_local_review_run_row_persisted_with_cost_and_completed_status(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")

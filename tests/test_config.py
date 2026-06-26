@@ -178,9 +178,7 @@ repos: []
     assert cfg.ui.enabled is False
 
 
-def test_ui_status_threshold_defaults_and_overrides(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_ui_status_threshold_defaults_and_overrides(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     defaults = UIStatusThresholds().to_timedeltas()
     assert defaults[CanonicalState.PAUSED] == timedelta(minutes=15)
     assert defaults[CanonicalState.AWAITING_MERGE] == timedelta(hours=4)
@@ -210,9 +208,7 @@ repos: []
     assert thresholds[CanonicalState.RUNNING] == timedelta(seconds=1800)
     assert thresholds[CanonicalState.AWAITING_REVIEW_TRIGGER] == timedelta(seconds=60)
     assert thresholds[CanonicalState.PR_OPEN] == timedelta(seconds=3600)
-    assert cfg.ui.status_stuck_thresholds.pr_no_progress_threshold() == timedelta(
-        seconds=1800
-    )
+    assert cfg.ui.status_stuck_thresholds.pr_no_progress_threshold() == timedelta(seconds=1800)
 
 
 def test_ui_status_thresholds_accept_legacy_awaiting_operator_key(
@@ -235,9 +231,7 @@ repos: []
 def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
-    )
+    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
     cfg = Config.load(p)
     assert cfg.repos[0].runner == "local"
     assert cfg.repos[0].codex_model == "gpt-5.1-codex"
@@ -310,9 +304,7 @@ repos:
     assert cfg.repos[0].codex_model == "gpt-5.1-codex-max"
 
 
-def test_activity_comment_config_defaults_and_overrides(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_activity_comment_config_defaults_and_overrides(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 activity_comments_enabled: true
@@ -341,9 +333,7 @@ repos:
     assert cfg.repos[0].activity_comment_event_threshold == 5
 
 
-def test_github_webhook_config_defaults_and_overrides(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_github_webhook_config_defaults_and_overrides(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "global-secret")
     raw = f"""
@@ -367,9 +357,7 @@ repos:
     assert cfg.repos[1].webhook_secret is None
 
 
-def test_reconcile_config_defaults_and_overrides(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_reconcile_config_defaults_and_overrides(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 reconcile_interval_secs: 120
@@ -475,9 +463,7 @@ def test_review_strategy_defaults_to_remote(tmp_path: Path, monkeypatch) -> None
     """Default behavior must keep today's @codex-bot loop until operators opt in."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
-    )
+    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
     cfg = Config.load(p)
     binding = cfg.repos[0]
     assert binding.review_strategy == "remote"
@@ -545,9 +531,7 @@ repos:
     assert binding.reviewer_codex_model == "gpt-5.1-codex-max"
 
 
-def test_resolved_reviewer_agent_defaults_to_opposite_family(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_resolved_reviewer_agent_defaults_to_opposite_family(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -567,9 +551,7 @@ repos:
     assert cfg.repos[1].resolved_reviewer_agent() == "claude"
 
 
-def test_resolved_reviewer_agent_honors_explicit_override(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_resolved_reviewer_agent_honors_explicit_override(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """An operator who wants same-family review (e.g. for cost) can pin it."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
@@ -689,9 +671,7 @@ def test_legacy_review_strategy_maps_to_booleans(
 def test_legacy_review_strategy_booleans_win_on_conflict() -> None:
     """Conflicting legacy + boolean config: booleans win, with a warning."""
     with pytest.warns(DeprecationWarning, match="ignored"):
-        binding = _review_binding(
-            review_strategy="remote", local_review=True, remote_review=False
-        )
+        binding = _review_binding(review_strategy="remote", local_review=True, remote_review=False)
     assert binding.resolved_local_review() is True
     assert binding.resolved_remote_review() is False
 
@@ -727,9 +707,7 @@ def test_local_review_iteration_cap_default_global_is_3(tmp_path: Path, monkeypa
     expensive 5–6 round tail escalates to a human instead."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
-    )
+    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
     cfg = Config.load(p)
     assert cfg.local_review_iteration_cap == 3
     # Remote cap unchanged.
@@ -737,17 +715,10 @@ def test_local_review_iteration_cap_default_global_is_3(tmp_path: Path, monkeypa
     binding = cfg.repos[0]
     assert binding.local_review_iteration_cap is None
     # Resolved cap falls back to global default.
-    assert (
-        binding.resolved_local_review_iteration_cap(
-            cfg.local_review_iteration_cap
-        )
-        == 3
-    )
+    assert binding.resolved_local_review_iteration_cap(cfg.local_review_iteration_cap) == 3
 
 
-def test_local_review_iteration_cap_per_binding_override(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_local_review_iteration_cap_per_binding_override(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 local_review_iteration_cap: 8
@@ -766,24 +737,12 @@ repos:
     assert cfg.local_review_iteration_cap == 8
     # ENG overrides; WEB inherits.
     assert cfg.repos[0].local_review_iteration_cap == 3
-    assert (
-        cfg.repos[0].resolved_local_review_iteration_cap(
-            cfg.local_review_iteration_cap
-        )
-        == 3
-    )
+    assert cfg.repos[0].resolved_local_review_iteration_cap(cfg.local_review_iteration_cap) == 3
     assert cfg.repos[1].local_review_iteration_cap is None
-    assert (
-        cfg.repos[1].resolved_local_review_iteration_cap(
-            cfg.local_review_iteration_cap
-        )
-        == 8
-    )
+    assert cfg.repos[1].resolved_local_review_iteration_cap(cfg.local_review_iteration_cap) == 8
 
 
-def test_local_review_iteration_cap_must_be_positive(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_local_review_iteration_cap_must_be_positive(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """ge=1: a zero/negative cap would never enter the loop and is
     almost certainly a typo. Reject at load time."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
@@ -804,21 +763,15 @@ def test_per_issue_token_budget_default_off(tmp_path: Path, monkeypatch) -> None
     """Off by default: global `None` and per-binding `None` → gate disabled."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
-    )
+    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
     cfg = Config.load(p)
     assert cfg.per_issue_token_budget is None
     binding = cfg.repos[0]
     assert binding.per_issue_token_budget is None
-    assert (
-        binding.resolved_per_issue_token_budget(cfg.per_issue_token_budget) is None
-    )
+    assert binding.resolved_per_issue_token_budget(cfg.per_issue_token_budget) is None
 
 
-def test_per_issue_token_budget_per_binding_override(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_per_issue_token_budget_per_binding_override(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 per_issue_token_budget: 20000000
@@ -837,20 +790,12 @@ repos:
     assert cfg.per_issue_token_budget == 20_000_000
     # ENG overrides; WEB inherits the global default.
     assert cfg.repos[0].per_issue_token_budget == 5_000_000
-    assert (
-        cfg.repos[0].resolved_per_issue_token_budget(cfg.per_issue_token_budget)
-        == 5_000_000
-    )
+    assert cfg.repos[0].resolved_per_issue_token_budget(cfg.per_issue_token_budget) == 5_000_000
     assert cfg.repos[1].per_issue_token_budget is None
-    assert (
-        cfg.repos[1].resolved_per_issue_token_budget(cfg.per_issue_token_budget)
-        == 20_000_000
-    )
+    assert cfg.repos[1].resolved_per_issue_token_budget(cfg.per_issue_token_budget) == 20_000_000
 
 
-def test_per_issue_token_budget_must_be_positive(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_per_issue_token_budget_must_be_positive(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Validation is daemon-start only: positive int or None."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
@@ -866,28 +811,19 @@ repos:
         Config.load(p)
 
 
-def test_post_local_review_pr_summary_default_global_true(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_post_local_review_pr_summary_default_global_true(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
-    )
+    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
     cfg = Config.load(p)
     assert cfg.post_local_review_pr_summary is True
     assert cfg.repos[0].post_local_review_pr_summary is None
     assert (
-        cfg.repos[0].resolved_post_local_review_pr_summary(
-            cfg.post_local_review_pr_summary
-        )
-        is True
+        cfg.repos[0].resolved_post_local_review_pr_summary(cfg.post_local_review_pr_summary) is True
     )
 
 
-def test_post_local_review_pr_summary_per_binding_override_off(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_post_local_review_pr_summary_per_binding_override_off(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Global ON, but this binding's PR thread should stay quiet."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
@@ -908,17 +844,12 @@ repos:
     # ENG overrides off; WEB inherits global True.
     assert cfg.repos[0].post_local_review_pr_summary is False
     assert (
-        cfg.repos[0].resolved_post_local_review_pr_summary(
-            cfg.post_local_review_pr_summary
-        )
+        cfg.repos[0].resolved_post_local_review_pr_summary(cfg.post_local_review_pr_summary)
         is False
     )
     assert cfg.repos[1].post_local_review_pr_summary is None
     assert (
-        cfg.repos[1].resolved_post_local_review_pr_summary(
-            cfg.post_local_review_pr_summary
-        )
-        is True
+        cfg.repos[1].resolved_post_local_review_pr_summary(cfg.post_local_review_pr_summary) is True
     )
 
 
@@ -940,10 +871,7 @@ repos:
     cfg = Config.load(p)
     assert cfg.post_local_review_pr_summary is False
     assert (
-        cfg.repos[0].resolved_post_local_review_pr_summary(
-            cfg.post_local_review_pr_summary
-        )
-        is True
+        cfg.repos[0].resolved_post_local_review_pr_summary(cfg.post_local_review_pr_summary) is True
     )
 
 
@@ -967,9 +895,7 @@ repos:
         Config.load(p)
 
 
-def test_yaml_missing_code_review_uses_legacy_needs_approval(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_yaml_missing_code_review_uses_legacy_needs_approval(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Legacy bindings keep loading with review pointed at their old lane."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = """
@@ -1012,9 +938,7 @@ repos:
     assert cfg.repos[0].linear_states.needs_approval == "Needs Approval"
 
 
-def test_repo_binding_auto_merge_can_be_disabled(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_repo_binding_auto_merge_can_be_disabled(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1065,9 +989,7 @@ def test_roles_old_style_codex_config_resolves_identically() -> None:
     assert rv.agent == "claude" and rv.model == "opus"
 
 
-def test_roles_per_binding_deep_merges_per_field_over_global(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_roles_per_binding_deep_merges_per_field_over_global(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Global `roles:` default + per-binding `roles:` override deep-merge per
     field: `role = merge(global[role], binding[role])`."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
@@ -1155,9 +1077,7 @@ repos:
         Config.load(p)
 
 
-def test_roles_config_builds_implement_command_with_model(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_roles_config_builds_implement_command_with_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """A `roles`-based config drives the built `implement` claude command:
     resolved model → `--model`; no `roles:` → no flag (today's behavior)."""
     from symphony.orchestrator.poll import build_runner_command
@@ -1187,9 +1107,7 @@ repos:
         return build_runner_command(
             role.agent,
             "do it",
-            codex_model=(
-                role.model if (is_codex and role.model) else binding.codex_model
-            ),
+            codex_model=(role.model if (is_codex and role.model) else binding.codex_model),
             claude_model=None if is_codex else role.model,
         )
 
@@ -1199,9 +1117,7 @@ repos:
     assert "--model" not in implement_command(cfg.repos[1])
 
 
-def test_roles_effort_resolves_and_builds_codex_command(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_roles_effort_resolves_and_builds_codex_command(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """A codex role with `effort` resolves onto the role and drives the codex
     command's `model_reasoning_effort` flag."""
     from symphony.orchestrator.poll import build_runner_command
@@ -1233,9 +1149,7 @@ repos:
     assert 'model_reasoning_effort="high"' in command
 
 
-def test_roles_effort_resolves_and_builds_claude_command(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_roles_effort_resolves_and_builds_claude_command(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """A claude role with `effort` resolves onto the role and drives the claude
     command's `--effort` flag."""
     from symphony.orchestrator.poll import build_runner_command
@@ -1323,9 +1237,7 @@ repos:
         Config.load(p)
 
 
-def test_roles_config_builds_fix_command_with_model(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_roles_config_builds_fix_command_with_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """A `roles`-based config drives the built `fix` claude command through
     both builder-fix command builders (poll's `build_fix_runner_command` and
     the local-review/verify `_build_fix_command`): resolved model → `--model`;
@@ -1411,9 +1323,7 @@ def test_no_legacy_role_field_no_deprecation_warning() -> None:
     assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
 
 
-def test_legacy_field_and_per_binding_matrix_conflict_fails(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_legacy_field_and_per_binding_matrix_conflict_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Legacy `agent` + a per-binding `roles[*].agent` for the same cell errors."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
@@ -1432,9 +1342,7 @@ repos:
         Config.load(p)
 
 
-def test_legacy_field_and_global_matrix_conflict_fails(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_legacy_field_and_global_matrix_conflict_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Legacy `local_review_claude_model` + global `roles.review_find.model` errors."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
@@ -1453,9 +1361,7 @@ repos:
         Config.load(p)
 
 
-def test_legacy_agent_with_matrix_model_does_not_conflict(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_legacy_agent_with_matrix_model_does_not_conflict(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Legacy `agent` and `roles.implement.model` target different cells → no error."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
@@ -1484,9 +1390,7 @@ def test_roles_effort_unset_defaults_to_none() -> None:
         assert binding.resolved_role(name).effort is None
 
 
-def test_roles_effort_resolves_per_field_over_global(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_roles_effort_resolves_per_field_over_global(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Global `roles` effort default + per-binding override deep-merge per field.
 
     Effort requires an explicit model (validated as a pair), so each role pins

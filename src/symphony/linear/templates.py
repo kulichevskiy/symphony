@@ -36,9 +36,7 @@ def mark_symphony_comment(body: str, *, limit: int = COMMENT_BYTE_LIMIT) -> str:
         return body
     marker_size = len(_SYMPHONY_COMMENT_SUFFIX.encode("utf-8"))
     if limit <= marker_size:
-        return _SYMPHONY_COMMENT_SUFFIX.encode("utf-8")[:limit].decode(
-            "utf-8", errors="ignore"
-        )
+        return _SYMPHONY_COMMENT_SUFFIX.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
     return truncate_body(body, limit=limit - marker_size) + _SYMPHONY_COMMENT_SUFFIX
 
 
@@ -340,9 +338,7 @@ def fixing_merge_conflict(v: CommentVars) -> str:
 
 def fix_pushed(v: CommentVars) -> str:
     commit_line = (
-        f"- Commit: [{v.commit_url.split('/')[-1][:8]}]({v.commit_url})\n"
-        if v.commit_url
-        else ""
+        f"- Commit: [{v.commit_url.split('/')[-1][:8]}]({v.commit_url})\n" if v.commit_url else ""
     )
     return (
         f"📤 **Fix pushed** for `{v.repo}#{v.issue}`\n\n"

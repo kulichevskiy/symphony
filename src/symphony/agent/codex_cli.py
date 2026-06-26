@@ -8,9 +8,7 @@ import tomllib
 from pathlib import Path
 
 SYMPHONY_PERMISSIONS_PROFILE = "symphony-git"
-CODEX_DEFAULT_PERMISSIONS_CONFIG = (
-    f'default_permissions="{SYMPHONY_PERMISSIONS_PROFILE}"'
-)
+CODEX_DEFAULT_PERMISSIONS_CONFIG = f'default_permissions="{SYMPHONY_PERMISSIONS_PROFILE}"'
 CODEX_APPROVAL_POLICY_CONFIG = 'approval_policy="never"'
 
 # Grant write to the workspace via the `:workspace_roots` token. Codex >= 0.136
@@ -84,10 +82,7 @@ def _profile_uses_legacy_project_roots(profile: dict[str, object]) -> bool:
     rewritten rather than preserved.
     """
     filesystem = profile.get("filesystem")
-    return (
-        isinstance(filesystem, dict)
-        and _LEGACY_PROJECT_ROOTS_TOKEN in filesystem
-    )
+    return isinstance(filesystem, dict) and _LEGACY_PROJECT_ROOTS_TOKEN in filesystem
 
 
 def _split_dotted_key(header: str) -> list[str] | None:
@@ -194,7 +189,7 @@ def ensure_symphony_permissions_profile(
                 raise CodexPermissionsProfileError(
                     f"Codex config {path} defines {SYMPHONY_PERMISSIONS_PROFILE!r} "
                     "as a non-table value; add the permissions profile manually."
-            )
+                )
             if isinstance(profile, dict):
                 if not _profile_uses_legacy_project_roots(profile):
                     return path, False
@@ -208,10 +203,7 @@ def ensure_symphony_permissions_profile(
                 # duplicate the table path and corrupt the file. Don't write a
                 # broken config — hand the operator the exact block to paste.
                 leftover = tomllib.loads(stripped).get("permissions")
-                if (
-                    isinstance(leftover, dict)
-                    and SYMPHONY_PERMISSIONS_PROFILE in leftover
-                ):
+                if isinstance(leftover, dict) and SYMPHONY_PERMISSIONS_PROFILE in leftover:
                     raise CodexPermissionsProfileError(
                         f"Codex config {path} defines a stale "
                         f"{SYMPHONY_PERMISSIONS_PROFILE!r} profile as an inline "

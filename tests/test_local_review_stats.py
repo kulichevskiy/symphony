@@ -84,9 +84,7 @@ async def test_stats_counts_by_status_and_skips_other_stages(
     must not pollute the aggregates."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
 
         # 2 approved, 2 non-approved, 1 running (local_review). The
         # legacy interrupted row is no longer a first-class outcome.
@@ -184,9 +182,7 @@ async def test_stats_counts_by_status_and_skips_other_stages(
 async def test_stats_approval_rate_only_completed(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         for i in range(3):
             await _seed_run(
                 conn,
@@ -219,9 +215,7 @@ def test_cli_local_review_stats_empty_db(tmp_path: Path) -> None:
     asyncio.run(_setup())
 
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["runs", "local-review-stats", "--db", str(db_path)]
-    )
+    result = runner.invoke(main, ["runs", "local-review-stats", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "completed (APPROVED):    0" in result.output
     assert "interrupted" not in result.output
@@ -243,9 +237,7 @@ def test_cli_local_review_trace_missing_issue_exits_with_error(
     asyncio.run(_setup())
 
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["runs", "local-review-trace", "ENG-404", "--db", str(db_path)]
-    )
+    result = runner.invoke(main, ["runs", "local-review-trace", "ENG-404", "--db", str(db_path)])
     assert result.exit_code == 1
     assert "no issue found" in result.output
 
@@ -260,9 +252,7 @@ def test_cli_local_review_trace_issue_with_no_local_reviews(
     async def _setup() -> None:
         conn = await db.connect(db_path)
         try:
-            await db.issues.upsert(
-                conn, id="iss-1", identifier="ENG-7", title="t", team_key="ENG"
-            )
+            await db.issues.upsert(conn, id="iss-1", identifier="ENG-7", title="t", team_key="ENG")
             # Only an implement row — no local-review phase ran.
             await _seed_run(
                 conn,
@@ -280,9 +270,7 @@ def test_cli_local_review_trace_issue_with_no_local_reviews(
     asyncio.run(_setup())
 
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["runs", "local-review-trace", "ENG-7", "--db", str(db_path)]
-    )
+    result = runner.invoke(main, ["runs", "local-review-trace", "ENG-7", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "no local-review runs recorded for ENG-7" in result.output
 
@@ -297,9 +285,7 @@ def test_cli_local_review_trace_lists_newest_first_with_duration(
     async def _setup() -> None:
         conn = await db.connect(db_path)
         try:
-            await db.issues.upsert(
-                conn, id="iss-1", identifier="ENG-9", title="t", team_key="ENG"
-            )
+            await db.issues.upsert(conn, id="iss-1", identifier="ENG-9", title="t", team_key="ENG")
             await _seed_run(
                 conn,
                 run_id="lr-old",
@@ -337,9 +323,7 @@ def test_cli_local_review_trace_lists_newest_first_with_duration(
     asyncio.run(_setup())
 
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["runs", "local-review-trace", "ENG-9", "--db", str(db_path)]
-    )
+    result = runner.invoke(main, ["runs", "local-review-trace", "ENG-9", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "ENG-9 (2 total)" in result.output
     # Newest first.
@@ -400,9 +384,7 @@ def test_cli_local_review_stats_with_seeded_rows(tmp_path: Path) -> None:
     asyncio.run(_setup())
 
     runner = CliRunner()
-    result = runner.invoke(
-        main, ["runs", "local-review-stats", "--db", str(db_path)]
-    )
+    result = runner.invoke(main, ["runs", "local-review-stats", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "completed (APPROVED):    1" in result.output
     assert "interrupted" not in result.output
@@ -413,10 +395,7 @@ def test_cli_local_review_stats_with_seeded_rows(tmp_path: Path) -> None:
     assert "total effective tokens:  162" in result.output
     # Dollar cost stays but is demoted to a notional list-price estimate;
     # a single caveat header covers both the total and per-session figures.
-    assert (
-        "cost (notional list-price estimate, not the actual bill):"
-        in result.output
-    )
+    assert "cost (notional list-price estimate, not the actual bill):" in result.output
     assert "total cost:            $1.0000" in result.output
     assert "avg cost per session:  $0.5000" in result.output
     assert "avg duration per session: 120.0s" in result.output

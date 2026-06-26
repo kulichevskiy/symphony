@@ -96,9 +96,7 @@ def test_for_binding_builds_linear_or_jira_tracker(monkeypatch) -> None:  # type
         assert isinstance(jira, JiraTracker)
         assert registry.resolve(TrackerContext(provider="linear", site="default")) is linear
         assert (
-            registry.resolve(
-                TrackerContext(provider="jira", site="https://jira.example.test")
-            )
+            registry.resolve(TrackerContext(provider="jira", site="https://jira.example.test"))
             is jira
         )
     finally:
@@ -129,9 +127,7 @@ def test_for_binding_registers_jira_secret_base_url(monkeypatch) -> None:  # typ
         assert isinstance(jira, JiraTracker)
         assert binding.tracker_site == "https://jira.example.test"
         assert (
-            registry.resolve(
-                TrackerContext(provider="jira", site="https://jira.example.test")
-            )
+            registry.resolve(TrackerContext(provider="jira", site="https://jira.example.test"))
             is jira
         )
     finally:
@@ -171,9 +167,7 @@ def test_for_binding_registers_same_site_jira_projects_separately(
         assert registry.resolve(context_for_binding(sym_binding)) is sym
         assert registry.resolve(context_for_binding(ops_binding)) is ops
         with pytest.raises(KeyError, match="provide project_key"):
-            registry.resolve(
-                TrackerContext(provider="jira", site="https://jira.example.test")
-            )
+            registry.resolve(TrackerContext(provider="jira", site="https://jira.example.test"))
     finally:
         import asyncio
 
@@ -322,9 +316,7 @@ async def test_orchestrator_uses_supplied_tracker_registry(tmp_path) -> None:  #
 
 
 @pytest.mark.asyncio
-async def test_jira_binding_does_not_crash_warmup_or_tick(
-    tmp_path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+async def test_jira_binding_does_not_crash_warmup_or_tick(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
     from symphony.jira.client import JiraTracker
     from symphony.tracker import TrackerRegistry, for_binding
@@ -356,9 +348,12 @@ async def test_jira_binding_does_not_crash_warmup_or_tick(
         scheduled = await orch._tick()  # noqa: SLF001
 
         assert scheduled == []
-        assert orch._states[("jira", "https://jira.example.test", "SYM")][  # noqa: SLF001
-            "To Do"
-        ] == "To Do"
+        assert (
+            orch._states[("jira", "https://jira.example.test", "SYM")][  # noqa: SLF001
+                "To Do"
+            ]
+            == "To Do"
+        )
     finally:
         await jira.aclose()
         await conn.close()
@@ -549,17 +544,13 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
             provider=secondary_binding.tracker_provider,
             site=secondary_binding.tracker_site,
         )
-        cur = await conn.execute(
-            "SELECT issue_id, stage, status FROM runs ORDER BY stage"
-        )
+        cur = await conn.execute("SELECT issue_id, stage, status FROM runs ORDER BY stage")
         rows = [dict(row) for row in await cur.fetchall()]
         assert rows == [
             {"issue_id": scoped_issue_id, "stage": "implement", "status": "completed"},
             {"issue_id": scoped_issue_id, "stage": "review", "status": "running"},
         ]
-        cur = await conn.execute(
-            "SELECT issue_id, pr_number, github_repo FROM review_state"
-        )
+        cur = await conn.execute("SELECT issue_id, pr_number, github_repo FROM review_state")
         assert [dict(row) for row in await cur.fetchall()] == [
             {
                 "issue_id": scoped_issue_id,
@@ -573,12 +564,8 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
         assert await db.issue_prs.get_for_issue(conn, issue_id=issue.id) is None
         assert run_id is not None
         assert orch._dispatch_run_ids[scoped_issue_id] == run_id  # noqa: SLF001
-        assert all(
-            call.args[0] == issue.id for call in tracker.post_comment.await_args_list
-        )
-        assert all(
-            call.args[0] == issue.id for call in tracker.move_issue.await_args_list
-        )
+        assert all(call.args[0] == issue.id for call in tracker.post_comment.await_args_list)
+        assert all(call.args[0] == issue.id for call in tracker.move_issue.await_args_list)
     finally:
         await conn.close()
 
@@ -688,9 +675,7 @@ async def test_reconciler_translates_scoped_storage_id_before_tracker_lookup(tmp
             tracker_site=secondary_binding.tracker_site,
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         reconciler = Reconciler(
@@ -722,9 +707,7 @@ async def test_binding_scoped_lookup_uses_binding_tracker(tmp_path) -> None:  # 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(
@@ -764,9 +747,7 @@ async def test_issue_webhook_uses_recorded_tracker_context(tmp_path) -> None:  #
             site="secondary",
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(
@@ -895,9 +876,7 @@ async def test_issue_webhook_provider_context_limits_unseen_lookup(tmp_path) -> 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(
@@ -960,9 +939,7 @@ async def test_issue_webhook_provider_context_wins_over_default_storage_id(
             site=secondary_binding.tracker_site,
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(
@@ -1025,9 +1002,7 @@ async def test_state_webhook_reconciles_scoped_storage_issue_id(tmp_path) -> Non
             site=secondary_binding.tracker_site,
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(
@@ -1282,9 +1257,7 @@ async def test_review_failed_retry_uses_tracker_issue_id_for_scoped_issue(
         secondary_tracker = AsyncMock()
         secondary_tracker.comments_since = AsyncMock(return_value=[_comment("$retry")])
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
-        secondary_tracker.team_states = AsyncMock(
-            return_value={"Needs Approval": "state-review"}
-        )
+        secondary_tracker.team_states = AsyncMock(return_value={"Needs Approval": "state-review"})
         secondary_tracker.move_issue = AsyncMock()
         secondary_tracker.post_comment = AsyncMock(return_value="c-resumed")
         gh = MagicMock()
@@ -1369,9 +1342,7 @@ async def test_acceptance_blocked_retry_moves_tracker_issue_id_for_scoped_issue(
             tracker_site=secondary_binding.tracker_site,
         )
         default_tracker = AsyncMock()
-        default_tracker.move_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.move_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.team_states = AsyncMock(
             return_value={secondary_binding.linear_states.needs_approval: "state-review"}
@@ -1467,9 +1438,7 @@ async def test_acceptance_blocked_skip_uses_tracker_issue_id_for_scoped_issue(
             tracker_site=secondary_binding.tracker_site,
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         secondary_tracker.post_comment = AsyncMock(return_value="c-skipped")
@@ -1566,9 +1535,7 @@ async def test_merge_wait_reconcile_uses_tracker_issue_id_for_scoped_issue(
             created_at="2026-05-10T00:01:00+00:00",
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         secondary_tracker.post_comment = AsyncMock(return_value="c-reconcile")
@@ -1659,9 +1626,7 @@ async def test_merge_candidate_refresh_uses_tracker_issue_id_for_scoped_issue(
             created_at="2026-05-10T00:01:00+00:00",
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(
@@ -1780,9 +1745,7 @@ async def test_review_poll_uses_stored_tracker_context_for_rebound_binding(
             started_at="2026-05-10T00:00:00+00:00",
         )
         default_tracker = AsyncMock()
-        default_tracker.lookup_issue = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.lookup_issue = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.lookup_issue = AsyncMock(return_value=issue)
         orch = Orchestrator(

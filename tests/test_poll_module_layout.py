@@ -609,8 +609,7 @@ def test_fix_run_wrappers_route_through_shared_helper() -> None:
             ):
                 routed.add(node.name)
     assert routed == set(_FIX_DISPATCH_WRAPPERS), (
-        f"wrappers not routed through _run_fix_dispatch: "
-        f"{set(_FIX_DISPATCH_WRAPPERS) - routed}"
+        f"wrappers not routed through _run_fix_dispatch: {set(_FIX_DISPATCH_WRAPPERS) - routed}"
     )
 
 

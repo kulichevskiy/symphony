@@ -39,21 +39,13 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE issues ADD COLUMN tracker_issue_id TEXT NOT NULL DEFAULT ''"
         )
-        await conn.execute(
-            "UPDATE issues SET tracker_issue_id = id WHERE tracker_issue_id = ''"
-        )
+        await conn.execute("UPDATE issues SET tracker_issue_id = id WHERE tracker_issue_id = ''")
     if "provider" not in issue_cols:
-        await conn.execute(
-            "ALTER TABLE issues ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
-        )
+        await conn.execute("ALTER TABLE issues ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'")
     if "site" not in issue_cols:
-        await conn.execute(
-            "ALTER TABLE issues ADD COLUMN site TEXT NOT NULL DEFAULT 'default'"
-        )
+        await conn.execute("ALTER TABLE issues ADD COLUMN site TEXT NOT NULL DEFAULT 'default'")
     if "granted_token_budget" not in issue_cols:
-        await conn.execute(
-            "ALTER TABLE issues ADD COLUMN granted_token_budget INTEGER DEFAULT 0"
-        )
+        await conn.execute("ALTER TABLE issues ADD COLUMN granted_token_budget INTEGER DEFAULT 0")
     await conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_tracker_identity
@@ -70,13 +62,9 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         "cache_read_tokens",
     ):
         if col not in run_cols:
-            await conn.execute(
-                f"ALTER TABLE runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
-            )
+            await conn.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
     if "termination_kind" not in run_cols:
-        await conn.execute(
-            "ALTER TABLE runs ADD COLUMN termination_kind TEXT NOT NULL DEFAULT ''"
-        )
+        await conn.execute("ALTER TABLE runs ADD COLUMN termination_kind TEXT NOT NULL DEFAULT ''")
     if "termination_detail" not in run_cols:
         await conn.execute(
             "ALTER TABLE runs ADD COLUMN termination_detail TEXT NOT NULL DEFAULT ''"
@@ -85,31 +73,26 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE runs ADD COLUMN exit_returncode INTEGER")
     if "stage_done_announced_at" not in run_cols:
         await conn.execute(
-            "ALTER TABLE runs "
-            "ADD COLUMN stage_done_announced_at TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE runs ADD COLUMN stage_done_announced_at TEXT NOT NULL DEFAULT ''"
         )
 
     cur = await conn.execute("PRAGMA table_info(comment_cursors)")
     cols = {row[1] for row in await cur.fetchall()}
     if "last_seen_ids" not in cols:
         await conn.execute(
-            "ALTER TABLE comment_cursors "
-            "ADD COLUMN last_seen_ids TEXT NOT NULL DEFAULT '[]'"
+            "ALTER TABLE comment_cursors ADD COLUMN last_seen_ids TEXT NOT NULL DEFAULT '[]'"
         )
 
     cur = await conn.execute("PRAGMA table_info(review_state)")
     review_cols = {row[1] for row in await cur.fetchall()}
     if "ci_fetch_failures" not in review_cols:
         await conn.execute(
-            "ALTER TABLE review_state "
-            "ADD COLUMN ci_fetch_failures INTEGER NOT NULL DEFAULT 0"
+            "ALTER TABLE review_state ADD COLUMN ci_fetch_failures INTEGER NOT NULL DEFAULT 0"
         )
     if "pr_number" not in review_cols:
         await conn.execute("ALTER TABLE review_state ADD COLUMN pr_number INTEGER")
     if "pr_url" not in review_cols:
-        await conn.execute(
-            "ALTER TABLE review_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''"
-        )
+        await conn.execute("ALTER TABLE review_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''")
     if "github_repo" not in review_cols:
         await conn.execute(
             "ALTER TABLE review_state ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''"
@@ -120,65 +103,55 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         )
     if "codex_lgtm_comment_id" not in review_cols:
         await conn.execute(
-            "ALTER TABLE review_state "
-            "ADD COLUMN codex_lgtm_comment_id TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE review_state ADD COLUMN codex_lgtm_comment_id TEXT NOT NULL DEFAULT ''"
         )
     if "codex_review_requested_at" not in review_cols:
         await conn.execute(
-            "ALTER TABLE review_state "
-            "ADD COLUMN codex_review_requested_at TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE review_state ADD COLUMN codex_review_requested_at TEXT NOT NULL DEFAULT ''"
         )
 
     cur = await conn.execute("PRAGMA table_info(webhook_deliveries)")
     cols = {row[1] for row in await cur.fetchall()}
     if "status" not in cols:
         await conn.execute(
-            "ALTER TABLE webhook_deliveries "
-            "ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            "ALTER TABLE webhook_deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
         )
         await conn.execute("UPDATE webhook_deliveries SET status = 'handled'")
 
     cur = await conn.execute("PRAGMA table_info(issue_prs)")
     cols = {row[1] for row in await cur.fetchall()}
     if "binding_key" not in cols:
-        await conn.execute(
-            "ALTER TABLE issue_prs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''"
-        )
+        await conn.execute("ALTER TABLE issue_prs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''")
     if "parked_at" not in cols:
         await conn.execute("ALTER TABLE issue_prs ADD COLUMN parked_at TEXT")
     if "review_bypassed" not in cols:
         await conn.execute(
-            "ALTER TABLE issue_prs "
-            "ADD COLUMN review_bypassed INTEGER NOT NULL DEFAULT 0"
+            "ALTER TABLE issue_prs ADD COLUMN review_bypassed INTEGER NOT NULL DEFAULT 0"
         )
 
     cur = await conn.execute("PRAGMA table_info(acceptance_state)")
     cols = {row[1] for row in await cur.fetchall()}
     if "pr_head_sha" not in cols:
         await conn.execute(
-            "ALTER TABLE acceptance_state "
-            "ADD COLUMN pr_head_sha TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE acceptance_state ADD COLUMN pr_head_sha TEXT NOT NULL DEFAULT ''"
         )
     if "infra_retries" not in cols:
         await conn.execute(
-            "ALTER TABLE acceptance_state "
-            "ADD COLUMN infra_retries INTEGER NOT NULL DEFAULT 0"
+            "ALTER TABLE acceptance_state ADD COLUMN infra_retries INTEGER NOT NULL DEFAULT 0"
         )
 
     cur = await conn.execute("PRAGMA table_info(merge_conflict_fix_marks)")
     cols = {row[1] for row in await cur.fetchall()}
     if "head_sha" not in cols:
         await conn.execute(
-            "ALTER TABLE merge_conflict_fix_marks "
-            "ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE merge_conflict_fix_marks ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''"
         )
 
     cur = await conn.execute("PRAGMA table_info(operator_waits)")
     cols = {row[1] for row in await cur.fetchall()}
     if "tracker_provider" not in cols:
         await conn.execute(
-            "ALTER TABLE operator_waits "
-            "ADD COLUMN tracker_provider TEXT NOT NULL DEFAULT 'linear'"
+            "ALTER TABLE operator_waits ADD COLUMN tracker_provider TEXT NOT NULL DEFAULT 'linear'"
         )
         await conn.execute(
             """
@@ -191,8 +164,7 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         )
     if "tracker_site" not in cols:
         await conn.execute(
-            "ALTER TABLE operator_waits "
-            "ADD COLUMN tracker_site TEXT NOT NULL DEFAULT 'default'"
+            "ALTER TABLE operator_waits ADD COLUMN tracker_site TEXT NOT NULL DEFAULT 'default'"
         )
         await conn.execute(
             """
@@ -206,15 +178,12 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     cur = await conn.execute("PRAGMA table_info(operator_waits)")
     cols = {row[1] for row in await cur.fetchall()}
     if "local_review_outcome" not in cols:
-        await conn.execute(
-            "ALTER TABLE operator_waits ADD COLUMN local_review_outcome TEXT"
-        )
+        await conn.execute("ALTER TABLE operator_waits ADD COLUMN local_review_outcome TEXT")
     cur = await conn.execute("PRAGMA table_info(operator_waits)")
     cols = {row[1] for row in await cur.fetchall()}
     if "provider" not in cols:
         await conn.execute(
-            "ALTER TABLE operator_waits "
-            "ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
+            "ALTER TABLE operator_waits ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
         )
         await conn.execute(
             """

@@ -27,9 +27,7 @@ async def _default_push(workspace_path: Path, branch: str) -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git push failed: {stderr.decode(errors='replace').strip()}"
-        )
+        raise RuntimeError(f"git push failed: {stderr.decode(errors='replace').strip()}")
 
 
 async def _default_force_push(workspace_path: Path, branch: str) -> None:
@@ -48,8 +46,7 @@ async def _default_force_push(workspace_path: Path, branch: str) -> None:
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(
-            f"git push --force-with-lease failed: "
-            f"{stderr.decode(errors='replace').strip()}"
+            f"git push --force-with-lease failed: {stderr.decode(errors='replace').strip()}"
         )
 
 
@@ -61,7 +58,10 @@ async def _sync_workspace_to_remote(workspace_path: Path, branch: str) -> None:
     a non-fast-forward push failure later.
     """
     fetch_proc = await asyncio.create_subprocess_exec(
-        "git", "fetch", "origin", branch,
+        "git",
+        "fetch",
+        "origin",
+        branch,
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -69,11 +69,12 @@ async def _sync_workspace_to_remote(workspace_path: Path, branch: str) -> None:
     )
     _, stderr = await fetch_proc.communicate()
     if fetch_proc.returncode != 0:
-        raise RuntimeError(
-            f"git fetch failed: {stderr.decode(errors='replace').strip()}"
-        )
+        raise RuntimeError(f"git fetch failed: {stderr.decode(errors='replace').strip()}")
     reset_proc = await asyncio.create_subprocess_exec(
-        "git", "reset", "--hard", f"origin/{branch}",
+        "git",
+        "reset",
+        "--hard",
+        f"origin/{branch}",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -81,15 +82,15 @@ async def _sync_workspace_to_remote(workspace_path: Path, branch: str) -> None:
     )
     _, stderr = await reset_proc.communicate()
     if reset_proc.returncode != 0:
-        raise RuntimeError(
-            f"git reset --hard failed: {stderr.decode(errors='replace').strip()}"
-        )
+        raise RuntimeError(f"git reset --hard failed: {stderr.decode(errors='replace').strip()}")
 
 
 async def _git_fetch(workspace_path: Path) -> None:
     """Run ``git fetch origin`` in *workspace_path*."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "fetch", "origin",
+        "git",
+        "fetch",
+        "origin",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -97,15 +98,16 @@ async def _git_fetch(workspace_path: Path) -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git fetch failed: {stderr.decode(errors='replace').strip()}"
-        )
+        raise RuntimeError(f"git fetch failed: {stderr.decode(errors='replace').strip()}")
 
 
 async def _git_fetch_branch(workspace_path: Path, branch: str) -> None:
     """Fetch ``origin/branch`` so remote-head validation has a fresh baseline."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "fetch", "origin", branch,
+        "git",
+        "fetch",
+        "origin",
+        branch,
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -121,7 +123,10 @@ async def _git_fetch_branch(workspace_path: Path, branch: str) -> None:
 async def _git_status_short(workspace_path: Path) -> str:
     """Return ``git status --short`` output for failure diagnostics."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "status", "--short", "--untracked-files=all",
+        "git",
+        "status",
+        "--short",
+        "--untracked-files=all",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -140,7 +145,9 @@ async def _git_rebase(workspace_path: Path, upstream: str) -> bool:
     if it stopped due to conflicts.
     """
     proc = await asyncio.create_subprocess_exec(
-        "git", "rebase", upstream,
+        "git",
+        "rebase",
+        upstream,
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -153,7 +160,9 @@ async def _git_rebase(workspace_path: Path, upstream: str) -> bool:
 async def _git_abort_rebase(workspace_path: Path) -> None:
     """Abort an in-progress rebase in *workspace_path*."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "rebase", "--abort",
+        "git",
+        "rebase",
+        "--abort",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -161,15 +170,16 @@ async def _git_abort_rebase(workspace_path: Path) -> None:
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"git rebase --abort failed: {stderr.decode(errors='replace').strip()}"
-        )
+        raise RuntimeError(f"git rebase --abort failed: {stderr.decode(errors='replace').strip()}")
 
 
 async def _git_conflicted_files(workspace_path: Path) -> list[str]:
     """Return a list of paths with unresolved conflict markers."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "diff", "--name-only", "--diff-filter=U",
+        "git",
+        "diff",
+        "--name-only",
+        "--diff-filter=U",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -182,7 +192,9 @@ async def _git_conflicted_files(workspace_path: Path) -> list[str]:
 async def _git_tree_is_clean(workspace_path: Path) -> bool:
     """True if the working tree has no staged, unstaged, or untracked changes."""
     proc = await asyncio.create_subprocess_exec(
-        "git", "status", "--porcelain",
+        "git",
+        "status",
+        "--porcelain",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -192,9 +204,7 @@ async def _git_tree_is_clean(workspace_path: Path) -> bool:
     return proc.returncode == 0 and not stdout.strip()
 
 
-async def _git_add_and_continue_rebase(
-    workspace_path: Path, files: list[str]
-) -> bool:
+async def _git_add_and_continue_rebase(workspace_path: Path, files: list[str]) -> bool:
     """Stage *files* and run ``git rebase --continue``.
 
     Returns ``True`` when the rebase completed, or when no rebase is in
@@ -209,7 +219,10 @@ async def _git_add_and_continue_rebase(
             return True
     if files:
         add_proc = await asyncio.create_subprocess_exec(
-            "git", "add", "--", *files,
+            "git",
+            "add",
+            "--",
+            *files,
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -217,13 +230,14 @@ async def _git_add_and_continue_rebase(
         )
         _, stderr = await add_proc.communicate()
         if add_proc.returncode != 0:
-            raise RuntimeError(
-                f"git add failed: {stderr.decode(errors='replace').strip()}"
-            )
+            raise RuntimeError(f"git add failed: {stderr.decode(errors='replace').strip()}")
     import os  # noqa: PLC0415
+
     env = {**os.environ, "GIT_EDITOR": "true"}
     cont_proc = await asyncio.create_subprocess_exec(
-        "git", "rebase", "--continue",
+        "git",
+        "rebase",
+        "--continue",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -252,7 +266,10 @@ async def _rebase_in_progress(workspace_path: Path) -> bool:
     """
     for name in ("rebase-merge", "rebase-apply"):
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "--git-path", name,
+            "git",
+            "rev-parse",
+            "--git-path",
+            name,
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -276,7 +293,10 @@ async def _workspace_ref_sha(workspace_path: Path, ref: str) -> str:
     """Return the commit SHA for *ref* in *workspace_path*, or "" on error."""
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "--verify", ref,
+            "git",
+            "rev-parse",
+            "--verify",
+            ref,
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -301,7 +321,11 @@ async def _workspace_ref_is_ancestor(
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "merge-base", "--is-ancestor", ancestor, descendant,
+            "git",
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -333,9 +357,7 @@ async def _workspace_ref_landed_in_base(
     return False
 
 
-async def _workspace_commits_ahead(
-    workspace_path: Path, base_branch: str
-) -> int | None:
+async def _workspace_commits_ahead(workspace_path: Path, base_branch: str) -> int | None:
     """Commits on HEAD not in *base_branch*, or None if undeterminable.
 
     Prefer `origin/<base>` (present after a fresh clone), fall back to the
@@ -345,7 +367,10 @@ async def _workspace_commits_ahead(
     for ref in (f"origin/{base_branch}..HEAD", f"{base_branch}..HEAD"):
         try:
             proc = await asyncio.create_subprocess_exec(
-                "git", "rev-list", "--count", ref,
+                "git",
+                "rev-list",
+                "--count",
+                ref,
                 cwd=str(workspace_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -358,9 +383,7 @@ async def _workspace_commits_ahead(
     return None
 
 
-async def _workspace_diff_size(
-    workspace_path: Path, base_branch: str
-) -> DiffSize:
+async def _workspace_diff_size(workspace_path: Path, base_branch: str) -> DiffSize:
     """Measure the branch's diff vs *base_branch* via `git diff --numstat`.
 
     Mirrors the reviewer prompt's ref logic: prefer `origin/<base>...HEAD`,
@@ -372,7 +395,10 @@ async def _workspace_diff_size(
     for ref in (f"origin/{base_branch}...HEAD", f"{base_branch}...HEAD"):
         try:
             proc = await asyncio.create_subprocess_exec(
-                "git", "diff", "--numstat", ref,
+                "git",
+                "diff",
+                "--numstat",
+                ref,
                 cwd=str(workspace_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -400,7 +426,10 @@ async def _branch_ahead_of_base(workspace_path: Path, base_branch: str | None) -
     for ref in (f"origin/{base_branch}..HEAD", f"{base_branch}..HEAD"):
         try:
             proc = await asyncio.create_subprocess_exec(
-                "git", "rev-list", "--count", ref,
+                "git",
+                "rev-list",
+                "--count",
+                ref,
                 cwd=str(workspace_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -448,7 +477,9 @@ async def _workspace_dirty_files(workspace_path: Path) -> list[str]:
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "status", "--porcelain",
+            "git",
+            "status",
+            "--porcelain",
             cwd=str(workspace_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -456,11 +487,7 @@ async def _workspace_dirty_files(workspace_path: Path) -> list[str]:
         )
         stdout, _ = await proc.communicate()
         if proc.returncode == 0:
-            return [
-                line
-                for line in stdout.decode(errors="replace").splitlines()
-                if line.strip()
-            ]
+            return [line for line in stdout.decode(errors="replace").splitlines() if line.strip()]
     except Exception:  # noqa: BLE001
         pass
     return []

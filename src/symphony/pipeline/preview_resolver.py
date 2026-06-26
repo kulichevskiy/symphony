@@ -44,9 +44,7 @@ def render_preview_url(
 ) -> str:
     pattern = (acceptance.preview_url_pattern or "").strip()
     if not pattern:
-        raise PreviewResolutionError(
-            "preview acceptance requires acceptance.preview_url_pattern."
-        )
+        raise PreviewResolutionError("preview acceptance requires acceptance.preview_url_pattern.")
     try:
         return pattern.format(
             pr_number=pr_number,
@@ -60,9 +58,7 @@ def render_preview_url(
             f"preview_url_pattern contains unknown placeholder {{{e.args[0]}}}."
         ) from e
     except Exception as e:  # noqa: BLE001
-        raise PreviewResolutionError(
-            f"could not render preview_url_pattern: {e}"
-        ) from e
+        raise PreviewResolutionError(f"could not render preview_url_pattern: {e}") from e
 
 
 async def resolve_preview_url(
@@ -85,9 +81,7 @@ async def resolve_preview_url(
         pr_url=pr_url,
     )
     wait_timeout_secs = (
-        acceptance.preview_wait_timeout_secs
-        if timeout_secs is None
-        else timeout_secs
+        acceptance.preview_wait_timeout_secs if timeout_secs is None else timeout_secs
     )
     if wait_timeout_secs is None:
         wait_timeout_secs = DEFAULT_PREVIEW_WAIT_TIMEOUT_SECS

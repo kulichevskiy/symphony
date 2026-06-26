@@ -137,7 +137,6 @@ from ._helpers import (
 log = logging.getLogger(__name__)
 
 
-
 CI_FETCH_FAILURE_LIMIT = 5
 
 
@@ -145,10 +144,6 @@ REVIEW_RESURRECT_COOLDOWN_SECS = 120
 
 
 CODEX_NO_ISSUES_MARKER = "any major issues"
-
-
-
-
 
 
 def _local_review_needs_approval(result: LoopResult | None) -> bool:
@@ -174,10 +169,6 @@ def _local_review_permits_remote(result: LoopResult | None) -> bool:
     return result is not None and result.outcome in {
         LoopOutcome.APPROVED,
     }
-
-
-
-
 
 
 def _local_review_failure_log(result: LoopResult | None) -> str:
@@ -250,9 +241,7 @@ def _review_comments_from_github(
             ReviewComment(
                 user_login=_user_login(entry),
                 body=str(entry.get("body") or ""),
-                commit_sha=str(
-                    entry.get("commit_id") or entry.get("original_commit_id") or ""
-                ),
+                commit_sha=str(entry.get("commit_id") or entry.get("original_commit_id") or ""),
                 created_at=str(entry.get("created_at") or ""),
                 path=str(entry.get("path") or ""),
                 line=line,
@@ -368,9 +357,7 @@ async def _commit_committed_at_or_empty(
     return ""
 
 
-async def _abort_rebase_safely(
-    workspace_path: Path, *, issue_identifier: str, reason: str
-) -> None:
+async def _abort_rebase_safely(workspace_path: Path, *, issue_identifier: str, reason: str) -> None:
     try:
         await _git_abort_rebase(workspace_path)
     except Exception as e:  # noqa: BLE001
@@ -401,11 +388,7 @@ def _read_run_stream_api_error_obj(log_path: Path) -> StreamApiError | None:
 def _review_check_from_gh(run: GitHubCheckRun) -> ReviewCheckRun:
     bucket = run.bucket.lower()
     state = run.state.lower()
-    status = (
-        "completed"
-        if bucket in {"pass", "fail", "cancel", "skipping"}
-        else "in_progress"
-    )
+    status = "completed" if bucket in {"pass", "fail", "cancel", "skipping"} else "in_progress"
     conclusion_by_bucket = {
         "pass": "success",
         "fail": "failure",
@@ -424,11 +407,7 @@ def _review_check_from_gh(run: GitHubCheckRun) -> ReviewCheckRun:
 
 
 def _unknown_head_ci_scope(checks: PRChecks) -> str:
-    failed = [
-        run
-        for run in checks.runs
-        if run.bucket.lower() in {"fail", "cancel"}
-    ]
+    failed = [run for run in checks.runs if run.bucket.lower() in {"fail", "cancel"}]
     scoped_runs = failed or checks.runs
     parts = sorted(
         "\0".join(
@@ -454,11 +433,9 @@ class _ReviewMixin(_OrchestratorBase):
 
     if TYPE_CHECKING:
         # Sibling-domain methods provided by the concrete `Orchestrator`.
-        async def _agent_infra_retry_backoff_active(self, issue_id: str) -> bool:
-            ...
+        async def _agent_infra_retry_backoff_active(self, issue_id: str) -> bool: ...
 
-        def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None:
-            ...
+        def _binding_for_pr(self, candidate: db.issue_prs.IssuePR) -> RepoBinding | None: ...
 
         async def _block_local_only_review_infra_failure(
             self,
@@ -469,11 +446,9 @@ class _ReviewMixin(_OrchestratorBase):
             run_id: str,
             result: LoopResult | None,
             force_local_review_resume: bool = False,
-        ) -> None:
-            ...
+        ) -> None: ...
 
-        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
-            ...
+        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None: ...
 
         async def _interrupt_stale_merge_needs_approval_for_state(
             self,
@@ -481,13 +456,11 @@ class _ReviewMixin(_OrchestratorBase):
             binding: RepoBinding,
             issue: LinearIssue,
             state: db.review_state.ReviewState,
-        ) -> int:
-            ...
+        ) -> int: ...
 
         async def _maybe_park_for_token_budget(
             self, issue_id: str, run_id: str, binding: RepoBinding
-        ) -> bool:
-            ...
+        ) -> bool: ...
 
         async def _maybe_requeue_transient_agent_failure(
             self,
@@ -501,13 +474,11 @@ class _ReviewMixin(_OrchestratorBase):
             returncode: int | None = None,
             termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
             workspace_path: Path | None = None,
-        ) -> bool:
-            ...
+        ) -> bool: ...
 
         async def _move_issue_to_review_state(
             self, *, binding: RepoBinding, issue: LinearIssue
-        ) -> None:
-            ...
+        ) -> None: ...
 
         async def _park_local_only_review_needs_approval(
             self,
@@ -518,13 +489,11 @@ class _ReviewMixin(_OrchestratorBase):
             pr_url: str,
             result: LoopResult | None,
             operator_wait: bool = False,
-        ) -> None:
-            ...
+        ) -> None: ...
 
         async def _post_command_rejected(
             self, issue_id: str, slash_text: str, reason: str
-        ) -> None:
-            ...
+        ) -> None: ...
 
         async def _restore_operator_wait_binding(
             self,
@@ -533,8 +502,7 @@ class _ReviewMixin(_OrchestratorBase):
             intent: SlashIntent,
             *,
             expected_kinds: tuple[str, ...],
-        ) -> RepoBinding | None:
-            ...
+        ) -> RepoBinding | None: ...
 
         @asynccontextmanager
         async def _review_fix_dispatch_slot(
@@ -555,8 +523,7 @@ class _ReviewMixin(_OrchestratorBase):
             workspace_path: Path,
             prompt: str,
             prior_total: float,
-        ) -> tuple[UsageDelta, str, int | None]:
-            ...
+        ) -> tuple[UsageDelta, str, int | None]: ...
 
         async def _run_local_review_phase(
             self,
@@ -567,8 +534,7 @@ class _ReviewMixin(_OrchestratorBase):
             workspace_path: Path,
             parent_run_id: str,
             allow_fixes: bool = True,
-        ) -> LoopResult | None:
-            ...
+        ) -> LoopResult | None: ...
 
         def _schedule_merge(
             self,
@@ -580,12 +546,10 @@ class _ReviewMixin(_OrchestratorBase):
             approved_head_sha: str = "",
             skip_review: bool = False,
             on_started: Callable[[str], Awaitable[None]] | None = None,
-        ) -> asyncio.Task[None]:
-            ...
+        ) -> asyncio.Task[None]: ...
 
         @staticmethod
-        def _slash_text(intent: SlashIntent) -> str:
-            ...
+        def _slash_text(intent: SlashIntent) -> str: ...
 
     async def _handle_active_review_retry_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
@@ -637,8 +601,7 @@ class _ReviewMixin(_OrchestratorBase):
         signature = f"manual_retry:{run_id}:{intent.comment_id}"
         await db.review_state.set_signature(self._conn, issue_id, signature)
         log.info(
-            "$retry received for active review monitor %s (issue %s); "
-            "re-triggered @codex review",
+            "$retry received for active review monitor %s (issue %s); re-triggered @codex review",
             run_id,
             issue_id,
         )
@@ -766,10 +729,7 @@ class _ReviewMixin(_OrchestratorBase):
                     project_key=project_key,
                 )
         for binding in self.config.repos:
-            if (
-                tracker_ctx is not None
-                and _tracker_context_for_binding(binding) != tracker_ctx
-            ):
+            if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if team_key and binding.linear_team_key != team_key:
                 continue
@@ -794,13 +754,9 @@ class _ReviewMixin(_OrchestratorBase):
         for run in await db.runs.list_live_by_stage(self._conn, stage="review"):
             if run.id in self._active_run_ids or run.id in self._review_poll_run_ids:
                 continue
-            if await self._review_poll_deferred_by_deliver_failed_wait(
-                run.issue_id, run.id
-            ):
+            if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
                 continue
-            tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
-                run.issue_id
-            )
+            tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(run.issue_id)
             tracker = self.tracker(tracker_ctx)
             try:
                 issue = await tracker.lookup_issue(tracker_issue_id)
@@ -819,10 +775,7 @@ class _ReviewMixin(_OrchestratorBase):
                     run=run,
                     issue=issue,
                     state=state,
-                    error=(
-                        "review monitor no longer matches any configured "
-                        "repository binding"
-                    ),
+                    error=("review monitor no longer matches any configured repository binding"),
                 )
                 continue
             if not _review_issue_is_active(issue, binding):
@@ -836,8 +789,7 @@ class _ReviewMixin(_OrchestratorBase):
                 continue
             if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
                 log.info(
-                    "review run %s for %s: dispatch capacity is zero "
-                    "(global=%d, binding=%d)",
+                    "review run %s for %s: dispatch capacity is zero (global=%d, binding=%d)",
                     run.id,
                     issue.identifier,
                     self.config.global_max_concurrent,
@@ -869,9 +821,7 @@ class _ReviewMixin(_OrchestratorBase):
         task = asyncio.create_task(self._poll_review_run_with_limits(run, binding, issue))
         self._review_poll_tasks.add(task)
         self._review_poll_run_tasks[run.id] = task
-        task.add_done_callback(
-            partial(self._review_poll_done, run_id=run.id, issue_id=issue.id)
-        )
+        task.add_done_callback(partial(self._review_poll_done, run_id=run.id, issue_id=issue.id))
         return task
 
     async def _mark_review_rearm_retry(self, run_id: str) -> None:
@@ -895,18 +845,11 @@ class _ReviewMixin(_OrchestratorBase):
             key for key in self._review_no_signal_rearm_heads if key[0] != run_id
         }
 
-    async def _local_review_approved_for_current_review(
-        self, run: db.runs.Run
-    ) -> bool:
+    async def _local_review_approved_for_current_review(self, run: db.runs.Run) -> bool:
         latest_local_review = await self._latest_local_review_for_current_review(run)
-        return (
-            latest_local_review is not None
-            and latest_local_review.status == "completed"
-        )
+        return latest_local_review is not None and latest_local_review.status == "completed"
 
-    async def _latest_local_review_for_current_review(
-        self, run: db.runs.Run
-    ) -> db.runs.Run | None:
+    async def _latest_local_review_for_current_review(self, run: db.runs.Run) -> db.runs.Run | None:
         latest_implement = await db.runs.latest_for_issue_stage(
             self._conn,
             issue_id=run.issue_id,
@@ -922,9 +865,7 @@ class _ReviewMixin(_OrchestratorBase):
         )
         if latest_local_review is None:
             return None
-        if _parse_rfc3339(latest_local_review.started_at) > _parse_rfc3339(
-            run.started_at
-        ):
+        if _parse_rfc3339(latest_local_review.started_at) > _parse_rfc3339(run.started_at):
             return None
         return latest_local_review
 
@@ -943,9 +884,7 @@ class _ReviewMixin(_OrchestratorBase):
             return True
         return not await self._local_review_permits_current_review(run)
 
-    async def _local_review_completed_for_issue(
-        self, candidate: db.issue_prs.IssuePR
-    ) -> bool:
+    async def _local_review_completed_for_issue(self, candidate: db.issue_prs.IssuePR) -> bool:
         """Whether a completed local-review run covers the current PR HEAD.
 
         Used by the merge scheduler to gate the `remote_review: false`
@@ -965,9 +904,9 @@ class _ReviewMixin(_OrchestratorBase):
             issue_id=candidate.issue_id,
             stage="implement",
         )
-        if latest_implement is None or _parse_rfc3339(
-            latest_implement.started_at
-        ) > _parse_rfc3339(candidate.created_at):
+        if latest_implement is None or _parse_rfc3339(latest_implement.started_at) > _parse_rfc3339(
+            candidate.created_at
+        ):
             return False
         latest_local_review = await db.runs.latest_for_issue_stage(
             self._conn,
@@ -975,19 +914,16 @@ class _ReviewMixin(_OrchestratorBase):
             stage="local_review",
             started_at_gte=latest_implement.started_at,
         )
-        if (
-            latest_local_review is None
-            or latest_local_review.status != "completed"
-        ):
+        if latest_local_review is None or latest_local_review.status != "completed":
             return False
         latest_fix = await db.runs.latest_for_issue_stage(
             self._conn,
             issue_id=candidate.issue_id,
             stage="review_fix",
         )
-        if latest_fix is not None and _parse_rfc3339(
-            latest_fix.started_at
-        ) > _parse_rfc3339(latest_local_review.started_at):
+        if latest_fix is not None and _parse_rfc3339(latest_fix.started_at) > _parse_rfc3339(
+            latest_local_review.started_at
+        ):
             return False
         return True
 
@@ -999,8 +935,7 @@ class _ReviewMixin(_OrchestratorBase):
     ) -> None:
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
             log.info(
-                "review run %s for %s: dispatch capacity is zero "
-                "(global=%d, binding=%d)",
+                "review run %s for %s: dispatch capacity is zero (global=%d, binding=%d)",
                 run.id,
                 issue.identifier,
                 self.config.global_max_concurrent,
@@ -1015,9 +950,7 @@ class _ReviewMixin(_OrchestratorBase):
             return
         current_binding, current_issue = current
         rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
         rearm_done = True
         if rearm_retry_pending:
@@ -1030,13 +963,9 @@ class _ReviewMixin(_OrchestratorBase):
             )
             if rearm_done:
                 await self._clear_review_rearm_retry(run.id)
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
-        handled_feedback = await self._poll_review_run(
-            run, current_binding, current_issue
-        )
+        handled_feedback = await self._poll_review_run(run, current_binding, current_issue)
         if rearm_retry_pending and not rearm_done and handled_feedback:
             await self._clear_review_rearm_retry(run.id)
 
@@ -1050,13 +979,9 @@ class _ReviewMixin(_OrchestratorBase):
         if not any(live_run.id == run.id for live_run in live_review_runs):
             log.info("skipping review run %s: run is no longer live", run.id)
             return None
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return None
-        tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(
-            run.issue_id
-        )
+        tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(run.issue_id)
         tracker = self.tracker(tracker_ctx)
         try:
             current = await tracker.lookup_issue(tracker_issue_id)
@@ -1068,9 +993,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
             return None
         state = await db.review_state.get(self._conn, run.issue_id)
-        current_binding = self._binding_for_review(
-            current, state, tracker_ctx=tracker_ctx
-        )
+        current_binding = self._binding_for_review(current, state, tracker_ctx=tracker_ctx)
         if current_binding is None:
             log.warning(
                 "no repo binding found for active review run %s (%s)",
@@ -1081,10 +1004,7 @@ class _ReviewMixin(_OrchestratorBase):
                 run=run,
                 issue=current,
                 state=state,
-                error=(
-                    "review monitor no longer matches any configured "
-                    "repository binding"
-                ),
+                error=("review monitor no longer matches any configured repository binding"),
             )
             return None
         if _binding_key(current_binding) != _binding_key(binding):
@@ -1107,14 +1027,10 @@ class _ReviewMixin(_OrchestratorBase):
             current.state_name == current_binding.linear_states.in_progress
             and current_binding.resolved_remote_review()
         ):
-            await self._move_issue_to_review_state(
-                binding=current_binding, issue=current
-            )
+            await self._move_issue_to_review_state(binding=current_binding, issue=current)
         return current_binding, current
 
-    def _review_poll_done(
-        self, task: asyncio.Task[None], run_id: str, issue_id: str = ""
-    ) -> None:
+    def _review_poll_done(self, task: asyncio.Task[None], run_id: str, issue_id: str = "") -> None:
         self._review_poll_tasks.discard(task)
         self._review_poll_run_ids.discard(run_id)
         self._review_poll_run_tasks.pop(run_id, None)
@@ -1338,9 +1254,7 @@ class _ReviewMixin(_OrchestratorBase):
             remote_review=remote_review,
         )
 
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            storage_issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(storage_issue_id, run.id):
             return False
 
         if remote_review:
@@ -1354,11 +1268,7 @@ class _ReviewMixin(_OrchestratorBase):
                 issue_comments=issue_comments,
             )
 
-        if (
-            remote_review
-            and verdict.kind is VerdictKind.PENDING
-            and verdict.rule == "no_signal"
-        ):
+        if remote_review and verdict.kind is VerdictKind.PENDING and verdict.rule == "no_signal":
             await self._maybe_rearm_codex_review_for_no_signal(
                 run=run,
                 binding=binding,
@@ -1396,9 +1306,7 @@ class _ReviewMixin(_OrchestratorBase):
         try:
             checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
         except GitHubError as e:
-            failures = await db.review_state.bump_ci_fetch_failures(
-                self._conn, storage_issue_id
-            )
+            failures = await db.review_state.bump_ci_fetch_failures(self._conn, storage_issue_id)
             log.warning(
                 "gh pr checks failed for %s#%d (%d/%d): %s",
                 binding.github_repo,
@@ -1467,9 +1375,7 @@ class _ReviewMixin(_OrchestratorBase):
                 # bindings still ignore Codex bot signals here; they only
                 # honor human review-state changes.
                 try:
-                    raw_reviews = await self._gh.pr_reviews(
-                        pr_number, repo=binding.github_repo
-                    )
+                    raw_reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
                     review_signal_reviews = _reviews_from_github(raw_reviews)
                 except GitHubError as e:
                     log.warning(
@@ -1487,9 +1393,7 @@ class _ReviewMixin(_OrchestratorBase):
                         raw_comments = await self._gh.pr_review_comments(
                             pr_number, repo=binding.github_repo
                         )
-                        review_signal_comments = _review_comments_from_github(
-                            raw_comments
-                        )
+                        review_signal_comments = _review_comments_from_github(raw_comments)
                     except GitHubError as e:
                         log.warning(
                             "could not fetch PR review comments for %s#%d: %s",
@@ -1514,9 +1418,7 @@ class _ReviewMixin(_OrchestratorBase):
                         review_signal_reactions = ()
                 else:
                     review_signal_reviews = tuple(
-                        r
-                        for r in review_signal_reviews
-                        if not is_codex_author(r.user_login)
+                        r for r in review_signal_reviews if not is_codex_author(r.user_login)
                     )
 
                 review_verdict = review_classifier(
@@ -1534,9 +1436,7 @@ class _ReviewMixin(_OrchestratorBase):
                     verdict = review_verdict
         elif not remote_review:
             try:
-                raw_reviews = await self._gh.pr_reviews(
-                    pr_number, repo=binding.github_repo
-                )
+                raw_reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
                 human_reviews = tuple(
                     r
                     for r in _reviews_from_github(raw_reviews)
@@ -1563,9 +1463,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
         else:
             try:
-                raw_reviews = await self._gh.pr_reviews(
-                    pr_number, repo=binding.github_repo
-                )
+                raw_reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
                 reviews: tuple[Review, ...] = _reviews_from_github(raw_reviews)
             except GitHubError as e:
                 log.warning(
@@ -1580,9 +1478,7 @@ class _ReviewMixin(_OrchestratorBase):
                 raw_comments = await self._gh.pr_review_comments(
                     pr_number, repo=binding.github_repo
                 )
-                comments: list[ReviewComment] = _review_comments_from_github(
-                    raw_comments
-                )
+                comments: list[ReviewComment] = _review_comments_from_github(raw_comments)
             except GitHubError as e:
                 log.warning(
                     "could not fetch PR review comments for %s#%d: %s",
@@ -1593,9 +1489,7 @@ class _ReviewMixin(_OrchestratorBase):
                 comments = []
 
             try:
-                raw_reactions = await self._gh.pr_reactions(
-                    pr_number, repo=binding.github_repo
-                )
+                raw_reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
                 reactions: tuple[Reaction, ...] = _reactions_from_github(raw_reactions)
             except GitHubError as e:
                 log.warning(
@@ -1697,12 +1591,8 @@ class _ReviewMixin(_OrchestratorBase):
             new_signature=verdict.trigger_signature,
         ):
             return False
-        if has_hit_iteration_cap(
-            iteration=state.iteration, cap=self.config.review_iteration_cap
-        ):
-            if await self._review_poll_deferred_by_deliver_failed_wait(
-                storage_issue_id, run.id
-            ):
+        if has_hit_iteration_cap(iteration=state.iteration, cap=self.config.review_iteration_cap):
+            if await self._review_poll_deferred_by_deliver_failed_wait(storage_issue_id, run.id):
                 return False
             await self._park_review_for_approval(
                 run=run,
@@ -1750,9 +1640,7 @@ class _ReviewMixin(_OrchestratorBase):
         verdict: Verdict,
         iteration: int,
     ) -> bool:
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return False
         log_tail = await self._failing_check_log_tail(
             checks=checks,
@@ -1901,8 +1789,7 @@ class _ReviewMixin(_OrchestratorBase):
 
             local_review_result: LoopResult | None = None
             local_only_review = (
-                binding.resolved_local_review()
-                and not binding.resolved_remote_review()
+                binding.resolved_local_review() and not binding.resolved_remote_review()
             )
             if local_only_review:
                 local_review_result = await self._run_local_review_phase(
@@ -1925,9 +1812,7 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 await self._push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "git push failed for review fix-run %s: %s", issue.identifier, e
-                )
+                log.warning("git push failed for review fix-run %s: %s", issue.identifier, e)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2006,8 +1891,7 @@ class _ReviewMixin(_OrchestratorBase):
         """
         if not binding.resolved_remote_review():
             log.debug(
-                "skipping automatic @codex review re-trigger for %s: "
-                "remote_review disabled",
+                "skipping automatic @codex review re-trigger for %s: remote_review disabled",
                 issue.identifier,
             )
             return True
@@ -2027,8 +1911,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "could not classify approval before re-triggering @codex review "
-                "on %s#%d: %s",
+                "could not classify approval before re-triggering @codex review on %s#%d: %s",
                 binding.github_repo,
                 state.pr_number,
                 e,
@@ -2038,8 +1921,7 @@ class _ReviewMixin(_OrchestratorBase):
         else:
             if verdict.kind is VerdictKind.APPROVED:
                 log.info(
-                    "skipping @codex review re-trigger on %s#%d for %s: "
-                    "approval already present",
+                    "skipping @codex review re-trigger on %s#%d for %s: approval already present",
                     binding.github_repo,
                     state.pr_number,
                     issue.identifier,
@@ -2095,14 +1977,10 @@ class _ReviewMixin(_OrchestratorBase):
         view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
-            raise GitHubError(
-                f"pr view missing headRefOid for {binding.github_repo}#{pr_number}"
-            )
+            raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
         comments = []
         if include_comments:
-            comments = await self._gh.pr_review_comments(
-                pr_number, repo=binding.github_repo
-            )
+            comments = await self._gh.pr_review_comments(pr_number, repo=binding.github_repo)
         reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
         reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
         try:
@@ -2170,8 +2048,7 @@ class _ReviewMixin(_OrchestratorBase):
     def _format_comment_trigger(self, verdict: Verdict, iteration: int) -> str:
         cap = self.config.review_iteration_cap
         suffix = (
-            f"\nTrigger signature: {verdict.trigger_signature}\n"
-            f"Review iteration: {iteration}/{cap}"
+            f"\nTrigger signature: {verdict.trigger_signature}\nReview iteration: {iteration}/{cap}"
         )
         if verdict.codex_comments:
             parts = []
@@ -2193,9 +2070,7 @@ class _ReviewMixin(_OrchestratorBase):
         verdict: Verdict,
         iteration: int,
     ) -> bool:
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return False
         state = await db.review_state.get(self._conn, issue.id)
         pr_url = _pr_url_for_state(
@@ -2271,9 +2146,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
             try:
                 try:
-                    await tracker.post_comment(
-                        issue.id, truncate_body(reviewing_feedback(v))
-                    )
+                    await tracker.post_comment(issue.id, truncate_body(reviewing_feedback(v)))
                 except LinearError as e:
                     log.warning(
                         "could not post reviewing_feedback comment for %s: %s",
@@ -2363,9 +2236,7 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 await self._push_fn(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "git push failed for review fix-run %s: %s", issue.identifier, e
-                )
+                log.warning("git push failed for review fix-run %s: %s", issue.identifier, e)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2389,13 +2260,9 @@ class _ReviewMixin(_OrchestratorBase):
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(fix_pushed(v_done))
-                )
+                await tracker.post_comment(issue.id, truncate_body(fix_pushed(v_done)))
             except LinearError as e:
-                log.warning(
-                    "could not post fix_pushed comment for %s: %s", issue.identifier, e
-                )
+                log.warning("could not post fix_pushed comment for %s: %s", issue.identifier, e)
 
             state = await db.review_state.get(self._conn, issue.id)
             await self._retrigger_codex_review_unless_approved(
@@ -2428,9 +2295,7 @@ class _ReviewMixin(_OrchestratorBase):
         issue: LinearIssue,
         iteration: int,
     ) -> bool:
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            run.issue_id, run.id
-        ):
+        if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return False
         base_branch = binding.base_branch
         if base_branch is None:
@@ -2516,9 +2381,7 @@ class _ReviewMixin(_OrchestratorBase):
                 review_iter=iteration,
             )
             try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(fixing_merge_conflict(v_start))
-                )
+                await tracker.post_comment(issue.id, truncate_body(fixing_merge_conflict(v_start)))
             except LinearError as e:
                 log.warning(
                     "could not post fixing_merge_conflict comment for %s: %s",
@@ -2697,9 +2560,7 @@ class _ReviewMixin(_OrchestratorBase):
                         workspace_path, conflicted_files
                     )
                 except Exception as e:  # noqa: BLE001
-                    log.warning(
-                        "rebase --continue failed for %s: %s", issue.identifier, e
-                    )
+                    log.warning("rebase --continue failed for %s: %s", issue.identifier, e)
                     await _abort_rebase_safely(
                         workspace_path,
                         issue_identifier=issue.identifier,
@@ -2815,13 +2676,9 @@ class _ReviewMixin(_OrchestratorBase):
                 commit_url=_github_commit_url(binding.github_repo, pushed_sha),
             )
             try:
-                await tracker.post_comment(
-                    issue.id, truncate_body(fix_pushed(v_done))
-                )
+                await tracker.post_comment(issue.id, truncate_body(fix_pushed(v_done)))
             except LinearError as e:
-                log.warning(
-                    "could not post fix_pushed comment for %s: %s", issue.identifier, e
-                )
+                log.warning("could not post fix_pushed comment for %s: %s", issue.identifier, e)
 
             state = await db.review_state.get(self._conn, issue.id)
             await self._retrigger_codex_review_unless_approved(
@@ -2865,10 +2722,7 @@ class _ReviewMixin(_OrchestratorBase):
         short_sha = (current_sha or start_sha)[:12] or "(unknown)"
         status_short = await _git_status_short(workspace_path)
         last_log = f"git status --short:\n{status_short}" if status_short else ""
-        reason = (
-            f"review fix-run completed without advancing {branch}; "
-            f"HEAD stayed at {short_sha}"
-        )
+        reason = f"review fix-run completed without advancing {branch}; HEAD stayed at {short_sha}"
         # Before escalating to operator wait, check whether the fix agent hit a
         # transient provider API error (exit 0, no HEAD advance). If so, requeue
         # with backoff instead of parking the issue — the review polling loop
@@ -3007,9 +2861,7 @@ class _ReviewMixin(_OrchestratorBase):
                     try:
                         await tracker.move_issue(tracker_issue_id, blocked_id)
                     except LinearError as e:
-                        log.warning(
-                            "could not move %s to blocked: %s", issue.identifier, e
-                        )
+                        log.warning("could not move %s to blocked: %s", issue.identifier, e)
                         raise SlashHandlerFailure(
                             slash_text=self._slash_text(intent),
                             reason=f"could not move issue to blocked state: {e}",
@@ -3229,9 +3081,7 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 await issue_tracker.post_comment(
                     issue_id,
-                    truncate_body(
-                        command_rejected("$skip-review", "no PR found for this issue")
-                    ),
+                    truncate_body(command_rejected("$skip-review", "no PR found for this issue")),
                 )
             except LinearError as e:
                 log.warning("could not post skip-review rejection for %s: %s", issue_id, e)
@@ -3356,9 +3206,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
             if task is not None:
                 scheduled.append(task)
-        for pr in await db.issue_prs.list_completed_review_prs_without_monitor(
-            self._conn
-        ):
+        for pr in await db.issue_prs.list_completed_review_prs_without_monitor(self._conn):
             task = await self._resurrect_one_review_monitor(
                 pr, require_remote_review_unapproved=True
             )
@@ -3393,9 +3241,7 @@ class _ReviewMixin(_OrchestratorBase):
         )
         if last_review is not None and last_review.ended_at is not None:
             try:
-                elapsed = (
-                    self._now() - _parse_rfc3339(last_review.ended_at)
-                ).total_seconds()
+                elapsed = (self._now() - _parse_rfc3339(last_review.ended_at)).total_seconds()
                 if elapsed < REVIEW_RESURRECT_COOLDOWN_SECS:
                     return None
             except ValueError:
@@ -3418,13 +3264,10 @@ class _ReviewMixin(_OrchestratorBase):
             if not binding.resolved_remote_review():
                 return None
             try:
-                verdict = await self._review_verdict_for_pr(
-                    binding=binding, pr_number=pr.pr_number
-                )
+                verdict = await self._review_verdict_for_pr(binding=binding, pr_number=pr.pr_number)
             except GitHubError as e:
                 log.warning(
-                    "could not classify review before re-arming monitor for "
-                    "%s#%d: %s",
+                    "could not classify review before re-arming monitor for %s#%d: %s",
                     binding.github_repo,
                     pr.pr_number,
                     e,
@@ -3567,7 +3410,7 @@ class _ReviewMixin(_OrchestratorBase):
             body += (
                 "\nReply with `$retry` or `$approve` to resume review monitoring. "
                 "Reply with `$reject` or `$stop` to leave it halted.\n"
-        )
+            )
         try:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
@@ -3688,9 +3531,7 @@ class _ReviewMixin(_OrchestratorBase):
             return
         if issue_comments is None:
             try:
-                raw = await self._gh.pr_issue_comments(
-                    pr_number, repo=binding.github_repo
-                )
+                raw = await self._gh.pr_issue_comments(pr_number, repo=binding.github_repo)
             except GitHubError as e:
                 log.warning(
                     "could not fetch issue comments for %s#%d: %s",

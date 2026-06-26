@@ -172,19 +172,14 @@ class _MergeMixin(_OrchestratorBase):
 
     _CODEX_NO_ISSUES_MARKER = CODEX_NO_ISSUES_MARKER
 
-
-    async def _run_auto_recoverable_merge_wait_reconciler(
-        self, shutdown: asyncio.Event
-    ) -> None:
+    async def _run_auto_recoverable_merge_wait_reconciler(self, shutdown: asyncio.Event) -> None:
         log.info(
             "auto-recoverable merge wait reconciler entering loop (interval=%ds)",
             MERGE_WAIT_RECONCILE_INTERVAL_SECS,
         )
         while not shutdown.is_set():
             try:
-                await asyncio.wait_for(
-                    shutdown.wait(), timeout=MERGE_WAIT_RECONCILE_INTERVAL_SECS
-                )
+                await asyncio.wait_for(shutdown.wait(), timeout=MERGE_WAIT_RECONCILE_INTERVAL_SECS)
                 break
             except TimeoutError:
                 pass
@@ -193,9 +188,7 @@ class _MergeMixin(_OrchestratorBase):
             except Exception:  # noqa: BLE001
                 log.exception("orphaned merge run reconcile failed")
             try:
-                recovered = await self._reconcile_auto_recoverable_merge_waits(
-                    reason="periodic"
-                )
+                recovered = await self._reconcile_auto_recoverable_merge_waits(reason="periodic")
             except Exception:  # noqa: BLE001
                 log.exception("auto-recoverable merge wait reconcile failed")
                 continue
@@ -204,7 +197,6 @@ class _MergeMixin(_OrchestratorBase):
                     "auto-recoverable merge wait reconcile dispatched %d recovery run(s)",
                     recovered,
                 )
-
 
     async def _reconcile_orphaned_merge_runs(self, *, reason: str = "manual") -> int:
         """Retire zombie merge `needs_approval` runs whose operator wait is gone.
@@ -215,12 +207,8 @@ class _MergeMixin(_OrchestratorBase):
         polling forever — and the dead run shows the issue as Halted. Retiring
         the run re-opens candidacy so the normal merge poll re-engages.
         """
-        before = (
-            self._now() - timedelta(seconds=ORPHANED_MERGE_RUN_GRACE_SECS)
-        ).isoformat()
-        issue_ids = await db.runs.supersede_orphaned_merge_needs_approval(
-            self._conn, before=before
-        )
+        before = (self._now() - timedelta(seconds=ORPHANED_MERGE_RUN_GRACE_SECS)).isoformat()
+        issue_ids = await db.runs.supersede_orphaned_merge_needs_approval(self._conn, before=before)
         if issue_ids:
             log.info(
                 "reconcile(%s): retired %d orphaned merge needs_approval run(s), "
@@ -232,10 +220,7 @@ class _MergeMixin(_OrchestratorBase):
             self._wake.set()
         return len(issue_ids)
 
-
-    async def _reconcile_auto_recoverable_merge_waits(
-        self, *, reason: str = "manual"
-    ) -> int:
+    async def _reconcile_auto_recoverable_merge_waits(self, *, reason: str = "manual") -> int:
         """Re-drive stale merge waits whose current PR state is now auto-recoverable."""
         dispatched = 0
         repo_view_cache: dict[str, dict[str, object] | None] = {}
@@ -256,7 +241,6 @@ class _MergeMixin(_OrchestratorBase):
                     wait.issue_id,
                 )
         return dispatched
-
 
     async def _reconcile_auto_recoverable_merge_wait(
         self,
@@ -297,8 +281,7 @@ class _MergeMixin(_OrchestratorBase):
             return False
         if not _merge_issue_matches_binding(issue, binding):
             log.info(
-                "skipping merge wait reconcile for %s: issue is no longer active "
-                "for binding %s/%s",
+                "skipping merge wait reconcile for %s: issue is no longer active for binding %s/%s",
                 issue.identifier,
                 binding.github_repo,
                 binding.issue_label or "",
@@ -339,8 +322,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
             except GitHubError as e:
                 log.warning(
-                    "could not classify review before clean merge wait reconcile "
-                    "%s#%d: %s",
+                    "could not classify review before clean merge wait reconcile %s#%d: %s",
                     binding.github_repo,
                     pr.pr_number,
                     e,
@@ -398,6 +380,7 @@ class _MergeMixin(_OrchestratorBase):
                     wait_run_id=wait.run_id,
                 )
             else:
+
                 async def clear_reconciled_merge_wait(_new_run_id: str) -> None:
                     await self._clear_operator_wait(wait.issue_id, wait.run_id)
 
@@ -416,7 +399,6 @@ class _MergeMixin(_OrchestratorBase):
                 reason,
             )
             return True
-
 
     async def _repo_view_for_merge_wait_reconcile(
         self,
@@ -442,7 +424,6 @@ class _MergeMixin(_OrchestratorBase):
             return result
         cache[repo] = None
         return None
-
 
     def _schedule_reconciled_merge_conflict_rebase_fix(
         self,
@@ -478,10 +459,7 @@ class _MergeMixin(_OrchestratorBase):
         )
         return task
 
-
-    def _merge_wait_reconcile_task_done(
-        self, task: asyncio.Task[None], *, issue_id: str
-    ) -> None:
+    def _merge_wait_reconcile_task_done(self, task: asyncio.Task[None], *, issue_id: str) -> None:
         self._dispatch_tasks.discard(task)
         self._merge_wait_reconcile_issue_ids.discard(issue_id)
         try:
@@ -490,7 +468,6 @@ class _MergeMixin(_OrchestratorBase):
             pass
         except Exception:
             log.exception("merge wait recovery task crashed for issue_id=%s", issue_id)
-
 
     async def _interrupt_stale_merge_needs_approval_for_state(
         self,
@@ -515,7 +492,6 @@ class _MergeMixin(_OrchestratorBase):
                 state.pr_number,
             )
         return interrupted
-
 
     async def _resolve_pr_base_ref(
         self,
@@ -544,7 +520,6 @@ class _MergeMixin(_OrchestratorBase):
                 e,
             )
         return "main"
-
 
     async def _required_check_failures_for_view(
         self,
@@ -585,12 +560,7 @@ class _MergeMixin(_OrchestratorBase):
         required = {context.strip() for context in required_contexts if context.strip()}
         if not required:
             return []
-        return [
-            check
-            for check in failing_rollup_checks
-            if _status_check_names(check) & required
-        ]
-
+        return [check for check in failing_rollup_checks if _status_check_names(check) & required]
 
     async def _merge_required_check_fix_should_dispatch(
         self,
@@ -608,7 +578,6 @@ class _MergeMixin(_OrchestratorBase):
             prev_signature=state.last_trigger_signature,
             new_signature=signature,
         )
-
 
     async def _merge_required_check_action_log_tail(
         self,
@@ -648,7 +617,6 @@ class _MergeMixin(_OrchestratorBase):
                 sections.append(f"## {name}\n{tail.strip()}")
         return "\n\n".join(sections)
 
-
     async def _mark_merge_required_check_fix_needs_approval(
         self,
         *,
@@ -666,7 +634,6 @@ class _MergeMixin(_OrchestratorBase):
             reason=reason,
             create_run=merge_run_id is None,
         )
-
 
     async def _merge_required_check_terminal_run(
         self, *, issue: LinearIssue, merge_run_id: str | None
@@ -693,7 +660,6 @@ class _MergeMixin(_OrchestratorBase):
             ended_at=None,
             cost_usd=0.0,
         )
-
 
     async def _dispatch_merge_required_check_fix_if_allowed(
         self,
@@ -769,7 +735,6 @@ class _MergeMixin(_OrchestratorBase):
             await db.review_state.set_signature(self._conn, issue.id, signature)
         return dispatched is not False
 
-
     async def _dispatch_merge_required_check_fix_run(
         self,
         *,
@@ -844,8 +809,7 @@ class _MergeMixin(_OrchestratorBase):
                     issue=issue,
                     pr_url=pr_url,
                     reason=(
-                        "required-check fix-run failed: could not read remote "
-                        f"HEAD for {branch}"
+                        f"required-check fix-run failed: could not read remote HEAD for {branch}"
                     ),
                     merge_run_id=merge_run_id,
                 )
@@ -1101,7 +1065,6 @@ class _MergeMixin(_OrchestratorBase):
             dispatch_capacity_held=dispatch_capacity_held,
         )
 
-
     async def _run_required_check_fix_agent(
         self,
         *,
@@ -1130,7 +1093,6 @@ class _MergeMixin(_OrchestratorBase):
             prior_total=prior_total,
         )
 
-
     async def _mark_merge_conflict_fix_needs_approval(
         self,
         *,
@@ -1148,7 +1110,6 @@ class _MergeMixin(_OrchestratorBase):
             reason=reason,
             create_run=merge_run_id is None,
         )
-
 
     async def _dispatch_merge_conflict_rebase_fix_run(
         self,
@@ -1193,8 +1154,7 @@ class _MergeMixin(_OrchestratorBase):
                 await on_started(fix_run_id)
             except Exception:  # noqa: BLE001
                 log.exception(
-                    "merge-conflict rebase fix-run start callback failed "
-                    "for %s run %s",
+                    "merge-conflict rebase fix-run start callback failed for %s run %s",
                     issue.identifier,
                     fix_run_id,
                 )
@@ -1221,16 +1181,14 @@ class _MergeMixin(_OrchestratorBase):
                 mcp_servers=binding.mcp_servers,
             )
             try:
-                usage_delta, final_kind, final_returncode = (
-                    await self._run_stage_command(
-                        binding=binding,
-                        issue=issue,
-                        command=command,
-                        run_id=fix_run_id,
-                        workspace_path=workspace_path,
-                        stage="review_fix",
-                        prior_total=prior_total,
-                    )
+                usage_delta, final_kind, final_returncode = await self._run_stage_command(
+                    binding=binding,
+                    issue=issue,
+                    command=command,
+                    run_id=fix_run_id,
+                    workspace_path=workspace_path,
+                    stage="review_fix",
+                    prior_total=prior_total,
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception(
@@ -1282,10 +1240,7 @@ class _MergeMixin(_OrchestratorBase):
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
-                    reason=(
-                        "merge-conflict fix-run failed: "
-                        f"runner ended with {final_kind}"
-                    ),
+                    reason=(f"merge-conflict fix-run failed: runner ended with {final_kind}"),
                     merge_run_id=merge_run_id,
                 )
                 return False
@@ -1302,8 +1257,7 @@ class _MergeMixin(_OrchestratorBase):
                 fixed_head_sha = str(fixed_view.get("headRefOid") or "")
             except Exception as e:  # noqa: BLE001
                 log.warning(
-                    "could not refresh PR head after merge-conflict fix-run "
-                    "for %s#%d: %s",
+                    "could not refresh PR head after merge-conflict fix-run for %s#%d: %s",
                     binding.github_repo,
                     pr_number,
                     e,
@@ -1360,7 +1314,6 @@ class _MergeMixin(_OrchestratorBase):
         )
         return bool(result)
 
-
     async def _schedule_parked_manual_merge_revival_for_issue_event(
         self,
         *,
@@ -1401,7 +1354,6 @@ class _MergeMixin(_OrchestratorBase):
             new_state_id=new_state_id,
             new_state_name=new_state_name,
         )
-
 
     async def _schedule_parked_manual_merge_revival_if_requested(
         self,
@@ -1458,6 +1410,7 @@ class _MergeMixin(_OrchestratorBase):
             view=view,
         ):
             return None
+
         async def clear_parked_marker(_run_id: str) -> None:
             await db.issue_prs.clear_parked_for_manual_merge(
                 self._conn,
@@ -1475,7 +1428,6 @@ class _MergeMixin(_OrchestratorBase):
             on_started=clear_parked_marker,
         )
 
-
     async def _parked_manual_merge_transition_matches(
         self,
         *,
@@ -1485,13 +1437,9 @@ class _MergeMixin(_OrchestratorBase):
         new_state_id: str | None,
         new_state_name: str | None,
     ) -> bool:
-        if old_state_name is not None and old_state_name != (
-            binding.linear_states.needs_approval
-        ):
+        if old_state_name is not None and old_state_name != (binding.linear_states.needs_approval):
             return False
-        if new_state_name is not None and new_state_name != (
-            binding.linear_states.code_review
-        ):
+        if new_state_name is not None and new_state_name != (binding.linear_states.code_review):
             return False
         if old_state_id is None and new_state_id is None:
             return True
@@ -1510,7 +1458,6 @@ class _MergeMixin(_OrchestratorBase):
         if new_state_id is not None and new_state_id != code_review_id:
             return False
         return True
-
 
     def _schedule_parked_manual_merge_revival(
         self,
@@ -1544,7 +1491,6 @@ class _MergeMixin(_OrchestratorBase):
         )
         return task
 
-
     def _parked_manual_merge_revival_task_done(
         self, task: asyncio.Task[None], *, issue_id: str
     ) -> None:
@@ -1559,7 +1505,6 @@ class _MergeMixin(_OrchestratorBase):
                 "parked manual-merge revival task crashed for issue_id=%s",
                 issue_id,
             )
-
 
     async def _handle_merge_needs_approval_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
@@ -1638,9 +1583,7 @@ class _MergeMixin(_OrchestratorBase):
             log.warning("merge re-dispatch for %s: no PR number in review_state", issue_id)
             return
         pr_number = state.pr_number
-        pr_url = state.pr_url or (
-            f"https://github.com/{binding.github_repo}/pull/{pr_number}"
-        )
+        pr_url = state.pr_url or (f"https://github.com/{binding.github_repo}/pull/{pr_number}")
         log.info(
             "merge re-dispatch: scheduling merge for %s (PR #%d)",
             issue.identifier,
@@ -1679,7 +1622,6 @@ class _MergeMixin(_OrchestratorBase):
             pr_url=pr_url,
             on_started=on_merge_started,
         )
-
 
     async def _parked_closed_unmerged_pr_for_event(
         self, event: GitHubWebhookEvent
@@ -1720,18 +1662,11 @@ class _MergeMixin(_OrchestratorBase):
             pr_number=int(row["pr_number"]),
             pr_url=str(row["pr_url"]),
             created_at=str(row["created_at"]),
-            merged_at=(
-                str(row["merged_at"]) if row["merged_at"] is not None else None
-            ),
-            parked_at=(
-                str(row["parked_at"]) if row["parked_at"] is not None else None
-            ),
+            merged_at=(str(row["merged_at"]) if row["merged_at"] is not None else None),
+            parked_at=(str(row["parked_at"]) if row["parked_at"] is not None else None),
         )
 
-
-    async def _reconcile_parked_closed_unmerged_pr_event(
-        self, event: GitHubWebhookEvent
-    ) -> int:
+    async def _reconcile_parked_closed_unmerged_pr_event(self, event: GitHubWebhookEvent) -> int:
         pr = await self._parked_closed_unmerged_pr_for_event(event)
         if pr is None:
             return 0
@@ -1772,7 +1707,6 @@ class _MergeMixin(_OrchestratorBase):
             return 1
         return 0
 
-
     async def _mark_parked_closed_unmerged_pr_done(
         self,
         *,
@@ -1786,11 +1720,7 @@ class _MergeMixin(_OrchestratorBase):
                 issue_id=issue.id,
                 github_repo=binding.github_repo,
             )
-            if (
-                current is None
-                or current.pr_number != pr.pr_number
-                or current.parked_at is None
-            ):
+            if current is None or current.pr_number != pr.pr_number or current.parked_at is None:
                 return True
             pr = current
 
@@ -1855,11 +1785,8 @@ class _MergeMixin(_OrchestratorBase):
                 )
             return True
 
-
     async def _reconcile_merged_issues_linear_state(self) -> int:
-        since = self._now() - timedelta(
-            hours=MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS
-        )
+        since = self._now() - timedelta(hours=MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS)
         recent_merged = await db.issue_prs.list_recent_merged(self._conn, since=since)
         corrected = 0
         for pr in recent_merged:
@@ -1935,7 +1862,6 @@ class _MergeMixin(_OrchestratorBase):
             self._merged_linear_state_drift_comment_keys.add(comment_key)
         return corrected
 
-
     async def _refresh_issue_for_acceptance_merge_handoff(
         self, binding: RepoBinding, issue: LinearIssue
     ) -> LinearIssue:
@@ -1949,7 +1875,6 @@ class _MergeMixin(_OrchestratorBase):
                 e,
             )
             return issue
-
 
     async def _open_merge_wait_for_human_approval_label(
         self,
@@ -1967,7 +1892,6 @@ class _MergeMixin(_OrchestratorBase):
             reason=f"{NEEDS_HUMAN_APPROVAL_LABEL} label present",
             create_run=True,
         )
-
 
     async def _park_pr_for_manual_merge(
         self,
@@ -1990,8 +1914,7 @@ class _MergeMixin(_OrchestratorBase):
         needs_approval_id = states.get(binding.linear_states.needs_approval)
         if needs_approval_id is None:
             log.warning(
-                "missing Linear needs_approval state %r while parking %s for "
-                "manual merge",
+                "missing Linear needs_approval state %r while parking %s for manual merge",
                 binding.linear_states.needs_approval,
                 issue.identifier,
             )
@@ -2030,15 +1953,12 @@ class _MergeMixin(_OrchestratorBase):
                 e,
             )
 
-
     async def _poll_merge_candidates(self) -> list[asyncio.Task[None]]:
         """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
         required_context_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         for candidate in await db.issue_prs.list_merge_candidates(self._conn):
-            scheduled.extend(
-                await self._process_merge_candidate(candidate, required_context_cache)
-            )
+            scheduled.extend(await self._process_merge_candidate(candidate, required_context_cache))
         return scheduled
 
     async def _process_merge_candidate(
@@ -2137,9 +2057,7 @@ class _MergeMixin(_OrchestratorBase):
         if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
             return None
         tracker = self.tracker(binding)
-        tracker_issue_id, _ = await self._tracker_identity_for_issue(
-            candidate.issue_id
-        )
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(candidate.issue_id)
         try:
             issue = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
@@ -2154,17 +2072,11 @@ class _MergeMixin(_OrchestratorBase):
             and not binding.auto_merge
             and issue.team_key == binding.linear_team_key
             and issue.state_name == binding.linear_states.done
-            and (
-                binding.issue_label is None or binding.issue_label in issue.labels
-            )
+            and (binding.issue_label is None or binding.issue_label in issue.labels)
         )
-        if (
-            not _merge_issue_matches_binding(issue, binding)
-            and not parked_done_cleanup
-        ):
+        if not _merge_issue_matches_binding(issue, binding) and not parked_done_cleanup:
             log.info(
-                "skipping merge candidate %s: issue is no longer active for "
-                "binding %s/%s",
+                "skipping merge candidate %s: issue is no longer active for binding %s/%s",
                 issue.identifier,
                 binding.github_repo,
                 binding.issue_label or "",
@@ -2231,13 +2143,11 @@ class _MergeMixin(_OrchestratorBase):
             ):
                 return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
             if candidate.parked_at is not None:
-                revived = (
-                    await self._schedule_parked_manual_merge_revival_if_requested(
-                        binding=binding,
-                        issue=issue,
-                        candidate=candidate,
-                        view=view,
-                    )
+                revived = await self._schedule_parked_manual_merge_revival_if_requested(
+                    binding=binding,
+                    issue=issue,
+                    candidate=candidate,
+                    view=view,
                 )
                 if revived is not None:
                     tasks.append(revived)
@@ -2266,13 +2176,10 @@ class _MergeMixin(_OrchestratorBase):
                 view=view,
                 required_context_cache=required_context_cache,
             )
-            if (
-                required_check_failures
-                and await self._merge_required_check_fix_should_dispatch(
-                    issue_id=issue.id,
-                    head_sha=str(view.get("headRefOid") or ""),
-                    failing_checks=required_check_failures,
-                )
+            if required_check_failures and await self._merge_required_check_fix_should_dispatch(
+                issue_id=issue.id,
+                head_sha=str(view.get("headRefOid") or ""),
+                failing_checks=required_check_failures,
             ):
                 tasks.append(
                     self._schedule_merge_required_check_fix(
@@ -2336,9 +2243,7 @@ class _MergeMixin(_OrchestratorBase):
         if no_signal_mergeable and not binding.resolved_remote_review():
             review_bypass_ready = (
                 not binding.resolved_local_review()
-                or await self._local_review_completed_for_issue(
-                    candidate
-                )
+                or await self._local_review_completed_for_issue(candidate)
             )
         return _NoSignalMergeReadiness(
             conflict_fix_ready=conflict_fix_ready,
@@ -2439,17 +2344,12 @@ class _MergeMixin(_OrchestratorBase):
             or readiness.conflict_fix_ready
             or readiness.review_bypass_ready
         ):
-            if (
-                binding.acceptance.mode != "off"
-                and not await self._acceptance_passed_for_candidate(
-                    candidate, binding, head_sha
-                )
+            if binding.acceptance.mode != "off" and not await self._acceptance_passed_for_candidate(
+                candidate, binding, head_sha
             ):
                 if self._dispatch_capacity(binding) <= 0:
                     return []
-                if await self._acceptance_infra_retry_backoff_active(
-                    candidate.issue_id
-                ):
+                if await self._acceptance_infra_retry_backoff_active(candidate.issue_id):
                     return []
                 return [
                     self._schedule_acceptance(
@@ -2479,6 +2379,7 @@ class _MergeMixin(_OrchestratorBase):
                 return []
             on_started: Callable[[str], Awaitable[None]] | None = None
             if readiness.conflict_fix_ready:
+
                 async def clear_conflict_fix_marker(
                     _run_id: str,
                     *,
@@ -2535,7 +2436,6 @@ class _MergeMixin(_OrchestratorBase):
             )
         return []
 
-
     def _schedule_merge_conflict_rebase_fix(
         self,
         *,
@@ -2558,7 +2458,6 @@ class _MergeMixin(_OrchestratorBase):
         self._dispatch_tasks.add(task)
         task.add_done_callback(self._dispatch_tasks.discard)
         return task
-
 
     def _schedule_merge_required_check_fix(
         self,
@@ -2586,7 +2485,6 @@ class _MergeMixin(_OrchestratorBase):
         self._dispatch_tasks.add(task)
         task.add_done_callback(self._dispatch_tasks.discard)
         return task
-
 
     def _schedule_merge(
         self,
@@ -2621,7 +2519,6 @@ class _MergeMixin(_OrchestratorBase):
             )
         )
         return task
-
 
     async def _merge_with_limits(
         self,
@@ -2660,7 +2557,6 @@ class _MergeMixin(_OrchestratorBase):
                 await self._fail_run(run_id, "merge cancelled")
             raise
 
-
     async def _refresh_merge_candidate(
         self,
         binding: RepoBinding,
@@ -2685,7 +2581,6 @@ class _MergeMixin(_OrchestratorBase):
             )
             return None
         return current
-
 
     async def _poll_submitted_merge(
         self,
@@ -2746,7 +2641,6 @@ class _MergeMixin(_OrchestratorBase):
                 run_id=run_id,
                 reason=reason,
             )
-
 
     async def _finalize_pr_if_closed(
         self,
@@ -2817,7 +2711,6 @@ class _MergeMixin(_OrchestratorBase):
             )
             return True
         return False
-
 
     async def _merge_approved_pr(
         self,
@@ -3112,8 +3005,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
             except GitHubError as e:
                 log.warning(
-                    "could not classify review for post-merge-agent HEAD "
-                    "%s#%d at %s: %s",
+                    "could not classify review for post-merge-agent HEAD %s#%d at %s: %s",
                     binding.github_repo,
                     pr_number,
                     premerge_head_sha[:12] or "(unknown)",
@@ -3121,10 +3013,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
                 verdict = None
             if verdict is None or verdict.kind is not VerdictKind.APPROVED:
-                reason = (
-                    "merge-agent pushed unreviewed HEAD "
-                    f"{premerge_head_sha or '(unknown)'}"
-                )
+                reason = f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}"
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,
@@ -3183,8 +3072,7 @@ class _MergeMixin(_OrchestratorBase):
                     )
                 except Exception as view_error:  # noqa: BLE001
                     log.warning(
-                        "could not refresh PR base after merge conflict for "
-                        "%s#%d: %s",
+                        "could not refresh PR base after merge conflict for %s#%d: %s",
                         binding.github_repo,
                         pr_number,
                         view_error,
@@ -3216,8 +3104,7 @@ class _MergeMixin(_OrchestratorBase):
                     )
                 except Exception as view_error:  # noqa: BLE001
                     log.warning(
-                        "could not refresh PR checks after merge failure for "
-                        "%s#%d: %s",
+                        "could not refresh PR checks after merge failure for %s#%d: %s",
                         binding.github_repo,
                         pr_number,
                         view_error,
@@ -3241,11 +3128,7 @@ class _MergeMixin(_OrchestratorBase):
                         merge_run_id=run_id,
                         dispatch_capacity_held=True,
                     )
-                    if (
-                        dispatched
-                        or await db.operator_waits.get(self._conn, issue.id)
-                        is not None
-                    ):
+                    if dispatched or await db.operator_waits.get(self._conn, issue.id) is not None:
                         return True
             await self._mark_merge_needs_approval(
                 binding=binding,
@@ -3301,7 +3184,6 @@ class _MergeMixin(_OrchestratorBase):
                 ended_at=self._now().isoformat(),
             )
 
-
     async def _mark_merge_done_if_merged(
         self,
         *,
@@ -3321,7 +3203,6 @@ class _MergeMixin(_OrchestratorBase):
             run_id=run_id,
         )
         return True
-
 
     async def _mark_merge_done(
         self,
@@ -3399,7 +3280,6 @@ class _MergeMixin(_OrchestratorBase):
                         issue.identifier,
                         e,
                     )
-
 
     async def _mark_merge_needs_approval(
         self,
@@ -3515,7 +3395,6 @@ class _MergeMixin(_OrchestratorBase):
                     issue.identifier,
                     run_id,
                 )
-
 
     async def _run_merge_agent(
         self,

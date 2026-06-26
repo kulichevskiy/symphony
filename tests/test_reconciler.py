@@ -125,9 +125,7 @@ class _FakeGitHub:
         entry = self.open_prs_by_head.get(head)
         return dict(entry) if entry is not None else None
 
-    async def pr_comment(
-        self, pr: int | str, body: str, *, repo: str | None = None
-    ) -> None:
+    async def pr_comment(self, pr: int | str, body: str, *, repo: str | None = None) -> None:
         if self.comment_error is not None:
             raise self.comment_error
         self.comments.append((int(pr), body, repo))
@@ -263,9 +261,7 @@ async def _seed_pr(
     pr_number: int = 42,
 ) -> None:
     stored_binding_key = (
-        binding_key
-        if binding_key is not None
-        else f'["ENG","{github_repo}","symphony"]'
+        binding_key if binding_key is not None else f'["ENG","{github_repo}","symphony"]'
     )
     await db.issue_prs.upsert(
         conn,
@@ -360,14 +356,8 @@ def test_classifies_all_drift_kinds() -> None:
         == DRIFT_LINEAR_STATE_DONE
     )
     assert classify_github_drift(has_merge_wait=True, prs=[merged_pr]) == DRIFT_MERGE_ZOMBIE
-    assert (
-        classify_github_drift(has_merge_wait=True, prs=[closed_pr])
-        == DRIFT_PR_CLOSED_NO_MERGE
-    )
-    assert (
-        classify_github_drift(has_merge_wait=False, prs=[merged_pr])
-        == DRIFT_PR_LOCALLY_MERGED
-    )
+    assert classify_github_drift(has_merge_wait=True, prs=[closed_pr]) == DRIFT_PR_CLOSED_NO_MERGE
+    assert classify_github_drift(has_merge_wait=False, prs=[merged_pr]) == DRIFT_PR_LOCALLY_MERGED
 
 
 @pytest.mark.asyncio

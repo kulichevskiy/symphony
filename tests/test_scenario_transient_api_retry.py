@@ -146,8 +146,7 @@ async def test_transient_api_error_retries_then_escalates(
         retried = [
             r
             for r in runs
-            if r.stage == "implement"
-            and r.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND
+            if r.stage == "implement" and r.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND
         ]
         assert len(retried) == 2, f"expected 2 retried runs, got {len(retried)}"
 
@@ -189,8 +188,7 @@ async def test_transient_api_error_then_success_recovers(
         retried = [
             r
             for r in runs
-            if r.stage == "implement"
-            and r.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND
+            if r.stage == "implement" and r.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND
         ]
         assert len(retried) == 1, f"expected 1 retried run, got {len(retried)}"
         # Recovery means no escalation.
@@ -211,9 +209,7 @@ async def test_local_review_transient_api_error_recovers(
     the resume_after_local_review branch of the dispatch logic."""
     monkeypatch.setattr(poll_module._base, "AGENT_INFRA_RETRY_LIMIT", 5)
     clock = ManualClock()
-    harness = await Harness.create(
-        tmp_path, config=_local_review_config(tmp_path), clock=clock
-    )
+    harness = await Harness.create(tmp_path, config=_local_review_config(tmp_path), clock=clock)
     try:
         issue = harness.sim.seed_issue(
             identifier="ENG-3", team_key=TEAM, state_name=READY, title="local review flaky"
@@ -277,9 +273,7 @@ async def test_local_review_transient_api_error_escalates(
     exactly as today — no change to the escalation path itself."""
     monkeypatch.setattr(poll_module._base, "AGENT_INFRA_RETRY_LIMIT", 2)
     clock = ManualClock()
-    harness = await Harness.create(
-        tmp_path, config=_local_review_config(tmp_path), clock=clock
-    )
+    harness = await Harness.create(tmp_path, config=_local_review_config(tmp_path), clock=clock)
     try:
         issue = harness.sim.seed_issue(
             identifier="ENG-4", team_key=TEAM, state_name=READY, title="local review always fails"
@@ -319,8 +313,7 @@ async def test_local_review_transient_api_error_escalates(
         impl_transient = [
             r
             for r in runs
-            if r.stage == "implement"
-            and r.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND
+            if r.stage == "implement" and r.termination_kind == db.runs.TRANSIENT_API_RETRY_KIND
         ]
         assert len(impl_transient) == 0, (
             f"unexpected implement-transient runs (implementer should not have failed): "

@@ -52,9 +52,7 @@ async def test_comments_since_paginates_all_matching_comments() -> None:
 
     linear._query = fake_query  # type: ignore[method-assign]
     try:
-        comments = await linear.comments_since(
-            "iss-1", datetime(2026, 5, 10, 12, tzinfo=UTC)
-        )
+        comments = await linear.comments_since("iss-1", datetime(2026, 5, 10, 12, tzinfo=UTC))
     finally:
         await linear.aclose()
 
@@ -249,9 +247,7 @@ async def test_upload_issue_attachment_uses_linear_file_upload_and_attachment_cr
             }
         raise AssertionError(f"unexpected query: {gql}")
 
-    async def fake_put(
-        url: str, *, content: bytes, headers: dict[str, str]
-    ) -> Any:
+    async def fake_put(url: str, *, content: bytes, headers: dict[str, str]) -> Any:
         put_calls.append((url, headers, content))
 
         class _Response:
@@ -330,9 +326,7 @@ async def test_upload_issue_attachment_rejects_redirect_upload_response(
             raise AssertionError("attachmentCreate must not run after failed upload")
         raise AssertionError(f"unexpected query: {gql}")
 
-    async def fake_put(
-        url: str, *, content: bytes, headers: dict[str, str]
-    ) -> httpx.Response:
+    async def fake_put(url: str, *, content: bytes, headers: dict[str, str]) -> httpx.Response:
         assert content == b"png-bytes"
         assert headers == {}
         return httpx.Response(
@@ -385,7 +379,7 @@ def _issue_node() -> dict[str, Any]:
                         "state": {"type": "started"},
                     },
                 },
-            ]
+            ],
         },
         "inverseRelations": {
             "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -399,7 +393,7 @@ def _issue_node() -> dict[str, Any]:
                         "state": {"type": "unstarted"},
                     },
                 }
-            ]
+            ],
         },
     }
 

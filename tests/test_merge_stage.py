@@ -128,8 +128,7 @@ async def _git(workspace_path: Path, *args: str) -> str:
     )
     stdout, stderr = await proc.communicate()
     assert proc.returncode == 0, (
-        f"git {' '.join(args)} failed with {proc.returncode}: "
-        f"{stderr.decode().strip()}"
+        f"git {' '.join(args)} failed with {proc.returncode}: {stderr.decode().strip()}"
     )
     return stdout.decode().strip()
 
@@ -237,9 +236,7 @@ def _issue_in_review() -> LinearIssue:
     return issue
 
 
-async def _seed_review_candidate(
-    conn, *, binding_key: str = ""
-) -> None:  # type: ignore[no-untyped-def]
+async def _seed_review_candidate(conn, *, binding_key: str = "") -> None:  # type: ignore[no-untyped-def]
     await db.issues.upsert(
         conn,
         id="iss-1",
@@ -277,9 +274,7 @@ async def _seed_review_candidate(
     )
 
 
-async def _seed_no_review_candidate(
-    conn, *, binding_key: str = ""
-) -> None:  # type: ignore[no-untyped-def]
+async def _seed_no_review_candidate(conn, *, binding_key: str = "") -> None:  # type: ignore[no-untyped-def]
     await db.issues.upsert(
         conn,
         id="iss-1",
@@ -309,9 +304,7 @@ async def _seed_no_review_candidate(
     )
 
 
-async def _seed_merged_pr(
-    conn, *, merged_at: str, binding_key: str = ""
-) -> None:  # type: ignore[no-untyped-def]
+async def _seed_merged_pr(conn, *, merged_at: str, binding_key: str = "") -> None:  # type: ignore[no-untyped-def]
     await db.issues.upsert(
         conn,
         id="iss-1",
@@ -409,9 +402,7 @@ async def test_reconcile_orphaned_merge_runs_retires_zombie_and_wakes(
     try:
         # Orphaned merge needs_approval run (operator wait already gone) for a
         # still-open PR — the zombie that strands the PR out of merge polling.
-        await db.issues.upsert(
-            conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
         await db.issue_prs.upsert(
             conn,
             issue_id="iss-1",
@@ -462,9 +453,7 @@ async def test_reconcile_orphaned_merge_runs_retires_zombie_and_wakes(
         # Woke the poll loop so the merge candidate poll re-engages promptly.
         assert orch._wake.is_set()  # noqa: SLF001
 
-        cur = await conn.execute(
-            "SELECT status, termination_kind FROM runs WHERE id = 'merge-run'"
-        )
+        cur = await conn.execute("SELECT status, termination_kind FROM runs WHERE id = 'merge-run'")
         row = await cur.fetchone()
         assert row["status"] == "interrupted"
         assert row["termination_kind"] == "superseded"
@@ -943,9 +932,7 @@ async def test_run_reconciles_merge_waits_once_after_startup_restore(
         await conn.close()
 
 
-def _write_fake_gh(
-    tmp_path: Path, *, auto_merge_disabled: bool = False
-) -> tuple[Path, Path]:
+def _write_fake_gh(tmp_path: Path, *, auto_merge_disabled: bool = False) -> tuple[Path, Path]:
     calls = tmp_path / "gh-calls.jsonl"
     merged_flag = tmp_path / "merged.flag"
     shim = tmp_path / "gh"
@@ -1392,9 +1379,7 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -1456,12 +1441,9 @@ async def test_auto_merge_false_parks_approved_mergeable_pr_for_manual_merge(
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_awaited_once_with(
             "iss-1",
-            "✅ review passed, ready for manual merge: "
-            "https://github.com/org/repo/pull/42",
+            "✅ review passed, ready for manual merge: https://github.com/org/repo/pull/42",
         )
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is not None
         candidates = await db.issue_prs.list_merge_candidates(conn)
@@ -1532,12 +1514,9 @@ async def test_auto_merge_false_parks_without_dispatch_capacity(
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_awaited_once_with(
             "iss-1",
-            "✅ review passed, ready for manual merge: "
-            "https://github.com/org/repo/pull/42",
+            "✅ review passed, ready for manual merge: https://github.com/org/repo/pull/42",
         )
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is not None
     finally:
@@ -1566,9 +1545,7 @@ async def test_auto_merge_false_manual_merge_parking_is_idempotent(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -1605,9 +1582,7 @@ async def test_auto_merge_false_manual_merge_parking_is_idempotent(
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
         await _poll_and_wait(orch)
-        first_pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        first_pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert first_pr is not None
         first_parked_at = first_pr.parked_at
 
@@ -1616,9 +1591,7 @@ async def test_auto_merge_false_manual_merge_parking_is_idempotent(
         gh.pr_merge.assert_not_awaited()
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_awaited_once()
-        second_pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        second_pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert second_pr is not None
         assert second_pr.parked_at == first_parked_at
     finally:
@@ -1636,9 +1609,7 @@ async def test_auto_merge_false_parked_pr_close_moves_issue_done_once(
         parked_issue.state_id = "state-na"
         parked_issue.state_name = "Needs Approval"
         linear = AsyncMock()
-        linear.lookup_issue = AsyncMock(
-            side_effect=[_issue(), parked_issue, _done_issue()]
-        )
+        linear.lookup_issue = AsyncMock(side_effect=[_issue(), parked_issue, _done_issue()])
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
         gh = MagicMock()
@@ -1661,9 +1632,7 @@ async def test_auto_merge_false_parked_pr_close_moves_issue_done_once(
             ]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_merge = AsyncMock()
 
@@ -1688,9 +1657,7 @@ async def test_auto_merge_false_parked_pr_close_moves_issue_done_once(
         )
 
         await _poll_and_wait(orch)
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is not None
 
@@ -1715,10 +1682,7 @@ async def test_auto_merge_false_parked_pr_close_moves_issue_done_once(
         assert merge_run is None
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is None
-        assert (
-            await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
-            is None
-        )
+        assert await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo") is None
         assert await db.issue_prs.list_merge_candidates(conn) == []
     finally:
         await conn.close()
@@ -1745,9 +1709,7 @@ async def test_auto_merge_false_parked_pr_close_retries_comment_after_done_move(
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(side_effect=[parked_issue, _done_issue()])
         linear.move_issue = AsyncMock()
-        linear.post_comment = AsyncMock(
-            side_effect=[LinearError("comments down"), "cmt-1"]
-        )
+        linear.post_comment = AsyncMock(side_effect=[LinearError("comments down"), "cmt-1"])
         gh = MagicMock()
         gh.pr_view = AsyncMock(
             return_value={
@@ -1783,9 +1745,7 @@ async def test_auto_merge_false_parked_pr_close_retries_comment_after_done_move(
         linear.post_comment.assert_awaited_once_with(
             "iss-1", "🛑 PR closed without merge — marking done"
         )
-        assert (
-            await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
-        ) is not None
+        assert (await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")) is not None
 
         await _poll_and_wait(orch)
 
@@ -1794,9 +1754,7 @@ async def test_auto_merge_false_parked_pr_close_retries_comment_after_done_move(
         assert linear.post_comment.await_args.args[1] == (
             "🛑 PR closed without merge — marking done"
         )
-        assert (
-            await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
-        ) is None
+        assert (await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")) is None
         assert gh.pr_view.await_count == 2
     finally:
         await conn.close()
@@ -2231,13 +2189,10 @@ async def test_auto_merge_false_parks_before_human_approval_wait(
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_awaited_once_with(
             "iss-1",
-            "✅ review passed, ready for manual merge: "
-            "https://github.com/org/repo/pull/42",
+            "✅ review passed, ready for manual merge: https://github.com/org/repo/pull/42",
         )
         assert await db.operator_waits.get(conn, "iss-1") is None
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is not None
     finally:
@@ -2291,9 +2246,7 @@ async def test_auto_merge_false_retries_when_manual_merge_move_fails(
 
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_not_awaited()
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is None
         assert (await db.issue_prs.list_merge_candidates(conn))[0].pr_number == 42
@@ -2302,9 +2255,7 @@ async def test_auto_merge_false_retries_when_manual_merge_move_fails(
 
         assert linear.move_issue.await_count == 2
         linear.post_comment.assert_awaited_once()
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is not None
         candidates = await db.issue_prs.list_merge_candidates(conn)
@@ -2415,9 +2366,7 @@ async def test_queued_merge_revalidates_issue_before_execution(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -2483,9 +2432,7 @@ async def test_review_verdict_treats_issue_comment_fetch_failure_as_empty(
         )
         gh = MagicMock()
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -2539,9 +2486,7 @@ async def test_review_verdict_preserves_mergeability_when_remote_review_disabled
         )
         gh = MagicMock()
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(
             return_value=[
@@ -2629,9 +2574,7 @@ async def test_review_verdict_honors_human_changes_requested_when_remote_disable
         )
         gh = MagicMock()
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(
             return_value=[
@@ -2731,9 +2674,7 @@ async def test_approved_merge_runs_in_background(tmp_path: Path) -> None:
             ]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -2842,9 +2783,7 @@ async def test_tick_schedules_merge_before_new_implementation_when_capacity_is_f
             ]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -2952,9 +2891,7 @@ async def test_merge_agent_new_commit_requires_fresh_review_before_merge(
 
         gh.pr_view = AsyncMock(side_effect=pr_view)
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -3006,10 +2943,7 @@ async def test_merge_agent_new_commit_requires_fresh_review_before_merge(
         assert history[-1].stage == "merge"
         assert history[-1].status == "needs_approval"
         bodies = [c.args[1] for c in linear.post_comment.await_args_list]
-        assert any(
-            f"merge-agent pushed unreviewed HEAD {new_head_sha}" in body
-            for body in bodies
-        )
+        assert any(f"merge-agent pushed unreviewed HEAD {new_head_sha}" in body for body in bodies)
     finally:
         await conn.close()
 
@@ -3041,9 +2975,7 @@ async def test_codex_no_issues_issue_comment_advances_merge(tmp_path: Path) -> N
             ]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(
             return_value=[
@@ -3131,9 +3063,7 @@ async def test_auto_merge_submission_waits_until_pr_reports_merged(
             ]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -3222,9 +3152,7 @@ async def test_merge_cleanup_failure_still_marks_done(
             ]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -3305,9 +3233,7 @@ async def test_submitted_merge_regression_moves_to_needs_approval(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="FAILURE", bucket="fail")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="FAILURE", bucket="fail")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -3623,9 +3549,7 @@ async def test_merge_failure_moves_issue_to_needs_approval(tmp_path: Path) -> No
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
         gh = MagicMock()
-        gh.pr_view = AsyncMock(
-            return_value={"headRefOid": "abc123", "mergeable": "MERGEABLE"}
-        )
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "abc123", "mergeable": "MERGEABLE"})
         gh.pr_checks = AsyncMock(
             return_value=PRChecks(
                 runs=[
@@ -3747,9 +3671,7 @@ async def test_conflicting_pr_precheck_dispatches_rebase_fix_not_needs_approval(
         gh.pr_merge.assert_not_awaited()
         linear.move_issue.assert_not_awaited()
         assert await db.operator_waits.get(conn, "iss-1") is None
-        pr = await db.issue_prs.get(
-            conn, issue_id="iss-1", github_repo="org/repo"
-        )
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
         assert pr.parked_at is None
         history = await db.runs.history_for_issue(conn, "iss-1")
@@ -3803,9 +3725,7 @@ async def test_merge_conflict_fix_reenters_merge_on_next_poll(
             side_effect=[conflict_view, clean_view, clean_view, clean_view, merged_view]
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -3917,9 +3837,7 @@ async def test_stale_merge_conflict_fix_marker_does_not_bypass_new_pr_cycle(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -3983,9 +3901,7 @@ async def test_stale_merge_conflict_fix_marker_does_not_bypass_new_head(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -4043,9 +3959,7 @@ async def test_merge_conflict_fix_marker_survives_when_merge_capacity_full(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -4116,9 +4030,7 @@ async def test_merge_conflict_fix_marker_survives_when_scheduled_merge_bails(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(return_value=[])
@@ -4186,9 +4098,7 @@ async def test_merge_conflict_exception_dispatches_rebase_fix_not_needs_approval
         }
         gh.pr_view = AsyncMock(return_value=approved_view)
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -4205,9 +4115,7 @@ async def test_merge_conflict_exception_dispatches_rebase_fix_not_needs_approval
         gh.pr_reactions = AsyncMock(return_value=[])
         gh.pr_issue_comments = AsyncMock(return_value=[])
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
-        gh.pr_merge = AsyncMock(
-            side_effect=GitHubError("merge conflict between abc123 and base")
-        )
+        gh.pr_merge = AsyncMock(side_effect=GitHubError("merge conflict between abc123 and base"))
         push_fn = AsyncMock()
         binding = _binding(agent="claude").model_copy(update={"max_concurrent": 1})
 
@@ -4575,9 +4483,7 @@ async def test_merge_precheck_after_merge_agent_dispatches_rebase_fix(
         gh = MagicMock()
         gh.pr_view = AsyncMock(side_effect=[approved_view, conflict_view, fixed_view])
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
         )
         gh.pr_review_comments = AsyncMock(return_value=[])
         gh.pr_reviews = AsyncMock(
@@ -4657,9 +4563,7 @@ async def test_merge_dispatch_closes_active_review_monitor_before_needs_approval
         linear.move_issue = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
         gh = MagicMock()
-        gh.pr_view = AsyncMock(
-            return_value={"headRefOid": "abc123", "mergeable": "MERGEABLE"}
-        )
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "abc123", "mergeable": "MERGEABLE"})
         gh.pr_checks = AsyncMock(
             return_value=PRChecks(
                 runs=[
@@ -4868,9 +4772,7 @@ async def test_required_status_failure_precheck_dispatches_fix_run(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="ci", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="ci", state="SUCCESS", bucket="pass")])
         )
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
         gh.pr_merge = AsyncMock()
@@ -5045,9 +4947,7 @@ async def test_optional_status_failure_precheck_preserves_merge_path(
             }
         )
         gh.pr_checks = AsyncMock(
-            return_value=PRChecks(
-                runs=[CheckRun(name="ci", state="SUCCESS", bucket="pass")]
-            )
+            return_value=PRChecks(runs=[CheckRun(name="ci", state="SUCCESS", bucket="pass")])
         )
         gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
 
@@ -5367,9 +5267,7 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
             assert unresolved_findings in comment
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history[-1].stage == "merge"
-        assert history[-1].status == (
-            "needs_approval" if expected_wait_kind is None else "failed"
-        )
+        assert history[-1].status == ("needs_approval" if expected_wait_kind is None else "failed")
     finally:
         await conn.close()
 
@@ -5447,9 +5345,7 @@ async def test_no_review_binding_merges_clean_ci_no_signal(tmp_path: Path) -> No
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_no_review_candidate(conn)
-        binding = _binding().model_copy(
-            update={"local_review": False, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": False, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5496,8 +5392,7 @@ async def test_no_review_binding_auto_merge_false_parks_clean_ci_no_signal(
         linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
         linear.post_comment.assert_awaited_once_with(
             "iss-1",
-            "✅ review passed, ready for manual merge: "
-            "https://github.com/org/repo/pull/42",
+            "✅ review passed, ready for manual merge: https://github.com/org/repo/pull/42",
         )
         pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         assert pr is not None
@@ -5517,9 +5412,7 @@ async def test_no_review_binding_red_ci_dispatches_required_check_fix(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_no_review_candidate(conn)
-        binding = _binding().model_copy(
-            update={"local_review": False, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": False, "remote_review": False})
         linear = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=_issue())
         gh = MagicMock()
@@ -5598,9 +5491,7 @@ async def test_local_only_binding_merges_after_local_review_completed(
             pid=None,
             started_at="2026-05-10T00:00:30+00:00",
         )
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5634,9 +5525,7 @@ async def test_local_only_binding_waits_when_local_review_predates_pr_cycle(
             pid=None,
             started_at="2026-05-09T23:59:00+00:00",
         )
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5659,9 +5548,7 @@ async def test_local_only_binding_waits_without_completed_local_review(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_review_candidate(conn)
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5703,9 +5590,7 @@ async def test_local_only_binding_waits_when_local_review_predates_fix(
             pid=None,
             started_at="2026-05-10T00:05:00+00:00",
         )
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5746,9 +5631,7 @@ async def test_local_only_binding_merges_when_local_review_follows_fix(
             pid=None,
             started_at="2026-05-10T00:06:00+00:00",
         )
-        binding = _binding().model_copy(
-            update={"local_review": True, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": True, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5782,9 +5665,7 @@ async def test_no_signal_zero_checks_no_verify_waits_for_operator(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_no_review_candidate(conn)
-        binding = _binding().model_copy(
-            update={"local_review": False, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": False, "remote_review": False})
         orch = _make_poll_merge_orchestrator(
             conn,
             binding=binding,
@@ -5917,9 +5798,7 @@ async def test_no_signal_pending_check_never_merges(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_no_review_candidate(conn)
-        binding = _binding().model_copy(
-            update={"local_review": False, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": False, "remote_review": False})
         pending_view = _no_checks_view()
         pending_view["statusCheckRollup"] = [
             {
@@ -5960,9 +5839,7 @@ async def test_no_signal_failed_non_required_check_waits_for_operator(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_no_review_candidate(conn)
-        binding = _binding().model_copy(
-            update={"local_review": False, "remote_review": False}
-        )
+        binding = _binding().model_copy(update={"local_review": False, "remote_review": False})
         failed_view = _no_checks_view()
         failed_view["statusCheckRollup"] = [
             {
@@ -6009,9 +5886,7 @@ async def test_required_check_fix_run_carries_fix_role_model(
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
         )
-        orch = Orchestrator(
-            cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock()
-        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
         captured: dict[str, list[str]] = {}
 
         async def fake_run_stage_command(

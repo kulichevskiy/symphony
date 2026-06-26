@@ -58,9 +58,7 @@ class _StagedRunner:
         self.captured.append(spec)
         bucket = self._scripts.get(spec.stage)
         if not bucket:
-            raise AssertionError(
-                f"unexpected stage {spec.stage!r}; remaining={self._scripts}"
-            )
+            raise AssertionError(f"unexpected stage {spec.stage!r}; remaining={self._scripts}")
         events = bucket.pop(0)
         # A successful implement run commits its work; the completion gate
         # requires HEAD to advance over the branch base.
@@ -212,9 +210,7 @@ async def test_hybrid_strategy_runs_local_then_remote_then_merge(
         workspace.cleanup = AsyncMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -308,9 +304,7 @@ async def test_hybrid_strategy_runs_local_then_remote_then_merge(
             call("iss-1", "state-review"),
             call("iss-1", "state-done"),
         ]
-        assert any(
-            "cap=2" in c.args[1] for c in linear.post_comment.await_args_list
-        )
+        assert any("cap=2" in c.args[1] for c in linear.post_comment.await_args_list)
         gh.pr_comment.assert_any_await(42, "@codex review", repo="org/repo")
         gh.pr_merge.assert_awaited_once_with(
             42,
@@ -445,8 +439,7 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
         codex_calls = [
             c
             for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert codex_calls == []
         assert await db.operator_waits.get(conn, "iss-1") is None
@@ -497,9 +490,7 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -536,9 +527,7 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
             push_fn=push_fn,
         )
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
-            return_value=LoopResult(
-                outcome=LoopOutcome.APPROVED, iterations=1, verdicts=()
-            )
+            return_value=LoopResult(outcome=LoopOutcome.APPROVED, iterations=1, verdicts=())
         )
         orch._post_local_review_pr_summary = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             side_effect=[RuntimeError("summary write failed"), None]
@@ -555,8 +544,7 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         codex_calls = [
             c
             for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert len(codex_calls) == 1
         assert [s.stage for s in runner.captured].count("implement") == 1
@@ -573,9 +561,7 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         await db.review_state.set_signature(conn, "iss-1", "codex_inline:stale")
         await db.review_state.bump_iteration(conn, "iss-1")
         await db.review_state.bump_ci_fetch_failures(conn, "iss-1")
-        await db.review_state.set_codex_lgtm_comment_id(
-            conn, "iss-1", "comment-42"
-        )
+        await db.review_state.set_codex_lgtm_comment_id(conn, "iss-1", "comment-42")
 
         parked_issue = _issue()
         parked_issue.state_id = "state-na"
@@ -603,8 +589,7 @@ async def test_deliver_failed_retry_adopts_live_review_run_without_duplicate_han
         codex_calls = [
             c
             for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert len(codex_calls) == 1
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
@@ -762,9 +747,7 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -826,8 +809,7 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
         codex_calls = [
             c
             for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert codex_calls == []
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
@@ -838,9 +820,7 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
         review_rows = [h for h in history if h.stage == "review"]
         assert len(review_rows) == 1
         assert review_rows[0].status == "needs_approval"
-        assert "src/auth.py:12 missing token validation" in (
-            review_rows[0].termination_detail
-        )
+        assert "src/auth.py:12 missing token validation" in (review_rows[0].termination_detail)
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
         assert wait.run_id == review_rows[0].id
@@ -874,9 +854,7 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -905,9 +883,7 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
                 ],
                 "local_review": [
                     [
-                        _codex_agent_message(
-                            f"Looks clean to me.\n{VERDICT_APPROVED_MARKER}"
-                        ),
+                        _codex_agent_message(f"Looks clean to me.\n{VERDICT_APPROVED_MARKER}"),
                         RunnerEvent(kind="exit", returncode=0),
                     ]
                 ],
@@ -933,8 +909,7 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
         assert runner.captured[1].command[:2] == ["codex", "exec"]
         assert "--sandbox" in runner.captured[1].command
         assert (
-            runner.captured[1]
-            .command[runner.captured[1].command.index("--sandbox") + 1]
+            runner.captured[1].command[runner.captured[1].command.index("--sandbox") + 1]
             == "read-only"
         )
 
@@ -992,9 +967,7 @@ async def test_local_strategy_approved_posts_pr_summary(tmp_path: Path) -> None:
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1021,9 +994,7 @@ async def test_local_strategy_approved_posts_pr_summary(tmp_path: Path) -> None:
                 ],
                 "local_review": [
                     [
-                        _codex_agent_message(
-                            f"clean\n{VERDICT_APPROVED_MARKER}"
-                        ),
+                        _codex_agent_message(f"clean\n{VERDICT_APPROVED_MARKER}"),
                         RunnerEvent(kind="exit", returncode=0),
                     ]
                 ],
@@ -1031,8 +1002,13 @@ async def test_local_strategy_approved_posts_pr_summary(tmp_path: Path) -> None:
         )
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh,
-            workspace=workspace, push_fn=push_fn,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
@@ -1040,13 +1016,10 @@ async def test_local_strategy_approved_posts_pr_summary(tmp_path: Path) -> None:
 
         # Find the PR comment that's the local-review summary.
         summary_calls = [
-            c
-            for c in gh.pr_comment.await_args_list
-            if "local reviewer" in str(c).lower()
+            c for c in gh.pr_comment.await_args_list if "local reviewer" in str(c).lower()
         ]
         assert len(summary_calls) == 1, (
-            f"expected one local-review summary PR comment, got: "
-            f"{gh.pr_comment.await_args_list}"
+            f"expected one local-review summary PR comment, got: {gh.pr_comment.await_args_list}"
         )
         call = summary_calls[0]
         # Body is the second positional arg.
@@ -1087,9 +1060,7 @@ async def test_local_strategy_disabled_pr_summary_does_not_post(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1116,9 +1087,7 @@ async def test_local_strategy_disabled_pr_summary_does_not_post(
                 ],
                 "local_review": [
                     [
-                        _codex_agent_message(
-                            f"ok\n{VERDICT_APPROVED_MARKER}"
-                        ),
+                        _codex_agent_message(f"ok\n{VERDICT_APPROVED_MARKER}"),
                         RunnerEvent(kind="exit", returncode=0),
                     ]
                 ],
@@ -1126,8 +1095,13 @@ async def test_local_strategy_disabled_pr_summary_does_not_post(
         )
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh,
-            workspace=workspace, push_fn=push_fn,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
@@ -1180,9 +1154,7 @@ async def test_binding_pr_summary_override_off_beats_global_on(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1217,8 +1189,13 @@ async def test_binding_pr_summary_override_off_beats_global_on(
         )
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh,
-            workspace=workspace, push_fn=push_fn,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
@@ -1266,9 +1243,7 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1297,8 +1272,13 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         )
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh,
-            workspace=workspace, push_fn=push_fn,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
         )
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             return_value=LoopResult(
@@ -1320,13 +1300,12 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
 
         # Neither the @codex ping nor the local-review summary should fire.
         codex_calls = [
-            c for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
+            c
+            for c in gh.pr_comment.await_args_list
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         summary_calls = [
-            c for c in gh.pr_comment.await_args_list
-            if "local reviewer" in str(c).lower()
+            c for c in gh.pr_comment.await_args_list if "local reviewer" in str(c).lower()
         ]
         assert codex_calls == []
         assert len(summary_calls) == 0
@@ -1471,9 +1450,7 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
     async def _exploding_session(**_: object) -> None:
         raise RuntimeError("local-review session blew up")
 
-    monkeypatch.setattr(
-        lifecycle_mod, "run_local_review_session", _exploding_session
-    )
+    monkeypatch.setattr(lifecycle_mod, "run_local_review_session", _exploding_session)
 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -1496,9 +1473,7 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1529,8 +1504,13 @@ async def test_local_review_phase_exception_does_not_break_pipeline(
         )
 
         orch = Orchestrator(
-            cfg, linear, conn, runner=runner, gh=gh,
-            workspace=workspace, push_fn=push_fn,
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
         )
         orch._states = {"ENG": _states()}  # noqa: SLF001
 
@@ -1583,9 +1563,7 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
         workspace.release = MagicMock()
 
         gh = MagicMock()
-        gh.ensure_pr = AsyncMock(
-            return_value="https://github.com/org/repo/pull/42"
-        )
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
         gh.pr_comment = AsyncMock()
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
@@ -1634,12 +1612,9 @@ async def test_local_strategy_does_not_post_codex_when_reviewer_fails(
         codex_pings = [
             c
             for c in gh.pr_comment.await_args_list
-            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body"))
-            == "@codex review"
+            if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
-        assert codex_pings == [], (
-            "local-only mode must not post @codex when the reviewer fails"
-        )
+        assert codex_pings == [], "local-only mode must not post @codex when the reviewer fails"
         gh.ensure_pr.assert_not_awaited()
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-bl" in move_targets
@@ -1728,9 +1703,7 @@ async def test_local_review_deliver_failed_resumes_after_restart(
         )
         # Local review approves on the first (pre-PR) pass.
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
-            return_value=LoopResult(
-                outcome=LoopOutcome.APPROVED, iterations=1, verdicts=()
-            )
+            return_value=LoopResult(outcome=LoopOutcome.APPROVED, iterations=1, verdicts=())
         )
         # Spy on the dead-end path the reconstructed-as-None bug took.
         orch._fail_review_run = AsyncMock(wraps=orch._fail_review_run)  # type: ignore[method-assign]  # noqa: SLF001
@@ -1775,19 +1748,12 @@ async def test_local_review_deliver_failed_resumes_after_restart(
         # The reconstructed synthetic-APPROVED result must not post a degenerate
         # "iterations: 0" local-review PR summary.
         summary_calls = [
-            c
-            for c in gh.pr_comment.await_args_list
-            if "local reviewer" in str(c).lower()
+            c for c in gh.pr_comment.await_args_list if "local reviewer" in str(c).lower()
         ]
         assert summary_calls == []
         posted = [str(c.args[1]) for c in linear.post_comment.await_args_list]
-        stage_done_posts = [
-            body for body in posted if "**Implement → Review**" in body
-        ]
+        stage_done_posts = [body for body in posted if "**Implement → Review**" in body]
         assert len(stage_done_posts) == 1
-        assert (
-            "Tokens: in 7 · out 11 · cache w 13 / r 17"
-            in stage_done_posts[0]
-        )
+        assert "Tokens: in 7 · out 11 · cache w 13 / r 17" in stage_done_posts[0]
     finally:
         await conn.close()

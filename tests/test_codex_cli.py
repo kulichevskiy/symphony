@@ -233,7 +233,7 @@ def test_ensure_symphony_permissions_profile_reports_inline_permissions_table(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.toml"
-    existing = 'permissions = { other = { network = { enabled = false } } }\n'
+    existing = "permissions = { other = { network = { enabled = false } } }\n"
     config_path.write_text(existing, encoding="utf-8")
 
     with pytest.raises(CodexPermissionsProfileError, match="other permissions"):

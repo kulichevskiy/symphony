@@ -238,10 +238,7 @@ async def run_local_review_loop(
                 head_sha=out.head_sha,
                 last_message_file=out.last_message_file,
             )
-            if (
-                parsed.kind == LocalVerdictKind.UNPARSEABLE
-                and attempt < REVIEWER_FAILURE_RETRIES
-            ):
+            if parsed.kind == LocalVerdictKind.UNPARSEABLE and attempt < REVIEWER_FAILURE_RETRIES:
                 continue
             verdict = parsed
             break
@@ -284,9 +281,7 @@ async def run_local_review_loop(
         # CHANGES_REQUESTED — gate on the merged-findings digest before paying
         # for another fix-run. Same unresolved findings twice in a row is the
         # local non-convergence signal even when the fix-run advanced HEAD.
-        findings_signature = (
-            verdict.findings_signature or verdict.trigger_signature
-        )
+        findings_signature = verdict.findings_signature or verdict.trigger_signature
         if findings_signature == prev_findings_signature:
             return _result(
                 outcome=LoopOutcome.STUCK_LOOP,

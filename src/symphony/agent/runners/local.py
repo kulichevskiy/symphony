@@ -247,9 +247,7 @@ class LocalRunner:
                 # heartbeat: it fires even while output is fresh or a command
                 # is in flight (the heartbeat clauses can't catch a chatty but
                 # wedged agent — incident SYM-148).
-                wall_clock_breached = (
-                    wall_clock_deadline is not None and now >= wall_clock_deadline
-                )
+                wall_clock_breached = wall_clock_deadline is not None and now >= wall_clock_deadline
                 if not wall_clock_breached:
                     deadline = hb.deadline(now, spec.stall_secs, spec.command_secs)
                     if now < deadline:
@@ -285,9 +283,7 @@ class LocalRunner:
                     ev = await asyncio.wait_for(events.get(), timeout=0.25)
                 except TimeoutError:
                     process_done = (
-                        wait_task.done()
-                        or proc.returncode is not None
-                        or not _pid_alive(proc.pid)
+                        wait_task.done() or proc.returncode is not None or not _pid_alive(proc.pid)
                     )
                     if process_done:
                         # Flush tail output without letting inherited pipe handles

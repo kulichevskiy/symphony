@@ -117,9 +117,7 @@ async def _execute_upsert(
     )
 
 
-async def get_granted_token_budget(
-    conn: aiosqlite.Connection, issue_id: str
-) -> int:
+async def get_granted_token_budget(conn: aiosqlite.Connection, issue_id: str) -> int:
     """Extra effective-token budget granted via `$approve` on a budget trip.
 
     Returns 0 for an unknown issue or a NULL column (the default).

@@ -55,7 +55,7 @@ _ANSI_RED = "\x1b[31m"
 _ANSI_BOLD_RED = "\x1b[1;31m"
 
 # Matches `HTTP/1.1 500 ...` and similar inside log messages from httpx etc.
-_HTTP_STATUS_RE = re.compile(r'HTTP/\d(?:\.\d)?\s+(\d{3})\b')
+_HTTP_STATUS_RE = re.compile(r"HTTP/\d(?:\.\d)?\s+(\d{3})\b")
 
 
 class _ColorFormatter(logging.Formatter):
@@ -167,10 +167,7 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
 def _binding_can_run_codex_cli(binding: RepoBinding) -> bool:
     if binding.agent == "codex":
         return True
-    return (
-        binding.resolved_local_review()
-        and binding.resolved_reviewer_agent() == "codex"
-    )
+    return binding.resolved_local_review() and binding.resolved_reviewer_agent() == "codex"
 
 
 def _config_can_run_codex_cli(cfg: Config) -> bool:
@@ -247,9 +244,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     WebhookSettings(
                         secret=cfg.linear_webhook_secret,
                         dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
-                        timestamp_tolerance_secs=(
-                            cfg.webhook_timestamp_tolerance_secs
-                        ),
+                        timestamp_tolerance_secs=(cfg.webhook_timestamp_tolerance_secs),
                     )
                     if cfg.linear_webhook_secret
                     else None
@@ -269,9 +264,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
                     ),
                     ui_command_sink=orch,
-                    ui_webhook_public_url=os.environ.get(
-                        "SYMPHONY_WEBHOOK_PUBLIC_URL"
-                    ),
+                    ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
                 )
                 server = uvicorn.Server(
                     build_server_config(
@@ -313,9 +306,7 @@ def preflight(config_path: Path) -> None:
     asyncio.run(_preflight(config_path))
 
 
-async def _preflight_configured_bindings(
-    cfg: Config, trackers: TrackerRegistry
-) -> bool:
+async def _preflight_configured_bindings(cfg: Config, trackers: TrackerRegistry) -> bool:
     visible_by_ctx: dict[TrackerContext, list[str]] = {}
     ok = True
     for binding in cfg.repos:
@@ -330,15 +321,11 @@ async def _preflight_configured_bindings(
                 sys.exit(1)
             visible_by_ctx[ctx] = visible
             visible_label = (
-                "linear teams"
-                if binding.provider == "linear"
-                else f"{binding.provider} projects"
+                "linear teams" if binding.provider == "linear" else f"{binding.provider} projects"
             )
             click.echo(f"{visible_label} visible to this key: {visible}")
         if binding.project_key not in visible:
-            click.echo(
-                f"  ✗ {binding.project_key}: not visible — will be skipped at runtime"
-            )
+            click.echo(f"  ✗ {binding.project_key}: not visible — will be skipped at runtime")
             ok = False
             continue
         states = await tracker.team_states(binding.project_key)
@@ -359,9 +346,7 @@ async def _preflight_configured_bindings(
             ("done", binding.states.done),
         ]
         if binding.resolved_local_review():
-            required_states.append(
-                ("local_code_review", binding.states.local_code_review)
-            )
+            required_states.append(("local_code_review", binding.states.local_code_review))
         if binding.resolved_remote_review():
             required_states.append(("code_review", binding.states.code_review))
         missing = [
@@ -485,15 +470,11 @@ async def _runs_ls(db_path: Path, limit: int) -> None:
     if not rows:
         click.echo("(no runs)")
         return
-    click.echo(
-        "id\tissue\tstage\tstatus\ttermination_kind\teff_tokens\tstarted_at"
-    )
+    click.echo("id\tissue\tstage\tstatus\ttermination_kind\teff_tokens\tstarted_at")
     for r in rows:
         run = r.run
         termination_kind = (
-            run.termination_kind
-            if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES
-            else ""
+            run.termination_kind if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES else ""
         )
         eff = effective_tokens(
             run.input_tokens,
@@ -551,8 +532,7 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
     )
     click.echo(f"effective_tokens: {eff:,.0f}")
     click.echo(
-        f"cost_usd:       {run.cost_usd}  "
-        "(notional list-price estimate, not the actual bill)"
+        f"cost_usd:       {run.cost_usd}  (notional list-price estimate, not the actual bill)"
     )
     if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
         click.echo(f"termination_kind:   {run.termination_kind or '-'}")
@@ -568,9 +548,7 @@ async def _runs_show(run_id: str, db_path: Path) -> None:
     click.echo("stage history:")
     for h in history:
         marker = "*" if h.id == run.id else " "
-        click.echo(
-            f"  {marker} {h.started_at}  {h.stage:<10}  {h.status:<11}  {h.id}"
-        )
+        click.echo(f"  {marker} {h.started_at}  {h.stage:<10}  {h.status:<11}  {h.id}")
 
 
 @runs.command("local-review-trace")
@@ -594,9 +572,7 @@ def runs_local_review_trace(issue_identifier: str, db_path: Path) -> None:
     asyncio.run(_runs_local_review_trace(issue_identifier, db_path))
 
 
-async def _runs_local_review_trace(
-    issue_identifier: str, db_path: Path
-) -> None:
+async def _runs_local_review_trace(issue_identifier: str, db_path: Path) -> None:
     conn = await db.connect(db_path)
     try:
         # Resolve identifier ("ENG-123") → issue_id.
@@ -617,17 +593,11 @@ async def _runs_local_review_trace(
         await conn.close()
     local_rows = [h for h in history if h.stage == "local_review"]
     if not local_rows:
-        click.echo(
-            f"no local-review runs recorded for {issue_identifier}"
-        )
+        click.echo(f"no local-review runs recorded for {issue_identifier}")
         return
     # `history_for_issue` returns chronologically; reverse for "newest first".
-    click.echo(
-        f"local-review runs for {issue_identifier} ({len(local_rows)} total):"
-    )
-    click.echo(
-        "started_at                       status        eff_tokens  duration  id"
-    )
+    click.echo(f"local-review runs for {issue_identifier} ({len(local_rows)} total):")
+    click.echo("started_at                       status        eff_tokens  duration  id")
     for h in reversed(local_rows):
         duration = _duration_secs(h.started_at, h.ended_at)
         duration_str = f"{duration:7.1f}s" if duration is not None else "      —"
@@ -637,10 +607,7 @@ async def _runs_local_review_trace(
             h.cache_write_tokens,
             h.cache_read_tokens,
         )
-        click.echo(
-            f"{h.started_at:<32} {h.status:<13} {eff:<10,.0f} "
-            f"{duration_str}  {h.id}"
-        )
+        click.echo(f"{h.started_at:<32} {h.status:<13} {eff:<10,.0f} {duration_str}  {h.id}")
 
 
 def _duration_secs(started_at: str | None, ended_at: str | None) -> float | None:
@@ -746,9 +713,7 @@ def runs_backfill_tokens(db_path: Path, log_root: Path) -> None:
     help="Config file used to resolve Codex models per team binding. "
     "Without it, Codex usage is attributed to `unknown`.",
 )
-def runs_backfill_model_usage(
-    db_path: Path, log_root: Path, config_path: Path | None
-) -> None:
+def runs_backfill_model_usage(db_path: Path, log_root: Path, config_path: Path | None) -> None:
     """Backfill per-(provider, model) token attribution from historical logs."""
     from .db.token_backfill import CodexModels, run_model_usage_backfill
 
@@ -802,8 +767,7 @@ def runs_backfill_model_usage(
     "--reviewer-model",
     "reviewer_codex_model",
     default=None,
-    help="Codex model to use when --reviewer=codex. Omit to use the "
-    "CLI's account default.",
+    help="Codex model to use when --reviewer=codex. Omit to use the CLI's account default.",
 )
 @click.option(
     "--title",
@@ -919,9 +883,7 @@ async def _local_review_dry_run(
     click.echo(f"running {reviewer_agent} reviewer against {workspace_path}…")
     out = await collect_runner_output(runner, spec)
     last_text = (
-        last_msg.read_text(encoding="utf-8", errors="replace")
-        if last_msg.exists()
-        else None
+        last_msg.read_text(encoding="utf-8", errors="replace") if last_msg.exists() else None
     )
     verdict = parse_local_review_output(
         agent=reviewer_agent,  # type: ignore[arg-type]
@@ -990,11 +952,7 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
         try:
             orch = Orchestrator(cfg, linear, conn)
             run_id = await orch._dispatch_one(binding, issue)  # noqa: SLF001
-            rwi = (
-                await db.runs.get_with_issue(conn, run_id)
-                if run_id is not None
-                else None
-            )
+            rwi = await db.runs.get_with_issue(conn, run_id) if run_id is not None else None
         finally:
             await conn.close()
         if run_id is None:

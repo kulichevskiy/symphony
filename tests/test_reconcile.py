@@ -20,12 +20,8 @@ from symphony.tracker import TrackerContext, TrackerRegistry
 async def test_reconcile_marks_dead_pids_interrupted_and_comments(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-alive", identifier="ENG-1", title="t", team_key="ENG"
-        )
-        await db.issues.upsert(
-            conn, id="iss-dead", identifier="ENG-2", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-alive", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issues.upsert(conn, id="iss-dead", identifier="ENG-2", title="t", team_key="ENG")
 
         # Live PID — current python process. Reconcile must NOT touch this row.
         await db.runs.create(
@@ -110,9 +106,7 @@ async def test_reconcile_posts_comment_through_persisted_tracker_context(
         )
 
         default_tracker = AsyncMock()
-        default_tracker.post_comment = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.post_comment = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.post_comment = AsyncMock(return_value="cmt-1")
         contexts: list[TrackerContext] = []
@@ -171,9 +165,7 @@ async def test_reconcile_posts_comment_with_tracker_issue_id_for_scoped_issue(
         )
 
         default_tracker = AsyncMock()
-        default_tracker.post_comment = AsyncMock(
-            side_effect=AssertionError("default tracker used")
-        )
+        default_tracker.post_comment = AsyncMock(side_effect=AssertionError("default tracker used"))
         secondary_tracker = AsyncMock()
         secondary_tracker.post_comment = AsyncMock(return_value="cmt-1")
 
@@ -201,9 +193,7 @@ async def test_reconcile_marks_pidless_live_review_runs_interrupted_and_comments
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-review", identifier="ENG-5", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-review", identifier="ENG-5", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="pidless-review",
@@ -397,9 +387,7 @@ async def test_reconcile_recovers_pidless_local_review_run(tmp_path: Path) -> No
     needed before — so the issue is not wedged in "Local Code Review"."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="pidless-local-review",
@@ -468,9 +456,7 @@ async def test_reconcile_leaves_local_review_live_when_move_fails(
     this PR exists to rescue would be re-introduced by a single flaky call."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="pidless-local-review",
@@ -526,9 +512,7 @@ async def test_reconcile_recovers_vib198_implement_plus_local_review(
     interrupted, the issue moved back to ready exactly once."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-local", identifier="ENG-9", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="implement",
@@ -703,9 +687,7 @@ async def test_reconcile_treats_unexpected_oserror_as_alive(
     prevent the orchestrator from booting. Treat as alive and continue."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-weird", identifier="ENG-4", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-weird", identifier="ENG-4", title="t", team_key="ENG")
         await db.runs.create(
             conn,
             id="weird",
@@ -742,9 +724,7 @@ async def test_reconcile_collapses_duplicate_same_stage_runs(tmp_path: Path) -> 
     younger's process and flips it `superseded` with a duplicate-stage kind."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.issues.upsert(
-            conn, id="iss-dup", identifier="ENG-10", title="t", team_key="ENG"
-        )
+        await db.issues.upsert(conn, id="iss-dup", identifier="ENG-10", title="t", team_key="ENG")
         # Use distinct fake PIDs with an injected pid_alive so the orphan sweep
         # leaves both alive and only the duplicate-collapse pass acts.
         await db.runs.create(
