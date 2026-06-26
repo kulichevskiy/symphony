@@ -778,35 +778,30 @@ class _MergeMixin(_OrchestratorBase):
             trigger_signature=trigger_signature,
             iteration=f"{iteration}/{self.config.review_iteration_cap}",
         )
+        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        start_sha = ""
 
-        async with self._review_fix_dispatch_slot(
-            binding,
-            issue,
-            dispatch_capacity_held=dispatch_capacity_held,
-        ):
-            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+        async def on_acquire_failure(e: Exception) -> None:
+            await self._mark_merge_required_check_fix_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                reason=f"required-check fix-run failed: workspace acquire failed: {e}",
+                merge_run_id=merge_run_id,
+            )
 
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for required-check fix-run %s",
-                    issue.identifier,
-                )
-                await self._mark_merge_required_check_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=f"required-check fix-run failed: workspace acquire failed: {e}",
-                    merge_run_id=merge_run_id,
-                )
-                return False
+        async def on_dedup_loss() -> bool | None:
+            # Lost the race: an existing review_fix is already running.
+            # Interrupt the parent merge so it doesn't stay stuck in "running".
+            if merge_run_id is not None:
+                await db.runs.interrupt_running_merge(self._conn, merge_run_id)
+            return None
 
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        async def setup(workspace_path: Path) -> bool:
+            nonlocal start_sha
             try:
                 await _git_fetch_branch(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
-                self._workspace.release(binding, issue)
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
                     issue=issue,
@@ -821,7 +816,6 @@ class _MergeMixin(_OrchestratorBase):
 
             start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
-                self._workspace.release(binding, issue)
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
                     issue=issue,
@@ -833,27 +827,14 @@ class _MergeMixin(_OrchestratorBase):
                     merge_run_id=merge_run_id,
                 )
                 return False
+            return True
 
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stages=("review", "merge"),
-            )
-            if not inserted:
-                # Lost the race: an existing review_fix is already running.
-                # Interrupt the parent merge so it doesn't stay stuck in "running".
-                self._workspace.release(binding, issue)
-                if merge_run_id is not None:
-                    await db.runs.interrupt_running_merge(self._conn, merge_run_id)
-                return None
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool | None:
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
             try:
                 (
                     usage_delta,
@@ -891,11 +872,8 @@ class _MergeMixin(_OrchestratorBase):
                     merge_run_id=merge_run_id,
                 )
                 return False
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -1089,6 +1067,17 @@ class _MergeMixin(_OrchestratorBase):
                     )
             return True
 
+        return await self._run_fix_dispatch(
+            binding=binding,
+            issue=issue,
+            ignored_stages=("review", "merge"),
+            on_acquire_failure=on_acquire_failure,
+            body=body,
+            setup=setup,
+            on_dedup_loss=on_dedup_loss,
+            dispatch_capacity_held=dispatch_capacity_held,
+        )
+
 
     async def _run_required_check_fix_agent(
         self,
@@ -1155,61 +1144,44 @@ class _MergeMixin(_OrchestratorBase):
             issue=issue,
             view=view,
         )
-        async with self._review_fix_dispatch_slot(
-            binding,
-            issue,
-            dispatch_capacity_held=dispatch_capacity_held,
-        ):
-            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
 
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for merge-conflict rebase fix-run %s",
-                    issue.identifier,
-                )
-                await self._mark_merge_conflict_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=f"merge-conflict fix-run failed: workspace acquire failed: {e}",
-                    merge_run_id=merge_run_id,
-                )
-                return False
-
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stages=("review", "merge"),
+        async def on_acquire_failure(e: Exception) -> None:
+            await self._mark_merge_conflict_fix_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                reason=f"merge-conflict fix-run failed: workspace acquire failed: {e}",
+                merge_run_id=merge_run_id,
             )
-            if not inserted:
-                # Lost the race: an existing review_fix is already running.
-                # Interrupt the parent merge so it doesn't stay stuck in "running".
-                # Return False so callers don't clear operator waits for a fix that
-                # was never started (e.g. the reconcile-merge-wait path).
-                self._workspace.release(binding, issue)
-                if merge_run_id is not None:
-                    await db.runs.interrupt_running_merge(self._conn, merge_run_id)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
-            if on_started is not None:
-                try:
-                    await on_started(fix_run_id)
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "merge-conflict rebase fix-run start callback failed "
-                        "for %s run %s",
-                        issue.identifier,
-                        fix_run_id,
-                    )
 
+        async def on_dedup_loss() -> bool:
+            # Lost the race: an existing review_fix is already running.
+            # Interrupt the parent merge so it doesn't stay stuck in "running".
+            # Return False so callers don't clear operator waits for a fix that
+            # was never started (e.g. the reconcile-merge-wait path).
+            if merge_run_id is not None:
+                await db.runs.interrupt_running_merge(self._conn, merge_run_id)
+            return False
+
+        async def after_dedup(fix_run_id: str) -> None:
+            if on_started is None:
+                return
+            try:
+                await on_started(fix_run_id)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "merge-conflict rebase fix-run start callback failed "
+                    "for %s run %s",
+                    issue.identifier,
+                    fix_run_id,
+                )
+
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
             prompt = merge_conflict_rebase_fix_prompt(
                 issue_title=issue.title,
                 issue_body=issue.description,
@@ -1261,11 +1233,8 @@ class _MergeMixin(_OrchestratorBase):
                     merge_run_id=merge_run_id,
                 )
                 return False
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -1355,6 +1324,18 @@ class _MergeMixin(_OrchestratorBase):
                         merge_run_id,
                     )
             return True
+
+        result = await self._run_fix_dispatch(
+            binding=binding,
+            issue=issue,
+            ignored_stages=("review", "merge"),
+            on_acquire_failure=on_acquire_failure,
+            body=body,
+            after_dedup=after_dedup,
+            on_dedup_loss=on_dedup_loss,
+            dispatch_capacity_held=dispatch_capacity_held,
+        )
+        return bool(result)
 
 
     async def _schedule_parked_manual_merge_revival_for_issue_event(

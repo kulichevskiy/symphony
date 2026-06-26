@@ -1694,28 +1694,23 @@ class _ReviewMixin(_OrchestratorBase):
             trigger=trigger,
             failing_check_log_tail=log_tail,
         )
+        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        start_sha = ""
 
-        async with self._review_fix_dispatch_slot(binding, issue):
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for review fix-run %s", issue.identifier
-                )
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace acquire failed: {e}",
-                    last_log=str(e),
-                )
-                return False
+        async def on_acquire_failure(e: Exception) -> None:
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"workspace acquire failed: {e}",
+                last_log=str(e),
+            )
 
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        async def setup(workspace_path: Path) -> bool:
+            nonlocal start_sha
             try:
                 await _git_fetch_branch(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -1729,7 +1724,6 @@ class _ReviewMixin(_OrchestratorBase):
 
             start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -1740,25 +1734,13 @@ class _ReviewMixin(_OrchestratorBase):
                     operator_wait=True,
                 )
                 return False
+            return True
 
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stage="review",
-            )
-            if not inserted:
-                # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                # Release the workspace and bail without clobbering dispatch ids.
-                self._workspace.release(binding, issue)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
             try:
                 prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
                 usage_delta, final_kind, final_returncode = await self._run_fix_agent(
@@ -1790,11 +1772,8 @@ class _ReviewMixin(_OrchestratorBase):
                     last_log=str(e),
                 )
                 return False
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -1924,6 +1903,16 @@ class _ReviewMixin(_OrchestratorBase):
                 state=state,
             )
             return True
+
+        result = await self._run_fix_dispatch(
+            binding=binding,
+            issue=issue,
+            ignored_stages=("review",),
+            on_acquire_failure=on_acquire_failure,
+            body=body,
+            setup=setup,
+        )
+        return bool(result)
 
     async def _retrigger_codex_review_unless_approved(
         self,
@@ -2145,28 +2134,23 @@ class _ReviewMixin(_OrchestratorBase):
             trigger=trigger,
         )
         tracker = self.tracker(binding)
+        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        start_sha = ""
 
-        async with self._review_fix_dispatch_slot(binding, issue):
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for review fix-run %s", issue.identifier
-                )
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace acquire failed: {e}",
-                    last_log=str(e),
-                )
-                return False
+        async def on_acquire_failure(e: Exception) -> None:
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"workspace acquire failed: {e}",
+                last_log=str(e),
+            )
 
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        async def setup(workspace_path: Path) -> bool:
+            nonlocal start_sha
             try:
                 await _git_fetch_branch(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2180,7 +2164,6 @@ class _ReviewMixin(_OrchestratorBase):
 
             start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2191,26 +2174,14 @@ class _ReviewMixin(_OrchestratorBase):
                     operator_wait=True,
                 )
                 return False
+            return True
 
-            # Dedup after workspace setup: no pidless row is left in the DB
-            # if setup fails or the host restarts mid-setup (SYM-152 P1).
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stage="review",
-            )
-            if not inserted:
-                # Lost the race against a concurrent fix-run dispatch (SYM-152).
-                self._workspace.release(binding, issue)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
+            nonlocal state
             # Post the "starting" comment only after dedup succeeds so we do
             # not announce a fix-run that will not execute (SYM-152).
             v = CommentVars(
@@ -2262,11 +2233,8 @@ class _ReviewMixin(_OrchestratorBase):
                     last_log=str(e),
                 )
                 return False
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
 
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
 
             transition = on_runner_event(
@@ -2365,6 +2333,16 @@ class _ReviewMixin(_OrchestratorBase):
             )
             return True
 
+        result = await self._run_fix_dispatch(
+            binding=binding,
+            issue=issue,
+            ignored_stages=("review",),
+            on_acquire_failure=on_acquire_failure,
+            body=body,
+            setup=setup,
+        )
+        return bool(result)
+
     async def _dispatch_merge_conflict_fix_run(
         self,
         *,
@@ -2396,31 +2374,25 @@ class _ReviewMixin(_OrchestratorBase):
             pr_url=state.pr_url,
         )
         tracker = self.tracker(binding)
+        branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
+        start_sha = ""
 
-        async with self._review_fix_dispatch_slot(binding, issue):
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "workspace acquire failed for merge-conflict fix-run %s",
-                    issue.identifier,
-                )
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=f"workspace acquire failed: {e}",
-                    last_log=str(e),
-                )
-                return False
+        async def on_acquire_failure(e: Exception) -> None:
+            await self._fail_review_run(
+                run=run,
+                binding=binding,
+                issue=issue,
+                error=f"workspace acquire failed: {e}",
+                last_log=str(e),
+            )
 
+        async def setup(workspace_path: Path) -> bool:
+            nonlocal start_sha
             # Step 1: orchestrator fetches origin.
-            branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
             try:
                 await _sync_workspace_to_remote(workspace_path, branch)
             except Exception as e:  # noqa: BLE001
                 log.warning("workspace sync failed for %s: %s", issue.identifier, e)
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2432,7 +2404,6 @@ class _ReviewMixin(_OrchestratorBase):
 
             start_sha = await _workspace_ref_sha(workspace_path, f"origin/{branch}")
             if not start_sha:
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2448,7 +2419,6 @@ class _ReviewMixin(_OrchestratorBase):
                 await _git_fetch(workspace_path)
             except Exception as e:  # noqa: BLE001
                 log.warning("git fetch failed for %s: %s", issue.identifier, e)
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2457,25 +2427,9 @@ class _ReviewMixin(_OrchestratorBase):
                     last_log=str(e),
                 )
                 return False
+            return True
 
-            # Dedup after workspace setup: no pidless row is left in the DB
-            # if setup fails or the host restarts mid-setup (SYM-152 P1).
-            fix_run_id = str(uuid.uuid4())
-            inserted = await db.runs.create_if_no_active(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="review_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                ignored_stage="review",
-            )
-            if not inserted:
-                self._workspace.release(binding, issue)
-                return False
-            self._dispatch_run_ids[issue.id] = fix_run_id
-
+        async def after_dedup(_fix_run_id: str) -> None:
             # Post the "fixing" comment once dedup has passed.
             v_start = CommentVars(
                 stage="review",
@@ -2495,6 +2449,12 @@ class _ReviewMixin(_OrchestratorBase):
                     e,
                 )
 
+        async def body(
+            workspace_path: Path,
+            fix_run_id: str,
+            drop_dispatch_id: Callable[[], None],
+        ) -> bool:
+            nonlocal state
             # Step 2: orchestrator attempts the rebase.
             upstream = f"origin/{base_branch or 'main'}"
             try:
@@ -2512,9 +2472,6 @@ class _ReviewMixin(_OrchestratorBase):
                         reason=f"git rebase failed: {e}",
                     ),
                 )
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
@@ -2556,9 +2513,6 @@ class _ReviewMixin(_OrchestratorBase):
                             reason=error,
                         ),
                     )
-                    if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                        self._dispatch_run_ids.pop(issue.id, None)
-                    self._workspace.release(binding, issue)
                     await self._fail_review_run(
                         run=run,
                         binding=binding,
@@ -2568,115 +2522,149 @@ class _ReviewMixin(_OrchestratorBase):
                     )
                     return False
 
-            try:
-                cumulative_usage = UsageDelta()
-                if rebase_clean:
-                    # No conflicts: skip the agent entirely.
-                    log.info(
-                        "rebase was clean for %s; skipping agent", issue.identifier
+            cumulative_usage = UsageDelta()
+            if rebase_clean:
+                # No conflicts: skip the agent entirely.
+                log.info("rebase was clean for %s; skipping agent", issue.identifier)
+            while not rebase_clean:
+                # Step 3: dispatch the agent to resolve conflict markers (no git cmds).
+                prompt = merge_conflict_fix_prompt(
+                    issue_title=issue.title,
+                    issue_body=issue.description,
+                    labels=list(issue.labels),
+                    base_branch=base_branch or "main",
+                    conflicted_files=conflicted_files,
+                )
+                try:
+                    prior_total = (
+                        await db.runs.cost_for_issue(self._conn, issue.id)
+                    ) + cumulative_usage.cost_usd
+                    (
+                        run_usage,
+                        final_kind,
+                        final_returncode,
+                    ) = await self._run_fix_agent(
+                        binding=binding,
+                        issue=issue,
+                        run_id=fix_run_id,
+                        workspace_path=workspace_path,
+                        prompt=prompt,
+                        prior_total=prior_total,
                     )
-                while not rebase_clean:
-                    # Step 3: dispatch the agent to resolve conflict markers (no git cmds).
-                    prompt = merge_conflict_fix_prompt(
-                        issue_title=issue.title,
-                        issue_body=issue.description,
-                        labels=list(issue.labels),
-                        base_branch=base_branch or "main",
-                        conflicted_files=conflicted_files,
+                except Exception as e:  # noqa: BLE001
+                    log.exception(
+                        "merge-conflict fix-run execution failed for %s",
+                        issue.identifier,
                     )
-                    try:
-                        prior_total = (
-                            await db.runs.cost_for_issue(self._conn, issue.id)
-                        ) + cumulative_usage.cost_usd
-                        (
-                            run_usage,
-                            final_kind,
-                            final_returncode,
-                        ) = await self._run_fix_agent(
-                            binding=binding,
-                            issue=issue,
-                            run_id=fix_run_id,
-                            workspace_path=workspace_path,
-                            prompt=prompt,
-                            prior_total=prior_total,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        log.exception(
-                            "merge-conflict fix-run execution failed for %s",
-                            issue.identifier,
-                        )
-                        await _abort_rebase_safely(
-                            workspace_path,
-                            issue_identifier=issue.identifier,
-                            reason="merge-conflict fix-run execution failure",
-                        )
-                        await db.runs.update_status(
-                            self._conn,
-                            fix_run_id,
-                            "failed",
-                            ended_at=self._now().isoformat(),
-                            **_termination_kwargs(
-                                status="failed",
-                                exc=e,
-                                reason=f"merge-conflict fix-run execution failed: {e}",
-                            ),
-                        )
-                        await self._fail_review_run(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            error=f"merge-conflict fix-run execution failed: {e}",
-                            last_log=str(e),
-                        )
-                        return False
-                    cumulative_usage = _sum_usage(cumulative_usage, run_usage)
+                    await _abort_rebase_safely(
+                        workspace_path,
+                        issue_identifier=issue.identifier,
+                        reason="merge-conflict fix-run execution failure",
+                    )
+                    await db.runs.update_status(
+                        self._conn,
+                        fix_run_id,
+                        "failed",
+                        ended_at=self._now().isoformat(),
+                        **_termination_kwargs(
+                            status="failed",
+                            exc=e,
+                            reason=f"merge-conflict fix-run execution failed: {e}",
+                        ),
+                    )
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=f"merge-conflict fix-run execution failed: {e}",
+                        last_log=str(e),
+                    )
+                    return False
+                cumulative_usage = _sum_usage(cumulative_usage, run_usage)
 
-                    transition = on_runner_event(
-                        stage="review",
-                        event_kind=final_kind,
-                        returncode=final_returncode,
+                transition = on_runner_event(
+                    stage="review",
+                    event_kind=final_kind,
+                    returncode=final_returncode,
+                )
+                if transition.next_run_status != "completed":
+                    await _abort_rebase_safely(
+                        workspace_path,
+                        issue_identifier=issue.identifier,
+                        reason=f"merge-conflict fix-run {final_kind}",
                     )
-                    if transition.next_run_status != "completed":
-                        await _abort_rebase_safely(
-                            workspace_path,
-                            issue_identifier=issue.identifier,
-                            reason=f"merge-conflict fix-run {final_kind}",
-                        )
-                        await db.runs.update_status(
-                            self._conn,
-                            fix_run_id,
-                            transition.next_run_status,
-                            ended_at=self._now().isoformat(),
-                            **_termination_kwargs(
-                                status=transition.next_run_status,
-                                final_kind=final_kind,
-                                returncode=final_returncode,
-                                reason=f"merge-conflict fix-run ended with {final_kind}",
-                            ),
-                        )
-                        await self._fail_review_run(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            error=f"merge-conflict fix-run ended with {final_kind}",
-                            last_log="",
-                        )
-                        return False
+                    await db.runs.update_status(
+                        self._conn,
+                        fix_run_id,
+                        transition.next_run_status,
+                        ended_at=self._now().isoformat(),
+                        **_termination_kwargs(
+                            status=transition.next_run_status,
+                            final_kind=final_kind,
+                            returncode=final_returncode,
+                            reason=f"merge-conflict fix-run ended with {final_kind}",
+                        ),
+                    )
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=f"merge-conflict fix-run ended with {final_kind}",
+                        last_log="",
+                    )
+                    return False
 
-                    # Step 4: stage resolved files and continue the rebase.
-                    try:
-                        rebase_clean = await _git_add_and_continue_rebase(
-                            workspace_path, conflicted_files
-                        )
-                    except Exception as e:  # noqa: BLE001
+                # Step 4: stage resolved files and continue the rebase.
+                try:
+                    rebase_clean = await _git_add_and_continue_rebase(
+                        workspace_path, conflicted_files
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "rebase --continue failed for %s: %s", issue.identifier, e
+                    )
+                    await _abort_rebase_safely(
+                        workspace_path,
+                        issue_identifier=issue.identifier,
+                        reason="rebase --continue failure",
+                    )
+                    await db.runs.update_status(
+                        self._conn,
+                        fix_run_id,
+                        "failed",
+                        ended_at=self._now().isoformat(),
+                        **_termination_kwargs(
+                            status="failed",
+                            exc=e,
+                            reason=f"rebase --continue failed: {e}",
+                        ),
+                    )
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=f"rebase --continue failed: {e}",
+                        last_log=str(e),
+                    )
+                    return False
+                if not rebase_clean:
+                    conflicted_files = await _git_conflicted_files(workspace_path)
+                    if not conflicted_files:
+                        status_short = await _git_status_short(workspace_path)
                         log.warning(
-                            "rebase --continue failed for %s: %s", issue.identifier, e
+                            "rebase --continue non-zero but no unresolved paths "
+                            "for %s; git status:\n%s",
+                            issue.identifier,
+                            status_short or "<clean>",
                         )
                         await _abort_rebase_safely(
                             workspace_path,
                             issue_identifier=issue.identifier,
-                            reason="rebase --continue failure",
+                            reason="rebase --continue with no unresolved paths",
                         )
+                        error = "rebase --continue failed with no unresolved paths"
+                        if status_short:
+                            error += f"; git status: {status_short}"
                         await db.runs.update_status(
                             self._conn,
                             fix_run_id,
@@ -2684,60 +2672,19 @@ class _ReviewMixin(_OrchestratorBase):
                             ended_at=self._now().isoformat(),
                             **_termination_kwargs(
                                 status="failed",
-                                exc=e,
-                                reason=f"rebase --continue failed: {e}",
+                                reason=error,
                             ),
                         )
                         await self._fail_review_run(
                             run=run,
                             binding=binding,
                             issue=issue,
-                            error=f"rebase --continue failed: {e}",
-                            last_log=str(e),
+                            error=error,
+                            last_log=status_short,
                         )
                         return False
-                    if not rebase_clean:
-                        conflicted_files = await _git_conflicted_files(workspace_path)
-                        if not conflicted_files:
-                            status_short = await _git_status_short(workspace_path)
-                            log.warning(
-                                "rebase --continue non-zero but no unresolved paths "
-                                "for %s; git status:\n%s",
-                                issue.identifier,
-                                status_short or "<clean>",
-                            )
-                            await _abort_rebase_safely(
-                                workspace_path,
-                                issue_identifier=issue.identifier,
-                                reason="rebase --continue with no unresolved paths",
-                            )
-                            error = "rebase --continue failed with no unresolved paths"
-                            if status_short:
-                                error += f"; git status: {status_short}"
-                            await db.runs.update_status(
-                                self._conn,
-                                fix_run_id,
-                                "failed",
-                                ended_at=self._now().isoformat(),
-                                **_termination_kwargs(
-                                    status="failed",
-                                    reason=error,
-                                ),
-                            )
-                            await self._fail_review_run(
-                                run=run,
-                                binding=binding,
-                                issue=issue,
-                                error=error,
-                                last_log=status_short,
-                            )
-                            return False
 
-            finally:
-                if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                self._workspace.release(binding, issue)
-
+            drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
 
             pushed_sha = await self._validate_review_fix_advanced(
@@ -2811,6 +2758,17 @@ class _ReviewMixin(_OrchestratorBase):
                 state=state,
             )
             return True
+
+        result = await self._run_fix_dispatch(
+            binding=binding,
+            issue=issue,
+            ignored_stages=("review",),
+            on_acquire_failure=on_acquire_failure,
+            body=body,
+            setup=setup,
+            after_dedup=after_dedup,
+        )
+        return bool(result)
 
     async def _validate_review_fix_advanced(
         self,

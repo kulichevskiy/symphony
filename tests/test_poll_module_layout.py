@@ -525,6 +525,65 @@ def test_deduped_names_defined_in_exactly_one_module() -> None:
         assert len(modules) == 1, f"{name} defined in {modules}, expected exactly one"
 
 
+# SYM-157: the shared fix-run dispatch scaffolding lives in one helper on
+# `_OrchestratorBase` and every `_dispatch_*_fix_run` wrapper routes through it.
+_FIX_DISPATCH_WRAPPERS = [
+    "_dispatch_ci_fix_run",
+    "_dispatch_review_comment_fix_run",
+    "_dispatch_merge_conflict_fix_run",
+    "_dispatch_merge_required_check_fix_run",
+    "_dispatch_merge_conflict_rebase_fix_run",
+]
+
+
+def _calls_self_method(node: ast.AST, method: str) -> bool:
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == method
+            and isinstance(sub.func.value, ast.Name)
+            and sub.func.value.id == "self"
+        ):
+            return True
+    return False
+
+
+def test_run_fix_dispatch_defined_once_on_base() -> None:
+    member = _OrchestratorBase._run_fix_dispatch
+    assert member.__qualname__.startswith("_OrchestratorBase."), member.__qualname__
+    poll_dir = Path(poll.__file__).parent
+    owners: list[str] = []
+    for path in sorted(poll_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name == "_run_fix_dispatch"
+                and not _is_stub(node)
+            ):
+                owners.append(path.name)
+    assert owners == ["_base.py"], owners
+
+
+def test_fix_run_wrappers_route_through_shared_helper() -> None:
+    poll_dir = Path(poll.__file__).parent
+    routed: set[str] = set()
+    for path in sorted(poll_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name in _FIX_DISPATCH_WRAPPERS
+                and _calls_self_method(node, "_run_fix_dispatch")
+            ):
+                routed.add(node.name)
+    assert routed == set(_FIX_DISPATCH_WRAPPERS), (
+        f"wrappers not routed through _run_fix_dispatch: "
+        f"{set(_FIX_DISPATCH_WRAPPERS) - routed}"
+    )
+
+
 def test_orchestrator_inherits_review_mixin() -> None:
     assert issubclass(poll.Orchestrator, _ReviewMixin)
     assert issubclass(_ReviewMixin, _OrchestratorBase)
