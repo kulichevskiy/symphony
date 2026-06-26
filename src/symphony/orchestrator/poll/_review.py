@@ -1297,47 +1297,25 @@ class _ReviewMixin(_OrchestratorBase):
                 last_log="",
             )
             return False
+        pr_number = state.pr_number
 
-        try:
-            checks = await self._gh.pr_checks(state.pr_number, repo=binding.github_repo)
-        except GitHubError as e:
-            failures = await db.review_state.bump_ci_fetch_failures(
-                self._conn, storage_issue_id
-            )
-            log.warning(
-                "gh pr checks failed for %s#%d (%d/%d): %s",
-                binding.github_repo,
-                state.pr_number,
-                failures,
-                CI_FETCH_FAILURE_LIMIT,
-                e,
-            )
-            if failures >= CI_FETCH_FAILURE_LIMIT:
-                await self._fail_review_run(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    error=(
-                        "gh pr checks failed "
-                        f"{failures} consecutive times: {e}"
-                    ),
-                    last_log=str(e),
-            )
+        checks = await self._fetch_review_pr_checks(
+            run=run, binding=binding, issue=issue, pr_number=pr_number
+        )
+        if checks is None:
             return False
 
-        await db.review_state.reset_ci_fetch_failures(self._conn, storage_issue_id)
-
         head_sha = _unknown_head_ci_scope(checks)
-        mergeable: str = ""
+        mergeable = ""
         try:
-            view = await self._gh.pr_view(state.pr_number, repo=binding.github_repo)
+            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
             head_sha = str(view.get("headRefOid") or "") or head_sha
             mergeable = str(view.get("mergeable") or "")
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "could not fetch PR view for %s#%d: %s",
                 binding.github_repo,
-                state.pr_number,
+                pr_number,
                 e,
             )
 
@@ -1347,9 +1325,120 @@ class _ReviewMixin(_OrchestratorBase):
             sha=head_sha,
         )
         ci_runs = [_review_check_from_gh(c) for c in checks.runs]
-        issue_comments: list[dict[str, object]] | None = None
         remote_review = binding.resolved_remote_review()
 
+        verdict, issue_comments = await self._compute_review_verdict(
+            binding=binding,
+            pr_number=pr_number,
+            state=state,
+            ci_runs=ci_runs,
+            head_sha=head_sha,
+            head_committed_at=head_committed_at,
+            mergeable=mergeable,
+            remote_review=remote_review,
+        )
+
+        if await self._review_poll_deferred_by_deliver_failed_wait(
+            storage_issue_id, run.id
+        ):
+            return False
+
+        if remote_review:
+            await self._maybe_post_codex_lgtm(
+                run=run,
+                binding=binding,
+                issue=issue,
+                state=state,
+                pr_number=pr_number,
+                head_committed_at=head_committed_at,
+                issue_comments=issue_comments,
+            )
+
+        if (
+            remote_review
+            and verdict.kind is VerdictKind.PENDING
+            and verdict.rule == "no_signal"
+        ):
+            await self._maybe_rearm_codex_review_for_no_signal(
+                run=run,
+                binding=binding,
+                issue=issue,
+                state=state,
+                head_sha=head_sha,
+            )
+
+        if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
+            return False
+
+        return await self._dispatch_review_changes_requested_fix(
+            run=run,
+            binding=binding,
+            issue=issue,
+            state=state,
+            checks=checks,
+            verdict=verdict,
+        )
+
+    async def _fetch_review_pr_checks(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+    ) -> PRChecks | None:
+        """Fetch PR CI checks, failing the run after repeated fetch errors.
+
+        Returns None (and leaves the run unchanged, or fails it once the
+        consecutive-failure limit is hit) when checks can't be fetched.
+        """
+        storage_issue_id = run.issue_id
+        try:
+            checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            failures = await db.review_state.bump_ci_fetch_failures(
+                self._conn, storage_issue_id
+            )
+            log.warning(
+                "gh pr checks failed for %s#%d (%d/%d): %s",
+                binding.github_repo,
+                pr_number,
+                failures,
+                CI_FETCH_FAILURE_LIMIT,
+                e,
+            )
+            if failures >= CI_FETCH_FAILURE_LIMIT:
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"gh pr checks failed {failures} consecutive times: {e}",
+                    last_log=str(e),
+                )
+            return None
+
+        await db.review_state.reset_ci_fetch_failures(self._conn, storage_issue_id)
+        return checks
+
+    async def _compute_review_verdict(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_number: int,
+        state: db.review_state.ReviewState,
+        ci_runs: list[ReviewCheckRun],
+        head_sha: str,
+        head_committed_at: str,
+        mergeable: str,
+        remote_review: bool,
+    ) -> tuple[Verdict, list[dict[str, object]] | None]:
+        """Evaluate CI + review signals for the current head into a verdict.
+
+        Returns the verdict alongside the fetched PR issue comments (when the
+        fully-remote branch loaded them, else None) so the caller can re-use
+        them for the Codex-LGTM check.
+        """
+        issue_comments: list[dict[str, object]] | None = None
         # Only fetch review signals when CI is clean — Rule 1 (failing CI)
         # pre-empts all comment/review rules, so avoid the extra API calls.
         has_blocking_ci = any(
@@ -1379,14 +1468,14 @@ class _ReviewMixin(_OrchestratorBase):
                 # honor human review-state changes.
                 try:
                     raw_reviews = await self._gh.pr_reviews(
-                        state.pr_number, repo=binding.github_repo
+                        pr_number, repo=binding.github_repo
                     )
                     review_signal_reviews = _reviews_from_github(raw_reviews)
                 except GitHubError as e:
                     log.warning(
                         "could not fetch PR reviews for %s#%d: %s",
                         binding.github_repo,
-                        state.pr_number,
+                        pr_number,
                         e,
                     )
                     review_signal_reviews = ()
@@ -1396,7 +1485,7 @@ class _ReviewMixin(_OrchestratorBase):
                 if remote_review:
                     try:
                         raw_comments = await self._gh.pr_review_comments(
-                            state.pr_number, repo=binding.github_repo
+                            pr_number, repo=binding.github_repo
                         )
                         review_signal_comments = _review_comments_from_github(
                             raw_comments
@@ -1405,21 +1494,21 @@ class _ReviewMixin(_OrchestratorBase):
                         log.warning(
                             "could not fetch PR review comments for %s#%d: %s",
                             binding.github_repo,
-                            state.pr_number,
+                            pr_number,
                             e,
                         )
                         review_signal_comments = []
 
                     try:
                         raw_reactions = await self._gh.pr_reactions(
-                            state.pr_number, repo=binding.github_repo
+                            pr_number, repo=binding.github_repo
                         )
                         review_signal_reactions = _reactions_from_github(raw_reactions)
                     except GitHubError as e:
                         log.warning(
                             "could not fetch PR reactions for %s#%d: %s",
                             binding.github_repo,
-                            state.pr_number,
+                            pr_number,
                             e,
                         )
                         review_signal_reactions = ()
@@ -1446,7 +1535,7 @@ class _ReviewMixin(_OrchestratorBase):
         elif not remote_review:
             try:
                 raw_reviews = await self._gh.pr_reviews(
-                    state.pr_number, repo=binding.github_repo
+                    pr_number, repo=binding.github_repo
                 )
                 human_reviews = tuple(
                     r
@@ -1457,7 +1546,7 @@ class _ReviewMixin(_OrchestratorBase):
                 log.warning(
                     "could not fetch PR reviews for %s#%d: %s",
                     binding.github_repo,
-                    state.pr_number,
+                    pr_number,
                     e,
                 )
                 human_reviews = ()
@@ -1475,21 +1564,21 @@ class _ReviewMixin(_OrchestratorBase):
         else:
             try:
                 raw_reviews = await self._gh.pr_reviews(
-                    state.pr_number, repo=binding.github_repo
+                    pr_number, repo=binding.github_repo
                 )
                 reviews: tuple[Review, ...] = _reviews_from_github(raw_reviews)
             except GitHubError as e:
                 log.warning(
                     "could not fetch PR reviews for %s#%d: %s",
                     binding.github_repo,
-                    state.pr_number,
+                    pr_number,
                     e,
                 )
                 reviews = ()
 
             try:
                 raw_comments = await self._gh.pr_review_comments(
-                    state.pr_number, repo=binding.github_repo
+                    pr_number, repo=binding.github_repo
                 )
                 comments: list[ReviewComment] = _review_comments_from_github(
                     raw_comments
@@ -1498,34 +1587,34 @@ class _ReviewMixin(_OrchestratorBase):
                 log.warning(
                     "could not fetch PR review comments for %s#%d: %s",
                     binding.github_repo,
-                    state.pr_number,
+                    pr_number,
                     e,
                 )
                 comments = []
 
             try:
                 raw_reactions = await self._gh.pr_reactions(
-                    state.pr_number, repo=binding.github_repo
+                    pr_number, repo=binding.github_repo
                 )
                 reactions: tuple[Reaction, ...] = _reactions_from_github(raw_reactions)
             except GitHubError as e:
                 log.warning(
                     "could not fetch PR reactions for %s#%d: %s",
                     binding.github_repo,
-                    state.pr_number,
+                    pr_number,
                     e,
                 )
                 reactions = ()
 
             try:
                 issue_comments = await self._gh.pr_issue_comments(
-                    state.pr_number, repo=binding.github_repo
+                    pr_number, repo=binding.github_repo
                 )
             except GitHubError as e:
                 log.warning(
                     "could not fetch PR issue comments for %s#%d: %s",
                     binding.github_repo,
-                    state.pr_number,
+                    pr_number,
                     e,
                 )
                 issue_comments = []
@@ -1545,37 +1634,25 @@ class _ReviewMixin(_OrchestratorBase):
                 ),
             )
 
-        if await self._review_poll_deferred_by_deliver_failed_wait(
-            storage_issue_id, run.id
-        ):
-            return False
+        return verdict, issue_comments
 
-        if remote_review:
-            await self._maybe_post_codex_lgtm(
-                run=run,
-                binding=binding,
-                issue=issue,
-                state=state,
-                pr_number=state.pr_number,
-                head_committed_at=head_committed_at,
-                issue_comments=issue_comments,
-            )
+    async def _dispatch_review_changes_requested_fix(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+        checks: PRChecks,
+        verdict: Verdict,
+    ) -> bool:
+        """Dispatch the fix-run a CHANGES_REQUESTED verdict calls for.
 
-        if (
-            remote_review
-            and verdict.kind is VerdictKind.PENDING
-            and verdict.rule == "no_signal"
-        ):
-            await self._maybe_rearm_codex_review_for_no_signal(
-                run=run,
-                binding=binding,
-                issue=issue,
-                state=state,
-                head_sha=head_sha,
-            )
-
-        if verdict.kind is not VerdictKind.CHANGES_REQUESTED:
-            return False
+        Routes to the merge-conflict, failing-CI, or review-comment fix path,
+        parking for approval at the iteration cap and gating on the per-issue
+        token budget and the transient-retry backoff.
+        """
+        storage_issue_id = run.issue_id
         # Soft per-issue token-budget gate at the remote-review / merge-gate
         # fix-run dispatch boundary: park instead of dispatching the next fix.
         if await self._maybe_park_for_token_budget(storage_issue_id, run.id, binding):
