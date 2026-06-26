@@ -2859,18 +2859,13 @@ class _MergeMixin(_OrchestratorBase):
                 )
         workspace_path: Path | None = None
         try:
-            try:
-                workspace_path = await self._workspace.acquire(binding, issue)
-            except Exception as e:  # noqa: BLE001
-                log.exception("workspace acquire failed for merge %s", issue.identifier)
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=f"workspace acquire failed: {e}",
-                    exc=e,
-                )
+            workspace_path = await self._acquire_merge_workspace(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+            )
+            if workspace_path is None:
                 return run_id
 
             # Sync workspace to the remote branch so the agent starts from a
@@ -2878,274 +2873,433 @@ class _MergeMixin(_OrchestratorBase):
             # Review-fix runs may have left behind local commits that diverge
             # from the remote; resetting here avoids a non-fast-forward failure.
             branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
-            try:
-                await _sync_workspace_to_remote(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "workspace sync failed for merge %s, proceeding anyway: %s",
-                    issue.identifier,
-                    e,
-                )
-
-            try:
-                prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
-                (
-                    cumulative_usage,
-                    final_kind,
-                    final_returncode,
-                ) = await self._run_merge_agent(
-                    binding=binding,
-                    issue=issue,
-                    run_id=run_id,
-                    workspace_path=workspace_path,
-                    pr_url=pr_url,
-                    prior_total=prior_total,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.exception("merge agent execution failed for %s", issue.identifier)
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=f"merge agent execution failed: {e}",
-                    exc=e,
-                )
-                return run_id
-
-            await _add_run_usage(self._conn, run_id, cumulative_usage)
-
-            transition = on_runner_event(
-                stage="merge",
-                event_kind=final_kind,
-                returncode=final_returncode,
+            await self._sync_merge_workspace(
+                workspace_path=workspace_path,
+                branch=branch,
+                issue=issue,
             )
-            if transition.next_run_status != "completed":
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=f"merge runner ended with {final_kind}",
-                    final_kind=final_kind,
-                    returncode=final_returncode,
-                )
+
+            if await self._run_merge_agent_step(
+                binding=binding,
+                issue=issue,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                pr_url=pr_url,
+            ):
                 return run_id
 
-            try:
-                await self._push_fn(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning("merge push failed for %s#%d: %s", binding.github_repo, pr_number, e)
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=str(e),
-                    exc=e,
-                )
+            if await self._push_merge_branch(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                branch=branch,
+                pr_number=pr_number,
+            ):
                 return run_id
 
-            try:
-                premerge_view = await self._gh.pr_view(
-                    pr_number,
-                    repo=binding.github_repo,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "could not pre-check mergeability for %s#%d before merge: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                if approved_head_sha:
-                    await self._mark_merge_needs_approval(
-                        binding=binding,
-                        issue=issue,
-                        pr_url=pr_url,
-                        run_id=run_id,
-                        reason=f"post-push HEAD verification failed: {e}",
-                        exc=e,
-                    )
-                    return run_id
-            else:
-                premerge_head_sha = str(premerge_view.get("headRefOid") or "")
-                if approved_head_sha and premerge_head_sha != approved_head_sha:
-                    try:
-                        verdict = await self._review_verdict_for_pr(
-                            binding=binding,
-                            pr_number=pr_number,
-                            view=premerge_view,
-                        )
-                    except GitHubError as e:
-                        log.warning(
-                            "could not classify review for post-merge-agent HEAD "
-                            "%s#%d at %s: %s",
-                            binding.github_repo,
-                            pr_number,
-                            premerge_head_sha[:12] or "(unknown)",
-                            e,
-                        )
-                        verdict = None
-                    if verdict is None or verdict.kind is not VerdictKind.APPROVED:
-                        reason = (
-                            "merge-agent pushed unreviewed HEAD "
-                            f"{premerge_head_sha or '(unknown)'}"
-                        )
-                        await self._mark_merge_needs_approval(
-                            binding=binding,
-                            issue=issue,
-                            pr_url=pr_url,
-                            run_id=run_id,
-                            reason=reason,
-                        )
-                        state = await db.review_state.get(self._conn, issue.id)
-                        await self._retrigger_codex_review_unless_approved(
-                            binding=binding,
-                            issue=issue,
-                            state=state,
-                        )
-                        return run_id
-
-                if _pr_view_has_merge_conflict(premerge_view):
-                    await self._dispatch_merge_conflict_rebase_fix_run(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        view=premerge_view,
-                        merge_run_id=run_id,
-                        dispatch_capacity_held=True,
-                    )
-                    return run_id
-
-            try:
-                await self._gh.pr_merge(
-                    pr_number,
-                    strategy=binding.merge_strategy,
-                    auto=binding.allow_auto_merge,
-                    repo=binding.github_repo,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("merge failed for %s#%d: %s", binding.github_repo, pr_number, e)
-                if _is_merge_conflict_error(e):
-                    try:
-                        conflict_view = await self._gh.pr_view(
-                            pr_number,
-                            repo=binding.github_repo,
-                        )
-                    except Exception as view_error:  # noqa: BLE001
-                        log.warning(
-                            "could not refresh PR base after merge conflict for "
-                            "%s#%d: %s",
-                            binding.github_repo,
-                            pr_number,
-                            view_error,
-                        )
-                        conflict_view = None
-                    await self._dispatch_merge_conflict_rebase_fix_run(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        view=conflict_view,
-                        merge_run_id=run_id,
-                        dispatch_capacity_held=True,
-                    )
-                    return run_id
-                required_view: dict[str, object] | None = None
-                if (
-                    "premerge_view" in locals()
-                    and isinstance(premerge_view, dict)
-                    and "statusCheckRollup" in premerge_view
-                ):
-                    required_view = premerge_view
-                else:
-                    try:
-                        required_view = await self._gh.pr_view(
-                            pr_number,
-                            repo=binding.github_repo,
-                            include_status_checks=True,
-                        )
-                    except Exception as view_error:  # noqa: BLE001
-                        log.warning(
-                            "could not refresh PR checks after merge failure for "
-                            "%s#%d: %s",
-                            binding.github_repo,
-                            pr_number,
-                            view_error,
-                        )
-                if required_view is not None:
-                    required_failures = await self._required_check_failures_for_view(
-                        binding=binding,
-                        pr_number=pr_number,
-                        view=required_view,
-                        required_context_cache={},
-                    )
-                    if required_failures:
-                        dispatched = await self._dispatch_merge_required_check_fix_if_allowed(
-                            binding=binding,
-                            issue=issue,
-                            pr_number=pr_number,
-                            pr_url=pr_url,
-                            head_sha=str(required_view.get("headRefOid") or ""),
-                            failing_checks=required_failures,
-                            merge_error=str(e),
-                            merge_run_id=run_id,
-                            dispatch_capacity_held=True,
-                        )
-                        if (
-                            dispatched
-                            or await db.operator_waits.get(self._conn, issue.id)
-                            is not None
-                        ):
-                            return run_id
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=str(e),
-                    exc=e,
-                )
+            halted, premerge_view = await self._verify_premerge_head(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+                approved_head_sha=approved_head_sha,
+            )
+            if halted:
                 return run_id
 
-            try:
-                merged = await self._mark_merge_done_if_merged(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "could not verify merge completion for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=f"merge finalization failed: {e}",
-                    exc=e,
-                )
+            if await self._execute_pr_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+                premerge_view=premerge_view,
+            ):
                 return run_id
-            if not merged:
-                await db.runs.update_status(
-                    self._conn,
-                    run_id,
-                    "completed",
-                    ended_at=self._now().isoformat(),
-                )
+
+            await self._finalize_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+            )
             return run_id
         finally:
             if workspace_path is not None:
                 self._workspace.release(binding, issue)
             self._dispatch_run_ids.pop(issue.id, None)
+
+    async def _acquire_merge_workspace(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        run_id: str,
+    ) -> Path | None:
+        """Acquire the per-issue workspace clone; mark needs-approval and return
+        None on failure so the caller halts the run."""
+        try:
+            return await self._workspace.acquire(binding, issue)
+        except Exception as e:  # noqa: BLE001
+            log.exception("workspace acquire failed for merge %s", issue.identifier)
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=f"workspace acquire failed: {e}",
+                exc=e,
+            )
+            return None
+
+    async def _sync_merge_workspace(
+        self,
+        *,
+        workspace_path: Path,
+        branch: str,
+        issue: LinearIssue,
+    ) -> None:
+        """Reset the workspace to the remote branch; a failure is logged and
+        tolerated (the merge proceeds anyway)."""
+        try:
+            await _sync_workspace_to_remote(workspace_path, branch)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "workspace sync failed for merge %s, proceeding anyway: %s",
+                issue.identifier,
+                e,
+            )
+
+    async def _run_merge_agent_step(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        run_id: str,
+        workspace_path: Path,
+        pr_url: str,
+    ) -> bool:
+        """Run the merge agent, record its usage, and check the runner verdict.
+        Returns True if the run halted (caller returns the run id)."""
+        try:
+            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            (
+                cumulative_usage,
+                final_kind,
+                final_returncode,
+            ) = await self._run_merge_agent(
+                binding=binding,
+                issue=issue,
+                run_id=run_id,
+                workspace_path=workspace_path,
+                pr_url=pr_url,
+                prior_total=prior_total,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("merge agent execution failed for %s", issue.identifier)
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=f"merge agent execution failed: {e}",
+                exc=e,
+            )
+            return True
+
+        await _add_run_usage(self._conn, run_id, cumulative_usage)
+
+        transition = on_runner_event(
+            stage="merge",
+            event_kind=final_kind,
+            returncode=final_returncode,
+        )
+        if transition.next_run_status != "completed":
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=f"merge runner ended with {final_kind}",
+                final_kind=final_kind,
+                returncode=final_returncode,
+            )
+            return True
+        return False
+
+    async def _push_merge_branch(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        run_id: str,
+        workspace_path: Path,
+        branch: str,
+        pr_number: int,
+    ) -> bool:
+        """Push the merge branch; mark needs-approval and return True (halt) on
+        failure."""
+        try:
+            await self._push_fn(workspace_path, branch)
+        except Exception as e:  # noqa: BLE001
+            log.warning("merge push failed for %s#%d: %s", binding.github_repo, pr_number, e)
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=str(e),
+                exc=e,
+            )
+            return True
+        return False
+
+    async def _verify_premerge_head(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+        approved_head_sha: str,
+    ) -> tuple[bool, dict[str, object] | None]:
+        """Re-fetch the PR before merging and verify the pushed HEAD is the
+        approved one (re-classifying review on drift) and conflict-free.
+
+        Returns ``(halted, premerge_view)``. ``halted`` True means the caller
+        returns the run id; ``premerge_view`` is the fetched view (None when the
+        pre-check could not run), forwarded to the merge step for required-check
+        recovery.
+        """
+        try:
+            premerge_view = await self._gh.pr_view(
+                pr_number,
+                repo=binding.github_repo,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not pre-check mergeability for %s#%d before merge: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            if approved_head_sha:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"post-push HEAD verification failed: {e}",
+                    exc=e,
+                )
+                return True, None
+            return False, None
+
+        premerge_head_sha = str(premerge_view.get("headRefOid") or "")
+        if approved_head_sha and premerge_head_sha != approved_head_sha:
+            try:
+                verdict = await self._review_verdict_for_pr(
+                    binding=binding,
+                    pr_number=pr_number,
+                    view=premerge_view,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not classify review for post-merge-agent HEAD "
+                    "%s#%d at %s: %s",
+                    binding.github_repo,
+                    pr_number,
+                    premerge_head_sha[:12] or "(unknown)",
+                    e,
+                )
+                verdict = None
+            if verdict is None or verdict.kind is not VerdictKind.APPROVED:
+                reason = (
+                    "merge-agent pushed unreviewed HEAD "
+                    f"{premerge_head_sha or '(unknown)'}"
+                )
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=reason,
+                )
+                state = await db.review_state.get(self._conn, issue.id)
+                await self._retrigger_codex_review_unless_approved(
+                    binding=binding,
+                    issue=issue,
+                    state=state,
+                )
+                return True, premerge_view
+
+        if _pr_view_has_merge_conflict(premerge_view):
+            await self._dispatch_merge_conflict_rebase_fix_run(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                view=premerge_view,
+                merge_run_id=run_id,
+                dispatch_capacity_held=True,
+            )
+            return True, premerge_view
+
+        return False, premerge_view
+
+    async def _execute_pr_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+        premerge_view: dict[str, object] | None,
+    ) -> bool:
+        """Merge the PR, recovering from merge conflicts / required-check
+        failures. Returns True if the run halted (caller returns the run id)."""
+        try:
+            await self._gh.pr_merge(
+                pr_number,
+                strategy=binding.merge_strategy,
+                auto=binding.allow_auto_merge,
+                repo=binding.github_repo,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("merge failed for %s#%d: %s", binding.github_repo, pr_number, e)
+            if _is_merge_conflict_error(e):
+                try:
+                    conflict_view = await self._gh.pr_view(
+                        pr_number,
+                        repo=binding.github_repo,
+                    )
+                except Exception as view_error:  # noqa: BLE001
+                    log.warning(
+                        "could not refresh PR base after merge conflict for "
+                        "%s#%d: %s",
+                        binding.github_repo,
+                        pr_number,
+                        view_error,
+                    )
+                    conflict_view = None
+                await self._dispatch_merge_conflict_rebase_fix_run(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    view=conflict_view,
+                    merge_run_id=run_id,
+                    dispatch_capacity_held=True,
+                )
+                return True
+            required_view: dict[str, object] | None = None
+            if (
+                premerge_view is not None
+                and isinstance(premerge_view, dict)
+                and "statusCheckRollup" in premerge_view
+            ):
+                required_view = premerge_view
+            else:
+                try:
+                    required_view = await self._gh.pr_view(
+                        pr_number,
+                        repo=binding.github_repo,
+                        include_status_checks=True,
+                    )
+                except Exception as view_error:  # noqa: BLE001
+                    log.warning(
+                        "could not refresh PR checks after merge failure for "
+                        "%s#%d: %s",
+                        binding.github_repo,
+                        pr_number,
+                        view_error,
+                    )
+            if required_view is not None:
+                required_failures = await self._required_check_failures_for_view(
+                    binding=binding,
+                    pr_number=pr_number,
+                    view=required_view,
+                    required_context_cache={},
+                )
+                if required_failures:
+                    dispatched = await self._dispatch_merge_required_check_fix_if_allowed(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        head_sha=str(required_view.get("headRefOid") or ""),
+                        failing_checks=required_failures,
+                        merge_error=str(e),
+                        merge_run_id=run_id,
+                        dispatch_capacity_held=True,
+                    )
+                    if (
+                        dispatched
+                        or await db.operator_waits.get(self._conn, issue.id)
+                        is not None
+                    ):
+                        return True
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=str(e),
+                exc=e,
+            )
+            return True
+        return False
+
+    async def _finalize_merge(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+    ) -> None:
+        """Confirm the merge landed and close out the run; a verification error
+        marks needs-approval."""
+        try:
+            merged = await self._mark_merge_done_if_merged(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "could not verify merge completion for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            await self._mark_merge_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                run_id=run_id,
+                reason=f"merge finalization failed: {e}",
+                exc=e,
+            )
+            return
+        if not merged:
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "completed",
+                ended_at=self._now().isoformat(),
+            )
 
 
     async def _mark_merge_done_if_merged(

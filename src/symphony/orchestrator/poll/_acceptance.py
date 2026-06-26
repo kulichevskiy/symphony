@@ -18,7 +18,7 @@ import asyncio
 import json
 import logging
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -154,6 +154,18 @@ def _acceptance_artifact_path(workspace_path: Path, raw_path: str) -> Path:
     except ValueError as e:
         raise OSError(f"acceptance artifact path escapes workspace: {raw_path}") from e
     return resolved
+
+
+@dataclass(frozen=True)
+class _AcceptancePrep:
+    """Inputs computed by `_begin_acceptance_run` and consumed by the verdict step."""
+
+    effective_mode: str
+    degrade_note: str | None
+    preview_url: str
+    preview_resolution_error: str
+    criteria_names: list[str]
+    criteria_predicates: list[str]
 
 
 class _AcceptanceMixin(_OrchestratorBase):
@@ -620,162 +632,22 @@ class _AcceptanceMixin(_OrchestratorBase):
 
         self._dispatch_run_ids[issue.id] = run_id
         try:
-            await self._complete_review_monitors_for_merge(issue)
-            degrade_note = (
-                _acceptance_degrade_note(issue.description)
-                if binding.acceptance.mode != _CODE_ONLY_ACCEPTANCE_MODE
-                else None
-            )
-            effective_mode = _CODE_ONLY_ACCEPTANCE_MODE if degrade_note else binding.acceptance.mode
-            if degrade_note:
-                log.info("%s for %s", degrade_note, issue.identifier)
-            preview_url = ""
-            preview_resolution_error = ""
-            if not degrade_note:
-                if effective_mode == "preview" and binding.acceptance.preview_url_pattern:
-                    try:
-                        preview_url = render_preview_url(
-                            acceptance=binding.acceptance,
-                            issue_identifier=issue.identifier,
-                            issue_id=issue.id,
-                            pr_number=pr_number,
-                            pr_url=pr_url,
-                        )
-                    except PreviewResolutionError as e:
-                        preview_resolution_error = str(e)
-                        preview_url = e.url
-                else:
-                    preview_url = self._acceptance_preview_url(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                    )
-            extracted_criteria = extract_acceptance_criteria(issue.description)
-            criteria_names = _acceptance_criterion_names(extracted_criteria)
-            criteria_predicates = _acceptance_criterion_predicates(extracted_criteria)
-            await db.acceptance_state.begin_acceptance(
-                self._conn,
-                issue.id,
+            prep = await self._begin_acceptance_run(
+                binding=binding,
+                issue=issue,
                 pr_number=pr_number,
                 pr_url=pr_url,
                 pr_head_sha=pr_head_sha,
-                mode=binding.acceptance.mode,
-                preview_url=preview_url,
-                extracted_criteria=json.dumps(extracted_criteria),
                 reset_iteration=reset_iteration,
             )
-            await self._post_acceptance_criteria_comment(
+            verdict = await self._compute_acceptance_verdict(
+                run_id=run_id,
                 binding=binding,
                 issue=issue,
-                criteria=extracted_criteria,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                prep=prep,
             )
-            await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
-
-            verdict: AcceptanceVerdict | None = None
-            if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev", "preview"}:
-                verdict = AcceptanceVerdict(
-                    kind="pass",
-                    criteria=criteria_names,
-                    cost=0.0,
-                    hero_screenshot_url="",
-                    details=(
-                        f"Acceptance mode {binding.acceptance.mode!r} is configured, "
-                        "but this mode does not have a real runner in this slice. "
-                        "Preserving pass-through acceptance behavior until that "
-                        "mode's runner is implemented."
-                    ),
-                )
-            elif preview_resolution_error:
-                verdict = AcceptanceVerdict(
-                    kind="infra_error",
-                    criteria=criteria_names,
-                    cost=0.0,
-                    hero_screenshot_url="",
-                    details=preview_resolution_error,
-                    preview_url=preview_url,
-                )
-            elif effective_mode == "preview":
-                try:
-                    preview_url = await resolve_preview_url(
-                        acceptance=binding.acceptance,
-                        pr_number=pr_number,
-                        issue_identifier=issue.identifier,
-                        issue_id=issue.id,
-                        pr_url=pr_url,
-                    )
-                except PreviewResolutionError as e:
-                    verdict = AcceptanceVerdict(
-                        kind="infra_error",
-                        criteria=criteria_names,
-                        cost=0.0,
-                        hero_screenshot_url="",
-                        details=str(e),
-                        preview_url=e.url,
-                    )
-
-            if verdict is None:
-                try:
-                    pr_diff_summary = await self._acceptance_pr_diff(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                    )
-                except _AcceptancePrDiffUnavailable as e:
-                    verdict = AcceptanceVerdict(
-                        kind="infra_error",
-                        criteria=criteria_names,
-                        cost=0.0,
-                        hero_screenshot_url="",
-                        details=str(e),
-                    )
-                else:
-                    quick_skip = (
-                        quick_skip_trivial_acceptance(
-                            linear_description=issue.description,
-                            pr_diff_summary=pr_diff_summary,
-                            criteria=criteria_names,
-                        )
-                        if effective_mode == _CODE_ONLY_ACCEPTANCE_MODE
-                        else None
-                    )
-                    if quick_skip is not None:
-                        verdict = quick_skip
-                    else:
-                        workspace_path = await self._workspace.acquire(binding, issue)
-                        try:
-                            verdict = await run_acceptance(
-                                runner=self._runner,
-                                run_id=run_id,
-                                workspace_path=workspace_path,
-                                mode=effective_mode,
-                                linear_description=issue.description,
-                                pr_diff_summary=pr_diff_summary,
-                                taste_guide=load_taste_guide(
-                                    binding_taste_guide=binding.acceptance.taste_guide,
-                                ),
-                                criteria=criteria_predicates,
-                                stall_secs=binding.acceptance.time_cap_minutes * 60,
-                                preview_url=preview_url,
-                                dev_command=binding.acceptance.dev_command,
-                                dev_port=binding.acceptance.dev_port,
-                            )
-                            verdict = _replace_acceptance_criteria_labels(
-                                verdict=verdict,
-                                criteria_names=criteria_names,
-                                criteria_predicates=criteria_predicates,
-                            )
-                            if effective_mode in {"dev", "preview"}:
-                                verdict = await self._upload_acceptance_screenshots(
-                                    binding=binding,
-                                    issue=issue,
-                                    workspace_path=workspace_path,
-                                    verdict=verdict,
-                                )
-                        finally:
-                            self._workspace.release(binding, issue)
-
-            verdict = _with_acceptance_degrade_note(verdict, degrade_note)
 
             verdict_usage = verdict.usage
             if verdict_usage.has_usage():
@@ -805,114 +677,15 @@ class _AcceptanceMixin(_OrchestratorBase):
                 preview_url=verdict.preview_url,
             )
 
-            ended_at = self._now().isoformat()
-            if verdict.kind == "pass":
-                await db.runs.update_status(
-                    self._conn,
-                    run_id,
-                    "completed",
-                    ended_at=ended_at,
-                )
-                if self._dispatch_run_ids.get(issue.id) == run_id:
-                    self._dispatch_run_ids.pop(issue.id, None)
-                merge_issue = await self._refresh_issue_for_acceptance_merge_handoff(binding, issue)
-                if _needs_human_approval_label_present(merge_issue):
-                    await self._open_merge_wait_for_human_approval_label(
-                        binding=binding,
-                        issue=merge_issue,
-                        pr_url=pr_url,
-                    )
-                else:
-                    await self._merge_approved_pr(
-                        binding=binding,
-                        issue=merge_issue,
-                        pr_number=pr_number,
-                        pr_url=pr_url,
-                        approved_head_sha=pr_head_sha,
-                    )
-                return run_id
-
-            if verdict.kind == "infra_error":
-                state = await db.acceptance_state.get(self._conn, issue.id)
-                if state.infra_retries >= ACCEPTANCE_INFRA_RETRY_LIMIT:
-                    await db.runs.update_status(
-                        self._conn,
-                        run_id,
-                        "failed",
-                        ended_at=ended_at,
-                        **_termination_kwargs(
-                            status="failed",
-                            reason=f"acceptance infra_error: {verdict.details}",
-                        ),
-                    )
-                    await self._track_acceptance_blocked_wait(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=pr_number,
-                        run_id=run_id,
-                        verdict=verdict,
-                    )
-                    return run_id
-                await db.acceptance_state.bump_infra_retries(self._conn, issue.id)
-                await db.runs.update_status(
-                    self._conn,
-                    run_id,
-                    "failed",
-                    ended_at=ended_at,
-                    **_termination_kwargs(
-                        status="failed",
-                        reason=f"acceptance infra_error: {verdict.details}",
-                    ),
-                )
-                return run_id
-
-            state = await db.acceptance_state.get(self._conn, issue.id)
-            await db.runs.update_status(
-                self._conn,
-                run_id,
-                "failed",
-                ended_at=ended_at,
-                **_termination_kwargs(
-                    status="failed",
-                    reason=f"acceptance rejected: {verdict.details}",
-                ),
+            return await self._finalize_acceptance_verdict(
+                run_id=run_id,
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_head_sha=pr_head_sha,
+                verdict=verdict,
             )
-            if state.iteration < ACCEPTANCE_FIX_ITERATION_CAP:
-                dispatched = await self._dispatch_acceptance_fix_run(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    pr_head_sha=pr_head_sha,
-                    verdict=verdict,
-                )
-                if dispatched:
-                    return run_id
-                log.warning(
-                    "acceptance fix-run did not advance %s; opening operator wait",
-                    issue.identifier,
-                )
-
-            await self._track_acceptance_rejected_wait(issue.id, run_id, binding)
-            body = acceptance_rejected(
-                CommentVars(
-                    stage="acceptance",
-                    repo=binding.github_repo,
-                    issue=pr_number,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                )
-            )
-            tracker = self.tracker(binding)
-            try:
-                await tracker.post_comment(issue.id, truncate_body(body))
-            except LinearError as e:
-                log.warning(
-                    "acceptance rejected wait comment failed on %s: %s",
-                    issue.identifier,
-                    e,
-                )
-            return run_id
         except Exception as e:
             log.exception("acceptance stage failed for %s", issue.identifier)
             await db.runs.update_status(
@@ -933,6 +706,322 @@ class _AcceptanceMixin(_OrchestratorBase):
                 and run_id not in self._operator_wait_run_ids
             ):
                 self._dispatch_run_ids.pop(issue.id, None)
+
+    async def _begin_acceptance_run(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        pr_head_sha: str,
+        reset_iteration: bool,
+    ) -> _AcceptancePrep:
+        """Complete review monitors, resolve mode/preview/criteria, and open the
+        acceptance state + comments before the verdict is computed."""
+        await self._complete_review_monitors_for_merge(issue)
+        degrade_note = (
+            _acceptance_degrade_note(issue.description)
+            if binding.acceptance.mode != _CODE_ONLY_ACCEPTANCE_MODE
+            else None
+        )
+        effective_mode = _CODE_ONLY_ACCEPTANCE_MODE if degrade_note else binding.acceptance.mode
+        if degrade_note:
+            log.info("%s for %s", degrade_note, issue.identifier)
+        preview_url = ""
+        preview_resolution_error = ""
+        if not degrade_note:
+            if effective_mode == "preview" and binding.acceptance.preview_url_pattern:
+                try:
+                    preview_url = render_preview_url(
+                        acceptance=binding.acceptance,
+                        issue_identifier=issue.identifier,
+                        issue_id=issue.id,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
+                except PreviewResolutionError as e:
+                    preview_resolution_error = str(e)
+                    preview_url = e.url
+            else:
+                preview_url = self._acceptance_preview_url(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                )
+        extracted_criteria = extract_acceptance_criteria(issue.description)
+        criteria_names = _acceptance_criterion_names(extracted_criteria)
+        criteria_predicates = _acceptance_criterion_predicates(extracted_criteria)
+        await db.acceptance_state.begin_acceptance(
+            self._conn,
+            issue.id,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            pr_head_sha=pr_head_sha,
+            mode=binding.acceptance.mode,
+            preview_url=preview_url,
+            extracted_criteria=json.dumps(extracted_criteria),
+            reset_iteration=reset_iteration,
+        )
+        await self._post_acceptance_criteria_comment(
+            binding=binding,
+            issue=issue,
+            criteria=extracted_criteria,
+        )
+        await self._move_issue_to_acceptance_state(binding=binding, issue=issue)
+        return _AcceptancePrep(
+            effective_mode=effective_mode,
+            degrade_note=degrade_note,
+            preview_url=preview_url,
+            preview_resolution_error=preview_resolution_error,
+            criteria_names=criteria_names,
+            criteria_predicates=criteria_predicates,
+        )
+
+    async def _compute_acceptance_verdict(
+        self,
+        *,
+        run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        prep: _AcceptancePrep,
+    ) -> AcceptanceVerdict:
+        """Resolve the acceptance verdict for the prepared run (pass-through /
+        preview-resolution / quick-skip / real runner), with the degrade note
+        applied."""
+        effective_mode = prep.effective_mode
+        preview_url = prep.preview_url
+        criteria_names = prep.criteria_names
+        criteria_predicates = prep.criteria_predicates
+        verdict: AcceptanceVerdict | None = None
+        if effective_mode not in {_CODE_ONLY_ACCEPTANCE_MODE, "dev", "preview"}:
+            verdict = AcceptanceVerdict(
+                kind="pass",
+                criteria=criteria_names,
+                cost=0.0,
+                hero_screenshot_url="",
+                details=(
+                    f"Acceptance mode {binding.acceptance.mode!r} is configured, "
+                    "but this mode does not have a real runner in this slice. "
+                    "Preserving pass-through acceptance behavior until that "
+                    "mode's runner is implemented."
+                ),
+            )
+        elif prep.preview_resolution_error:
+            verdict = AcceptanceVerdict(
+                kind="infra_error",
+                criteria=criteria_names,
+                cost=0.0,
+                hero_screenshot_url="",
+                details=prep.preview_resolution_error,
+                preview_url=preview_url,
+            )
+        elif effective_mode == "preview":
+            try:
+                preview_url = await resolve_preview_url(
+                    acceptance=binding.acceptance,
+                    pr_number=pr_number,
+                    issue_identifier=issue.identifier,
+                    issue_id=issue.id,
+                    pr_url=pr_url,
+                )
+            except PreviewResolutionError as e:
+                verdict = AcceptanceVerdict(
+                    kind="infra_error",
+                    criteria=criteria_names,
+                    cost=0.0,
+                    hero_screenshot_url="",
+                    details=str(e),
+                    preview_url=e.url,
+                )
+
+        if verdict is None:
+            try:
+                pr_diff_summary = await self._acceptance_pr_diff(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                )
+            except _AcceptancePrDiffUnavailable as e:
+                verdict = AcceptanceVerdict(
+                    kind="infra_error",
+                    criteria=criteria_names,
+                    cost=0.0,
+                    hero_screenshot_url="",
+                    details=str(e),
+                )
+            else:
+                quick_skip = (
+                    quick_skip_trivial_acceptance(
+                        linear_description=issue.description,
+                        pr_diff_summary=pr_diff_summary,
+                        criteria=criteria_names,
+                    )
+                    if effective_mode == _CODE_ONLY_ACCEPTANCE_MODE
+                    else None
+                )
+                if quick_skip is not None:
+                    verdict = quick_skip
+                else:
+                    workspace_path = await self._workspace.acquire(binding, issue)
+                    try:
+                        verdict = await run_acceptance(
+                            runner=self._runner,
+                            run_id=run_id,
+                            workspace_path=workspace_path,
+                            mode=effective_mode,
+                            linear_description=issue.description,
+                            pr_diff_summary=pr_diff_summary,
+                            taste_guide=load_taste_guide(
+                                binding_taste_guide=binding.acceptance.taste_guide,
+                            ),
+                            criteria=criteria_predicates,
+                            stall_secs=binding.acceptance.time_cap_minutes * 60,
+                            preview_url=preview_url,
+                            dev_command=binding.acceptance.dev_command,
+                            dev_port=binding.acceptance.dev_port,
+                        )
+                        verdict = _replace_acceptance_criteria_labels(
+                            verdict=verdict,
+                            criteria_names=criteria_names,
+                            criteria_predicates=criteria_predicates,
+                        )
+                        if effective_mode in {"dev", "preview"}:
+                            verdict = await self._upload_acceptance_screenshots(
+                                binding=binding,
+                                issue=issue,
+                                workspace_path=workspace_path,
+                                verdict=verdict,
+                            )
+                    finally:
+                        self._workspace.release(binding, issue)
+
+        return _with_acceptance_degrade_note(verdict, prep.degrade_note)
+
+    async def _finalize_acceptance_verdict(
+        self,
+        *,
+        run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        pr_head_sha: str,
+        verdict: AcceptanceVerdict,
+    ) -> str:
+        """Record the run outcome and drive the next step: merge on pass, retry/
+        block on infra_error, fix-run/operator-wait on rejection."""
+        ended_at = self._now().isoformat()
+        if verdict.kind == "pass":
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "completed",
+                ended_at=ended_at,
+            )
+            if self._dispatch_run_ids.get(issue.id) == run_id:
+                self._dispatch_run_ids.pop(issue.id, None)
+            merge_issue = await self._refresh_issue_for_acceptance_merge_handoff(binding, issue)
+            if _needs_human_approval_label_present(merge_issue):
+                await self._open_merge_wait_for_human_approval_label(
+                    binding=binding,
+                    issue=merge_issue,
+                    pr_url=pr_url,
+                )
+            else:
+                await self._merge_approved_pr(
+                    binding=binding,
+                    issue=merge_issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    approved_head_sha=pr_head_sha,
+                )
+            return run_id
+
+        if verdict.kind == "infra_error":
+            state = await db.acceptance_state.get(self._conn, issue.id)
+            if state.infra_retries >= ACCEPTANCE_INFRA_RETRY_LIMIT:
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "failed",
+                    ended_at=ended_at,
+                    **_termination_kwargs(
+                        status="failed",
+                        reason=f"acceptance infra_error: {verdict.details}",
+                    ),
+                )
+                await self._track_acceptance_blocked_wait(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    run_id=run_id,
+                    verdict=verdict,
+                )
+                return run_id
+            await db.acceptance_state.bump_infra_retries(self._conn, issue.id)
+            await db.runs.update_status(
+                self._conn,
+                run_id,
+                "failed",
+                ended_at=ended_at,
+                **_termination_kwargs(
+                    status="failed",
+                    reason=f"acceptance infra_error: {verdict.details}",
+                ),
+            )
+            return run_id
+
+        state = await db.acceptance_state.get(self._conn, issue.id)
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            "failed",
+            ended_at=ended_at,
+            **_termination_kwargs(
+                status="failed",
+                reason=f"acceptance rejected: {verdict.details}",
+            ),
+        )
+        if state.iteration < ACCEPTANCE_FIX_ITERATION_CAP:
+            dispatched = await self._dispatch_acceptance_fix_run(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_head_sha=pr_head_sha,
+                verdict=verdict,
+            )
+            if dispatched:
+                return run_id
+            log.warning(
+                "acceptance fix-run did not advance %s; opening operator wait",
+                issue.identifier,
+            )
+
+        await self._track_acceptance_rejected_wait(issue.id, run_id, binding)
+        body = acceptance_rejected(
+            CommentVars(
+                stage="acceptance",
+                repo=binding.github_repo,
+                issue=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+            )
+        )
+        tracker = self.tracker(binding)
+        try:
+            await tracker.post_comment(issue.id, truncate_body(body))
+        except LinearError as e:
+            log.warning(
+                "acceptance rejected wait comment failed on %s: %s",
+                issue.identifier,
+                e,
+            )
+        return run_id
 
     async def _dispatch_acceptance_fix_run(
         self,
