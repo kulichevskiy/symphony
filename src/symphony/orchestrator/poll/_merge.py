@@ -37,6 +37,7 @@ from datetime import (
 )
 from functools import partial
 from pathlib import Path
+from typing import NamedTuple
 
 from ... import db
 from ...agent.prompt import (
@@ -72,6 +73,7 @@ from ...pipeline.local_review_loop import (
     LoopResult,
 )
 from ...pipeline.review_classifier import (
+    Verdict,
     VerdictKind,
     has_hit_iteration_cap,
     should_dispatch_fix_run,
@@ -142,6 +144,27 @@ def _merge_issue_matches_binding(issue: LinearIssue, binding: RepoBinding) -> bo
         and issue.state_name in active_states
         and (binding.issue_label is None or binding.issue_label in issue.labels)
     )
+
+
+class _MergePreDispatch(NamedTuple):
+    """Outcome of the pre-merge finalize/fix stage for a single merge candidate.
+
+    `handled` is non-None (the tasks to schedule) when a finalize/parked/
+    conflict/required-check branch owns the candidate and the caller should
+    stop. When None, the candidate proceeds to the merge decision using the
+    fetched `view` and `required_check_failures`.
+    """
+
+    handled: list[asyncio.Task[None]] | None
+    view: dict[str, object] | None
+    required_check_failures: list[dict[str, object]]
+
+
+class _NoSignalMergeReadiness(NamedTuple):
+    """Whether a clean no_signal head is merge-ready, and via which path."""
+
+    conflict_fix_ready: bool
+    review_bypass_ready: bool
 
 
 class _MergeMixin(_OrchestratorBase):
@@ -2012,339 +2035,214 @@ class _MergeMixin(_OrchestratorBase):
         """Advance approved Review PRs into Merge without operator action."""
         scheduled: list[asyncio.Task[None]] = []
         required_context_cache: dict[tuple[str, str], tuple[str, ...]] = {}
-        candidates = await db.issue_prs.list_merge_candidates(self._conn)
-        for candidate in candidates:
-            binding = self._binding_for_pr(candidate)
-            if binding is None:
-                log.warning(
-                    "no binding for merge candidate %s in %s",
-                    candidate.identifier,
-                    candidate.github_repo,
-                )
-                continue
-            if candidate.issue_id in self._scheduled_issue_ids:
-                continue
-            if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
-                continue
-            if await db.runs.has_active(
-                self._conn,
-                candidate.issue_id,
-                ignored_stage="review",
+        for candidate in await db.issue_prs.list_merge_candidates(self._conn):
+            scheduled.extend(
+                await self._process_merge_candidate(candidate, required_context_cache)
+            )
+        return scheduled
+
+    async def _process_merge_candidate(
+        self,
+        candidate: db.issue_prs.IssuePR,
+        required_context_cache: dict[tuple[str, str], tuple[str, ...]],
+    ) -> list[asyncio.Task[None]]:
+        """Decide and schedule the next merge action for one candidate PR."""
+        resolved = await self._resolve_merge_candidate(candidate)
+        if resolved is None:
+            return []
+        binding, issue = resolved
+
+        if await self._poll_completed_merge_candidate(candidate, binding, issue):
+            return []
+
+        pre = await self._handle_merge_candidate_pre_dispatch(
+            candidate=candidate,
+            binding=binding,
+            issue=issue,
+            required_context_cache=required_context_cache,
+        )
+        if pre.handled is not None:
+            return pre.handled
+        assert pre.view is not None
+        view = pre.view
+
+        try:
+            verdict = await self._review_verdict_for_pr(
+                binding=binding,
+                pr_number=candidate.pr_number,
+                view=view,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not classify review for %s#%d: %s",
+                binding.github_repo,
+                candidate.pr_number,
+                e,
+            )
+            return []
+
+        head_sha = str(view.get("headRefOid") or "")
+        readiness = await self._merge_candidate_no_signal_readiness(
+            candidate=candidate,
+            binding=binding,
+            verdict=verdict,
+            view=view,
+            head_sha=head_sha,
+        )
+
+        gated = await self._gate_no_signal_merge_on_ci(
+            candidate=candidate,
+            binding=binding,
+            issue=issue,
+            view=view,
+            head_sha=head_sha,
+            readiness=readiness,
+            required_check_failures=pre.required_check_failures,
+        )
+        if gated is not None:
+            return gated
+
+        return await self._dispatch_merge_candidate_decision(
+            candidate=candidate,
+            binding=binding,
+            issue=issue,
+            view=view,
+            verdict=verdict,
+            head_sha=head_sha,
+            readiness=readiness,
+        )
+
+    async def _resolve_merge_candidate(
+        self, candidate: db.issue_prs.IssuePR
+    ) -> tuple[RepoBinding, LinearIssue] | None:
+        """Resolve binding + refreshed issue, or None when the candidate is skipped."""
+        binding = self._binding_for_pr(candidate)
+        if binding is None:
+            log.warning(
+                "no binding for merge candidate %s in %s",
+                candidate.identifier,
+                candidate.github_repo,
+            )
+            return None
+        if candidate.issue_id in self._scheduled_issue_ids:
+            return None
+        if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
+            return None
+        if await db.runs.has_active(
+            self._conn,
+            candidate.issue_id,
+            ignored_stage="review",
+        ):
+            return None
+        if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
+            return None
+        tracker = self.tracker(binding)
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(
+            candidate.issue_id
+        )
+        try:
+            issue = await tracker.lookup_issue(tracker_issue_id)
+        except LinearError as e:
+            log.warning(
+                "could not refresh %s before merge: %s",
+                candidate.identifier,
+                e,
+            )
+            return None
+        parked_done_cleanup = (
+            candidate.parked_at is not None
+            and not binding.auto_merge
+            and issue.team_key == binding.linear_team_key
+            and issue.state_name == binding.linear_states.done
+            and (
+                binding.issue_label is None or binding.issue_label in issue.labels
+            )
+        )
+        if (
+            not _merge_issue_matches_binding(issue, binding)
+            and not parked_done_cleanup
+        ):
+            log.info(
+                "skipping merge candidate %s: issue is no longer active for "
+                "binding %s/%s",
+                issue.identifier,
+                binding.github_repo,
+                binding.issue_label or "",
+            )
+            return None
+        return binding, issue
+
+    async def _poll_completed_merge_candidate(
+        self,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> bool:
+        """Poll an already-submitted merge; True when this candidate is handled."""
+        latest_merge = await db.runs.latest_for_issue_stage(
+            self._conn,
+            issue_id=candidate.issue_id,
+            stage="merge",
+            started_at_gte=candidate.created_at,
+        )
+        if latest_merge is not None and latest_merge.status == "completed":
+            await self._poll_submitted_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=candidate.pr_number,
+                pr_url=candidate.pr_url,
+                run_id=latest_merge.id,
+            )
+            return True
+        return False
+
+    async def _handle_merge_candidate_pre_dispatch(
+        self,
+        *,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        required_context_cache: dict[tuple[str, str], tuple[str, ...]],
+    ) -> _MergePreDispatch:
+        """Finalize / fix the PR before the merge decision.
+
+        Handles closed PRs, parked manual-merge revival, merge-conflict rebase
+        fix-runs, and required-check fix-runs. When one owns the candidate,
+        `handled` carries the tasks to schedule and the caller stops; otherwise
+        `handled` is None and the fetched `view` + `required_check_failures`
+        flow into the merge decision.
+        """
+        tasks: list[asyncio.Task[None]] = []
+        try:
+            view = await self._gh.pr_view(
+                candidate.pr_number,
+                repo=binding.github_repo,
+                include_status_checks=True,
+            )
+            if await self._finalize_pr_if_closed(
+                binding=binding,
+                issue=issue,
+                pr=candidate,
+                pr_number=candidate.pr_number,
+                pr_url=candidate.pr_url,
+                run_id=str(uuid.uuid4()),
+                create_run=True,
+                view=view,
             ):
-                continue
-            if await db.operator_waits.get(self._conn, candidate.issue_id) is not None:
-                continue
-            tracker = self.tracker(binding)
-            tracker_issue_id, _ = await self._tracker_identity_for_issue(
-                candidate.issue_id
-            )
-            try:
-                issue = await tracker.lookup_issue(tracker_issue_id)
-            except LinearError as e:
-                log.warning(
-                    "could not refresh %s before merge: %s",
-                    candidate.identifier,
-                    e,
-                )
-                continue
-            parked_done_cleanup = (
-                candidate.parked_at is not None
-                and not binding.auto_merge
-                and issue.team_key == binding.linear_team_key
-                and issue.state_name == binding.linear_states.done
-                and (
-                    binding.issue_label is None or binding.issue_label in issue.labels
-                )
-            )
-            if (
-                not _merge_issue_matches_binding(issue, binding)
-                and not parked_done_cleanup
-            ):
-                log.info(
-                    "skipping merge candidate %s: issue is no longer active for "
-                    "binding %s/%s",
-                    issue.identifier,
-                    binding.github_repo,
-                    binding.issue_label or "",
-                )
-                continue
-            latest_merge = await db.runs.latest_for_issue_stage(
-                self._conn,
-                issue_id=candidate.issue_id,
-                stage="merge",
-                started_at_gte=candidate.created_at,
-            )
-            if latest_merge is not None and latest_merge.status == "completed":
-                await self._poll_submitted_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=candidate.pr_number,
-                    pr_url=candidate.pr_url,
-                    run_id=latest_merge.id,
-                )
-                continue
-            try:
-                view = await self._gh.pr_view(
-                    candidate.pr_number,
-                    repo=binding.github_repo,
-                    include_status_checks=True,
-                )
-                if await self._finalize_pr_if_closed(
-                    binding=binding,
-                    issue=issue,
-                    pr=candidate,
-                    pr_number=candidate.pr_number,
-                    pr_url=candidate.pr_url,
-                    run_id=str(uuid.uuid4()),
-                    create_run=True,
-                    view=view,
-                ):
-                    continue
-                if candidate.parked_at is not None:
-                    revived = (
-                        await self._schedule_parked_manual_merge_revival_if_requested(
-                            binding=binding,
-                            issue=issue,
-                            candidate=candidate,
-                            view=view,
-                        )
-                    )
-                    if revived is not None:
-                        scheduled.append(revived)
-                    continue
-                if _pr_view_has_merge_conflict(view):
-                    await db.issue_prs.clear_merge_conflict_fixed(
-                        self._conn,
-                        issue_id=candidate.issue_id,
-                        github_repo=binding.github_repo,
-                        pr_number=candidate.pr_number,
-                        pr_created_at=candidate.created_at,
-                    )
-                    scheduled.append(
-                        self._schedule_merge_conflict_rebase_fix(
-                            binding=binding,
-                            issue=issue,
-                            pr_number=candidate.pr_number,
-                            pr_url=candidate.pr_url,
-                            view=view,
-                        )
-                    )
-                    continue
-                required_check_failures = await self._required_check_failures_for_view(
-                    binding=binding,
-                    pr_number=candidate.pr_number,
-                    view=view,
-                    required_context_cache=required_context_cache,
-                )
-                if (
-                    required_check_failures
-                    and await self._merge_required_check_fix_should_dispatch(
-                        issue_id=issue.id,
-                        head_sha=str(view.get("headRefOid") or ""),
-                        failing_checks=required_check_failures,
-                    )
-                ):
-                    scheduled.append(
-                        self._schedule_merge_required_check_fix(
-                            binding=binding,
-                            issue=issue,
-                            pr_number=candidate.pr_number,
-                            pr_url=candidate.pr_url,
-                            head_sha=str(view.get("headRefOid") or ""),
-                            failing_checks=required_check_failures,
-                            merge_error="required status check failed before merge",
-                        )
-                    )
-                    continue
-            except Exception as e:  # noqa: BLE001 — retry finalization next tick
-                log.warning(
-                    "could not check finalized PR state for %s#%d: %s",
-                    binding.github_repo,
-                    candidate.pr_number,
-                    e,
-                )
-                continue
-            try:
-                verdict = await self._review_verdict_for_pr(
-                    binding=binding,
-                    pr_number=candidate.pr_number,
-                    view=view,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not classify review for %s#%d: %s",
-                    binding.github_repo,
-                    candidate.pr_number,
-                    e,
-                )
-                continue
-
-            head_sha = str(view.get("headRefOid") or "")
-            no_signal_mergeable = (
-                verdict.kind is VerdictKind.PENDING
-                and verdict.rule == "no_signal"
-                and str(view.get("mergeable") or "").upper() == "MERGEABLE"
-            )
-            conflict_fix_ready = False
-            if no_signal_mergeable:
-                conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
-                    self._conn,
-                    issue_id=candidate.issue_id,
-                    github_repo=binding.github_repo,
-                    pr_number=candidate.pr_number,
-                    pr_created_at=candidate.created_at,
-                    head_sha=head_sha,
-                )
-
-            # `remote_review: false` is an intentional review bypass: no
-            # `@codex` approval will ever land, so once CI and mergeability
-            # pass we treat the clean no_signal state as the merge signal.
-            # Local-only bindings (local_review: true) additionally require a
-            # completed local-review loop; no-review bindings (false/false)
-            # gate on CI alone.
-            review_bypass_ready = False
-            if no_signal_mergeable and not binding.resolved_remote_review():
-                review_bypass_ready = (
-                    not binding.resolved_local_review()
-                    or await self._local_review_completed_for_issue(
-                        candidate
-                    )
-                )
-
-            # SYM-108: a no_signal merge trigger (conflict-fix or review
-            # bypass) is honored only when the head's CI is green. PR #24
-            # merged on an empty rollup before its build voted. Gate it:
-            # green → merge; pending → keep polling; failed → defer to the
-            # review/required-check fix path. With zero checks reporting,
-            # merge only when `verify_cmd` ran green for this exact head (or
-            # the repo opted into `allow_unverified_merge`); otherwise hand to
-            # an operator instead of silently merging unverified code.
-            if conflict_fix_ready or review_bypass_ready:
-                check_state = _no_signal_head_check_state(view)
-                if check_state == "none":
-                    verified = await db.issue_prs.has_verify_passed(
-                        self._conn,
-                        issue_id=candidate.issue_id,
-                        github_repo=binding.github_repo,
-                        head_sha=head_sha,
-                    )
-                    if not (binding.allow_unverified_merge or verified):
-                        await self._mark_merge_needs_approval(
-                            binding=binding,
-                            issue=issue,
-                            pr_url=candidate.pr_url,
-                            run_id=str(uuid.uuid4()),
-                            reason=(
-                                "no CI checks report on the head and no green "
-                                "verify_cmd for it — merge needs operator "
-                                "approval"
-                            ),
-                            create_run=True,
-                        )
-                        continue
-                elif check_state == "pending":
-                    # Checks still running — keep polling until they settle.
-                    # Never merge.
-                    continue
-                elif check_state == "failed":
-                    # A failing *required* check is driven by the required-check
-                    # fix path above (it dispatched a rerun this tick, or one is
-                    # already mid-flight); keep polling for that. But a failing
-                    # *non-required* check (e.g. a Vercel build, PR #24) yields
-                    # no `required_check_failures` and thus no fix path — keep
-                    # polling forever otherwise. Escalate to an operator instead,
-                    # mirroring the "none" branch.
-                    if not required_check_failures:
-                        await self._mark_merge_needs_approval(
-                            binding=binding,
-                            issue=issue,
-                            pr_url=candidate.pr_url,
-                            run_id=str(uuid.uuid4()),
-                            reason=(
-                                "head CI failed and no failing check is "
-                                "branch-protection required (no fix path) — "
-                                "merge needs operator approval"
-                            ),
-                            create_run=True,
-                        )
-                    continue
-
-            if (
-                verdict.kind is VerdictKind.APPROVED
-                or conflict_fix_ready
-                or review_bypass_ready
-            ):
-                if (
-                    binding.acceptance.mode != "off"
-                    and not await self._acceptance_passed_for_candidate(
-                        candidate, binding, head_sha
-                    )
-                ):
-                    if self._dispatch_capacity(binding) <= 0:
-                        continue
-                    if await self._acceptance_infra_retry_backoff_active(
-                        candidate.issue_id
-                    ):
-                        continue
-                    scheduled.append(
-                        self._schedule_acceptance(
-                            binding=binding,
-                            issue=issue,
-                            pr_number=candidate.pr_number,
-                            pr_url=candidate.pr_url,
-                            pr_head_sha=head_sha,
-                        )
-                    )
-                    continue
-                if not binding.auto_merge:
-                    await self._park_pr_for_manual_merge(
+                return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
+            if candidate.parked_at is not None:
+                revived = (
+                    await self._schedule_parked_manual_merge_revival_if_requested(
                         binding=binding,
                         issue=issue,
-                        pr_number=candidate.pr_number,
-                        pr_url=candidate.pr_url,
-                    )
-                    continue
-                if self._dispatch_capacity(binding) <= 0:
-                    continue
-                if _needs_human_approval_label_present(issue):
-                    await self._open_merge_wait_for_human_approval_label(
-                        binding=binding,
-                        issue=issue,
-                        pr_url=candidate.pr_url,
-                    )
-                    continue
-                on_started: Callable[[str], Awaitable[None]] | None = None
-                if conflict_fix_ready:
-                    async def clear_conflict_fix_marker(
-                        _run_id: str,
-                        *,
-                        issue_id: str = candidate.issue_id,
-                        github_repo: str = binding.github_repo,
-                        pr_number: int = candidate.pr_number,
-                        pr_created_at: str = candidate.created_at,
-                    ) -> None:
-                        await db.issue_prs.clear_merge_conflict_fixed(
-                            self._conn,
-                            issue_id=issue_id,
-                            github_repo=github_repo,
-                            pr_number=pr_number,
-                            pr_created_at=pr_created_at,
-                        )
-
-                    on_started = clear_conflict_fix_marker
-
-                scheduled.append(
-                    self._schedule_merge(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=candidate.pr_number,
-                        pr_url=candidate.pr_url,
-                        approved_head_sha=head_sha,
-                        skip_review=verdict.kind is not VerdictKind.APPROVED,
-                        on_started=on_started,
+                        candidate=candidate,
+                        view=view,
                     )
                 )
-            elif verdict.merge_conflict:
+                if revived is not None:
+                    tasks.append(revived)
+                return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
+            if _pr_view_has_merge_conflict(view):
                 await db.issue_prs.clear_merge_conflict_fixed(
                     self._conn,
                     issue_id=candidate.issue_id,
@@ -2352,7 +2250,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_number=candidate.pr_number,
                     pr_created_at=candidate.created_at,
                 )
-                scheduled.append(
+                tasks.append(
                     self._schedule_merge_conflict_rebase_fix(
                         binding=binding,
                         issue=issue,
@@ -2361,15 +2259,281 @@ class _MergeMixin(_OrchestratorBase):
                         view=view,
                     )
                 )
-            elif verdict.kind is VerdictKind.CHANGES_REQUESTED:
-                await db.issue_prs.clear_merge_conflict_fixed(
-                    self._conn,
-                    issue_id=candidate.issue_id,
-                    github_repo=binding.github_repo,
-                    pr_number=candidate.pr_number,
-                    pr_created_at=candidate.created_at,
+                return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
+            required_check_failures = await self._required_check_failures_for_view(
+                binding=binding,
+                pr_number=candidate.pr_number,
+                view=view,
+                required_context_cache=required_context_cache,
+            )
+            if (
+                required_check_failures
+                and await self._merge_required_check_fix_should_dispatch(
+                    issue_id=issue.id,
+                    head_sha=str(view.get("headRefOid") or ""),
+                    failing_checks=required_check_failures,
                 )
-        return scheduled
+            ):
+                tasks.append(
+                    self._schedule_merge_required_check_fix(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                        head_sha=str(view.get("headRefOid") or ""),
+                        failing_checks=required_check_failures,
+                        merge_error="required status check failed before merge",
+                    )
+                )
+                return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
+            return _MergePreDispatch(
+                handled=None,
+                view=view,
+                required_check_failures=required_check_failures,
+            )
+        except Exception as e:  # noqa: BLE001 — retry finalization next tick
+            log.warning(
+                "could not check finalized PR state for %s#%d: %s",
+                binding.github_repo,
+                candidate.pr_number,
+                e,
+            )
+            return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
+
+    async def _merge_candidate_no_signal_readiness(
+        self,
+        *,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        verdict: Verdict,
+        view: dict[str, object],
+        head_sha: str,
+    ) -> _NoSignalMergeReadiness:
+        """Whether a clean no_signal head is merge-ready via conflict-fix or bypass."""
+        no_signal_mergeable = (
+            verdict.kind is VerdictKind.PENDING
+            and verdict.rule == "no_signal"
+            and str(view.get("mergeable") or "").upper() == "MERGEABLE"
+        )
+        conflict_fix_ready = False
+        if no_signal_mergeable:
+            conflict_fix_ready = await db.issue_prs.has_merge_conflict_fixed(
+                self._conn,
+                issue_id=candidate.issue_id,
+                github_repo=binding.github_repo,
+                pr_number=candidate.pr_number,
+                pr_created_at=candidate.created_at,
+                head_sha=head_sha,
+            )
+
+        # `remote_review: false` is an intentional review bypass: no
+        # `@codex` approval will ever land, so once CI and mergeability
+        # pass we treat the clean no_signal state as the merge signal.
+        # Local-only bindings (local_review: true) additionally require a
+        # completed local-review loop; no-review bindings (false/false)
+        # gate on CI alone.
+        review_bypass_ready = False
+        if no_signal_mergeable and not binding.resolved_remote_review():
+            review_bypass_ready = (
+                not binding.resolved_local_review()
+                or await self._local_review_completed_for_issue(
+                    candidate
+                )
+            )
+        return _NoSignalMergeReadiness(
+            conflict_fix_ready=conflict_fix_ready,
+            review_bypass_ready=review_bypass_ready,
+        )
+
+    async def _gate_no_signal_merge_on_ci(
+        self,
+        *,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        view: dict[str, object],
+        head_sha: str,
+        readiness: _NoSignalMergeReadiness,
+        required_check_failures: list[dict[str, object]],
+    ) -> list[asyncio.Task[None]] | None:
+        """Gate a no_signal merge trigger on the head's CI state (SYM-108).
+
+        Returns None to let the merge decision proceed; an empty task list when
+        the candidate must keep polling / be escalated and not merge this tick.
+        """
+        if not (readiness.conflict_fix_ready or readiness.review_bypass_ready):
+            return None
+
+        # SYM-108: a no_signal merge trigger (conflict-fix or review
+        # bypass) is honored only when the head's CI is green. PR #24
+        # merged on an empty rollup before its build voted. Gate it:
+        # green → merge; pending → keep polling; failed → defer to the
+        # review/required-check fix path. With zero checks reporting,
+        # merge only when `verify_cmd` ran green for this exact head (or
+        # the repo opted into `allow_unverified_merge`); otherwise hand to
+        # an operator instead of silently merging unverified code.
+        check_state = _no_signal_head_check_state(view)
+        if check_state == "none":
+            verified = await db.issue_prs.has_verify_passed(
+                self._conn,
+                issue_id=candidate.issue_id,
+                github_repo=binding.github_repo,
+                head_sha=head_sha,
+            )
+            if not (binding.allow_unverified_merge or verified):
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=candidate.pr_url,
+                    run_id=str(uuid.uuid4()),
+                    reason=(
+                        "no CI checks report on the head and no green "
+                        "verify_cmd for it — merge needs operator "
+                        "approval"
+                    ),
+                    create_run=True,
+                )
+                return []
+        elif check_state == "pending":
+            # Checks still running — keep polling until they settle.
+            # Never merge.
+            return []
+        elif check_state == "failed":
+            # A failing *required* check is driven by the required-check
+            # fix path above (it dispatched a rerun this tick, or one is
+            # already mid-flight); keep polling for that. But a failing
+            # *non-required* check (e.g. a Vercel build, PR #24) yields
+            # no `required_check_failures` and thus no fix path — keep
+            # polling forever otherwise. Escalate to an operator instead,
+            # mirroring the "none" branch.
+            if not required_check_failures:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=candidate.pr_url,
+                    run_id=str(uuid.uuid4()),
+                    reason=(
+                        "head CI failed and no failing check is "
+                        "branch-protection required (no fix path) — "
+                        "merge needs operator approval"
+                    ),
+                    create_run=True,
+                )
+            return []
+        return None
+
+    async def _dispatch_merge_candidate_decision(
+        self,
+        *,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        view: dict[str, object],
+        verdict: Verdict,
+        head_sha: str,
+        readiness: _NoSignalMergeReadiness,
+    ) -> list[asyncio.Task[None]]:
+        """Schedule acceptance / park / merge / conflict-fix per the final verdict."""
+        if (
+            verdict.kind is VerdictKind.APPROVED
+            or readiness.conflict_fix_ready
+            or readiness.review_bypass_ready
+        ):
+            if (
+                binding.acceptance.mode != "off"
+                and not await self._acceptance_passed_for_candidate(
+                    candidate, binding, head_sha
+                )
+            ):
+                if self._dispatch_capacity(binding) <= 0:
+                    return []
+                if await self._acceptance_infra_retry_backoff_active(
+                    candidate.issue_id
+                ):
+                    return []
+                return [
+                    self._schedule_acceptance(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                        pr_head_sha=head_sha,
+                    )
+                ]
+            if not binding.auto_merge:
+                await self._park_pr_for_manual_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                )
+                return []
+            if self._dispatch_capacity(binding) <= 0:
+                return []
+            if _needs_human_approval_label_present(issue):
+                await self._open_merge_wait_for_human_approval_label(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=candidate.pr_url,
+                )
+                return []
+            on_started: Callable[[str], Awaitable[None]] | None = None
+            if readiness.conflict_fix_ready:
+                async def clear_conflict_fix_marker(
+                    _run_id: str,
+                    *,
+                    issue_id: str = candidate.issue_id,
+                    github_repo: str = binding.github_repo,
+                    pr_number: int = candidate.pr_number,
+                    pr_created_at: str = candidate.created_at,
+                ) -> None:
+                    await db.issue_prs.clear_merge_conflict_fixed(
+                        self._conn,
+                        issue_id=issue_id,
+                        github_repo=github_repo,
+                        pr_number=pr_number,
+                        pr_created_at=pr_created_at,
+                    )
+
+                on_started = clear_conflict_fix_marker
+
+            return [
+                self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                    approved_head_sha=head_sha,
+                    skip_review=verdict.kind is not VerdictKind.APPROVED,
+                    on_started=on_started,
+                )
+            ]
+        elif verdict.merge_conflict:
+            await db.issue_prs.clear_merge_conflict_fixed(
+                self._conn,
+                issue_id=candidate.issue_id,
+                github_repo=binding.github_repo,
+                pr_number=candidate.pr_number,
+                pr_created_at=candidate.created_at,
+            )
+            return [
+                self._schedule_merge_conflict_rebase_fix(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=candidate.pr_number,
+                    pr_url=candidate.pr_url,
+                    view=view,
+                )
+            ]
+        elif verdict.kind is VerdictKind.CHANGES_REQUESTED:
+            await db.issue_prs.clear_merge_conflict_fixed(
+                self._conn,
+                issue_id=candidate.issue_id,
+                github_repo=binding.github_repo,
+                pr_number=candidate.pr_number,
+                pr_created_at=candidate.created_at,
+            )
+        return []
 
 
     def _schedule_merge_conflict_rebase_fix(
