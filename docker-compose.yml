@@ -1,0 +1,61 @@
+# Local Docker Compose stack: containerized daemon + Caddy reverse proxy.
+#
+# The daemon binds 127.0.0.1 only (a security invariant — see
+# src/symphony/app.py::build_server_config). So caddy OWNS the network
+# namespace and publishes 443/80; the symphony daemon JOINS it
+# (network_mode: service:caddy) and its loopback http surface is reachable by
+# caddy at 127.0.0.1:8787. caddy being the namespace owner keeps TLS and the
+# published ports up even when the daemon restarts.
+#
+# Before `docker compose up`:
+#   cp .env.example .env                       # fill in secrets
+#   cp examples/config.docker.yaml config.local.yaml
+# Auth the CLIs into the named volumes once (they persist across restarts):
+#   docker compose run --rm symphony claude   # /login
+#   docker compose run --rm symphony codex login
+#   docker compose run --rm symphony gh auth login
+
+services:
+  symphony:
+    build: .
+    image: symphony:local
+    env_file: .env
+    restart: unless-stopped
+    # Join caddy's network namespace: the daemon's 127.0.0.1:8787 http surface
+    # is then reachable by caddy over loopback, without exposing it to the host.
+    network_mode: "service:caddy"
+    depends_on:
+      - caddy
+    volumes:
+      # Operator config — read-only, never baked into the image.
+      - ./config.local.yaml:/app/config.local.yaml:ro
+      # CLI auth dirs — persisted, so a one-time login survives rebuilds.
+      - claude_auth:/home/symphony/.claude
+      - codex_auth:/home/symphony/.codex
+      - gh_auth:/home/symphony/.config/gh
+      # Daemon state: SQLite DB, per-issue workspaces, run logs.
+      - symphony_db:/data/db
+      - symphony_workspaces:/data/workspaces
+      - symphony_logs:/data/logs
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # Namespace owner: publishes HTTPS (and HTTP) for the whole stack.
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  claude_auth:
+  codex_auth:
+  gh_auth:
+  symphony_db:
+  symphony_workspaces:
+  symphony_logs:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,11 @@
+# Caddy reverse proxy for the local symphony stack.
+#
+# Caddy shares the daemon's network namespace, so the http surface is on
+# loopback:8787. `tls internal` uses Caddy's own CA for a locally-trusted
+# HTTPS cert. Every path is proxied unchanged — the UI (/ui/), the JSON API
+# (/api/*), and the Linear/GitHub webhook receivers (/linear/webhook,
+# /github/webhook) all remain reachable through Caddy.
+localhost {
+	tls internal
+	reverse_proxy 127.0.0.1:8787
+}
