@@ -15,7 +15,7 @@ from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
-from .auth import Auth0Settings, create_auth_dependency
+from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .config import Config
 from .github.client import GitHub
 from .github.webhook import (
@@ -129,6 +129,10 @@ def create_app(
         )
 
     if ui_enabled:
+        # Unauthenticated: the SPA reads this at startup to know whether it
+        # must run the Auth0 login flow before calling the gated routes below.
+        app.include_router(create_auth_config_router(auth0_settings))
+
         # Single gate shared by the two /api/* routers. Webhook routes are
         # mounted above, outside this gate (they verify their own HMAC).
         api_dependencies = (

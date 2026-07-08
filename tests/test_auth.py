@@ -35,12 +35,20 @@ def _jwks() -> dict[str, Any]:
 def _token(
     *,
     email: str = ALLOWED_EMAIL,
+    email_verified: bool = True,
     aud: str = CLIENT_ID,
     iss: str = ISSUER,
     key: rsa.RSAPrivateKey = _KEY,
     kid: str = KID,
 ) -> str:
-    payload = {"iss": iss, "aud": aud, "email": email, "sub": "auth0|1", "exp": 9999999999}
+    payload = {
+        "iss": iss,
+        "aud": aud,
+        "email": email,
+        "email_verified": email_verified,
+        "sub": "auth0|1",
+        "exp": 9999999999,
+    }
     return jwt.encode(payload, key, algorithm="RS256", headers={"kid": kid})
 
 
@@ -102,6 +110,35 @@ async def test_allowlist_is_case_insensitive() -> None:
     async with _client(_app()) as client:
         resp = await client.get("/api/meta", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unverified_email_is_403() -> None:
+    respx.get(JWKS_URI).mock(return_value=httpx.Response(200, json=_jwks()))
+    token = _token(email_verified=False)
+    async with _client(_app()) as client:
+        resp = await client.get("/api/meta", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_jwks_refetched_on_unknown_kid() -> None:
+    """Simulates Auth0 rotating signing keys: the first JWKS fetch doesn't
+    have the key the token was signed with, so the verifier must refetch
+    before rejecting it as unknown."""
+    route = respx.get(JWKS_URI).mock(
+        side_effect=[
+            httpx.Response(200, json={"keys": []}),
+            httpx.Response(200, json=_jwks()),
+        ]
+    )
+    token = _token()
+    async with _client(_app()) as client:
+        resp = await client.get("/api/meta", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert route.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -181,3 +218,52 @@ def test_from_env_parses_and_normalizes_allowlist() -> None:
     assert settings.allowed_emails == frozenset({"a@x.com", "b@y.com"})
     assert settings.issuer == ISSUER
     assert settings.jwks_uri == JWKS_URI
+
+
+@pytest.mark.asyncio
+async def test_auth_config_endpoint_reports_disabled_when_unset() -> None:
+    app = create_app(_Handler(), object(), ui_enabled=True, auth0_settings=None)  # type: ignore[arg-type]
+    async with _client(app) as client:
+        resp = await client.get("/api/auth-config")
+    assert resp.status_code == 200
+    assert resp.json() == {"enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_auth_config_endpoint_is_public_and_reports_enabled() -> None:
+    async with _client(_app()) as client:
+        resp = await client.get("/api/auth-config")
+    assert resp.status_code == 200
+    assert resp.json() == {"enabled": True, "domain": DOMAIN, "client_id": CLIENT_ID}
+
+
+def test_cli_auth0_settings_disabled_when_all_unset() -> None:
+    from symphony.cli import _auth0_settings
+    from symphony.config import Config
+
+    assert _auth0_settings(Config()) is None
+
+
+def test_cli_auth0_settings_enabled_when_all_set() -> None:
+    from symphony.cli import _auth0_settings
+    from symphony.config import Config
+
+    cfg = Config(
+        auth0_domain=DOMAIN,
+        auth0_client_id=CLIENT_ID,
+        auth0_allowed_emails=ALLOWED_EMAIL,
+    )
+    settings = _auth0_settings(cfg)
+    assert settings is not None
+    assert settings.domain == DOMAIN
+
+
+def test_cli_auth0_settings_fails_closed_on_partial_config() -> None:
+    import click
+
+    from symphony.cli import _auth0_settings
+    from symphony.config import Config
+
+    cfg = Config(auth0_domain=DOMAIN, auth0_client_id=CLIENT_ID)
+    with pytest.raises(click.ClickException):
+        _auth0_settings(cfg)

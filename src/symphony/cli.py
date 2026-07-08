@@ -146,8 +146,21 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
 
 
 def _auth0_settings(cfg: Config) -> Auth0Settings | None:
-    if not (cfg.auth0_domain and cfg.auth0_client_id and cfg.auth0_allowed_emails):
+    fields = {
+        "AUTH0_DOMAIN": cfg.auth0_domain,
+        "AUTH0_CLIENT_ID": cfg.auth0_client_id,
+        "AUTH0_ALLOWED_EMAILS": cfg.auth0_allowed_emails,
+    }
+    set_fields = [name for name, value in fields.items() if value]
+    if not set_fields:
         return None
+    if len(set_fields) < len(fields):
+        missing = sorted(set(fields) - set(set_fields))
+        raise click.ClickException(
+            f"partial Auth0 config: {', '.join(missing)} not set. "
+            "Set all of AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_ALLOWED_EMAILS to enable "
+            "the /api/* gate, or none to disable it."
+        )
     return Auth0Settings.from_env(
         domain=cfg.auth0_domain,
         client_id=cfg.auth0_client_id,

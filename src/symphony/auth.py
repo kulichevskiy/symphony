@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 import jwt
-from fastapi import Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 
@@ -55,16 +55,19 @@ class Auth0Verifier:
         self._client = client
         self._keys: dict[str, dict[str, Any]] | None = None
 
+    async def _fetch_signing_keys(self) -> dict[str, dict[str, Any]]:
+        if self._client is not None:
+            resp = await self._client.get(self._settings.jwks_uri)
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(self._settings.jwks_uri)
+        resp.raise_for_status()
+        data = resp.json()
+        return {key["kid"]: key for key in data.get("keys", []) if "kid" in key}
+
     async def _signing_keys(self) -> dict[str, dict[str, Any]]:
         if self._keys is None:
-            if self._client is not None:
-                resp = await self._client.get(self._settings.jwks_uri)
-            else:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(self._settings.jwks_uri)
-            resp.raise_for_status()
-            data = resp.json()
-            self._keys = {key["kid"]: key for key in data.get("keys", []) if "kid" in key}
+            self._keys = await self._fetch_signing_keys()
         return self._keys
 
     async def verify(self, token: str) -> dict[str, Any]:
@@ -74,7 +77,14 @@ class Auth0Verifier:
         except jwt.InvalidTokenError as exc:
             raise HTTPException(status_code=401, detail="malformed token") from exc
         kid = header.get("kid")
-        jwk = (await self._signing_keys()).get(kid) if isinstance(kid, str) else None
+        if not isinstance(kid, str):
+            raise HTTPException(status_code=401, detail="unknown signing key")
+        keys = await self._signing_keys()
+        if kid not in keys:
+            # Auth0 rotates signing keys without notice; refetch once before
+            # rejecting so a token signed with a newly-rotated key still verifies.
+            self._keys = keys = await self._fetch_signing_keys()
+        jwk = keys.get(kid)
         if jwk is None:
             raise HTTPException(status_code=401, detail="unknown signing key")
         public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
@@ -104,9 +114,29 @@ def create_auth_dependency(
         if credentials is None or not credentials.credentials:
             raise HTTPException(status_code=401, detail="missing bearer token")
         claims = await verifier.verify(credentials.credentials)
+        if claims.get("email_verified") is not True:
+            raise HTTPException(status_code=403, detail="email not verified")
         email = claims.get("email")
         if not isinstance(email, str) or email.strip().casefold() not in settings.allowed_emails:
             raise HTTPException(status_code=403, detail="email not allowlisted")
         return claims
 
     return require_auth
+
+
+def create_auth_config_router(settings: Auth0Settings | None) -> APIRouter:
+    """Unauthenticated endpoint the SPA reads at startup to decide whether to
+    run the Auth0 login flow before calling the gated ``/api/*`` routes.
+
+    Only the public SPA client_id/domain are exposed here — never the email
+    allowlist.
+    """
+    router = APIRouter()
+
+    @router.get("/api/auth-config")
+    async def auth_config() -> dict[str, Any]:
+        if settings is None:
+            return {"enabled": False}
+        return {"enabled": True, "domain": settings.domain, "client_id": settings.client_id}
+
+    return router
