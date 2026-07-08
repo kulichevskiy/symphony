@@ -1,3 +1,5 @@
+import { authHeaders } from "@/lib/auth";
+
 export type CanonicalStatusState =
   | "drift_detected"
   | "halted"
@@ -282,7 +284,7 @@ async function fetchJson<T>(
   fallbackMessage: string,
 ): Promise<T> {
   const response = await fetch(path, {
-    headers: { Accept: "application/json" },
+    headers: { Accept: "application/json", ...(await authHeaders()) },
   });
 
   if (!response.ok) {
@@ -433,7 +435,11 @@ export async function postIssueCommand(
 ): Promise<CommandAccepted> {
   const response = await fetch(`/api/issues/${encodeURIComponent(id)}/command`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(await authHeaders()),
+    },
     body: JSON.stringify({ command }),
   });
   if (!response.ok) {

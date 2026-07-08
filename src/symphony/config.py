@@ -574,6 +574,9 @@ class Secrets(BaseSettings):
     jira_email: str = Field(default="", validation_alias="JIRA_EMAIL")
     jira_api_token: str = Field(default="", validation_alias="JIRA_API_TOKEN")
     jira_webhook_secret: str = Field(default="", validation_alias="JIRA_WEBHOOK_SECRET")
+    auth0_domain: str = Field(default="", validation_alias="AUTH0_DOMAIN")
+    auth0_client_id: str = Field(default="", validation_alias="AUTH0_CLIENT_ID")
+    auth0_allowed_emails: str = Field(default="", validation_alias="AUTH0_ALLOWED_EMAILS")
 
 
 class UIStatusThresholds(BaseModel):
@@ -685,6 +688,9 @@ class Config(BaseModel):
     jira_base_url: str = ""
     jira_email: str = ""
     jira_api_token: str = ""
+    auth0_domain: str = ""
+    auth0_client_id: str = ""
+    auth0_allowed_emails: str = ""
     jira_webhook_secret: str = ""
 
     def _reject_legacy_matrix_conflicts(self, binding: RepoBinding) -> None:
@@ -788,6 +794,9 @@ class Config(BaseModel):
                 "jira_email": secrets.jira_email,
                 "jira_api_token": secrets.jira_api_token,
                 "jira_webhook_secret": secrets.jira_webhook_secret,
+                "auth0_domain": secrets.auth0_domain,
+                "auth0_client_id": secrets.auth0_client_id,
+                "auth0_allowed_emails": secrets.auth0_allowed_emails,
             }
         )
         # Per-binding agent env: same `.env` file pydantic-settings reads,

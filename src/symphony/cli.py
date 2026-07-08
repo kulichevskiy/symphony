@@ -31,6 +31,7 @@ from .agent.codex_cli import (
 )
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
+from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -142,6 +143,32 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
         err=True,
     )
     return None
+
+
+def _auth0_settings(cfg: Config) -> Auth0Settings | None:
+    fields = {
+        "AUTH0_DOMAIN": cfg.auth0_domain,
+        "AUTH0_CLIENT_ID": cfg.auth0_client_id,
+        "AUTH0_ALLOWED_EMAILS": cfg.auth0_allowed_emails,
+    }
+    set_fields = [name for name, value in fields.items() if value]
+    if not set_fields:
+        return None
+    if len(set_fields) < len(fields):
+        missing = sorted(set(fields) - set(set_fields))
+        raise click.ClickException(
+            f"partial Auth0 config: {', '.join(missing)} not set. "
+            "Set all of AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_ALLOWED_EMAILS to enable "
+            "the /api/* gate, or none to disable it."
+        )
+    try:
+        return Auth0Settings.from_env(
+            domain=cfg.auth0_domain,
+            client_id=cfg.auth0_client_id,
+            allowed_emails=cfg.auth0_allowed_emails,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
@@ -265,6 +292,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ),
                     ui_command_sink=orch,
                     ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
+                    auth0_settings=_auth0_settings(cfg) if cfg.ui.enabled else None,
                 )
                 server = uvicorn.Server(
                     build_server_config(
@@ -407,6 +435,13 @@ async def _preflight(config_path: Path) -> None:
     if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY is empty", err=True)
         sys.exit(2)
+    if cfg.ui.enabled:
+        # Raises ClickException on a partial AUTH0_* env — surface that here
+        # rather than at daemon startup.
+        if _auth0_settings(cfg) is not None:
+            click.echo("Auth0 config: ok, /api/* gate enabled")
+        else:
+            click.echo("Auth0 config: unset, /api/* is unauthenticated")
     if _config_can_run_codex_cli(cfg):
         try:
             codex_config, created_profile = ensure_symphony_permissions_profile()

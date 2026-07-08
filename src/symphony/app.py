@@ -8,13 +8,14 @@ from datetime import timedelta
 from pathlib import Path
 
 import aiosqlite
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
+from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .config import Config
 from .github.client import GitHub
 from .github.webhook import (
@@ -69,6 +70,7 @@ def create_app(
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
     ui_webhook_public_url: str | None = None,
+    auth0_settings: Auth0Settings | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     ui_pool = ReadOnlyDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
@@ -127,6 +129,15 @@ def create_app(
         )
 
     if ui_enabled:
+        # Unauthenticated: the SPA reads this at startup to know whether it
+        # must run the Auth0 login flow before calling the gated routes below.
+        app.include_router(create_auth_config_router(auth0_settings))
+
+        # Single gate shared by the two /api/* routers. Webhook routes are
+        # mounted above, outside this gate (they verify their own HMAC).
+        api_dependencies = (
+            [Depends(create_auth_dependency(auth0_settings))] if auth0_settings is not None else []
+        )
         if ui_pool is not None:
             app.include_router(
                 create_issue_detail_router(
@@ -135,7 +146,8 @@ def create_app(
                     clock=clock,
                     status_thresholds=ui_status_thresholds,
                     no_progress_threshold=ui_pr_no_progress_threshold,
-                )
+                ),
+                dependencies=api_dependencies,
             )
 
         ui_teams = (
@@ -152,7 +164,8 @@ def create_app(
                 command_sink=ui_command_sink,
                 teams=ui_teams,
                 webhook_public_url=ui_webhook_public_url,
-            )
+            ),
+            dependencies=api_dependencies,
         )
         dist_dir = ui_dist_dir or _DEFAULT_UI_DIST
         if dist_dir.exists():
