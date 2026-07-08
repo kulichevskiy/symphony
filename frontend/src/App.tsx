@@ -7,6 +7,7 @@ import { LiveDot } from "@/components/dashboard/StatusBadge";
 import { ThemeToggle } from "@/components/dashboard/ThemeToggle";
 import { Icon } from "@/components/ui/icon";
 import { fetchMeta } from "@/lib/api";
+import { authEnabled, LogoutButton } from "@/lib/auth0";
 import { FiltersProvider } from "@/lib/filters";
 import { useTheme } from "@/lib/useTheme";
 import { HomePage } from "@/pages/HomePage";
@@ -79,6 +80,7 @@ export function App() {
                 <LiveDot tone="bg-green-500" /> daemon · loopback
               </span>
               <ThemeToggle dark={dark} onToggle={toggle} />
+              {authEnabled ? <LogoutButton /> : null}
             </div>
           </div>
         </header>

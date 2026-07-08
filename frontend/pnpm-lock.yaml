@@ -8,9 +8,9 @@ importers:
 
   .:
     dependencies:
-      '@auth0/auth0-spa-js':
-        specifier: ^2.23.0
-        version: 2.23.0
+      '@auth0/auth0-react':
+        specifier: ^2.20.0
+        version: 2.20.0(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
       '@tanstack/react-query':
         specifier: ^5.90.0
         version: 5.100.10(react@19.2.6)
@@ -72,6 +72,12 @@ packages:
 
   '@auth0/auth0-auth-js@1.11.0':
     resolution: {integrity: sha512-hy5knYIPKECTLCPCZKolHsdOkjZhCAc59pga4Y3dp8q7E1uVSKYI7BUhzukNVykUshJRmcgPwOiBtsn2JjUo6w==}
+
+  '@auth0/auth0-react@2.20.0':
+    resolution: {integrity: sha512-Ic08VdYxt6cUDFwiJBehcuBGkr7DOWD9CrIkDL/LRmgvBX/PU9CgfON7QEsflq7GqXNRJh/+f8Vu0T7hdL8p1Q==}
+    peerDependencies:
+      react: ^16.11.0 || ^17 || ^18 || ~19.0.1 || ~19.1.2 || ^19.2.1
+      react-dom: ^16.11.0 || ^17 || ^18 || ~19.0.1 || ~19.1.2 || ^19.2.1
 
   '@auth0/auth0-spa-js@2.23.0':
     resolution: {integrity: sha512-fRiPlTIMLahes6eXq5C4CF8zFi9vLxUtii8e7CESmzWBJGSa3jRrnjgQVAPSaox2x+CwzTFcJbt4mR+UiVMk1Q==}
@@ -1148,6 +1154,12 @@ snapshots:
     dependencies:
       jose: 6.2.3
       openid-client: 6.8.4
+
+  '@auth0/auth0-react@2.20.0(react-dom@19.2.6(react@19.2.6))(react@19.2.6)':
+    dependencies:
+      '@auth0/auth0-spa-js': 2.23.0
+      react: 19.2.6
+      react-dom: 19.2.6(react@19.2.6)
 
   '@auth0/auth0-spa-js@2.23.0':
     dependencies:

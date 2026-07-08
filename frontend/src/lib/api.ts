@@ -1,5 +1,17 @@
 import { authHeaders } from "@/lib/auth";
 
+/** A non-2xx `/api/*` response. Carries the HTTP `status` so callers can
+ *  distinguish an allowlist rejection (403) from other failures. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export type CanonicalStatusState =
   | "drift_detected"
   | "halted"
@@ -288,7 +300,10 @@ async function fetchJson<T>(
   });
 
   if (!response.ok) {
-    throw new Error(response.status === 404 ? notFoundMessage : fallbackMessage);
+    throw new ApiError(
+      response.status === 404 ? notFoundMessage : fallbackMessage,
+      response.status,
+    );
   }
 
   return (await response.json()) as T;
