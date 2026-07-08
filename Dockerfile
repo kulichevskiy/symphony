@@ -43,6 +43,7 @@ WORKDIR /app
 # Dependencies first for layer caching.
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
+COPY prompts/ ./prompts/
 RUN uv sync --frozen --no-dev
 
 # Prebuilt dashboard so the daemon can mount /ui.

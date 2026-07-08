@@ -53,6 +53,14 @@ def test_dockerfile_builds_frontend_so_ui_is_served() -> None:
     assert "COPY --from=frontend /build/frontend/dist ./frontend/dist" in text
 
 
+def test_dockerfile_copies_prompts_so_templates_ship_in_image() -> None:
+    text = _read("Dockerfile")
+
+    # _load_prompt_template() reads /app/prompts/<name>.md at runtime; without
+    # this COPY the image silently falls back to inline default prompts.
+    assert "COPY prompts/ ./prompts/" in text
+
+
 def test_dockerfile_auth_dirs_are_precreated_and_owned_by_symphony() -> None:
     text = _read("Dockerfile")
 

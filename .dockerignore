@@ -8,7 +8,6 @@
 .ruff_cache
 tests
 evals
-prompts
 .thoughts
 docs
 analysis
