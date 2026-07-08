@@ -31,6 +31,7 @@ from .agent.codex_cli import (
 )
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
+from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -142,6 +143,16 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
         err=True,
     )
     return None
+
+
+def _auth0_settings(cfg: Config) -> Auth0Settings | None:
+    if not (cfg.auth0_domain and cfg.auth0_client_id and cfg.auth0_allowed_emails):
+        return None
+    return Auth0Settings.from_env(
+        domain=cfg.auth0_domain,
+        client_id=cfg.auth0_client_id,
+        allowed_emails=cfg.auth0_allowed_emails,
+    )
 
 
 def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
@@ -265,6 +276,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ),
                     ui_command_sink=orch,
                     ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
+                    auth0_settings=_auth0_settings(cfg),
                 )
                 server = uvicorn.Server(
                     build_server_config(
