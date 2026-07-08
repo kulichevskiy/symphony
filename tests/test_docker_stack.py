@@ -77,7 +77,12 @@ def test_dockerfile_auth_dirs_are_precreated_and_owned_by_symphony() -> None:
 
     # Empty named volumes mounted over paths absent from the image are
     # created by Docker as root:root, breaking the non-root user's logins.
-    for auth_dir in ("/home/symphony/.claude", "/home/symphony/.codex", "/home/symphony/.config/gh"):
+    auth_dirs = (
+        "/home/symphony/.claude",
+        "/home/symphony/.codex",
+        "/home/symphony/.config/gh",
+    )
+    for auth_dir in auth_dirs:
         assert auth_dir in text
     assert "chown -R symphony:symphony" in text
 
