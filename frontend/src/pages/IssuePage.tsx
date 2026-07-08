@@ -18,6 +18,7 @@ import {
 } from "@/components/dashboard/atoms";
 import { LiveDot, StatusBadge } from "@/components/dashboard/StatusBadge";
 import { IssueTimeline } from "@/components/IssueTimeline";
+import { LiveFeed } from "@/components/LiveFeed";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -827,6 +828,7 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
+  const liveRun = detail?.runs.find((r) => r.status === "running") ?? null;
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
@@ -886,6 +888,11 @@ export function IssuePage() {
 
           <div className="mt-4 space-y-4">
             <NowCard c={cockpit} nowMs={nowMs} />
+            {liveRun ? (
+              <CockpitCard title="Live output">
+                <LiveFeed runId={liveRun.id} active />
+              </CockpitCard>
+            ) : null}
             <div className="grid gap-4 sm:grid-cols-2">
               <TokensCard c={cockpit} />
               <PrCard pr={cockpit.pr} />

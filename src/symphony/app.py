@@ -28,6 +28,7 @@ from .ui.api import CommandSink, create_api_router
 from .ui.db import ReadOnlyDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
+from .ui.live import create_live_stream_router
 from .ui.status import CanonicalState
 from .webhook import (
     LOOPBACK_HOST,
@@ -61,6 +62,7 @@ def create_app(
     github_handler: GitHubWebhookHandler | None = None,
     ui_enabled: bool = True,
     ui_db_path: Path | None = None,
+    ui_log_root: Path | None = None,
     ui_dist_dir: Path | None = None,
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     ui_external_config: Config | None = None,
@@ -149,6 +151,11 @@ def create_app(
                 ),
                 dependencies=api_dependencies,
             )
+            if ui_log_root is not None:
+                app.include_router(
+                    create_live_stream_router(ui_pool, log_root=ui_log_root),
+                    dependencies=api_dependencies,
+                )
 
         ui_teams = (
             sorted({b.linear_team_key for b in ui_external_config.repos})

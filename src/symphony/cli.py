@@ -283,6 +283,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     github_webhook_settings,
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
+                    ui_log_root=cfg.log_root,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                     ui_external_config=cfg,
                     ui_external_linear=external_linear,
