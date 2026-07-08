@@ -10,13 +10,20 @@ let idToken: string | null = null;
 let idTokenExpiresAt = 0;
 
 async function fetchAuthConfig(): Promise<AuthConfig> {
-  const response = await fetch("/api/auth-config", {
-    headers: { Accept: "application/json" },
-  });
-  if (!response.ok) {
+  try {
+    const response = await fetch("/api/auth-config", {
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      return { enabled: false };
+    }
+    return (await response.json()) as AuthConfig;
+  } catch {
+    // Network error (e.g. the daemon/proxy isn't up yet) — treat as
+    // disabled so the UI renders instead of hanging forever. Auth0-gated
+    // API calls will still 401 until the page is reloaded.
     return { enabled: false };
   }
-  return (await response.json()) as AuthConfig;
 }
 
 /**
@@ -50,12 +57,17 @@ export async function initAuth(): Promise<void> {
   }
 
   if (!(await client.isAuthenticated())) {
-    const targetUrl = `${window.location.pathname}${window.location.search}`;
-    await client.loginWithRedirect({ appState: { targetUrl } });
-    return new Promise<void>(() => {});
+    return redirectToLogin();
   }
 
   await refreshIdToken();
+}
+
+/** Sends the browser to Auth0 login, preserving the current route, and never resolves. */
+async function redirectToLogin(): Promise<never> {
+  const targetUrl = `${window.location.pathname}${window.location.search}`;
+  await client?.loginWithRedirect({ appState: { targetUrl } });
+  return new Promise<never>(() => {});
 }
 
 async function refreshIdToken(): Promise<void> {
@@ -68,11 +80,18 @@ async function refreshIdToken(): Promise<void> {
  * `Authorization` header for `/api/*` fetches; empty once auth is disabled or
  * unset. Refreshes the cached ID token first if it's expired or about to
  * expire, so a dashboard left open past the token's `exp` keeps working.
+ * If silent renewal can't complete without an interactive login (Auth0
+ * session expired, third-party cookies blocked, ...), redirect to login
+ * instead of proceeding with a stale/missing token.
  */
 export async function authHeaders(): Promise<Record<string, string>> {
   if (client !== null && Date.now() / 1000 >= idTokenExpiresAt - REFRESH_SKEW_SECS) {
-    await client.getTokenSilently();
-    await refreshIdToken();
+    try {
+      await client.getTokenSilently();
+      await refreshIdToken();
+    } catch {
+      return redirectToLogin();
+    }
   }
   return idToken ? { Authorization: `Bearer ${idToken}` } : {};
 }

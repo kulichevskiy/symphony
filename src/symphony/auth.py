@@ -60,7 +60,7 @@ class Auth0Verifier:
         self._settings = settings
         self._client = client
         self._keys: dict[str, dict[str, Any]] | None = None
-        self._last_kid_refetch: float | None = None
+        self._kid_refetch_at: dict[str, float] = {}
 
     async def _fetch_signing_keys(self) -> dict[str, dict[str, Any]]:
         try:
@@ -93,14 +93,15 @@ class Auth0Verifier:
         if kid not in keys:
             # Auth0 rotates signing keys without notice; refetch before
             # rejecting so a token signed with a newly-rotated key still
-            # verifies. Throttled so a flood of unknown kids can't force a
-            # JWKS fetch per request.
+            # verifies. Throttled per-kid (not globally) so a flood of
+            # requests carrying the same unknown kid can't force a JWKS
+            # fetch per request, without letting a probe with one bad kid
+            # throttle the refetch a *different*, genuinely rotated kid
+            # needs right after.
             now = time.monotonic()
-            if (
-                self._last_kid_refetch is None
-                or now - self._last_kid_refetch >= _MIN_KID_REFETCH_INTERVAL_SECS
-            ):
-                self._last_kid_refetch = now
+            last = self._kid_refetch_at.get(kid)
+            if last is None or now - last >= _MIN_KID_REFETCH_INTERVAL_SECS:
+                self._kid_refetch_at[kid] = now
                 self._keys = keys = await self._fetch_signing_keys()
         jwk = keys.get(kid)
         if jwk is None:
