@@ -432,6 +432,13 @@ async def _preflight(config_path: Path) -> None:
     if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY is empty", err=True)
         sys.exit(2)
+    if cfg.ui.enabled:
+        # Raises ClickException on a partial AUTH0_* env — surface that here
+        # rather than at daemon startup.
+        if _auth0_settings(cfg) is not None:
+            click.echo("Auth0 config: ok, /api/* gate enabled")
+        else:
+            click.echo("Auth0 config: unset, /api/* is unauthenticated")
     if _config_can_run_codex_cli(cfg):
         try:
             codex_config, created_profile = ensure_symphony_permissions_profile()

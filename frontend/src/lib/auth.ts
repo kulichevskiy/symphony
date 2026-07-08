@@ -2,7 +2,12 @@ import { Auth0Client } from "@auth0/auth0-spa-js";
 
 type AuthConfig = { enabled: false } | { enabled: true; domain: string; client_id: string };
 
+/** Refresh the ID token this many seconds before it actually expires. */
+const REFRESH_SKEW_SECS = 60;
+
+let client: Auth0Client | null = null;
 let idToken: string | null = null;
+let idTokenExpiresAt = 0;
 
 async function fetchAuthConfig(): Promise<AuthConfig> {
   const response = await fetch("/api/auth-config", {
@@ -26,7 +31,7 @@ export async function initAuth(): Promise<void> {
     return;
   }
 
-  const client = new Auth0Client({
+  client = new Auth0Client({
     domain: config.domain,
     clientId: config.client_id,
     authorizationParams: { redirect_uri: `${window.location.origin}/ui/` },
@@ -35,20 +40,34 @@ export async function initAuth(): Promise<void> {
 
   const params = new URLSearchParams(window.location.search);
   if (params.has("code") && params.has("state")) {
-    await client.handleRedirectCallback();
-    window.history.replaceState({}, "", window.location.pathname);
+    const result = await client.handleRedirectCallback<{ targetUrl?: string }>();
+    window.history.replaceState({}, "", result.appState?.targetUrl ?? window.location.pathname);
   }
 
   if (!(await client.isAuthenticated())) {
-    await client.loginWithRedirect();
+    const targetUrl = `${window.location.pathname}${window.location.search}`;
+    await client.loginWithRedirect({ appState: { targetUrl } });
     return new Promise<void>(() => {});
   }
 
-  const claims = await client.getIdTokenClaims();
-  idToken = claims?.__raw ?? null;
+  await refreshIdToken();
 }
 
-/** `Authorization` header for `/api/*` fetches; empty once auth is disabled or unset. */
-export function authHeaders(): Record<string, string> {
+async function refreshIdToken(): Promise<void> {
+  const claims = await client?.getIdTokenClaims();
+  idToken = claims?.__raw ?? null;
+  idTokenExpiresAt = claims?.exp ?? 0;
+}
+
+/**
+ * `Authorization` header for `/api/*` fetches; empty once auth is disabled or
+ * unset. Refreshes the cached ID token first if it's expired or about to
+ * expire, so a dashboard left open past the token's `exp` keeps working.
+ */
+export async function authHeaders(): Promise<Record<string, string>> {
+  if (client !== null && Date.now() / 1000 >= idTokenExpiresAt - REFRESH_SKEW_SECS) {
+    await client.getTokenSilently();
+    await refreshIdToken();
+  }
   return idToken ? { Authorization: `Bearer ${idToken}` } : {};
 }

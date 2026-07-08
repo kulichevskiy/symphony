@@ -12,6 +12,7 @@ Webhook routes verify their own HMAC and stay outside this gate.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -20,6 +21,11 @@ import httpx
 import jwt
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+# Minimum gap between forced JWKS refetches triggered by an unrecognized
+# `kid`. Without this, a flood of requests carrying random kids (e.g. through
+# a public tunnel) would each cause an outbound JWKS fetch.
+_MIN_KID_REFETCH_INTERVAL_SECS = 30.0
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,7 @@ class Auth0Verifier:
         self._settings = settings
         self._client = client
         self._keys: dict[str, dict[str, Any]] | None = None
+        self._last_kid_refetch: float | None = None
 
     async def _fetch_signing_keys(self) -> dict[str, dict[str, Any]]:
         if self._client is not None:
@@ -81,9 +88,17 @@ class Auth0Verifier:
             raise HTTPException(status_code=401, detail="unknown signing key")
         keys = await self._signing_keys()
         if kid not in keys:
-            # Auth0 rotates signing keys without notice; refetch once before
-            # rejecting so a token signed with a newly-rotated key still verifies.
-            self._keys = keys = await self._fetch_signing_keys()
+            # Auth0 rotates signing keys without notice; refetch before
+            # rejecting so a token signed with a newly-rotated key still
+            # verifies. Throttled so a flood of unknown kids can't force a
+            # JWKS fetch per request.
+            now = time.monotonic()
+            if (
+                self._last_kid_refetch is None
+                or now - self._last_kid_refetch >= _MIN_KID_REFETCH_INTERVAL_SECS
+            ):
+                self._last_kid_refetch = now
+                self._keys = keys = await self._fetch_signing_keys()
         jwk = keys.get(kid)
         if jwk is None:
             raise HTTPException(status_code=401, detail="unknown signing key")

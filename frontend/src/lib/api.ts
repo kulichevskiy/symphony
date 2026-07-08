@@ -284,7 +284,7 @@ async function fetchJson<T>(
   fallbackMessage: string,
 ): Promise<T> {
   const response = await fetch(path, {
-    headers: { Accept: "application/json", ...authHeaders() },
+    headers: { Accept: "application/json", ...(await authHeaders()) },
   });
 
   if (!response.ok) {
@@ -438,7 +438,7 @@ export async function postIssueCommand(
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
-      ...authHeaders(),
+      ...(await authHeaders()),
     },
     body: JSON.stringify({ command }),
   });

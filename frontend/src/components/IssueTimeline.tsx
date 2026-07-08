@@ -10,6 +10,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { authHeaders } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
 type TimelineEvent = {
@@ -67,7 +68,9 @@ const KIND_COLORS: Record<string, string> = {
 };
 
 async function fetchIssueTimeline(id: string): Promise<TimelineEvent[]> {
-  const response = await fetch(`/api/issues/${encodeURIComponent(id)}/timeline`);
+  const response = await fetch(`/api/issues/${encodeURIComponent(id)}/timeline`, {
+    headers: await authHeaders(),
+  });
   if (!response.ok) {
     throw new Error(response.status === 404 ? "Issue not found" : "Failed to load timeline");
   }
