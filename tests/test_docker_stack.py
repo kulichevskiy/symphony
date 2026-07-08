@@ -64,6 +64,14 @@ def test_dockerfile_copies_prompts_so_templates_ship_in_image() -> None:
     assert "COPY prompts/ ./prompts/" in text
 
 
+def test_dockerfile_copies_taste_guide_so_acceptance_has_global_guide() -> None:
+    text = _read("Dockerfile")
+
+    # The Acceptance stage loads the global taste guide from Path.cwd()
+    # (/app) at runtime; without this COPY it silently runs with none.
+    assert "COPY taste-guide.md ./" in text
+
+
 def test_dockerfile_auth_dirs_are_precreated_and_owned_by_symphony() -> None:
     text = _read("Dockerfile")
 

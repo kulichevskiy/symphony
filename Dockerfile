@@ -44,6 +44,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY src/ ./src/
 COPY prompts/ ./prompts/
+COPY taste-guide.md ./
 RUN uv sync --frozen --no-dev
 
 # Prebuilt dashboard so the daemon can mount /ui.
