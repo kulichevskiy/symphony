@@ -49,11 +49,16 @@ RUN uv sync --frozen --no-dev
 COPY --from=frontend /build/frontend/dist ./frontend/dist
 
 # Data dirs (mount points for named volumes) owned by the runtime user.
+# Auth dirs are created here too: an empty named volume mounted over a path
+# that doesn't exist in the image gets created by Docker as root:root, which
+# breaks the non-root `symphony` user's one-time CLI logins.
 RUN mkdir -p /data/workspaces /data/logs /data/db \
-    && chown -R symphony:symphony /app /data
+        /home/symphony/.claude /home/symphony/.codex /home/symphony/.config/gh \
+    && chown -R symphony:symphony /app /data /home/symphony
 
 USER symphony
+ENV HOME=/home/symphony
 ENV PATH="/app/.venv/bin:$PATH"
 
-ENTRYPOINT ["uv", "run", "--no-dev", "symphony"]
+ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD ["--config", "/app/config.local.yaml"]

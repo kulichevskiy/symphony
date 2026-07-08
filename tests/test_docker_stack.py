@@ -48,8 +48,25 @@ def test_dockerfile_verifies_toolchain_on_path() -> None:
 def test_dockerfile_builds_frontend_so_ui_is_served() -> None:
     text = _read("Dockerfile")
 
-    # The daemon only mounts /ui when frontend/dist exists.
-    assert "frontend/dist" in text or "pnpm" in text or "vite" in text
+    # The daemon only mounts /ui when frontend/dist exists; pin to the exact
+    # copy so deleting it can't slip past a trivially-true substring check.
+    assert "COPY --from=frontend /build/frontend/dist ./frontend/dist" in text
+
+
+def test_dockerfile_auth_dirs_are_precreated_and_owned_by_symphony() -> None:
+    text = _read("Dockerfile")
+
+    # Empty named volumes mounted over paths absent from the image are
+    # created by Docker as root:root, breaking the non-root user's logins.
+    for auth_dir in ("/home/symphony/.claude", "/home/symphony/.codex", "/home/symphony/.config/gh"):
+        assert auth_dir in text
+    assert "chown -R symphony:symphony" in text
+
+
+def test_dockerfile_sets_home_for_symphony_user() -> None:
+    text = _read("Dockerfile")
+
+    assert "ENV HOME=/home/symphony" in text
 
 
 # --- docker-compose.yml ---------------------------------------------------
