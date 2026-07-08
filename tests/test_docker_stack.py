@@ -7,9 +7,12 @@ loopback — no code change to the loopback guard is needed.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import yaml
+
+from symphony.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -131,6 +134,18 @@ def test_compose_caddy_fronts_the_daemon_and_publishes_https() -> None:
     assert symphony.get("network_mode") == "service:caddy"
     published = "\n".join(str(p) for p in caddy.get("ports", []))
     assert "443" in published
+
+
+# --- examples/config.docker.yaml ------------------------------------------
+
+
+def test_docker_config_template_loads_without_deprecation_warning() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        Config.load(ROOT / "examples" / "config.docker.yaml")
+
+    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+    assert not deprecations, [str(w.message) for w in deprecations]
 
 
 # --- Caddyfile ------------------------------------------------------------

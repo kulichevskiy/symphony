@@ -27,7 +27,6 @@ ui:
 repos:
   - linear_team_key: ENG
     github_repo: org/repo
-    agent: claude
     local_review: false
     remote_review: true
     issue_label: symphony
