@@ -1,10 +1,10 @@
 import { Auth0Provider, useAuth0 } from "@auth0/auth0-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
 import { ApiError, fetchAuthConfig, fetchMeta } from "@/lib/api";
-import { registerTokenProvider } from "@/lib/auth";
+import { registerTokenProvider, type TokenProvider } from "@/lib/auth";
 
 // Build-time fallback only — used when the runtime `/api/auth-config` call
 // below fails outright. The daemon's own env vars are the source of truth,
@@ -101,25 +101,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 }
 
-/** Publishes the auth0-react client to `authHeaders()`, which runs outside React. */
+/**
+ * Publishes the auth0-react client to `authHeaders()`, which runs outside
+ * React. Registers during render, not in an effect: `AllowlistGate`'s
+ * `useQuery` can kick off its fetch as soon as it renders (React Query
+ * doesn't wait for effects to commit), so registering the bridge only after
+ * commit would leave that first request without a bearer token.
+ */
 function AuthBridge() {
   const { getAccessTokenSilently, getIdTokenClaims, loginWithRedirect } = useAuth0();
-  useEffect(() => {
-    registerTokenProvider({
+  const tokenProvider = useMemo<TokenProvider>(
+    () => ({
       getAccessTokenSilently: (opts) => getAccessTokenSilently(opts),
-      getIdTokenClaims,
-      loginWithRedirect: () => loginWithRedirect(),
-    });
-    return () => registerTokenProvider(null);
-  }, [getAccessTokenSilently, getIdTokenClaims, loginWithRedirect]);
+      getIdTokenClaims: () => getIdTokenClaims(),
+      loginWithRedirect: (opts) => loginWithRedirect(opts),
+    }),
+    [getAccessTokenSilently, getIdTokenClaims, loginWithRedirect],
+  );
+  registerTokenProvider(tokenProvider);
+  useEffect(() => () => registerTokenProvider(null), []);
   return null;
 }
 
 function AuthGate({ children }: { children: ReactNode }) {
   const { isLoading, isAuthenticated, error, loginWithRedirect } = useAuth0();
+  // StrictMode double-invokes effects in dev; without this guard an
+  // unauthenticated user's first render would start two login redirects.
+  const redirectStarted = useRef(false);
 
   useEffect(() => {
-    if (!isLoading && !isAuthenticated && !error) {
+    if (!isLoading && !isAuthenticated && !error && !redirectStarted.current) {
+      redirectStarted.current = true;
       void loginWithRedirect({
         appState: { returnTo: `${window.location.pathname}${window.location.search}` },
       });

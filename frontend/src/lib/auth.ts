@@ -10,7 +10,7 @@ import type { IdToken } from "@auth0/auth0-react";
 export interface TokenProvider {
   getAccessTokenSilently: (opts?: { cacheMode?: "on" | "off" | "cache-only" }) => Promise<string>;
   getIdTokenClaims: () => Promise<IdToken | undefined>;
-  loginWithRedirect: () => Promise<void>;
+  loginWithRedirect: (opts?: { appState?: { returnTo?: string } }) => Promise<void>;
 }
 
 let provider: TokenProvider | null = null;
@@ -19,8 +19,19 @@ export function registerTokenProvider(next: TokenProvider | null): void {
   provider = next;
 }
 
+// Refresh a bit ahead of the exact expiry instant: the backend independently
+// validates `exp`, so a token that's still "valid" here by a few seconds can
+// arrive there already expired.
+const EXPIRY_LEEWAY_MS = 30_000;
+
 function isExpired(claims: IdToken | undefined): boolean {
-  return typeof claims?.exp === "number" && claims.exp * 1000 <= Date.now();
+  return typeof claims?.exp === "number" && claims.exp * 1000 <= Date.now() + EXPIRY_LEEWAY_MS;
+}
+
+function currentReturnTo(): string | undefined {
+  return typeof window === "undefined"
+    ? undefined
+    : `${window.location.pathname}${window.location.search}`;
 }
 
 /**
@@ -49,7 +60,7 @@ export async function authHeaders(): Promise<Record<string, string>> {
     const raw = claims?.__raw;
     return raw ? { Authorization: `Bearer ${raw}` } : {};
   } catch {
-    await provider.loginWithRedirect();
+    await provider.loginWithRedirect({ appState: { returnTo: currentReturnTo() } });
     return {};
   }
 }
