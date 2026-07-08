@@ -42,6 +42,27 @@ describe("authHeaders", () => {
     expect(calls).toEqual(["refresh", "claims"]);
   });
 
+  it("forces an uncached refresh when the cached ID token is already expired", async () => {
+    const cacheModes: Array<string | undefined> = [];
+    let claimsCall = 0;
+    registerTokenProvider(
+      provider({
+        getAccessTokenSilently: async (opts) => {
+          cacheModes.push(opts?.cacheMode);
+          return "a";
+        },
+        getIdTokenClaims: async () => {
+          claimsCall += 1;
+          // First read: expired. Second (post-forced-refresh) read: fresh.
+          const exp = claimsCall === 1 ? Date.now() / 1000 - 60 : Date.now() / 1000 + 3600;
+          return { __raw: `token-${claimsCall}`, exp } as never;
+        },
+      }),
+    );
+    expect(await authHeaders()).toEqual({ Authorization: "Bearer token-2" });
+    expect(cacheModes).toEqual([undefined, "off"]);
+  });
+
   it("redirects to login and sends no header when renewal fails", async () => {
     let loggedIn = false;
     registerTokenProvider(

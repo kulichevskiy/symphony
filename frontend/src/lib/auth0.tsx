@@ -1,35 +1,88 @@
 import { Auth0Provider, useAuth0 } from "@auth0/auth0-react";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ApiError, fetchMeta } from "@/lib/api";
+import { ApiError, fetchAuthConfig, fetchMeta } from "@/lib/api";
 import { registerTokenProvider } from "@/lib/auth";
 
-const DOMAIN = import.meta.env.VITE_AUTH0_DOMAIN;
-const CLIENT_ID = import.meta.env.VITE_AUTH0_CLIENT_ID;
+// Build-time fallback only — used when the runtime `/api/auth-config` call
+// below fails outright. The daemon's own env vars are the source of truth,
+// since a static bundle can be served by a daemon whose AUTH0_DOMAIN /
+// AUTH0_CLIENT_ID differ from (or weren't set at) build time.
+const BUILD_DOMAIN = import.meta.env.VITE_AUTH0_DOMAIN;
+const BUILD_CLIENT_ID = import.meta.env.VITE_AUTH0_CLIENT_ID;
 
-/** Auth0 is only enforced when both env vars are set (e.g. production). Local
- *  loopback dev leaves them unset and the app renders without a login gate. */
-export const authEnabled = Boolean(DOMAIN && CLIENT_ID);
+/** Whether the mounted app is running behind the Auth0 gate. `App` reads this
+ *  to decide whether to show the logout control; it's only ever read once
+ *  `AuthProvider` has resolved (its children, and everything under them,
+ *  don't mount until then), so it's always current by the time anything
+ *  reads it despite not being reactive state itself. */
+export let authEnabled = false;
 
 const RETURN_TO = () => `${window.location.origin}/ui/`;
 
+interface ResolvedAuthConfig {
+  domain: string;
+  clientId: string;
+}
+
+/** The running daemon's `/api/auth-config` is authoritative for whether/how
+ *  to run the Auth0 flow. Only falls back to the build-time `VITE_AUTH0_*`
+ *  vars when that call fails outright (e.g. network hiccup), so a reachable
+ *  daemon's runtime config always wins over whatever was baked into this
+ *  bundle at build time. */
+async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
+  try {
+    const config = await fetchAuthConfig();
+    if (config.enabled && config.domain && config.client_id) {
+      return { domain: config.domain, clientId: config.client_id };
+    }
+    return null;
+  } catch {
+    return BUILD_DOMAIN && BUILD_CLIENT_ID
+      ? { domain: BUILD_DOMAIN, clientId: BUILD_CLIENT_ID }
+      : null;
+  }
+}
+
 /**
- * Wraps the app in `<Auth0Provider>` (Authorization Code + PKCE, Google, no
- * `audience` so the ID token stays a validatable JWT) and gates it: tokens live
- * in memory with refresh-token rotation, unauthenticated users are sent to
- * Auth0 login, and a logged-in-but-not-allowlisted user (backend 403) gets an
- * access-denied screen. A no-op passthrough when Auth0 is disabled.
+ * Resolves the Auth0 config from the running daemon, then wraps the app in
+ * `<Auth0Provider>` (Authorization Code + PKCE, Google, no `audience` so the
+ * ID token stays a validatable JWT) and gates it: tokens live in memory with
+ * refresh-token rotation, unauthenticated users are sent to Auth0 login, and
+ * a logged-in-but-not-allowlisted user (backend 403) gets an access-denied
+ * screen. A no-op passthrough when Auth0 is disabled.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
-  if (!authEnabled) {
+  const [config, setConfig] = useState<ResolvedAuthConfig | null | "pending">("pending");
+
+  useEffect(() => {
+    let cancelled = false;
+    void resolveAuthConfig().then((resolved) => {
+      if (!cancelled) {
+        setConfig(resolved);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (config === "pending") {
+    return <AuthNotice title="Loading…" />;
+  }
+
+  authEnabled = config !== null;
+
+  if (config === null) {
     return <>{children}</>;
   }
+
   return (
     <Auth0Provider
-      domain={DOMAIN as string}
-      clientId={CLIENT_ID as string}
+      domain={config.domain}
+      clientId={config.clientId}
       authorizationParams={{
         redirect_uri: RETURN_TO(),
         // Force the Google social connection — the app's only login method.
@@ -53,7 +106,7 @@ function AuthBridge() {
   const { getAccessTokenSilently, getIdTokenClaims, loginWithRedirect } = useAuth0();
   useEffect(() => {
     registerTokenProvider({
-      getAccessTokenSilently: () => getAccessTokenSilently(),
+      getAccessTokenSilently: (opts) => getAccessTokenSilently(opts),
       getIdTokenClaims,
       loginWithRedirect: () => loginWithRedirect(),
     });

@@ -41,6 +41,16 @@ export interface Meta {
   linear_webhook_url?: string | null;
 }
 
+/** The daemon's live Auth0 tenant config, as configured by its own
+ *  `AUTH0_DOMAIN`/`AUTH0_CLIENT_ID` env vars — the source of truth for
+ *  whether/how to run the Auth0 login flow, since those can differ from
+ *  whatever was baked into this static bundle at build time. */
+export interface AuthConfig {
+  enabled: boolean;
+  domain?: string;
+  client_id?: string;
+}
+
 export interface IssueSummary {
   id: string;
   identifier: string;
@@ -362,6 +372,14 @@ export function fetchIssues({
 
 export function fetchMeta(): Promise<Meta> {
   return fetchJson<Meta>("/api/meta", "Meta not found", "Failed to load meta");
+}
+
+export function fetchAuthConfig(): Promise<AuthConfig> {
+  return fetchJson<AuthConfig>(
+    "/api/auth-config",
+    "Auth config not found",
+    "Failed to load auth config",
+  );
 }
 
 export function fetchSpendSummary(
