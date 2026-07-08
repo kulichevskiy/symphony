@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -9,6 +11,7 @@ import pytest
 from symphony import db
 from symphony.app import create_app
 from symphony.auth import Auth0Settings
+from symphony.ui import live as live_module
 from symphony.ui.live import parse_stream_events
 
 from .test_webhook import _Handler
@@ -282,6 +285,126 @@ async def test_stream_offset_skips_already_read_bytes(tmp_path: Path) -> None:
     events = _events(resp.text)
     texts = [e.get("text") for e in events if e["kind"] == "message"]
     assert texts == ["second"]
+
+
+@pytest.mark.asyncio
+async def test_stream_tails_growing_log_across_polls(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_run(conn, "run-grow", "running")
+        log_root.mkdir(parents=True, exist_ok=True)
+        log_path = log_root / "run-grow.log"
+        log_path.write_text("")
+        first = json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "first"}]}}
+        )
+        second = json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "second"}]}}
+        )
+
+        async def _grow_log() -> None:
+            await asyncio.sleep(0.05)
+            with log_path.open("a") as fh:
+                fh.write(first + "\n")
+            await asyncio.sleep(0.6)
+            with log_path.open("a") as fh:
+                fh.write(second + "\n")
+            raw = sqlite3.connect(db_path)
+            try:
+                raw.execute("UPDATE runs SET status = 'completed' WHERE id = 'run-grow'")
+                raw.commit()
+            finally:
+                raw.close()
+
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_log_root=log_root,
+        )
+        grower = asyncio.create_task(_grow_log())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/runs/run-grow/stream")
+        await grower
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 200
+    events = _events(resp.text)
+    messages = [e["text"] for e in events if e["kind"] == "message"]
+    assert messages == ["first", "second"]
+    cursor_offsets = [e["offset"] for e in events if e["kind"] == "cursor"]
+    assert len(f"{first}\n".encode()) in cursor_offsets
+    assert cursor_offsets[-1] == len(f"{first}\n{second}\n".encode())
+    assert events[-1]["kind"] == "end"
+
+
+@pytest.mark.asyncio
+async def test_stream_drains_final_line_written_during_terminal_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Simulates the race the reviewer flagged: the run's last line lands on
+    disk and the status flips to terminal in the gap between one loop
+    iteration's read and its status check. The fix must drain that line
+    before signalling `end` instead of dropping it."""
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_run(conn, "run-race", "running")
+        first = json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "first"}]}}
+        )
+        second = json.dumps(
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "second"}]}}
+        )
+        _write_log(log_root, "run-race", [first])
+        log_path = log_root / "run-race.log"
+
+        original_read_from = live_module._read_from
+        calls = {"n": 0}
+
+        def _fake_read_from(path: Path, pos: int) -> tuple[bytes, int]:
+            calls["n"] += 1
+            data, new_pos = original_read_from(path, pos)
+            if calls["n"] == 1:
+                with path.open("a") as fh:
+                    fh.write(second + "\n")
+                raw = sqlite3.connect(db_path)
+                try:
+                    raw.execute("UPDATE runs SET status = 'completed' WHERE id = 'run-race'")
+                    raw.commit()
+                finally:
+                    raw.close()
+            return data, new_pos
+
+        monkeypatch.setattr(live_module, "_read_from", _fake_read_from)
+
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_log_root=log_root,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/runs/run-race/stream")
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 200
+    events = _events(resp.text)
+    messages = [e["text"] for e in events if e["kind"] == "message"]
+    assert messages == ["first", "second"]
+    assert events[-1]["kind"] == "end"
+    assert log_path.read_text() == f"{first}\n{second}\n"
 
 
 @pytest.mark.asyncio

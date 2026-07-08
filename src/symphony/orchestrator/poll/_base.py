@@ -2092,6 +2092,7 @@ class _OrchestratorBase:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
                         logf.write(ev.line + "\n")
+                        logf.flush()
                         usage = parse_event_line(ev.line)
                         if usage is not None:
                             cumulative_usage = _sum_usage(
@@ -2106,6 +2107,7 @@ class _OrchestratorBase:
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
+                        logf.flush()
                     elif ev.kind == "tick":
                         await self._record_activity_tick(
                             session=activity,
@@ -2378,6 +2380,7 @@ class _OrchestratorBase:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
                         logf.write(ev.line + "\n")
+                        logf.flush()
                         usage = parse_event_line(ev.line)
                         if usage is not None:
                             cumulative_usage = _sum_usage(
@@ -2392,6 +2395,7 @@ class _OrchestratorBase:
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
                         logf.write(f"[stderr] {ev.line}\n")
+                        logf.flush()
                     elif ev.kind == "tick":
                         await self._record_activity_tick(
                             session=activity,

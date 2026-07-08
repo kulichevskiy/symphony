@@ -60,14 +60,19 @@ def parse_stream_events(line: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
     # Token ticks: shared parser recognises claude `result` and codex
-    # `token_count` / `turn.completed`. claude assistant turns also carry a
-    # `message.usage` running total, surfaced below.
+    # `token_count` / `turn.completed`.
     usage = parse_event_line(line)
     if usage is not None:
         events.append(_tokens_event(usage.__dict__))
 
     if kind in ("assistant", "user"):
         message = obj.get("message")
+        if kind == "assistant" and isinstance(message, dict):
+            # Running per-turn total, ahead of the terminal `result` tick above
+            # so the feed shows token usage while the run is still live.
+            message_usage_event = _message_usage_event(message.get("usage"))
+            if message_usage_event is not None:
+                events.append(message_usage_event)
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list):
             for block in content:
@@ -90,6 +95,23 @@ def _tokens_event(usage: Mapping[str, Any]) -> dict[str, Any]:
         "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
         "cache_read_tokens": int(usage.get("cache_read_tokens", 0) or 0),
         "cost_usd": float(usage.get("cost_usd", 0.0) or 0.0),
+    }
+
+
+def _message_usage_event(usage: object) -> dict[str, Any] | None:
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if input_tokens is None and output_tokens is None:
+        return None
+    return {
+        "kind": "tokens",
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "cache_write_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
+        "cache_read_tokens": int(usage.get("cache_read_input_tokens", 0) or 0),
+        "cost_usd": 0.0,
     }
 
 
@@ -205,23 +227,37 @@ def create_live_stream_router(
         async def events() -> AsyncIterator[str]:
             pos = offset
             buffer = b""
+
+            async def drain_once() -> AsyncIterator[str]:
+                # Emits a `cursor` after each complete line (not just once per
+                # poll) so a reconnect after a mid-batch drop never re-reads a
+                # line the client already appended.
+                nonlocal pos, buffer
+                if not log_path.exists():
+                    return
+                chunk, new_pos = await asyncio.to_thread(_read_from, log_path, pos)
+                buffer += chunk
+                pos = new_pos
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    for event in parse_stream_events(raw.decode(errors="replace")):
+                        yield _ndjson(event)
+                    # `pos` is the total bytes physically read; `buffer` now
+                    # holds only what's left unconsumed (later lines plus a
+                    # trailing partial line), so their difference is exactly
+                    # this line's resumable boundary.
+                    yield _ndjson({"kind": "cursor", "offset": pos - len(buffer)})
+
             while True:
-                if log_path.exists():
-                    chunk, new_pos = await asyncio.to_thread(_read_from, log_path, pos)
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        raw, buffer = buffer.split(b"\n", 1)
-                        for event in parse_stream_events(raw.decode(errors="replace")):
-                            yield _ndjson(event)
-                    if new_pos != pos:
-                        pos = new_pos
-                        # Resume offset is the last line boundary, not raw `pos`:
-                        # bytes still in `buffer` are an unterminated line a
-                        # reconnect must re-read whole, not split mid-write.
-                        yield _ndjson({"kind": "cursor", "offset": pos - len(buffer)})
+                async for chunk in drain_once():
+                    yield chunk
                 current = await _run_status(run_id)
                 if current not in LIVE_STATUSES:
-                    # Terminal (or no row): one final drain already ran above.
+                    # The run may have finished writing between the read above
+                    # and this status check landing terminal — drain whatever
+                    # arrived in that window before signalling `end`.
+                    async for chunk in drain_once():
+                        yield chunk
                     break
                 await asyncio.sleep(poll_interval_secs)
             yield _ndjson({"kind": "end"})
