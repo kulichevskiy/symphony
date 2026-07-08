@@ -167,6 +167,14 @@ function AllowlistGate({ children }: { children: ReactNode }) {
       />
     );
   }
+  if (error) {
+    return (
+      <AuthNotice
+        title="Sign-in check failed"
+        detail={error instanceof ApiError ? `Server returned ${error.status}.` : String(error)}
+      />
+    );
+  }
   return <>{children}</>;
 }
 

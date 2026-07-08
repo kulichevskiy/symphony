@@ -6,6 +6,7 @@ import { registerTokenProvider } from "./auth";
 afterEach(() => {
   registerTokenProvider(null);
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("fetchJson", () => {
