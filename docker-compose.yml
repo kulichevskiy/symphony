@@ -11,9 +11,9 @@
 #   cp .env.example .env                       # fill in secrets
 #   cp examples/config.docker.yaml config.local.yaml
 # Auth the CLIs into the named volumes once (they persist across restarts):
-#   docker compose run --rm symphony claude   # /login
-#   docker compose run --rm symphony codex login
-#   docker compose run --rm symphony gh auth login
+#   docker compose run --rm --entrypoint claude symphony   # /login
+#   docker compose run --rm --entrypoint codex symphony login
+#   docker compose run --rm --entrypoint gh symphony auth login
 
 services:
   symphony:

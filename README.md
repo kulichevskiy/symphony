@@ -228,9 +228,9 @@ cp examples/config.docker.yaml config.local.yaml
 $EDITOR config.local.yaml                   # set team keys / repos
 
 # One-time: log the CLIs into their (persisted) named volumes.
-docker compose run --rm symphony claude     # /login
-docker compose run --rm symphony codex login
-docker compose run --rm symphony gh auth login
+docker compose run --rm --entrypoint claude symphony     # /login
+docker compose run --rm --entrypoint codex symphony login
+docker compose run --rm --entrypoint gh symphony auth login
 
 docker compose up -d
 ```
