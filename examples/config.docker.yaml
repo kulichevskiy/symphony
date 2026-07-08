@@ -29,6 +29,11 @@ repos:
     github_repo: org/repo
     local_review: false
     remote_review: true
+    # Off by default: webhook_enabled defaults true, and with no
+    # GITHUB_WEBHOOK_SECRET the daemon aborts at startup. The local quickstart
+    # has no public webhook URL anyway; remote review still works via polling.
+    # Set true + supply GITHUB_WEBHOOK_SECRET once you have a public hostname.
+    webhook_enabled: false
     issue_label: symphony
     branch_prefix: symphony
     max_concurrent: 2

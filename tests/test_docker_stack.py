@@ -93,6 +93,16 @@ def test_dockerfile_sets_home_for_symphony_user() -> None:
     assert "ENV HOME=/home/symphony" in text
 
 
+def test_dockerfile_enables_corepack_and_git_credentials() -> None:
+    text = _read("Dockerfile")
+
+    # pnpm/yarn shims so agents + verify_cmd can run repos pinned to pnpm.
+    assert "corepack enable" in text
+    # Plain `git push`/`git fetch` (not gh) must authenticate off the mounted
+    # gh_auth volume, so gh is wired in as the HTTPS credential helper.
+    assert "gh auth git-credential" in text
+
+
 # --- docker-compose.yml ---------------------------------------------------
 
 
@@ -125,11 +135,17 @@ def test_compose_named_volumes_persist_all_state() -> None:
     assert len(declared) >= 6
 
 
-def test_compose_wires_env_file_and_config() -> None:
+def test_compose_mounts_env_as_file_not_env_file() -> None:
     symphony = _compose()["services"]["symphony"]
 
-    assert symphony.get("env_file") == ".env" or ".env" in symphony.get("env_file", [])
+    # Secrets are mounted as a FILE, not via `env_file:`. `env_file:` would put
+    # every secret into the container os.environ, and LocalRunner starts agents
+    # with {**os.environ, ...} — so every agent would inherit every token,
+    # bypassing the per-binding `env:` allowlist. pydantic-settings +
+    # dotenv_values read /app/.env directly, so the file mount is enough.
+    assert "env_file" not in symphony
     mounts = "\n".join(symphony["volumes"])
+    assert "/app/.env" in mounts
     assert "config.local.yaml" in mounts
 
 
@@ -145,8 +161,13 @@ def test_compose_caddy_fronts_the_daemon_and_publishes_https() -> None:
     # published on the namespace owner (caddy), which stays up across daemon
     # restarts.
     assert symphony.get("network_mode") == "service:caddy"
-    published = "\n".join(str(p) for p in caddy.get("ports", []))
-    assert "443" in published
+    published = [str(p) for p in caddy.get("ports", [])]
+    joined = "\n".join(published)
+    assert "443" in joined
+    # Local stack: every published port is bound to loopback so the
+    # unauthenticated UI/API surface is not reachable from other hosts.
+    for mapping in published:
+        assert mapping.startswith("127.0.0.1:"), mapping
 
 
 # --- examples/config.docker.yaml ------------------------------------------

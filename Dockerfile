@@ -32,6 +32,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The two coding-agent CLIs, on PATH globally.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex
 
+# Corepack shims (pnpm/yarn) so agents + verify_cmd can run repos pinned to
+# pnpm (e.g. `verify_cmd: pnpm build && pnpm test`); node ships corepack.
+RUN corepack enable
+
 # Fail the build now if any tool is missing from PATH, rather than at runtime.
 RUN command -v claude && command -v codex && command -v gh \
     && command -v git && command -v uv && command -v node
@@ -68,6 +72,13 @@ ENV PATH="/app/.venv/bin:$PATH"
 # restarts.
 RUN git config --global user.name "Symphony" \
     && git config --global user.email "symphony@localhost"
+
+# The orchestrator delivers via plain `git push`/`git fetch`, not `gh`. Wire
+# gh in as the HTTPS credential helper (what `gh auth setup-git` does) so those
+# raw git ops authenticate off the mounted gh_auth volume. Baked at build time,
+# resolves the token from ~/.config/gh at runtime.
+RUN git config --global credential."https://github.com".helper "!gh auth git-credential" \
+    && git config --global credential."https://gist.github.com".helper "!gh auth git-credential"
 
 ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD ["--config", "/app/config.local.yaml"]
