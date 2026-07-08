@@ -27,6 +27,18 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 # a public tunnel) would each cause an outbound JWKS fetch.
 _MIN_KID_REFETCH_INTERVAL_SECS = 30.0
 
+# Global floor on unknown-kid-triggered refetches, independent of which `kid`
+# is presented. The per-kid throttle above only helps when the *same* bogus
+# kid repeats; a client cycling through a different bogus kid on every
+# request never hits it, since each kid is "new" and has no prior timestamp.
+_MIN_GLOBAL_REFETCH_INTERVAL_SECS = 2.0
+
+# How long a fetched JWKS is trusted before being revalidated from Auth0,
+# even if every presented `kid` still matches a cached key. Without this, a
+# key Auth0 revokes stays valid in `_keys` forever once cached, since the
+# unknown-kid path only ever *adds* keys, never re-checks removed ones.
+_JWKS_TTL_SECS = 3600.0
+
 
 @dataclass(frozen=True)
 class Auth0Settings:
@@ -42,6 +54,11 @@ class Auth0Settings:
         emails = frozenset(
             item.strip().casefold() for item in allowed_emails.split(",") if item.strip()
         )
+        if not emails:
+            raise ValueError(
+                "AUTH0_ALLOWED_EMAILS has no valid entries after normalization "
+                "(only commas/whitespace) — the gate would allowlist nobody"
+            )
         return cls(domain=domain.strip(), client_id=client_id.strip(), allowed_emails=emails)
 
     @property
@@ -60,7 +77,9 @@ class Auth0Verifier:
         self._settings = settings
         self._client = client
         self._keys: dict[str, dict[str, Any]] | None = None
+        self._keys_fetched_at = 0.0
         self._kid_refetch_at: dict[str, float] = {}
+        self._last_global_refetch = 0.0
 
     async def _fetch_signing_keys(self) -> dict[str, dict[str, Any]]:
         try:
@@ -76,8 +95,10 @@ class Auth0Verifier:
         return {key["kid"]: key for key in data.get("keys", []) if "kid" in key}
 
     async def _signing_keys(self) -> dict[str, dict[str, Any]]:
-        if self._keys is None:
+        now = time.monotonic()
+        if self._keys is None or now - self._keys_fetched_at >= _JWKS_TTL_SECS:
             self._keys = await self._fetch_signing_keys()
+            self._keys_fetched_at = now
         return self._keys
 
     async def verify(self, token: str) -> dict[str, Any]:
@@ -93,16 +114,20 @@ class Auth0Verifier:
         if kid not in keys:
             # Auth0 rotates signing keys without notice; refetch before
             # rejecting so a token signed with a newly-rotated key still
-            # verifies. Throttled per-kid (not globally) so a flood of
-            # requests carrying the same unknown kid can't force a JWKS
-            # fetch per request, without letting a probe with one bad kid
-            # throttle the refetch a *different*, genuinely rotated kid
-            # needs right after.
+            # verifies. Throttled both per-kid (a flood of requests carrying
+            # the same unknown kid can't force a fetch per request) and
+            # globally (a flood cycling through a *different* bogus kid on
+            # every request — each looking "new" to the per-kid throttle —
+            # still can't exceed one fetch per global window).
             now = time.monotonic()
             last = self._kid_refetch_at.get(kid)
-            if last is None or now - last >= _MIN_KID_REFETCH_INTERVAL_SECS:
+            kid_due = last is None or now - last >= _MIN_KID_REFETCH_INTERVAL_SECS
+            global_due = now - self._last_global_refetch >= _MIN_GLOBAL_REFETCH_INTERVAL_SECS
+            if kid_due and global_due:
                 self._kid_refetch_at[kid] = now
+                self._last_global_refetch = now
                 self._keys = keys = await self._fetch_signing_keys()
+                self._keys_fetched_at = now
         jwk = keys.get(kid)
         if jwk is None:
             raise HTTPException(status_code=401, detail="unknown signing key")

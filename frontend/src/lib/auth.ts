@@ -87,7 +87,10 @@ async function refreshIdToken(): Promise<void> {
 export async function authHeaders(): Promise<Record<string, string>> {
   if (client !== null && Date.now() / 1000 >= idTokenExpiresAt - REFRESH_SKEW_SECS) {
     try {
-      await client.getTokenSilently();
+      // cacheMode: "off" bypasses the access-token cache, which can outlive
+      // the ID token and otherwise satisfy this call without contacting
+      // Auth0 — leaving refreshIdToken() to reload the same stale ID token.
+      await client.getTokenSilently({ cacheMode: "off" });
       await refreshIdToken();
     } catch {
       return redirectToLogin();

@@ -161,11 +161,14 @@ def _auth0_settings(cfg: Config) -> Auth0Settings | None:
             "Set all of AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_ALLOWED_EMAILS to enable "
             "the /api/* gate, or none to disable it."
         )
-    return Auth0Settings.from_env(
-        domain=cfg.auth0_domain,
-        client_id=cfg.auth0_client_id,
-        allowed_emails=cfg.auth0_allowed_emails,
-    )
+    try:
+        return Auth0Settings.from_env(
+            domain=cfg.auth0_domain,
+            client_id=cfg.auth0_client_id,
+            allowed_emails=cfg.auth0_allowed_emails,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
