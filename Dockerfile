@@ -60,5 +60,12 @@ USER symphony
 ENV HOME=/home/symphony
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Headless commits (agent runs, `git rebase --continue` in the merge path)
+# need a global git identity — there's no interactive `git config` step in
+# this container. /home/symphony isn't a mounted volume, so this survives
+# restarts.
+RUN git config --global user.name "Symphony" \
+    && git config --global user.email "symphony@localhost"
+
 ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD ["--config", "/app/config.local.yaml"]
