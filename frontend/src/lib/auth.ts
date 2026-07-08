@@ -39,7 +39,12 @@ export async function initAuth(): Promise<void> {
   });
 
   const params = new URLSearchParams(window.location.search);
-  if (params.has("code") && params.has("state")) {
+  if (params.has("error") && params.has("state")) {
+    // Auth0 redirected back with a failed login/consent (no `code`). Let
+    // handleRedirectCallback surface the error instead of silently falling
+    // through to loginWithRedirect and looping forever.
+    await client.handleRedirectCallback();
+  } else if (params.has("code") && params.has("state")) {
     const result = await client.handleRedirectCallback<{ targetUrl?: string }>();
     window.history.replaceState({}, "", result.appState?.targetUrl ?? window.location.pathname);
   }

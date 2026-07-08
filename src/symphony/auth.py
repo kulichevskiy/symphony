@@ -63,12 +63,15 @@ class Auth0Verifier:
         self._last_kid_refetch: float | None = None
 
     async def _fetch_signing_keys(self) -> dict[str, dict[str, Any]]:
-        if self._client is not None:
-            resp = await self._client.get(self._settings.jwks_uri)
-        else:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(self._settings.jwks_uri)
-        resp.raise_for_status()
+        try:
+            if self._client is not None:
+                resp = await self._client.get(self._settings.jwks_uri)
+            else:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(self._settings.jwks_uri)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=401, detail="unable to fetch signing keys") from exc
         data = resp.json()
         return {key["kid"]: key for key in data.get("keys", []) if "kid" in key}
 
