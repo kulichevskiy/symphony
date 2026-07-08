@@ -1,5 +1,17 @@
 import { authHeaders } from "@/lib/auth";
 
+/** A non-2xx `/api/*` response. Carries the HTTP `status` so callers can
+ *  distinguish an allowlist rejection (403) from other failures. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 export type CanonicalStatusState =
   | "drift_detected"
   | "halted"
@@ -27,6 +39,16 @@ export interface Meta {
   tunnel_url?: string | null;
   /** Paste-ready Linear webhook URL (tunnel origin + /linear/webhook), or null. */
   linear_webhook_url?: string | null;
+}
+
+/** The daemon's live Auth0 tenant config, as configured by its own
+ *  `AUTH0_DOMAIN`/`AUTH0_CLIENT_ID` env vars — the source of truth for
+ *  whether/how to run the Auth0 login flow, since those can differ from
+ *  whatever was baked into this static bundle at build time. */
+export interface AuthConfig {
+  enabled: boolean;
+  domain?: string;
+  client_id?: string;
 }
 
 export interface IssueSummary {
@@ -288,7 +310,10 @@ async function fetchJson<T>(
   });
 
   if (!response.ok) {
-    throw new Error(response.status === 404 ? notFoundMessage : fallbackMessage);
+    throw new ApiError(
+      response.status === 404 ? notFoundMessage : fallbackMessage,
+      response.status,
+    );
   }
 
   return (await response.json()) as T;
@@ -347,6 +372,14 @@ export function fetchIssues({
 
 export function fetchMeta(): Promise<Meta> {
   return fetchJson<Meta>("/api/meta", "Meta not found", "Failed to load meta");
+}
+
+export function fetchAuthConfig(): Promise<AuthConfig> {
+  return fetchJson<AuthConfig>(
+    "/api/auth-config",
+    "Auth config not found",
+    "Failed to load auth config",
+  );
 }
 
 export function fetchSpendSummary(

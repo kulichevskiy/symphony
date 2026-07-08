@@ -1,100 +1,66 @@
-import { Auth0Client } from "@auth0/auth0-spa-js";
-
-type AuthConfig = { enabled: false } | { enabled: true; domain: string; client_id: string };
-
-/** Refresh the ID token this many seconds before it actually expires. */
-const REFRESH_SKEW_SECS = 60;
-
-let client: Auth0Client | null = null;
-let idToken: string | null = null;
-let idTokenExpiresAt = 0;
-
-async function fetchAuthConfig(): Promise<AuthConfig> {
-  try {
-    const response = await fetch("/api/auth-config", {
-      headers: { Accept: "application/json" },
-    });
-    if (!response.ok) {
-      return { enabled: false };
-    }
-    return (await response.json()) as AuthConfig;
-  } catch {
-    // Network error (e.g. the daemon/proxy isn't up yet) — treat as
-    // disabled so the UI renders instead of hanging forever. Auth0-gated
-    // API calls will still 401 until the page is reloaded.
-    return { enabled: false };
-  }
-}
+import type { IdToken } from "@auth0/auth0-react";
 
 /**
- * Reads `/api/auth-config` (unauthenticated) and, if the backend has Auth0
- * enabled, runs the SPA login flow before the app renders — the `/api/*`
- * gate rejects every call otherwise. Redirects away and never resolves when
- * the browser isn't authenticated yet.
+ * The slice of the `@auth0/auth0-react` client that `authHeaders()` needs.
+ * `fetchJson` is a plain module function, not a component, so it can't call
+ * `useAuth0()`; a component mounted inside `<Auth0Provider>` registers this
+ * bridge instead (see `AuthBridge` in `lib/auth0`). Until it does — Auth0
+ * disabled, or before mount — `authHeaders()` sends no bearer.
  */
-export async function initAuth(): Promise<void> {
-  const config = await fetchAuthConfig();
-  if (!config.enabled) {
-    return;
-  }
-
-  client = new Auth0Client({
-    domain: config.domain,
-    clientId: config.client_id,
-    authorizationParams: { redirect_uri: `${window.location.origin}/ui/` },
-    cacheLocation: "localstorage",
-  });
-
-  const params = new URLSearchParams(window.location.search);
-  if (params.has("error") && params.has("state")) {
-    // Auth0 redirected back with a failed login/consent (no `code`). Let
-    // handleRedirectCallback surface the error instead of silently falling
-    // through to loginWithRedirect and looping forever.
-    await client.handleRedirectCallback();
-  } else if (params.has("code") && params.has("state")) {
-    const result = await client.handleRedirectCallback<{ targetUrl?: string }>();
-    window.history.replaceState({}, "", result.appState?.targetUrl ?? window.location.pathname);
-  }
-
-  if (!(await client.isAuthenticated())) {
-    return redirectToLogin();
-  }
-
-  await refreshIdToken();
+export interface TokenProvider {
+  getAccessTokenSilently: (opts?: { cacheMode?: "on" | "off" | "cache-only" }) => Promise<string>;
+  getIdTokenClaims: () => Promise<IdToken | undefined>;
+  loginWithRedirect: (opts?: { appState?: { returnTo?: string } }) => Promise<void>;
 }
 
-/** Sends the browser to Auth0 login, preserving the current route, and never resolves. */
-async function redirectToLogin(): Promise<never> {
-  const targetUrl = `${window.location.pathname}${window.location.search}`;
-  await client?.loginWithRedirect({ appState: { targetUrl } });
-  return new Promise<never>(() => {});
+let provider: TokenProvider | null = null;
+
+export function registerTokenProvider(next: TokenProvider | null): void {
+  provider = next;
 }
 
-async function refreshIdToken(): Promise<void> {
-  const claims = await client?.getIdTokenClaims();
-  idToken = claims?.__raw ?? null;
-  idTokenExpiresAt = claims?.exp ?? 0;
+// Refresh a bit ahead of the exact expiry instant: the backend independently
+// validates `exp`, so a token that's still "valid" here by a few seconds can
+// arrive there already expired.
+const EXPIRY_LEEWAY_MS = 30_000;
+
+function isExpired(claims: IdToken | undefined): boolean {
+  return typeof claims?.exp === "number" && claims.exp * 1000 <= Date.now() + EXPIRY_LEEWAY_MS;
+}
+
+function currentReturnTo(): string | undefined {
+  return typeof window === "undefined"
+    ? undefined
+    : `${window.location.pathname}${window.location.search}`;
 }
 
 /**
- * `Authorization` header for `/api/*` fetches; empty once auth is disabled or
- * unset. Refreshes the cached ID token first if it's expired or about to
- * expire, so a dashboard left open past the token's `exp` keeps working.
- * If silent renewal can't complete without an interactive login (Auth0
- * session expired, third-party cookies blocked, ...), redirect to login
- * instead of proceeding with a stale/missing token.
+ * `Authorization` header for `/api/*` fetches; empty when Auth0 is disabled or
+ * not yet wired. Calls `getAccessTokenSilently()` first so the SDK rotates the
+ * refresh token and refreshes the cache when it's near expiry, then sends the
+ * raw ID token — a JWT the backend gate can validate against its email
+ * allowlist (the access token would be opaque). The SDK's cache is keyed off
+ * the access token's own expiry, not the ID token's, so a dashboard left open
+ * past the ID token's expiry (while the cached access token is still valid)
+ * can otherwise be served a stale, already-expired ID token straight from
+ * cache; if that happens, force one uncached round-trip before giving up.
+ * Redirects to login if the session can't be renewed silently.
  */
 export async function authHeaders(): Promise<Record<string, string>> {
-  if (client !== null && Date.now() / 1000 >= idTokenExpiresAt - REFRESH_SKEW_SECS) {
-    try {
-      // cacheMode: "off" bypasses the access-token cache, which can outlive
-      // the ID token and otherwise satisfy this call without contacting
-      // Auth0 — leaving refreshIdToken() to reload the same stale ID token.
-      await client.getTokenSilently({ cacheMode: "off" });
-      await refreshIdToken();
-    } catch {
-      return redirectToLogin();
-    }
+  if (provider === null) {
+    return {};
   }
-  return idToken ? { Authorization: `Bearer ${idToken}` } : {};
+  try {
+    await provider.getAccessTokenSilently();
+    let claims = await provider.getIdTokenClaims();
+    if (isExpired(claims)) {
+      await provider.getAccessTokenSilently({ cacheMode: "off" });
+      claims = await provider.getIdTokenClaims();
+    }
+    const raw = claims?.__raw;
+    return raw ? { Authorization: `Bearer ${raw}` } : {};
+  } catch {
+    await provider.loginWithRedirect({ appState: { returnTo: currentReturnTo() } });
+    return {};
+  }
 }
