@@ -564,6 +564,14 @@ class _DispatchMixin(_OrchestratorBase):
         try:
             async with self._global_dispatch_sem:
                 async with binding_sem:
+                    # Re-check the kill-switch: it may have been toggled on
+                    # while this task was waiting on the semaphores above.
+                    if self._dispatch_paused:
+                        log.info(
+                            "skipping %s: dispatch paused while waiting for a slot",
+                            issue.identifier,
+                        )
+                        return
                     current = await self._refresh_dispatch_candidate(binding, issue)
                     if current is None:
                         return

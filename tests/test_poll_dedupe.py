@@ -207,6 +207,43 @@ async def test_paused_dispatch_starts_no_new_runs(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pause_toggled_while_dispatch_task_waits_on_limits(tmp_path: Path) -> None:
+    """Regression: pause toggled after `_schedule_ready_issue` has already
+    returned a task, but before that task acquires dispatch capacity and
+    reaches `_dispatch_one`, must still prevent the run from starting."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value="run-x")  # type: ignore[method-assign]  # noqa: SLF001
+
+        # Simulate the global dispatch slot being fully occupied by other
+        # in-flight work, forcing the newly scheduled task to wait on the
+        # semaphore instead of dispatching immediately.
+        for _ in range(cfg.global_max_concurrent):
+            await orch._global_dispatch_sem.acquire()  # noqa: SLF001
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.sleep(0)  # let the task start waiting on the semaphore
+
+        # Pause is toggled while the task is still waiting for capacity.
+        orch.set_dispatch_paused(True)
+
+        # Free the slot: the waiting task can now acquire it, but must
+        # notice the pause before calling `_dispatch_one`.
+        orch._global_dispatch_sem.release()  # noqa: SLF001
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_kills_and_cancels_active_dispatch(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
