@@ -261,10 +261,28 @@ class _DispatchMixin(_OrchestratorBase):
         finally:
             self._release_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
 
+    def is_dispatch_paused(self) -> bool:
+        """Whether the daemon-level dispatch kill-switch is engaged."""
+        return self._dispatch_paused
+
+    def set_dispatch_paused(self, paused: bool) -> None:
+        """Engage/release the dispatch kill-switch.
+
+        Resuming wakes the poll loop so pending Ready issues dispatch promptly
+        instead of waiting for the next poll interval.
+        """
+        self._dispatch_paused = paused
+        if not paused:
+            self._wake.set()
+
     async def _schedule_ready_issue(
         self, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None] | None:
         async with self._schedule_lock:
+            # Kill-switch: start no new runs while paused (in-flight runs and
+            # their follow-up stages are unaffected — they don't route here).
+            if self._dispatch_paused:
+                return None
             if self._dispatch_capacity(binding) <= 0:
                 return None
             if issue.id in self._scheduled_issue_ids:

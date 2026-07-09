@@ -374,6 +374,36 @@ export function fetchMeta(): Promise<Meta> {
   return fetchJson<Meta>("/api/meta", "Meta not found", "Failed to load meta");
 }
 
+/** Daemon-level dispatch kill-switch state. When `paused`, the daemon starts
+ *  no new runs; in-flight runs continue. Resets to running on daemon restart. */
+export interface PauseState {
+  paused: boolean;
+}
+
+export function fetchPauseState(): Promise<PauseState> {
+  return fetchJson<PauseState>(
+    "/api/pause",
+    "Pause state not found",
+    "Failed to load pause state",
+  );
+}
+
+export async function setPauseState(paused: boolean): Promise<PauseState> {
+  const response = await fetch("/api/pause", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(await authHeaders()),
+    },
+    body: JSON.stringify({ paused }),
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to update pause state", response.status);
+  }
+  return (await response.json()) as PauseState;
+}
+
 export function fetchAuthConfig(): Promise<AuthConfig> {
   return fetchJson<AuthConfig>(
     "/api/auth-config",

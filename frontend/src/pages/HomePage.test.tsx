@@ -11,6 +11,7 @@ import {
   HomePage,
   IssueTable,
   MixLegend,
+  PauseToggle,
   SectionTotals,
   StatRail,
   TokenOverview,
@@ -120,6 +121,33 @@ describe("StatRail", () => {
     expect(markup).toContain('title="4000">4k</span>');
     // No summed hero number (1000+2000+3000+4000 = 10000).
     expect(markup).not.toContain("10k");
+  });
+});
+
+describe("PauseToggle", () => {
+  it("offers a Pause action when dispatch is running", () => {
+    const markup = renderToStaticMarkup(
+      <PauseToggle paused={false} pending={false} onToggle={() => {}} />,
+    );
+    expect(markup).toContain("Pause");
+    expect(markup).not.toContain("Paused");
+    // Not disabled while idle.
+    expect(markup).not.toContain('disabled=""');
+  });
+
+  it("shows a paused indicator and a Resume action when paused", () => {
+    const markup = renderToStaticMarkup(
+      <PauseToggle paused={true} pending={false} onToggle={() => {}} />,
+    );
+    expect(markup).toContain("Paused");
+    expect(markup).toContain("Resume");
+  });
+
+  it("disables the control while a toggle is in flight", () => {
+    const markup = renderToStaticMarkup(
+      <PauseToggle paused={false} pending={true} onToggle={() => {}} />,
+    );
+    expect(markup).toContain('disabled=""');
   });
 });
 

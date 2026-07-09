@@ -169,6 +169,22 @@ class CommandSink(Protocol):
     def enqueue_web_command(self, issue_id: str, kind: SlashKind) -> str: ...
 
 
+class PauseState(BaseModel):
+    paused: bool
+
+
+class PauseRequest(BaseModel):
+    paused: bool
+
+
+class PauseController(Protocol):
+    """Daemon-level dispatch kill-switch surface for the web UI."""
+
+    def is_dispatch_paused(self) -> bool: ...
+
+    def set_dispatch_paused(self, paused: bool) -> None: ...
+
+
 _ISSUE_SCOPE_CTES = """
 WITH active_issue_ids(issue_id) AS (
     SELECT issue_id FROM runs WHERE status = 'running'
@@ -914,6 +930,7 @@ def create_api_router(
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     no_progress_threshold: timedelta | None = None,
     command_sink: CommandSink | None = None,
+    pause_controller: PauseController | None = None,
     teams: list[str] | None = None,
     webhook_public_url: str | None = None,
 ) -> APIRouter:
@@ -1174,6 +1191,19 @@ def create_api_router(
             raise HTTPException(status_code=404, detail="issue not found")
         command_id = command_sink.enqueue_web_command(issue_id, kind)
         return CommandAccepted(status="accepted", command_id=command_id, command=f"${kind.value}")
+
+    @router.get("/pause", response_model=PauseState)
+    async def get_pause() -> PauseState:
+        if pause_controller is None:
+            raise HTTPException(status_code=503, detail="pause control is not available")
+        return PauseState(paused=pause_controller.is_dispatch_paused())
+
+    @router.post("/pause", response_model=PauseState)
+    async def set_pause(body: PauseRequest) -> PauseState:
+        if pause_controller is None:
+            raise HTTPException(status_code=503, detail="pause control is not available")
+        pause_controller.set_dispatch_paused(body.paused)
+        return PauseState(paused=pause_controller.is_dispatch_paused())
 
     @router.get("/meta", response_model=Meta, response_model_exclude_defaults=True)
     async def meta() -> Meta:

@@ -177,6 +177,36 @@ async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_paused_dispatch_starts_no_new_runs(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue(), _issue("iss-2", "ENG-2")])
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value="run-x")  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert orch.is_dispatch_paused() is False
+
+        # Paused: scanning ready issues schedules no new runs.
+        orch.set_dispatch_paused(True)
+        assert orch.is_dispatch_paused() is True
+        paused_tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert paused_tasks == []
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+
+        # Resume: normal dispatch is restored.
+        orch.set_dispatch_paused(False)
+        assert orch.is_dispatch_paused() is False
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 2
+        await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_kills_and_cancels_active_dispatch(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

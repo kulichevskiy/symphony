@@ -292,6 +292,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
                     ),
                     ui_command_sink=orch,
+                    ui_pause_controller=orch,
                     ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
                     auth0_settings=_auth0_settings(cfg) if cfg.ui.enabled else None,
                 )

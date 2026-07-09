@@ -270,6 +270,19 @@ Steer a run by leaving a **top-level Linear comment** that starts with `$`
 Commands are context-specific (they act on whatever the issue is currently
 waiting on). Free-form comments are **not** steering — only `$`-prefixed ones.
 
+The web dashboard renders these same commands as per-issue buttons, enabled
+only when valid for the issue's current status.
+
+### Global pause / resume
+
+The dashboard header has a **Pause** toggle — a daemon-level kill-switch. When
+paused, the dispatch loop starts **no new runs** for Ready issues (via either
+the poll scan or a webhook); in-flight runs and their review/merge/acceptance
+follow-ups continue untouched. **Resume** restores normal dispatch. The toggle
+is also exposed as an auth-gated `GET`/`POST /api/pause` endpoint.
+
+The flag is in-memory: **a daemon restart clears it back to running.**
+
 ---
 
 ## Troubleshooting

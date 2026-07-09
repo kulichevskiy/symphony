@@ -3298,6 +3298,70 @@ async def test_api_issue_command_accepts_and_enqueues(tmp_path: Path) -> None:
     assert missing.status_code == 404
 
 
+class _FakePauseController:
+    def __init__(self, paused: bool = False) -> None:
+        self.paused = paused
+
+    def is_dispatch_paused(self) -> bool:
+        return self.paused
+
+    def set_dispatch_paused(self, paused: bool) -> None:
+        self.paused = paused
+
+
+@pytest.mark.asyncio
+async def test_api_pause_reads_and_toggles(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    pause = _FakePauseController()
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            ui_pause_controller=pause,
+        )
+        async with await _client(app) as client:
+            initial = await client.get("/api/pause")
+            paused = await client.post("/api/pause", json={"paused": True})
+            after_pause = await client.get("/api/pause")
+            resumed = await client.post("/api/pause", json={"paused": False})
+    finally:
+        await conn.close()
+
+    assert initial.status_code == 200
+    assert initial.json() == {"paused": False}
+    assert paused.status_code == 200
+    assert paused.json() == {"paused": True}
+    assert after_pause.json() == {"paused": True}
+    assert resumed.json() == {"paused": False}
+    assert pause.paused is False
+
+
+@pytest.mark.asyncio
+async def test_api_pause_503_without_controller(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+        async with await _client(app) as client:
+            get = await client.get("/api/pause")
+            post = await client.post("/api/pause", json={"paused": True})
+    finally:
+        await conn.close()
+
+    assert get.status_code == 503
+    assert post.status_code == 503
+
+
 @pytest.mark.asyncio
 async def test_api_issue_command_503_without_sink(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"

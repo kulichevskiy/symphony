@@ -367,6 +367,11 @@ class _OrchestratorBase:
         # interrupts the inter-tick sleep so a command applies near-instantly.
         self._wake = asyncio.Event()
         self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = asyncio.Queue()
+        # Daemon-level dispatch kill-switch (SYM-170). When True, the poll loop
+        # and webhook path start no new runs for Ready issues; in-flight runs
+        # (and their review/merge/acceptance follow-ups) are unaffected. In
+        # memory only: a daemon restart clears it back to running.
+        self._dispatch_paused = False
         self._gh: GitHubClient = gh if gh is not None else GitHub()
         self._runner: Runner = runner if runner is not None else LocalRunner()
         self._workspace: Workspace = (
