@@ -393,9 +393,7 @@ class _OrchestratorBase:
         self._clock = clock
         # Telegram push for attention-needed events (SYM-171). A no-op unless
         # both token + chat id are configured in the environment.
-        self._notifier = TelegramNotifier(
-            config.telegram_bot_token, config.telegram_chat_id
-        )
+        self._notifier = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
         # Cache of ((provider, site, team_key) -> {state_name: state_uuid}).
         # Re-fetched on startup; never mutated at runtime.
         self._states: dict[StateCacheKey, dict[str, str]] = {}
@@ -2519,9 +2517,7 @@ class _OrchestratorBase:
         if not self._notifier.enabled:
             return
         try:
-            claimed = await db.notifications.claim(
-                self._conn, dedupe_key, self._now().isoformat()
-            )
+            claimed = await db.notifications.claim(self._conn, dedupe_key, self._now().isoformat())
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification claim failed for %s: %s", issue_identifier, e)
             return

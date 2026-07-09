@@ -220,9 +220,11 @@ async def test_notify_attention_releases_claim_on_send_failure(tmp_path: Path) -
     try:
         orch = _orch(conn, AsyncMock())
         failing = _FakeNotifier()
-        failing.send = AsyncMock(side_effect=httpx.HTTPStatusError(  # type: ignore[method-assign]
-            "400", request=MagicMock(), response=MagicMock()
-        ))
+        failing.send = AsyncMock(
+            side_effect=httpx.HTTPStatusError(  # type: ignore[method-assign]
+                "400", request=MagicMock(), response=MagicMock()
+            )
+        )
         orch._notifier = failing  # type: ignore[assignment]  # noqa: SLF001
 
         await orch._notify_attention(  # noqa: SLF001
