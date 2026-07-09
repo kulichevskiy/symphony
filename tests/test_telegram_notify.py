@@ -17,6 +17,9 @@ from symphony import db, notify
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
+from symphony.orchestrator.poll._base import _PendingDelivery
+from symphony.pipeline.acceptance_classifier import AcceptanceVerdict
+from symphony.pipeline.cost_guard import UsageDelta
 
 # --- pure notifier ---------------------------------------------------------
 
@@ -27,6 +30,18 @@ def test_build_message_includes_identifier_and_deep_link() -> None:
         issue_identifier="ENG-1",
         issue_url="https://linear.app/team/issue/ENG-1",
     )
+    assert "ENG-1" in msg
+    assert "https://linear.app/team/issue/ENG-1" in msg
+
+
+def test_build_message_truncates_oversized_detail() -> None:
+    msg = notify.build_message(
+        event=notify.EVENT_RUN_FAILED,
+        issue_identifier="ENG-1",
+        issue_url="https://linear.app/team/issue/ENG-1",
+        detail="x" * 20_000,
+    )
+    assert len(msg.encode("utf-8")) <= notify.MESSAGE_LIMIT
     assert "ENG-1" in msg
     assert "https://linear.app/team/issue/ENG-1" in msg
 
@@ -199,6 +214,31 @@ async def test_notify_attention_sends_once_then_dedupes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_notify_attention_releases_claim_on_send_failure(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _orch(conn, AsyncMock())
+        failing = _FakeNotifier()
+        failing.send = AsyncMock(side_effect=httpx.HTTPStatusError(  # type: ignore[method-assign]
+            "400", request=MagicMock(), response=MagicMock()
+        ))
+        orch._notifier = failing  # type: ignore[assignment]  # noqa: SLF001
+
+        await orch._notify_attention(  # noqa: SLF001
+            event=notify.EVENT_PR_MERGED,
+            issue_identifier="ENG-1",
+            issue_url="https://linear.app/team/issue/ENG-1",
+            dedupe_key="pr_merged:iss-1:run-1",
+        )
+
+        # The failed send must not leave the event permanently claimed —
+        # a later poll has to be able to retry it.
+        assert await db.notifications.claim(conn, "pr_merged:iss-1:run-1", "t") is True
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_notify_attention_noop_when_disabled(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -361,5 +401,196 @@ async def test_fail_review_run_notifies_only_on_operator_wait(tmp_path: Path) ->
         kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
         assert kwargs["event"] == notify.EVENT_RUN_FAILED
         assert kwargs["issue_url"] == issue.url
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_implement_blocked_notifies_operator_wait(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="impl-run",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._block_implement_run(  # noqa: SLF001
+            "impl-run",
+            "needs a decision on library X",
+            issue=issue,
+            rollback_state_id="state-todo",
+            binding=_binding(),
+        )
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_OPERATOR_WAIT
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == "operator_wait:impl-run"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_deliver_failed_notifies_run_failed(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="deliver-run",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        ctx = _PendingDelivery(
+            binding=_binding(),
+            issue=issue,
+            storage_issue_id=issue.id,
+            run_id="deliver-run",
+            workspace_path=tmp_path / "ws",
+            branch="symphony/eng-1",
+            cumulative_usage=UsageDelta(),
+            local_review_result=None,
+        )
+
+        await orch._park_deliver_failed("push failed: boom", ctx=ctx)  # noqa: SLF001
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_RUN_FAILED
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == "run_failed:deliver-run"
+        assert kwargs["detail"] == "push failed: boom"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_blocked_notifies_operator_wait(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="accept-run",
+            issue_id=issue.id,
+            stage="acceptance",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        verdict = AcceptanceVerdict(
+            kind="blocked",
+            criteria=[],
+            cost=0.0,
+            hero_screenshot_url="",
+            details="needs a human call on scope",
+        )
+        await orch._track_acceptance_blocked_wait(  # noqa: SLF001
+            binding=_binding(),
+            issue=issue,
+            pr_number=42,
+            run_id="accept-run",
+            verdict=verdict,
+        )
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_OPERATOR_WAIT
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == "operator_wait:accept-run"
+        assert kwargs["detail"] == "needs a human call on scope"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_rejected_notifies_operator_wait(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="accept-run",
+            issue_id=issue.id,
+            stage="acceptance",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        # Already at the fix-iteration cap, so the rejection opens an operator
+        # wait directly instead of dispatching another fix-run.
+        await db.acceptance_state.bump_iteration(conn, issue.id)
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        verdict = AcceptanceVerdict(
+            kind="rejected",
+            criteria=[],
+            cost=0.0,
+            hero_screenshot_url="",
+            details="button color does not match spec",
+        )
+        await orch._finalize_acceptance_verdict(  # noqa: SLF001
+            run_id="accept-run",
+            binding=_binding(),
+            issue=issue,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="deadbeef",
+            verdict=verdict,
+        )
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_OPERATOR_WAIT
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == "operator_wait:accept-run"
+        assert kwargs["detail"] == "button color does not match spec"
     finally:
         await conn.close()

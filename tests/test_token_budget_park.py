@@ -137,7 +137,9 @@ async def test_guard_trips_at_boundary_and_parks(tmp_path: Path) -> None:
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
         linear.move_issue = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
         orch = _make_orch(cfg, linear, conn)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
         await _seed_issue(conn)
         # implement 700 effective + review_fix 400 effective = 1100 >= 1000.
         await _seed_run_with_tokens(conn, run_id="r-impl", stage="implement", input_tokens=700)
@@ -173,6 +175,12 @@ async def test_guard_trips_at_boundary_and_parks(tmp_path: Path) -> None:
         assert orch._budget_exceeded_run_bindings["r-monitor"] is cfg.repos[0]  # noqa: SLF001
         # No active run blocks re-dispatch after approval.
         assert not await db.runs.has_active(conn, "iss-1")
+        # Operator-wait attention notification fires too (SYM-171).
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == "operator_wait"
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["dedupe_key"] == "operator_wait:r-monitor"
     finally:
         await conn.close()
 

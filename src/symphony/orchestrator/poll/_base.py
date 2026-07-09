@@ -59,7 +59,7 @@ from ...linear.templates import (
     implement_blocked,
     truncate_body,
 )
-from ...notify import EVENT_RUN_FAILED, TelegramNotifier, build_message
+from ...notify import EVENT_OPERATOR_WAIT, EVENT_RUN_FAILED, TelegramNotifier, build_message
 from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
@@ -1292,6 +1292,20 @@ class _OrchestratorBase:
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
+        try:
+            tracked_issue = await tracker.lookup_issue(tracker_issue_id)
+            issue_identifier = tracked_issue.identifier
+            issue_url = tracked_issue.url
+        except LinearError as e:
+            log.warning("could not look up %s for budget-exceeded notification: %s", issue_id, e)
+            issue_identifier = linear_identifier or tracker_issue_id
+            issue_url = ""
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue_identifier,
+            issue_url=issue_url,
+            dedupe_key=f"operator_wait:{run_id}",
+        )
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
@@ -2506,6 +2520,7 @@ class _OrchestratorBase:
             await self._notifier.send(text)
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification failed for %s: %s", issue_identifier, e)
+            await db.notifications.release(self._conn, dedupe_key)
 
     async def _fail_run_and_reset_issue(
         self,
@@ -2650,6 +2665,13 @@ class _OrchestratorBase:
                 e,
             )
         await self._track_implement_blocked_wait(storage_issue_id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"operator_wait:{run_id}",
+            detail=reason,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = implement_blocked(
             CommentVars(
@@ -2884,6 +2906,13 @@ class _OrchestratorBase:
             run_id,
             binding,
             local_review_outcome=local_review_outcome,
+        )
+        await self._notify_attention(
+            event=EVENT_RUN_FAILED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"run_failed:{run_id}",
+            detail=reason,
         )
         self._cancel_deliver_failed_review_poll_tasks(storage_issue_id)
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)

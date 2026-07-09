@@ -14,9 +14,16 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+from .linear.templates import truncate_body
+
 EVENT_OPERATOR_WAIT = "operator_wait"
 EVENT_RUN_FAILED = "run_failed"
 EVENT_PR_MERGED = "pr_merged"
+
+# Telegram's Bot API `sendMessage` rejects text over 4096 characters with a
+# 400; cap the built message (truncating `detail`, the field that can carry
+# unbounded subprocess/git stderr) so we always stay under it.
+MESSAGE_LIMIT = 4096
 
 # Leading emoji per event so the phone push carries a glanceable signal
 # (mirrors the Linear-template convention).
@@ -30,14 +37,25 @@ SendFn = Callable[[str, str, str], Awaitable[None]]
 
 
 def build_message(*, event: str, issue_identifier: str, issue_url: str, detail: str = "") -> str:
-    """A short body: headline + identifier, optional detail, then the deep link."""
+    """A short body: headline + identifier, optional detail, then the deep link.
+
+    `detail` is truncated to whatever budget is left after the headline and
+    the deep link, so the joined message never exceeds `MESSAGE_LIMIT`.
+    """
     headline = _HEADLINES.get(event, "🔔 Attention needed")
-    lines = [f"{headline}: {issue_identifier}"]
-    if detail:
-        lines.append(detail)
+    head = f"{headline}: {issue_identifier}"
+    parts = [head]
+    fixed_len = len(head.encode("utf-8"))
     if issue_url:
-        lines.append(issue_url)
-    return "\n".join(lines)
+        fixed_len += len(f"\n{issue_url}".encode())
+    if detail:
+        detail_budget = MESSAGE_LIMIT - fixed_len - len(b"\n")
+        detail = truncate_body(detail, limit=max(detail_budget, 0))
+        if detail:
+            parts.append(detail)
+    if issue_url:
+        parts.append(issue_url)
+    return "\n".join(parts)
 
 
 async def _http_send(
