@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
+from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 
 from symphony import db
+from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.app import create_app
 from symphony.auth import Auth0Settings
+from symphony.config import Config, LinearStates, RepoBinding
+from symphony.linear.client import LinearIssue
+from symphony.orchestrator.poll import Orchestrator
 from symphony.ui import live as live_module
 from symphony.ui.live import parse_stream_events
 
@@ -459,3 +466,112 @@ async def test_stream_unknown_run_is_404(tmp_path: Path) -> None:
         await conn.close()
 
     assert resp.status_code == 404
+
+
+# --- orchestrator write path: the log must be flushed line-by-line ---------
+#
+# The endpoint tests above write the run log through their own `open("a")`
+# handles, which auto-flush on block exit — they never exercise the
+# orchestrator's per-line `logf.flush()` calls that make live tailing
+# possible while a run is still in progress. This test drives the write
+# path directly and reads the file from an independent handle *before* the
+# run finishes, so it would fail if those `flush()` calls were removed.
+
+
+class _PausingRunner:
+    """Yields one stdout and one stderr line, each followed by a pause the
+    test controls, so it can observe the log file mid-write."""
+
+    def __init__(self) -> None:
+        self.after_stdout = asyncio.Event()
+        self.after_stderr = asyncio.Event()
+        self.release_stdout = asyncio.Event()
+        self.release_stderr = asyncio.Event()
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        return self._aiter()
+
+    async def _aiter(self) -> AsyncIterator[RunnerEvent]:
+        yield RunnerEvent(kind="started", pid=1)
+        yield RunnerEvent(kind="stdout", line="first line")
+        self.after_stdout.set()
+        await self.release_stdout.wait()
+        yield RunnerEvent(kind="stderr", line="boom")
+        self.after_stderr.set()
+        await self.release_stderr.wait()
+        yield RunnerEvent(kind="exit", returncode=0)
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_run_log_is_flushed_line_by_line_while_run_is_live(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    conn = await db.connect(db_path)
+    try:
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            linear_states=LinearStates(ready="Todo", code_review="In Review"),
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=log_root,
+            workspace_root=tmp_path / "ws",
+            db_path=db_path,
+        )
+        issue = LinearIssue(
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add auth",
+            description="Need OAuth.",
+            url="https://linear.app/team/issue/ENG-1",
+            state_id="state-todo",
+            state_name="Todo",
+            state_type="unstarted",
+            team_key="ENG",
+            labels=[],
+        )
+        runner = _PausingRunner()
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=runner,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        log_path = log_root / "run-flush.log"
+
+        task = asyncio.create_task(
+            orch._run_runner(  # noqa: SLF001
+                run_id="run-flush",
+                workspace_path=tmp_path / "ws",
+                command=["true"],
+                stage="implement",
+                agent="claude",
+                binding=binding,
+                issue=issue,
+            )
+        )
+        try:
+            await asyncio.wait_for(runner.after_stdout.wait(), timeout=5)
+            # The run is still live (log file handle still open) — this only
+            # sees the stdout line if the orchestrator flushed after writing it.
+            assert log_path.read_text() == "first line\n"
+            runner.release_stdout.set()
+
+            await asyncio.wait_for(runner.after_stderr.wait(), timeout=5)
+            assert log_path.read_text() == "first line\n[stderr] boom\n"
+            runner.release_stderr.set()
+
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    finally:
+        await conn.close()

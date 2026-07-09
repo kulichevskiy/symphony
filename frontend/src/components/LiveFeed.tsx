@@ -56,7 +56,13 @@ function useLiveFeed(runId: string, enabled: boolean) {
             },
             onEvent: (event) => {
               if (event.kind === "tokens") {
-                setTokens(event);
+                setTokens((prev) => ({
+                  ...event,
+                  // output_tokens is per-turn, not cumulative — sum it across
+                  // ticks so the header is a genuine running total.
+                  output_tokens:
+                    (prev?.output_tokens ?? 0) + event.output_tokens,
+                }));
               } else if (
                 event.kind !== "cursor" &&
                 event.kind !== "end"
