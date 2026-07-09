@@ -215,6 +215,33 @@ uv run symphony --config config.local.yaml
 
 If `preflight` fails, fix `.env` / YAML before starting the daemon.
 
+### Run with Docker Compose (daemon + Caddy)
+
+A containerized stack runs the same daemon behind a [Caddy](https://caddyserver.com/)
+reverse proxy that terminates HTTPS locally. The image bundles the full agent
+toolchain (`claude`, `codex`, `gh`, `git`, `uv`, `node`); named volumes persist
+all CLI auth and daemon state, so nothing sensitive is baked into the image.
+
+```bash
+cp .env.example .env                        # fill in secrets
+cp examples/config.docker.yaml config.local.yaml
+$EDITOR config.local.yaml                   # set team keys / repos
+
+# One-time: log the CLIs into their (persisted) named volumes.
+docker compose run --rm --entrypoint claude symphony auth login
+docker compose run --rm --entrypoint codex symphony login
+docker compose run --rm --entrypoint gh symphony auth login --git-protocol https
+
+docker compose up -d
+```
+
+The UI is then at `https://localhost/ui/` (Caddy's internal cert — accept the
+warning or trust the CA once), and the `/linear/webhook` + `/github/webhook`
+receivers are reachable through the same origin. The daemon's http surface
+stays bound to `127.0.0.1` inside the shared network namespace; only Caddy is
+published. This is the foundation for the VPS move — the same stack runs there
+with a public hostname swapped into the `Caddyfile`.
+
 ---
 
 ## Using it

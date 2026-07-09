@@ -1,0 +1,48 @@
+# Docker-tailored symphony config. Copy to config.local.yaml (gitignored),
+# then edit the LINEAR_TEAM_KEY / GITHUB_REPO entries:
+#
+#   cp examples/config.docker.yaml config.local.yaml
+#
+# The only difference from examples/config.yaml is the paths: state lives
+# under /data (backed by named volumes in docker-compose.yml), not ~/symphony.
+# See examples/config.yaml for the full, line-commented field reference.
+
+poll_interval_secs: 60
+global_max_concurrent: 4
+
+# Persisted via named volumes (see docker-compose.yml). Do not change these
+# without updating the volume mounts.
+workspace_root: /data/workspaces
+log_root: /data/logs
+db_path: /data/db/state.sqlite
+
+# Loopback only. Caddy shares this container's network namespace and proxies
+# to it; the port is never published directly.
+webhook_host: 127.0.0.1
+webhook_port: 8787
+
+ui:
+  enabled: true
+
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    local_review: false
+    remote_review: true
+    # Off by default: webhook_enabled defaults true, and with no
+    # GITHUB_WEBHOOK_SECRET the daemon aborts at startup. The local quickstart
+    # has no public webhook URL anyway; remote review still works via polling.
+    # Set true + supply GITHUB_WEBHOOK_SECRET once you have a public hostname.
+    webhook_enabled: false
+    issue_label: symphony
+    branch_prefix: symphony
+    max_concurrent: 2
+    runner: local
+    linear_states:
+      ready: Todo            # source state — orchestrator picks up issues here
+      in_progress: In Progress
+      local_code_review: Local Code Review
+      code_review: In Review
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done

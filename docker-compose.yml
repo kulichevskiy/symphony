@@ -1,0 +1,69 @@
+# Local Docker Compose stack: containerized daemon + Caddy reverse proxy.
+#
+# The daemon binds 127.0.0.1 only (a security invariant — see
+# src/symphony/app.py::build_server_config). So caddy OWNS the network
+# namespace and publishes 443/80; the symphony daemon JOINS it
+# (network_mode: service:caddy) and its loopback http surface is reachable by
+# caddy at 127.0.0.1:8787. caddy being the namespace owner keeps TLS and the
+# published ports up even when the daemon restarts.
+#
+# Before `docker compose up`:
+#   cp .env.example .env                       # fill in secrets
+#   cp examples/config.docker.yaml config.local.yaml
+# Auth the CLIs into the named volumes once (they persist across restarts):
+#   docker compose run --rm --entrypoint claude symphony auth login
+#   docker compose run --rm --entrypoint codex symphony login
+#   docker compose run --rm --entrypoint gh symphony auth login --git-protocol https
+
+services:
+  symphony:
+    build: .
+    image: symphony:local
+    restart: unless-stopped
+    # Join caddy's network namespace: the daemon's 127.0.0.1:8787 http surface
+    # is then reachable by caddy over loopback, without exposing it to the host.
+    network_mode: "service:caddy"
+    depends_on:
+      - caddy
+    volumes:
+      # Operator config — read-only, never baked into the image.
+      - ./config.local.yaml:/app/config.local.yaml:ro
+      # Secrets — mounted as a FILE (read by pydantic-settings + dotenv_values),
+      # NOT `env_file:`. env_file would put every secret into the container's
+      # os.environ, and LocalRunner starts agents with {**os.environ, ...} — so
+      # every agent would inherit every token, bypassing the per-binding `env:`
+      # allowlist. Mounting the file keeps secrets out of the process env.
+      - ./.env:/app/.env:ro
+      # CLI auth dirs — persisted, so a one-time login survives rebuilds.
+      - claude_auth:/home/symphony/.claude
+      - codex_auth:/home/symphony/.codex
+      - gh_auth:/home/symphony/.config/gh
+      # Daemon state: SQLite DB, per-issue workspaces, run logs.
+      - symphony_db:/data/db
+      - symphony_workspaces:/data/workspaces
+      - symphony_logs:/data/logs
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # Namespace owner: publishes HTTPS (and HTTP) for the whole stack.
+    # Bound to loopback only: the UI/API (incl. the unauthenticated
+    # /api/issues/{id}/command surface) must not be reachable from other hosts
+    # in this local stack. The VPS deploy swaps these to public bindings.
+    ports:
+      - "127.0.0.1:443:443"
+      - "127.0.0.1:80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  claude_auth:
+  codex_auth:
+  gh_auth:
+  symphony_db:
+  symphony_workspaces:
+  symphony_logs:
+  caddy_data:
+  caddy_config:

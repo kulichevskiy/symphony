@@ -1,0 +1,31 @@
+.git
+.github
+.venv
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+evals
+.thoughts
+docs
+analysis
+
+# Secrets + local state must never enter the build context.
+.env
+.env.*
+config.local.yaml
+*.sqlite
+*.sqlite-*
+logs/
+workspaces/
+.symphony/
+
+# Frontend is built in-image from source; drop local deps/output.
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
+
+# OS
+.DS_Store
