@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { Icon } from "@/components/ui/icon";
 import { formatTokens } from "@/lib/format";
-import { streamRun, type LiveEvent } from "@/lib/live";
+import { foldTokenTick, streamRun, type LiveEvent, type TokenTick } from "@/lib/live";
 import { cn } from "@/lib/utils";
 
 /** Cap the retained feed so a long run can't grow the DOM without bound. */
@@ -10,7 +10,6 @@ const MAX_FEED = 300;
 const RECONNECT_DELAY_MS = 2000;
 
 type FeedItem = Exclude<LiveEvent, { kind: "tokens" | "cursor" | "end" }>;
-type TokenTick = Extract<LiveEvent, { kind: "tokens" }>;
 type FeedStatus = "connecting" | "live" | "ended" | "error";
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -56,13 +55,7 @@ function useLiveFeed(runId: string, enabled: boolean) {
             },
             onEvent: (event) => {
               if (event.kind === "tokens") {
-                setTokens((prev) => ({
-                  ...event,
-                  // output_tokens is per-turn, not cumulative — sum it across
-                  // ticks so the header is a genuine running total.
-                  output_tokens:
-                    (prev?.output_tokens ?? 0) + event.output_tokens,
-                }));
+                setTokens((prev) => foldTokenTick(prev, event));
               } else if (
                 event.kind !== "cursor" &&
                 event.kind !== "end"

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { registerTokenProvider } from "./auth";
-import { streamRun, type LiveEvent } from "./live";
+import { foldTokenTick, streamRun, type LiveEvent, type TokenTick } from "./live";
 
 afterEach(() => {
   registerTokenProvider(null);
@@ -110,5 +110,50 @@ describe("streamRun", () => {
 
     expect(cursors).toEqual([10]);
     expect(result).toEqual({ offset: 10, ended: false });
+  });
+});
+
+function tick(overrides: Partial<TokenTick>): TokenTick {
+  return {
+    kind: "tokens",
+    cumulative: false,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_write_tokens: 0,
+    cache_read_tokens: 0,
+    cost_usd: 0,
+    ...overrides,
+  };
+}
+
+describe("foldTokenTick", () => {
+  it("sums per-turn delta ticks into a running total", () => {
+    let total = foldTokenTick(null, tick({ input_tokens: 5, output_tokens: 10 }));
+    total = foldTokenTick(total, tick({ input_tokens: 7, output_tokens: 15 }));
+
+    expect(total).toMatchObject({ input_tokens: 12, output_tokens: 25 });
+  });
+
+  it("replaces (not adds) on a repeated cumulative tick, matching the true total", () => {
+    // Mirrors codex `token_count`, which re-emits the whole-run running
+    // total on every tick (see the backend's own
+    // test_codex_token_count_is_cumulative_within_process): out=10 then
+    // out=40, true total 40 — a naive sum would wrongly report 50.
+    let total = foldTokenTick(null, tick({ cumulative: true, output_tokens: 10 }));
+    total = foldTokenTick(total, tick({ cumulative: true, output_tokens: 40 }));
+
+    expect(total?.output_tokens).toBe(40);
+  });
+
+  it("keeps input and output on the same accounting basis", () => {
+    // Per-turn deltas accumulate live...
+    let total = foldTokenTick(null, tick({ input_tokens: 10, output_tokens: 2 }));
+    total = foldTokenTick(total, tick({ input_tokens: 10, output_tokens: 3 }));
+    expect(total).toMatchObject({ input_tokens: 20, output_tokens: 5 });
+
+    // ...then the terminal cumulative tick (claude `result`) replaces both
+    // fields together rather than mixing "latest" input with "summed" output.
+    total = foldTokenTick(total, tick({ cumulative: true, input_tokens: 22, output_tokens: 6 }));
+    expect(total).toMatchObject({ input_tokens: 22, output_tokens: 6 });
   });
 });

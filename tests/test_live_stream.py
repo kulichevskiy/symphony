@@ -90,6 +90,7 @@ def test_parse_claude_result_is_tokens_tick() -> None:
     assert parse_stream_events(line) == [
         {
             "kind": "tokens",
+            "cumulative": True,
             "input_tokens": 100,
             "output_tokens": 20,
             "cache_write_tokens": 30,
@@ -160,6 +161,7 @@ def test_parse_codex_token_count_is_tokens_tick() -> None:
     assert parse_stream_events(line) == [
         {
             "kind": "tokens",
+            "cumulative": True,
             "input_tokens": 7,
             "output_tokens": 3,
             "cache_write_tokens": 0,

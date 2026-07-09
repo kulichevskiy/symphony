@@ -88,8 +88,13 @@ def parse_stream_events(line: str) -> list[dict[str, Any]]:
 
 
 def _tokens_event(usage: Mapping[str, Any]) -> dict[str, Any]:
+    # Claude `result` and codex `token_count`/`turn.completed` (the events
+    # `parse_event_line` recognises) all report the whole-run running total,
+    # not a per-turn delta — the client must replace its total with this tick
+    # rather than add it.
     return {
         "kind": "tokens",
+        "cumulative": True,
         "input_tokens": int(usage.get("input_tokens", 0) or 0),
         "output_tokens": int(usage.get("output_tokens", 0) or 0),
         "cache_write_tokens": int(usage.get("cache_write_tokens", 0) or 0),
@@ -105,8 +110,12 @@ def _message_usage_event(usage: object) -> dict[str, Any] | None:
     output_tokens = usage.get("output_tokens")
     if input_tokens is None and output_tokens is None:
         return None
+    # Claude's per-assistant-message usage is scoped to that one turn, ahead
+    # of the terminal cumulative `result` tick above — the client must add it
+    # to the running total rather than replace.
     return {
         "kind": "tokens",
+        "cumulative": False,
         "input_tokens": int(input_tokens or 0),
         "output_tokens": int(output_tokens or 0),
         "cache_write_tokens": int(usage.get("cache_creation_input_tokens", 0) or 0),
