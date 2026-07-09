@@ -25,6 +25,7 @@ from .github.webhook import (
 )
 from .linear.client import Linear
 from .ui.api import CommandSink, PauseController, create_api_router
+from .ui.config_view import create_config_router
 from .ui.db import ReadOnlyDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
@@ -157,6 +158,13 @@ def create_app(
                     create_live_stream_router(ui_pool, log_root=ui_log_root),
                     dependencies=api_dependencies,
                 )
+
+        # Read-only view of the loaded config (redacted). Gated like the other
+        # /api routers; included before create_api_router's catch-all.
+        app.include_router(
+            create_config_router(ui_external_config),
+            dependencies=api_dependencies,
+        )
 
         ui_teams = (
             sorted({b.linear_team_key for b in ui_external_config.repos})

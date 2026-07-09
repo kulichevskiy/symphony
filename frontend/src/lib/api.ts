@@ -404,6 +404,38 @@ export async function setPauseState(paused: boolean): Promise<PauseState> {
   return (await response.json()) as PauseState;
 }
 
+/** One resolved pipeline role in the read-only config view. */
+export interface RoleView {
+  agent: string;
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** One tracker-project ↔ GitHub-repo binding (non-sensitive fields only). */
+export interface BindingView {
+  provider: string;
+  project_key: string;
+  github_repo: string;
+  max_concurrent: number;
+  roles: Record<string, RoleView>;
+}
+
+/** The effective loaded daemon config, redacted for read-only display. */
+export interface ConfigView {
+  read_only: boolean;
+  global_max_concurrent: number;
+  poll_interval_secs: number;
+  bindings: BindingView[];
+}
+
+export function fetchConfigView(): Promise<ConfigView> {
+  return fetchJson<ConfigView>(
+    "/api/config",
+    "Config not found",
+    "Failed to load config",
+  );
+}
+
 export function fetchAuthConfig(): Promise<AuthConfig> {
   return fetchJson<AuthConfig>(
     "/api/auth-config",
