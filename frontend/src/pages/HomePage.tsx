@@ -115,7 +115,8 @@ export function PauseToggle({
             : "Pause dispatch — the daemon starts no new runs (in-flight runs continue)"
         }
         className={cn(
-          "inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+          // 44px tap target on phones for one-handed pause/resume; compact ≥sm.
+          "inline-flex h-11 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50 sm:h-9",
           paused
             ? "bg-primary text-primary-foreground hover:bg-primary/90"
             : "border border-border hover:bg-secondary",

@@ -4,11 +4,12 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateRunsByStage,
   CmdButton,
+  ConfirmBar,
   PrCard,
   StageSpendCard,
   TokensCard,
 } from "./IssuePage";
-import { applicability } from "./issueControls";
+import { applicability, COMMANDS } from "./issueControls";
 
 function run(stage: string, tok: Partial<Record<string, number>>) {
   return {
@@ -93,6 +94,39 @@ describe("CmdButton", () => {
     );
     expect(markup).toContain("Applied");
     expect(markup).toContain("bg-green-50");
+  });
+
+  it("is a full-width, phone-sized tap target on mobile and compact on desktop", () => {
+    // One-handed reach: approve/reject fill the row and hit 44px on phones,
+    // collapsing to inline, compact buttons from the sm breakpoint up.
+    const markup = renderToStaticMarkup(
+      <CmdButton
+        id="approve"
+        enabled
+        why=""
+        applied={false}
+        busy={false}
+        onClick={() => {}}
+      />,
+    );
+    expect(markup).toContain("h-11");
+    expect(markup).toContain("sm:h-9");
+    expect(markup).toContain("w-full");
+    expect(markup).toContain("sm:w-auto");
+  });
+});
+
+describe("ConfirmBar", () => {
+  it("makes the destructive confirm button a full-width, phone-sized tap target too", () => {
+    // The confirm tap completes a reject/stop flow, so it needs the same
+    // one-handed 44px/full-width-on-mobile treatment as CmdButton.
+    const markup = renderToStaticMarkup(
+      <ConfirmBar c={COMMANDS.reject} onCancel={() => {}} onConfirm={() => {}} />,
+    );
+    expect(markup).toContain("h-11");
+    expect(markup).toContain("sm:h-9");
+    expect(markup).toContain("w-full");
+    expect(markup).toContain("sm:w-auto");
   });
 });
 
