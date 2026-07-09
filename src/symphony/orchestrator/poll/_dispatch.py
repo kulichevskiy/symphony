@@ -261,10 +261,31 @@ class _DispatchMixin(_OrchestratorBase):
         finally:
             self._release_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
 
+    def is_dispatch_paused(self) -> bool:
+        """Whether the daemon-level dispatch kill-switch is engaged."""
+        return self._dispatch_paused
+
+    async def set_dispatch_paused(self, paused: bool) -> None:
+        """Engage/release the dispatch kill-switch.
+
+        Acquires `_dispatch_pause_lock` so the toggle can't land in the
+        middle of `_dispatch_one`'s final check-then-insert critical section.
+        Resuming wakes the poll loop so pending Ready issues dispatch
+        promptly instead of waiting for the next poll interval.
+        """
+        async with self._dispatch_pause_lock:
+            self._dispatch_paused = paused
+        if not paused:
+            self._wake.set()
+
     async def _schedule_ready_issue(
         self, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None] | None:
         async with self._schedule_lock:
+            # Kill-switch: start no new runs while paused (in-flight runs and
+            # their follow-up stages are unaffected — they don't route here).
+            if self._dispatch_paused:
+                return None
             if self._dispatch_capacity(binding) <= 0:
                 return None
             if issue.id in self._scheduled_issue_ids:
@@ -546,8 +567,22 @@ class _DispatchMixin(_OrchestratorBase):
         try:
             async with self._global_dispatch_sem:
                 async with binding_sem:
+                    # Re-check the kill-switch: it may have been toggled on
+                    # while this task was waiting on the semaphores above.
+                    if self._dispatch_paused:
+                        log.info(
+                            "skipping %s: dispatch paused while waiting for a slot",
+                            issue.identifier,
+                        )
+                        return
                     current = await self._refresh_dispatch_candidate(binding, issue)
                     if current is None:
+                        return
+                    if self._dispatch_paused:
+                        log.info(
+                            "skipping %s: dispatch paused while refreshing candidate",
+                            issue.identifier,
+                        )
                         return
                     await self._dispatch_one(binding, current)
         except asyncio.CancelledError:

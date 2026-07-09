@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
+import aiosqlite
 import pytest
 
 from symphony import db
@@ -18,6 +19,7 @@ from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
+from symphony.tracker import DEFAULT_PROVIDER, DEFAULT_SITE
 
 
 def test_orchestrator_no_longer_uses_in_memory_dispatched_dict() -> None:
@@ -172,6 +174,225 @@ async def test_scan_schedules_dispatch_without_waiting(tmp_path: Path) -> None:
         await asyncio.wait_for(started.wait(), timeout=1)
         release.set()
         await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_dispatch_starts_no_new_runs(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue(), _issue("iss-2", "ENG-2")])
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value="run-x")  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert orch.is_dispatch_paused() is False
+
+        # Paused: scanning ready issues schedules no new runs.
+        await orch.set_dispatch_paused(True)
+        assert orch.is_dispatch_paused() is True
+        paused_tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert paused_tasks == []
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+
+        # Resume: normal dispatch is restored.
+        await orch.set_dispatch_paused(False)
+        assert orch.is_dispatch_paused() is False
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 2
+        await asyncio.gather(*tasks)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_toggled_while_dispatch_task_waits_on_limits(tmp_path: Path) -> None:
+    """Regression: pause toggled after `_schedule_ready_issue` has already
+    returned a task, but before that task acquires dispatch capacity and
+    reaches `_dispatch_one`, must still prevent the run from starting."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value="run-x")  # type: ignore[method-assign]  # noqa: SLF001
+
+        # Simulate the global dispatch slot being fully occupied by other
+        # in-flight work, forcing the newly scheduled task to wait on the
+        # semaphore instead of dispatching immediately.
+        for _ in range(cfg.global_max_concurrent):
+            await orch._global_dispatch_sem.acquire()  # noqa: SLF001
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.sleep(0)  # let the task start waiting on the semaphore
+
+        # Pause is toggled while the task is still waiting for capacity.
+        await orch.set_dispatch_paused(True)
+
+        # Free the slot: the waiting task can now acquire it, but must
+        # notice the pause before calling `_dispatch_one`.
+        orch._global_dispatch_sem.release()  # noqa: SLF001
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_toggled_while_refreshing_dispatch_candidate(tmp_path: Path) -> None:
+    """Regression: pause toggled while the dispatch task is awaiting
+    `_refresh_dispatch_candidate` (a Linear API round-trip) must still
+    prevent `_dispatch_one` from running once that await returns."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value="run-x")  # type: ignore[method-assign]  # noqa: SLF001
+
+        refreshing = asyncio.Event()
+        resume_refresh = asyncio.Event()
+        real_refresh = orch._refresh_dispatch_candidate  # noqa: SLF001
+
+        async def _slow_refresh(binding: object, issue: LinearIssue) -> LinearIssue | None:
+            refreshing.set()
+            await resume_refresh.wait()
+            return await real_refresh(binding, issue)  # noqa: SLF001
+
+        orch._refresh_dispatch_candidate = _slow_refresh  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.wait_for(refreshing.wait(), timeout=1)
+
+        # Pause is toggled while the task is mid-refresh.
+        await orch.set_dispatch_paused(True)
+        resume_refresh.set()
+
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_toggled_while_dispatch_one_upserts_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: pause toggled while `_dispatch_one` is awaiting
+    `db.issues.upsert` (before the `runs` row is inserted) must still
+    prevent the run from being created once that await returns."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+
+        upserting = asyncio.Event()
+        resume_upsert = asyncio.Event()
+        real_upsert = db.issues.upsert
+
+        async def _slow_upsert(
+            conn: aiosqlite.Connection,
+            *,
+            id: str,
+            identifier: str,
+            title: str,
+            team_key: str,
+            provider: str = DEFAULT_PROVIDER,
+            site: str = DEFAULT_SITE,
+        ) -> str:
+            upserting.set()
+            await resume_upsert.wait()
+            return await real_upsert(
+                conn,
+                id=id,
+                identifier=identifier,
+                title=title,
+                team_key=team_key,
+                provider=provider,
+                site=site,
+            )
+
+        monkeypatch.setattr("symphony.orchestrator.poll._lifecycle.db.issues.upsert", _slow_upsert)
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.wait_for(upserting.wait(), timeout=1)
+
+        # Pause is toggled while `_dispatch_one` is mid-upsert, i.e. after
+        # the last pre-dispatch pause check but before the `runs` row is
+        # inserted.
+        await orch.set_dispatch_paused(True)
+        resume_upsert.set()
+
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_lock_serializes_toggle_with_run_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a pause request concurrent with `_dispatch_one`'s final
+    check-then-insert must not interleave with it. `set_dispatch_paused`
+    blocks on `_dispatch_pause_lock` until the in-flight insert (which
+    already passed the check while unpaused) finishes; it can never observe
+    or apply the toggle mid-insert."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+
+        creating = asyncio.Event()
+        resume_create = asyncio.Event()
+        real_create = db.runs.create_if_not_dispatched
+
+        async def _slow_create(conn: aiosqlite.Connection, **kwargs: object) -> bool:
+            creating.set()
+            await resume_create.wait()
+            return await real_create(conn, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._lifecycle.db.runs.create_if_not_dispatched",
+            _slow_create,
+        )
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.wait_for(creating.wait(), timeout=1)
+
+        # A pause request arrives while `_dispatch_one` holds the lock inside
+        # its check-then-insert block.
+        pause_task = asyncio.create_task(orch.set_dispatch_paused(True))
+        await asyncio.sleep(0)
+        assert not pause_task.done(), "pause must block on the held dispatch-pause lock"
+
+        resume_create.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, pause_task), timeout=1)
+
+        assert orch.is_dispatch_paused() is True
+        # The run had already passed its unpaused check before the toggle
+        # was requested, so it is treated as in-flight and completes.
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is True
     finally:
         await conn.close()
 

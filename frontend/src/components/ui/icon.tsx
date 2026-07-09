@@ -14,6 +14,8 @@ const ICON_PATHS: Record<string, string> = {
     '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
   square: '<rect width="14" height="14" x="5" y="5" rx="2"/>',
   skip: '<path d="M5 4v16l8-8z"/><path d="M19 5v14"/>',
+  pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  play: '<path d="M6 3v18l15-9z"/>',
   gitPr:
     '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 9v6"/><path d="M18 6a9 9 0 0 0-9 9"/><circle cx="18" cy="18" r="3"/>',
   clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',

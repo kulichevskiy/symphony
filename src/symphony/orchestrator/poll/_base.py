@@ -305,6 +305,7 @@ class _OrchestratorBase:
     _scheduled_issue_refcounts: dict[str, int]
     _scheduled_binding_counts: dict[BindingKey, int]
     _schedule_lock: asyncio.Lock
+    _dispatch_pause_lock: asyncio.Lock
     _comment_event_lock: asyncio.Lock
     _active_run_ids: set[str]
     _dispatch_run_ids: dict[str, str]
@@ -367,6 +368,15 @@ class _OrchestratorBase:
         # interrupts the inter-tick sleep so a command applies near-instantly.
         self._wake = asyncio.Event()
         self._web_commands: asyncio.Queue[tuple[str, SlashKind, str]] = asyncio.Queue()
+        # Daemon-level dispatch kill-switch (SYM-170). When True, the poll loop
+        # and webhook path start no new runs for Ready issues; in-flight runs
+        # (and their review/merge/acceptance follow-ups) are unaffected. In
+        # memory only: a daemon restart clears it back to running.
+        self._dispatch_paused = False
+        # Serializes toggling `_dispatch_paused` against the final
+        # check-then-insert in `_dispatch_one`, so a pause request can never
+        # land in the middle of that critical section.
+        self._dispatch_pause_lock = asyncio.Lock()
         self._gh: GitHubClient = gh if gh is not None else GitHub()
         self._runner: Runner = runner if runner is not None else LocalRunner()
         self._workspace: Workspace = (

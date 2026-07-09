@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
@@ -23,9 +23,11 @@ import { Icon } from "@/components/ui/icon";
 import { Segmented } from "@/components/ui/segmented";
 import {
   fetchIssues,
+  fetchPauseState,
   fetchSpendHeatmap,
   fetchSpendStageSeries,
   fetchSpendSummary,
+  setPauseState,
   type IssueSummary,
   type SpendHeatmap,
   type SpendSummary,
@@ -80,6 +82,77 @@ function useNowMs(): number {
 
 function linearIssueUrl(identifier: string): string {
   return `https://linear.app/issue/${encodeURIComponent(identifier)}`;
+}
+
+/** The global dispatch kill-switch control (pure presentation). When paused,
+ *  shows a prominent "Paused" pill + a Resume action; otherwise a Pause action.
+ *  `pending` disables the button while a toggle round-trips. */
+export function PauseToggle({
+  paused,
+  pending,
+  onToggle,
+}: {
+  paused: boolean;
+  pending: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      {paused ? (
+        <span className="inline-flex items-center gap-1.5 rounded-md bg-amber-500/15 px-2 py-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+          <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+          Paused — no new runs
+        </span>
+      ) : null}
+      <button
+        type="button"
+        onClick={onToggle}
+        disabled={pending}
+        aria-pressed={paused}
+        title={
+          paused
+            ? "Resume dispatch — the daemon starts new runs again"
+            : "Pause dispatch — the daemon starts no new runs (in-flight runs continue)"
+        }
+        className={cn(
+          "inline-flex h-9 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:pointer-events-none disabled:opacity-50",
+          paused
+            ? "bg-primary text-primary-foreground hover:bg-primary/90"
+            : "border border-border hover:bg-secondary",
+        )}
+      >
+        <Icon name={paused ? "play" : "pause"} size={14} />
+        {paused ? "Resume" : "Pause"}
+      </button>
+    </div>
+  );
+}
+
+/** Wires the pause toggle to the daemon: reads `/api/pause` (polled), and posts
+ *  the flip. Renders nothing until the first read resolves so we never show a
+ *  wrong state. Hidden entirely when the daemon exposes no pause control (503). */
+function PauseControl() {
+  const queryClient = useQueryClient();
+  const pauseQuery = useQuery({
+    queryKey: ["pause"],
+    queryFn: fetchPauseState,
+    refetchInterval: 10_000,
+  });
+  const mutation = useMutation({
+    mutationFn: (next: boolean) => setPauseState(next),
+    onSuccess: (state) => queryClient.setQueryData(["pause"], state),
+  });
+  if (pauseQuery.data === undefined) {
+    return null;
+  }
+  const paused = pauseQuery.data.paused;
+  return (
+    <PauseToggle
+      paused={paused}
+      pending={mutation.isPending}
+      onToggle={() => mutation.mutate(!paused)}
+    />
+  );
 }
 
 /** All-time token totals as a tidy 2×2 rail of the four categories, each with
@@ -777,6 +850,7 @@ export function HomePage() {
             {tracked} issues tracked · {active.length + done.length} shown
           </p>
         </div>
+        <PauseControl />
       </div>
 
       <TokenOverview

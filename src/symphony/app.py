@@ -24,7 +24,7 @@ from .github.webhook import (
     create_github_webhook_router,
 )
 from .linear.client import Linear
-from .ui.api import CommandSink, create_api_router
+from .ui.api import CommandSink, PauseController, create_api_router
 from .ui.db import ReadOnlyDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
@@ -71,6 +71,7 @@ def create_app(
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
+    ui_pause_controller: PauseController | None = None,
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
     clock: Clock | None = None,
@@ -169,6 +170,7 @@ def create_app(
                 status_thresholds=ui_status_thresholds,
                 no_progress_threshold=ui_pr_no_progress_threshold,
                 command_sink=ui_command_sink,
+                pause_controller=ui_pause_controller,
                 teams=ui_teams,
                 webhook_public_url=ui_webhook_public_url,
             ),
