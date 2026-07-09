@@ -780,6 +780,20 @@ function useNowMs(): number {
   return nowMs;
 }
 
+// Stages whose runs don't incrementally write `log_root/{run_id}.log`, so
+// LiveFeed has nothing to tail for them: local_review(_fix) writes
+// .out.log/.err.log instead; acceptance and verify collect their subprocess
+// output in memory and write it (if at all) only after the run finishes;
+// review is a passive monitor (pid=None) waiting on the remote `@codex
+// review` bot, with no local subprocess to tail.
+const NON_STREAMING_STAGES = new Set([
+  "local_review",
+  "local_review_fix",
+  "acceptance",
+  "verify",
+  "review",
+]);
+
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
@@ -828,12 +842,8 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
-  // local_review(_fix) runs write .out.log/.err.log, not the live-streamed
-  // `{run_id}.log`, so LiveFeed has nothing to tail for them.
   const liveRun =
-    detail?.runs.find(
-      (r) => r.status === "running" && r.stage !== "local_review" && r.stage !== "local_review_fix",
-    ) ?? null;
+    detail?.runs.find((r) => r.status === "running" && !NON_STREAMING_STAGES.has(r.stage)) ?? null;
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">

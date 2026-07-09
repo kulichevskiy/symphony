@@ -98,6 +98,11 @@ export async function streamRun(
   let buffer = "";
   let cursor = offset;
   let ended = false;
+  // Events for a log line are held here until the `cursor` frame confirming
+  // that line arrives. If the connection drops in between, the pending
+  // events are discarded (not forwarded to `onEvent`) rather than replayed —
+  // the reconnect re-reads that same line from the still-unadvanced `cursor`.
+  let pending: LiveEvent[] = [];
 
   const drain = (chunk: string): void => {
     buffer += chunk;
@@ -114,12 +119,14 @@ export async function streamRun(
         continue;
       }
       if (event.kind === "cursor") {
+        for (const pendingEvent of pending) onEvent(pendingEvent);
+        pending = [];
         cursor = event.offset;
         onCursor?.(cursor);
       } else if (event.kind === "end") {
         ended = true;
       } else {
-        onEvent(event);
+        pending.push(event);
       }
     }
   };

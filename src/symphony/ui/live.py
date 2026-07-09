@@ -80,6 +80,12 @@ def parse_stream_events(line: str) -> list[dict[str, Any]]:
                 block_event = _claude_block_event(block)
                 if block_event is not None:
                     events.append(block_event)
+    elif kind == "result":
+        # claude's terminal event: the only place carrying the final answer
+        # text for `claude --print --output-format stream-json` runs.
+        text = obj.get("result")
+        if isinstance(text, str) and text.strip():
+            events.append({"kind": "message", "text": text.strip()})
     elif kind in ("item.started", "item.completed"):
         item_event = _codex_item_event(obj, str(kind))
         if item_event is not None:
