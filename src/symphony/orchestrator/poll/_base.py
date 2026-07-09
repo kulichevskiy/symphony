@@ -1292,20 +1292,21 @@ class _OrchestratorBase:
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
-        try:
-            tracked_issue = await tracker.lookup_issue(tracker_issue_id)
-            issue_identifier = tracked_issue.identifier
-            issue_url = tracked_issue.url
-        except LinearError as e:
-            log.warning("could not look up %s for budget-exceeded notification: %s", issue_id, e)
-            issue_identifier = linear_identifier or tracker_issue_id
-            issue_url = ""
-        await self._notify_attention(
-            event=EVENT_OPERATOR_WAIT,
-            issue_identifier=issue_identifier,
-            issue_url=issue_url,
-            dedupe_key=f"operator_wait:{run_id}",
-        )
+        if self._notifier.enabled:
+            try:
+                tracked_issue = await tracker.lookup_issue(tracker_issue_id)
+                issue_identifier = tracked_issue.identifier
+                issue_url = tracked_issue.url
+            except LinearError as e:
+                log.warning("could not look up %s for budget-exceeded notification: %s", issue_id, e)
+                issue_identifier = linear_identifier or tracker_issue_id
+                issue_url = ""
+            await self._notify_attention(
+                event=EVENT_OPERATOR_WAIT,
+                issue_identifier=issue_identifier,
+                issue_url=issue_url,
+                dedupe_key=f"operator_wait:{run_id}",
+            )
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:

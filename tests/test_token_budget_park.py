@@ -139,6 +139,7 @@ async def test_guard_trips_at_boundary_and_parks(tmp_path: Path) -> None:
         linear.move_issue = AsyncMock()
         linear.lookup_issue = AsyncMock(return_value=_issue())
         orch = _make_orch(cfg, linear, conn)
+        orch._notifier = MagicMock(enabled=True)  # type: ignore[assignment]  # noqa: SLF001
         orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
         await _seed_issue(conn)
         # implement 700 effective + review_fix 400 effective = 1100 >= 1000.
@@ -181,6 +182,43 @@ async def test_guard_trips_at_boundary_and_parks(tmp_path: Path) -> None:
         assert kwargs["event"] == "operator_wait"
         assert kwargs["issue_identifier"] == "ENG-1"
         assert kwargs["dedupe_key"] == "operator_wait:r-monitor"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_guard_trips_skips_tracker_lookup_when_notifier_disabled(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding(per_issue_token_budget=_BUDGET)])
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        orch = _make_orch(cfg, linear, conn)
+        # Notifier is unset by default (no bot token/chat id) -> disabled.
+        await _seed_issue(conn)
+        await _seed_run_with_tokens(conn, run_id="r-impl", stage="implement", input_tokens=700)
+        await _seed_run_with_tokens(conn, run_id="r-fix", stage="review_fix", input_tokens=400)
+        await db.runs.create(
+            conn,
+            id="r-monitor",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T02:00:00+00:00",
+        )
+
+        parked = await orch._maybe_park_for_token_budget(  # noqa: SLF001
+            "iss-1", "r-monitor", cfg.repos[0]
+        )
+
+        assert parked is True
+        # Disabled Telegram notifier: no extra tracker round-trip for the notification.
+        linear.lookup_issue.assert_not_called()
     finally:
         await conn.close()
 
