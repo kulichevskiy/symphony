@@ -67,6 +67,7 @@ from ...linear.templates import (
     stage_done,
     truncate_body,
 )
+from ...notify import EVENT_OPERATOR_WAIT, EVENT_PR_MERGED
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review_loop import (
     LoopOutcome,
@@ -3258,6 +3259,12 @@ class _MergeMixin(_OrchestratorBase):
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
         await self._clear_operator_wait(issue.id, run_id)
+        await self._notify_attention(
+            event=EVENT_PR_MERGED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"pr_merged:{issue.id}:{run_id}",
+        )
         try:
             archived = await self._workspace.cleanup(issue)
         except Exception as e:  # noqa: BLE001
@@ -3395,6 +3402,13 @@ class _MergeMixin(_OrchestratorBase):
                     issue.identifier,
                     run_id,
                 )
+            await self._notify_attention(
+                event=EVENT_OPERATOR_WAIT,
+                issue_identifier=issue.identifier,
+                issue_url=issue.url,
+                dedupe_key=f"operator_wait:{run_id}",
+                detail=reason,
+            )
 
     async def _run_merge_agent(
         self,

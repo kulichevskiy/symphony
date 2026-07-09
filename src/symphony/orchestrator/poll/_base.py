@@ -59,6 +59,7 @@ from ...linear.templates import (
     implement_blocked,
     truncate_body,
 )
+from ...notify import EVENT_RUN_FAILED, TelegramNotifier, build_message
 from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
@@ -298,6 +299,7 @@ class _OrchestratorBase:
     _push_fn: PushFn
     _force_push_fn: PushFn
     _clock: Callable[[], datetime] | None
+    _notifier: TelegramNotifier
     _states: dict[StateCacheKey, dict[str, str]]
     _dispatch_tasks: set[asyncio.Task[None]]
     _scheduled_issue_ids: set[str]
@@ -389,6 +391,11 @@ class _OrchestratorBase:
             force_push_fn if force_push_fn is not None else _default_force_push
         )
         self._clock = clock
+        # Telegram push for attention-needed events (SYM-171). A no-op unless
+        # both token + chat id are configured in the environment.
+        self._notifier = TelegramNotifier(
+            config.telegram_bot_token, config.telegram_chat_id
+        )
         # Cache of ((provider, site, team_key) -> {state_name: state_uuid}).
         # Re-fetched on startup; never mutated at runtime.
         self._states: dict[StateCacheKey, dict[str, str]] = {}
@@ -2471,6 +2478,35 @@ class _OrchestratorBase:
             **kwargs,
         )
 
+    async def _notify_attention(
+        self,
+        *,
+        event: str,
+        issue_identifier: str,
+        issue_url: str,
+        dedupe_key: str,
+        detail: str = "",
+    ) -> None:
+        """Push a Telegram message for an attention-needed event.
+
+        A no-op when the notifier is unconfigured; `dedupe_key` guards against
+        re-firing on repeated polls. Never raises into the poll loop.
+        """
+        if not self._notifier.enabled:
+            return
+        if not await db.notifications.claim(self._conn, dedupe_key, self._now().isoformat()):
+            return
+        text = build_message(
+            event=event,
+            issue_identifier=issue_identifier,
+            issue_url=issue_url,
+            detail=detail,
+        )
+        try:
+            await self._notifier.send(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram notification failed for %s: %s", issue_identifier, e)
+
     async def _fail_run_and_reset_issue(
         self,
         run_id: str,
@@ -2530,6 +2566,13 @@ class _OrchestratorBase:
         if binding is None:
             return
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_RUN_FAILED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"run_failed:{run_id}",
+            detail=reason,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(

@@ -71,6 +71,7 @@ from ...linear.templates import (
     stuck_loop_escape,
     truncate_body,
 )
+from ...notify import EVENT_RUN_FAILED
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review import (
     StreamApiError,
@@ -3367,6 +3368,13 @@ class _ReviewMixin(_OrchestratorBase):
         tracker = self.tracker(binding)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
+            await self._notify_attention(
+                event=EVENT_RUN_FAILED,
+                issue_identifier=issue.identifier,
+                issue_url=issue.url,
+                dedupe_key=f"run_failed:{run.id}",
+                detail=error,
+            )
             try:
                 states = await self._states_for_binding(binding)
                 needs_approval_id = states.get(binding.linear_states.needs_approval)
