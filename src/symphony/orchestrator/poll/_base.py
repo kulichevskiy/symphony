@@ -1298,7 +1298,9 @@ class _OrchestratorBase:
                 issue_identifier = tracked_issue.identifier
                 issue_url = tracked_issue.url
             except LinearError as e:
-                log.warning("could not look up %s for budget-exceeded notification: %s", issue_id, e)
+                log.warning(
+                    "could not look up %s for budget-exceeded notification: %s", issue_id, e
+                )
                 issue_identifier = linear_identifier or tracker_issue_id
                 issue_url = ""
             await self._notify_attention(
