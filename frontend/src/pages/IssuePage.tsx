@@ -18,6 +18,7 @@ import {
 } from "@/components/dashboard/atoms";
 import { LiveDot, StatusBadge } from "@/components/dashboard/StatusBadge";
 import { IssueTimeline } from "@/components/IssueTimeline";
+import { LiveFeed } from "@/components/LiveFeed";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -779,6 +780,20 @@ function useNowMs(): number {
   return nowMs;
 }
 
+// Stages whose runs don't incrementally write `log_root/{run_id}.log`, so
+// LiveFeed has nothing to tail for them: local_review(_fix) writes
+// .out.log/.err.log instead; acceptance and verify collect their subprocess
+// output in memory and write it (if at all) only after the run finishes;
+// review is a passive monitor (pid=None) waiting on the remote `@codex
+// review` bot, with no local subprocess to tail.
+const NON_STREAMING_STAGES = new Set([
+  "local_review",
+  "local_review_fix",
+  "acceptance",
+  "verify",
+  "review",
+]);
+
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
@@ -827,6 +842,8 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
+  const liveRun =
+    detail?.runs.find((r) => r.status === "running" && !NON_STREAMING_STAGES.has(r.stage)) ?? null;
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
@@ -886,6 +903,11 @@ export function IssuePage() {
 
           <div className="mt-4 space-y-4">
             <NowCard c={cockpit} nowMs={nowMs} />
+            {liveRun ? (
+              <CockpitCard title="Live output">
+                <LiveFeed runId={liveRun.id} active />
+              </CockpitCard>
+            ) : null}
             <div className="grid gap-4 sm:grid-cols-2">
               <TokensCard c={cockpit} />
               <PrCard pr={cockpit.pr} />
