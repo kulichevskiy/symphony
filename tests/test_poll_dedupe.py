@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
+import aiosqlite
 import pytest
 
 from symphony import db
@@ -18,6 +19,7 @@ from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator.poll import Orchestrator
+from symphony.tracker import DEFAULT_PROVIDER, DEFAULT_SITE
 
 
 def test_orchestrator_no_longer_uses_in_memory_dispatched_dict() -> None:
@@ -279,6 +281,66 @@ async def test_pause_toggled_while_refreshing_dispatch_candidate(tmp_path: Path)
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
 
         orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pause_toggled_while_dispatch_one_upserts_issue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: pause toggled while `_dispatch_one` is awaiting
+    `db.issues.upsert` (before the `runs` row is inserted) must still
+    prevent the run from being created once that await returns."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+
+        upserting = asyncio.Event()
+        resume_upsert = asyncio.Event()
+        real_upsert = db.issues.upsert
+
+        async def _slow_upsert(
+            conn: aiosqlite.Connection,
+            *,
+            id: str,
+            identifier: str,
+            title: str,
+            team_key: str,
+            provider: str = DEFAULT_PROVIDER,
+            site: str = DEFAULT_SITE,
+        ) -> str:
+            upserting.set()
+            await resume_upsert.wait()
+            return await real_upsert(
+                conn,
+                id=id,
+                identifier=identifier,
+                title=title,
+                team_key=team_key,
+                provider=provider,
+                site=site,
+            )
+
+        monkeypatch.setattr("symphony.orchestrator.poll._lifecycle.db.issues.upsert", _slow_upsert)
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.wait_for(upserting.wait(), timeout=1)
+
+        # Pause is toggled while `_dispatch_one` is mid-upsert, i.e. after
+        # the last pre-dispatch pause check but before the `runs` row is
+        # inserted.
+        orch.set_dispatch_paused(True)
+        resume_upsert.set()
+
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is False
     finally:
         await conn.close()
 

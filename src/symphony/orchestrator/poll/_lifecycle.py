@@ -254,6 +254,12 @@ class _LifecycleMixin(_OrchestratorBase):
             title=issue.title,
             team_key=issue.team_key,
         )
+        if self._dispatch_paused:
+            log.info(
+                "skipping dispatch for %s: dispatch paused before run creation",
+                issue.identifier,
+            )
+            return None
         inserted = await db.runs.create_if_not_dispatched(
             self._conn,
             id=run_id,
