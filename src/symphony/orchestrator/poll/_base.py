@@ -816,6 +816,10 @@ class _OrchestratorBase:
             except Exception:  # noqa: BLE001 — must not kill the loop
                 log.exception("merged issue Linear state reconcile failed")
         try:
+            await self._retry_pending_notifications()
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("telegram notification retry failed")
+        try:
             scheduled.extend(await self._poll_merge_candidates())
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("merge candidate poll failed")
@@ -2512,46 +2516,61 @@ class _OrchestratorBase:
         """Push a Telegram message for an attention-needed event.
 
         A no-op when the notifier is unconfigured; `dedupe_key` guards against
-        re-firing on repeated polls. The claim is held uncommitted until the
-        send succeeds, so a crash between claim and send leaves the event
-        unclaimed rather than falsely recorded as sent. Never raises into the
-        poll loop.
+        re-firing on repeated polls. The claim commits immediately (rather
+        than staying open across the outbound HTTP call), so it never rides
+        on the same transaction as unrelated writes on the shared connection.
+        A send that fails after the claim is queued in `pending_notifications`
+        for `_retry_pending_notifications` to flush on a later tick, since
+        most call sites fire once on a state transition and won't re-derive
+        the same event. Never raises into the poll loop.
         """
         if not self._notifier.enabled:
             return
         try:
-            claimed = await db.notifications.claim(
-                self._conn, dedupe_key, self._now().isoformat(), commit=False
-            )
+            claimed = await db.notifications.claim(self._conn, dedupe_key, self._now().isoformat())
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification claim failed for %s: %s", issue_identifier, e)
             return
         if not claimed:
-            await self._conn.rollback()
             return
+        text = build_message(
+            event=event,
+            issue_identifier=issue_identifier,
+            issue_url=issue_url,
+            detail=detail,
+        )
         try:
-            text = build_message(
-                event=event,
-                issue_identifier=issue_identifier,
-                issue_url=issue_url,
-                detail=detail,
-            )
             await self._notifier.send(text)
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification failed for %s: %s", issue_identifier, e)
             try:
-                await self._conn.rollback()
-            except Exception as rollback_exc:  # noqa: BLE001
+                await db.notifications.queue_retry(self._conn, dedupe_key, text)
+            except Exception as queue_exc:  # noqa: BLE001
                 log.warning(
-                    "telegram notification rollback failed for %s: %s",
+                    "telegram notification retry-queue failed for %s: %s",
                     issue_identifier,
-                    rollback_exc,
+                    queue_exc,
                 )
+
+    async def _retry_pending_notifications(self) -> None:
+        """Flush `pending_notifications` — sends that were claimed but failed."""
+        if not self._notifier.enabled:
             return
         try:
-            await self._conn.commit()
+            pending = await db.notifications.list_pending(self._conn)
         except Exception as e:  # noqa: BLE001
-            log.warning("telegram notification commit failed for %s: %s", issue_identifier, e)
+            log.warning("telegram pending-notification lookup failed: %s", e)
+            return
+        for event_key, text in pending:
+            try:
+                await self._notifier.send(text)
+            except Exception as e:  # noqa: BLE001
+                log.warning("telegram notification retry failed for %s: %s", event_key, e)
+                continue
+            try:
+                await db.notifications.clear_pending(self._conn, event_key)
+            except Exception as e:  # noqa: BLE001
+                log.warning("telegram pending-notification cleanup failed for %s: %s", event_key, e)
 
     async def _fail_run_and_reset_issue(
         self,

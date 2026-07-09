@@ -284,3 +284,10 @@ CREATE TABLE IF NOT EXISTS sent_notifications (
     event_key TEXT PRIMARY KEY,
     sent_at   TEXT NOT NULL
 );
+
+-- A claimed event whose send failed, kept so the next poll tick can retry
+-- it without depending on the (usually one-shot) call site firing again.
+CREATE TABLE IF NOT EXISTS pending_notifications (
+    event_key TEXT PRIMARY KEY,
+    text      TEXT NOT NULL
+);

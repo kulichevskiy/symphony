@@ -215,7 +215,7 @@ async def test_notify_attention_sends_once_then_dedupes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_notify_attention_releases_claim_on_send_failure(tmp_path: Path) -> None:
+async def test_notify_attention_queues_retry_on_send_failure(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         orch = _orch(conn, AsyncMock())
@@ -234,9 +234,20 @@ async def test_notify_attention_releases_claim_on_send_failure(tmp_path: Path) -
             dedupe_key="pr_merged:iss-1:run-1",
         )
 
-        # The failed send must not leave the event permanently claimed —
-        # a later poll has to be able to retry it.
-        assert await db.notifications.claim(conn, "pr_merged:iss-1:run-1", "t") is True
+        # The event stays claimed (no dedupe replay if the poll re-derives
+        # it), but the failed send is queued for a later retry sweep.
+        assert await db.notifications.claim(conn, "pr_merged:iss-1:run-1", "t") is False
+        pending = await db.notifications.list_pending(conn)
+        assert len(pending) == 1
+        assert pending[0][0] == "pr_merged:iss-1:run-1"
+        assert "ENG-1" in pending[0][1]
+
+        # Telegram recovers; the next poll tick's retry sweep flushes it.
+        recovered = _FakeNotifier()
+        orch._notifier = recovered  # type: ignore[assignment]  # noqa: SLF001
+        await orch._retry_pending_notifications()  # noqa: SLF001
+        assert len(recovered.sent) == 1
+        assert await db.notifications.list_pending(conn) == []
     finally:
         await conn.close()
 
