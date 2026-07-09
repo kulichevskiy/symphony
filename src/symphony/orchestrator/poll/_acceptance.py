@@ -39,6 +39,7 @@ from ...linear.templates import (
     acceptance_rejected,
     truncate_body,
 )
+from ...notify import EVENT_OPERATOR_WAIT
 from ...pipeline.acceptance_classifier import (
     AcceptanceScreenshot,
     AcceptanceVerdict,
@@ -316,6 +317,13 @@ class _AcceptanceMixin(_OrchestratorBase):
             provider=binding.provider,
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
+        )
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"operator_wait:{run_id}",
+            detail=verdict.details,
         )
 
     async def _track_acceptance_rejected_wait(
@@ -1003,6 +1011,13 @@ class _AcceptanceMixin(_OrchestratorBase):
             )
 
         await self._track_acceptance_rejected_wait(issue.id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"operator_wait:{run_id}",
+            detail=verdict.details,
+        )
         body = acceptance_rejected(
             CommentVars(
                 stage="acceptance",

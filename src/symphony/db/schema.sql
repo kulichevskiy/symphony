@@ -276,3 +276,18 @@ CREATE INDEX IF NOT EXISTS idx_external_observations_issue_ts
 
 CREATE INDEX IF NOT EXISTS idx_external_observations_drift
     ON external_observations(drift_kind) WHERE drift_kind IS NOT NULL;
+
+-- Dedupe ledger for outbound attention notifications (SYM-171). One row per
+-- pushed event; the `event_key` a caller composes (e.g.
+-- `pr_merged:<issue>:<run>`) makes repeated polls a no-op.
+CREATE TABLE IF NOT EXISTS sent_notifications (
+    event_key TEXT PRIMARY KEY,
+    sent_at   TEXT NOT NULL
+);
+
+-- A claimed event whose send failed, kept so the next poll tick can retry
+-- it without depending on the (usually one-shot) call site firing again.
+CREATE TABLE IF NOT EXISTS pending_notifications (
+    event_key TEXT PRIMARY KEY,
+    text      TEXT NOT NULL
+);

@@ -59,6 +59,7 @@ from ...linear.templates import (
     implement_blocked,
     truncate_body,
 )
+from ...notify import EVENT_OPERATOR_WAIT, EVENT_RUN_FAILED, TelegramNotifier, build_message
 from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
@@ -298,6 +299,7 @@ class _OrchestratorBase:
     _push_fn: PushFn
     _force_push_fn: PushFn
     _clock: Callable[[], datetime] | None
+    _notifier: TelegramNotifier
     _states: dict[StateCacheKey, dict[str, str]]
     _dispatch_tasks: set[asyncio.Task[None]]
     _scheduled_issue_ids: set[str]
@@ -389,6 +391,9 @@ class _OrchestratorBase:
             force_push_fn if force_push_fn is not None else _default_force_push
         )
         self._clock = clock
+        # Telegram push for attention-needed events (SYM-171). A no-op unless
+        # both token + chat id are configured in the environment.
+        self._notifier = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
         # Cache of ((provider, site, team_key) -> {state_name: state_uuid}).
         # Re-fetched on startup; never mutated at runtime.
         self._states: dict[StateCacheKey, dict[str, str]] = {}
@@ -810,6 +815,10 @@ class _OrchestratorBase:
                     )
             except Exception:  # noqa: BLE001 — must not kill the loop
                 log.exception("merged issue Linear state reconcile failed")
+        try:
+            await self._retry_pending_notifications()
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("telegram notification retry failed")
         try:
             scheduled.extend(await self._poll_merge_candidates())
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -1285,6 +1294,23 @@ class _OrchestratorBase:
             tracker_provider=binding.tracker_provider,
             tracker_site=binding.tracker_site,
         )
+        if self._notifier.enabled:
+            try:
+                tracked_issue = await tracker.lookup_issue(tracker_issue_id)
+                issue_identifier = tracked_issue.identifier
+                issue_url = tracked_issue.url
+            except LinearError as e:
+                log.warning(
+                    "could not look up %s for budget-exceeded notification: %s", issue_id, e
+                )
+                issue_identifier = linear_identifier or tracker_issue_id
+                issue_url = ""
+            await self._notify_attention(
+                event=EVENT_OPERATOR_WAIT,
+                issue_identifier=issue_identifier,
+                issue_url=issue_url,
+                dedupe_key=f"operator_wait:{run_id}",
+            )
 
     async def drain_dispatch_tasks(self, *, cancel: bool = False) -> None:
         if cancel:
@@ -1586,6 +1612,13 @@ class _OrchestratorBase:
         await self._clear_review_rearm_retry(run.id)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"operator_wait:{run.id}",
+            detail=reason,
+        )
 
     async def _start_review_stage(
         self,
@@ -2471,6 +2504,74 @@ class _OrchestratorBase:
             **kwargs,
         )
 
+    async def _notify_attention(
+        self,
+        *,
+        event: str,
+        issue_identifier: str,
+        issue_url: str,
+        dedupe_key: str,
+        detail: str = "",
+    ) -> None:
+        """Push a Telegram message for an attention-needed event.
+
+        A no-op when the notifier is unconfigured; `dedupe_key` guards against
+        re-firing on repeated polls. The claim commits immediately (rather
+        than staying open across the outbound HTTP call), so it never rides
+        on the same transaction as unrelated writes on the shared connection.
+        A send that fails after the claim is queued in `pending_notifications`
+        for `_retry_pending_notifications` to flush on a later tick, since
+        most call sites fire once on a state transition and won't re-derive
+        the same event. Never raises into the poll loop.
+        """
+        if not self._notifier.enabled:
+            return
+        try:
+            claimed = await db.notifications.claim(self._conn, dedupe_key, self._now().isoformat())
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram notification claim failed for %s: %s", issue_identifier, e)
+            return
+        if not claimed:
+            return
+        text = build_message(
+            event=event,
+            issue_identifier=issue_identifier,
+            issue_url=issue_url,
+            detail=detail,
+        )
+        try:
+            await self._notifier.send(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram notification failed for %s: %s", issue_identifier, e)
+            try:
+                await db.notifications.queue_retry(self._conn, dedupe_key, text)
+            except Exception as queue_exc:  # noqa: BLE001
+                log.warning(
+                    "telegram notification retry-queue failed for %s: %s",
+                    issue_identifier,
+                    queue_exc,
+                )
+
+    async def _retry_pending_notifications(self) -> None:
+        """Flush `pending_notifications` — sends that were claimed but failed."""
+        if not self._notifier.enabled:
+            return
+        try:
+            pending = await db.notifications.list_pending(self._conn)
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram pending-notification lookup failed: %s", e)
+            return
+        for event_key, text in pending:
+            try:
+                await self._notifier.send(text)
+            except Exception as e:  # noqa: BLE001
+                log.warning("telegram notification retry failed for %s: %s", event_key, e)
+                continue
+            try:
+                await db.notifications.clear_pending(self._conn, event_key)
+            except Exception as e:  # noqa: BLE001
+                log.warning("telegram pending-notification cleanup failed for %s: %s", event_key, e)
+
     async def _fail_run_and_reset_issue(
         self,
         run_id: str,
@@ -2530,6 +2631,13 @@ class _OrchestratorBase:
         if binding is None:
             return
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_RUN_FAILED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"run_failed:{run_id}",
+            detail=reason,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
@@ -2607,6 +2715,13 @@ class _OrchestratorBase:
                 e,
             )
         await self._track_implement_blocked_wait(storage_issue_id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"operator_wait:{run_id}",
+            detail=reason,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = implement_blocked(
             CommentVars(
@@ -2841,6 +2956,13 @@ class _OrchestratorBase:
             run_id,
             binding,
             local_review_outcome=local_review_outcome,
+        )
+        await self._notify_attention(
+            event=EVENT_RUN_FAILED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"run_failed:{run_id}",
+            detail=reason,
         )
         self._cancel_deliver_failed_review_poll_tasks(storage_issue_id)
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
