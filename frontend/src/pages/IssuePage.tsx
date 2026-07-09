@@ -828,7 +828,12 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
-  const liveRun = detail?.runs.find((r) => r.status === "running") ?? null;
+  // local_review(_fix) runs write .out.log/.err.log, not the live-streamed
+  // `{run_id}.log`, so LiveFeed has nothing to tail for them.
+  const liveRun =
+    detail?.runs.find(
+      (r) => r.status === "running" && r.stage !== "local_review" && r.stage !== "local_review_fix",
+    ) ?? null;
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">

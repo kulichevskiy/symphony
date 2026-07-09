@@ -27,6 +27,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query
 from starlette.responses import StreamingResponse
 
+from ..agent.activity import sanitize_text
 from ..agent.process import parse_event_line
 from ..db.runs import LIVE_STATUSES
 from .db import ReadOnlyDbPool
@@ -153,7 +154,7 @@ def _tool_detail(tool_input: Mapping[str, Any]) -> str:
     for key in ("command", "pattern", "query", "file_path", "path", "url", "description"):
         value = tool_input.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip()
+            return sanitize_text(value)
     return ""
 
 
@@ -178,9 +179,9 @@ def _codex_item_event(obj: Mapping[str, Any], kind: str) -> dict[str, Any] | Non
 def _codex_command(item: Mapping[str, Any]) -> str:
     value = item.get("command")
     if isinstance(value, str):
-        return value.strip()
+        return sanitize_text(value)
     if isinstance(value, list):
-        return " ".join(str(part) for part in value)
+        return sanitize_text(" ".join(str(part) for part in value))
     return ""
 
 
@@ -229,8 +230,9 @@ def create_live_stream_router(
     ) -> StreamingResponse:
         log_path = log_root / f"{run_id}.log"
         status = await _run_status(run_id)
-        # Nothing to show and no run on record → genuinely unknown.
-        if status is None and not log_path.exists():
+        # No `runs` row → genuinely unknown, even if an orphaned log file
+        # exists on disk (DB reset/backfill mismatch, failed insert).
+        if status is None:
             raise HTTPException(status_code=404, detail="Run not found")
 
         async def events() -> AsyncIterator[str]:

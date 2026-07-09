@@ -56,6 +56,29 @@ def test_parse_claude_tool_use_is_tool_call() -> None:
     ]
 
 
+def test_parse_claude_tool_use_redacts_secret_in_command() -> None:
+    line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "input": {
+                            "command": "curl -H 'Authorization: Bearer sk-live-abc123xyz789' https://x"
+                        },
+                    }
+                ]
+            },
+        }
+    )
+    events = parse_stream_events(line)
+    assert len(events) == 1
+    assert "sk-live-abc123xyz789" not in events[0]["detail"]
+    assert "[redacted]" in events[0]["detail"]
+
+
 def test_parse_claude_edit_tool_is_file_edit() -> None:
     line = json.dumps(
         {
@@ -129,6 +152,23 @@ def test_parse_codex_command_started_is_tool_call() -> None:
         }
     )
     assert parse_stream_events(line) == [{"kind": "tool_call", "tool": "shell", "detail": "pytest"}]
+
+
+def test_parse_codex_command_started_redacts_secret() -> None:
+    line = json.dumps(
+        {
+            "type": "item.started",
+            "item": {
+                "id": "cmd-1",
+                "type": "command_execution",
+                "command": "export SUPABASE_ACCESS_TOKEN=sk-live-abc123xyz789",
+            },
+        }
+    )
+    events = parse_stream_events(line)
+    assert len(events) == 1
+    assert "sk-live-abc123xyz789" not in events[0]["detail"]
+    assert "[redacted]" in events[0]["detail"]
 
 
 def test_parse_codex_file_change_is_file_edit() -> None:
@@ -464,6 +504,33 @@ async def test_stream_unknown_run_is_404(tmp_path: Path) -> None:
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
             resp = await client.get("/api/runs/nope/stream")
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_stream_orphaned_log_without_runs_row_is_404(tmp_path: Path) -> None:
+    """A log file can outlive its `runs` row (DB reset/backfill mismatch, a
+    failed insert that left a log behind) — that must still 404 rather than
+    stream the orphaned file's contents."""
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    conn = await db.connect(db_path)
+    try:
+        _write_log(log_root, "run-orphaned", ["{}"])
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_log_root=log_root,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/runs/run-orphaned/stream")
     finally:
         await conn.close()
 
