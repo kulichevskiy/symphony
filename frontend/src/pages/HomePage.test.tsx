@@ -149,6 +149,15 @@ describe("PauseToggle", () => {
     );
     expect(markup).toContain('disabled=""');
   });
+
+  it("gives the button a phone-sized tap target that shrinks on desktop", () => {
+    // One-handed mobile reach: 44px touch target on phones, compact on ≥sm.
+    const markup = renderToStaticMarkup(
+      <PauseToggle paused={false} pending={false} onToggle={() => {}} />,
+    );
+    expect(markup).toContain("h-11");
+    expect(markup).toContain("sm:h-9");
+  });
 });
 
 describe("MixLegend", () => {

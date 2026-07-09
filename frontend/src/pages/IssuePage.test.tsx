@@ -94,6 +94,25 @@ describe("CmdButton", () => {
     expect(markup).toContain("Applied");
     expect(markup).toContain("bg-green-50");
   });
+
+  it("is a full-width, phone-sized tap target on mobile and compact on desktop", () => {
+    // One-handed reach: approve/reject fill the row and hit 44px on phones,
+    // collapsing to inline, compact buttons from the sm breakpoint up.
+    const markup = renderToStaticMarkup(
+      <CmdButton
+        id="approve"
+        enabled
+        why=""
+        applied={false}
+        busy={false}
+        onClick={() => {}}
+      />,
+    );
+    expect(markup).toContain("h-11");
+    expect(markup).toContain("sm:h-9");
+    expect(markup).toContain("w-full");
+    expect(markup).toContain("sm:w-auto");
+  });
 });
 
 const cockpit = {

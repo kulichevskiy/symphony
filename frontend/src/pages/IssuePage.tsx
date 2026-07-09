@@ -590,7 +590,9 @@ export function CmdButton({
       title={enabled ? c.cmd : why}
       onClick={() => onClick(id)}
       className={cn(
-        "group relative inline-flex h-9 items-center justify-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45",
+        // Full-width, 44px tap target on phones (one-handed reach); inline and
+        // compact from the sm breakpoint up.
+        "group relative inline-flex h-11 w-full items-center justify-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 sm:h-9 sm:w-auto",
         cls,
       )}
     >
