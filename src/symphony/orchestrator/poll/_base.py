@@ -1607,6 +1607,13 @@ class _OrchestratorBase:
         await self._clear_review_rearm_retry(run.id)
         if operator_wait:
             await self._track_review_failed_wait(issue.id, run.id, binding)
+        await self._notify_attention(
+            event=EVENT_OPERATOR_WAIT,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"operator_wait:{run.id}",
+            detail=reason,
+        )
 
     async def _start_review_stage(
         self,
@@ -2508,19 +2515,33 @@ class _OrchestratorBase:
         """
         if not self._notifier.enabled:
             return
-        if not await db.notifications.claim(self._conn, dedupe_key, self._now().isoformat()):
-            return
-        text = build_message(
-            event=event,
-            issue_identifier=issue_identifier,
-            issue_url=issue_url,
-            detail=detail,
-        )
         try:
+            claimed = await db.notifications.claim(
+                self._conn, dedupe_key, self._now().isoformat()
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram notification claim failed for %s: %s", issue_identifier, e)
+            return
+        if not claimed:
+            return
+        try:
+            text = build_message(
+                event=event,
+                issue_identifier=issue_identifier,
+                issue_url=issue_url,
+                detail=detail,
+            )
             await self._notifier.send(text)
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification failed for %s: %s", issue_identifier, e)
-            await db.notifications.release(self._conn, dedupe_key)
+            try:
+                await db.notifications.release(self._conn, dedupe_key)
+            except Exception as release_exc:  # noqa: BLE001
+                log.warning(
+                    "telegram notification release failed for %s: %s",
+                    issue_identifier,
+                    release_exc,
+                )
 
     async def _fail_run_and_reset_issue(
         self,

@@ -32,6 +32,7 @@ from ...linear.templates import (
     stage_done,
     truncate_body,
 )
+from ...notify import EVENT_RUN_FAILED
 from ...pipeline.cost_guard import UsageCostEstimator as _UsageCostEstimator
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review import LocalVerdict, StreamApiError
@@ -1847,6 +1848,13 @@ class _LifecycleMixin(_OrchestratorBase):
             )
 
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_RUN_FAILED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"run_failed:{run_id}",
+            detail=reason,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(
@@ -2047,6 +2055,13 @@ class _LifecycleMixin(_OrchestratorBase):
             )
 
         await self._track_implement_failed_wait(storage_issue_id, run_id, binding)
+        await self._notify_attention(
+            event=EVENT_RUN_FAILED,
+            issue_identifier=issue.identifier,
+            issue_url=issue.url,
+            dedupe_key=f"run_failed:{run_id}",
+            detail=reason,
+        )
         tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         body = failed(
             CommentVars(

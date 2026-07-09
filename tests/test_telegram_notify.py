@@ -20,6 +20,7 @@ from symphony.orchestrator.poll import Orchestrator
 from symphony.orchestrator.poll._base import _PendingDelivery
 from symphony.pipeline.acceptance_classifier import AcceptanceVerdict
 from symphony.pipeline.cost_guard import UsageDelta
+from symphony.pipeline.verify import VerifyResult
 
 # --- pure notifier ---------------------------------------------------------
 
@@ -592,5 +593,142 @@ async def test_acceptance_rejected_notifies_operator_wait(tmp_path: Path) -> Non
         assert kwargs["issue_url"] == issue.url
         assert kwargs["dedupe_key"] == "operator_wait:accept-run"
         assert kwargs["detail"] == "button color does not match spec"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_review_infra_failure_notifies_run_failed(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="infra-run",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._block_local_only_review_infra_failure(  # noqa: SLF001
+            binding=_binding(),
+            issue=issue,
+            storage_issue_id=issue.id,
+            run_id="infra-run",
+            result=None,
+        )
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_RUN_FAILED
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == "run_failed:infra-run"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_verify_failure_notifies_run_failed(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="verify-run",
+            issue_id=issue.id,
+            stage="verify",
+            status="running",
+            pid=1234,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._block_verify_failure(  # noqa: SLF001
+            binding=_binding(),
+            issue=issue,
+            storage_issue_id=issue.id,
+            run_id="verify-run",
+            result=VerifyResult(ok=False, error="lint failed", tail="e501 too long"),
+        )
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_RUN_FAILED
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == "run_failed:verify-run"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_review_park_needs_approval_notifies_operator_wait(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn, id=issue.id, identifier=issue.identifier, title=issue.title, team_key="ENG"
+        )
+        run = db.runs.Run(
+            id="local-review-run",
+            issue_id=issue.id,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+            ended_at=None,
+            cost_usd=0.0,
+        )
+        await db.runs.create(
+            conn,
+            id=run.id,
+            issue_id=run.issue_id,
+            stage=run.stage,
+            status=run.status,
+            pid=run.pid,
+            started_at=run.started_at,
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _orch(conn, linear)
+        orch._notify_attention = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        # `operator_wait=False` — no formal wait row opened, but the issue
+        # still lands in needs_approval and still needs a human to look, so
+        # the notification must fire regardless.
+        await orch._park_local_only_review_needs_approval(  # noqa: SLF001
+            run=run,
+            binding=_binding(),
+            issue=issue,
+            pr_url="https://github.com/org/repo/pull/7",
+            result=None,
+            operator_wait=False,
+        )
+
+        orch._notify_attention.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._notify_attention.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["event"] == notify.EVENT_OPERATOR_WAIT
+        assert kwargs["issue_identifier"] == "ENG-1"
+        assert kwargs["issue_url"] == issue.url
+        assert kwargs["dedupe_key"] == f"operator_wait:{run.id}"
     finally:
         await conn.close()
