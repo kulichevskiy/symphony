@@ -45,6 +45,7 @@ import {
   applicability,
   COMMANDS,
   type CommandId,
+  type CommandMeta,
   GROUPS,
   waitLabel,
 } from "./issueControls";
@@ -607,6 +608,40 @@ export function CmdButton({
   );
 }
 
+export function ConfirmBar({
+  c,
+  onCancel,
+  onConfirm,
+}: {
+  c: CommandMeta;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-3 rounded-md border border-red-300 bg-red-50 px-4 py-3 dark:border-red-800 dark:bg-red-950/30">
+      <Icon name="alert" size={16} strokeWidth={2} className="text-red-600 dark:text-red-400" />
+      <span className="text-sm text-red-900 dark:text-red-200">
+        Run <span className="font-mono font-semibold">{c.cmd}</span>? This is
+        destructive.
+      </span>
+      <div className="flex w-full flex-col gap-2 sm:ml-auto sm:w-auto sm:flex-row">
+        <Button variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+        <button
+          type="button"
+          onClick={onConfirm}
+          // Full-width, 44px tap target on phones (one-handed reach), matching
+          // CmdButton; inline and compact from the sm breakpoint up.
+          className="inline-flex h-11 w-full items-center justify-center gap-1.5 rounded-md bg-red-600 px-3 text-sm font-medium text-white transition-colors hover:bg-red-700 sm:h-9 sm:w-auto"
+        >
+          <Icon name={c.icon} size={14} strokeWidth={2} /> Confirm {c.cmd}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function Controls({
   status,
   applied,
@@ -630,30 +665,15 @@ function Controls({
   }
 
   if (confirm) {
-    const c = COMMANDS[confirm];
     return (
-      <div className="flex flex-wrap items-center gap-3 rounded-md border border-red-300 bg-red-50 px-4 py-3 dark:border-red-800 dark:bg-red-950/30">
-        <Icon name="alert" size={16} strokeWidth={2} className="text-red-600 dark:text-red-400" />
-        <span className="text-sm text-red-900 dark:text-red-200">
-          Run <span className="font-mono font-semibold">{c.cmd}</span>? This is
-          destructive.
-        </span>
-        <div className="ml-auto flex gap-2">
-          <Button variant="ghost" onClick={() => setConfirm(null)}>
-            Cancel
-          </Button>
-          <button
-            type="button"
-            onClick={() => {
-              onRun(confirm);
-              setConfirm(null);
-            }}
-            className="inline-flex h-9 items-center gap-1.5 rounded-md bg-red-600 px-3 text-sm font-medium text-white transition-colors hover:bg-red-700"
-          >
-            <Icon name={c.icon} size={14} strokeWidth={2} /> Confirm {c.cmd}
-          </button>
-        </div>
-      </div>
+      <ConfirmBar
+        c={COMMANDS[confirm]}
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => {
+          onRun(confirm);
+          setConfirm(null);
+        }}
+      />
     );
   }
 

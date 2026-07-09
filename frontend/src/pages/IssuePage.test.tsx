@@ -4,11 +4,12 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateRunsByStage,
   CmdButton,
+  ConfirmBar,
   PrCard,
   StageSpendCard,
   TokensCard,
 } from "./IssuePage";
-import { applicability } from "./issueControls";
+import { applicability, COMMANDS } from "./issueControls";
 
 function run(stage: string, tok: Partial<Record<string, number>>) {
   return {
@@ -107,6 +108,20 @@ describe("CmdButton", () => {
         busy={false}
         onClick={() => {}}
       />,
+    );
+    expect(markup).toContain("h-11");
+    expect(markup).toContain("sm:h-9");
+    expect(markup).toContain("w-full");
+    expect(markup).toContain("sm:w-auto");
+  });
+});
+
+describe("ConfirmBar", () => {
+  it("makes the destructive confirm button a full-width, phone-sized tap target too", () => {
+    // The confirm tap completes a reject/stop flow, so it needs the same
+    // one-handed 44px/full-width-on-mobile treatment as CmdButton.
+    const markup = renderToStaticMarkup(
+      <ConfirmBar c={COMMANDS.reject} onCancel={() => {}} onConfirm={() => {}} />,
     );
     expect(markup).toContain("h-11");
     expect(markup).toContain("sm:h-9");
