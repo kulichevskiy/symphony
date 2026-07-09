@@ -3305,7 +3305,7 @@ class _FakePauseController:
     def is_dispatch_paused(self) -> bool:
         return self.paused
 
-    def set_dispatch_paused(self, paused: bool) -> None:
+    async def set_dispatch_paused(self, paused: bool) -> None:
         self.paused = paused
 
 

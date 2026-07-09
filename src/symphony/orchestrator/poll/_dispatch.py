@@ -265,13 +265,16 @@ class _DispatchMixin(_OrchestratorBase):
         """Whether the daemon-level dispatch kill-switch is engaged."""
         return self._dispatch_paused
 
-    def set_dispatch_paused(self, paused: bool) -> None:
+    async def set_dispatch_paused(self, paused: bool) -> None:
         """Engage/release the dispatch kill-switch.
 
-        Resuming wakes the poll loop so pending Ready issues dispatch promptly
-        instead of waiting for the next poll interval.
+        Acquires `_dispatch_pause_lock` so the toggle can't land in the
+        middle of `_dispatch_one`'s final check-then-insert critical section.
+        Resuming wakes the poll loop so pending Ready issues dispatch
+        promptly instead of waiting for the next poll interval.
         """
-        self._dispatch_paused = paused
+        async with self._dispatch_pause_lock:
+            self._dispatch_paused = paused
         if not paused:
             self._wake.set()
 

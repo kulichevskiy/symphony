@@ -192,14 +192,14 @@ async def test_paused_dispatch_starts_no_new_runs(tmp_path: Path) -> None:
         assert orch.is_dispatch_paused() is False
 
         # Paused: scanning ready issues schedules no new runs.
-        orch.set_dispatch_paused(True)
+        await orch.set_dispatch_paused(True)
         assert orch.is_dispatch_paused() is True
         paused_tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
         assert paused_tasks == []
         orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
 
         # Resume: normal dispatch is restored.
-        orch.set_dispatch_paused(False)
+        await orch.set_dispatch_paused(False)
         assert orch.is_dispatch_paused() is False
         tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
         assert len(tasks) == 2
@@ -233,7 +233,7 @@ async def test_pause_toggled_while_dispatch_task_waits_on_limits(tmp_path: Path)
         await asyncio.sleep(0)  # let the task start waiting on the semaphore
 
         # Pause is toggled while the task is still waiting for capacity.
-        orch.set_dispatch_paused(True)
+        await orch.set_dispatch_paused(True)
 
         # Free the slot: the waiting task can now acquire it, but must
         # notice the pause before calling `_dispatch_one`.
@@ -275,7 +275,7 @@ async def test_pause_toggled_while_refreshing_dispatch_candidate(tmp_path: Path)
         await asyncio.wait_for(refreshing.wait(), timeout=1)
 
         # Pause is toggled while the task is mid-refresh.
-        orch.set_dispatch_paused(True)
+        await orch.set_dispatch_paused(True)
         resume_refresh.set()
 
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
@@ -335,12 +335,64 @@ async def test_pause_toggled_while_dispatch_one_upserts_issue(
         # Pause is toggled while `_dispatch_one` is mid-upsert, i.e. after
         # the last pre-dispatch pause check but before the `runs` row is
         # inserted.
-        orch.set_dispatch_paused(True)
+        await orch.set_dispatch_paused(True)
         resume_upsert.set()
 
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
 
         assert await db.runs.has_running_or_completed(conn, "iss-1") is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_pause_lock_serializes_toggle_with_run_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a pause request concurrent with `_dispatch_one`'s final
+    check-then-insert must not interleave with it. `set_dispatch_paused`
+    blocks on `_dispatch_pause_lock` until the in-flight insert (which
+    already passed the check while unpaused) finishes; it can never observe
+    or apply the toggle mid-insert."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+
+        creating = asyncio.Event()
+        resume_create = asyncio.Event()
+        real_create = db.runs.create_if_not_dispatched
+
+        async def _slow_create(conn: aiosqlite.Connection, **kwargs: object) -> bool:
+            creating.set()
+            await resume_create.wait()
+            return await real_create(conn, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._lifecycle.db.runs.create_if_not_dispatched",
+            _slow_create,
+        )
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.wait_for(creating.wait(), timeout=1)
+
+        # A pause request arrives while `_dispatch_one` holds the lock inside
+        # its check-then-insert block.
+        pause_task = asyncio.create_task(orch.set_dispatch_paused(True))
+        await asyncio.sleep(0)
+        assert not pause_task.done(), "pause must block on the held dispatch-pause lock"
+
+        resume_create.set()
+        await asyncio.wait_for(asyncio.gather(*tasks, pause_task), timeout=1)
+
+        assert orch.is_dispatch_paused() is True
+        # The run had already passed its unpaused check before the toggle
+        # was requested, so it is treated as in-flight and completes.
+        assert await db.runs.has_running_or_completed(conn, "iss-1") is True
     finally:
         await conn.close()
 

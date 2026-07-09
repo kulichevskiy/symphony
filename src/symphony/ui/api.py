@@ -182,7 +182,7 @@ class PauseController(Protocol):
 
     def is_dispatch_paused(self) -> bool: ...
 
-    def set_dispatch_paused(self, paused: bool) -> None: ...
+    async def set_dispatch_paused(self, paused: bool) -> None: ...
 
 
 _ISSUE_SCOPE_CTES = """
@@ -1202,7 +1202,7 @@ def create_api_router(
     async def set_pause(body: PauseRequest) -> PauseState:
         if pause_controller is None:
             raise HTTPException(status_code=503, detail="pause control is not available")
-        pause_controller.set_dispatch_paused(body.paused)
+        await pause_controller.set_dispatch_paused(body.paused)
         return PauseState(paused=pause_controller.is_dispatch_paused())
 
     @router.get("/meta", response_model=Meta, response_model_exclude_defaults=True)
