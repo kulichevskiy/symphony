@@ -10,6 +10,7 @@ import { fetchMeta } from "@/lib/api";
 import { authEnabled, LogoutButton } from "@/lib/auth0";
 import { FiltersProvider } from "@/lib/filters";
 import { useTheme } from "@/lib/useTheme";
+import { ConfigPage } from "@/pages/ConfigPage";
 import { HomePage } from "@/pages/HomePage";
 import { IssuePage } from "@/pages/IssuePage";
 
@@ -76,6 +77,12 @@ export function App() {
             </Link>
             <div className="flex items-center gap-2">
               <WebhookChip />
+              <Link
+                to="/config"
+                className="hidden rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground sm:inline-flex"
+              >
+                Config
+              </Link>
               <span className="hidden items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground sm:inline-flex">
                 <LiveDot tone="bg-green-500" /> daemon · loopback
               </span>
@@ -90,6 +97,7 @@ export function App() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/issue/:id" element={<IssuePage />} />
+          <Route path="/config" element={<ConfigPage />} />
         </Routes>
       </div>
     </FiltersProvider>
