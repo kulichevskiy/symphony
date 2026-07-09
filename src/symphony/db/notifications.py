@@ -4,8 +4,8 @@ One row per notification event that has already been pushed, keyed by an
 opaque `event_key` the caller composes (e.g. `pr_merged:<issue>:<run>`).
 `claim` is the dedupe primitive: it returns True exactly once per key, so a
 repeated poll that re-derives the same key gets False and stays quiet.
-`release` undoes a claim when the send that followed it failed, so a later
-poll retries instead of the event staying permanently (and wrongly) claimed.
+Callers that need to retry a failed send should pass `commit=False` and
+roll back the connection rather than committing the claim.
 """
 
 from __future__ import annotations
@@ -31,16 +31,4 @@ async def claim(
     return inserted
 
 
-async def release(
-    conn: aiosqlite.Connection,
-    event_key: str,
-    *,
-    commit: bool = True,
-) -> None:
-    """Undo a `claim` so the event is retried on a later poll."""
-    await conn.execute("DELETE FROM sent_notifications WHERE event_key = ?", (event_key,))
-    if commit:
-        await conn.commit()
-
-
-__all__ = ["claim", "release"]
+__all__ = ["claim"]

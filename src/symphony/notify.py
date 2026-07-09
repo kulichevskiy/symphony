@@ -58,6 +58,15 @@ def build_message(*, event: str, issue_identifier: str, issue_url: str, detail: 
     return "\n".join(parts)
 
 
+class TelegramSendError(RuntimeError):
+    """The Bot API rejected `sendMessage` (non-2xx response).
+
+    Carries only the status code and reason phrase. `httpx.HTTPStatusError.__str__`
+    embeds the full request URL, which contains the bot token, so it must never
+    be logged verbatim — this is what callers should log instead.
+    """
+
+
 async def _http_send(
     bot_token: str,
     chat_id: str,
@@ -73,7 +82,12 @@ async def _http_send(
             f"https://api.telegram.org/bot{bot_token}/sendMessage",
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError:
+            raise TelegramSendError(
+                f"Telegram sendMessage failed: {resp.status_code} {resp.reason_phrase}"
+            ) from None
     finally:
         if owns:
             await client.aclose()
@@ -104,5 +118,6 @@ __all__ = [
     "EVENT_PR_MERGED",
     "EVENT_RUN_FAILED",
     "TelegramNotifier",
+    "TelegramSendError",
     "build_message",
 ]

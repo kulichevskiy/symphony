@@ -2512,16 +2512,22 @@ class _OrchestratorBase:
         """Push a Telegram message for an attention-needed event.
 
         A no-op when the notifier is unconfigured; `dedupe_key` guards against
-        re-firing on repeated polls. Never raises into the poll loop.
+        re-firing on repeated polls. The claim is held uncommitted until the
+        send succeeds, so a crash between claim and send leaves the event
+        unclaimed rather than falsely recorded as sent. Never raises into the
+        poll loop.
         """
         if not self._notifier.enabled:
             return
         try:
-            claimed = await db.notifications.claim(self._conn, dedupe_key, self._now().isoformat())
+            claimed = await db.notifications.claim(
+                self._conn, dedupe_key, self._now().isoformat(), commit=False
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification claim failed for %s: %s", issue_identifier, e)
             return
         if not claimed:
+            await self._conn.rollback()
             return
         try:
             text = build_message(
@@ -2534,13 +2540,18 @@ class _OrchestratorBase:
         except Exception as e:  # noqa: BLE001
             log.warning("telegram notification failed for %s: %s", issue_identifier, e)
             try:
-                await db.notifications.release(self._conn, dedupe_key)
-            except Exception as release_exc:  # noqa: BLE001
+                await self._conn.rollback()
+            except Exception as rollback_exc:  # noqa: BLE001
                 log.warning(
-                    "telegram notification release failed for %s: %s",
+                    "telegram notification rollback failed for %s: %s",
                     issue_identifier,
-                    release_exc,
+                    rollback_exc,
                 )
+            return
+        try:
+            await self._conn.commit()
+        except Exception as e:  # noqa: BLE001
+            log.warning("telegram notification commit failed for %s: %s", issue_identifier, e)
 
     async def _fail_run_and_reset_issue(
         self,
