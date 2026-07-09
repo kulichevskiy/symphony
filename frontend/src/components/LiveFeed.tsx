@@ -51,6 +51,9 @@ function useLiveFeed(runId: string, enabled: boolean) {
           const result = await streamRun(runId, {
             offset,
             signal: controller.signal,
+            onCursor: (o) => {
+              offset = o;
+            },
             onEvent: (event) => {
               if (event.kind === "tokens") {
                 setTokens(event);

@@ -39,10 +39,15 @@ export async function streamRun(
     offset = 0,
     signal,
     onEvent,
+    onCursor,
   }: {
     offset?: number;
     signal?: AbortSignal;
     onEvent: (event: LiveEvent) => void;
+    /** Invoked with the latest byte offset as `cursor` frames are consumed,
+     *  so the caller can track resume progress even if the read loop later
+     *  errors out (e.g. a real mid-stream connection drop). */
+    onCursor?: (offset: number) => void;
   },
 ): Promise<StreamResult> {
   const params = new URLSearchParams({ offset: String(offset) });
@@ -79,6 +84,7 @@ export async function streamRun(
       }
       if (event.kind === "cursor") {
         cursor = event.offset;
+        onCursor?.(cursor);
       } else if (event.kind === "end") {
         ended = true;
       } else {
@@ -89,9 +95,16 @@ export async function streamRun(
 
   try {
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      drain(decoder.decode(value, { stream: true }));
+      let step: ReadableStreamReadResult<Uint8Array>;
+      try {
+        step = await reader.read();
+      } catch {
+        // Mid-stream drop (not a clean `done`) — report progress made so far
+        // instead of throwing, so the caller can resume from `cursor`.
+        break;
+      }
+      if (step.done) break;
+      drain(decoder.decode(step.value, { stream: true }));
     }
     drain(decoder.decode());
   } finally {

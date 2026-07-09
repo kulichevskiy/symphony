@@ -80,4 +80,35 @@ describe("streamRun", () => {
     const result = await streamRun("run-2", { onEvent: () => {} });
     expect(result).toEqual({ offset: 10, ended: false });
   });
+
+  it("reports the last cursor instead of throwing when the read rejects (real drop)", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode(`${JSON.stringify({ kind: "cursor", offset: 10 })}\n`));
+        // Deferred so the enqueued chunk is actually read before the stream
+        // errors — an immediate error() discards unread queued chunks too.
+        setTimeout(() => controller.error(new TypeError("network error")), 0);
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(body, {
+            status: 200,
+            headers: { "Content-Type": "application/x-ndjson" },
+          }),
+      ),
+    );
+
+    const cursors: number[] = [];
+    const result = await streamRun("run-3", {
+      onEvent: () => {},
+      onCursor: (offset) => cursors.push(offset),
+    });
+
+    expect(cursors).toEqual([10]);
+    expect(result).toEqual({ offset: 10, ended: false });
+  });
 });
