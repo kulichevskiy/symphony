@@ -244,6 +244,46 @@ async def test_pause_toggled_while_dispatch_task_waits_on_limits(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_pause_toggled_while_refreshing_dispatch_candidate(tmp_path: Path) -> None:
+    """Regression: pause toggled while the dispatch task is awaiting
+    `_refresh_dispatch_candidate` (a Linear API round-trip) must still
+    prevent `_dispatch_one` from running once that await returns."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._dispatch_one = AsyncMock(return_value="run-x")  # type: ignore[method-assign]  # noqa: SLF001
+
+        refreshing = asyncio.Event()
+        resume_refresh = asyncio.Event()
+        real_refresh = orch._refresh_dispatch_candidate  # noqa: SLF001
+
+        async def _slow_refresh(binding: object, issue: LinearIssue) -> LinearIssue | None:
+            refreshing.set()
+            await resume_refresh.wait()
+            return await real_refresh(binding, issue)  # noqa: SLF001
+
+        orch._refresh_dispatch_candidate = _slow_refresh  # type: ignore[method-assign]  # noqa: SLF001
+
+        tasks = await orch._scan_binding(cfg.repos[0])  # noqa: SLF001
+        assert len(tasks) == 1
+        await asyncio.wait_for(refreshing.wait(), timeout=1)
+
+        # Pause is toggled while the task is mid-refresh.
+        orch.set_dispatch_paused(True)
+        resume_refresh.set()
+
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+
+        orch._dispatch_one.assert_not_awaited()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_kills_and_cancels_active_dispatch(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

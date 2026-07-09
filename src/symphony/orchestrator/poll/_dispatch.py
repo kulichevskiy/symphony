@@ -575,6 +575,12 @@ class _DispatchMixin(_OrchestratorBase):
                     current = await self._refresh_dispatch_candidate(binding, issue)
                     if current is None:
                         return
+                    if self._dispatch_paused:
+                        log.info(
+                            "skipping %s: dispatch paused while refreshing candidate",
+                            issue.identifier,
+                        )
+                        return
                     await self._dispatch_one(binding, current)
         except asyncio.CancelledError:
             await self._mark_cancelled_dispatch(issue, binding)
