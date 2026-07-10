@@ -77,6 +77,9 @@ def test_ensure_symphony_permissions_profile_creates_missing_config(
     assert profile["filesystem"]["/tmp"] == "write"
     assert ":project_roots" not in profile["filesystem"]
     assert profile["network"]["enabled"] is False
+    # Codex >= 0.143 refuses to load a config with [permissions] tables unless a
+    # top-level default_permissions is set; it must point at our profile.
+    assert parsed["default_permissions"] == SYMPHONY_PERMISSIONS_PROFILE
 
 
 def test_ensure_symphony_permissions_profile_preserves_existing_profile(
@@ -84,6 +87,8 @@ def test_ensure_symphony_permissions_profile_preserves_existing_profile(
 ) -> None:
     config_path = tmp_path / "config.toml"
     existing = f"""
+default_permissions="{SYMPHONY_PERMISSIONS_PROFILE}"
+
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
 enabled = true
 """.lstrip()
@@ -94,6 +99,35 @@ enabled = true
     assert path == config_path
     assert created is False
     assert config_path.read_text(encoding="utf-8") == existing
+
+
+def test_ensure_symphony_permissions_profile_backfills_missing_default_permissions(
+    tmp_path: Path,
+) -> None:
+    # A config with a current profile but no top-level default_permissions is
+    # unloadable on Codex >= 0.143 (older Symphony wrote the profile without it).
+    # The key is backfilled — pointing at our profile — while the profile tables
+    # are left intact.
+    config_path = tmp_path / "config.toml"
+    existing = f"""
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":workspace_roots"]
+"." = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
+enabled = false
+""".lstrip()
+    config_path.write_text(existing, encoding="utf-8")
+
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is True
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["default_permissions"] == SYMPHONY_PERMISSIONS_PROFILE
+    # Profile tables preserved (only the root key was added).
+    profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
+    assert profile["filesystem"][":workspace_roots"]["."] == "write"
+    assert profile["network"]["enabled"] is False
 
 
 def test_ensure_symphony_permissions_profile_migrates_legacy_project_roots(
@@ -172,6 +206,8 @@ def test_ensure_symphony_permissions_profile_leaves_unrelated_profile_legacy_tok
     # config and must not be touched.
     config_path = tmp_path / "config.toml"
     existing = f"""
+default_permissions="{SYMPHONY_PERMISSIONS_PROFILE}"
+
 [permissions.workspace.filesystem]
 ":project_roots" = "write"
 
