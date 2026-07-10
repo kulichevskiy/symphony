@@ -146,16 +146,57 @@ def _strip_symphony_profile_tables(config_text: str) -> str:
     return "".join(kept)
 
 
+def _config_sets_default_permissions(config_text: str) -> bool:
+    """True if `config_text` sets a top-level `default_permissions` key."""
+    try:
+        return "default_permissions" in tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError:
+        return False
+
+
+def _backfill_default_permissions(path: Path, existing: str) -> tuple[Path, bool]:
+    """Add a top-level `default_permissions` to a config that already has a
+    current profile but no default set.
+
+    Codex >= 0.143 refuses to load any config that defines `[permissions]`
+    tables without a top-level `default_permissions`. Older Symphony versions
+    wrote the profile without it (the value was only passed per-invocation via
+    `--config`), so an existing config can be structurally current yet fail to
+    load. Prepend the key — it must live in the root scope, above any table
+    header. Returns `(path, False)` untouched when a default is already set.
+    """
+    if _config_sets_default_permissions(existing):
+        return path, False
+    updated = f"{CODEX_DEFAULT_PERMISSIONS_CONFIG}\n{existing}"
+    try:
+        tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        raise CodexPermissionsProfileError(
+            f"Codex config {path} could not be safely updated; add "
+            f"`{CODEX_DEFAULT_PERMISSIONS_CONFIG}` manually."
+        ) from exc
+    try:
+        path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        raise CodexPermissionsProfileError(
+            f"Codex config {path} needs `{CODEX_DEFAULT_PERMISSIONS_CONFIG}` but "
+            f"could not be updated: {exc}. Add it manually."
+        ) from exc
+    return path, True
+
+
 def ensure_symphony_permissions_profile(
     config_path: Path | None = None,
 ) -> tuple[Path, bool]:
     """Ensure Codex has the named profile that can write managed `.git` dirs.
 
     Returns `(path, created)`. Existing profiles are treated as operator-owned
-    and left untouched, with one exception: a profile still using the legacy
+    and left untouched, with two exceptions: a profile still using the legacy
     `:project_roots` filesystem token is silently broken on Codex >= 0.136, so
-    it is rewritten to the current `:workspace_roots`-based block (and `created`
-    is `True`).
+    it is rewritten to the current `:workspace_roots`-based block; and a config
+    that defines the profile but no top-level `default_permissions` (which Codex
+    >= 0.143 requires whenever `[permissions]` tables exist) gets the key
+    backfilled. Either case sets `created` to `True`.
     """
     path = config_path or codex_config_path()
     existing = ""
@@ -192,7 +233,10 @@ def ensure_symphony_permissions_profile(
                 )
             if isinstance(profile, dict):
                 if not _profile_uses_legacy_project_roots(profile):
-                    return path, False
+                    # Profile is current. Codex >= 0.143 still refuses to load
+                    # it without a top-level `default_permissions`; backfill it
+                    # if unset, otherwise leave the config untouched.
+                    return _backfill_default_permissions(path, existing)
                 # Legacy profile written for an older Codex: strip its tables so
                 # the current `:workspace_roots`-based block is re-appended below.
                 stripped = _strip_symphony_profile_tables(existing)
@@ -216,6 +260,11 @@ def ensure_symphony_permissions_profile(
 
     separator = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
     updated = f"{existing}{separator}{SYMPHONY_PERMISSIONS_PROFILE_TOML}\n"
+    # Codex >= 0.143 requires a top-level `default_permissions` once
+    # `[permissions]` tables exist. Prepend it (root scope, above any table)
+    # unless the operator already set one.
+    if not _config_sets_default_permissions(existing):
+        updated = f"{CODEX_DEFAULT_PERMISSIONS_CONFIG}\n{updated}"
     try:
         tomllib.loads(updated)
     except tomllib.TOMLDecodeError as exc:
