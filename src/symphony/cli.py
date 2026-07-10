@@ -415,7 +415,15 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
     # behind another binding's valid key.
     claude_checks: set[tuple[str, str, str]] = set()
     for binding in cfg.repos:
-        binding_key = binding.env.get("ANTHROPIC_API_KEY") or env_key
+        # Presence, not truthiness: the runner merges `{**os.environ, **spec.env}`,
+        # so a binding that sets ANTHROPIC_API_KEY — even to "" (typo/empty secret)
+        # — overrides the process key for its subprocess. Inherit the process key
+        # only when the binding omits it entirely; an empty override means the
+        # binding really runs with no key (→ skipped below), not the parent's.
+        if "ANTHROPIC_API_KEY" in binding.env:
+            binding_key = binding.env["ANTHROPIC_API_KEY"]
+        else:
+            binding_key = env_key
         for name in get_args(RoleName):
             role = binding.resolved_role(name, cfg.roles)
             if role.effort is None or role.model is None:

@@ -380,6 +380,56 @@ repos:
     assert set(seen_keys) == {"sk-a", "sk-b"}
 
 
+def test_preflight_empty_binding_key_override_is_not_masked_by_parent(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A binding that sets `env: ANTHROPIC_API_KEY` to an empty value overrides
+    the parent key for its subprocess ({**os.environ, **spec.env}), so preflight
+    must validate with "" (→ skip), not fall back to the parent's valid key."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-parent")
+    monkeypatch.setenv("EMPTY_SECRET", "")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    seen_keys: list[str | None] = []
+
+    async def _fetch(_model: str, api_key: str | None = None) -> list[str] | None:
+        seen_keys.append(api_key)
+        return None if not api_key else ["low", "medium", "high"]
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    agent: claude
+    review_strategy: remote
+    env:
+      ANTHROPIC_API_KEY: EMPTY_SECRET
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+    )
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert "skipping claude model 'sonnet' effort validation" in result.output
+    # Validated with the binding's empty override, never the parent key.
+    assert seen_keys == [""]
+    assert "sk-parent" not in seen_keys
+
+
 def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
