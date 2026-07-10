@@ -17,24 +17,29 @@ CLAUDE_MODELS_API_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
 
 
-async def fetch_claude_effort_capabilities(model: str) -> list[str]:
+async def fetch_claude_effort_capabilities(model: str) -> list[str] | None:
     """Return the effort levels claude `model` supports, in API order.
 
     Reads the Models API `capabilities.effort.<level>` tree for `model`
-    (`opus`/`sonnet`/`haiku` aliases flow through unchanged). Requires
-    `ANTHROPIC_API_KEY`; raises `ValueError` — not a bare `httpx` error — when
-    the key is missing or the request fails (auth, network, timeout), so
-    preflight can report a clean message instead of a raw traceback. Also
-    raises `ValueError` when the response carries no effort tree, so an
-    absent/empty tree reads as "cannot validate" rather than "supports zero
-    efforts" (which would falsely reject a structurally valid pair).
+    (`opus`/`sonnet`/`haiku` aliases flow through unchanged).
+
+    Returns `None` when `ANTHROPIC_API_KEY` is unset. The daemon runs claude via
+    the CLI's own auth (OAuth in the containerized deployment), so no API key is
+    present there — the caller treats `None` as "cannot validate, skip with a
+    warning" rather than a hard failure, letting such a deployment still pass
+    preflight. A genuinely-broken pair is still caught structurally at
+    `Config.load`.
+
+    Raises `ValueError` — not a bare `httpx` error — when the key IS present but
+    the request fails (auth, network, timeout), so preflight reports a clean
+    message instead of a raw traceback. Also raises `ValueError` when the
+    response carries no effort tree, so an absent/empty tree reads as "cannot
+    validate" rather than "supports zero efforts" (which would falsely reject a
+    structurally valid pair).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        raise ValueError(
-            "ANTHROPIC_API_KEY is empty; cannot query the Models API to "
-            f"validate claude model {model!r}"
-        )
+        return None
     try:
         async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
             resp = await client.get(

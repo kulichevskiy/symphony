@@ -412,14 +412,29 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
                 continue
             pairs.add((role.agent, role.model, role.effort))
     ok = True
-    claude_caps: dict[str, list[str]] = {}
+    claude_caps: dict[str, list[str] | None] = {}
     for agent, model, effort in sorted(pairs):
         if agent == "codex":
-            supported = sorted(SUPPORTED_CODEX_EFFORTS)
+            supported: list[str] = sorted(SUPPORTED_CODEX_EFFORTS)
         else:
             if model not in claude_caps:
                 claude_caps[model] = await fetch_claude_effort_capabilities(model)
-            supported = claude_caps[model]
+                if claude_caps[model] is None:
+                    # ANTHROPIC_API_KEY absent: the daemon runs claude via CLI
+                    # auth (no key), so skip the online effort check with a
+                    # warning rather than hard-failing an otherwise-valid
+                    # deployment. The pair is still validated structurally at
+                    # Config.load. Warn once per model, not per (model, effort).
+                    click.echo(
+                        f"  ⚠ skipping claude model {model!r} effort validation: "
+                        "ANTHROPIC_API_KEY not set (daemon uses CLI auth; not "
+                        "required to run)",
+                        err=True,
+                    )
+            caps = claude_caps[model]
+            if caps is None:
+                continue
+            supported = caps
         if effort in supported:
             click.echo(f"  ✓ {agent} model {model!r} supports effort {effort!r}")
         else:

@@ -180,12 +180,13 @@ async def test_fetch_claude_effort_capabilities_empty_tree_raises_valueerror(
         await fetch_claude_effort_capabilities("sonnet")
 
 
-async def test_fetch_claude_effort_capabilities_missing_key_raises_valueerror(
+async def test_fetch_claude_effort_capabilities_missing_key_returns_none(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
+    """No ANTHROPIC_API_KEY → return None (a skip signal), NOT a raise: the
+    containerized/OAuth deployment has no API key and must still pass preflight."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
-        await fetch_claude_effort_capabilities("sonnet")
+    assert await fetch_claude_effort_capabilities("sonnet") is None
 
 
 async def test_fetch_claude_effort_capabilities_http_error_raises_valueerror(
@@ -239,6 +240,26 @@ def test_preflight_accepts_supported_model_effort_pair(tmp_path: Path, monkeypat
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert "claude model 'sonnet' supports effort 'high'" in result.output
+
+
+def test_preflight_skips_claude_check_when_api_key_missing(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Fetcher returns None (no ANTHROPIC_API_KEY) → the claude effort check is
+    skipped with a warning and preflight still exits 0. This is the containerized
+    OAuth deployment: claude runs via CLI auth, no API key present."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _no_key(_model: str) -> None:
+        return None
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _no_key)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("high", model="sonnet"))
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert "skipping claude model 'sonnet' effort validation" in result.output
+    assert "ANTHROPIC_API_KEY not set" in result.output
 
 
 def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
