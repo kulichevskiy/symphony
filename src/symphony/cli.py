@@ -411,6 +411,16 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
             if role.effort is None or role.model is None:
                 continue
             pairs.add((role.agent, role.model, role.effort))
+    # Resolve the key to validate claude pairs with: the process env, else a key
+    # a binding supplies via its `env:` mapping (already resolved from `.env` by
+    # Config.load, and merged into the claude subprocess by the runner). Using a
+    # binding-supplied key means an API-key deployment is validated, not skipped.
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        for binding in cfg.repos:
+            if binding.env.get("ANTHROPIC_API_KEY"):
+                anthropic_key = binding.env["ANTHROPIC_API_KEY"]
+                break
     ok = True
     claude_caps: dict[str, list[str] | None] = {}
     for agent, model, effort in sorted(pairs):
@@ -418,13 +428,14 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
             supported: list[str] = sorted(SUPPORTED_CODEX_EFFORTS)
         else:
             if model not in claude_caps:
-                claude_caps[model] = await fetch_claude_effort_capabilities(model)
+                claude_caps[model] = await fetch_claude_effort_capabilities(model, anthropic_key)
                 if claude_caps[model] is None:
-                    # ANTHROPIC_API_KEY absent: the daemon runs claude via CLI
-                    # auth (no key), so skip the online effort check with a
-                    # warning rather than hard-failing an otherwise-valid
-                    # deployment. The pair is still validated structurally at
-                    # Config.load. Warn once per model, not per (model, effort).
+                    # No ANTHROPIC_API_KEY in the process env or any binding's
+                    # `env:` — the daemon runs claude via CLI auth (no key), so
+                    # skip the online effort check with a warning rather than
+                    # hard-failing an otherwise-valid deployment. The pair is
+                    # still validated structurally at Config.load. Warn once per
+                    # model, not per (model, effort).
                     click.echo(
                         f"  ⚠ skipping claude model {model!r} effort validation: "
                         "ANTHROPIC_API_KEY not set (daemon uses CLI auth; not "

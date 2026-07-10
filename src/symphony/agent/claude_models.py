@@ -17,35 +17,41 @@ CLAUDE_MODELS_API_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
 
 
-async def fetch_claude_effort_capabilities(model: str) -> list[str] | None:
+async def fetch_claude_effort_capabilities(
+    model: str, api_key: str | None = None
+) -> list[str] | None:
     """Return the effort levels claude `model` supports, in API order.
 
     Reads the Models API `capabilities.effort.<level>` tree for `model`
-    (`opus`/`sonnet`/`haiku` aliases flow through unchanged).
+    (`opus`/`sonnet`/`haiku` aliases flow through unchanged). `api_key` is the
+    key to authenticate with; when `None` it falls back to the process env
+    `ANTHROPIC_API_KEY`. Preflight resolves the key from the process env OR a
+    binding's `env:` mapping and passes it in, so a key supplied only through a
+    binding still drives validation.
 
-    Returns `None` when `ANTHROPIC_API_KEY` is unset. The daemon runs claude via
-    the CLI's own auth (OAuth in the containerized deployment), so no API key is
-    present there — the caller treats `None` as "cannot validate, skip with a
+    Returns `None` when no key is available anywhere. The daemon can run claude
+    via the CLI's own auth (OAuth in the containerized deployment) with no API
+    key present — the caller treats `None` as "cannot validate, skip with a
     warning" rather than a hard failure, letting such a deployment still pass
     preflight. A genuinely-broken pair is still caught structurally at
     `Config.load`.
 
-    Raises `ValueError` — not a bare `httpx` error — when the key IS present but
+    Raises `ValueError` — not a bare `httpx` error — when a key IS available but
     the request fails (auth, network, timeout), so preflight reports a clean
     message instead of a raw traceback. Also raises `ValueError` when the
     response carries no effort tree, so an absent/empty tree reads as "cannot
     validate" rather than "supports zero efforts" (which would falsely reject a
     structurally valid pair).
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
         return None
     try:
         async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
             resp = await client.get(
                 f"/v1/models/{model}",
                 headers={
-                    "x-api-key": api_key,
+                    "x-api-key": key,
                     "anthropic-version": _ANTHROPIC_VERSION,
                 },
             )

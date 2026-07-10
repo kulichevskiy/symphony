@@ -211,7 +211,7 @@ def test_preflight_exits_cleanly_when_fetcher_http_errors(tmp_path: Path, monkey
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
 
-    async def _raise(_model: str) -> list[str]:
+    async def _raise(_model: str, _api_key: str | None = None) -> list[str]:
         raise ValueError("Models API returned HTTP 401 for claude model 'sonnet'")
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _raise)
@@ -224,7 +224,7 @@ def test_preflight_exits_cleanly_when_fetcher_http_errors(tmp_path: Path, monkey
 
 
 def _fake_claude_caps(monkeypatch, supported: list[str]) -> None:  # type: ignore[no-untyped-def]
-    async def _fetch(_model: str) -> list[str]:
+    async def _fetch(_model: str, _api_key: str | None = None) -> list[str]:
         return list(supported)
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
@@ -250,7 +250,7 @@ def test_preflight_skips_claude_check_when_api_key_missing(tmp_path: Path, monke
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
 
-    async def _no_key(_model: str) -> None:
+    async def _no_key(_model: str, _api_key: str | None = None) -> None:
         return None
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _no_key)
@@ -260,6 +260,54 @@ def test_preflight_skips_claude_check_when_api_key_missing(tmp_path: Path, monke
     assert result.exit_code == 0, result.output
     assert "skipping claude model 'sonnet' effort validation" in result.output
     assert "ANTHROPIC_API_KEY not set" in result.output
+
+
+def test_preflight_validates_with_binding_supplied_api_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A key supplied only through a binding's `env:` mapping (not the process
+    env) must still drive validation — not fall into the no-key skip. Otherwise
+    an API-key deployment could pass preflight on an unsupported effort."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("MY_ANTHROPIC_KEY", "sk-from-binding")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    seen_keys: list[str | None] = []
+
+    async def _fetch(_model: str, api_key: str | None = None) -> list[str]:
+        seen_keys.append(api_key)
+        return ["low", "medium", "high"]
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    agent: claude
+    review_strategy: remote
+    env:
+      ANTHROPIC_API_KEY: MY_ANTHROPIC_KEY
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+    )
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 0, result.output
+    assert "claude model 'sonnet' supports effort 'high'" in result.output
+    assert "skipping" not in result.output
+    # The binding-resolved secret — not an empty string — reached the fetcher.
+    assert seen_keys == ["sk-from-binding"]
 
 
 def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -284,7 +332,7 @@ def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
 
-    async def _boom(_model: str) -> list[str]:
+    async def _boom(_model: str, _api_key: str | None = None) -> list[str]:
         raise AssertionError("claude Models API must not be queried for codex")
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _boom)
