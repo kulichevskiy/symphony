@@ -310,6 +310,76 @@ repos:
     assert seen_keys == ["sk-from-binding"]
 
 
+def test_preflight_exercises_each_binding_api_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Two claude bindings with different `env:` keys for the same model: each
+    distinct key is validated, so a present-but-broken key on one binding fails
+    preflight instead of hiding behind the other binding's valid key."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("KEY_A", "sk-a")
+    monkeypatch.setenv("KEY_B", "sk-b")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(
+        monkeypatch,
+        _FakeLinear(viewer_keys=["ENG", "OPS"], states={"ENG": _STD_STATES, "OPS": _STD_STATES}),
+    )
+
+    seen_keys: list[str | None] = []
+
+    async def _fetch(_model: str, api_key: str | None = None) -> list[str]:
+        seen_keys.append(api_key)
+        if api_key == "sk-b":  # binding B's key is expired/invalid
+            raise ValueError("Models API returned HTTP 401 for claude model 'sonnet'")
+        return ["low", "medium", "high"]
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        """
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    agent: claude
+    review_strategy: remote
+    env:
+      ANTHROPIC_API_KEY: KEY_A
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+  - linear_team_key: OPS
+    github_repo: org/ops-svc
+    agent: claude
+    review_strategy: remote
+    env:
+      ANTHROPIC_API_KEY: KEY_B
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+    )
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    assert result.exit_code == 2, result.output
+    assert "HTTP 401" in result.output
+    # Both distinct binding keys were exercised (not just the first).
+    assert set(seen_keys) == {"sk-a", "sk-b"}
+
+
 def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)

@@ -404,58 +404,69 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
     check — preflight only. Daemon boot stays structural (`Config.load`'s
     family-enum check) and never queries the network.
     """
-    pairs: set[tuple[str, str, str]] = set()
+    # Each binding runs claude with the key the runner injects: its own `env:`
+    # ANTHROPIC_API_KEY (resolved from `.env` by Config.load) takes precedence
+    # over the process env, matching `{**os.environ, **spec.env}` in the runner.
+    env_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    codex_pairs: set[tuple[str, str]] = set()
+    # (key, model, effort); key "" means no API key is available for that binding
+    # (claude runs via CLI auth). Keying by the resolved key exercises every
+    # distinct binding key, so a present-but-broken one fails rather than hiding
+    # behind another binding's valid key.
+    claude_checks: set[tuple[str, str, str]] = set()
     for binding in cfg.repos:
+        binding_key = binding.env.get("ANTHROPIC_API_KEY") or env_key
         for name in get_args(RoleName):
             role = binding.resolved_role(name, cfg.roles)
             if role.effort is None or role.model is None:
                 continue
-            pairs.add((role.agent, role.model, role.effort))
-    # Resolve the key to validate claude pairs with: the process env, else a key
-    # a binding supplies via its `env:` mapping (already resolved from `.env` by
-    # Config.load, and merged into the claude subprocess by the runner). Using a
-    # binding-supplied key means an API-key deployment is validated, not skipped.
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not anthropic_key:
-        for binding in cfg.repos:
-            if binding.env.get("ANTHROPIC_API_KEY"):
-                anthropic_key = binding.env["ANTHROPIC_API_KEY"]
-                break
+            if role.agent == "codex":
+                codex_pairs.add((role.model, role.effort))
+            else:
+                claude_checks.add((binding_key, role.model, role.effort))
+
     ok = True
-    claude_caps: dict[str, list[str] | None] = {}
-    for agent, model, effort in sorted(pairs):
-        if agent == "codex":
-            supported: list[str] = sorted(SUPPORTED_CODEX_EFFORTS)
-        else:
-            if model not in claude_caps:
-                claude_caps[model] = await fetch_claude_effort_capabilities(model, anthropic_key)
-                if claude_caps[model] is None:
-                    # No ANTHROPIC_API_KEY in the process env or any binding's
-                    # `env:` — the daemon runs claude via CLI auth (no key), so
-                    # skip the online effort check with a warning rather than
-                    # hard-failing an otherwise-valid deployment. The pair is
-                    # still validated structurally at Config.load. Warn once per
-                    # model, not per (model, effort).
-                    click.echo(
-                        f"  ⚠ skipping claude model {model!r} effort validation: "
-                        "ANTHROPIC_API_KEY not set (daemon uses CLI auth; not "
-                        "required to run)",
-                        err=True,
-                    )
-            caps = claude_caps[model]
-            if caps is None:
-                continue
-            supported = caps
-        if effort in supported:
-            click.echo(f"  ✓ {agent} model {model!r} supports effort {effort!r}")
-        else:
-            click.echo(
-                f"effort {effort!r} not supported by {agent} model {model!r}; "
-                f"supported: {', '.join(supported)}",
-                err=True,
-            )
-            ok = False
+    for model, effort in sorted(codex_pairs):
+        ok = _report_effort_support("codex", model, effort, sorted(SUPPORTED_CODEX_EFFORTS)) and ok
+
+    # One Models API call per distinct (key, model): every binding key is
+    # exercised at least once.
+    caps_cache: dict[tuple[str, str], list[str] | None] = {}
+    warned_models: set[str] = set()
+    for key, model, effort in sorted(claude_checks):
+        cache_key = (key, model)
+        if cache_key not in caps_cache:
+            caps_cache[cache_key] = await fetch_claude_effort_capabilities(model, key)
+            if caps_cache[cache_key] is None and model not in warned_models:
+                # No key for this binding — claude runs via CLI auth, so skip the
+                # online effort check with a warning rather than hard-failing an
+                # otherwise-valid deployment (the pair is still validated
+                # structurally at Config.load). Warn once per model.
+                warned_models.add(model)
+                click.echo(
+                    f"  ⚠ skipping claude model {model!r} effort validation: "
+                    "ANTHROPIC_API_KEY not set (daemon uses CLI auth; not "
+                    "required to run)",
+                    err=True,
+                )
+        supported = caps_cache[cache_key]
+        if supported is None:
+            continue
+        ok = _report_effort_support("claude", model, effort, supported) and ok
     return ok
+
+
+def _report_effort_support(agent: str, model: str, effort: str, supported: list[str]) -> bool:
+    """Echo a ✓/✗ line for one `(agent, model, effort)` pair; return True if ok."""
+    if effort in supported:
+        click.echo(f"  ✓ {agent} model {model!r} supports effort {effort!r}")
+        return True
+    click.echo(
+        f"effort {effort!r} not supported by {agent} model {model!r}; "
+        f"supported: {', '.join(supported)}",
+        err=True,
+    )
+    return False
 
 
 async def _preflight(config_path: Path) -> None:
