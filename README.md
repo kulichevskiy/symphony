@@ -227,13 +227,21 @@ cp .env.example .env                        # fill in secrets
 cp examples/config.docker.yaml config.local.yaml
 $EDITOR config.local.yaml                   # set team keys / repos
 
-# One-time: log the CLIs into their (persisted) named volumes.
-docker compose run --rm --entrypoint claude symphony auth login
-docker compose run --rm --entrypoint codex symphony login
-docker compose run --rm --entrypoint gh symphony auth login --git-protocol https
+# One-time: log the CLIs into their (persisted) named volumes. All three use
+# headless flows (device code / paste-back code), so nothing needs a reachable
+# localhost port — these work unchanged in the container and on a remote VPS
+# where the browser is on a different machine.
+docker compose run --rm --entrypoint claude symphony auth login          # opens a URL, paste the code back
+docker compose run --rm --entrypoint codex symphony login --device-auth  # prints a URL + one-time code
+docker compose run --rm --entrypoint gh symphony auth login --git-protocol https --web  # github.com/login/device
 
 docker compose up -d
 ```
+
+> `codex login` **must** use `--device-auth`. The default flow starts an OAuth
+> callback server on `localhost:1455`; inside the container (which owns no
+> published port — Caddy only exposes 443/80) the browser redirect can't reach
+> it, so login silently fails. `--device-auth` needs no inbound port.
 
 The UI is then at `https://localhost/ui/` (Caddy's internal cert — accept the
 warning or trust the CA once), and the `/linear/webhook` + `/github/webhook`

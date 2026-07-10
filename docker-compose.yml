@@ -10,10 +10,14 @@
 # Before `docker compose up`:
 #   cp .env.example .env                       # fill in secrets
 #   cp examples/config.docker.yaml config.local.yaml
-# Auth the CLIs into the named volumes once (they persist across restarts):
+# Auth the CLIs into the named volumes once (they persist across restarts).
+# All three are headless (paste-back / device code) — no inbound port needed,
+# so they work in-container and on a remote VPS. codex MUST use --device-auth:
+# its default flow opens a localhost:1455 callback server the browser can't
+# reach from outside the container (Caddy publishes only 443/80).
 #   docker compose run --rm --entrypoint claude symphony auth login
-#   docker compose run --rm --entrypoint codex symphony login
-#   docker compose run --rm --entrypoint gh symphony auth login --git-protocol https
+#   docker compose run --rm --entrypoint codex symphony login --device-auth
+#   docker compose run --rm --entrypoint gh symphony auth login --git-protocol https --web
 
 services:
   symphony:
