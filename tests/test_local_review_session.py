@@ -1368,8 +1368,8 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
     async def diff_size(_: Path) -> DiffSize:
         return DiffSize(changed_lines=500, changed_files=10)
 
-    async def scrubber(ws: Path) -> None:
-        events.append(("scrub", ws))
+    async def scrubber(ws: Path, target_sha: str) -> None:
+        events.append(("scrub", target_sha))
         if throwaway.exists():
             throwaway.unlink()
 
@@ -1397,6 +1397,8 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
     kinds = [e[0] for e in events]
     assert ("verify_wrote", True) in events
     assert "scrub" in kinds
+    # The scrub resets to the pre-review HEAD (discarding reviewer commits too).
+    assert ("scrub", "sha-1") in events
     # The fixer must have observed a clean tree.
     assert ("fix_saw_throwaway", False) in events
     # Scrub strictly precedes the fixer.

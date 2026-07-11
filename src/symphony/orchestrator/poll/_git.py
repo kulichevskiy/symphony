@@ -443,16 +443,25 @@ async def _branch_ahead_of_base(workspace_path: Path, base_branch: str | None) -
     return False
 
 
-async def _workspace_scrub(workspace_path: Path) -> None:
-    """Reset the working tree to HEAD and remove untracked files.
+async def _workspace_scrub(workspace_path: Path, target_sha: str) -> None:
+    """Reset the branch to *target_sha* and remove untracked files.
 
-    Runs `git checkout -- .` then `git clean -fd` so a pass-2 verifier's
-    throwaway tests / scratch edits never reach the diff the fixer sees or
-    the branch that gets pushed. Best-effort: failures are swallowed so a
-    scrub hiccup never breaks the local-review phase.
+    Runs `git reset --hard <target_sha>` then `git clean -fd`. `target_sha` is
+    the branch HEAD captured *before* a reviewer/verifier pass ran; resetting to
+    it discards not just the pass's throwaway working-tree edits but any commit
+    it made — so a reviewer run (now unsandboxed) can never contribute a commit
+    to the diff the fixer sees or the branch that gets pushed. Earlier fix
+    commits are preserved (they are already part of `target_sha`).
+
+    Falls back to a working-tree-only clean when `target_sha` is empty (e.g. an
+    empty repo) so we never hard-reset to nothing. Best-effort: failures are
+    swallowed so a scrub hiccup never breaks the local-review phase.
     """
+    reset_argv = (
+        ["git", "reset", "--hard", target_sha] if target_sha else ["git", "checkout", "--", "."]
+    )
     for argv in (
-        ["git", "checkout", "--", "."],
+        reset_argv,
         ["git", "clean", "-fd"],
     ):
         try:

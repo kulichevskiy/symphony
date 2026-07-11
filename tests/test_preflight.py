@@ -486,7 +486,7 @@ def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert not (codex_home / "config.toml").exists()
-    assert "codex permissions profile not required" in result.output
+    assert "codex CLI not used by configured repos" in result.output
 
 
 def test_preflight_allows_jira_binding_without_linear_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -516,7 +516,7 @@ repos:
     assert "SYM → org/api-svc: states ok" in result.output
 
 
-def test_preflight_creates_codex_profile_when_binding_uses_codex_agent(
+def test_preflight_notes_codex_bypass_when_binding_uses_codex_agent(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
@@ -538,11 +538,12 @@ def test_preflight_creates_codex_profile_when_binding_uses_codex_agent(
     p.write_text(_yaml_with_ready("Todo").replace("agent: claude", "agent: codex"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
-    assert (codex_home / "config.toml").exists()
-    assert "symphony-git" in result.output
+    # codex runs bypass its OS sandbox; no permissions profile is provisioned.
+    assert not (codex_home / "config.toml").exists()
+    assert "--dangerously-bypass-approvals-and-sandbox" in result.output
 
 
-def test_preflight_creates_codex_profile_when_local_reviewer_uses_codex(
+def test_preflight_notes_codex_bypass_when_local_reviewer_uses_codex(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
@@ -565,8 +566,9 @@ def test_preflight_creates_codex_profile_when_local_reviewer_uses_codex(
     p.write_text(_yaml_with_ready("Todo").replace("review_strategy: remote", "local_review: true"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
-    assert (codex_home / "config.toml").exists()
-    assert "symphony-git" in result.output
+    # codex runs bypass its OS sandbox; no permissions profile is provisioned.
+    assert not (codex_home / "config.toml").exists()
+    assert "--dangerously-bypass-approvals-and-sandbox" in result.output
 
 
 def test_preflight_fails_when_ready_not_in_team_states(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -819,75 +821,3 @@ def test_preflight_requires_code_review_when_remote_review_enabled(
 
     assert result.exit_code != 0
     assert "code_review state ''" in result.output
-
-
-def test_daemon_boot_ensures_codex_profile(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """The daemon must provision the codex permissions profile itself: the
-    containerized deployment boots the daemon directly (no preflight), and on
-    a fresh codex auth volume there is no config.toml — every codex exec
-    would die referencing the missing `symphony-git` profile."""
-    import tomllib
-
-    from symphony.cli import _ensure_codex_profile
-    from symphony.config import Config
-
-    codex_home = _isolate_codex_home(tmp_path, monkeypatch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("high", agent="codex", model="gpt-5.1-codex"))
-    cfg = Config.load(p)
-    _ensure_codex_profile(cfg)
-    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
-    assert parsed["default_permissions"] == "symphony-git"
-    assert "symphony-git" in parsed["permissions"]
-
-
-def test_daemon_boot_skips_codex_profile_without_codex_bindings(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    from symphony.cli import _ensure_codex_profile
-    from symphony.config import Config
-
-    codex_home = _isolate_codex_home(tmp_path, monkeypatch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("high", agent="claude", model="sonnet"))
-    cfg = Config.load(p)
-    _ensure_codex_profile(cfg)
-    assert not (codex_home / "config.toml").exists()
-
-
-def test_daemon_boot_ensures_codex_profile_for_roles_matrix_codex(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    """A binding that selects codex only through the roles matrix (legacy
-    `agent:` stays claude) must still get the profile provisioned — dispatch
-    resolves agents through `resolved_role`, not the legacy field."""
-    import tomllib
-
-    from symphony.cli import _ensure_codex_profile
-    from symphony.config import Config
-
-    codex_home = _isolate_codex_home(tmp_path, monkeypatch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        """
-roles:
-  implement:
-    agent: codex
-    model: gpt-5.1-codex
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    review_strategy: remote
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
-    )
-    cfg = Config.load(p)
-    _ensure_codex_profile(cfg)
-    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
-    assert parsed["default_permissions"] == "symphony-git"

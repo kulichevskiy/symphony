@@ -24,11 +24,6 @@ import click
 
 from . import db
 from .agent.claude_models import fetch_claude_effort_capabilities
-from .agent.codex_cli import (
-    SYMPHONY_PERMISSIONS_PROFILE,
-    CodexPermissionsProfileError,
-    ensure_symphony_permissions_profile,
-)
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
 from .auth import Auth0Settings
@@ -267,30 +262,6 @@ def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
         asyncio.run(_run(config_path, once=once))
 
 
-def _ensure_codex_profile(cfg: Config) -> None:
-    """Ensure the codex `symphony-git` permissions profile exists at daemon
-    boot when any binding can spawn the codex CLI.
-
-    Preflight has always provisioned this, but the containerized deployment
-    boots the daemon directly — on a fresh codex auth volume there is no
-    config.toml at all, so every `codex exec --config
-    default_permissions="symphony-git"` would die referencing a profile that
-    doesn't exist. Fail closed with the writer's message when the profile
-    can't be ensured.
-    """
-    if not _config_can_run_codex_cli(cfg):
-        return
-    try:
-        codex_config, created_profile = ensure_symphony_permissions_profile()
-    except CodexPermissionsProfileError as e:
-        click.echo(str(e), err=True)
-        sys.exit(1)
-    if created_profile:
-        click.echo(
-            f"codex permissions profile {SYMPHONY_PERMISSIONS_PROFILE!r} added to {codex_config}"
-        )
-
-
 def _enforce_require_auth0(cfg: Config) -> None:
     """Fail closed BEFORE any state mutation when a publicly-routed deploy
     (SYMPHONY_REQUIRE_AUTH0=1, set by docker-compose.coolify.yml) lacks Auth0
@@ -319,7 +290,6 @@ async def _run(config_path: Path, *, once: bool) -> None:
         click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
         sys.exit(2)
     _enforce_require_auth0(cfg)
-    _ensure_codex_profile(cfg)
     async with _configured_tracker_registry(cfg) as (trackers, external_linear):
         conn = await db.connect(cfg.db_path)
         try:
@@ -559,23 +529,12 @@ async def _preflight(config_path: Path) -> None:
         else:
             click.echo("Auth0 config: unset, /api/* is unauthenticated")
     if _config_can_run_codex_cli(cfg):
-        try:
-            codex_config, created_profile = ensure_symphony_permissions_profile()
-        except CodexPermissionsProfileError as e:
-            click.echo(str(e), err=True)
-            sys.exit(1)
-        if created_profile:
-            click.echo(
-                f"codex permissions profile {SYMPHONY_PERMISSIONS_PROFILE!r} "
-                f"added to {codex_config}"
-            )
-        else:
-            click.echo(
-                f"codex permissions profile {SYMPHONY_PERMISSIONS_PROFILE!r} "
-                f"present in {codex_config}"
-            )
+        click.echo(
+            "codex runs use --dangerously-bypass-approvals-and-sandbox "
+            "(container is the sandbox); no permissions profile needed"
+        )
     else:
-        click.echo("codex permissions profile not required by configured repos")
+        click.echo("codex CLI not used by configured repos")
     try:
         # Structural binding checks first: they emit their findings before the
         # online capability check, so an ANTHROPIC_API_KEY gap can't mask them.

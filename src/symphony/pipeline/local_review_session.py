@@ -77,12 +77,13 @@ HeadShaProvider = Callable[[Path], Awaitable[str]]
 # size the diff and stays single-pass (cheaper, back-compat default).
 DiffSizeProvider = Callable[[Path], Awaitable[DiffSize]]
 
-# Scrubs the working tree after the pass-2 verifier returns, before verdict
-# parsing and before the fixer. The orchestrator implements this with
-# `git checkout -- . && git clean -fd` so the verifier's throwaway tests /
-# mutations never reach the diff the fixer sees. When None, no scrub runs
-# (back-compat: only relevant once pass 2 has Tier B write access).
-WorkspaceScrubber = Callable[[Path], Awaitable[None]]
+# Resets the branch to a given SHA after a reviewer/verifier pass, before
+# verdict parsing and before the fixer. Called with the branch HEAD captured
+# *before* the pass ran; the orchestrator implements it as
+# `git reset --hard <sha> && git clean -fd` so the pass's throwaway edits AND
+# any commit it made (reviewer runs are unsandboxed) never reach the diff the
+# fixer sees or the branch that gets pushed. When None, no scrub runs.
+WorkspaceScrubber = Callable[[Path, str], Awaitable[None]]
 
 # Run IDs must survive becoming git refs / log filenames. The orchestrator
 # already uses UUIDs, but if a caller passes something weirder we still
@@ -350,7 +351,7 @@ async def run_local_review_session(
         if diff_size_provider is not None:
             small = is_small_diff(await diff_size_provider(workspace_path))
         if small:
-            return await _run_reviewer_pass(
+            single_out = await _run_reviewer_pass(
                 agent=reviewer_agent,
                 codex_model=reviewer_codex_model,
                 claude_model=local_review_claude_model,
@@ -360,6 +361,12 @@ async def run_local_review_session(
                 estimator=reviewer_estimator,
                 head_sha=head_sha,
             )
+            # Reviewer is unsandboxed: discard anything it wrote/committed so it
+            # can't taint the delivered branch (its verdict is already captured
+            # from stdout / the last-message file, outside the workspace).
+            if workspace_scrubber is not None:
+                await workspace_scrubber(workspace_path, head_sha)
+            return single_out
 
         # Pass 1 — finder, opposite the implementer's family. Lists every
         # suspicion, emits no verdict marker; its findings feed pass 2.
@@ -373,6 +380,11 @@ async def run_local_review_session(
             estimator=reviewer_estimator,
             head_sha=head_sha,
         )
+        # Finder is unsandboxed: reset before the verifier sees the diff (and
+        # before delivery) so finder edits/commits never leak. Findings are
+        # already captured from the finder's stdout / last-message file.
+        if workspace_scrubber is not None:
+            await workspace_scrubber(workspace_path, head_sha)
         if not finder_out.ok:
             # Propagate the finder failure (with its cost) to the loop;
             # no point paying for a verifier with nothing to verify.
@@ -412,14 +424,14 @@ async def run_local_review_session(
             head_sha=head_sha,
             pass_two=True,
         )
-        # Pass 2 had Tier B write access: scrub the working tree before the
-        # verdict is parsed and before the fixer runs, so the verifier's
-        # throwaway tests / scratch edits never reach the diff the fixer
-        # sees. The verifier's final message is already captured below from
-        # stdout / the last-message file (outside the workspace), so the
-        # scrub can't lose the verdict.
+        # Pass 2 had Tier B write access: reset to the pre-review HEAD before
+        # the verdict is parsed and before the fixer runs, so the verifier's
+        # throwaway tests / scratch edits — and any commit it made — never reach
+        # the diff the fixer sees or the delivered branch. The verifier's final
+        # message is already captured below from stdout / the last-message file
+        # (outside the workspace), so the reset can't lose the verdict.
         if workspace_scrubber is not None:
-            await workspace_scrubber(workspace_path)
+            await workspace_scrubber(workspace_path, head_sha)
         # Merge: the loop parses pass-2's verdict (survivors + new
         # findings already merged in the verifier's message); fold in
         # pass-1's usage so the loop sees the full two-pass spend.
