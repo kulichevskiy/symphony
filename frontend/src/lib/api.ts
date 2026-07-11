@@ -190,6 +190,7 @@ export type IssueDetail = {
     termination_kind: string;
     termination_detail: string;
     exit_returncode: number | null;
+    has_log: boolean;
   }>;
   issue_prs: Array<{
     github_repo: string;

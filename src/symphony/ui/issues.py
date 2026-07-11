@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Any
 
 import aiosqlite
@@ -254,6 +255,7 @@ def create_issue_detail_router(
     clock: Callable[[], datetime] | None = None,
     status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     no_progress_threshold: timedelta | None = None,
+    log_root: Path | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
@@ -317,6 +319,14 @@ def create_issue_detail_router(
             """,
             (issue_id,),
         )
+        # `has_log` reflects whether the run's incremental
+        # `{log_root}/{run_id}.log` exists — the only signal the final-log
+        # viewer needs to decide drain-vs-empty-state. Old runs (pre-tee) and
+        # synthetic rows with no subprocess simply have no file.
+        for run in runs:
+            run["has_log"] = (
+                log_root is not None and (log_root / f"{run['id']}.log").exists()
+            )
         issue_prs = await _fetch_all(
             conn,
             """

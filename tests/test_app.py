@@ -1156,6 +1156,7 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "termination_kind": "",
                 "termination_detail": "",
                 "exit_returncode": None,
+                "has_log": False,
             },
             {
                 "id": "run-1",
@@ -1171,6 +1172,7 @@ async def test_issue_detail_api_returns_nested_issue_payload(tmp_path: Path) -> 
                 "termination_kind": "",
                 "termination_detail": "",
                 "exit_returncode": None,
+                "has_log": False,
             },
         ],
         "issue_prs": [
@@ -1336,8 +1338,61 @@ async def test_issue_detail_api_serializes_run_termination_fields(
             "termination_kind": "agent_nonzero_exit",
             "termination_detail": "[backfill] return code 2",
             "exit_returncode": 2,
+            "has_log": False,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_api_reports_has_log_per_run(tmp_path: Path) -> None:
+    """`has_log` is true iff `{log_root}/{run_id}.log` exists — the final-log
+    viewer keys purely off it (drained when true, empty state when false)."""
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    log_root.mkdir()
+    (log_root / "run-with-log.log").write_text("hi\n", encoding="utf-8")
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-log",
+            identifier="ENG-10",
+            title="Log presence",
+            team_key="ENG",
+        )
+        for run_id, started in (
+            ("run-with-log", "2026-05-17T10:00:00Z"),
+            ("run-without-log", "2026-05-17T09:00:00Z"),
+        ):
+            await conn.execute(
+                """
+                INSERT INTO runs (id, issue_id, stage, status, pid, started_at, ended_at, cost_usd)
+                VALUES (?, 'iss-log', 'local_review', 'failed', NULL, ?, ?, 0)
+                """,
+                (run_id, started, started),
+            )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_log_root=log_root,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/issues/iss-log")
+    finally:
+        await conn.close()
+
+    assert response.status_code == 200
+    has_log = {r["id"]: r["has_log"] for r in response.json()["runs"]}
+    assert has_log == {"run-with-log": True, "run-without-log": False}
 
 
 @pytest.mark.asyncio

@@ -130,3 +130,34 @@ async def test_tick_events_are_dropped() -> None:
     )
     out = await collect_runner_output(runner, _spec())
     assert out.stdout == "real"
+
+
+@pytest.mark.asyncio
+async def test_tees_stdout_and_stderr_to_log_path(tmp_path: Path) -> None:
+    """With `log_path`, every line is written as it arrives — stdout
+    verbatim, stderr prefixed `[stderr] ` — matching the orchestrator's
+    implement-run tee. The in-memory collection is unaffected."""
+    log_path = tmp_path / "logs" / "rid-1.log"
+    runner = _FakeRunner(
+        [
+            RunnerEvent(kind="stdout", line="line one"),
+            RunnerEvent(kind="stderr", line="warning: x"),
+            RunnerEvent(kind="stdout", line="line two"),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+    out = await collect_runner_output(runner, _spec(), log_path=log_path)
+    # In-memory collection unchanged (stdout/stderr kept separate).
+    assert out.stdout == "line one\nline two"
+    assert out.stderr == "warning: x"
+    # The tee'd file interleaves them in arrival order, stderr prefixed.
+    assert log_path.read_text(encoding="utf-8") == (
+        "line one\n[stderr] warning: x\nline two\n"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_log_path_writes_nothing(tmp_path: Path) -> None:
+    runner = _FakeRunner([RunnerEvent(kind="stdout", line="x"), RunnerEvent(kind="exit", returncode=0)])
+    await collect_runner_output(runner, _spec())
+    assert list(tmp_path.iterdir()) == []

@@ -167,6 +167,7 @@ def create_app(
                     clock=clock,
                     status_thresholds=ui_status_thresholds,
                     no_progress_threshold=ui_pr_no_progress_threshold,
+                    log_root=ui_log_root,
                 ),
                 dependencies=api_dependencies,
             )

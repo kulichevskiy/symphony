@@ -1525,6 +1525,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     workspace_scrubber=_workspace_scrub,
                     on_iteration=_on_iteration,
                     allow_fixes=allow_fixes,
+                    log_path=self.config.log_root / f"{local_review_run_id}.log",
                 )
             finally:
                 await self._finalize_local_review_run(
