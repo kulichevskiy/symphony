@@ -24,18 +24,22 @@ receiving it (call the API, don't trust):
 | Auth0 tenant | SPA app client_id; operator edits Application URIs |
 | `.env` + `config.local.yaml` | from the current working deployment |
 
-API call pattern (panel speaks plain HTTP on the IP):
+API call pattern. The panel speaks plain HTTP on the IP — do NOT send
+the bearer token (or, worse, the deploy private key) over it from
+outside. Either tunnel (`ssh -L 8000:localhost:8000 <host>`, then call
+`http://127.0.0.1:8000`) or, when sshd blocks forwarding
+("administratively prohibited"), run curl ON the host over ssh:
 
 ```bash
-curl -s -H "Authorization: Bearer $COOLIFY_API_KEY" \
-  http://<ip>:8000/api/v1/<path>
+ssh <host> 'curl -s -H "Authorization: Bearer $TOK" \
+  http://127.0.0.1:8000/api/v1/<path>'
 ```
 
 ## Phase 1 — Coolify resource
 
 1. **Repo access — deploy key.** Generate `ssh-keygen -t ed25519` in the
    scratchpad; add the public half to GitHub
-   (`gh api repos/<owner>/<repo>/keys -f title=coolify-symphony -f key=@… -F read_only=true`);
+   (`gh api repos/<owner>/<repo>/keys -f title=coolify-symphony -f key="$(cat <pub-file>)" -F read_only=true` — note `-f key=@path` would send the literal string, not the file);
    register the private half: `POST /security/keys {name, private_key}` → keep `uuid`.
 2. **Project.** `GET /projects`; create if absent.
 3. **Application.** `POST /applications/private-deploy-key` with
@@ -69,15 +73,21 @@ Prepare a script for the operator (secrets + root writes are theirs to
 run; put it in the scratchpad and hand over the path):
 
 ```bash
-# build locally: config gets /data paths, .env drops panel-only tokens
-#   workspace_root: /data/workspaces, log_root: /data/logs,
-#   db_path: /data/db/state.sqlite
-# strip GCORE_API_KEY / COOLIFY_API_KEY lines from .env
-scp both files → <host>:/tmp/, then on the host:
-sudo install -d -m 755 /opt/symphony
-sudo install -m 444 -o 1000 -g 1000 /tmp/vps-config.yaml /opt/symphony/config.local.yaml
-sudo install -m 400 -o 1000 -g 1000 /tmp/vps.env         /opt/symphony/.env
+# Build locally first: the config gets /data paths
+#   (workspace_root: /data/workspaces, log_root: /data/logs,
+#    db_path: /data/db/state.sqlite)
+# and .env drops panel-only tokens (GCORE_API_KEY, COOLIFY_API_KEY lines).
+scp /tmp/vps-config.yaml /tmp/vps.env "<host>:/tmp/"
+ssh "<host>" '
+  sudo install -d -m 755 /opt/symphony
+  sudo install -m 400 -o 1000 -g 1000 /tmp/vps-config.yaml /opt/symphony/config.local.yaml
+  sudo install -m 400 -o 1000 -g 1000 /tmp/vps.env         /opt/symphony/.env
+  rm /tmp/vps-config.yaml /tmp/vps.env
+'
 ```
+
+Both files get mode 400: `config.local.yaml` can carry per-binding
+`webhook_secret`s, so it is as sensitive as `.env`.
 
 > ⚠️ **uid 1000, not root.** The container user is `symphony` (uid 1000);
 > a root-owned 600 `.env` boots into `PermissionError` — happened.
@@ -93,8 +103,9 @@ design; fix the file, don't remove the flag.
 
 1. A-record `<sub>` → VPS IP (Gcore: overrides the `*`→vercel wildcard
    for that name only). Verify: `dig +short <sub>.<domain> @<zone-ns>`.
-2. Deploy: `GET /deploy?uuid=<app-uuid>` → returns `deployment_uuid`.
-   Poll `GET /deployments/{deployment_uuid}` (`status`, `logs` is a JSON
+2. Deploy: `GET /deploy?uuid=<app-uuid>` → response is
+   `{"deployments": [{"deployment_uuid": …}]}` (nested in the array, not
+   top-level). Poll `GET /deployments/{deployment_uuid}` (`status`, `logs` is a JSON
    string of `{output}` entries) until `finished`/`failed`. First build
    ≈ 5–15 min (full agent toolchain); later ones hit cache.
 3. Traefik issues the LE cert automatically once DNS resolves.
@@ -103,7 +114,7 @@ Smoke (all through the public domain):
 
 ```
 GET  /api/issues        → 401 {"detail":"missing bearer token"}   (Auth0 gate)
-POST /linear/webhook    → 401 {"detail":"invalid signature"}       (own HMAC — outside the gate)
+POST /linear/webhook    → 401 {"detail":"invalid signature"}       (own HMAC — outside the gate; 404 is EXPECTED when LINEAR_WEBHOOK_SECRET is unset — the receiver isn't registered)
 GET  /ui/               → 200
 TLS                     → valid LE cert
 GET  /api/auth-config   → {"enabled":true,...}
