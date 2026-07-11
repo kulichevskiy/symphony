@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Icon } from "@/components/ui/icon";
 import { formatTokens } from "@/lib/format";
@@ -23,12 +23,14 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Subscribe to a run's live event stream. Reconnects from the last byte offset
- * if the connection drops before the run finishes, and stops cleanly on the
- * server's `end` frame. Token ticks are folded into a single running total
- * rather than appended as feed lines.
+ * Subscribe to a run's event stream. In live mode reconnects from the last
+ * byte offset if the connection drops before the run finishes; in non-live
+ * mode (a finished run) it drains the log in a single pass and never
+ * reconnects — the server tails a terminal run's log to the end and emits
+ * `end`. Stops cleanly on that `end` frame. Token ticks are folded into a
+ * single running total rather than appended as feed lines.
  */
-function useLiveFeed(runId: string, enabled: boolean) {
+function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
   const [items, setItems] = useState<FeedItem[]>([]);
   const [tokens, setTokens] = useState<TokenTick | null>(null);
   const [status, setStatus] = useState<FeedStatus>("connecting");
@@ -69,9 +71,19 @@ function useLiveFeed(runId: string, enabled: boolean) {
             if (!cancelled) setStatus("ended");
             return;
           }
+          if (!live) {
+            // Drain returned without an `end` frame — a dropped connection
+            // or proxy/server restart cut it short. Surface as retryable
+            // rather than claiming the final log is complete.
+            if (!cancelled) setStatus("error");
+            return;
+          }
         } catch {
           if (cancelled) return;
           setStatus("error");
+          // Non-live: surface the error but never retry — a past run's log
+          // is drained in one pass (the retry button can re-trigger it).
+          if (!live) return;
         }
         if (cancelled) return;
         // Dropped or errored while the run is still live — resume from offset.
@@ -83,7 +95,7 @@ function useLiveFeed(runId: string, enabled: boolean) {
       cancelled = true;
       controller.abort();
     };
-  }, [runId, enabled, attempt]);
+  }, [runId, enabled, live, attempt]);
 
   return { items, tokens, status, reconnect: () => setAttempt((n) => n + 1) };
 }
@@ -139,11 +151,24 @@ const STATUS_LABEL: Record<FeedStatus, string> = {
   error: "reconnecting",
 };
 
-/** Live, parsed view of a running agent — messages, tool calls, file edits and
- *  a running token total, tailed from the run log. Renders nothing until the
- *  first event arrives. Scrolls with new output; readable on mobile. */
-export function LiveFeed({ runId, active }: { runId: string; active: boolean }) {
-  const { items, tokens, status, reconnect } = useLiveFeed(runId, active);
+/** Parsed view of an agent run — messages, tool calls, file edits and a running
+ *  token total, tailed from the run log. In `live` mode (default) it follows a
+ *  running run and reconnects on drops; with `live={false}` it drains a
+ *  finished run's log once (no reconnect loop) as a final log. `label`
+ *  overrides the header text (e.g. "final log — implement, failed"). Scrolls
+ *  with new output; readable on mobile. */
+export function LiveFeed({
+  runId,
+  active,
+  live = true,
+  label,
+}: {
+  runId: string;
+  active: boolean;
+  live?: boolean;
+  label?: ReactNode;
+}) {
+  const { items, tokens, status, reconnect } = useLiveFeed(runId, active, live);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
 
@@ -178,7 +203,7 @@ export function LiveFeed({ runId, active }: { runId: string; active: boolean }) 
               status === "live" && "animate-pulse",
             )}
           />
-          {STATUS_LABEL[status]}
+          {label ?? STATUS_LABEL[status]}
         </span>
         {tokens ? (
           <span className="font-mono text-muted-foreground">
@@ -203,7 +228,11 @@ export function LiveFeed({ runId, active }: { runId: string; active: boolean }) 
       >
         {items.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
-            {status === "ended" ? "No live output." : "Waiting for output…"}
+            {status === "ended"
+              ? live
+                ? "No live output."
+                : "No output recorded for this run."
+              : "Waiting for output…"}
           </p>
         ) : (
           <div className="divide-y divide-border/40">

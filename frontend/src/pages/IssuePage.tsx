@@ -816,6 +816,194 @@ const NON_STREAMING_STAGES = new Set([
   "review",
 ]);
 
+type Run = IssueDetail["runs"][number];
+
+// Terminal statuses that mean the run failed or was cut short — the ones an
+// operator most wants to inspect (mirrors runs.py TERMINAL_NON_SUCCESS_STATUSES
+// plus the legacy "halted").
+const FAILED_RUN_STATUSES = new Set(["failed", "interrupted", "needs_approval", "halted"]);
+
+// Mirrors runs.py SUPERSEDED_STATUS: startup reconcile marks a collapsed
+// duplicate live run this way — pure bookkeeping that must never shadow the
+// surviving run's log.
+const SUPERSEDED_STATUS = "superseded";
+
+// `interrupt_running_merge` (and the orphaned-merge-approval cleanup) don't
+// use SUPERSEDED_STATUS — they stamp the displaced row `status="interrupted"`
+// with `termination_kind="superseded"` instead, since "interrupted" is what
+// drives merge/needs_approval re-dispatch. Same bookkeeping-only intent: a
+// collapsed duplicate, not something the operator wants surfaced by default.
+function isSupersededRun(r: Run): boolean {
+  return r.status === SUPERSEDED_STATUS || r.termination_kind === "superseded";
+}
+
+/** Whether `r` has an actual `<run_id>.log` for LiveFeed to drain, beyond what
+ *  `NON_STREAMING_STAGES` alone captures:
+ *  - `verify` always writes `fix_log_path` (`run_verify_session` writes a
+ *    "passed on first attempt" or "fix turn disabled" note when no fix turn
+ *    ran, else the fix turn's stdout), so it's always tailable and never
+ *    opens to a blank "No output recorded" state by default.
+ *  - `merge` is usually a real agent run, but `_mark_merge_needs_approval`
+ *    also inserts synthetic `stage="merge"` rows purely to park the issue in
+ *    Needs Approval, created with `pid=None` and no `_run_stage_command` —
+ *    those never get a log, so `pid === null` marks the synthetic case. */
+function hasTailableLog(r: Run): boolean {
+  if (r.stage === "merge") return r.pid !== null;
+  if (r.stage === "verify") return true;
+  return !NON_STREAMING_STAGES.has(r.stage);
+}
+
+function runsByStartDesc(runs: Run[]): Run[] {
+  return [...runs].sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
+}
+
+/** The run whose final log opens by default: the most-recent failed/interrupted
+ *  run that actually has a tailable log (what the operator usually needs after
+ *  a park), falling back to the most-recent tailable run, then to the most
+ *  recent run overall — a failed `review` run or a synthetic merge-approval
+ *  park row (`hasTailableLog` false, no log) must not shadow a streamable
+ *  `implement` run. `superseded` rows are excluded from both fallbacks: they're
+ *  a killed duplicate of a surviving run, not something an operator wants to
+ *  see by default. Null when the issue has no runs. */
+export function pickDefaultRun(runs: Run[]): Run | null {
+  if (!runs.length) return null;
+  const sorted = runsByStartDesc(runs);
+  const eligible = sorted.filter((r) => !isSupersededRun(r));
+  return (
+    eligible.find((r) => FAILED_RUN_STATUSES.has(r.status) && hasTailableLog(r)) ??
+    eligible.find(hasTailableLog) ??
+    eligible[0] ??
+    sorted[0]
+  );
+}
+
+/** The running run to stream live, and the running run to attribute the
+ *  "still running" placeholder to when nothing streams. `_run_prepush_gates`
+ *  starts newer running `local_review`/`verify` child rows before the parent
+ *  `implement` row is marked completed, so the newest running row by start
+ *  time isn't necessarily the tailable one — prefer whichever running run
+ *  actually has a per-run log, falling back to the newest running row so the
+ *  non-streaming placeholder still has a stage/status to label. Both null
+ *  when nothing is running. */
+export function pickLiveRun(runs: Run[]): { live: Run | null; active: Run | null } {
+  const runningRuns = runsByStartDesc(runs).filter((r) => r.status === "running");
+  const live = runningRuns.find((r) => !NON_STREAMING_STAGES.has(r.stage)) ?? null;
+  return { live, active: live ?? runningRuns[0] ?? null };
+}
+
+function formatDuration(startedAt: string, endedAt: string | null): string {
+  if (!endedAt) return "—";
+  const secs = Math.round((Date.parse(endedAt) - Date.parse(startedAt)) / 1000);
+  if (!Number.isFinite(secs) || secs < 0) return "—";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
+
+const RUN_STATUS_TONE: Record<string, string> = {
+  done: "text-green-600 dark:text-green-400",
+  completed: "text-green-600 dark:text-green-400",
+  failed: "text-red-600 dark:text-red-400",
+  interrupted: "text-red-600 dark:text-red-400",
+  halted: "text-red-600 dark:text-red-400",
+  needs_approval: "text-amber-600 dark:text-amber-400",
+  running: "text-blue-600 dark:text-blue-400",
+};
+
+function RunPicker({
+  runs,
+  selectedId,
+  onSelect,
+}: {
+  runs: Run[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="mb-3 flex flex-col gap-1.5">
+      {runs.map((r) => {
+        const selected = r.id === selectedId;
+        return (
+          <button
+            key={r.id}
+            type="button"
+            onClick={() => onSelect(r.id)}
+            className={cn(
+              "flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border px-3 py-2 text-left text-xs transition-colors",
+              selected
+                ? "border-blue-400 bg-blue-50 dark:border-blue-700 dark:bg-blue-950/40"
+                : "border-border bg-secondary/20 hover:bg-secondary/40",
+            )}
+          >
+            <span className="font-medium capitalize text-foreground">
+              {STAGE_LABEL[r.stage] ?? r.stage}
+            </span>
+            <span className={cn("font-medium", RUN_STATUS_TONE[r.status] ?? "text-muted-foreground")}>
+              {r.status}
+            </span>
+            <span className="ml-auto font-mono text-muted-foreground" title={formatUtc(r.started_at)}>
+              {formatUtc(r.started_at)}
+            </span>
+            <span className="font-mono text-muted-foreground">
+              · {formatDuration(r.started_at, r.ended_at)}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function NoTailableLog({ stageLabel, reason }: { stageLabel: string; reason: string }) {
+  return (
+    <div className="rounded-md border border-border bg-secondary/20 px-3 py-6 text-center text-sm text-muted-foreground">
+      <span className="capitalize">{stageLabel}</span> {reason}
+    </div>
+  );
+}
+
+/** Final-log viewer for a non-running issue: a run picker (stage, status,
+ *  started, duration) over all the issue's runs, defaulting to the most-recent
+ *  failed run, with the selected run's log drained once through the LiveFeed in
+ *  non-live mode. Runs with no actual log (`!hasTailableLog`) get an
+ *  explanatory empty state instead of a stuck spinner. */
+export function FinalLogCard({ runs }: { runs: Run[] }) {
+  const sorted = runsByStartDesc(runs);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  if (!sorted.length) return null;
+
+  const fallback = pickDefaultRun(sorted)!;
+  const selected = sorted.find((r) => r.id === selectedId) ?? fallback;
+  const stageLabel = STAGE_LABEL[selected.stage] ?? selected.stage;
+
+  return (
+    <CockpitCard
+      title="Final log"
+      aside={
+        <span className="font-mono text-[11px] text-muted-foreground">finished run</span>
+      }
+    >
+      {sorted.length > 1 ? (
+        <RunPicker runs={sorted} selectedId={selected.id} onSelect={setSelectedId} />
+      ) : null}
+      {!hasTailableLog(selected) ? (
+        <NoTailableLog
+          stageLabel={stageLabel}
+          reason="writes no per-run log to tail, so there's nothing to show here."
+        />
+      ) : (
+        <LiveFeed
+          key={selected.id}
+          runId={selected.id}
+          active
+          live={false}
+          label={`final log — ${stageLabel}, ${selected.status}`}
+        />
+      )}
+    </CockpitCard>
+  );
+}
+
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
@@ -864,8 +1052,7 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
-  const liveRun =
-    detail?.runs.find((r) => r.status === "running" && !NON_STREAMING_STAGES.has(r.stage)) ?? null;
+  const { live: liveRun, active: activeRun } = pickLiveRun(detail?.runs ?? []);
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
@@ -929,7 +1116,23 @@ export function IssuePage() {
               <CockpitCard title="Live output">
                 <LiveFeed runId={liveRun.id} active />
               </CockpitCard>
-            ) : null}
+            ) : activeRun ? (
+              <CockpitCard
+                title="Live output"
+                aside={
+                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400">
+                    <LiveDot tone="bg-blue-500" /> running
+                  </span>
+                }
+              >
+                <NoTailableLog
+                  stageLabel={STAGE_LABEL[activeRun.stage] ?? activeRun.stage}
+                  reason="is running now, but this stage doesn't write a per-run log to tail."
+                />
+              </CockpitCard>
+            ) : (
+              <FinalLogCard runs={detail.runs} />
+            )}
             <div className="grid gap-4 sm:grid-cols-2">
               <TokensCard c={cockpit} />
               <PrCard pr={cockpit.pr} />
