@@ -828,12 +828,20 @@ function runsByStartDesc(runs: Run[]): Run[] {
 }
 
 /** The run whose final log opens by default: the most-recent failed/interrupted
- *  run (what the operator usually needs after a park), falling back to the
- *  most-recent run overall. Null when the issue has no runs. */
+ *  run that actually has a tailable log (what the operator usually needs after
+ *  a park), falling back to the most-recent tailable run, then to the most
+ *  recent run overall — a failed `review` run (NON_STREAMING_STAGES, no log)
+ *  must not shadow a streamable `implement` run. Null when the issue has no
+ *  runs. */
 export function pickDefaultRun(runs: Run[]): Run | null {
   if (!runs.length) return null;
   const sorted = runsByStartDesc(runs);
-  return sorted.find((r) => FAILED_RUN_STATUSES.has(r.status)) ?? sorted[0];
+  const streamable = (r: Run) => !NON_STREAMING_STAGES.has(r.stage);
+  return (
+    sorted.find((r) => FAILED_RUN_STATUSES.has(r.status) && streamable(r)) ??
+    sorted.find(streamable) ??
+    sorted[0]
+  );
 }
 
 function formatDuration(startedAt: string, endedAt: string | null): string {
@@ -935,7 +943,7 @@ export function FinalLogCard({ runs }: { runs: Run[] }) {
           runId={selected.id}
           active
           live={false}
-          label={`final log — ${selected.stage}, ${selected.status}`}
+          label={`final log — ${stageLabel}, ${selected.status}`}
         />
       )}
     </CockpitCard>

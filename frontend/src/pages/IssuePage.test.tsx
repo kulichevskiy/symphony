@@ -285,6 +285,26 @@ describe("pickDefaultRun", () => {
   it("returns null for no runs", () => {
     expect(pickDefaultRun([])).toBeNull();
   });
+
+  it("skips a newer NON_STREAMING needs_approval run for the older tailable implement run (park scenario)", () => {
+    // Mirrors a local-review-only park: review(needs_approval, newest),
+    // local_review(completed), implement(completed) — the review run has no
+    // per-run log, so its needs_approval status must not win the default pick.
+    const runs = [
+      run("review", { id: "r-review", status: "needs_approval", started_at: "2026-06-07T14:00:00Z" }),
+      run("local_review", { id: "r-lr", status: "completed", started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-impl", status: "completed", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-impl");
+  });
+
+  it("prefers a failed tailable run over a newer failed NON_STREAMING run", () => {
+    const runs = [
+      run("review", { id: "r-review", status: "failed", started_at: "2026-06-07T14:00:00Z" }),
+      run("implement", { id: "r-impl-fail", status: "failed", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-impl-fail");
+  });
 });
 
 describe("FinalLogCard", () => {
@@ -294,7 +314,18 @@ describe("FinalLogCard", () => {
       run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — implement, failed");
+    expect(markup).toContain("final log — Implement, failed");
+  });
+
+  it("opens the implement run's log by default on a local-review-only park, not the empty review state", () => {
+    const runs = [
+      run("review", { id: "r-review", status: "needs_approval", started_at: "2026-06-07T14:00:00Z" }),
+      run("local_review", { id: "r-lr", status: "completed", started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
+      run("implement", { id: "r-impl", status: "completed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
+    ];
+    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    expect(markup).toContain("final log — Implement, completed");
+    expect(markup).not.toContain("no per-run log");
   });
 
   it("lists every run in the picker with stage, status and duration", () => {
