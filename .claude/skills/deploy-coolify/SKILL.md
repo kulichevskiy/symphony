@@ -18,7 +18,7 @@ receiving it (call the API, don't trust):
 | Input | Notes |
 |---|---|
 | VPS with Coolify | panel usually at `http://<ip>:8000` (302 = alive) |
-| `COOLIFY_API_KEY` | panel → Keys & Tokens → API tokens; verify `GET /api/v1/version` |
+| `COOLIFY_API_KEY` | panel → Keys & Tokens → API tokens with **read+write+deploy**; verify `GET /api/v1/version` AND a write-scope call (e.g. `GET /security/keys`) — 403 later means a permission is missing, not a bad token |
 | ssh access | `ssh <user>@<host>`; check passwordless `sudo -n true` |
 | Domain + DNS control | e.g. Gcore zone; A-record `<sub>` → VPS IP overrides a wildcard |
 | Auth0 tenant | SPA app client_id; operator edits Application URIs |
@@ -31,23 +31,29 @@ outside. Either tunnel (`ssh -L 8000:localhost:8000 <host>`, then call
 ("administratively prohibited"), run curl ON the host over ssh:
 
 ```bash
-# pipe the token over stdin: a single-quoted $TOK would expand (empty) on
-# the REMOTE shell, and a locally-expanded one would show up in remote ps
-printf '%s' "$COOLIFY_API_KEY" | ssh <host> \
-  'read -r TOK; curl -s -H "Authorization: Bearer $TOK" \
-     http://127.0.0.1:8000/api/v1/<path>'
+# pipe the token over stdin ALL the way into curl: a single-quoted $TOK
+# would expand (empty) on the REMOTE shell, and putting it in curl argv
+# would expose it in remote ps — `curl -H @-` reads the header from stdin
+printf 'Authorization: Bearer %s' "$COOLIFY_API_KEY" | ssh <host> \
+  'curl -s -H @- http://127.0.0.1:8000/api/v1/<path>'
 ```
 
 ## Phase 1 — Coolify resource
 
-1. **Repo access — deploy key.** Generate `ssh-keygen -t ed25519` in the
-   scratchpad; add the public half to GitHub
+1. **Repo access — deploy key.** Generate non-interactively into the
+   scratchpad — without `-f`/`-N` ssh-keygen prompts and defaults to the
+   operator's personal `~/.ssh/id_ed25519`:
+   `ssh-keygen -t ed25519 -N "" -C coolify-symphony -f <scratchpad>/coolify_deploy_key`;
+   add the public half to GitHub
    (`gh api repos/<owner>/<repo>/keys -f title=coolify-symphony -f key="$(cat <pub-file>)" -F read_only=true` — note `-f key=@path` would send the literal string, not the file);
    register the private half: `POST /security/keys {name, private_key}` → keep `uuid`.
 2. **Project.** `GET /projects`; create if absent.
 3. **Application.** `POST /applications/private-deploy-key` with
    `project_uuid`, `server_uuid` (from `GET /servers`),
-   `environment_name: production`, `private_key_uuid`,
+   `environment_name: production` (worked on Coolify 4.1.2; if the
+   instance enforces the OpenAPI schema and 422s asking for
+   `environment_uuid`, fetch it from `GET /projects/{uuid}` →
+   `environments[]`), `private_key_uuid`,
    `git_repository: git@github.com:<owner>/<repo>.git`, `git_branch: main`,
    `build_pack: dockercompose`,
    `docker_compose_location: "/docker-compose.coolify.yml"`
@@ -152,7 +158,10 @@ three logins are one-time; volumes survive redeploys.
   later warning about missing `~/.claude.json` is cosmetic (that file is
   outside the volume and regenerates). Verify with a live call:
   `--entrypoint claude <image> -p "Reply with exactly one word: ok"`.
-- **gh** — device flow: `… --entrypoint gh <image> auth login --git-protocol https --web`.
+- **gh** — device flow (the volume flag is required — a one-off
+  `docker run` mounts nothing automatically, creds would die with the
+  container):
+  `ssh -t <host> 'sudo docker run --rm -it -v <gh-vol>:/home/symphony/.config/gh --entrypoint gh <image> auth login --git-protocol https --web'`
 - **codex** — layered fallbacks, in order:
   1. `codex login --device-auth` — unless the OpenAI org admin disabled
      device codes (rejected one-time code).
