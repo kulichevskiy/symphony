@@ -72,10 +72,10 @@ function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
             return;
           }
           if (!live) {
-            // One-shot drain of a finished run returned without an `end`
-            // frame (rare) — treat the single pass as complete rather than
-            // reconnecting.
-            if (!cancelled) setStatus("ended");
+            // Drain returned without an `end` frame — a dropped connection
+            // or proxy/server restart cut it short. Surface as retryable
+            // rather than claiming the final log is complete.
+            if (!cancelled) setStatus("error");
             return;
           }
         } catch {

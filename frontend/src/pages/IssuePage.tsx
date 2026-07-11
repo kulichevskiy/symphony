@@ -823,6 +823,21 @@ type Run = IssueDetail["runs"][number];
 // plus the legacy "halted").
 const FAILED_RUN_STATUSES = new Set(["failed", "interrupted", "needs_approval", "halted"]);
 
+/** Whether `r` has an actual `<run_id>.log` for LiveFeed to drain, beyond what
+ *  `NON_STREAMING_STAGES` alone captures:
+ *  - `verify` only writes a log when its fix turn ran (`run_verify_session`
+ *    writes `fix_log_path` solely on that branch); a clean first-try pass
+ *    spends no tokens on that run, so tokens stand in for "fix attempted".
+ *  - `merge` is usually a real agent run, but `_mark_merge_needs_approval`
+ *    also inserts synthetic `stage="merge"` rows purely to park the issue in
+ *    Needs Approval, created with `pid=None` and no `_run_stage_command` —
+ *    those never get a log, so `pid === null` marks the synthetic case. */
+function hasTailableLog(r: Run): boolean {
+  if (r.stage === "merge") return r.pid !== null;
+  if (r.stage === "verify") return r.input_tokens > 0 || r.output_tokens > 0;
+  return !NON_STREAMING_STAGES.has(r.stage);
+}
+
 function runsByStartDesc(runs: Run[]): Run[] {
   return [...runs].sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
 }
@@ -830,16 +845,15 @@ function runsByStartDesc(runs: Run[]): Run[] {
 /** The run whose final log opens by default: the most-recent failed/interrupted
  *  run that actually has a tailable log (what the operator usually needs after
  *  a park), falling back to the most-recent tailable run, then to the most
- *  recent run overall — a failed `review` run (NON_STREAMING_STAGES, no log)
- *  must not shadow a streamable `implement` run. Null when the issue has no
- *  runs. */
+ *  recent run overall — a failed `review` run or a synthetic merge-approval
+ *  park row (`hasTailableLog` false, no log) must not shadow a streamable
+ *  `implement` run. Null when the issue has no runs. */
 export function pickDefaultRun(runs: Run[]): Run | null {
   if (!runs.length) return null;
   const sorted = runsByStartDesc(runs);
-  const streamable = (r: Run) => !NON_STREAMING_STAGES.has(r.stage);
   return (
-    sorted.find((r) => FAILED_RUN_STATUSES.has(r.status) && streamable(r)) ??
-    sorted.find(streamable) ??
+    sorted.find((r) => FAILED_RUN_STATUSES.has(r.status) && hasTailableLog(r)) ??
+    sorted.find(hasTailableLog) ??
     sorted[0]
   );
 }
@@ -907,10 +921,18 @@ function RunPicker({
   );
 }
 
+function NoTailableLog({ stageLabel, reason }: { stageLabel: string; reason: string }) {
+  return (
+    <div className="rounded-md border border-border bg-secondary/20 px-3 py-6 text-center text-sm text-muted-foreground">
+      <span className="capitalize">{stageLabel}</span> {reason}
+    </div>
+  );
+}
+
 /** Final-log viewer for a non-running issue: a run picker (stage, status,
  *  started, duration) over all the issue's runs, defaulting to the most-recent
  *  failed run, with the selected run's log drained once through the LiveFeed in
- *  non-live mode. NON_STREAMING_STAGES runs (which write no per-run log) get an
+ *  non-live mode. Runs with no actual log (`!hasTailableLog`) get an
  *  explanatory empty state instead of a stuck spinner. */
 export function FinalLogCard({ runs }: { runs: Run[] }) {
   const sorted = runsByStartDesc(runs);
@@ -919,7 +941,6 @@ export function FinalLogCard({ runs }: { runs: Run[] }) {
 
   const fallback = pickDefaultRun(sorted)!;
   const selected = sorted.find((r) => r.id === selectedId) ?? fallback;
-  const nonStreaming = NON_STREAMING_STAGES.has(selected.stage);
   const stageLabel = STAGE_LABEL[selected.stage] ?? selected.stage;
 
   return (
@@ -932,11 +953,11 @@ export function FinalLogCard({ runs }: { runs: Run[] }) {
       {sorted.length > 1 ? (
         <RunPicker runs={sorted} selectedId={selected.id} onSelect={setSelectedId} />
       ) : null}
-      {nonStreaming ? (
-        <div className="rounded-md border border-border bg-secondary/20 px-3 py-6 text-center text-sm text-muted-foreground">
-          <span className="capitalize">{stageLabel}</span> writes no per-run log to
-          tail, so there's nothing to show here.
-        </div>
+      {!hasTailableLog(selected) ? (
+        <NoTailableLog
+          stageLabel={stageLabel}
+          reason="writes no per-run log to tail, so there's nothing to show here."
+        />
       ) : (
         <LiveFeed
           key={selected.id}
@@ -998,8 +1019,9 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
+  const activeRun = detail?.runs.find((r) => r.status === "running") ?? null;
   const liveRun =
-    detail?.runs.find((r) => r.status === "running" && !NON_STREAMING_STAGES.has(r.stage)) ?? null;
+    activeRun && !NON_STREAMING_STAGES.has(activeRun.stage) ? activeRun : null;
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
@@ -1062,6 +1084,20 @@ export function IssuePage() {
             {liveRun ? (
               <CockpitCard title="Live output">
                 <LiveFeed runId={liveRun.id} active />
+              </CockpitCard>
+            ) : activeRun ? (
+              <CockpitCard
+                title="Live output"
+                aside={
+                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400">
+                    <LiveDot tone="bg-blue-500" /> running
+                  </span>
+                }
+              >
+                <NoTailableLog
+                  stageLabel={STAGE_LABEL[activeRun.stage] ?? activeRun.stage}
+                  reason="is running now, but this stage doesn't write a per-run log to tail."
+                />
               </CockpitCard>
             ) : (
               <FinalLogCard runs={detail.runs} />

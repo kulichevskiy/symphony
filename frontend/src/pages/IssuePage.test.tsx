@@ -277,9 +277,22 @@ describe("pickDefaultRun", () => {
   it("falls back to the most-recent run when none failed", () => {
     const runs = [
       run("implement", { id: "r-old", status: "done", started_at: "2026-06-07T09:00:00Z" }),
-      run("merge", { id: "r-new", status: "done", started_at: "2026-06-07T13:00:00Z" }),
+      // pid set: a real merge-agent run (not a synthetic park row), so it
+      // has a log.
+      run("merge", { id: "r-new", status: "done", pid: 4321, started_at: "2026-06-07T13:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-new");
+  });
+
+  it("skips a synthetic merge-approval park row (pid=null) for the older tailable run", () => {
+    // Mirrors _mark_merge_needs_approval(create_run=True): a stage="merge",
+    // pid=None row inserted purely to park the issue — it never runs
+    // _run_stage_command, so it has no per-run log to tail.
+    const runs = [
+      run("merge", { id: "r-park", status: "needs_approval", pid: null, started_at: "2026-06-07T14:00:00Z" }),
+      run("implement", { id: "r-impl", status: "completed", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-impl");
   });
 
   it("returns null for no runs", () => {
@@ -350,6 +363,36 @@ describe("FinalLogCard", () => {
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
     expect(markup).toContain("no per-run log");
     expect(markup).not.toContain("Waiting for output…");
+  });
+
+  it("drains the log for a failed verify run that attempted a fix (spent tokens)", () => {
+    // run_verify_session only writes fix_log_path once the fix turn runs, so
+    // a verify run with fix-turn tokens has an actual <run_id>.log to tail.
+    const runs = [
+      run("verify", {
+        id: "r-verify",
+        status: "failed",
+        output_tokens: 120,
+        started_at: "2026-06-07T12:00:00Z",
+        ended_at: "2026-06-07T12:05:00Z",
+      }),
+    ];
+    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    expect(markup).toContain("final log — verify, failed");
+    expect(markup).not.toContain("no per-run log");
+  });
+
+  it("shows the empty state for a verify run that never attempted a fix (no tokens)", () => {
+    const runs = [
+      run("verify", {
+        id: "r-verify",
+        status: "failed",
+        started_at: "2026-06-07T12:00:00Z",
+        ended_at: "2026-06-07T12:05:00Z",
+      }),
+    ];
+    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    expect(markup).toContain("no per-run log");
   });
 
   it("renders nothing when the issue has no runs", () => {
