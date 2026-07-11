@@ -335,6 +335,23 @@ describe("pickDefaultRun", () => {
     const runs = [run("implement", { id: "r-only", status: "superseded" })];
     expect(pickDefaultRun(runs)?.id).toBe("r-only");
   });
+
+  it("skips an interrupted merge displaced by interrupt_running_merge (termination_kind=superseded)", () => {
+    // interrupt_running_merge (and the orphaned-approval cleanup) stamp the
+    // displaced row status="interrupted"/termination_kind="superseded" rather
+    // than status="superseded" — it must not win over a real failed run just
+    // because FAILED_RUN_STATUSES includes "interrupted".
+    const runs = [
+      run("merge", {
+        id: "r-displaced",
+        status: "interrupted",
+        termination_kind: "superseded",
+        started_at: "2026-06-07T13:00:00Z",
+      }),
+      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-fail");
+  });
 });
 
 describe("pickLiveRun", () => {

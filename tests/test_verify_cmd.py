@@ -359,6 +359,31 @@ async def test_verify_session_fix_run_spawn_failure_fails_closed() -> None:
     assert "red output" in result.tail
 
 
+@pytest.mark.asyncio
+async def test_verify_session_fix_run_spawn_failure_writes_parseable_log(tmp_path: Path) -> None:
+    """A fix turn that dies before producing any stdout (missing agent
+    binary, or a CLI/auth error emitted only on stderr) must still leave a
+    stream-parseable note in `fix_log_path` — an empty file yields no
+    events and the LiveFeed is stuck on "Waiting for output…" forever."""
+
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
+        return False, "red output"
+
+    runner = _StagedRunner({"verify_fix": [[RunnerEvent(kind="spawn_failed", error="no claude")]]})
+    fix_log_path = tmp_path / "verify.log"
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner), fix_log_path=fix_log_path
+    )
+    assert not result.ok
+    text = fix_log_path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    events = parse_stream_events(text.strip())
+    assert len(events) == 1
+    assert events[0]["kind"] == "message"
+    assert "no output" in events[0]["text"]
+    assert "no claude" in events[0]["text"]
+
+
 # --- orchestrator e2e ------------------------------------------------------
 
 

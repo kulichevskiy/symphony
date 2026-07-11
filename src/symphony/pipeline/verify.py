@@ -193,7 +193,6 @@ async def run_verify_session(
         stage="verify_fix",
     )
     collected = await collect_runner_output(runner, spec, usage_handler=usage_handler)
-    _write_fix_log(fix_log_path, collected.stdout)
     if not collected.ok_exit:
         detail = (
             f"spawn_failed: {collected.spawn_error or 'unknown'}"
@@ -202,12 +201,21 @@ async def run_verify_session(
             if collected.stall_timeout
             else f"fix-run exited rc={collected.returncode}"
         )
+        # The fix turn can die before emitting any stdout (missing agent
+        # binary, CLI/auth errors that land only on stderr) — fall back to a
+        # parseable note so the stream endpoint has an event to render
+        # instead of an empty log the UI waits on forever.
+        _write_fix_log(
+            fix_log_path,
+            collected.stdout or _fix_log_note(f"verify-fix turn produced no output ({detail})."),
+        )
         return VerifyResult(
             ok=False,
             fix_attempted=True,
             tail=tail,
             error=f"verify_cmd failed and the fix turn did not finish ({detail})",
         )
+    _write_fix_log(fix_log_path, collected.stdout)
 
     ok, output = await command_runner(workspace_path, verify_cmd, timeout_secs)
     if ok:

@@ -828,6 +828,15 @@ const FAILED_RUN_STATUSES = new Set(["failed", "interrupted", "needs_approval", 
 // surviving run's log.
 const SUPERSEDED_STATUS = "superseded";
 
+// `interrupt_running_merge` (and the orphaned-merge-approval cleanup) don't
+// use SUPERSEDED_STATUS — they stamp the displaced row `status="interrupted"`
+// with `termination_kind="superseded"` instead, since "interrupted" is what
+// drives merge/needs_approval re-dispatch. Same bookkeeping-only intent: a
+// collapsed duplicate, not something the operator wants surfaced by default.
+function isSupersededRun(r: Run): boolean {
+  return r.status === SUPERSEDED_STATUS || r.termination_kind === "superseded";
+}
+
 /** Whether `r` has an actual `<run_id>.log` for LiveFeed to drain, beyond what
  *  `NON_STREAMING_STAGES` alone captures:
  *  - `verify` always writes `fix_log_path` (`run_verify_session` writes a
@@ -859,7 +868,7 @@ function runsByStartDesc(runs: Run[]): Run[] {
 export function pickDefaultRun(runs: Run[]): Run | null {
   if (!runs.length) return null;
   const sorted = runsByStartDesc(runs);
-  const eligible = sorted.filter((r) => r.status !== SUPERSEDED_STATUS);
+  const eligible = sorted.filter((r) => !isSupersededRun(r));
   return (
     eligible.find((r) => FAILED_RUN_STATUSES.has(r.status) && hasTailableLog(r)) ??
     eligible.find(hasTailableLog) ??
