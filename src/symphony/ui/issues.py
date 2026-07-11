@@ -324,9 +324,7 @@ def create_issue_detail_router(
         # viewer needs to decide drain-vs-empty-state. Old runs (pre-tee) and
         # synthetic rows with no subprocess simply have no file.
         for run in runs:
-            run["has_log"] = (
-                log_root is not None and (log_root / f"{run['id']}.log").exists()
-            )
+            run["has_log"] = log_root is not None and (log_root / f"{run['id']}.log").exists()
         issue_prs = await _fetch_all(
             conn,
             """

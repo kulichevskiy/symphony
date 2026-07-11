@@ -152,9 +152,7 @@ async def test_tees_stdout_and_stderr_to_log_path(tmp_path: Path) -> None:
     assert out.stdout == "line one\nline two"
     assert out.stderr == "warning: x"
     # The tee'd file interleaves them in arrival order, stderr prefixed.
-    assert log_path.read_text(encoding="utf-8") == (
-        "line one\n[stderr] warning: x\nline two\n"
-    )
+    assert log_path.read_text(encoding="utf-8") == ("line one\n[stderr] warning: x\nline two\n")
 
 
 @pytest.mark.asyncio
