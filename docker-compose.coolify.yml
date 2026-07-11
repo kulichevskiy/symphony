@@ -7,16 +7,17 @@
 #     127.0.0.1:443, which would EADDRINUSE against Traefik's 0.0.0.0:443.)
 #   * Caddy uses Caddyfile.coolify (`:80`, `auto_https off`) instead of the
 #     local `localhost { tls internal }` site.
-#   * `.env` and `config.local.yaml` are declared as long-form bind mounts
-#     with `content:` — Coolify's file-mount extension (it creates the files
-#     and exposes the content for editing in the service's Storages UI).
-#     Paste the real contents there before the first deploy. Because
-#     `content:` is a Coolify extension, this file does NOT pass a plain
-#     `docker compose config` — it is only deployable through Coolify.
-#     Do NOT move secrets into Coolify's env-vars UI: env vars land in the
+#   * `.env` and `config.local.yaml` mount from /opt/symphony/ — absolute
+#     host paths the operator provisions ONCE (see the volumes comment in
+#     the symphony service). They are deliberately NOT Coolify-managed file
+#     mounts: Coolify resets managed mounts to their compose placeholders on
+#     every re-parse, which clobbers operator-supplied content. Do NOT move
+#     secrets into Coolify's env-vars UI either: env vars land in the
 #     container's os.environ and leak into agent subprocesses past the
-#     per-binding `env:` allowlist; the mounted-file path keeps secrets out
-#     of the process env.
+#     per-binding `env:` allowlist; host files keep secrets out of the
+#     process env. (The Caddyfile still uses Coolify's `content:` extension,
+#     so this file passes only Coolify's pre-processor, not a plain
+#     `docker compose config`.)
 #   * SYMPHONY_REQUIRE_AUTH0=1 makes the daemon fail closed at boot if the
 #     AUTH0_* triple is missing from .env — this variant is publicly routed,
 #     and without the gate /api/* (including the mutating
@@ -58,27 +59,23 @@ services:
       # publicly routed (see header). Non-secret flag; safe in os.environ.
       SYMPHONY_REQUIRE_AUTH0: "1"
     volumes:
-      # Operator config + secrets. Long-form bind mounts with `content:` —
-      # Coolify's file-mount syntax (docs: knowledge-base/docker/compose#storage):
-      # it creates each file with this placeholder content and exposes it for
-      # editing in the service's Storages UI. Short-form `./file:/path` would
-      # NOT create editable file content on a from-git deploy (both files are
-      # gitignored) — Docker would mount empty dirs and the daemon dies on
-      # `--config`. Paste the real contents in the UI before the first deploy.
-      - type: bind
-        source: ./config.local.yaml
-        target: /app/config.local.yaml
-        read_only: true
-        content: |
-          # REPLACE via Coolify Storages UI with your real config.local.yaml
-          # (shape: examples/config.docker.yaml — /data paths are set there).
-      - type: bind
-        source: ./.env
-        target: /app/.env
-        read_only: true
-        content: |
-          # REPLACE via Coolify Storages UI with your real .env (secrets:
-          # LINEAR_API_KEY, LINEAR_WEBHOOK_SECRET, AUTH0_*, TELEGRAM_*).
+      # Operator config + secrets: ABSOLUTE host paths, deliberately outside
+      # Coolify's managed application dir. Coolify re-parses the compose on
+      # every deploy/restart and resets its managed file mounts (relative or
+      # `content:` ones) back to the compose placeholders — verified live:
+      # a real .env uploaded into the storage record was clobbered to the
+      # placeholder on the next restart. Secrets can't live as compose
+      # `content:` (they'd be committed), so these two files are provisioned
+      # once by the operator on the host and Coolify never touches them:
+      #   sudo install -d -m 755 /opt/symphony
+      #   sudo install -m 444 -o 1000 -g 1000 <config> /opt/symphony/config.local.yaml
+      #   sudo install -m 400 -o 1000 -g 1000 <env>    /opt/symphony/.env
+      # (uid 1000 = the container's `symphony` user; the daemon reads both.)
+      # The Caddyfile below CAN stay `content:`-managed because its real
+      # content is static and lives in this file — the placeholder IS the
+      # config, so Coolify's reset is a no-op for it.
+      - /opt/symphony/config.local.yaml:/app/config.local.yaml:ro
+      - /opt/symphony/.env:/app/.env:ro
       # CLI auth dirs — persisted, so a one-time login survives redeploys.
       - claude_auth:/home/symphony/.claude
       - codex_auth:/home/symphony/.codex
