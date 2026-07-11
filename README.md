@@ -297,6 +297,11 @@ callback/logout/origin URLs at the new domain.
 **Linear is the main screen.** State changes and comments (start, activity,
 review feedback, cost warnings, merge) tell the whole story.
 
+The web dashboard is the second screen. Served at `/ui/` behind the Auth0
+gate, it shows the active issues, streams live agent output, exposes per-issue
+command buttons, and offers a global pause. See
+[Optional: web dashboard](#optional-web-dashboard) below to build it.
+
 Local inspection of the daemon's own state:
 
 ```bash
