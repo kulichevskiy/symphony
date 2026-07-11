@@ -351,31 +351,53 @@ describe("pickDefaultRun", () => {
 });
 
 describe("pickLiveRun", () => {
-  it("prefers a tailable running run over a newer non-streaming running child", () => {
-    // _run_prepush_gates starts a running verify/local_review child before
-    // the parent implement row is marked completed — the newer child must
-    // not shadow the still-running, tailable implement run.
+  it("streams a running run that has a log (any stage) → live feed", () => {
+    // Every subprocess stage now tees its log; gating is purely has_log.
     const runs = [
-      run("verify", { id: "r-verify", status: "running", started_at: "2026-06-07T13:00:00Z" }),
-      run("implement", { id: "r-impl", status: "running", started_at: "2026-06-07T12:00:00Z" }),
+      run("acceptance", { id: "r-acc", status: "running", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
     ];
     const { live, active } = pickLiveRun(runs);
-    expect(live?.id).toBe("r-impl");
-    expect(active?.id).toBe("r-impl");
+    expect(live?.id).toBe("r-acc");
+    expect(active?.id).toBe("r-acc");
   });
 
-  it("falls back to the newest running row when none are tailable", () => {
+  it("prefers the running run that has a log over a newer running run without one", () => {
+    // _run_prepush_gates starts a running child before the parent's log is
+    // written; the log-less child must not shadow the tailable run.
     const runs = [
-      run("review", { id: "r-review", status: "running", started_at: "2026-06-07T13:00:00Z" }),
-      run("acceptance", { id: "r-acc", status: "running", started_at: "2026-06-07T12:00:00Z" }),
+      run("verify", { id: "r-verify", status: "running", has_log: false, started_at: "2026-06-07T13:00:00Z" }),
+      run("local_review", { id: "r-lr", status: "running", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    const { live, active } = pickLiveRun(runs);
+    expect(live?.id).toBe("r-lr");
+    expect(active?.id).toBe("r-lr");
+  });
+
+  it("shows the placeholder for a running run with no log yet (review / pre-tee)", () => {
+    // A running `review` (remote codex bot, no local subprocess) never gets a
+    // log; the newest running row still labels the in-progress placeholder.
+    const runs = [
+      run("review", { id: "r-review", status: "running", has_log: false, started_at: "2026-06-07T13:00:00Z" }),
+      run("acceptance", { id: "r-acc", status: "running", has_log: false, started_at: "2026-06-07T12:00:00Z" }),
     ];
     const { live, active } = pickLiveRun(runs);
     expect(live).toBeNull();
     expect(active?.id).toBe("r-review");
   });
 
+  it("upgrades placeholder → feed once has_log flips true on a detail refresh", () => {
+    // The gate re-checks each render as issue detail polls: a running run with
+    // no log yet is placeholder-only, then streams once its log appears.
+    const before = [run("local_review", { id: "r-lr", status: "running", has_log: false })];
+    expect(pickLiveRun(before).live).toBeNull();
+    expect(pickLiveRun(before).active?.id).toBe("r-lr");
+
+    const after = [run("local_review", { id: "r-lr", status: "running", has_log: true })];
+    expect(pickLiveRun(after).live?.id).toBe("r-lr");
+  });
+
   it("returns both null when nothing is running", () => {
-    const runs = [run("implement", { id: "r-done", status: "completed" })];
+    const runs = [run("implement", { id: "r-done", status: "completed", has_log: true })];
     const { live, active } = pickLiveRun(runs);
     expect(live).toBeNull();
     expect(active).toBeNull();

@@ -802,20 +802,6 @@ function useNowMs(): number {
   return nowMs;
 }
 
-// Stages the LiveFeed does not stream *while running*. These subprocess
-// stages now tee `log_root/{run_id}.log` in real time (SYM-177), but wiring
-// them into the live pane is a follow-up — so the running placeholder still
-// treats them as non-streaming. `review` is a passive monitor (pid=None)
-// waiting on the remote `@codex review` bot, with no local subprocess at all.
-// The final-log viewer, by contrast, keys purely off `has_log`.
-const NON_STREAMING_STAGES = new Set([
-  "local_review",
-  "local_review_fix",
-  "acceptance",
-  "verify",
-  "review",
-]);
-
 type Run = IssueDetail["runs"][number];
 
 // Terminal statuses that mean the run failed or was cut short — the ones an
@@ -862,16 +848,21 @@ export function pickDefaultRun(runs: Run[]): Run | null {
 }
 
 /** The running run to stream live, and the running run to attribute the
- *  "still running" placeholder to when nothing streams. `_run_prepush_gates`
- *  starts newer running `local_review`/`verify` child rows before the parent
- *  `implement` row is marked completed, so the newest running row by start
- *  time isn't necessarily the tailable one — prefer whichever running run
- *  actually has a per-run log, falling back to the newest running row so the
- *  non-streaming placeholder still has a stage/status to label. Both null
- *  when nothing is running. */
+ *  "still running" placeholder to when nothing streams. Every subprocess stage
+ *  tees `{log_root}/{run_id}.log` in real time (SYM-177) and the API reports
+ *  `has_log` per run, so the live feed is gated purely by reality: the running
+ *  run that actually has a per-run log. This gate re-checks each render as issue
+ *  detail polls, so the placeholder upgrades to the feed once `has_log` flips
+ *  true (the log file appears late — the stream endpoint tails it once it does).
+ *  `_run_prepush_gates` starts newer running child rows before the parent's log
+ *  exists, so the newest running row by start time isn't necessarily the
+ *  tailable one — hence the has_log preference, falling back to the newest
+ *  running row so the placeholder (a running `review` on the remote codex bot, a
+ *  synthetic merge row, or the first moments before the log file is created)
+ *  still has a stage/status to label. Both null when nothing is running. */
 export function pickLiveRun(runs: Run[]): { live: Run | null; active: Run | null } {
   const runningRuns = runsByStartDesc(runs).filter((r) => r.status === "running");
-  const live = runningRuns.find((r) => !NON_STREAMING_STAGES.has(r.stage)) ?? null;
+  const live = runningRuns.find((r) => r.has_log) ?? null;
   return { live, active: live ?? runningRuns[0] ?? null };
 }
 
@@ -1111,7 +1102,7 @@ export function IssuePage() {
               >
                 <NoTailableLog
                   stageLabel={STAGE_LABEL[activeRun.stage] ?? activeRun.stage}
-                  reason="is running now, but this stage doesn't write a per-run log to tail."
+                  reason="is running now — no per-run log to tail yet. The live feed appears here as soon as one does."
                 />
               </CockpitCard>
             ) : (
