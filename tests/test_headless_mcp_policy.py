@@ -79,6 +79,29 @@ def test_implement_and_fix_prompts_contain_headless_rule() -> None:
 # --- 2. Strict MCP allowlist on claude spawns -------------------------------
 
 
+def test_claude_runner_command_preapproves_mcp_server_tools() -> None:
+    """A binding-granted MCP server must come with an mcp__<name>__* allow
+    rule: --strict-mcp-config only makes the server visible, and without the
+    rule its tool calls still prompt/deny in the fresh-auth headless env."""
+    servers = {"supabase": {"type": "http", "url": "https://mcp.example"}}
+    argv = build_runner_command("claude", "do it", mcp_servers=servers)
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert "mcp__supabase__*" in allowed.split(",")
+
+
+def test_local_review_fix_command_preapproves_builder_tools() -> None:
+    """The in-session fix mirror must carry the same explicit allowlist as
+    build_runner_command — a review/verify fix turn on a fresh auth volume
+    would otherwise auto-deny every mutation."""
+    from symphony.pipeline.local_review_session import _build_fix_command
+
+    argv = _build_fix_command(agent="claude", codex_model="gpt-5.5", prompt="fix it")
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert "Bash" in allowed.split(",")
+    assert "Edit" in allowed.split(",")
+    assert argv[-2:] == ["--", "fix it"]
+
+
 def test_claude_runner_command_preapproves_builder_tools() -> None:
     """Mutating claude runs must not depend on the operator's ambient
     ~/.claude permission rules: in the containerized deployment the auth

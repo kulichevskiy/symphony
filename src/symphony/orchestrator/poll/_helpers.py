@@ -19,6 +19,7 @@ from typing import Any, TypedDict
 import aiosqlite
 
 from ... import db
+from ...agent.claude_cli import claude_builder_allowed_tools
 from ...agent.codex_cli import build_codex_workspace_write_command
 from ...agent.codex_models import DEFAULT_CODEX_MODEL
 from ...pipeline.cost_guard import UsageDelta
@@ -83,24 +84,6 @@ def build_pr_body(issue: LinearIssue) -> str:
     return f"Relates to {issue.url}"
 
 
-# Pre-approved tool surface for mutating claude runs (implement / fix /
-# merge / acceptance-fix — every claude spawn that must change the workspace).
-# The read-only reviewer keeps its own narrow allowlist in
-# pipeline/local_review.py; this one is deliberately broad because builder
-# runs execute arbitrary repo test/build commands and git.
-_CLAUDE_BUILDER_ALLOWED_TOOLS = ",".join(
-    (
-        "Bash",
-        "Edit",
-        "Write",
-        "MultiEdit",
-        "NotebookEdit",
-        "WebFetch",
-        "WebSearch",
-    )
-)
-
-
 def build_runner_command(
     agent: str,
     prompt: str,
@@ -133,17 +116,12 @@ def build_runner_command(
             "stream-json",
             "--verbose",
             "--strict-mcp-config",
-            # Pre-approve the full builder surface explicitly. Without this
-            # the spawn depends on whatever permission rules happen to live
-            # in the operator's ~/.claude — absent in the containerized
-            # deployment, where a fresh auth volume means every
-            # Edit/Write/Bash is auto-denied and the run parks blocked. Bare
-            # "Bash" approves all commands: implement/fix/merge runs must run
-            # repo-specific test/build commands plus git commit/push.
-            # (Comma-joined single arg + `--` before the prompt — the SYM-42
-            # idiom; a variadic --allowedTools would swallow the prompt.)
+            # Pre-approve the full builder surface, plus mcp__<name>__* for
+            # each MCP server the binding grants — see agent/claude_cli.py
+            # for why a fresh containerized auth volume otherwise auto-denies
+            # every mutation. Prompt rides behind `--` (SYM-42 idiom).
             "--allowedTools",
-            _CLAUDE_BUILDER_ALLOWED_TOOLS,
+            claude_builder_allowed_tools(mcp_servers),
         ]
         if mcp_servers:
             command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])

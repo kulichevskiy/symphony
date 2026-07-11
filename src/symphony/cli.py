@@ -246,6 +246,30 @@ def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
         asyncio.run(_run(config_path, once=once))
 
 
+def _ensure_codex_profile(cfg: Config) -> None:
+    """Ensure the codex `symphony-git` permissions profile exists at daemon
+    boot when any binding can spawn the codex CLI.
+
+    Preflight has always provisioned this, but the containerized deployment
+    boots the daemon directly — on a fresh codex auth volume there is no
+    config.toml at all, so every `codex exec --config
+    default_permissions="symphony-git"` would die referencing a profile that
+    doesn't exist. Fail closed with the writer's message when the profile
+    can't be ensured.
+    """
+    if not _config_can_run_codex_cli(cfg):
+        return
+    try:
+        codex_config, created_profile = ensure_symphony_permissions_profile()
+    except CodexPermissionsProfileError as e:
+        click.echo(str(e), err=True)
+        sys.exit(1)
+    if created_profile:
+        click.echo(
+            f"codex permissions profile {SYMPHONY_PERMISSIONS_PROFILE!r} added to {codex_config}"
+        )
+
+
 def _enforce_require_auth0(cfg: Config) -> None:
     """Fail closed BEFORE any state mutation when a publicly-routed deploy
     (SYMPHONY_REQUIRE_AUTH0=1, set by docker-compose.coolify.yml) lacks Auth0
@@ -274,6 +298,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
         click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
         sys.exit(2)
     _enforce_require_auth0(cfg)
+    _ensure_codex_profile(cfg)
     async with _configured_tracker_registry(cfg) as (trackers, external_linear):
         conn = await db.connect(cfg.db_path)
         try:

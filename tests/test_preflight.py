@@ -819,3 +819,37 @@ def test_preflight_requires_code_review_when_remote_review_enabled(
 
     assert result.exit_code != 0
     assert "code_review state ''" in result.output
+
+
+def test_daemon_boot_ensures_codex_profile(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The daemon must provision the codex permissions profile itself: the
+    containerized deployment boots the daemon directly (no preflight), and on
+    a fresh codex auth volume there is no config.toml — every codex exec
+    would die referencing the missing `symphony-git` profile."""
+    import tomllib
+
+    from symphony.cli import _ensure_codex_profile
+    from symphony.config import Config
+
+    codex_home = _isolate_codex_home(tmp_path, monkeypatch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("high", agent="codex", model="gpt-5.1-codex"))
+    cfg = Config.load(p)
+    _ensure_codex_profile(cfg)
+    parsed = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert parsed["default_permissions"] == "symphony-git"
+    assert "symphony-git" in parsed["permissions"]
+
+
+def test_daemon_boot_skips_codex_profile_without_codex_bindings(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    from symphony.cli import _ensure_codex_profile
+    from symphony.config import Config
+
+    codex_home = _isolate_codex_home(tmp_path, monkeypatch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(_yaml_with_role_effort("high", agent="claude", model="sonnet"))
+    cfg = Config.load(p)
+    _ensure_codex_profile(cfg)
+    assert not (codex_home / "config.toml").exists()
