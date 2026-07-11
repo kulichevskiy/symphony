@@ -14,7 +14,7 @@ import {
 } from "./IssuePage";
 import { applicability, COMMANDS } from "./issueControls";
 
-function run(stage: string, tok: Partial<Record<string, number | string | null>>) {
+function run(stage: string, tok: Partial<Record<string, number | string | boolean | null>>) {
   return {
     id: stage + Math.random(),
     stage,
@@ -29,6 +29,7 @@ function run(stage: string, tok: Partial<Record<string, number | string | null>>
     termination_kind: "",
     termination_detail: "",
     exit_returncode: null,
+    has_log: false,
     ...tok,
   };
 }
@@ -266,32 +267,30 @@ describe("StageSpendCard", () => {
 });
 
 describe("pickDefaultRun", () => {
-  it("surfaces the most-recent failed/interrupted run, even under a newer success", () => {
+  it("surfaces the most-recent failed/interrupted run with a log, even under a newer success", () => {
     const runs = [
-      run("merge", { id: "r-merge", status: "done", started_at: "2026-06-07T13:00:00Z" }),
-      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z" }),
-      run("implement", { id: "r-old-fail", status: "interrupted", started_at: "2026-06-07T09:00:00Z" }),
+      run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
+      run("implement", { id: "r-old-fail", status: "interrupted", has_log: true, started_at: "2026-06-07T09:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-fail");
   });
 
-  it("falls back to the most-recent run when none failed", () => {
+  it("falls back to the most-recent run with a log when none failed", () => {
     const runs = [
-      run("implement", { id: "r-old", status: "done", started_at: "2026-06-07T09:00:00Z" }),
-      // pid set: a real merge-agent run (not a synthetic park row), so it
-      // has a log.
-      run("merge", { id: "r-new", status: "done", pid: 4321, started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-old", status: "done", has_log: true, started_at: "2026-06-07T09:00:00Z" }),
+      run("merge", { id: "r-new", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-new");
   });
 
-  it("skips a synthetic merge-approval park row (pid=null) for the older tailable run", () => {
-    // Mirrors _mark_merge_needs_approval(create_run=True): a stage="merge",
-    // pid=None row inserted purely to park the issue — it never runs
-    // _run_stage_command, so it has no per-run log to tail.
+  it("skips a run without a log for the older run that has one", () => {
+    // A synthetic merge-approval park row (no subprocess) never gets a
+    // `{run_id}.log`, so `has_log: false` — it must not shadow the run with
+    // real output.
     const runs = [
-      run("merge", { id: "r-park", status: "needs_approval", pid: null, started_at: "2026-06-07T14:00:00Z" }),
-      run("implement", { id: "r-impl", status: "completed", started_at: "2026-06-07T12:00:00Z" }),
+      run("merge", { id: "r-park", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
+      run("implement", { id: "r-impl", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-impl");
   });
@@ -300,24 +299,20 @@ describe("pickDefaultRun", () => {
     expect(pickDefaultRun([])).toBeNull();
   });
 
-  it("skips a newer NON_STREAMING needs_approval run for the older tailable implement run (park scenario)", () => {
-    // Mirrors a local-review-only park: review(needs_approval, newest),
-    // local_review(completed), implement(completed) — the review run has no
-    // per-run log, so its needs_approval status must not win the default pick.
+  it("prefers a failed run with a log over a newer failed run without one", () => {
     const runs = [
-      run("review", { id: "r-review", status: "needs_approval", started_at: "2026-06-07T14:00:00Z" }),
-      run("local_review", { id: "r-lr", status: "completed", started_at: "2026-06-07T13:00:00Z" }),
-      run("implement", { id: "r-impl", status: "completed", started_at: "2026-06-07T12:00:00Z" }),
-    ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-impl");
-  });
-
-  it("prefers a failed tailable run over a newer failed NON_STREAMING run", () => {
-    const runs = [
-      run("review", { id: "r-review", status: "failed", started_at: "2026-06-07T14:00:00Z" }),
-      run("implement", { id: "r-impl-fail", status: "failed", started_at: "2026-06-07T12:00:00Z" }),
+      run("review", { id: "r-review", status: "failed", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
+      run("implement", { id: "r-impl-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-impl-fail");
+  });
+
+  it("falls back to the newest run when nothing has a log", () => {
+    const runs = [
+      run("review", { id: "r-review", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
+      run("implement", { id: "r-impl", status: "completed", has_log: false, started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-review");
   });
 
   it("skips a superseded duplicate for the older surviving run", () => {
@@ -325,8 +320,8 @@ describe("pickDefaultRun", () => {
     // "superseded" — pure bookkeeping that must not shadow the survivor once
     // it later completes.
     const runs = [
-      run("implement", { id: "r-dup", status: "superseded", started_at: "2026-06-07T13:00:00Z" }),
-      run("implement", { id: "r-survivor", status: "completed", started_at: "2026-06-07T12:00:00Z" }),
+      run("implement", { id: "r-dup", status: "superseded", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-survivor", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-survivor");
   });
@@ -346,9 +341,10 @@ describe("pickDefaultRun", () => {
         id: "r-displaced",
         status: "interrupted",
         termination_kind: "superseded",
+        has_log: true,
         started_at: "2026-06-07T13:00:00Z",
       }),
-      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z" }),
+      run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-fail");
   });
@@ -389,28 +385,31 @@ describe("pickLiveRun", () => {
 describe("FinalLogCard", () => {
   it("opens the failed run's final log by default, clearly labelled", () => {
     const runs = [
-      run("merge", { id: "r-merge", status: "done", started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
-      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
+      run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
+      run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
     expect(markup).toContain("final log — Implement, failed");
   });
 
-  it("opens the implement run's log by default on a local-review-only park, not the empty review state", () => {
+  it("opens the newest run with a log by default, not an unlogged newer park row", () => {
+    // A local-review-only park: review(needs_approval, no log, newest),
+    // local_review(completed, now tees a log), implement(completed, has log).
+    // The unlogged review row must not win — the newest run with a log does.
     const runs = [
-      run("review", { id: "r-review", status: "needs_approval", started_at: "2026-06-07T14:00:00Z" }),
-      run("local_review", { id: "r-lr", status: "completed", started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
-      run("implement", { id: "r-impl", status: "completed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
+      run("review", { id: "r-review", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
+      run("local_review", { id: "r-lr", status: "completed", has_log: true, started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
+      run("implement", { id: "r-impl", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — Implement, completed");
+    expect(markup).toContain("final log — Local review, completed");
     expect(markup).not.toContain("no per-run log");
   });
 
   it("lists every run in the picker with stage, status and duration", () => {
     const runs = [
-      run("merge", { id: "r-merge", status: "done", started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:00:30Z" }),
-      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
+      run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:00:30Z" }),
+      run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
     expect(markup).toContain("Merge");
@@ -422,48 +421,31 @@ describe("FinalLogCard", () => {
     expect(markup).toContain("5m 0s");
   });
 
-  it("explains the empty state for a NON_STREAMING stage instead of a spinner", () => {
+  it("explains the empty state for a run without a log instead of a spinner", () => {
+    // A pre-tee run (or synthetic row): `has_log: false` → honest empty
+    // state, no stuck spinner.
     const runs = [
-      run("local_review", { id: "r-lr", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:01:00Z" }),
+      run("local_review", { id: "r-lr", status: "failed", has_log: false, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:01:00Z" }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
     expect(markup).toContain("no per-run log");
     expect(markup).not.toContain("Waiting for output…");
   });
 
-  it("drains the log for a failed verify run that attempted a fix (spent tokens)", () => {
-    // run_verify_session only writes fix_log_path once the fix turn runs, so
-    // a verify run with fix-turn tokens has an actual <run_id>.log to tail.
+  it("drains the log for any run that has one", () => {
+    // A finished local_review created after the tee change has a real
+    // `{run_id}.log`, so it drains rather than showing the empty state.
     const runs = [
-      run("verify", {
-        id: "r-verify",
+      run("local_review", {
+        id: "r-lr",
         status: "failed",
-        output_tokens: 120,
+        has_log: true,
         started_at: "2026-06-07T12:00:00Z",
         ended_at: "2026-06-07T12:05:00Z",
       }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — verify, failed");
-    expect(markup).not.toContain("no per-run log");
-  });
-
-  it("still drains a failed verify run with zero tokens instead of assuming no log", () => {
-    // A fix turn that stalls or times out writes fix_log_path (verify.py
-    // writes stdout unconditionally once the fix turn runs) without ever
-    // emitting a parseable usage event, so token counts alone can't tell
-    // "no fix ran" apart from "fix ran but never reported usage" — the
-    // viewer must attempt the drain rather than assume there's no log.
-    const runs = [
-      run("verify", {
-        id: "r-verify",
-        status: "failed",
-        started_at: "2026-06-07T12:00:00Z",
-        ended_at: "2026-06-07T12:05:00Z",
-      }),
-    ];
-    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — verify, failed");
+    expect(markup).toContain("final log — Local review, failed");
     expect(markup).not.toContain("no per-run log");
   });
 

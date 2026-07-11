@@ -802,12 +802,12 @@ function useNowMs(): number {
   return nowMs;
 }
 
-// Stages whose runs don't incrementally write `log_root/{run_id}.log`, so
-// LiveFeed has nothing to tail for them: local_review(_fix) writes
-// .out.log/.err.log instead; acceptance and verify collect their subprocess
-// output in memory and write it (if at all) only after the run finishes;
-// review is a passive monitor (pid=None) waiting on the remote `@codex
-// review` bot, with no local subprocess to tail.
+// Stages the LiveFeed does not stream *while running*. These subprocess
+// stages now tee `log_root/{run_id}.log` in real time (SYM-177), but wiring
+// them into the live pane is a follow-up — so the running placeholder still
+// treats them as non-streaming. `review` is a passive monitor (pid=None)
+// waiting on the remote `@codex review` bot, with no local subprocess at all.
+// The final-log viewer, by contrast, keys purely off `has_log`.
 const NON_STREAMING_STAGES = new Set([
   "local_review",
   "local_review_fix",
@@ -837,41 +837,25 @@ function isSupersededRun(r: Run): boolean {
   return r.status === SUPERSEDED_STATUS || r.termination_kind === "superseded";
 }
 
-/** Whether `r` has an actual `<run_id>.log` for LiveFeed to drain, beyond what
- *  `NON_STREAMING_STAGES` alone captures:
- *  - `verify` always writes `fix_log_path` (`run_verify_session` writes a
- *    "passed on first attempt" or "fix turn disabled" note when no fix turn
- *    ran, else the fix turn's stdout), so it's always tailable and never
- *    opens to a blank "No output recorded" state by default.
- *  - `merge` is usually a real agent run, but `_mark_merge_needs_approval`
- *    also inserts synthetic `stage="merge"` rows purely to park the issue in
- *    Needs Approval, created with `pid=None` and no `_run_stage_command` —
- *    those never get a log, so `pid === null` marks the synthetic case. */
-function hasTailableLog(r: Run): boolean {
-  if (r.stage === "merge") return r.pid !== null;
-  if (r.stage === "verify") return true;
-  return !NON_STREAMING_STAGES.has(r.stage);
-}
-
 function runsByStartDesc(runs: Run[]): Run[] {
   return [...runs].sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
 }
 
 /** The run whose final log opens by default: the most-recent failed/interrupted
- *  run that actually has a tailable log (what the operator usually needs after
- *  a park), falling back to the most-recent tailable run, then to the most
- *  recent run overall — a failed `review` run or a synthetic merge-approval
- *  park row (`hasTailableLog` false, no log) must not shadow a streamable
- *  `implement` run. `superseded` rows are excluded from both fallbacks: they're
- *  a killed duplicate of a surviving run, not something an operator wants to
- *  see by default. Null when the issue has no runs. */
+ *  run that actually has a per-run log (`has_log`, a stat of
+ *  `{log_root}/{run_id}.log` from the API), falling back to the most-recent run
+ *  with a log, then to the most recent run overall — a failed `review` run or a
+ *  synthetic merge-approval park row (no subprocess, so no log) must not shadow
+ *  a run with real output. `superseded` rows are excluded from both fallbacks:
+ *  they're a killed duplicate of a surviving run, not something an operator
+ *  wants to see by default. Null when the issue has no runs. */
 export function pickDefaultRun(runs: Run[]): Run | null {
   if (!runs.length) return null;
   const sorted = runsByStartDesc(runs);
   const eligible = sorted.filter((r) => !isSupersededRun(r));
   return (
-    eligible.find((r) => FAILED_RUN_STATUSES.has(r.status) && hasTailableLog(r)) ??
-    eligible.find(hasTailableLog) ??
+    eligible.find((r) => FAILED_RUN_STATUSES.has(r.status) && r.has_log) ??
+    eligible.find((r) => r.has_log) ??
     eligible[0] ??
     sorted[0]
   );
@@ -965,8 +949,8 @@ function NoTailableLog({ stageLabel, reason }: { stageLabel: string; reason: str
 /** Final-log viewer for a non-running issue: a run picker (stage, status,
  *  started, duration) over all the issue's runs, defaulting to the most-recent
  *  failed run, with the selected run's log drained once through the LiveFeed in
- *  non-live mode. Runs with no actual log (`!hasTailableLog`) get an
- *  explanatory empty state instead of a stuck spinner. */
+ *  non-live mode. Runs with no per-run log (`!has_log`) get an explanatory
+ *  empty state instead of a stuck spinner. */
 export function FinalLogCard({ runs }: { runs: Run[] }) {
   const sorted = runsByStartDesc(runs);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -986,10 +970,10 @@ export function FinalLogCard({ runs }: { runs: Run[] }) {
       {sorted.length > 1 ? (
         <RunPicker runs={sorted} selectedId={selected.id} onSelect={setSelectedId} />
       ) : null}
-      {!hasTailableLog(selected) ? (
+      {!selected.has_log ? (
         <NoTailableLog
           stageLabel={stageLabel}
-          reason="writes no per-run log to tail, so there's nothing to show here."
+          reason="recorded no per-run log, so there's nothing to show here."
         />
       ) : (
         <LiveFeed

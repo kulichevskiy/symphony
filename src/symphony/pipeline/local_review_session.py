@@ -172,12 +172,18 @@ async def run_local_review_session(
     workspace_scrubber: WorkspaceScrubber | None = None,
     on_iteration: IterationCallback | None = None,
     allow_fixes: bool = True,
+    log_path: Path | None = None,
 ) -> LoopResult:
     """Run the review→fix loop in-workspace; return the loop's outcome.
 
     `last_message_dir` is where the reviewer's `-o <file>` payloads go
     so each iteration's final agent message is recoverable. The
     directory is created on demand.
+
+    `log_path`, when set, is the run's `{log_root}/{run_id}.log`: every
+    reviewer/fixer subprocess line is teed to it in real time so the log
+    grows while the loop runs (`.out.log`/`.err.log` transcripts are
+    still persisted per iteration, unchanged).
     """
     # Same sync-mkdir pattern as `_run_stage_command` in poll.py.
     # Directory creation is microseconds; pushing it to a thread would
@@ -269,7 +275,9 @@ async def run_local_review_session(
         output_before = estimator.total_output_tokens
         cache_write_before = estimator.total_cache_write_tokens
         cache_read_before = estimator.total_cache_read_tokens
-        collected = await collect_runner_output(runner, spec, usage_handler=estimator.delta)
+        collected = await collect_runner_output(
+            runner, spec, usage_handler=estimator.delta, log_path=log_path
+        )
         _persist_runner_transcript(last_message_dir, stem, collected)
         cost_delta = estimator.total_cost_usd - cost_before
         input_delta = estimator.total_input_tokens - input_before
@@ -474,7 +482,9 @@ async def run_local_review_session(
         output_before = fixer_estimator.total_output_tokens
         cache_write_before = fixer_estimator.total_cache_write_tokens
         cache_read_before = fixer_estimator.total_cache_read_tokens
-        collected = await collect_runner_output(runner, spec, usage_handler=fixer_estimator.delta)
+        collected = await collect_runner_output(
+            runner, spec, usage_handler=fixer_estimator.delta, log_path=log_path
+        )
         _persist_runner_transcript(last_message_dir, f"fix-{iteration}", collected)
         cost_delta = fixer_estimator.total_cost_usd - cost_before
         input_delta = fixer_estimator.total_input_tokens - input_before

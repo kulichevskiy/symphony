@@ -24,7 +24,11 @@ from symphony.pipeline.acceptance_classifier import (
     acceptance_classifier,
 )
 from symphony.pipeline.cost_guard import UsageDelta
-from symphony.pipeline.local_review_io import CollectedRunnerOutput
+from symphony.pipeline.local_review_io import (
+    CollectedRunnerOutput,
+    open_run_log,
+    tee_run_log,
+)
 
 _DIFF_LIMIT_CHARS = 60_000
 _CODE_ONLY_MODE = "code_only"
@@ -191,7 +195,12 @@ async def run_acceptance(
     dev_command: str | None = None,
     dev_port: int | None = None,
     dev_startup_timeout_secs: float = _DEV_SERVER_STARTUP_TIMEOUT_SECS,
+    log_root: Path | None = None,
 ) -> AcceptanceVerdict:
+    # `{log_root}/{run_id}.log` is the run's tailable log — the acceptance
+    # subprocess tees to it in real time (same file the issue-detail API
+    # reports `has_log` for).
+    log_path = log_root / f"{run_id}.log" if log_root is not None else None
     if mode == _DEV_MODE:
         return await _run_dev_acceptance(
             runner=runner,
@@ -206,6 +215,7 @@ async def run_acceptance(
             dev_command=dev_command,
             dev_port=dev_port,
             dev_startup_timeout_secs=dev_startup_timeout_secs,
+            log_path=log_path,
         )
     if mode == _PREVIEW_MODE:
         return await _run_preview_acceptance(
@@ -218,6 +228,7 @@ async def run_acceptance(
             criteria=criteria,
             stall_secs=stall_secs,
             preview_url=preview_url,
+            log_path=log_path,
         )
     if mode != _CODE_ONLY_MODE:
         return AcceptanceVerdict(
@@ -256,6 +267,7 @@ async def run_acceptance(
         runner,
         spec,
         wall_clock_secs=stall_secs,
+        log_path=log_path,
     )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
@@ -312,6 +324,7 @@ async def _run_dev_acceptance(
     dev_command: str | None,
     dev_port: int | None,
     dev_startup_timeout_secs: float,
+    log_path: Path | None = None,
 ) -> AcceptanceVerdict:
     if not dev_command or dev_port is None:
         return AcceptanceVerdict(
@@ -359,6 +372,7 @@ async def _run_dev_acceptance(
             criteria=criteria,
             stall_secs=stall_secs,
             preview_url=resolved_preview_url,
+            log_path=log_path,
         )
     finally:
         await _stop_dev_server(dev_server)
@@ -375,6 +389,7 @@ async def _run_preview_acceptance(
     criteria: list[str] | None,
     stall_secs: float,
     preview_url: str,
+    log_path: Path | None = None,
 ) -> AcceptanceVerdict:
     if not preview_url:
         return AcceptanceVerdict(
@@ -395,6 +410,7 @@ async def _run_preview_acceptance(
         criteria=criteria,
         stall_secs=stall_secs,
         preview_url=preview_url,
+        log_path=log_path,
     )
 
 
@@ -410,6 +426,7 @@ async def _run_playwright_acceptance(
     criteria: list[str] | None,
     stall_secs: float,
     preview_url: str,
+    log_path: Path | None = None,
 ) -> AcceptanceVerdict:
     artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -446,6 +463,7 @@ async def _run_playwright_acceptance(
         runner,
         spec,
         wall_clock_secs=stall_secs,
+        log_path=log_path,
     )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
@@ -550,6 +568,7 @@ async def _collect_acceptance_output(
     spec: RunnerSpec,
     *,
     wall_clock_secs: float,
+    log_path: Path | None = None,
 ) -> _AcceptanceRunOutput:
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -561,6 +580,10 @@ async def _collect_acceptance_output(
     tracked_usage = UsageDelta()
     started_at = time.monotonic()
     iterator: AsyncIterator[RunnerEvent] = runner.run(spec).__aiter__()
+    # Tee every line to `{log_root}/{run_id}.log` as it arrives so the
+    # acceptance run's log grows in real time; strictly additive to the
+    # in-memory collection below.
+    logf = open_run_log(log_path)
 
     async def abort(details: str) -> _AcceptanceRunOutput:
         await runner.kill(spec.run_id)
@@ -579,75 +602,83 @@ async def _collect_acceptance_output(
             usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
         )
 
-    while True:
-        remaining = wall_clock_secs - (time.monotonic() - started_at)
-        if remaining <= 0:
-            return await abort(_time_cap_exceeded_details(wall_clock_secs))
+    try:
+        while True:
+            remaining = wall_clock_secs - (time.monotonic() - started_at)
+            if remaining <= 0:
+                return await abort(_time_cap_exceeded_details(wall_clock_secs))
 
-        next_event: asyncio.Task[RunnerEvent] = asyncio.create_task(_next_runner_event(iterator))
-        done, _pending = await asyncio.wait({next_event}, timeout=remaining)
-        if not done:
-            await runner.kill(spec.run_id)
-            next_event.cancel()
-            with suppress(asyncio.CancelledError):
-                await next_event
-            await _close_iterator(iterator)
-            return _AcceptanceRunOutput(
-                output=CollectedRunnerOutput(
-                    stdout="\n".join(stdout_parts),
-                    stderr="\n".join(stderr_parts),
-                    terminal_kind="abort",
-                    returncode=None,
-                    spawn_error=None,
-                    stall_timeout=False,
-                ),
-                abort_details=_time_cap_exceeded_details(wall_clock_secs),
-                cost=tracked_cost,
-                usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
+            next_event: asyncio.Task[RunnerEvent] = asyncio.create_task(
+                _next_runner_event(iterator)
             )
-
-        try:
-            event = next_event.result()
-        except StopAsyncIteration:
-            break
-
-        if event.kind == "stdout" and event.line is not None:
-            stdout_parts.append(event.line)
-            usage = parse_event_line(event.line)
-            if usage is not None:
-                tracked_usage = _sum_usage_delta(
-                    tracked_usage,
-                    _usage_delta_from_usage(usage),
+            done, _pending = await asyncio.wait({next_event}, timeout=remaining)
+            if not done:
+                await runner.kill(spec.run_id)
+                next_event.cancel()
+                with suppress(asyncio.CancelledError):
+                    await next_event
+                await _close_iterator(iterator)
+                return _AcceptanceRunOutput(
+                    output=CollectedRunnerOutput(
+                        stdout="\n".join(stdout_parts),
+                        stderr="\n".join(stderr_parts),
+                        terminal_kind="abort",
+                        returncode=None,
+                        spawn_error=None,
+                        stall_timeout=False,
+                    ),
+                    abort_details=_time_cap_exceeded_details(wall_clock_secs),
+                    cost=tracked_cost,
+                    usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
                 )
-                tracked_cost = max(tracked_cost, usage.cost_usd)
-        elif event.kind == "stderr" and event.line is not None:
-            stderr_parts.append(event.line)
-        elif event.kind == "exit":
-            terminal_kind = "exit"
-            returncode = event.returncode
-            break
-        elif event.kind == "stall_timeout":
-            terminal_kind = "stall_timeout"
-            stall_timeout = True
-            break
-        elif event.kind == "spawn_failed":
-            terminal_kind = "spawn_failed"
-            spawn_error = event.error
-            break
 
-    await _close_iterator(iterator)
-    return _AcceptanceRunOutput(
-        output=CollectedRunnerOutput(
-            stdout="\n".join(stdout_parts),
-            stderr="\n".join(stderr_parts),
-            terminal_kind=terminal_kind,
-            returncode=returncode,
-            spawn_error=spawn_error,
-            stall_timeout=stall_timeout,
-        ),
-        cost=tracked_cost,
-        usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
-    )
+            try:
+                event = next_event.result()
+            except StopAsyncIteration:
+                break
+
+            if event.kind == "stdout" and event.line is not None:
+                stdout_parts.append(event.line)
+                tee_run_log(logf, event.line)
+                usage = parse_event_line(event.line)
+                if usage is not None:
+                    tracked_usage = _sum_usage_delta(
+                        tracked_usage,
+                        _usage_delta_from_usage(usage),
+                    )
+                    tracked_cost = max(tracked_cost, usage.cost_usd)
+            elif event.kind == "stderr" and event.line is not None:
+                stderr_parts.append(event.line)
+                tee_run_log(logf, event.line, stderr=True)
+            elif event.kind == "exit":
+                terminal_kind = "exit"
+                returncode = event.returncode
+                break
+            elif event.kind == "stall_timeout":
+                terminal_kind = "stall_timeout"
+                stall_timeout = True
+                break
+            elif event.kind == "spawn_failed":
+                terminal_kind = "spawn_failed"
+                spawn_error = event.error
+                break
+
+        await _close_iterator(iterator)
+        return _AcceptanceRunOutput(
+            output=CollectedRunnerOutput(
+                stdout="\n".join(stdout_parts),
+                stderr="\n".join(stderr_parts),
+                terminal_kind=terminal_kind,
+                returncode=returncode,
+                spawn_error=spawn_error,
+                stall_timeout=stall_timeout,
+            ),
+            cost=tracked_cost,
+            usage=_usage_delta_with_cost(tracked_usage, tracked_cost),
+        )
+    finally:
+        if logf is not None:
+            logf.close()
 
 
 async def _close_iterator(iterator: object) -> None:

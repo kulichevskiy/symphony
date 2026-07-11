@@ -891,6 +891,7 @@ class _AcceptanceMixin(_OrchestratorBase):
                             preview_url=preview_url,
                             dev_command=binding.acceptance.dev_command,
                             dev_port=binding.acceptance.dev_port,
+                            log_root=self.config.log_root,
                         )
                         verdict = _replace_acceptance_criteria_labels(
                             verdict=verdict,
