@@ -79,6 +79,21 @@ def test_implement_and_fix_prompts_contain_headless_rule() -> None:
 # --- 2. Strict MCP allowlist on claude spawns -------------------------------
 
 
+def test_claude_runner_command_preapproves_builder_tools() -> None:
+    """Mutating claude runs must not depend on the operator's ambient
+    ~/.claude permission rules: in the containerized deployment the auth
+    volume is fresh and every Edit/Write/Bash would be auto-denied, parking
+    the run. Bare "Bash" (all commands) is required for repo test/build
+    commands and git commit/push. The prompt rides behind `--` so the
+    single-string --allowedTools can't swallow it (SYM-42)."""
+    argv = build_runner_command("claude", "do it")
+    allowed = argv[argv.index("--allowedTools") + 1]
+    assert "Bash" in allowed.split(",")
+    assert "Edit" in allowed.split(",")
+    assert "Write" in allowed.split(",")
+    assert argv[-2:] == ["--", "do it"]
+
+
 def test_claude_runner_command_is_strict_mcp_with_no_servers_by_default() -> None:
     argv = build_runner_command("claude", "do it")
     assert "--strict-mcp-config" in argv

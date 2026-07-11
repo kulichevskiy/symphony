@@ -83,6 +83,24 @@ def build_pr_body(issue: LinearIssue) -> str:
     return f"Relates to {issue.url}"
 
 
+# Pre-approved tool surface for mutating claude runs (implement / fix /
+# merge / acceptance-fix — every claude spawn that must change the workspace).
+# The read-only reviewer keeps its own narrow allowlist in
+# pipeline/local_review.py; this one is deliberately broad because builder
+# runs execute arbitrary repo test/build commands and git.
+_CLAUDE_BUILDER_ALLOWED_TOOLS = ",".join(
+    (
+        "Bash",
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+    )
+)
+
+
 def build_runner_command(
     agent: str,
     prompt: str,
@@ -115,6 +133,17 @@ def build_runner_command(
             "stream-json",
             "--verbose",
             "--strict-mcp-config",
+            # Pre-approve the full builder surface explicitly. Without this
+            # the spawn depends on whatever permission rules happen to live
+            # in the operator's ~/.claude — absent in the containerized
+            # deployment, where a fresh auth volume means every
+            # Edit/Write/Bash is auto-denied and the run parks blocked. Bare
+            # "Bash" approves all commands: implement/fix/merge runs must run
+            # repo-specific test/build commands plus git commit/push.
+            # (Comma-joined single arg + `--` before the prompt — the SYM-42
+            # idiom; a variadic --allowedTools would swallow the prompt.)
+            "--allowedTools",
+            _CLAUDE_BUILDER_ALLOWED_TOOLS,
         ]
         if mcp_servers:
             command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])
@@ -122,7 +151,7 @@ def build_runner_command(
             command.extend(["--model", claude_model])
         if effort is not None:
             command.extend(["--effort", effort])
-        command.append(prompt)
+        command.extend(["--", prompt])
         return command
     if agent == "codex":
         if workspace_path is None:
