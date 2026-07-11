@@ -12,6 +12,7 @@ the caller's signal to fail closed — no push, no PR.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 from collections.abc import Awaitable, Callable
@@ -88,11 +89,32 @@ async def run_verify_command(
 def _write_fix_log(fix_log_path: Path | None, text: str) -> None:
     if fix_log_path is None:
         return
+    # `/api/runs/{id}/stream` only emits an event once it sees a trailing
+    # `\n` (it buffers an unterminated final line forever, waiting for more
+    # bytes that never arrive) — without this, the last line a fix turn ever
+    # writes never reaches the UI.
+    if text and not text.endswith("\n"):
+        text += "\n"
     try:
         fix_log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
         fix_log_path.write_text(text, encoding="utf-8")  # noqa: ASYNC240
     except OSError:
         pass  # per-model attribution is best-effort
+
+
+def _fix_log_note(text: str) -> str:
+    """Format a placeholder note as a line the stream endpoint can parse.
+
+    `/api/runs/{id}/stream` only renders events `parse_stream_events`
+    recovers from agent JSONL; a plain-text placeholder yields no events
+    and the LiveFeed shows nothing. Piggyback on codex's `item.completed`
+    agent-message shape — unlike claude's `result` kind, it doesn't also
+    trip `parse_event_line`'s usage parsing, which would otherwise emit a
+    spurious all-zero token tick alongside the message.
+    """
+    return json.dumps(
+        {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+    )
 
 
 def _verify_fix_trigger(verify_cmd: str, tail: str) -> str:
@@ -134,11 +156,18 @@ async def run_verify_session(
     """
     ok, output = await command_runner(workspace_path, verify_cmd, timeout_secs)
     if ok:
-        _write_fix_log(fix_log_path, "verify_cmd passed on first attempt; no fix turn was run.")
+        _write_fix_log(
+            fix_log_path,
+            _fix_log_note("verify_cmd passed on first attempt; no fix turn was run."),
+        )
         return VerifyResult(ok=True)
 
     tail = output_tail(output)
     if not allow_fixes:
+        _write_fix_log(
+            fix_log_path,
+            _fix_log_note("verify_cmd failed; fix turn disabled for publish resume."),
+        )
         return VerifyResult(
             ok=False,
             tail=tail,

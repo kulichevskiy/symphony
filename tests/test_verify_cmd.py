@@ -34,6 +34,7 @@ from symphony.pipeline.verify import (
     run_verify_command,
     run_verify_session,
 )
+from symphony.ui.live import parse_stream_events
 
 from ._workspace_helpers import advance_head
 
@@ -163,7 +164,11 @@ async def test_verify_session_green_first_run_skips_fix_turn() -> None:
 @pytest.mark.asyncio
 async def test_verify_session_green_first_run_still_writes_fix_log(tmp_path: Path) -> None:
     """A green verify_cmd on the first attempt must still populate
-    `fix_log_path`, so the UI never opens a `verify` run to a blank log."""
+    `fix_log_path`, so the UI never opens a `verify` run to a blank log.
+
+    The note must also be stream-parseable (the endpoint drops plain text)
+    and end with a trailing newline (the endpoint buffers an unterminated
+    final line forever)."""
 
     async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
         return True, "all green"
@@ -175,7 +180,40 @@ async def test_verify_session_green_first_run_still_writes_fix_log(tmp_path: Pat
     )
     assert result.ok
     assert fix_log_path.exists()
-    assert fix_log_path.read_text(encoding="utf-8").strip()
+    text = fix_log_path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    events = parse_stream_events(text.strip())
+    assert events == [
+        {"kind": "message", "text": "verify_cmd passed on first attempt; no fix turn was run."}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_verify_session_disabled_fix_still_writes_parseable_log(tmp_path: Path) -> None:
+    """`allow_fixes=False` (publish-resume gate) failing must still populate
+    `fix_log_path` with a stream-parseable note — `hasTailableLog` in the UI
+    treats every `verify` run as tailable, so a silently-missing log here
+    would open to a permanent "Waiting for output…" spinner."""
+
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
+        return False, "red output"
+
+    runner = _StagedRunner({})
+    fix_log_path = tmp_path / "verify.log"
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner),
+        fix_log_path=fix_log_path,
+        allow_fixes=False,
+    )
+    assert not result.ok
+    assert not result.fix_attempted
+    assert runner.captured == []
+    text = fix_log_path.read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    events = parse_stream_events(text.strip())
+    assert events == [
+        {"kind": "message", "text": "verify_cmd failed; fix turn disabled for publish resume."}
+    ]
 
 
 @pytest.mark.asyncio
@@ -203,6 +241,35 @@ async def test_verify_session_red_then_fix_then_green() -> None:
     prompt = runner.captured[0].command[-1]
     assert "build error TS2345" in prompt
     assert "pnpm build && pnpm test" in prompt
+
+
+@pytest.mark.asyncio
+async def test_verify_session_fix_turn_log_ends_with_newline(tmp_path: Path) -> None:
+    """`collect_runner_output` joins stdout lines without a trailing
+    newline; the stream endpoint buffers an unterminated final line
+    forever, so `fix_log_path` must always end with one."""
+    outcomes = [(False, "build error TS2345"), (True, "ok")]
+
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
+        return outcomes.pop(0)
+
+    runner = _StagedRunner(
+        {
+            "verify_fix": [
+                [
+                    RunnerEvent(kind="started", pid=1),
+                    RunnerEvent(kind="stdout", line="fixed the build"),
+                    RunnerEvent(kind="exit", returncode=0),
+                ]
+            ]
+        }
+    )
+    fix_log_path = tmp_path / "verify.log"
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner), fix_log_path=fix_log_path
+    )
+    assert result.ok
+    assert fix_log_path.read_text(encoding="utf-8") == "fixed the build\n"
 
 
 @pytest.mark.asyncio

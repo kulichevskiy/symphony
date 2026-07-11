@@ -831,9 +831,9 @@ const SUPERSEDED_STATUS = "superseded";
 /** Whether `r` has an actual `<run_id>.log` for LiveFeed to drain, beyond what
  *  `NON_STREAMING_STAGES` alone captures:
  *  - `verify` always writes `fix_log_path` (`run_verify_session` writes a
- *    "passed on first attempt" note when no fix turn ran, else the fix
- *    turn's stdout), so it's always tailable and never opens to a blank
- *    "No output recorded" state by default.
+ *    "passed on first attempt" or "fix turn disabled" note when no fix turn
+ *    ran, else the fix turn's stdout), so it's always tailable and never
+ *    opens to a blank "No output recorded" state by default.
  *  - `merge` is usually a real agent run, but `_mark_merge_needs_approval`
  *    also inserts synthetic `stage="merge"` rows purely to park the issue in
  *    Needs Approval, created with `pid=None` and no `_run_stage_command` —
