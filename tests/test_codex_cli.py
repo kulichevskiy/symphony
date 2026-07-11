@@ -8,8 +8,6 @@ from pathlib import Path
 import pytest
 
 from symphony.agent.codex_cli import (
-    CODEX_APPROVAL_POLICY_CONFIG,
-    CODEX_DEFAULT_PERMISSIONS_CONFIG,
     SYMPHONY_PERMISSIONS_PROFILE,
     SYMPHONY_PERMISSIONS_PROFILE_TOML,
     CodexPermissionsProfileError,
@@ -18,24 +16,21 @@ from symphony.agent.codex_cli import (
 )
 
 
-def test_build_codex_workspace_write_command_uses_named_permissions_profile() -> None:
+def test_build_codex_workspace_write_command_bypasses_nested_sandbox() -> None:
     argv = build_codex_workspace_write_command(
         prompt="fix this",
         codex_model="gpt-5.1-codex",
     )
 
-    assert argv[:3] == ["codex", "exec", "--json"]
+    # No nested OS sandbox (bwrap can't init in our container); the container is
+    # the boundary. The bypass flag supersedes the permissions/approval knobs.
+    assert argv[:4] == ["codex", "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
     assert "--sandbox" not in argv
     assert "workspace-write" not in argv
-    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
-    assert configs == [
-        CODEX_DEFAULT_PERMISSIONS_CONFIG,
-        CODEX_APPROVAL_POLICY_CONFIG,
-    ]
+    # Unset effort → no --config at all (Codex CLI default effort).
+    assert "--config" not in argv
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
     assert argv[-1] == "fix this"
-    # Unset effort → no model_reasoning_effort flag (Codex CLI default).
-    assert not any("model_reasoning_effort" in arg for arg in argv)
 
 
 def test_build_codex_workspace_write_command_carries_effort() -> None:
@@ -45,12 +40,10 @@ def test_build_codex_workspace_write_command_carries_effort() -> None:
         effort="high",
     )
 
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    # Effort is the only remaining --config knob.
     configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
-    assert configs == [
-        CODEX_DEFAULT_PERMISSIONS_CONFIG,
-        CODEX_APPROVAL_POLICY_CONFIG,
-        'model_reasoning_effort="high"',
-    ]
+    assert configs == ['model_reasoning_effort="high"']
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
     assert argv[-1] == "fix this"
 

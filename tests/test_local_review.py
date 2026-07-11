@@ -104,8 +104,10 @@ def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:
     # contract; see build_local_review_command docstring.
     assert argv[:2] == ["codex", "exec"]
     assert "review" not in argv[:3]
-    # Read-only sandbox: reviewer can `git diff` but cannot write files.
-    assert "--sandbox" in argv and argv[argv.index("--sandbox") + 1] == "read-only"
+    # No nested OS sandbox (bwrap can't init in our container); the container is
+    # the boundary. Read-only intent rides in the prompt, not a `--sandbox` flag.
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "--sandbox" not in argv
     # `--base` not forwarded; base branch lives in the prompt body.
     assert "--base" not in argv
     assert "--json" in argv
@@ -250,8 +252,11 @@ def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> Non
         pass_two=True,
     )
     assert argv[:2] == ["codex", "exec"]
-    assert "--sandbox" in argv
-    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+    # codex no longer nests a sandbox (bypassed); pass 2's write/execute intent
+    # rides in the prompt, so there is no `--sandbox` flag to distinguish passes.
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "--sandbox" not in argv
+    assert "workspace-write" not in argv
     assert "read-only" not in argv
 
 
@@ -284,7 +289,10 @@ def test_build_local_review_command_pass_one_and_single_pass_stay_read_only() ->
     """Pass 1 and the single-pass fallback (pass_two=False) keep the
     read-only surface: no exec/write for codex or claude."""
     codex_argv = build_local_review_command(agent="codex", prompt="p", base_branch="main")
-    assert codex_argv[codex_argv.index("--sandbox") + 1] == "read-only"
+    # codex's sandbox is bypassed; the read-only intent is prompt-carried, so at
+    # the argv level pass 1 and pass 2 are identical (no `--sandbox`).
+    assert "--dangerously-bypass-approvals-and-sandbox" in codex_argv
+    assert "--sandbox" not in codex_argv
     assert "workspace-write" not in codex_argv
 
     claude_argv = build_local_review_command(agent="claude", prompt="p", base_branch="main")

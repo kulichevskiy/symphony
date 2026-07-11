@@ -320,18 +320,23 @@ def build_codex_workspace_write_command(
 ) -> list[str]:
     """Build `codex exec` argv for agents that must modify and commit.
 
-    `effort` maps to `--config model_reasoning_effort="<v>"` (the same repeated
-    `--config` pattern as the permission/approval knobs). Unset → no flag, so
-    the Codex CLI default stands.
+    Uses `--dangerously-bypass-approvals-and-sandbox`: codex's OS sandbox
+    (bubblewrap) can't initialize nested inside our Docker container — every
+    run dies at namespace/uid-map/loopback setup ("bwrap: ..."). That flag is
+    codex's documented mode for "already-sandboxed environments"; the container
+    IS the isolation boundary (non-root, ephemeral workspace clone, per-binding
+    env allowlist), so the agent may write anywhere inside it. This supersedes
+    the `symphony-git` permissions profile, whose filesystem/network scoping was
+    enforced *via* that sandbox.
+
+    `effort` maps to `--config model_reasoning_effort="<v>"`. Unset → no flag,
+    so the Codex CLI default stands.
     """
     command = [
         "codex",
         "exec",
         "--json",
-        "--config",
-        CODEX_DEFAULT_PERMISSIONS_CONFIG,
-        "--config",
-        CODEX_APPROVAL_POLICY_CONFIG,
+        "--dangerously-bypass-approvals-and-sandbox",
     ]
     if effort is not None:
         command += ["--config", f'model_reasoning_effort="{effort}"']
