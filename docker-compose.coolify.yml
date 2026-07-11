@@ -100,7 +100,28 @@ services:
     networks:
       - coolify
     volumes:
-      - ./Caddyfile.coolify:/etc/caddy/Caddyfile:ro
+      # Long-form content mount, same mechanism as .env/config.local.yaml
+      # above: Coolify writes the FILE from this content before `up`. A
+      # short-form `./Caddyfile.coolify:...` bind breaks on a from-git deploy:
+      # docker creates the missing source as a DIRECTORY and the container
+      # dies with "not a directory" mounting it onto /etc/caddy/Caddyfile.
+      # Content mirrors Caddyfile.coolify (kept for reference/local runs).
+      - type: bind
+        source: ./Caddyfile.coolify
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        content: |
+          # Coolify's proxy (Traefik) terminates TLS for the public domain and
+          # forwards here over the docker network; this caddy only bridges into
+          # the shared netns where the daemon listens on loopback (127.0.0.1
+          # bind is a security invariant — app.py::build_server_config).
+          {
+              auto_https off
+          }
+
+          :80 {
+              reverse_proxy 127.0.0.1:8787
+          }
       - caddy_data:/data
       - caddy_config:/config
 
