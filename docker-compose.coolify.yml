@@ -54,6 +54,17 @@ services:
     network_mode: "service:caddy"
     depends_on:
       - caddy
+    # The `local` runner invokes codex/claude with their own shell sandbox
+    # (`codex --sandbox workspace-write` → bubblewrap). bwrap must create a
+    # user+mount namespace; under Docker's default seccomp + AppArmor on a
+    # modern host (Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_-
+    # userns=1) that is denied and EVERY implement/review run dies with
+    # "bwrap: No permissions to create a new namespace". Unconfining AppArmor
+    # + seccomp for this single-purpose container lets the nested sandbox run;
+    # the container itself remains the outer isolation boundary.
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
     environment:
       # Fail closed at boot when AUTH0_* is not configured — this stack is
       # publicly routed (see header). Non-secret flag; safe in os.environ.

@@ -31,6 +31,15 @@ services:
     network_mode: "service:caddy"
     depends_on:
       - caddy
+    # LocalRunner launches codex/claude with their own shell sandbox
+    # (`codex --sandbox workspace-write` → bubblewrap), which must create a
+    # user+mount namespace. Docker's default seccomp + AppArmor denies that on
+    # a modern host, failing every run with "bwrap: No permissions to create a
+    # new namespace". Unconfine both for this single-purpose container; the
+    # container remains the outer isolation boundary. (Mirrors the Coolify file.)
+    security_opt:
+      - apparmor=unconfined
+      - seccomp=unconfined
     volumes:
       # Operator config — read-only, never baked into the image.
       - ./config.local.yaml:/app/config.local.yaml:ro
