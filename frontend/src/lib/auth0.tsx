@@ -49,8 +49,9 @@ async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
 /**
  * Resolves the Auth0 config from the running daemon, then wraps the app in
  * `<Auth0Provider>` (Authorization Code + PKCE, Google, no `audience` so the
- * ID token stays a validatable JWT) and gates it: tokens live in memory with
- * refresh-token rotation, unauthenticated users are sent to Auth0 login, and
+ * ID token stays a validatable JWT) and gates it: tokens are cached in
+ * localStorage with refresh-token rotation so a reload keeps the session,
+ * unauthenticated users are sent to Auth0 login, and
  * a logged-in-but-not-allowlisted user (backend 403) gets an access-denied
  * screen. A no-op passthrough when Auth0 is disabled.
  */
@@ -88,8 +89,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // Force the Google social connection — the app's only login method.
         connection: "google-oauth2",
       }}
-      // Keep tokens in memory (default cache) and rotate refresh tokens; never
-      // touch localStorage.
+      // Persist the session in localStorage so a page reload restores it
+      // instead of bouncing through the Auth0 redirect (and, under Safari ITP,
+      // a full re-login). Trade-off: the rotating refresh token now lives in
+      // localStorage, an accepted XSS surface for this SPA setup.
+      cacheLocation="localstorage"
       useRefreshTokens
       onRedirectCallback={(appState) => {
         window.history.replaceState({}, "", appState?.returnTo ?? "/ui/");
@@ -123,7 +127,7 @@ function AuthBridge() {
   return null;
 }
 
-function AuthGate({ children }: { children: ReactNode }) {
+export function AuthGate({ children }: { children: ReactNode }) {
   const { isLoading, isAuthenticated, error, loginWithRedirect } = useAuth0();
   // StrictMode double-invokes effects in dev; without this guard an
   // unauthenticated user's first render would start two login redirects.
