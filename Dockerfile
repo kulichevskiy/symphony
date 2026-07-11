@@ -18,7 +18,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # System deps: git + node/npm (for the coding-agent CLIs) + gh (GitHub CLI).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates gnupg util-linux \
+        git curl ca-certificates gnupg bubblewrap libcap2-bin \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -38,7 +38,20 @@ RUN corepack enable
 
 # Fail the build now if any tool is missing from PATH, rather than at runtime.
 RUN command -v claude && command -v codex && command -v gh \
-    && command -v git && command -v uv && command -v node
+    && command -v git && command -v uv && command -v node && command -v bwrap
+
+# The agent CLIs sandbox shell commands with bubblewrap, which unshares a
+# network namespace and brings up loopback (RTM_NEWADDR) — that needs an
+# EFFECTIVE CAP_NET_ADMIN. Grant it as a FILE capability on the bwrap binary
+# (masked by the container bounding set, which compose supplies via
+# `cap_add: NET_ADMIN`). This gives ONLY bwrap the cap when the non-root
+# `symphony` user execs it — no root entrypoint (login helpers stay non-root)
+# and no ambient cap leaking to the daemon or other agent-run children. Cover
+# the system bwrap (on PATH) and any bwrap bundled inside the agent CLIs.
+RUN set -eux; \
+    setcap cap_net_admin+ep "$(command -v bwrap)"; \
+    find /usr/lib/node_modules /usr/local/lib/node_modules -name bwrap -type f \
+        -exec setcap cap_net_admin+ep {} \;
 
 # Non-root runtime user; ~ is /home/symphony so config's ~/.claude etc. resolve.
 RUN useradd --create-home --shell /bin/bash symphony
@@ -80,17 +93,5 @@ RUN git config --global user.name "Symphony" \
 RUN git config --global credential."https://github.com".helper "!gh auth git-credential" \
     && git config --global credential."https://gist.github.com".helper "!gh auth git-credential"
 
-# Start as root so the entrypoint can hand `symphony` an EFFECTIVE CAP_NET_ADMIN.
-# The agent's bwrap sandbox creates an isolated network namespace and brings up
-# loopback (RTM_NEWADDR), which needs that capability. `cap_add: NET_ADMIN` in
-# compose only puts it in the container's *bounding* set; a non-root process
-# gets no effective caps across exec without file/ambient caps (Codex P1 on
-# #305). So drop to `symphony` via setpriv, raising NET_ADMIN into the *ambient*
-# set — ambient caps survive the uid switch AND are inherited by child processes
-# (the agent's bwrap), giving it the effective cap it needs. The main daemon
-# still runs as the non-root `symphony` user; only the setpriv shim is root.
-USER root
-ENTRYPOINT ["setpriv", "--reuid", "symphony", "--regid", "symphony", \
-            "--init-groups", "--inh-caps", "+net_admin", "--ambient-caps", "+net_admin", \
-            "--", "uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
+ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD ["--config", "/app/config.local.yaml"]

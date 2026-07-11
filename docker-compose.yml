@@ -38,10 +38,11 @@ services:
     # (2) bringing up loopback in the sandbox's isolated net namespace —
     # RTM_NEWADDR needs an EFFECTIVE CAP_NET_ADMIN ("bwrap: loopback: Failed
     # RTM_NEWADDR: Operation not permitted"). Unconfine apparmor+seccomp and add
-    # NET_ADMIN. cap_add only sets the bounding set, so the Dockerfile entrypoint
-    # raises NET_ADMIN into the ambient set when dropping to the non-root user
-    # (inherited by the agent's child bwrap). The container remains the outer
-    # isolation boundary. (Mirrors Coolify file.)
+    # NET_ADMIN. cap_add only sets the bounding set, so the Dockerfile grants a
+    # file capability on the bwrap binary (setcap cap_net_admin+ep) — masked by
+    # that bounding set, ONLY bwrap gets the effective cap (no root, no leak to
+    # other children). The container remains the outer isolation boundary.
+    # (Mirrors Coolify file.)
     security_opt:
       - apparmor=unconfined
       - seccomp=unconfined

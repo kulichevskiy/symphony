@@ -66,10 +66,11 @@ services:
     #      127.0.0.1 to `lo`): "bwrap: loopback: Failed RTM_NEWADDR: Operation
     #      not permitted". RTM_NEWADDR needs an EFFECTIVE CAP_NET_ADMIN.
     #      cap_add below only puts NET_ADMIN in the container's *bounding* set;
-    #      the Dockerfile entrypoint raises it into the *ambient* set when
-    #      dropping to the non-root `symphony` user (a non-root process gets no
-    #      effective caps across exec otherwise), and ambient caps are inherited
-    #      by the agent's child bwrap. Both pieces are required.
+    #      a non-root process gets no effective caps across exec on its own, so
+    #      the Dockerfile grants a FILE capability on the bwrap binary
+    #      (`setcap cap_net_admin+ep`) — masked by this bounding set, that gives
+    #      ONLY bwrap the effective cap, with no root entrypoint and no cap
+    #      leaking to the daemon or other agent children. Both pieces required.
     # The container itself remains the outer isolation boundary.
     security_opt:
       - apparmor=unconfined
