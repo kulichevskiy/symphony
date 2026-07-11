@@ -55,28 +55,16 @@ services:
     depends_on:
       - caddy
     # The `local` runner invokes codex/claude with their own shell sandbox
-    # (`codex --sandbox workspace-write` → bubblewrap). Two layers of the host
-    # deny it under Docker defaults, so EVERY implement/review run dies:
-    #   1. Creating the user+mount namespace — blocked by seccomp + AppArmor on
-    #      a modern host (Ubuntu 24.04 ships kernel.apparmor_restrict_-
-    #      unprivileged_userns=1): "bwrap: No permissions to create a new
-    #      namespace". Fixed by unconfining apparmor + seccomp below.
-    #   2. Bringing up loopback in the sandbox's isolated network namespace
-    #      (codex sets network.enabled=false, so bwrap unshares net and assigns
-    #      127.0.0.1 to `lo`): "bwrap: loopback: Failed RTM_NEWADDR: Operation
-    #      not permitted". RTM_NEWADDR needs an EFFECTIVE CAP_NET_ADMIN.
-    #      cap_add below only puts NET_ADMIN in the container's *bounding* set;
-    #      a non-root process gets no effective caps across exec on its own, so
-    #      the Dockerfile grants a FILE capability on the bwrap binary
-    #      (`setcap cap_net_admin+ep`) — masked by this bounding set, that gives
-    #      ONLY bwrap the effective cap, with no root entrypoint and no cap
-    #      leaking to the daemon or other agent children. Both pieces required.
-    # The container itself remains the outer isolation boundary.
+    # (`codex --sandbox workspace-write` → bubblewrap). bwrap must create a
+    # user+mount namespace; under Docker's default seccomp + AppArmor on a
+    # modern host (Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_-
+    # userns=1) that is denied and EVERY implement/review run dies with
+    # "bwrap: No permissions to create a new namespace". Unconfining AppArmor
+    # + seccomp for this single-purpose container lets the nested sandbox run;
+    # the container itself remains the outer isolation boundary.
     security_opt:
       - apparmor=unconfined
       - seccomp=unconfined
-    cap_add:
-      - NET_ADMIN
     environment:
       # Fail closed at boot when AUTH0_* is not configured — this stack is
       # publicly routed (see header). Non-secret flag; safe in os.environ.

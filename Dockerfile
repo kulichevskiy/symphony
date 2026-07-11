@@ -18,7 +18,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # System deps: git + node/npm (for the coding-agent CLIs) + gh (GitHub CLI).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl ca-certificates gnupg bubblewrap libcap2-bin \
+        git curl ca-certificates gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -38,20 +38,7 @@ RUN corepack enable
 
 # Fail the build now if any tool is missing from PATH, rather than at runtime.
 RUN command -v claude && command -v codex && command -v gh \
-    && command -v git && command -v uv && command -v node && command -v bwrap
-
-# The agent CLIs sandbox shell commands with bubblewrap, which unshares a
-# network namespace and brings up loopback (RTM_NEWADDR) — that needs an
-# EFFECTIVE CAP_NET_ADMIN. Grant it as a FILE capability on the bwrap binary
-# (masked by the container bounding set, which compose supplies via
-# `cap_add: NET_ADMIN`). This gives ONLY bwrap the cap when the non-root
-# `symphony` user execs it — no root entrypoint (login helpers stay non-root)
-# and no ambient cap leaking to the daemon or other agent-run children. Cover
-# the system bwrap (on PATH) and any bwrap bundled inside the agent CLIs.
-RUN set -eux; \
-    setcap cap_net_admin+ep "$(command -v bwrap)"; \
-    find /usr/lib/node_modules /usr/local/lib/node_modules -name bwrap -type f \
-        -exec setcap cap_net_admin+ep {} \;
+    && command -v git && command -v uv && command -v node
 
 # Non-root runtime user; ~ is /home/symphony so config's ~/.claude etc. resolve.
 RUN useradd --create-home --shell /bin/bash symphony

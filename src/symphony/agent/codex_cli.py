@@ -23,6 +23,16 @@ CODEX_APPROVAL_POLICY_CONFIG = 'approval_policy="never"'
 # Operation not permitted". `.codex`/`.agents` are pinned read-only so an
 # unattended agent can't rewrite the control dirs (its own config/instructions)
 # that drive later runs in the same checkout.
+#
+# Network is ENABLED for the agent sandbox. With it disabled, codex's OS sandbox
+# unshares a network namespace and brings up loopback (RTM_NEWADDR) — which
+# fails inside our container ("bwrap: loopback: Failed RTM_NEWADDR: Operation
+# not permitted"): a non-root process can't configure the fresh netns, and the
+# capability can't be handed to bwrap (bounding-set caps aren't effective for a
+# non-root exec, and bwrap rejects file caps on Debian's non-setuid build). The
+# container is already the network/isolation boundary (127.0.0.1-only daemon,
+# per-binding env allowlist), so the agent shares it instead of nesting another
+# isolated netns.
 SYMPHONY_PERMISSIONS_PROFILE_TOML = f"""
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem]
 ":root" = "read"
@@ -35,7 +45,7 @@ SYMPHONY_PERMISSIONS_PROFILE_TOML = f"""
 ".agents" = "read"
 
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
-enabled = false
+enabled = true
 """.strip()
 
 # Legacy filesystem token that Codex < 0.136 used to scope writes to the project

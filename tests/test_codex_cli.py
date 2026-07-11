@@ -76,7 +76,9 @@ def test_ensure_symphony_permissions_profile_creates_missing_config(
     assert profile["filesystem"][":root"] == "read"
     assert profile["filesystem"]["/tmp"] == "write"
     assert ":project_roots" not in profile["filesystem"]
-    assert profile["network"]["enabled"] is False
+    # Network is enabled: the container is the isolation boundary; codex's own
+    # net-namespace isolation can't bring up loopback in our container.
+    assert profile["network"]["enabled"] is True
     # Codex >= 0.143 refuses to load a config with [permissions] tables unless a
     # top-level default_permissions is set; it must point at our profile.
     assert parsed["default_permissions"] == SYMPHONY_PERMISSIONS_PROFILE
@@ -162,7 +164,8 @@ enabled = false
     profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
     assert profile["filesystem"][":workspace_roots"]["."] == "write"
     assert profile["filesystem"][":workspace_roots"][".git"] == "write"
-    assert profile["network"]["enabled"] is False
+    # Rewritten to the canonical profile, which now enables network (see above).
+    assert profile["network"]["enabled"] is True
 
 
 def test_ensure_symphony_permissions_profile_migrates_quoted_legacy_header(
