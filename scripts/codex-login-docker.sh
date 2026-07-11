@@ -20,6 +20,10 @@
 # automatically) and complete login; the token lands in the codex_auth
 # volume. Verify:
 #   docker compose run --rm --entrypoint codex symphony login status
+#
+# Remote VPS: run the same script through an SSH tunnel so the browser's
+# localhost:1455 redirect lands on the VPS:
+#   ssh -L 1455:localhost:1455 <vps>   # then run this script on the VPS
 set -euo pipefail
 
 VOLUME="${CODEX_AUTH_VOLUME:-symphony_codex_auth}"
