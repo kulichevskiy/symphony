@@ -817,12 +817,19 @@ class _ReviewMixin(_OrchestratorBase):
     def _schedule_review_poll(
         self, run: db.runs.Run, binding: RepoBinding, issue: LinearIssue
     ) -> asyncio.Task[None]:
+        # Key the in-memory monitor by the storage issue id (`run.issue_id`),
+        # not the tracker id (`issue.id`). They differ for contextual /
+        # provider-collision rows, and slash polling / webhooks resolve commands
+        # against storage ids — so keying by the tracker id would strand
+        # `$skip-review`/`$retry` on resurrected monitors for those issues.
         self._review_poll_run_ids.add(run.id)
-        self._review_poll_issue_ids[issue.id] = run.id
+        self._review_poll_issue_ids[run.issue_id] = run.id
         task = asyncio.create_task(self._poll_review_run_with_limits(run, binding, issue))
         self._review_poll_tasks.add(task)
         self._review_poll_run_tasks[run.id] = task
-        task.add_done_callback(partial(self._review_poll_done, run_id=run.id, issue_id=issue.id))
+        task.add_done_callback(
+            partial(self._review_poll_done, run_id=run.id, issue_id=run.issue_id)
+        )
         return task
 
     async def _mark_review_rearm_retry(self, run_id: str) -> None:

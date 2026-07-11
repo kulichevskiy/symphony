@@ -1987,20 +1987,30 @@ class _MergeMixin(_OrchestratorBase):
         assert pre.view is not None
         view = pre.view
 
-        try:
-            verdict = await self._review_verdict_for_pr(
-                binding=binding,
-                pr_number=candidate.pr_number,
-                view=view,
-            )
-        except GitHubError as e:
-            log.warning(
-                "could not classify review for %s#%d: %s",
-                binding.github_repo,
-                candidate.pr_number,
-                e,
-            )
-            return []
+        # A persisted `$skip-review` on a remote-review binding already waived
+        # the Codex verdict. Don't re-fetch reviews/comments/reactions for it —
+        # the immediate `$skip-review` path schedules merge without classifying,
+        # so a failed review-only API call here must not strand the bypassed PR
+        # in the merge poll forever. This is the restart-recovery path for a
+        # bypass persisted before `_schedule_merge` created the merge run.
+        review_waived = candidate.review_bypassed and binding.resolved_remote_review()
+        if review_waived:
+            verdict = Verdict(kind=VerdictKind.PENDING, rule="review_waived")
+        else:
+            try:
+                verdict = await self._review_verdict_for_pr(
+                    binding=binding,
+                    pr_number=candidate.pr_number,
+                    view=view,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not classify review for %s#%d: %s",
+                    binding.github_repo,
+                    candidate.pr_number,
+                    e,
+                )
+                return []
 
         head_sha = str(view.get("headRefOid") or "")
         readiness = await self._merge_candidate_no_signal_readiness(
@@ -2009,6 +2019,7 @@ class _MergeMixin(_OrchestratorBase):
             verdict=verdict,
             view=view,
             head_sha=head_sha,
+            review_waived=review_waived,
         )
 
         gated = await self._gate_no_signal_merge_on_ci(
@@ -2216,6 +2227,7 @@ class _MergeMixin(_OrchestratorBase):
         verdict: Verdict,
         view: dict[str, object],
         head_sha: str,
+        review_waived: bool = False,
     ) -> _NoSignalMergeReadiness:
         """Whether a clean no_signal head is merge-ready via conflict-fix or bypass."""
         no_signal_mergeable = (
@@ -2241,7 +2253,13 @@ class _MergeMixin(_OrchestratorBase):
         # completed local-review loop; no-review bindings (false/false)
         # gate on CI alone.
         review_bypass_ready = False
-        if no_signal_mergeable and not binding.resolved_remote_review():
+        if review_waived:
+            # Per-PR `$skip-review` on a remote-review binding: the operator
+            # deliberately waived the Codex verdict. Still require a clean
+            # mergeable verdict so a transient UNKNOWN/BLOCKED isn't raced into
+            # a failed merge that parks the PR; CI is gated downstream.
+            review_bypass_ready = str(view.get("mergeable") or "").upper() == "MERGEABLE"
+        elif no_signal_mergeable and not binding.resolved_remote_review():
             review_bypass_ready = (
                 not binding.resolved_local_review()
                 or await self._local_review_completed_for_issue(candidate)

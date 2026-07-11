@@ -380,7 +380,12 @@ async def reconcile(
                 kind="orphaned",
                 detail="Host restarted; pidless review monitor orphaned",
             )
-            await _preserve_pidless_review_retry_path(conn, run, created_at=now)
+            # A `$skip-review`d PR is excluded from the resurrection query by
+            # design — don't fall back to a `review_failed` operator wait, which
+            # would keep it out of merge polling. Make the run terminal and let
+            # `_poll_merge_candidates` pick the bypassed PR up.
+            if not await db.issue_prs.has_open_bypassed_pr(conn, issue_id=run.issue_id):
+                await _preserve_pidless_review_retry_path(conn, run, created_at=now)
         await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
 

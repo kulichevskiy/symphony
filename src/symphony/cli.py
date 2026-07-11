@@ -258,6 +258,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
                 await orch.warmup()
+                await orch.startup_reconcile(reason="once")
                 await orch._tick()  # pylint: disable=protected-access
                 await orch.drain_dispatch_tasks()
                 return
