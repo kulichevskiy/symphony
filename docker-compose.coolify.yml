@@ -7,16 +7,16 @@
 #     127.0.0.1:443, which would EADDRINUSE against Traefik's 0.0.0.0:443.)
 #   * Caddy uses Caddyfile.coolify (`:80`, `auto_https off`) instead of the
 #     local `localhost { tls internal }` site.
-#   * `.env` and `config.local.yaml` are declared as relative file bind
-#     mounts below. Both are gitignored (absent from Coolify's clone), but
-#     Coolify parses compose file mounts, creates the files under the
-#     resource's data dir, and exposes their CONTENT for editing in the UI
-#     (service → Storages) — paste the real contents there before the first
-#     deploy. Do NOT move secrets into Coolify's env-vars UI: env vars land
-#     in the container's os.environ, and LocalRunner starts agents with
-#     {**os.environ, ...} — every agent would inherit every token, bypassing
-#     the per-binding `env:` allowlist. The mounted-file path keeps secrets
-#     out of the process env.
+#   * `.env` and `config.local.yaml` are declared as long-form bind mounts
+#     with `content:` — Coolify's file-mount extension (it creates the files
+#     and exposes the content for editing in the service's Storages UI).
+#     Paste the real contents there before the first deploy. Because
+#     `content:` is a Coolify extension, this file does NOT pass a plain
+#     `docker compose config` — it is only deployable through Coolify.
+#     Do NOT move secrets into Coolify's env-vars UI: env vars land in the
+#     container's os.environ and leak into agent subprocesses past the
+#     per-binding `env:` allowlist; the mounted-file path keeps secrets out
+#     of the process env.
 #   * SYMPHONY_REQUIRE_AUTH0=1 makes the daemon fail closed at boot if the
 #     AUTH0_* triple is missing from .env — this variant is publicly routed,
 #     and without the gate /api/* (including the mutating
@@ -58,10 +58,27 @@ services:
       # publicly routed (see header). Non-secret flag; safe in os.environ.
       SYMPHONY_REQUIRE_AUTH0: "1"
     volumes:
-      # Operator config + secrets — file mounts whose content is edited in
-      # Coolify's Storages UI (see the header comment; both are gitignored).
-      - ./config.local.yaml:/app/config.local.yaml:ro
-      - ./.env:/app/.env:ro
+      # Operator config + secrets. Long-form bind mounts with `content:` —
+      # Coolify's file-mount syntax (docs: knowledge-base/docker/compose#storage):
+      # it creates each file with this placeholder content and exposes it for
+      # editing in the service's Storages UI. Short-form `./file:/path` would
+      # NOT create editable file content on a from-git deploy (both files are
+      # gitignored) — Docker would mount empty dirs and the daemon dies on
+      # `--config`. Paste the real contents in the UI before the first deploy.
+      - type: bind
+        source: ./config.local.yaml
+        target: /app/config.local.yaml
+        read_only: true
+        content: |
+          # REPLACE via Coolify Storages UI with your real config.local.yaml
+          # (shape: examples/config.docker.yaml — /data paths are set there).
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        read_only: true
+        content: |
+          # REPLACE via Coolify Storages UI with your real .env (secrets:
+          # LINEAR_API_KEY, LINEAR_WEBHOOK_SECRET, AUTH0_*, TELEGRAM_*).
       # CLI auth dirs — persisted, so a one-time login survives redeploys.
       - claude_auth:/home/symphony/.claude
       - codex_auth:/home/symphony/.codex

@@ -442,3 +442,31 @@ async def test_runner_kill_terminates(tmp_path: Path) -> None:
 
 async def _collect_events(runner: LocalRunner, spec: RunnerSpec) -> list[RunnerEvent]:
     return [ev async for ev in runner.run(spec)]
+
+
+@pytest.mark.asyncio
+async def test_runner_scrubs_symphony_env_from_agent(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Deployment flags (SYMPHONY_*) must not leak into agent subprocesses: an
+    agent working on this repo would otherwise inherit e.g.
+    SYMPHONY_REQUIRE_AUTH0=1 from the Coolify daemon and its own test runs of
+    unauthenticated UI mode would fail. Per-binding spec.env still wins."""
+    monkeypatch.setenv("SYMPHONY_REQUIRE_AUTH0", "1")
+    monkeypatch.setenv("SYMPHONY_DEPLOY_FLAG", "x")
+    monkeypatch.setenv("UNRELATED_VAR", "keep-me")
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-env",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            'printf "%s|%s|%s|%s\\n" "${SYMPHONY_REQUIRE_AUTH0:-unset}" '
+            '"${SYMPHONY_DEPLOY_FLAG:-unset}" "${UNRELATED_VAR:-unset}" '
+            '"${FROM_SPEC:-unset}"',
+        ],
+        stall_secs=10,
+        env={"FROM_SPEC": "spec-wins"},
+    )
+    events = [ev async for ev in runner.run(spec)]
+    lines = [ev.line for ev in events if ev.kind == "stdout"]
+    assert lines == ["unset|unset|keep-me|spec-wins"]

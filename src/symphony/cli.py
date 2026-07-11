@@ -246,11 +246,34 @@ def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
         asyncio.run(_run(config_path, once=once))
 
 
+def _enforce_require_auth0(cfg: Config) -> None:
+    """Fail closed BEFORE any state mutation when a publicly-routed deploy
+    (SYMPHONY_REQUIRE_AUTH0=1, set by docker-compose.coolify.yml) lacks Auth0
+    config. The startup `reconcile` posts tracker comments and flips run rows,
+    so the create_app-level guard alone would let a misconfigured public deploy
+    mutate Linear/local state once per restart before dying.
+    """
+    if (
+        cfg.ui.enabled
+        and os.environ.get("SYMPHONY_REQUIRE_AUTH0", "").strip() not in ("", "0", "false")
+        and _auth0_settings(cfg) is None
+    ):
+        click.echo(
+            "SYMPHONY_REQUIRE_AUTH0 is set but AUTH0_DOMAIN/AUTH0_CLIENT_ID/"
+            "AUTH0_ALLOWED_EMAILS are not configured — refusing to start a "
+            "public deployment with an unauthenticated UI/API. Set all three "
+            "in .env, or unset SYMPHONY_REQUIRE_AUTH0 for a local-only stack.",
+            err=True,
+        )
+        sys.exit(2)
+
+
 async def _run(config_path: Path, *, once: bool) -> None:
     cfg = Config.load(config_path)
     if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
         sys.exit(2)
+    _enforce_require_auth0(cfg)
     async with _configured_tracker_registry(cfg) as (trackers, external_linear):
         conn = await db.connect(cfg.db_path)
         try:
