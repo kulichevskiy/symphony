@@ -61,3 +61,17 @@ def test_readme_documents_review_venues_and_role_knobs() -> None:
     assert "defaults to the opposite agent family" in text
     assert "remote reviewer is the `@codex` GitHub bot" in text
     assert "`review_strategy`" not in text
+
+
+def test_readme_watch_progress_points_at_web_dashboard() -> None:
+    text = _read("README.md")
+
+    section = text.split("### Watch progress", 1)[1].split("###", 1)[0]
+
+    # Linear framing stays first.
+    assert section.index("Linear is the main screen") < section.index("/ui/")
+    # Dashboard at /ui/ behind the Auth0 gate.
+    assert "Auth0" in section
+    # One-sentence capability summary.
+    for capability in ("active issues", "live", "pause"):
+        assert capability in section
