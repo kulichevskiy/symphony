@@ -23,10 +23,6 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from symphony import db
-from symphony.agent.codex_cli import (
-    CODEX_APPROVAL_POLICY_CONFIG,
-    CODEX_DEFAULT_PERMISSIONS_CONFIG,
-)
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.client import CheckRun, GitHub, GitHubError, PRChecks
@@ -705,13 +701,11 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
             "exec",
             "--json",
         ]
+        assert "--dangerously-bypass-approvals-and-sandbox" in command
         assert "--sandbox" not in command
         assert "workspace-write" not in command
-        configs = [command[i + 1] for i, arg in enumerate(command) if arg == "--config"]
-        assert configs == [
-            CODEX_DEFAULT_PERMISSIONS_CONFIG,
-            CODEX_APPROVAL_POLICY_CONFIG,
-        ]
+        # Permissions/approval --config knobs are gone (superseded by the bypass).
+        assert not any("default_permissions" in a or "approval_policy" in a for a in command)
         assert command[command.index("--model") + 1] == "gpt-5.1-codex-max"
         prompt = command[-1]
         assert prompt.startswith("# Failing check log tail")
@@ -2356,13 +2350,10 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex(
         "exec",
         "--json",
     ]
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert "--sandbox" not in argv
     assert "workspace-write" not in argv
-    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
-    assert configs == [
-        CODEX_DEFAULT_PERMISSIONS_CONFIG,
-        CODEX_APPROVAL_POLICY_CONFIG,
-    ]
+    assert "--config" not in argv
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
     assert "fix this" in argv
 
@@ -2395,13 +2386,10 @@ def test_build_runner_command_allows_git_writes_for_codex_implement(
         "implement this",
         workspace_path=tmp_path,
     )
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert "--sandbox" not in argv
     assert "workspace-write" not in argv
-    configs = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--config"]
-    assert configs == [
-        CODEX_DEFAULT_PERMISSIONS_CONFIG,
-        CODEX_APPROVAL_POLICY_CONFIG,
-    ]
+    assert "--config" not in argv
     assert argv[-1] == "implement this"
 
 

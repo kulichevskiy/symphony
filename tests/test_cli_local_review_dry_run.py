@@ -96,8 +96,10 @@ def test_dry_run_approved_prints_verdict_and_no_findings(tmp_path: Path, monkeyp
     # `build_local_review_command(agent='codex')`.
     assert captured.spec is not None
     assert captured.spec.command[:2] == ["codex", "exec"]
-    assert "--sandbox" in captured.spec.command
-    assert "read-only" in captured.spec.command
+    # codex's nested OS sandbox is bypassed (bwrap can't init in our container);
+    # the container is the isolation boundary.
+    assert "--dangerously-bypass-approvals-and-sandbox" in captured.spec.command
+    assert "--sandbox" not in captured.spec.command
 
 
 def test_dry_run_changes_requested_prints_findings(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -907,11 +907,9 @@ async def test_local_strategy_approved_skips_codex_review(tmp_path: Path) -> Non
         stages = [s.stage for s in runner.captured]
         assert stages == ["implement", "local_review"]
         assert runner.captured[1].command[:2] == ["codex", "exec"]
-        assert "--sandbox" in runner.captured[1].command
-        assert (
-            runner.captured[1].command[runner.captured[1].command.index("--sandbox") + 1]
-            == "read-only"
-        )
+        # codex's nested OS sandbox is bypassed (container is the boundary).
+        assert "--dangerously-bypass-approvals-and-sandbox" in runner.captured[1].command
+        assert "--sandbox" not in runner.captured[1].command
 
         # PR was still opened.
         gh.ensure_pr.assert_awaited_once()

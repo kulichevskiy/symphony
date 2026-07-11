@@ -594,8 +594,11 @@ def build_local_review_command(
         command = [
             "codex",
             "exec",
-            "--sandbox",
-            "workspace-write" if pass_two else "read-only",
+            # codex's OS sandbox (bubblewrap) can't initialize nested inside our
+            # container, so bypass it — the container is the isolation boundary.
+            # Pass 1's read-only intent is carried by the prompt, not enforced by
+            # the sandbox (pass_two still gates the write/execute *prompt*).
+            "--dangerously-bypass-approvals-and-sandbox",
             "--json",
             "--model",
             codex_model,

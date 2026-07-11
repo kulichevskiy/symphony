@@ -13,10 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from symphony.agent.codex_cli import (
-    CODEX_APPROVAL_POLICY_CONFIG,
-    CODEX_DEFAULT_PERMISSIONS_CONFIG,
-)
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -182,8 +178,9 @@ async def test_first_review_approves_and_session_returns_approved(
     assert spec.stage == "local_review"
     assert spec.run_id == "run-abc-rev-0"
     assert spec.command[:2] == ["codex", "exec"]
-    assert "--sandbox" in spec.command
-    assert spec.command[spec.command.index("--sandbox") + 1] == "read-only"
+    # codex's nested OS sandbox is bypassed (container is the boundary).
+    assert "--dangerously-bypass-approvals-and-sandbox" in spec.command
+    assert "--sandbox" not in spec.command
     # `--base` is not a flag — base branch is threaded into the prompt
     # body (codex 0.130 forbids `--base` with `[PROMPT]`).
     assert "--base" not in spec.command
@@ -479,13 +476,11 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
 
     assert result.outcome == LoopOutcome.APPROVED
     fix_argv = runner.specs[1].command
+    assert "--dangerously-bypass-approvals-and-sandbox" in fix_argv
     assert "--sandbox" not in fix_argv
     assert "workspace-write" not in fix_argv
-    configs = [fix_argv[i + 1] for i, arg in enumerate(fix_argv) if arg == "--config"]
-    assert configs == [
-        CODEX_DEFAULT_PERMISSIONS_CONFIG,
-        CODEX_APPROVAL_POLICY_CONFIG,
-    ]
+    # Permissions/approval --config knobs are gone (superseded by the bypass).
+    assert not any("default_permissions" in a or "approval_policy" in a for a in fix_argv)
 
 
 @pytest.mark.asyncio
@@ -1300,15 +1295,20 @@ async def test_pass_two_verifier_gets_tier_b_command(
     finder_argv = runner.specs[0].command
     verifier_argv = runner.specs[1].command
 
-    # Pass 1 (finder, reviewer family) is read-only.
+    # Pass 1 (finder, reviewer family) is read-only. codex's sandbox is bypassed
+    # (container is the boundary), so read-only intent is prompt-carried, not a
+    # `--sandbox` flag.
     if reviewer_agent == "codex":
-        assert finder_argv[finder_argv.index("--sandbox") + 1] == "read-only"
+        assert "--dangerously-bypass-approvals-and-sandbox" in finder_argv
+        assert "--sandbox" not in finder_argv
     else:
         assert "Write" not in finder_argv[finder_argv.index("--tools") + 1]
 
-    # Pass 2 (verifier, implementer family) gets Tier B grants.
+    # Pass 2 (verifier, implementer family) gets Tier B grants. For codex the
+    # write/execute intent is prompt-carried; the argv carries no `--sandbox`.
     if implementer_agent == "codex":
-        assert verifier_argv[verifier_argv.index("--sandbox") + 1] == "workspace-write"
+        assert "--dangerously-bypass-approvals-and-sandbox" in verifier_argv
+        assert "--sandbox" not in verifier_argv
     else:
         assert "Write" in verifier_argv[verifier_argv.index("--tools") + 1]
         assert "uv run pytest" in verifier_argv[verifier_argv.index("--allowedTools") + 1]
@@ -1368,8 +1368,8 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
     async def diff_size(_: Path) -> DiffSize:
         return DiffSize(changed_lines=500, changed_files=10)
 
-    async def scrubber(ws: Path) -> None:
-        events.append(("scrub", ws))
+    async def scrubber(ws: Path, target_sha: str) -> None:
+        events.append(("scrub", target_sha))
         if throwaway.exists():
             throwaway.unlink()
 
@@ -1397,6 +1397,8 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
     kinds = [e[0] for e in events]
     assert ("verify_wrote", True) in events
     assert "scrub" in kinds
+    # The scrub resets to the pre-review HEAD (discarding reviewer commits too).
+    assert ("scrub", "sha-1") in events
     # The fixer must have observed a clean tree.
     assert ("fix_saw_throwaway", False) in events
     # Scrub strictly precedes the fixer.
