@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -158,6 +159,8 @@ async def test_tees_stdout_and_stderr_to_log_path(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_no_log_path_writes_nothing(tmp_path: Path) -> None:
-    runner = _FakeRunner([RunnerEvent(kind="stdout", line="x"), RunnerEvent(kind="exit", returncode=0)])
+    runner = _FakeRunner(
+        [RunnerEvent(kind="stdout", line="x"), RunnerEvent(kind="exit", returncode=0)]
+    )
     await collect_runner_output(runner, _spec())
-    assert list(tmp_path.iterdir()) == []
+    assert os.listdir(tmp_path) == []
