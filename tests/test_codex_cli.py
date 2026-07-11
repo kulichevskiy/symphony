@@ -76,7 +76,9 @@ def test_ensure_symphony_permissions_profile_creates_missing_config(
     assert profile["filesystem"][":root"] == "read"
     assert profile["filesystem"]["/tmp"] == "write"
     assert ":project_roots" not in profile["filesystem"]
-    assert profile["network"]["enabled"] is False
+    # Network is enabled: the container is the isolation boundary; codex's own
+    # net-namespace isolation can't bring up loopback in our container.
+    assert profile["network"]["enabled"] is True
     # Codex >= 0.143 refuses to load a config with [permissions] tables unless a
     # top-level default_permissions is set; it must point at our profile.
     assert parsed["default_permissions"] == SYMPHONY_PERMISSIONS_PROFILE
@@ -109,12 +111,14 @@ def test_ensure_symphony_permissions_profile_backfills_missing_default_permissio
     # The key is backfilled — pointing at our profile — while the profile tables
     # are left intact.
     config_path = tmp_path / "config.toml"
+    # Current + network-enabled profile (so it stays on the pure-backfill path;
+    # a network-disabled profile is instead rewritten — see the migration test).
     existing = f"""
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":workspace_roots"]
 "." = "write"
 
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
-enabled = false
+enabled = true
 """.lstrip()
     config_path.write_text(existing, encoding="utf-8")
 
@@ -127,7 +131,37 @@ enabled = false
     # Profile tables preserved (only the root key was added).
     profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
     assert profile["filesystem"][":workspace_roots"]["."] == "write"
-    assert profile["network"]["enabled"] is False
+    assert profile["network"]["enabled"] is True
+
+
+def test_ensure_symphony_permissions_profile_migrates_network_disabled(
+    tmp_path: Path,
+) -> None:
+    # An older Symphony wrote a structurally-current profile with network
+    # disabled. Its net-isolated sandbox can't bring up loopback in our
+    # container, so the profile must be rewritten to enable network rather than
+    # preserved — otherwise the deployed instance keeps the broken setting.
+    config_path = tmp_path / "config.toml"
+    existing = f"""
+default_permissions="{SYMPHONY_PERMISSIONS_PROFILE}"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.filesystem.":workspace_roots"]
+"." = "write"
+".git" = "write"
+
+[permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
+enabled = false
+""".lstrip()
+    config_path.write_text(existing, encoding="utf-8")
+
+    path, created = ensure_symphony_permissions_profile(config_path)
+
+    assert path == config_path
+    assert created is True
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
+    assert profile["network"]["enabled"] is True
+    assert profile["filesystem"][":workspace_roots"][".git"] == "write"
 
 
 def test_ensure_symphony_permissions_profile_migrates_legacy_project_roots(
@@ -162,7 +196,8 @@ enabled = false
     profile = parsed["permissions"][SYMPHONY_PERMISSIONS_PROFILE]
     assert profile["filesystem"][":workspace_roots"]["."] == "write"
     assert profile["filesystem"][":workspace_roots"][".git"] == "write"
-    assert profile["network"]["enabled"] is False
+    # Rewritten to the canonical profile, which now enables network (see above).
+    assert profile["network"]["enabled"] is True
 
 
 def test_ensure_symphony_permissions_profile_migrates_quoted_legacy_header(
@@ -215,7 +250,7 @@ default_permissions="{SYMPHONY_PERMISSIONS_PROFILE}"
 ":workspace_roots" = "write"
 
 [permissions.{SYMPHONY_PERMISSIONS_PROFILE}.network]
-enabled = false
+enabled = true
 """.lstrip()
     config_path.write_text(existing, encoding="utf-8")
 
