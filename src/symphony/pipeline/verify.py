@@ -112,9 +112,7 @@ def _fix_log_note(text: str) -> str:
     trip `parse_event_line`'s usage parsing, which would otherwise emit a
     spurious all-zero token tick alongside the message.
     """
-    return json.dumps(
-        {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
-    )
+    return json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
 
 
 def _verify_fix_trigger(verify_cmd: str, tail: str) -> str:
