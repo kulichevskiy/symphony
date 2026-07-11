@@ -7,6 +7,7 @@ import {
   ConfirmBar,
   FinalLogCard,
   pickDefaultRun,
+  pickLiveRun,
   PrCard,
   StageSpendCard,
   TokensCard,
@@ -318,6 +319,54 @@ describe("pickDefaultRun", () => {
     ];
     expect(pickDefaultRun(runs)?.id).toBe("r-impl-fail");
   });
+
+  it("skips a superseded duplicate for the older surviving run", () => {
+    // Startup reconcile marks the younger duplicate of a collapsed live run
+    // "superseded" — pure bookkeeping that must not shadow the survivor once
+    // it later completes.
+    const runs = [
+      run("implement", { id: "r-dup", status: "superseded", started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-survivor", status: "completed", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-survivor");
+  });
+
+  it("falls back to a superseded run only when nothing else exists", () => {
+    const runs = [run("implement", { id: "r-only", status: "superseded" })];
+    expect(pickDefaultRun(runs)?.id).toBe("r-only");
+  });
+});
+
+describe("pickLiveRun", () => {
+  it("prefers a tailable running run over a newer non-streaming running child", () => {
+    // _run_prepush_gates starts a running verify/local_review child before
+    // the parent implement row is marked completed — the newer child must
+    // not shadow the still-running, tailable implement run.
+    const runs = [
+      run("verify", { id: "r-verify", status: "running", started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-impl", status: "running", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    const { live, active } = pickLiveRun(runs);
+    expect(live?.id).toBe("r-impl");
+    expect(active?.id).toBe("r-impl");
+  });
+
+  it("falls back to the newest running row when none are tailable", () => {
+    const runs = [
+      run("review", { id: "r-review", status: "running", started_at: "2026-06-07T13:00:00Z" }),
+      run("acceptance", { id: "r-acc", status: "running", started_at: "2026-06-07T12:00:00Z" }),
+    ];
+    const { live, active } = pickLiveRun(runs);
+    expect(live).toBeNull();
+    expect(active?.id).toBe("r-review");
+  });
+
+  it("returns both null when nothing is running", () => {
+    const runs = [run("implement", { id: "r-done", status: "completed" })];
+    const { live, active } = pickLiveRun(runs);
+    expect(live).toBeNull();
+    expect(active).toBeNull();
+  });
 });
 
 describe("FinalLogCard", () => {
@@ -382,7 +431,12 @@ describe("FinalLogCard", () => {
     expect(markup).not.toContain("no per-run log");
   });
 
-  it("shows the empty state for a verify run that never attempted a fix (no tokens)", () => {
+  it("still drains a failed verify run with zero tokens instead of assuming no log", () => {
+    // A fix turn that stalls or times out writes fix_log_path (verify.py
+    // writes stdout unconditionally once the fix turn runs) without ever
+    // emitting a parseable usage event, so token counts alone can't tell
+    // "no fix ran" apart from "fix ran but never reported usage" — the
+    // viewer must attempt the drain rather than assume there's no log.
     const runs = [
       run("verify", {
         id: "r-verify",
@@ -392,7 +446,8 @@ describe("FinalLogCard", () => {
       }),
     ];
     const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("no per-run log");
+    expect(markup).toContain("final log — verify, failed");
+    expect(markup).not.toContain("no per-run log");
   });
 
   it("renders nothing when the issue has no runs", () => {
