@@ -1,0 +1,88 @@
+# Coolify deployment of the symphony stack. Differences from the local
+# docker-compose.yml:
+#
+#   * No host port publishing: Coolify's proxy (Traefik) owns 80/443 on the
+#     server and terminates TLS for the public domain, forwarding to caddy:80
+#     over the `coolify` docker network. (The local file publishes
+#     127.0.0.1:443, which would EADDRINUSE against Traefik's 0.0.0.0:443.)
+#   * Caddy uses Caddyfile.coolify (`:80`, `auto_https off`) instead of the
+#     local `localhost { tls internal }` site.
+#   * `.env` and `config.local.yaml` are NOT bind-mounted from the checkout —
+#     both are gitignored, so they don't exist in Coolify's clone. Provide
+#     them as Coolify **file mounts** (Storages → Add File Mount on the
+#     `symphony` service): paste the contents, mount at /app/.env and
+#     /app/config.local.yaml. Do NOT use Coolify's env-vars UI for secrets:
+#     env vars land in the container's os.environ, and LocalRunner starts
+#     agents with {**os.environ, ...} — every agent would inherit every
+#     token, bypassing the per-binding `env:` allowlist. The mounted-file
+#     path keeps secrets out of the process env.
+#   * caddy joins the external `coolify` network so Traefik can reach it.
+#     Turn OFF "Connect To Predefined Network" for this resource: Coolify
+#     would otherwise inject its network into every service, which conflicts
+#     with `network_mode: service:caddy` on the symphony service.
+#
+# The caddy⇄symphony topology is unchanged from the local stack: caddy owns
+# the network namespace, symphony joins it, and the daemon's 127.0.0.1:8787
+# surface (a security invariant) is reachable only by caddy over loopback.
+#
+# One-time CLI logins after the first deploy (over ssh to the server; the
+# named volumes persist across redeploys) — find the real volume/image names
+# with `docker volume ls` / `docker ps` (Coolify prefixes them):
+#   claude: docker run --rm -it -v <claude_auth-vol>:/home/symphony/.claude \
+#             --entrypoint claude <image> auth login        # paste-back code
+#   gh:     docker run --rm -it -v <gh_auth-vol>:/home/symphony/.config/gh \
+#             --entrypoint gh <image> auth login --git-protocol https --web
+#   codex:  ssh -L 1455:localhost:1455 <server>, then on the server:
+#             CODEX_AUTH_VOLUME=<codex_auth-vol> SYMPHONY_IMAGE=<image> \
+#               ./scripts/codex-login-docker.sh
+#           (default `codex login --device-auth` if your org allows it)
+
+services:
+  symphony:
+    build: .
+    restart: unless-stopped
+    # Join caddy's network namespace: the daemon's 127.0.0.1:8787 http surface
+    # is then reachable by caddy over loopback, without exposing it anywhere.
+    network_mode: "service:caddy"
+    depends_on:
+      - caddy
+    volumes:
+      # CLI auth dirs — persisted, so a one-time login survives redeploys.
+      - claude_auth:/home/symphony/.claude
+      - codex_auth:/home/symphony/.codex
+      - gh_auth:/home/symphony/.config/gh
+      # Daemon state: SQLite DB, per-issue workspaces, run logs.
+      - symphony_db:/data/db
+      - symphony_workspaces:/data/workspaces
+      - symphony_logs:/data/logs
+      # /app/.env and /app/config.local.yaml come from Coolify file mounts —
+      # see the header comment.
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    # Reachable by Coolify's proxy on :80 over the shared docker network;
+    # no host ports (Traefik owns 80/443 and terminates TLS).
+    expose:
+      - "80"
+    networks:
+      - default
+      - coolify
+    volumes:
+      - ./Caddyfile.coolify:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+networks:
+  coolify:
+    external: true
+
+volumes:
+  claude_auth:
+  codex_auth:
+  gh_auth:
+  symphony_db:
+  symphony_workspaces:
+  symphony_logs:
+  caddy_data:
+  caddy_config:
