@@ -5,13 +5,15 @@ import {
   aggregateRunsByStage,
   CmdButton,
   ConfirmBar,
+  FinalLogCard,
+  pickDefaultRun,
   PrCard,
   StageSpendCard,
   TokensCard,
 } from "./IssuePage";
 import { applicability, COMMANDS } from "./issueControls";
 
-function run(stage: string, tok: Partial<Record<string, number>>) {
+function run(stage: string, tok: Partial<Record<string, number | string | null>>) {
   return {
     id: stage + Math.random(),
     stage,
@@ -259,6 +261,69 @@ describe("StageSpendCard", () => {
     // Table shows raw token categories with exact per-run sums.
     expect(markup).toContain("CACHE-WRITE");
     expect(markup).toContain('title="150">150</span>');
+  });
+});
+
+describe("pickDefaultRun", () => {
+  it("surfaces the most-recent failed/interrupted run, even under a newer success", () => {
+    const runs = [
+      run("merge", { id: "r-merge", status: "done", started_at: "2026-06-07T13:00:00Z" }),
+      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z" }),
+      run("implement", { id: "r-old-fail", status: "interrupted", started_at: "2026-06-07T09:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-fail");
+  });
+
+  it("falls back to the most-recent run when none failed", () => {
+    const runs = [
+      run("implement", { id: "r-old", status: "done", started_at: "2026-06-07T09:00:00Z" }),
+      run("merge", { id: "r-new", status: "done", started_at: "2026-06-07T13:00:00Z" }),
+    ];
+    expect(pickDefaultRun(runs)?.id).toBe("r-new");
+  });
+
+  it("returns null for no runs", () => {
+    expect(pickDefaultRun([])).toBeNull();
+  });
+});
+
+describe("FinalLogCard", () => {
+  it("opens the failed run's final log by default, clearly labelled", () => {
+    const runs = [
+      run("merge", { id: "r-merge", status: "done", started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
+      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
+    ];
+    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    expect(markup).toContain("final log — implement, failed");
+  });
+
+  it("lists every run in the picker with stage, status and duration", () => {
+    const runs = [
+      run("merge", { id: "r-merge", status: "done", started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:00:30Z" }),
+      run("implement", { id: "r-fail", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
+    ];
+    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    expect(markup).toContain("Merge");
+    expect(markup).toContain("Implement");
+    expect(markup).toContain("done");
+    expect(markup).toContain("failed");
+    // Duration is rendered per run (merge ran 30s, implement 5m).
+    expect(markup).toContain("30s");
+    expect(markup).toContain("5m 0s");
+  });
+
+  it("explains the empty state for a NON_STREAMING stage instead of a spinner", () => {
+    const runs = [
+      run("local_review", { id: "r-lr", status: "failed", started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:01:00Z" }),
+    ];
+    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    expect(markup).toContain("no per-run log");
+    expect(markup).not.toContain("Waiting for output…");
+  });
+
+  it("renders nothing when the issue has no runs", () => {
+    const markup = renderToStaticMarkup(<FinalLogCard runs={[]} />);
+    expect(markup).toBe("");
   });
 });
 

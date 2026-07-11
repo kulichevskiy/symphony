@@ -816,6 +816,132 @@ const NON_STREAMING_STAGES = new Set([
   "review",
 ]);
 
+type Run = IssueDetail["runs"][number];
+
+// Terminal statuses that mean the run failed or was cut short — the ones an
+// operator most wants to inspect (mirrors runs.py TERMINAL_NON_SUCCESS_STATUSES
+// plus the legacy "halted").
+const FAILED_RUN_STATUSES = new Set(["failed", "interrupted", "needs_approval", "halted"]);
+
+function runsByStartDesc(runs: Run[]): Run[] {
+  return [...runs].sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
+}
+
+/** The run whose final log opens by default: the most-recent failed/interrupted
+ *  run (what the operator usually needs after a park), falling back to the
+ *  most-recent run overall. Null when the issue has no runs. */
+export function pickDefaultRun(runs: Run[]): Run | null {
+  if (!runs.length) return null;
+  const sorted = runsByStartDesc(runs);
+  return sorted.find((r) => FAILED_RUN_STATUSES.has(r.status)) ?? sorted[0];
+}
+
+function formatDuration(startedAt: string, endedAt: string | null): string {
+  if (!endedAt) return "—";
+  const secs = Math.round((Date.parse(endedAt) - Date.parse(startedAt)) / 1000);
+  if (!Number.isFinite(secs) || secs < 0) return "—";
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
+
+const RUN_STATUS_TONE: Record<string, string> = {
+  done: "text-green-600 dark:text-green-400",
+  completed: "text-green-600 dark:text-green-400",
+  failed: "text-red-600 dark:text-red-400",
+  interrupted: "text-red-600 dark:text-red-400",
+  halted: "text-red-600 dark:text-red-400",
+  needs_approval: "text-amber-600 dark:text-amber-400",
+  running: "text-blue-600 dark:text-blue-400",
+};
+
+function RunPicker({
+  runs,
+  selectedId,
+  onSelect,
+}: {
+  runs: Run[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <div className="mb-3 flex flex-col gap-1.5">
+      {runs.map((r) => {
+        const selected = r.id === selectedId;
+        return (
+          <button
+            key={r.id}
+            type="button"
+            onClick={() => onSelect(r.id)}
+            className={cn(
+              "flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border px-3 py-2 text-left text-xs transition-colors",
+              selected
+                ? "border-blue-400 bg-blue-50 dark:border-blue-700 dark:bg-blue-950/40"
+                : "border-border bg-secondary/20 hover:bg-secondary/40",
+            )}
+          >
+            <span className="font-medium capitalize text-foreground">
+              {STAGE_LABEL[r.stage] ?? r.stage}
+            </span>
+            <span className={cn("font-medium", RUN_STATUS_TONE[r.status] ?? "text-muted-foreground")}>
+              {r.status}
+            </span>
+            <span className="ml-auto font-mono text-muted-foreground" title={formatUtc(r.started_at)}>
+              {formatUtc(r.started_at)}
+            </span>
+            <span className="font-mono text-muted-foreground">
+              · {formatDuration(r.started_at, r.ended_at)}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Final-log viewer for a non-running issue: a run picker (stage, status,
+ *  started, duration) over all the issue's runs, defaulting to the most-recent
+ *  failed run, with the selected run's log drained once through the LiveFeed in
+ *  non-live mode. NON_STREAMING_STAGES runs (which write no per-run log) get an
+ *  explanatory empty state instead of a stuck spinner. */
+export function FinalLogCard({ runs }: { runs: Run[] }) {
+  const sorted = runsByStartDesc(runs);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  if (!sorted.length) return null;
+
+  const fallback = pickDefaultRun(sorted)!;
+  const selected = sorted.find((r) => r.id === selectedId) ?? fallback;
+  const nonStreaming = NON_STREAMING_STAGES.has(selected.stage);
+  const stageLabel = STAGE_LABEL[selected.stage] ?? selected.stage;
+
+  return (
+    <CockpitCard
+      title="Final log"
+      aside={
+        <span className="font-mono text-[11px] text-muted-foreground">finished run</span>
+      }
+    >
+      {sorted.length > 1 ? (
+        <RunPicker runs={sorted} selectedId={selected.id} onSelect={setSelectedId} />
+      ) : null}
+      {nonStreaming ? (
+        <div className="rounded-md border border-border bg-secondary/20 px-3 py-6 text-center text-sm text-muted-foreground">
+          <span className="capitalize">{stageLabel}</span> writes no per-run log to
+          tail, so there's nothing to show here.
+        </div>
+      ) : (
+        <LiveFeed
+          key={selected.id}
+          runId={selected.id}
+          active
+          live={false}
+          label={`final log — ${selected.stage}, ${selected.status}`}
+        />
+      )}
+    </CockpitCard>
+  );
+}
+
 export function IssuePage() {
   const { id } = useParams();
   const issueId = id ?? "";
@@ -929,7 +1055,9 @@ export function IssuePage() {
               <CockpitCard title="Live output">
                 <LiveFeed runId={liveRun.id} active />
               </CockpitCard>
-            ) : null}
+            ) : (
+              <FinalLogCard runs={detail.runs} />
+            )}
             <div className="grid gap-4 sm:grid-cols-2">
               <TokensCard c={cockpit} />
               <PrCard pr={cockpit.pr} />
