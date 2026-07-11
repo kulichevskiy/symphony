@@ -85,6 +85,16 @@ async def run_verify_command(
     return proc.returncode == 0, stdout.decode("utf-8", errors="replace")
 
 
+def _write_fix_log(fix_log_path: Path | None, text: str) -> None:
+    if fix_log_path is None:
+        return
+    try:
+        fix_log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+        fix_log_path.write_text(text, encoding="utf-8")  # noqa: ASYNC240
+    except OSError:
+        pass  # per-model attribution is best-effort
+
+
 def _verify_fix_trigger(verify_cmd: str, tail: str) -> str:
     return (
         f"The verify command `{verify_cmd}` failed in the workspace. "
@@ -124,6 +134,7 @@ async def run_verify_session(
     """
     ok, output = await command_runner(workspace_path, verify_cmd, timeout_secs)
     if ok:
+        _write_fix_log(fix_log_path, "verify_cmd passed on first attempt; no fix turn was run.")
         return VerifyResult(ok=True)
 
     tail = output_tail(output)
@@ -155,14 +166,7 @@ async def run_verify_session(
         stage="verify_fix",
     )
     collected = await collect_runner_output(runner, spec, usage_handler=usage_handler)
-    if fix_log_path is not None:
-        try:
-            fix_log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
-            fix_log_path.write_text(  # noqa: ASYNC240
-                collected.stdout, encoding="utf-8"
-            )
-        except OSError:
-            pass  # per-model attribution is best-effort
+    _write_fix_log(fix_log_path, collected.stdout)
     if not collected.ok_exit:
         detail = (
             f"spawn_failed: {collected.spawn_error or 'unknown'}"

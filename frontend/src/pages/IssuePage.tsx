@@ -830,13 +830,10 @@ const SUPERSEDED_STATUS = "superseded";
 
 /** Whether `r` has an actual `<run_id>.log` for LiveFeed to drain, beyond what
  *  `NON_STREAMING_STAGES` alone captures:
- *  - `verify` writes a log only when its fix turn ran (`run_verify_session`
- *    writes `fix_log_path` solely on that branch), but whether a fix turn ran
- *    isn't observable from the run row (a stalled/timed-out fix turn writes
- *    the log without ever emitting a parseable usage event, so token counts
- *    stay zero) — always treat verify as tailable and let the stream drain
- *    to an empty "No output recorded" state when there's truly nothing to
- *    show, rather than guessing from tokens and hiding a real log.
+ *  - `verify` always writes `fix_log_path` (`run_verify_session` writes a
+ *    "passed on first attempt" note when no fix turn ran, else the fix
+ *    turn's stdout), so it's always tailable and never opens to a blank
+ *    "No output recorded" state by default.
  *  - `merge` is usually a real agent run, but `_mark_merge_needs_approval`
  *    also inserts synthetic `stage="merge"` rows purely to park the issue in
  *    Needs Approval, created with `pid=None` and no `_run_stage_command` —

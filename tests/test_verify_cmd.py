@@ -161,6 +161,24 @@ async def test_verify_session_green_first_run_skips_fix_turn() -> None:
 
 
 @pytest.mark.asyncio
+async def test_verify_session_green_first_run_still_writes_fix_log(tmp_path: Path) -> None:
+    """A green verify_cmd on the first attempt must still populate
+    `fix_log_path`, so the UI never opens a `verify` run to a blank log."""
+
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
+        return True, "all green"
+
+    runner = _StagedRunner({})
+    fix_log_path = tmp_path / "verify.log"
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner), fix_log_path=fix_log_path
+    )
+    assert result.ok
+    assert fix_log_path.exists()
+    assert fix_log_path.read_text(encoding="utf-8").strip()
+
+
+@pytest.mark.asyncio
 async def test_verify_session_red_then_fix_then_green() -> None:
     outcomes = [(False, "FAIL src/a.test.ts\nbuild error TS2345"), (True, "ok")]
 
