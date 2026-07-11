@@ -242,6 +242,23 @@ docker compose up -d
 > callback server on `localhost:1455`; inside the container (which owns no
 > published port — Caddy only exposes 443/80) the browser redirect can't reach
 > it, so login silently fails. `--device-auth` needs no inbound port.
+>
+> If your OpenAI org **disables device-code auth** (the one-time code is
+> rejected by admin policy), use `./scripts/codex-login-docker.sh` instead: it
+> runs the default browser flow in a one-off container with a port bridge
+> (codex binds its callback to the container's loopback, which plain
+> `-p 1455:1455` can't reach — the script forwards published traffic to it).
+> On a remote VPS, run the same script through an SSH tunnel — the browser's
+> `localhost:1455` redirect then lands on the VPS:
+>
+> ```bash
+> ssh -L 1455:localhost:1455 <vps>   # then, on the VPS:
+> ./scripts/codex-login-docker.sh
+> ```
+>
+> Alternatives for headless setups: an API key
+> (`codex login --with-api-key`) or copying a working `~/.codex/auth.json`
+> into the `codex_auth` volume.
 
 The UI is then at `https://localhost/ui/` (Caddy's internal cert — accept the
 warning or trust the CA once), and the `/linear/webhook` + `/github/webhook`

@@ -18,6 +18,8 @@
 #   docker compose run --rm --entrypoint claude symphony auth login
 #   docker compose run --rm --entrypoint codex symphony login --device-auth
 #   docker compose run --rm --entrypoint gh symphony auth login --git-protocol https --web
+# Org disables device-code auth? Use ./scripts/codex-login-docker.sh (default
+# browser flow via a port bridge; see the script header). Local machine only.
 
 services:
   symphony:
