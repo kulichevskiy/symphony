@@ -7,16 +7,23 @@
 #     127.0.0.1:443, which would EADDRINUSE against Traefik's 0.0.0.0:443.)
 #   * Caddy uses Caddyfile.coolify (`:80`, `auto_https off`) instead of the
 #     local `localhost { tls internal }` site.
-#   * `.env` and `config.local.yaml` are NOT bind-mounted from the checkout —
-#     both are gitignored, so they don't exist in Coolify's clone. Provide
-#     them as Coolify **file mounts** (Storages → Add File Mount on the
-#     `symphony` service): paste the contents, mount at /app/.env and
-#     /app/config.local.yaml. Do NOT use Coolify's env-vars UI for secrets:
-#     env vars land in the container's os.environ, and LocalRunner starts
-#     agents with {**os.environ, ...} — every agent would inherit every
-#     token, bypassing the per-binding `env:` allowlist. The mounted-file
-#     path keeps secrets out of the process env.
-#   * caddy joins the external `coolify` network so Traefik can reach it.
+#   * `.env` and `config.local.yaml` are declared as relative file bind
+#     mounts below. Both are gitignored (absent from Coolify's clone), but
+#     Coolify parses compose file mounts, creates the files under the
+#     resource's data dir, and exposes their CONTENT for editing in the UI
+#     (service → Storages) — paste the real contents there before the first
+#     deploy. Do NOT move secrets into Coolify's env-vars UI: env vars land
+#     in the container's os.environ, and LocalRunner starts agents with
+#     {**os.environ, ...} — every agent would inherit every token, bypassing
+#     the per-binding `env:` allowlist. The mounted-file path keeps secrets
+#     out of the process env.
+#   * SYMPHONY_REQUIRE_AUTH0=1 makes the daemon fail closed at boot if the
+#     AUTH0_* triple is missing from .env — this variant is publicly routed,
+#     and without the gate /api/* (including the mutating
+#     /api/issues/{id}/command) would be open to the internet.
+#   * caddy joins ONLY the external `coolify` network (where Coolify's proxy
+#     lives). A single network means a single container IP — with two
+#     networks Traefik can pick the unreachable IP and intermittently 504.
 #     Turn OFF "Connect To Predefined Network" for this resource: Coolify
 #     would otherwise inject its network into every service, which conflicts
 #     with `network_mode: service:caddy` on the symphony service.
@@ -46,7 +53,15 @@ services:
     network_mode: "service:caddy"
     depends_on:
       - caddy
+    environment:
+      # Fail closed at boot when AUTH0_* is not configured — this stack is
+      # publicly routed (see header). Non-secret flag; safe in os.environ.
+      SYMPHONY_REQUIRE_AUTH0: "1"
     volumes:
+      # Operator config + secrets — file mounts whose content is edited in
+      # Coolify's Storages UI (see the header comment; both are gitignored).
+      - ./config.local.yaml:/app/config.local.yaml:ro
+      - ./.env:/app/.env:ro
       # CLI auth dirs — persisted, so a one-time login survives redeploys.
       - claude_auth:/home/symphony/.claude
       - codex_auth:/home/symphony/.codex
@@ -55,8 +70,6 @@ services:
       - symphony_db:/data/db
       - symphony_workspaces:/data/workspaces
       - symphony_logs:/data/logs
-      # /app/.env and /app/config.local.yaml come from Coolify file mounts —
-      # see the header comment.
 
   caddy:
     image: caddy:2
@@ -65,8 +78,9 @@ services:
     # no host ports (Traefik owns 80/443 and terminates TLS).
     expose:
       - "80"
+    # Single network = single IP (see header): only where Coolify's proxy
+    # lives. Nothing else needs to reach caddy — symphony shares its netns.
     networks:
-      - default
       - coolify
     volumes:
       - ./Caddyfile.coolify:/etc/caddy/Caddyfile:ro

@@ -267,3 +267,28 @@ def test_cli_auth0_settings_fails_closed_on_partial_config() -> None:
     cfg = Config(auth0_domain=DOMAIN, auth0_client_id=CLIENT_ID)
     with pytest.raises(click.ClickException):
         _auth0_settings(cfg)
+
+
+def test_create_app_refuses_ungated_ui_when_require_auth0_set(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """SYMPHONY_REQUIRE_AUTH0 (set by the publicly-routed Coolify compose) must
+    fail closed at boot when Auth0 settings are absent — otherwise a blank
+    AUTH0_* .env would serve mutating /api/* endpoints to the open internet."""
+    monkeypatch.setenv("SYMPHONY_REQUIRE_AUTH0", "1")
+    with pytest.raises(RuntimeError, match="SYMPHONY_REQUIRE_AUTH0"):
+        create_app(
+            _Handler(),
+            object(),  # type: ignore[arg-type]
+            ui_enabled=True,
+            auth0_settings=None,
+        )
+
+
+def test_create_app_require_auth0_satisfied_by_settings(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("SYMPHONY_REQUIRE_AUTH0", "1")
+    app = create_app(
+        _Handler(),
+        object(),  # type: ignore[arg-type]
+        ui_enabled=True,
+        auth0_settings=_settings(),
+    )
+    assert app is not None
