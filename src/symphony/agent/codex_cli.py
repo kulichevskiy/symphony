@@ -95,6 +95,19 @@ def _profile_uses_legacy_project_roots(profile: dict[str, object]) -> bool:
     return isinstance(filesystem, dict) and _LEGACY_PROJECT_ROOTS_TOKEN in filesystem
 
 
+def _profile_network_disabled(profile: dict[str, object]) -> bool:
+    """True if the managed profile does not already enable agent network access.
+
+    Older Symphony wrote the profile with `network.enabled = false`. That value
+    makes codex nest an isolated network namespace whose loopback can't be
+    brought up inside our container, so a stale profile must be rewritten to the
+    current (network-enabled) block rather than preserved. Missing/malformed
+    network table also counts as disabled.
+    """
+    network = profile.get("network")
+    return not (isinstance(network, dict) and network.get("enabled") is True)
+
+
 def _split_dotted_key(header: str) -> list[str] | None:
     """Split a TOML table header into its key parts, honoring quotes.
 
@@ -201,12 +214,14 @@ def ensure_symphony_permissions_profile(
     """Ensure Codex has the named profile that can write managed `.git` dirs.
 
     Returns `(path, created)`. Existing profiles are treated as operator-owned
-    and left untouched, with two exceptions: a profile still using the legacy
+    and left untouched, with three exceptions: a profile still using the legacy
     `:project_roots` filesystem token is silently broken on Codex >= 0.136, so
-    it is rewritten to the current `:workspace_roots`-based block; and a config
-    that defines the profile but no top-level `default_permissions` (which Codex
-    >= 0.143 requires whenever `[permissions]` tables exist) gets the key
-    backfilled. Either case sets `created` to `True`.
+    it is rewritten to the current `:workspace_roots`-based block; a profile with
+    `network.enabled != true` (an older Symphony default whose net-isolated
+    sandbox can't bring up loopback in our container) is rewritten to the current
+    network-enabled block; and a config that defines the profile but no top-level
+    `default_permissions` (which Codex >= 0.143 requires whenever `[permissions]`
+    tables exist) gets the key backfilled. Any case sets `created` to `True`.
     """
     path = config_path or codex_config_path()
     existing = ""
@@ -242,13 +257,19 @@ def ensure_symphony_permissions_profile(
                     "as a non-table value; add the permissions profile manually."
                 )
             if isinstance(profile, dict):
-                if not _profile_uses_legacy_project_roots(profile):
-                    # Profile is current. Codex >= 0.143 still refuses to load
-                    # it without a top-level `default_permissions`; backfill it
-                    # if unset, otherwise leave the config untouched.
+                if not _profile_uses_legacy_project_roots(
+                    profile
+                ) and not _profile_network_disabled(profile):
+                    # Profile is current and network-enabled. Codex >= 0.143
+                    # still refuses to load it without a top-level
+                    # `default_permissions`; backfill it if unset, otherwise
+                    # leave the config untouched.
                     return _backfill_default_permissions(path, existing)
-                # Legacy profile written for an older Codex: strip its tables so
-                # the current `:workspace_roots`-based block is re-appended below.
+                # Stale managed profile — a legacy `:project_roots` token (broken
+                # on Codex >= 0.136) or `network.enabled != true` (an older
+                # Symphony default; the container is the isolation boundary now
+                # and codex's own net isolation can't bring up loopback here).
+                # Strip its tables so the current block is re-appended below.
                 stripped = _strip_symphony_profile_tables(existing)
                 # `_strip_symphony_profile_tables` only removes
                 # `[permissions.symphony-git...]` table sections. A profile
