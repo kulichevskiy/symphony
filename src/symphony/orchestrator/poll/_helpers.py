@@ -19,6 +19,7 @@ from typing import Any, TypedDict
 import aiosqlite
 
 from ... import db
+from ...agent.claude_cli import claude_builder_allowed_tools
 from ...agent.codex_cli import build_codex_workspace_write_command
 from ...agent.codex_models import DEFAULT_CODEX_MODEL
 from ...pipeline.cost_guard import UsageDelta
@@ -115,6 +116,12 @@ def build_runner_command(
             "stream-json",
             "--verbose",
             "--strict-mcp-config",
+            # Pre-approve the full builder surface, plus mcp__<name>__* for
+            # each MCP server the binding grants — see agent/claude_cli.py
+            # for why a fresh containerized auth volume otherwise auto-denies
+            # every mutation. Prompt rides behind `--` (SYM-42 idiom).
+            "--allowedTools",
+            claude_builder_allowed_tools(mcp_servers),
         ]
         if mcp_servers:
             command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])
@@ -122,7 +129,7 @@ def build_runner_command(
             command.extend(["--model", claude_model])
         if effort is not None:
             command.extend(["--effort", effort])
-        command.append(prompt)
+        command.extend(["--", prompt])
         return command
     if agent == "codex":
         if workspace_path is None:

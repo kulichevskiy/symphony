@@ -39,6 +39,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
+from ..agent.claude_cli import claude_builder_allowed_tools
 from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.prompt import review_comment_fix_prompt
@@ -116,7 +117,9 @@ def _build_fix_command(
     if agent == "claude":
         # Headless MCP policy: always run --strict-mcp-config so the fixer
         # only sees servers the binding explicitly grants (none by default).
-        # Mirrors `build_runner_command` in poll.py.
+        # Mirrors `build_runner_command` in poll.py — including the explicit
+        # builder allowlist: without it a fresh containerized auth volume
+        # auto-denies every Edit/Write/Bash (see agent/claude_cli.py).
         command = [
             "claude",
             "--print",
@@ -124,12 +127,14 @@ def _build_fix_command(
             "stream-json",
             "--verbose",
             "--strict-mcp-config",
+            "--allowedTools",
+            claude_builder_allowed_tools(mcp_servers),
         ]
         if claude_model is not None:
             command.extend(["--model", claude_model])
         if mcp_servers:
             command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])
-        command.append(prompt)
+        command.extend(["--", prompt])
         return command
     if agent == "codex":
         return build_codex_workspace_write_command(
