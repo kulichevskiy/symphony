@@ -267,6 +267,18 @@ stays bound to `127.0.0.1` inside the shared network namespace; only Caddy is
 published. This is the foundation for the VPS move — the same stack runs there
 with a public hostname swapped into the `Caddyfile`.
 
+### Deploy on Coolify
+
+Use `docker-compose.coolify.yml` (compose-file path in the resource settings).
+It keeps the same caddy⇄daemon topology but drops host port publishing —
+Coolify's proxy terminates TLS on the public domain and forwards to caddy:80.
+The file's header comment is the deployment guide: file mounts for `.env` +
+`config.local.yaml` (they're gitignored, so they're absent from the clone —
+and secrets must NOT go through Coolify's env-vars UI), the
+"Connect To Predefined Network" toggle, and the one-time CLI logins over ssh.
+After the first deploy, point the Linear/GitHub webhooks and the Auth0
+callback/logout/origin URLs at the new domain.
+
 ---
 
 ## Using it

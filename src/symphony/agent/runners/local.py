@@ -117,7 +117,13 @@ class LocalRunner:
         self._pending_kills: set[str] = set()
 
     async def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
-        env = {**os.environ, **spec.env}
+        # Inherit the daemon's env minus SYMPHONY_*: those are deployment
+        # flags (e.g. SYMPHONY_REQUIRE_AUTH0 in the Coolify stack), and an
+        # agent working on this very repo must not have its tests/verification
+        # inherit the host deployment's posture. spec.env (the per-binding
+        # allowlist) still overrides.
+        inherited = {k: v for k, v in os.environ.items() if not k.startswith("SYMPHONY_")}
+        env = {**inherited, **spec.env}
         try:
             proc = await asyncio.create_subprocess_exec(
                 *spec.command,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -77,6 +78,22 @@ def create_app(
     auth0_settings: Auth0Settings | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
+    # Publicly-exposed deployments (docker-compose.coolify.yml) set
+    # SYMPHONY_REQUIRE_AUTH0=1: without Auth0 settings the /api/* routers mount
+    # ungated, so a blank AUTH0_* .env would put mutating endpoints (e.g.
+    # POST /api/issues/{id}/command) on the open internet. Fail closed at boot
+    # instead of serving unauthenticated.
+    if (
+        ui_enabled
+        and auth0_settings is None
+        and os.environ.get("SYMPHONY_REQUIRE_AUTH0", "").strip() not in ("", "0", "false")
+    ):
+        raise RuntimeError(
+            "SYMPHONY_REQUIRE_AUTH0 is set but AUTH0_DOMAIN/AUTH0_CLIENT_ID/"
+            "AUTH0_ALLOWED_EMAILS are not configured — refusing to serve the "
+            "UI/API unauthenticated on a public deployment. Set all three in "
+            ".env, or unset SYMPHONY_REQUIRE_AUTH0 for a local-only stack."
+        )
     ui_pool = ReadOnlyDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
     external_service = ui_external_service
     if (
