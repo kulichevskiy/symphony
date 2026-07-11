@@ -18,7 +18,7 @@ receiving it (call the API, don't trust):
 | Input | Notes |
 |---|---|
 | VPS with Coolify | panel usually at `http://<ip>:8000` (302 = alive) |
-| `COOLIFY_API_KEY` | panel → Keys & Tokens → API tokens with **read+write+deploy**; verify `GET /api/v1/version` AND a write-scope call (e.g. `GET /security/keys`) — 403 later means a permission is missing, not a bad token |
+| `COOLIFY_API_KEY` | panel → Keys & Tokens → API tokens with **read+write+deploy**; verify `GET /api/v1/version`, then prove write scope by creating and deleting a throwaway key (`POST /security/keys` + `DELETE`) — a read-only probe can pass while the first real mutation 403s |
 | ssh access | `ssh <user>@<host>`; check passwordless `sudo -n true` |
 | Domain + DNS control | e.g. Gcore zone; A-record `<sub>` → VPS IP overrides a wildcard |
 | Auth0 tenant | SPA app client_id; operator edits Application URIs |
@@ -52,8 +52,9 @@ printf 'Authorization: Bearer %s' "$COOLIFY_API_KEY" | ssh <host> \
    `project_uuid`, `server_uuid` (from `GET /servers`),
    `environment_name: production` (worked on Coolify 4.1.2; if the
    instance enforces the OpenAPI schema and 422s asking for
-   `environment_uuid`, fetch it from `GET /projects/{uuid}` →
-   `environments[]`), `private_key_uuid`,
+   `environment_uuid`, discover it via `GET /projects/{uuid}` — and if the
+   payload lacks an environments list on that version, open the
+   environment in the panel: its uuid is in the URL path), `private_key_uuid`,
    `git_repository: git@github.com:<owner>/<repo>.git`, `git_branch: main`,
    `build_pack: dockercompose`,
    `docker_compose_location: "/docker-compose.coolify.yml"`
@@ -86,12 +87,15 @@ run; put it in the scratchpad and hand over the path):
 #   (workspace_root: /data/workspaces, log_root: /data/logs,
 #    db_path: /data/db/state.sqlite)
 # and .env drops panel-only tokens (GCORE_API_KEY, COOLIFY_API_KEY lines).
-scp /tmp/vps-config.yaml /tmp/vps.env "<host>:/tmp/"
+# stage under the ssh user's HOME with mode 600 (never world-readable
+# /tmp — on a multi-user VPS the secrets would be exposed until install)
+chmod 600 /tmp/vps-config.yaml /tmp/vps.env
+scp /tmp/vps-config.yaml /tmp/vps.env "<host>:~/"
 ssh "<host>" '
   sudo install -d -m 755 /opt/symphony
-  sudo install -m 400 -o 1000 -g 1000 /tmp/vps-config.yaml /opt/symphony/config.local.yaml
-  sudo install -m 400 -o 1000 -g 1000 /tmp/vps.env         /opt/symphony/.env
-  rm /tmp/vps-config.yaml /tmp/vps.env
+  sudo install -m 400 -o 1000 -g 1000 ~/vps-config.yaml /opt/symphony/config.local.yaml
+  sudo install -m 400 -o 1000 -g 1000 ~/vps.env         /opt/symphony/.env
+  rm ~/vps-config.yaml ~/vps.env
 '
 ```
 
@@ -163,8 +167,10 @@ three logins are one-time; volumes survive redeploys.
   container):
   `ssh -t <host> 'sudo docker run --rm -it -v <gh-vol>:/home/symphony/.config/gh --entrypoint gh <image> auth login --git-protocol https --web'`
 - **codex** — layered fallbacks, in order:
-  1. `codex login --device-auth` — unless the OpenAI org admin disabled
-     device codes (rejected one-time code).
+  1. Device flow (needs the volume, like every login here):
+     `ssh -t <host> 'sudo docker run --rm -it -v <codex-vol>:/home/symphony/.codex --entrypoint codex <image> login --device-auth'`
+     — unless the OpenAI org admin disabled device codes (rejected
+     one-time code).
   2. Port bridge + ssh tunnel: `ssh -L 1455:localhost:1455 <host>`, then
      run `scripts/codex-login-docker.sh` semantics on the host (node
      forwarder `0.0.0.0:14550 → 127.0.0.1:1455`, publish
