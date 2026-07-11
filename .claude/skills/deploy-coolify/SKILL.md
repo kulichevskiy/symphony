@@ -1,6 +1,6 @@
 ---
 name: deploy-coolify
-description: Deploy the Symphony stack from scratch onto a Coolify VPS — drive the Coolify API end-to-end (deploy key, app, domain, operator files, DNS, Auth0, CLI logins, smoke test, live flow test). Use when the user wants to deploy/redeploy Symphony to Coolify or a new VPS, migrate the stack to another server, or debug a broken Coolify deployment. Battle-tested runbook: every step below was verified live (2026-07-11, symphony.vibecamp.ru) and every warning is a failure that actually happened.
+description: "Deploy the Symphony stack from scratch onto a Coolify VPS — drive the Coolify API end-to-end (deploy key, app, domain, operator files, DNS, Auth0, CLI logins, smoke test, live flow test). Use when the user wants to deploy/redeploy Symphony to Coolify or a new VPS, migrate the stack to another server, or debug a broken Coolify deployment. Battle-tested runbook: every step below was verified live (2026-07-11, symphony.vibecamp.ru) and every warning is a failure that actually happened."
 ---
 
 # Deploy Symphony on Coolify
@@ -31,8 +31,11 @@ outside. Either tunnel (`ssh -L 8000:localhost:8000 <host>`, then call
 ("administratively prohibited"), run curl ON the host over ssh:
 
 ```bash
-ssh <host> 'curl -s -H "Authorization: Bearer $TOK" \
-  http://127.0.0.1:8000/api/v1/<path>'
+# pipe the token over stdin: a single-quoted $TOK would expand (empty) on
+# the REMOTE shell, and a locally-expanded one would show up in remote ps
+printf '%s' "$COOLIFY_API_KEY" | ssh <host> \
+  'read -r TOK; curl -s -H "Authorization: Bearer $TOK" \
+     http://127.0.0.1:8000/api/v1/<path>'
 ```
 
 ## Phase 1 — Coolify resource
