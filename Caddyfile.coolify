@@ -1,0 +1,18 @@
+# Caddy config for the Coolify deployment (see docker-compose.coolify.yml).
+#
+# Coolify's own proxy (Traefik) owns the public domain and terminates TLS,
+# then forwards to this caddy on plain :80 over the docker network. Caddy's
+# only job here is bridging into the shared network namespace where the
+# daemon's http surface listens on loopback (the 127.0.0.1-only bind is a
+# security invariant — see src/symphony/app.py::build_server_config).
+#
+# `auto_https off`: TLS is Traefik's job; :80 answers any Host header the
+# proxy forwards (the public domain), unlike the local Caddyfile's
+# `localhost` site block.
+{
+	auto_https off
+}
+
+:80 {
+	reverse_proxy 127.0.0.1:8787
+}

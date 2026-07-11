@@ -717,12 +717,23 @@ class _OrchestratorBase:
         self._shutdown.set()
         self._wake.set()
 
+    async def startup_reconcile(self, *, reason: str = "startup") -> None:
+        """Self-heal stranded state before serving ticks.
+
+        Restores operator waits and retires/redrives orphaned merge runs and
+        stale merge waits. Called from `run()` and from the CLI `--once` path so
+        a cron-style single-tick invocation heals the same state the long-lived
+        daemon does — otherwise an orphaned `needs_approval` merge run keeps its
+        open PR out of merge candidacy on every once invocation.
+        """
+        await self._restore_operator_waits()
+        await self._reconcile_orphaned_merge_runs(reason=reason)
+        await self._reconcile_auto_recoverable_merge_waits(reason=reason)
+
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
-        await self._restore_operator_waits()
-        await self._reconcile_orphaned_merge_runs(reason="startup")
-        await self._reconcile_auto_recoverable_merge_waits(reason="startup")
+        await self.startup_reconcile(reason="startup")
         self._merge_wait_reconcile_task = asyncio.create_task(
             self._run_auto_recoverable_merge_wait_reconciler(self._shutdown)
         )
