@@ -15,7 +15,7 @@ import os
 import re
 import signal
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, cast, get_args
@@ -191,14 +191,35 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
         raise click.ClickException(str(e)) from e
 
 
-def _binding_can_run_codex_cli(binding: RepoBinding) -> bool:
-    if binding.agent == "codex":
-        return True
-    return binding.resolved_local_review() and binding.resolved_reviewer_agent() == "codex"
+# Review-lane roles only spawn a subprocess when the binding's local review
+# is enabled; the builder roles (implement/fix/accept) always can.
+_REVIEW_LANE_ROLES: tuple[str, ...] = ("review_find", "review_verify")
+
+
+def _binding_can_run_codex_cli(
+    binding: RepoBinding, global_roles: Mapping[RoleName, Any] | None
+) -> bool:
+    """True when any role this binding can actually spawn resolves to codex.
+
+    Resolves through the roles matrix (`binding.resolved_role`) — the same
+    lookup every dispatch path uses — rather than the legacy `binding.agent`
+    field alone, so a binding that selects codex only via `roles:` (e.g. a
+    global `roles.implement.agent: codex`) still gets the `symphony-git`
+    permissions profile provisioned. Review-lane roles are skipped when
+    local review is off: their resolved agent defaults to the implementer's
+    opposite family and would otherwise flag codex for bindings that never
+    spawn it.
+    """
+    for name in get_args(RoleName):
+        if name in _REVIEW_LANE_ROLES and not binding.resolved_local_review():
+            continue
+        if binding.resolved_role(name, global_roles).agent == "codex":
+            return True
+    return False
 
 
 def _config_can_run_codex_cli(cfg: Config) -> bool:
-    return any(_binding_can_run_codex_cli(binding) for binding in cfg.repos)
+    return any(_binding_can_run_codex_cli(binding, cfg.roles) for binding in cfg.repos)
 
 
 def _config_has_linear_bindings(cfg: Config) -> bool:
