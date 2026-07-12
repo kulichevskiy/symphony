@@ -1,7 +1,9 @@
+// @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { IssueSummary, SpendHeatmap, SpendSummary } from "@/lib/api";
 import { DEFAULT_DATE, FiltersProvider } from "@/lib/filters";
@@ -625,5 +627,100 @@ describe("HomePage issues section", () => {
     for (const col of BOARD_COLUMNS) {
       expect(markup).toContain(col.label);
     }
+  });
+});
+
+/** Contract-valid stub bodies, keyed by endpoint, so pages that render as
+ *  soon as their query resolves don't crash on `{}`. */
+function doneIssuesResponse(count: number): IssueSummary[] {
+  return Array.from({ length: count }, (_, i) =>
+    issue({
+      id: `done-${i}`,
+      identifier: `VIB-${i}`,
+      completed_at: "2026-05-01T00:00:00Z",
+      canonical_status: { state: "done", since: null, subtitle: null, stuck_for: null },
+    }),
+  );
+}
+
+function stubBodyFor(url: string): unknown {
+  if (url.includes("/api/issues")) {
+    if (url.includes("scope=done")) {
+      const limit = Number(new URL(url, "http://localhost").searchParams.get("limit") ?? "50");
+      // First page is full (implies more); a bumped limit is satisfied in full.
+      return doneIssuesResponse(Math.min(limit, 60));
+    }
+    return [];
+  }
+  if (url.includes("/api/spend/summary")) {
+    return {
+      totals: {
+        issues: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
+      },
+      per_team: [],
+      per_provider: [],
+      per_stage: [],
+      teams: [],
+      models: [],
+    };
+  }
+  if (url.includes("/api/spend/heatmap")) {
+    return { days: [], start: "2024-01-01", end: "2024-01-01" };
+  }
+  if (url.includes("/api/pause")) {
+    return { paused: false };
+  }
+  return {};
+}
+
+function stubFetch() {
+  return vi.fn((input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(stubBodyFor(url)),
+    } as Response);
+  });
+}
+
+describe("HomePage done pagination", () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("shows Load more when the done page is full, and fetches a bigger page on click", async () => {
+    const fetchMock = stubFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <FiltersProvider>
+            <HomePage />
+          </FiltersProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Table" }));
+    await waitFor(() => expect(screen.getByText("Load more")).toBeTruthy());
+
+    fireEvent.click(screen.getByText("Load more"));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some((call) => {
+          const url = typeof call[0] === "string" ? call[0] : call[0].toString();
+          return url.includes("scope=done") && url.includes("limit=100");
+        }),
+      ).toBe(true),
+    );
+    // The bigger page (60 rows) satisfies the request — no further "Load more".
+    await waitFor(() => expect(screen.queryByText("Load more")).toBeFalsy());
   });
 });

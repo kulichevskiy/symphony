@@ -850,10 +850,14 @@ function BoardCard({
  *  board readable and nudges deeper browsing into the Table view. */
 export const DONE_LANE_CARD_CAP = 30;
 
-/** How many done issues the home feed fetches (matches the API's own default).
- *  The kanban shows the newest `DONE_LANE_CARD_CAP`; the rest are reachable via
- *  the "+N more" affordance / Table view. */
+/** How many done issues the home feed fetches by default (matches the API's
+ *  own default). The kanban shows the newest `DONE_LANE_CARD_CAP`; the rest
+ *  are reachable via the "+N more" affordance / Table view's "Load more". */
 const DONE_SCOPE_LIMIT = 50;
+
+/** Ceiling for the done scope's `limit` param (matches the API's `le=500`).
+ *  "Load more" in the Table view steps toward this instead of unbounded growth. */
+const DONE_SCOPE_MAX_LIMIT = 500;
 
 /** The issues kanban: one lane per pipeline step, every tracked issue exactly
  *  once. Cards are links to the issue page (⌘-click works); the identifier
@@ -1079,6 +1083,14 @@ export function HomePage() {
   const modelsKey = [...models].sort().join(",");
   const modelsFilter = models.length ? models : undefined;
 
+  // How many done issues to request; grows via the Table view's "Load more".
+  // Reset to the default whenever the filters change so a bumped limit from a
+  // prior filter selection doesn't leak into a new one.
+  const [doneLimit, setDoneLimit] = useState(DONE_SCOPE_LIMIT);
+  useEffect(() => {
+    setDoneLimit(DONE_SCOPE_LIMIT);
+  }, [provider, teamsKey, modelsKey, from, to]);
+
   const summaryQuery = useQuery({
     queryKey: ["spend-summary", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
@@ -1111,7 +1123,7 @@ export function HomePage() {
     placeholderData: (prev) => prev,
   });
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to],
+    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to, doneLimit],
     queryFn: () =>
       fetchIssues({
         scope: "done",
@@ -1120,7 +1132,7 @@ export function HomePage() {
         from: dateFrom,
         to: dateTo,
         models: modelsFilter,
-        limit: DONE_SCOPE_LIMIT,
+        limit: doneLimit,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
@@ -1129,6 +1141,8 @@ export function HomePage() {
   const active = activeQuery.data ?? [];
   const done = doneQuery.data ?? [];
   const tracked = summaryQuery.data?.totals.issues ?? 0;
+  // A full page implies more done history exists beyond what's fetched.
+  const hasMoreDone = done.length === doneLimit && doneLimit < DONE_SCOPE_MAX_LIMIT;
 
   const openIssue = (id: string) => navigate(`/issue/${encodeURIComponent(id)}`);
 
@@ -1213,7 +1227,21 @@ export function HomePage() {
               </h3>
             </div>
             {done.length ? (
-              <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
+              <>
+                <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
+                {hasMoreDone ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDoneLimit((l) => Math.min(l + DONE_SCOPE_LIMIT, DONE_SCOPE_MAX_LIMIT))
+                    }
+                    disabled={doneQuery.isFetching}
+                    className="mt-2 w-full rounded-md border border-dashed border-border py-2 text-center text-xs font-medium text-muted-foreground transition-colors hover:border-blue-400 hover:text-foreground disabled:opacity-50 dark:hover:border-blue-600"
+                  >
+                    {doneQuery.isFetching ? "Loading…" : "Load more"}
+                  </button>
+                ) : null}
+              </>
             ) : (
               <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
                 No completed issues match your filters
