@@ -116,7 +116,12 @@ class Workspace:
         async with self._hold_lock(path):
             if (path / ".git").exists():
                 path.touch(exist_ok=True)
-                await self._abort_interrupted_ops(path)
+                # Heal only when no live stage holds the workspace: a racing
+                # duplicate dispatch must not abort a rebase that another
+                # run is actively resolving. After a host restart `_in_use`
+                # is empty, so genuinely orphaned state still gets cleared.
+                if path not in self._in_use:
+                    await self._abort_interrupted_ops(path)
                 await self._git(path, "fetch", "origin")
             else:
                 if path.exists():

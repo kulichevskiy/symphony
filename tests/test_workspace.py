@@ -15,7 +15,7 @@ import pytest
 
 from symphony.config import LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
-from symphony.workspace import Workspace
+from symphony.workspace import Workspace, WorkspaceError
 
 
 async def _run(*args: str, cwd: Path | None = None) -> None:
@@ -195,6 +195,8 @@ async def test_acquire_aborts_interrupted_rebase(tmp_path: Path) -> None:
     assert not await _run_ok("git", "rebase", "target", cwd=path)
     assert (path / ".git" / "rebase-merge").exists()
 
+    # The restart cleared in-memory liveness along with the process.
+    ws.release(_binding(), _issue("ENG-5"))
     path = await ws.acquire(_binding(), _issue("ENG-5"))
 
     assert not (path / ".git" / "rebase-merge").exists()
@@ -212,10 +214,29 @@ async def test_acquire_aborts_interrupted_merge(tmp_path: Path) -> None:
     assert not await _run_ok("git", "merge", "target", cwd=path)
     assert (path / ".git" / "MERGE_HEAD").exists()
 
+    ws.release(_binding(), _issue("ENG-5"))
     path = await ws.acquire(_binding(), _issue("ENG-5"))
 
     assert not (path / ".git" / "MERGE_HEAD").exists()
     assert (path / "README.md").read_text() == "ours\n"
+
+
+@pytest.mark.asyncio
+async def test_acquire_keeps_live_rebase_of_an_in_use_workspace(tmp_path: Path) -> None:
+    # A racing duplicate dispatch must not abort a rebase that a live
+    # fix-run is actively resolving; it fails to acquire (and dedupes
+    # out) exactly as before the healing was added.
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+    path = await ws.acquire(_binding(), _issue("ENG-5"))
+    await _seed_conflicting_target(path)
+
+    assert not await _run_ok("git", "rebase", "target", cwd=path)
+    assert (path / ".git" / "rebase-merge").exists()
+
+    with pytest.raises(WorkspaceError):
+        await ws.acquire(_binding(), _issue("ENG-5"))
+    assert (path / ".git" / "rebase-merge").exists(), "live rebase must survive"
 
 
 @pytest.mark.asyncio
