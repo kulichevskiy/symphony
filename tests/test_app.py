@@ -2143,6 +2143,158 @@ async def test_issue_timeline_api_404s_for_unknown_issue(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_issue_timeline_api_pages_newest_first_without_gaps(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_issue_timeline(conn)
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            page1 = await client.get("/api/issues/iss-timeline/timeline?limit=5")
+            body1 = page1.json()
+            oldest1 = body1[0]["ts"]
+            page2 = await client.get(f"/api/issues/iss-timeline/timeline?limit=5&before={oldest1}")
+            body2 = page2.json()
+            oldest2 = body2[0]["ts"]
+            page3 = await client.get(f"/api/issues/iss-timeline/timeline?limit=5&before={oldest2}")
+            body3 = page3.json()
+    finally:
+        await conn.close()
+
+    # Newest page anchors on the tie at 10:04:45 and keeps the whole tie group,
+    # so it exceeds the limit rather than splitting the tie.
+    assert [(e["ts"], e["kind"]) for e in body1] == [
+        ("2026-05-17T10:04:45Z", "operator_wait_ended"),
+        ("2026-05-17T10:04:45Z", "operator_wait_started"),
+        ("2026-05-17T10:05:00Z", "run_ended"),
+        ("2026-05-17T10:05:30Z", "operator_wait_ended"),
+        ("2026-05-17T10:05:45Z", "external_cleared"),
+        ("2026-05-17T10:06:00Z", "pr_merged"),
+    ]
+    assert [(e["ts"], e["kind"]) for e in body2] == [
+        ("2026-05-17T10:03:00Z", "activity_comment_posted"),
+        ("2026-05-17T10:03:30Z", "review_state_changed"),
+        ("2026-05-17T10:04:20Z", "external_observed"),
+        ("2026-05-17T10:04:30Z", "operator_wait_started"),
+        ("2026-05-17T10:04:40Z", "external_state_change"),
+    ]
+    assert [(e["ts"], e["kind"]) for e in body3] == [
+        ("2026-05-17T10:00:00Z", "run_started"),
+        ("2026-05-17T10:01:00Z", "comment_seen"),
+        ("2026-05-17T10:02:00Z", "pr_opened"),
+    ]
+    # No overlaps or gaps: concatenating the pages oldest-first reproduces the
+    # full unpaginated timeline exactly once.
+    combined = [(e["ts"], e["kind"]) for e in body3 + body2 + body1]
+    assert len(combined) == len(set(combined)) == 14
+    assert combined == sorted(combined)
+
+
+@pytest.mark.asyncio
+async def test_issue_timeline_api_orders_mixed_iso_timestamp_shapes(tmp_path: Path) -> None:
+    # Sources don't share one ISO shape: GitHub webhook timestamps have no
+    # fractional seconds ("...00Z"), while internally generated ones use
+    # `datetime.isoformat()` and can carry a microsecond fraction
+    # ("...00.500000+00:00"). Raw string ordering places the no-fraction row
+    # AFTER the fractional one within the same second (`Z` > `.` in ASCII),
+    # even though it's chronologically earlier or equal.
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-mixed-ts",
+            identifier="ENG-9",
+            title="Mixed ts shapes",
+            team_key="ENG",
+        )
+        await conn.execute(
+            """
+            INSERT INTO comment_events (comment_id, issue_id, seen_at)
+            VALUES ('comment-mixed', 'iss-mixed-ts', '2026-05-17T10:00:00Z')
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO state_transitions (
+                issue_id, table_name, field, old_value, new_value, ts
+            )
+            VALUES (
+                'iss-mixed-ts', 'review_state', 'iteration', '1', '2',
+                '2026-05-17T10:00:00.500000+00:00'
+            )
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            full = await client.get("/api/issues/iss-mixed-ts/timeline")
+            body = full.json()
+            assert [e["kind"] for e in body] == ["comment_seen", "review_state_changed"]
+
+            # Paginating at limit=1 must land on the chronologically later
+            # event first, and `before` must page back to the earlier one.
+            page1 = await client.get("/api/issues/iss-mixed-ts/timeline?limit=1")
+            body1 = page1.json()
+            assert [e["kind"] for e in body1] == ["review_state_changed"]
+            page2 = await client.get(
+                "/api/issues/iss-mixed-ts/timeline",
+                params={"limit": 1, "before": body1[0]["ts"]},
+            )
+            body2 = page2.json()
+            assert [e["kind"] for e in body2] == ["comment_seen"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_issue_timeline_api_rejects_out_of_range_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await _seed_issue_timeline(conn)
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            too_small = await client.get("/api/issues/iss-timeline/timeline?limit=0")
+            too_big = await client.get("/api/issues/iss-timeline/timeline?limit=1001")
+    finally:
+        await conn.close()
+
+    assert too_small.status_code == 422
+    assert too_big.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_shared_app_preserves_linear_webhook_route(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
