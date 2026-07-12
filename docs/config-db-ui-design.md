@@ -109,12 +109,15 @@ the existing YAML topology into the DB.
 
 ## Implementation Decisions
 
-- **Source of truth: SQLite.** Two new tables: one row per binding with a
+- **Source of truth: SQLite.** Three new tables: one row per binding with a
   JSON payload column, plus `version`, `enabled`, `updated_at`,
   `updated_by`; and a single-document table for global config (the global
   roles matrix, migration marker) carrying the same `version` column so
   fleet-wide role edits get the same optimistic-locking protection as
-  binding edits. A unique index on the binding's natural key rejects
+  binding edits; and a repo-scoped webhook-secret table (detailed in the
+  secrets decision below) with its own `version`, since that secret is
+  shared across a repo's bindings and can't live in any single binding
+  payload. A unique index on the binding's natural key rejects
   duplicates at the DB layer. The persisted key is byte-compatible with the
   orchestrator's existing binding-key tuple — same components (project key,
   github repo, issue label, tracker provider, tracker site — the registered
@@ -150,8 +153,10 @@ the existing YAML topology into the DB.
   legacy role field outright, so the DB stays legacy-free by construction.
 - **YAML loses bindings entirely.** The config loader stops reading `repos:`
   and `roles:` from YAML — when the DB has bindings, their presence is
-  ignored with a one-line startup warning; when the DB has none, it is a
-  boot error (see the boot gate below). YAML keeps
+  ignored with a one-line startup warning; with an empty DB their presence
+  is a boot error (see the boot gate below — a truly fresh install with no
+  YAML topology and no unresolved work boots fine, so the first binding can
+  be created through the UI). YAML keeps
   system-level knobs: ports, paths, poll/reconcile intervals, global caps,
   timeouts, UI thresholds. Those still require a restart to change, which is
   acceptable at their change frequency.
@@ -209,13 +214,22 @@ the existing YAML topology into the DB.
   credentials are absent from the environment — and per-binding concurrency
   limiters are rebuilt when a binding's cap changes, so an edited
   `max_concurrent` actually takes effect instead of the first-use semaphore
-  enforcing the old capacity forever. The same rule covers the webhook
+  enforcing the old capacity forever. Rebuilding must account for current
+  occupancy: a fresh full-capacity semaphore is blind to holders and waiters
+  of the old one, so lowering a cap would otherwise admit new work on top of
+  still-running old holders. The replacement limiter is seeded from the
+  binding's active + scheduled count (a lowered cap admits nothing new until
+  occupancy falls below it; running work is never killed). The same rule
+  covers the webhook
   verifier: it is initialized from settings at app startup today, so a
   repo-secret replacement from the UI must hot-swap the verifier's view of
   repo secrets, or GitHub signs with the new secret while Symphony checks
   the old one until a restart.
 - **Binding lifecycle.** New `enabled` flag on the binding: disabled means
-  the *dispatch scan* skips it — no new issues start — while the binding
+  no new work starts — the dispatch scan skips it, *and* already-scheduled
+  dispatch/fix-run tasks (which reserve slots and can sit behind semaphores
+  before spawning) re-check the flag at launch and abort instead of
+  starting an agent — while the binding
   stays loaded and visible to every follow-up poller (review monitors,
   merge-candidate polling, operator-wait resolution all locate their binding
   by iterating the loaded set), so in-flight work drains to completion
@@ -254,7 +268,13 @@ the existing YAML topology into the DB.
   the binding model, then assembles the full effective config (YAML system
   knobs + all DB bindings + global matrix) and runs the existing model
   validators, so cross-binding checks and family checks behave exactly as
-  they do at boot today. Validation errors return with field paths the form
+  they do at boot today — with one deliberate relaxation: the current rule
+  rejecting an `effort` override without an explicitly-set `model` is
+  replaced by validating the effort against the *resolved* role (the
+  assembly has the full merge context server-side, so it can resolve the
+  inherited agent/model and family-check the effort against them);
+  otherwise the UI's promised "effort dropdown over an inherited model"
+  would fail on save by construction. Validation errors return with field paths the form
   maps to inputs; the same-family review-diversity warning is returned as a
   non-blocking warning and rendered as a banner — the save succeeds.
 - **Secrets.** Agent-env entries store secret key *names* only (unchanged
@@ -273,8 +293,11 @@ the existing YAML topology into the DB.
   bindings of the same repo would otherwise race on the shared secret
   without a conflict). The binding form
   surfaces it as the repo's secret (shared across that repo's bindings), and
-  it is write-only: responses carry only a set/unset flag, and the advanced
-  JSON view masks it too. Audit diffs redact secret-bearing fields
+  it is write-only for the *value*: responses carry the set/unset flag plus
+  the non-secret metadata the client needs — the repo-secret `version` (a
+  version the UI never receives cannot participate in optimistic locking)
+  and updated_at/by. The advanced
+  JSON view masks the value too. Audit diffs redact secret-bearing fields
   unconditionally — the field-level diff logs only set/cleared/changed
   flags for them, never values, so routine secret rotation can't leak
   credentials into daemon logs. Update semantics preserve it across ordinary
@@ -284,20 +307,27 @@ the existing YAML topology into the DB.
   corrupt a repo's webhook secret.
 - **Concurrency and audit.** Optimistic locking via a per-row version — the
   UI sends the version it loaded and receives a conflict on mismatch. Every
-  write stamps `updated_at`/`updated_by` (email from the auth token) and
+  write stamps `updated_at`/`updated_by` (email from the auth token; the
+  literal `local` when the deployment runs without Auth0, where the API
+  mounts ungated by design) and
   logs a field-level diff to the daemon log. No role-based access control:
   every authenticated user is a config admin, matching the single-operator
   deployment model.
-- **Roles matrix reaches every command path.** Editable agent/model/effort
-  is only honest if every stage actually consumes it: today several dispatch
-  paths still read the legacy per-binding fields (implementer agent/model on
-  the binding, the local-review claude model fields), and the fix-runner
-  command builder does not accept an effort flag. Part of this work is
-  routing all five roles through the resolved-role lookup — implement,
-  review_find, review_verify, fix, and accept command construction all take
-  their agent, model, *and* effort from the matrix — and removing the
-  legacy-field reads from dispatch paths. Otherwise a DB-only role edit
-  saves successfully while some stages keep running old defaults.
+- **Roles matrix reaches every per-stage consumer.** Editable
+  agent/model/effort is only honest if every stage actually consumes it:
+  today several dispatch paths still read the legacy per-binding fields
+  (implementer agent/model on the binding, the local-review claude model
+  fields), and the fix-runner command builder does not accept an effort
+  flag. Part of this work is routing all five roles through the
+  resolved-role lookup — implement, review_find, review_verify, fix, and
+  accept command construction all take their agent, model, *and* effort
+  from the matrix — and removing the legacy-field reads from dispatch
+  paths. Command argv is not the whole story: the non-command consumers of
+  the same metadata (final-message parsing, cost estimation, model-usage
+  attribution) must read the resolved role captured for that stage too, or
+  a codex implement run would be parsed and billed as if it ran the default
+  claude binding fields. Otherwise a DB-only role edit saves successfully
+  while some stages keep running — or accounting for — old defaults.
 - **One effective-config assembly for every consumer.** The composition
   "YAML system knobs + DB bindings + DB global matrix" lives in a single
   assembly step that every topology consumer goes through — the daemon, the
@@ -364,10 +394,13 @@ a script produces — never the internals that produce them.
   users may edit.
 - Config version history, rollback UI, or a full audit table — `updated_by`
   plus log diffs only; history is a future slice if it hurts.
-- Killing or migrating in-flight runs on config change — they always finish
-  with the config they captured.
-- Secrets management UI (editing `.env`) — secret values never enter the DB
-  or the UI; only key names are referenced.
+- Killing or migrating a *running agent process* on config change — a
+  spawned agent always finishes with the argv/env it was started with
+  (subsequent stages follow the per-stage hot-apply contract above).
+- Secrets management UI (editing `.env`) — agent-env secret values never
+  enter the DB or the UI; only key names are referenced. The sole exception
+  is the repo-scoped webhook secret, which is deliberately stored write-only
+  as specified above.
 - Converting the webhook secret to an env-key reference — it keeps its
   current stored-value semantics, just write-only.
 - A CLI importer beyond the one-off migration script.
