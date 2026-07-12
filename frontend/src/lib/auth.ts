@@ -14,9 +14,14 @@ export interface TokenProvider {
 }
 
 let provider: TokenProvider | null = null;
+// Dedupes concurrent `loginWithRedirect()` calls: the non-blocking allowlist
+// gate lets several queries mount at once, so a stale session can otherwise
+// have each one hit this catch block and fire its own redirect.
+let redirecting: Promise<void> | null = null;
 
 export function registerTokenProvider(next: TokenProvider | null): void {
   provider = next;
+  redirecting = null;
 }
 
 // Refresh a bit ahead of the exact expiry instant: the backend independently
@@ -44,7 +49,9 @@ function currentReturnTo(): string | undefined {
  * past the ID token's expiry (while the cached access token is still valid)
  * can otherwise be served a stale, already-expired ID token straight from
  * cache; if that happens, force one uncached round-trip before giving up.
- * Redirects to login if the session can't be renewed silently.
+ * Redirects to login if the session can't be renewed silently — several
+ * queries can hit this concurrently, so they share one in-flight redirect
+ * instead of each calling `loginWithRedirect()`.
  */
 export async function authHeaders(): Promise<Record<string, string>> {
   if (provider === null) {
@@ -60,7 +67,8 @@ export async function authHeaders(): Promise<Record<string, string>> {
     const raw = claims?.__raw;
     return raw ? { Authorization: `Bearer ${raw}` } : {};
   } catch {
-    await provider.loginWithRedirect({ appState: { returnTo: currentReturnTo() } });
+    redirecting ??= provider.loginWithRedirect({ appState: { returnTo: currentReturnTo() } });
+    await redirecting;
     return {};
   }
 }

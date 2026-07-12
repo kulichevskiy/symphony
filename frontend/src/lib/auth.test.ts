@@ -78,4 +78,21 @@ describe("authHeaders", () => {
     expect(await authHeaders()).toEqual({});
     expect(loggedIn).toBe(true);
   });
+
+  it("shares one redirect across concurrent callers instead of firing one each", async () => {
+    let redirectCalls = 0;
+    registerTokenProvider(
+      provider({
+        getAccessTokenSilently: async () => {
+          throw new Error("login_required");
+        },
+        loginWithRedirect: async () => {
+          redirectCalls += 1;
+        },
+      }),
+    );
+    const results = await Promise.all([authHeaders(), authHeaders(), authHeaders()]);
+    expect(results).toEqual([{}, {}, {}]);
+    expect(redirectCalls).toBe(1);
+  });
 });
