@@ -1084,12 +1084,16 @@ export function HomePage() {
   const modelsFilter = models.length ? models : undefined;
 
   // How many done issues to request; grows via the Table view's "Load more".
-  // Reset to the default whenever the filters change so a bumped limit from a
-  // prior filter selection doesn't leak into a new one.
+  // Reset to the default whenever the filters change — done synchronously
+  // during render (not in a useEffect) so the reset lands before the done
+  // query runs with the new filters, instead of one render later.
+  const doneFilterKey = `${provider}|${teamsKey}|${modelsKey}|${from}|${to}`;
   const [doneLimit, setDoneLimit] = useState(DONE_SCOPE_LIMIT);
-  useEffect(() => {
+  const [prevDoneFilterKey, setPrevDoneFilterKey] = useState(doneFilterKey);
+  if (doneFilterKey !== prevDoneFilterKey) {
+    setPrevDoneFilterKey(doneFilterKey);
     setDoneLimit(DONE_SCOPE_LIMIT);
-  }, [provider, teamsKey, modelsKey, from, to]);
+  }
 
   const summaryQuery = useQuery({
     queryKey: ["spend-summary", provider, teamsKey, modelsKey, from, to],
@@ -1122,8 +1126,12 @@ export function HomePage() {
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
+  // Over-fetch by one beyond `doneLimit` so an exact page boundary (50, 100,
+  // …) can be told apart from "there's really more": if the extra row comes
+  // back, there's a next page; if not, `doneLimit` was already everything.
+  const doneRequestLimit = Math.min(doneLimit + 1, DONE_SCOPE_MAX_LIMIT);
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to, doneLimit],
+    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to, doneRequestLimit],
     queryFn: () =>
       fetchIssues({
         scope: "done",
@@ -1132,17 +1140,17 @@ export function HomePage() {
         from: dateFrom,
         to: dateTo,
         models: modelsFilter,
-        limit: doneLimit,
+        limit: doneRequestLimit,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
 
   const active = activeQuery.data ?? [];
-  const done = doneQuery.data ?? [];
+  const doneFetched = doneQuery.data ?? [];
+  const done = doneFetched.slice(0, doneLimit);
   const tracked = summaryQuery.data?.totals.issues ?? 0;
-  // A full page implies more done history exists beyond what's fetched.
-  const hasMoreDone = done.length === doneLimit && doneLimit < DONE_SCOPE_MAX_LIMIT;
+  const hasMoreDone = doneFetched.length > doneLimit && doneLimit < DONE_SCOPE_MAX_LIMIT;
 
   const openIssue = (id: string) => navigate(`/issue/${encodeURIComponent(id)}`);
 

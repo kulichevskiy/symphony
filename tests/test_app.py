@@ -3534,6 +3534,36 @@ async def test_api_issues_active_scope_ignores_limit(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_issues_active_scope_ignores_out_of_range_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(conn, id="act-1", identifier="ENG-1", title="t1", team_key="ENG")
+        await conn.execute(
+            "INSERT INTO runs (id, issue_id, stage, status, pid, started_at) "
+            "VALUES ('r1', 'act-1', 'implement', 'running', 1, '2026-05-16T09:00:00Z')",
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            resp = await client.get("/api/issues?scope=active&limit=0")
+    finally:
+        await conn.close()
+
+    # `limit` is meaningless for active scope, so an out-of-range value (valid
+    # only for the done scope's `ge=1 le=500`) is not rejected.
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
+
+
+@pytest.mark.asyncio
 async def test_api_issues_active_scope_filters_by_date_window(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
