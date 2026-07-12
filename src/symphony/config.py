@@ -836,9 +836,10 @@ class Config(BaseModel):
     def load(cls, path: Path, *, resolve_repos: bool = True) -> Config:
         raw = yaml.safe_load(path.read_text())
         if not resolve_repos:
-            # The DB already owns the topology; don't validate or resolve
-            # `repos:` secrets for a section that's now ignored.
-            raw = {k: v for k, v in (raw or {}).items() if k != "repos"}
+            # The DB already owns the topology (bindings + global roles);
+            # don't validate or resolve a `repos:`/`roles:` section that's
+            # now ignored.
+            raw = {k: v for k, v in (raw or {}).items() if k not in ("repos", "roles")}
         cfg = cls.model_validate(raw)
         secrets = Secrets()
         cfg = cfg.model_copy(

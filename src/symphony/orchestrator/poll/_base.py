@@ -815,6 +815,7 @@ class _OrchestratorBase:
                     keep=[
                         (binding.linear_team_key, _queue_scope(binding))
                         for binding in self.config.repos
+                        if binding.enabled
                     ],
                 )
                 self._tracker_queue_pruned = True

@@ -410,6 +410,31 @@ repos:
         Config.load(p)
 
 
+def test_resolve_repos_false_ignores_stale_yaml_roles_too(
+    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    """When the DB owns bindings *and* the global roles matrix, a leftover
+    YAML `roles:` block is ignored just like `repos:` — it shouldn't be able
+    to crash boot with a now-invalid agent literal (SYM-188 review)."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = """
+roles:
+  implement:
+    agent: not-a-real-agent
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError):
+        Config.load(p)
+
+    cfg = Config.load(p, resolve_repos=False)
+    assert cfg.repos == []
+    assert cfg.roles == {}
+
+
 def test_linear_states_ready_has_no_default() -> None:
     """`ready` must be supplied explicitly — there is no safe default."""
     with pytest.raises(ValidationError):
