@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -103,6 +103,19 @@ export function mergeTimelineEvents(
     }
   }
   return [...byKey.values()].sort((left, right) => left.ts.localeCompare(right.ts));
+}
+
+// The newest-page fetch is authoritative for everything at or after its
+// oldest ts: some sources are current-state rows that collapse to a single
+// row per key (e.g. activity_comment_marks), so a value that changed or
+// disappeared there must be dropped, not merged in on top of the stale one.
+export function mergeNewestPage(
+  prev: TimelineEvent[],
+  page: TimelineEvent[],
+): TimelineEvent[] {
+  const windowStart = oldestLoadedTs(page);
+  const kept = windowStart === undefined ? prev : prev.filter((event) => event.ts < windowStart);
+  return mergeTimelineEvents(kept, page);
 }
 
 async function fetchIssueTimeline(id: string, before?: string): Promise<TimelineEvent[]> {
@@ -396,9 +409,16 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
   const [earlierError, setEarlierError] = useState<string | null>(null);
   const [earlierLoadedOnce, setEarlierLoadedOnce] = useState(false);
 
+  // Lets in-flight requests notice they were issued for an issue the user has
+  // since navigated away from, so their responses can be dropped instead of
+  // being merged into the now-current issue's timeline.
+  const issueIdRef = useRef(issueId);
+
   useEffect(() => {
+    issueIdRef.current = issueId;
     setEvents([]);
     setHasMoreEarlier(false);
+    setLoadingEarlier(false);
     setEarlierError(null);
     setEarlierLoadedOnce(false);
   }, [issueId]);
@@ -409,7 +429,7 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     if (!data) {
       return;
     }
-    setEvents((prev) => mergeTimelineEvents(prev, data));
+    setEvents((prev) => mergeNewestPage(prev, data));
     // Seed the load-earlier control from the newest page's size, without
     // clobbering it once the user has started paging back manually.
     if (!earlierLoadedOnce) {
@@ -422,16 +442,23 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     if (!cursor || loadingEarlier) {
       return;
     }
+    const requestIssueId = issueId;
     setLoadingEarlier(true);
     setEarlierError(null);
     try {
-      const page = await fetchIssueTimeline(issueId, cursor);
+      const page = await fetchIssueTimeline(requestIssueId, cursor);
+      if (issueIdRef.current !== requestIssueId) {
+        return;
+      }
       setEvents((prev) => mergeTimelineEvents(prev, page));
       setHasMoreEarlier(hasEarlierEvents(page.length));
       setEarlierLoadedOnce(true);
+      setLoadingEarlier(false);
     } catch (loadError) {
+      if (issueIdRef.current !== requestIssueId) {
+        return;
+      }
       setEarlierError((loadError as Error).message);
-    } finally {
       setLoadingEarlier(false);
     }
   }

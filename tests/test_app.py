@@ -2201,6 +2201,73 @@ async def test_issue_timeline_api_pages_newest_first_without_gaps(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_issue_timeline_api_orders_mixed_iso_timestamp_shapes(tmp_path: Path) -> None:
+    # Sources don't share one ISO shape: GitHub webhook timestamps have no
+    # fractional seconds ("...00Z"), while internally generated ones use
+    # `datetime.isoformat()` and can carry a microsecond fraction
+    # ("...00.500000+00:00"). Raw string ordering places the no-fraction row
+    # AFTER the fractional one within the same second (`Z` > `.` in ASCII),
+    # even though it's chronologically earlier or equal.
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-mixed-ts",
+            identifier="ENG-9",
+            title="Mixed ts shapes",
+            team_key="ENG",
+        )
+        await conn.execute(
+            """
+            INSERT INTO comment_events (comment_id, issue_id, seen_at)
+            VALUES ('comment-mixed', 'iss-mixed-ts', '2026-05-17T10:00:00Z')
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO state_transitions (
+                issue_id, table_name, field, old_value, new_value, ts
+            )
+            VALUES (
+                'iss-mixed-ts', 'review_state', 'iteration', '1', '2',
+                '2026-05-17T10:00:00.500000+00:00'
+            )
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            full = await client.get("/api/issues/iss-mixed-ts/timeline")
+            body = full.json()
+            assert [e["kind"] for e in body] == ["comment_seen", "review_state_changed"]
+
+            # Paginating at limit=1 must land on the chronologically later
+            # event first, and `before` must page back to the earlier one.
+            page1 = await client.get("/api/issues/iss-mixed-ts/timeline?limit=1")
+            body1 = page1.json()
+            assert [e["kind"] for e in body1] == ["review_state_changed"]
+            page2 = await client.get(
+                "/api/issues/iss-mixed-ts/timeline",
+                params={"limit": 1, "before": body1[0]["ts"]},
+            )
+            body2 = page2.json()
+            assert [e["kind"] for e in body2] == ["comment_seen"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_issue_timeline_api_rejects_out_of_range_limit(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)

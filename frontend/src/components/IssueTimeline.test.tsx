@@ -7,6 +7,7 @@ import {
   buildTimelineUrl,
   hasEarlierEvents,
   IssueTimeline,
+  mergeNewestPage,
   mergeTimelineEvents,
   oldestLoadedTs,
   TIMELINE_PAGE_LIMIT,
@@ -74,6 +75,41 @@ describe("mergeTimelineEvents", () => {
     const second = event(ts, "comment_seen", { comment_id: 2 });
     const merged = mergeTimelineEvents([first, second]);
     expect(merged.length).toBe(2);
+  });
+});
+
+describe("mergeNewestPage", () => {
+  it("drops a stale prior value for a current-state row the newest page no longer reports", () => {
+    // activity_comment_marks collapses to one row per run: an older
+    // last_posted_at/fingerprint for the same run must not survive once the
+    // mark has moved on, unlike append-only rows.
+    const anchor = event("2026-05-17T10:00:00Z");
+    const stalePost = event("2026-05-17T10:03:00Z", "activity_comment_posted", {
+      run_id: "run-1",
+      fingerprint: "fp-old",
+    });
+    const prev = [anchor, stalePost];
+    const refreshedPost = event("2026-05-17T10:06:00Z", "activity_comment_posted", {
+      run_id: "run-1",
+      fingerprint: "fp-new",
+    });
+    // The fresh page's window starts back at `anchor`'s ts, so it's
+    // authoritative over the whole [anchor, now) range - including the ts
+    // where `stalePost` used to live.
+    const merged = mergeNewestPage(prev, [anchor, refreshedPost]);
+    expect(merged).toEqual([anchor, refreshedPost]);
+  });
+
+  it("keeps earlier events outside the newest page's window", () => {
+    const older = event("2026-05-17T09:00:00Z");
+    const prev = [older, event("2026-05-17T10:00:00Z")];
+    const page = [event("2026-05-17T10:00:00Z"), event("2026-05-17T10:05:00Z")];
+    const merged = mergeNewestPage(prev, page);
+    expect(merged.map((e) => e.ts)).toEqual([
+      "2026-05-17T09:00:00Z",
+      "2026-05-17T10:00:00Z",
+      "2026-05-17T10:05:00Z",
+    ]);
   });
 });
 
@@ -155,5 +191,61 @@ describe("IssueTimeline", () => {
     expect(renderedTimes).toContain(tsAt(810));
     expect(renderedTimes).toEqual([...renderedTimes].sort());
     expect(new Set(renderedTimes).size).toBe(renderedTimes.length);
+  });
+
+  it("drops a load-earlier response for an issue the user navigated away from before it resolved", async () => {
+    const iss1Newest = Array.from({ length: TIMELINE_PAGE_LIMIT }, (_, i) => eventAt(800 + i));
+    const iss1Earlier = Array.from({ length: 5 }, (_, i) => eventAt(795 + i));
+    const iss2Newest = [eventAt(1)];
+
+    let resolveIss1Earlier: ((events: TimelineEvent[]) => void) | undefined;
+    const iss1EarlierPromise = new Promise<TimelineEvent[]>((resolve) => {
+      resolveIss1Earlier = resolve;
+    });
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const parsed = new URL(url, "http://localhost");
+      const before = parsed.searchParams.get("before");
+      const respond = (body: TimelineEvent[]) =>
+        Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as Response);
+
+      if (parsed.pathname === "/api/issues/iss-1/timeline") {
+        return before ? iss1EarlierPromise.then(respond) : respond(iss1Newest);
+      }
+      return respond(iss2Newest);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <IssueTimeline issueId="iss-1" />
+      </QueryClientProvider>,
+    );
+
+    const loadEarlierButton = await screen.findByRole("button", { name: "Load earlier events" });
+    fireEvent.click(loadEarlierButton);
+
+    // Navigate to a different issue before the in-flight "load earlier"
+    // request for iss-1 resolves.
+    await act(async () => {
+      rerender(
+        <QueryClientProvider client={client}>
+          <IssueTimeline issueId="iss-2" />
+        </QueryClientProvider>,
+      );
+      await Promise.resolve();
+    });
+    await screen.findByText("1 events");
+
+    // The stale iss-1 response lands after navigation; it must be dropped
+    // rather than merged into iss-2's timeline.
+    await act(async () => {
+      resolveIss1Earlier?.(iss1Earlier);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await screen.findByText("1 events");
   });
 });

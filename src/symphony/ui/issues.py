@@ -398,6 +398,14 @@ _TIMELINE_UNION_SQL = """
 # Number of `issue_id` placeholders in `_TIMELINE_UNION_SQL`.
 _TIMELINE_UNION_PARAM_COUNT = 11
 
+# Timeline sources don't all format `ts` the same way (e.g. Linear API comment
+# timestamps use a millisecond `Z` suffix; internally generated ones use
+# `datetime.isoformat()`'s `+00:00` suffix with up to microsecond precision).
+# Lexicographic comparison of the raw strings isn't reliably order-preserving
+# across those shapes, so pagination must compare/order on this normalized form
+# instead of the raw `ts` column.
+_NORM_TS = "strftime('%Y-%m-%dT%H:%M:%f', ts)"
+
 
 def create_issue_detail_router(
     pool: ReadOnlyDbPool,
@@ -636,19 +644,20 @@ def create_issue_detail_router(
             raise HTTPException(status_code=404, detail="Issue not found")
 
         issue_params = (issue_id,) * _TIMELINE_UNION_PARAM_COUNT
+        norm_before = "strftime('%Y-%m-%dT%H:%M:%f', ?)"
         # Find the ts of the `limit`-th newest event at or before the cursor.
-        # `before` is an exclusive ts cursor; ts values are same-format ISO UTC
-        # strings, so lexicographic comparison matches the total order. Anchoring
-        # the page at this ts (not an offset row) lets us pull the *whole* tie
-        # group sharing it, so a ts-only cursor never splits ties.
+        # `before` is an exclusive ts cursor, compared on the normalized form
+        # (see `_NORM_TS`). Anchoring the page at this ts (not an offset row)
+        # lets us pull the *whole* tie group sharing it, so a ts-only cursor
+        # never splits ties.
         cutoff_row = await _fetch_one(
             conn,
             f"""
             WITH events AS ({_TIMELINE_UNION_SQL})
             SELECT ts
             FROM events
-            WHERE (? IS NULL OR ts < ?)
-            ORDER BY ts DESC, kind DESC
+            WHERE (? IS NULL OR {_NORM_TS} < {norm_before})
+            ORDER BY {_NORM_TS} DESC, kind DESC
             LIMIT 1 OFFSET ?
             """,
             (*issue_params, before, before, limit - 1),
@@ -660,9 +669,9 @@ def create_issue_detail_router(
             WITH events AS ({_TIMELINE_UNION_SQL})
             SELECT *
             FROM events
-            WHERE (? IS NULL OR ts < ?)
-              AND (? IS NULL OR ts >= ?)
-            ORDER BY ts ASC, kind ASC
+            WHERE (? IS NULL OR {_NORM_TS} < {norm_before})
+              AND (? IS NULL OR {_NORM_TS} >= {norm_before})
+            ORDER BY {_NORM_TS} ASC, kind ASC
             """,
             (*issue_params, before, before, cutoff, cutoff),
         )
