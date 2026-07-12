@@ -316,6 +316,13 @@ export function BreakdownTable({
               <tr
                 key={r.rowKey}
                 aria-selected={onToggleRow ? selected : undefined}
+                title={
+                  onToggleRow
+                    ? selected
+                      ? "Click to unpin — charts show everything again"
+                      : "Click to pin this row — charts filter to the selection"
+                    : undefined
+                }
                 onClick={onToggleRow ? () => onToggleRow(r.rowKey) : undefined}
                 className={cn(
                   "border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50",
@@ -673,6 +680,167 @@ export function SectionTotals({ issues }: { issues: IssueSummary[] }) {
   );
 }
 
+/** Kanban lanes in pipeline order. Each canonical status maps to exactly one
+ *  lane; `mixed` lanes hold several statuses, so their cards keep a status
+ *  badge to disambiguate. */
+export const BOARD_COLUMNS: Array<{
+  key: string;
+  label: string;
+  states: string[];
+  dot: string;
+  mixed?: boolean;
+}> = [
+  { key: "queued", label: "Queued", states: ["idle"], dot: "bg-slate-400" },
+  { key: "working", label: "Working", states: ["running"], dot: "bg-blue-500" },
+  {
+    key: "review",
+    label: "Review",
+    states: ["awaiting_review_trigger", "pr_open"],
+    dot: "bg-violet-500",
+    mixed: true,
+  },
+  { key: "merge", label: "Merge", states: ["awaiting_merge"], dot: "bg-cyan-500" },
+  {
+    key: "attention",
+    label: "Needs attention",
+    states: ["failed", "halted", "paused", "drift_detected"],
+    dot: "bg-red-500",
+    mixed: true,
+  },
+  { key: "done", label: "Done", states: ["done"], dot: "bg-green-500" },
+];
+
+const STATE_TO_COLUMN: Record<string, string> = Object.fromEntries(
+  BOARD_COLUMNS.flatMap((c) => c.states.map((s) => [s, c.key])),
+);
+
+/** Bucket issues into board lanes: active issues by canonical status (unknown
+ *  statuses land in "Needs attention" — never silently dropped), done-scope
+ *  issues into Done. Newest activity first within a lane. */
+export function groupForBoard(
+  active: IssueSummary[],
+  done: IssueSummary[],
+): Map<string, IssueSummary[]> {
+  const lanes = new Map<string, IssueSummary[]>(BOARD_COLUMNS.map((c) => [c.key, []]));
+  for (const i of active) {
+    const key = STATE_TO_COLUMN[i.canonical_status.state] ?? "attention";
+    lanes.get(key === "done" ? "done" : key)!.push(i);
+  }
+  for (const i of done) {
+    lanes.get("done")!.push(i);
+  }
+  for (const [key, issues] of lanes) {
+    issues.sort((a, b) => {
+      const ta = (key === "done" ? a.completed_at : a.latest_activity_ts) ?? "";
+      const tb = (key === "done" ? b.completed_at : b.latest_activity_ts) ?? "";
+      return tb.localeCompare(ta);
+    });
+  }
+  return lanes;
+}
+
+function BoardCard({
+  issue,
+  showBadge,
+  nowMs,
+}: {
+  issue: IssueSummary;
+  showBadge: boolean;
+  nowMs: number;
+}) {
+  const ts =
+    issue.canonical_status.state === "done"
+      ? issue.completed_at ?? issue.latest_activity_ts
+      : issue.latest_activity_ts;
+  return (
+    <Link
+      to={`/issue/${encodeURIComponent(issue.id)}`}
+      className="group block rounded-md border border-border bg-background p-2.5 transition-colors hover:border-blue-400 dark:hover:border-blue-600"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-xs font-semibold text-primary underline-offset-2 group-hover:underline">
+          {issue.identifier}
+        </span>
+        <span
+          className="shrink-0 font-mono text-[11px] text-muted-foreground"
+          title={ts ? formatUtcTimestamp(ts) : undefined}
+        >
+          {ts ? formatRelativeTimestamp(ts, nowMs) : "—"}
+        </span>
+      </div>
+      <p className="mt-1 line-clamp-2 text-xs leading-snug text-foreground">
+        {issue.title}
+      </p>
+      <div className="mt-2 flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+          <span
+            className={cn(
+              "h-1.5 w-1.5 shrink-0 rounded-full",
+              TEAM_TINT[issue.team_key] ?? "bg-slate-400",
+            )}
+          />
+          {issue.team_key}
+        </span>
+        {showBadge ? (
+          <StatusBadge status={issue.canonical_status.state} live />
+        ) : null}
+      </div>
+    </Link>
+  );
+}
+
+/** The issues kanban: one lane per pipeline step, every tracked issue exactly
+ *  once. Cards are links to the issue page (⌘-click works); the identifier
+ *  underlines on hover to signal it. */
+export function KanbanBoard({
+  active,
+  done,
+  nowMs,
+}: {
+  active: IssueSummary[];
+  done: IssueSummary[];
+  nowMs: number;
+}) {
+  const lanes = groupForBoard(active, done);
+  return (
+    <div className="flex gap-3 overflow-x-auto pb-1">
+      {BOARD_COLUMNS.map((col) => {
+        const issues = lanes.get(col.key) ?? [];
+        return (
+          <div
+            key={col.key}
+            className="flex min-w-[190px] flex-1 flex-col rounded-lg border border-border bg-secondary/20"
+          >
+            <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+              <span className={cn("h-2 w-2 shrink-0 rounded-full", col.dot)} />
+              <span className="text-xs font-semibold">{col.label}</span>
+              <span className="ml-auto font-mono text-[11px] tabular-nums text-muted-foreground">
+                {issues.length}
+              </span>
+            </div>
+            <div className="flex flex-col gap-2 p-2">
+              {issues.length ? (
+                issues.map((i) => (
+                  <BoardCard
+                    key={i.id}
+                    issue={i}
+                    showBadge={Boolean(col.mixed)}
+                    nowMs={nowMs}
+                  />
+                ))
+              ) : (
+                <p className="py-3 text-center text-xs text-muted-foreground/60">
+                  empty
+                </p>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function IssueTable({
   issues,
   mode,
@@ -694,6 +862,7 @@ export function IssueTable({
     "cache-read",
     "Title",
     "Team",
+    "", // trailing chevron: the whole row opens the issue page
   ];
   return (
     <div className="w-full overflow-x-auto rounded-md border border-border">
@@ -702,7 +871,7 @@ export function IssueTable({
           <tr className="border-b border-border bg-secondary/30">
             {headers.map((h, i) => (
               <th
-                key={h}
+                key={h || "nav"}
                 className={cn(
                   "h-9 px-3 align-middle text-xs font-medium uppercase tracking-wide text-muted-foreground",
                   i >= 3 && i <= 6 ? "text-right" : "text-left",
@@ -719,19 +888,29 @@ export function IssueTable({
             return (
               <tr
                 key={issue.id}
-                className="cursor-pointer border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
+                className="group cursor-pointer border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
                 onClick={() => onOpen(issue.id)}
               >
                 <td className="whitespace-nowrap px-3 py-2.5 font-medium">
-                  <a
-                    href={linearIssueUrl(issue.identifier)}
-                    target="_blank"
-                    rel="noreferrer"
-                    onClick={(e) => e.stopPropagation()}
-                    className="text-primary underline-offset-4 hover:underline"
-                  >
-                    {issue.identifier}
-                  </a>
+                  <span className="flex items-center gap-1.5">
+                    <Link
+                      to={`/issue/${encodeURIComponent(issue.id)}`}
+                      onClick={(e) => e.stopPropagation()}
+                      className="text-primary underline-offset-4 hover:underline"
+                    >
+                      {issue.identifier}
+                    </Link>
+                    <a
+                      href={linearIssueUrl(issue.identifier)}
+                      target="_blank"
+                      rel="noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      title={`Open ${issue.identifier} in Linear`}
+                      className="text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      <Icon name="external" size={12} />
+                    </a>
+                  </span>
                 </td>
                 <td className="px-3 py-2.5">
                   <StatusBadge status={issue.canonical_status.state} live />
@@ -754,16 +933,15 @@ export function IssueTable({
                 <td className="whitespace-nowrap px-3 py-2.5 text-right font-mono text-xs">
                   <Tk value={issue.cache_read_tokens} />
                 </td>
-                <td className="max-w-[26rem] px-3 py-2.5">
-                  <Link
-                    to={`/issue/${encodeURIComponent(issue.id)}`}
-                    onClick={(e) => e.stopPropagation()}
-                    className="text-foreground underline-offset-4 hover:underline"
-                  >
-                    {issue.title}
-                  </Link>
-                </td>
+                <td className="max-w-[26rem] truncate px-3 py-2.5">{issue.title}</td>
                 <td className="px-3 py-2.5 text-muted-foreground">{issue.team_key}</td>
+                <td className="w-8 px-2 py-2.5 text-right">
+                  <Icon
+                    name="chevronRight"
+                    size={14}
+                    className="inline text-muted-foreground/50 transition-colors group-hover:text-foreground"
+                  />
+                </td>
               </tr>
             );
           })}
@@ -776,6 +954,7 @@ export function IssueTable({
 export function HomePage() {
   const navigate = useNavigate();
   const nowMs = useNowMs();
+  const [issueView, setIssueView] = useState<"board" | "table">("board");
   const { provider, teams, models, date } = useFilters();
   // Day-granular bounds; the strings are stable across the 10s `nowMs` ticker,
   // so they don't churn the query keys.
@@ -864,39 +1043,67 @@ export function HomePage() {
 
       <section className="mt-7">
         <div className="mb-2.5 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="flex items-center gap-2 text-base font-semibold">
-            Active{" "}
-            <span className="font-mono text-sm font-normal text-muted-foreground">
-              · {active.length}
-            </span>
-          </h2>
-          <SectionTotals issues={active} />
-        </div>
-        {active.length ? (
-          <IssueTable issues={active} mode="active" nowMs={nowMs} onOpen={openIssue} />
-        ) : (
-          <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
-            No active issues match your filters
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="flex items-center gap-2 text-base font-semibold">
+              Issues{" "}
+              <span className="font-mono text-sm font-normal text-muted-foreground">
+                · {active.length + done.length}
+              </span>
+            </h2>
+            <Segmented
+              ariaLabel="Issues view"
+              options={[
+                { value: "board", label: "Board" },
+                { value: "table", label: "Table" },
+              ]}
+              value={issueView}
+              onChange={(v) => setIssueView(v as "board" | "table")}
+            />
           </div>
-        )}
-      </section>
+          <SectionTotals issues={[...active, ...done]} />
+        </div>
 
-      <section className="mt-7">
-        <div className="mb-2.5 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="flex items-center gap-2 text-base font-semibold">
-            Recently done{" "}
-            <span className="font-mono text-sm font-normal text-muted-foreground">
-              · {done.length}
-            </span>
-          </h2>
-          <SectionTotals issues={done} />
-        </div>
-        {done.length ? (
-          <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
+        {issueView === "board" ? (
+          <KanbanBoard active={active} done={done} nowMs={nowMs} />
         ) : (
-          <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
-            No completed issues match your filters
-          </div>
+          <>
+            <div className="mb-2.5 flex flex-wrap items-center justify-between gap-3">
+              <h3 className="flex items-center gap-2 text-sm font-semibold">
+                Active{" "}
+                <span className="font-mono text-xs font-normal text-muted-foreground">
+                  · {active.length}
+                </span>
+              </h3>
+            </div>
+            {active.length ? (
+              <IssueTable
+                issues={active}
+                mode="active"
+                nowMs={nowMs}
+                onOpen={openIssue}
+              />
+            ) : (
+              <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
+                No active issues match your filters
+              </div>
+            )}
+
+            <div className="mb-2.5 mt-6 flex flex-wrap items-center justify-between gap-3">
+              <h3 className="flex items-center gap-2 text-sm font-semibold">
+                Recently done{" "}
+                <span className="font-mono text-xs font-normal text-muted-foreground">
+                  · {done.length}
+                </span>
+              </h3>
+            </div>
+            {done.length ? (
+              <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
+            ) : (
+              <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
+                No completed issues match your filters
+              </div>
+            )}
+          </>
         )}
       </section>
 
