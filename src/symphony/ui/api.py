@@ -18,7 +18,7 @@ from .status import (
     DEFAULT_STUCK_THRESHOLDS,
     CanonicalState,
     canonical_status_sort_key,
-    compute_canonical_status,
+    compute_canonical_statuses,
 )
 from .warnings import DEFAULT_PR_NO_PROGRESS_THRESHOLD, issue_warnings
 
@@ -1023,8 +1023,10 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             issues = [dict(row) for row in rows]
+            # Queue rows describe issues with no runs, so they can't satisfy a
+            # provider/model filter — skip the merge entirely when one is set.
             queue_rows: list[dict[str, Any]] = []
-            if not is_done:
+            if not is_done and provider_filter is None and not model_filter:
                 qcur = await conn.execute(
                     """
                     SELECT team_key, issue_id, identifier, title, queue,
@@ -1037,18 +1039,13 @@ def create_api_router(
                     for row in map(dict, await qcur.fetchall())
                     if _queue_row_matches(row, q=q, teams=team_filter)
                 ]
-            statuses = [
-                (
-                    issue,
-                    await compute_canonical_status(
-                        conn,
-                        str(issue["id"]),
-                        now=request_now,
-                        thresholds=thresholds,
-                    ),
-                )
-                for issue in issues
-            ]
+            status_by_id = await compute_canonical_statuses(
+                conn,
+                [str(issue["id"]) for issue in issues],
+                now=request_now,
+                thresholds=thresholds,
+            )
+            statuses = [(issue, status_by_id[str(issue["id"])]) for issue in issues]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503,
