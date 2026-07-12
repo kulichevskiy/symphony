@@ -174,6 +174,30 @@ async def test_invalid_db_global_role_enum_refuses_boot(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unknown_db_global_role_name_refuses_boot(tmp_path: Path) -> None:
+    """A typo'd role-name key (e.g. `review-find`, restored/UI-written) must
+    raise `ConfigBootError` — the same rejection an unknown key gets in YAML
+    via the `RoleName` Literal, not a silent no-op that boots with the typo'd
+    role never actually configured."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    await db.config_globals.set_globals(
+        conn, roles={"review-find": {"agent": "codex"}}, migrated_at="t"
+    )
+    with pytest.raises(ConfigBootError):
+        await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_disabled_binding_with_unresolvable_env_does_not_block_boot(tmp_path: Path) -> None:
     """A disabled binding is kept only so restart/restore paths can resolve
     it; it must never block boot because an operator has since removed the

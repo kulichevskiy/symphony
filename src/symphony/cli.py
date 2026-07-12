@@ -20,6 +20,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, cast, get_args
 
+import aiosqlite
 import click
 
 from . import db
@@ -226,6 +227,21 @@ def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
 
 
+async def _db_owns_topology(conn: aiosqlite.Connection) -> bool:
+    """Whether the DB is the topology source of truth: bindings exist now, or
+    the importer has migrated it before (`config_globals.migrated_at` set).
+
+    The marker matters on its own because a migrated DB can have zero
+    *current* bindings — e.g. every binding was deleted via the UI — and
+    leftover YAML `repos:` must stay ignored (not resolved/validated) in that
+    case too, same as when bindings are still present.
+    """
+    if await db.config_bindings.count(conn) > 0:
+        return True
+    globals_row = await db.config_globals.get(conn)
+    return bool(globals_row and globals_row.migrated_at)
+
+
 @asynccontextmanager
 async def _configured_tracker_registry(
     cfg: Config,
@@ -235,6 +251,11 @@ async def _configured_tracker_registry(
     external_linear: Linear | None = None
     async with AsyncExitStack() as stack:
         for binding in cfg.repos:
+            # A disabled binding's stale/revoked credentials must not crash
+            # boot; reconcile() already tolerates a missing tracker for a
+            # given context (logs + defers), so skipping it here is safe.
+            if not binding.enabled:
+                continue
             tracker = for_binding(binding, secrets, registry=registry)
             await stack.enter_async_context(cast(Any, tracker))
             if binding.provider == "linear" and external_linear is None:
@@ -290,8 +311,8 @@ async def _run(config_path: Path, *, once: bool) -> None:
     try:
         # A migrated deployment's leftover YAML `repos:` is ignored — don't
         # pay for (or risk boot-crashing on) validating/resolving it.
-        has_db_bindings = await db.config_bindings.count(conn) > 0
-        base = Config.load(config_path, resolve_repos=not has_db_bindings)
+        db_owns_topology = await _db_owns_topology(conn)
+        base = Config.load(config_path, resolve_repos=not db_owns_topology)
         try:
             cfg = await assemble_effective_config(
                 conn, base, yaml_has_repos_topology=Config.peek_repos_topology(config_path)
@@ -570,8 +591,8 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
 async def _preflight(config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        has_db_bindings = await db.config_bindings.count(conn) > 0
-        base = Config.load(config_path, resolve_repos=not has_db_bindings)
+        db_owns_topology = await _db_owns_topology(conn)
+        base = Config.load(config_path, resolve_repos=not db_owns_topology)
         cfg = await assemble_effective_config(
             conn,
             base,
@@ -1112,8 +1133,8 @@ def dispatch(linear_id: str, config_path: Path) -> None:
 async def _dispatch(linear_id: str, config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        has_db_bindings = await db.config_bindings.count(conn) > 0
-        base = Config.load(config_path, resolve_repos=not has_db_bindings)
+        db_owns_topology = await _db_owns_topology(conn)
+        base = Config.load(config_path, resolve_repos=not db_owns_topology)
         if not base.linear_api_key:
             click.echo("LINEAR_API_KEY is empty", err=True)
             sys.exit(2)

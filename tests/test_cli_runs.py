@@ -866,3 +866,50 @@ def test_dispatch_errors_when_no_binding_matches_team_key(tmp_path: Path, monkey
             await conn.close()
 
     asyncio.run(_check())
+
+
+async def test_configured_tracker_registry_skips_disabled_bindings(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """A disabled binding's stale/invalid tracker credentials must not crash
+    boot: only enabled bindings get a tracker constructed (SYM-188 review)."""
+    monkeypatch.delenv("JIRA_BASE_URL", raising=False)
+    monkeypatch.delenv("JIRA_EMAIL", raising=False)
+    monkeypatch.delenv("JIRA_API_TOKEN", raising=False)
+    from symphony.cli import _configured_tracker_registry
+    from symphony.config import Config, RepoBinding, TrackerStates
+
+    # No base_url/email/api_token anywhere: constructing a JiraTracker for
+    # this binding would raise ValueError if it were ever attempted.
+    disabled_jira = RepoBinding(
+        provider="jira",
+        project_key="SYM",
+        github_repo="org/repo",
+        states=TrackerStates(ready="To Do", code_review="In Review"),
+        enabled=False,
+    )
+    cfg = Config(
+        workspace_root=tmp_path / "ws",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "state.sqlite",
+        repos=[disabled_jira],
+    )
+    async with _configured_tracker_registry(cfg) as (registry, external_linear):
+        assert external_linear is None
+
+
+async def test_db_owns_topology_true_after_migration_with_zero_bindings(
+    tmp_path: Path,
+) -> None:
+    """A migrated DB with all bindings since deleted (e.g. via the UI) must
+    still be treated as the topology source — leftover YAML `repos:` stays
+    ignored, not re-resolved/validated (SYM-188 review)."""
+    from symphony.cli import _db_owns_topology
+
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        assert await _db_owns_topology(conn) is False
+        await db.config_globals.set_globals(conn, roles={}, migrated_at="t")
+        assert await _db_owns_topology(conn) is True
+    finally:
+        await conn.close()

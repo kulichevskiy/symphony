@@ -24,14 +24,19 @@ import os
 
 import aiosqlite
 from dotenv import dotenv_values
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from . import db
-from .config import Config, RepoBinding, RoleConfig
+from .config import Config, RepoBinding, RoleConfig, RoleName
 
 _log = logging.getLogger(__name__)
 
 _IMPORT_HINT = "run the importer (`symphony config-import --config <yaml>`)"
+
+# `TypeAdapter` gets us the same "unknown role name" rejection YAML gets for
+# free from `dict[RoleName, RoleConfig]` field typing — `config_globals.roles`
+# is raw DB JSON, so it never passes through that pydantic field parse.
+_GlobalRolesAdapter = TypeAdapter(dict[RoleName, RoleConfig])
 
 
 class ConfigBootError(RuntimeError):
@@ -138,11 +143,7 @@ async def assemble_effective_config(
         bindings = [
             RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored
         ]
-        global_roles = (
-            {name: RoleConfig.model_validate(cell) for name, cell in globals_row.roles.items()}
-            if globals_row
-            else {}
-        )
+        global_roles = _GlobalRolesAdapter.validate_python(globals_row.roles) if globals_row else {}
         effective = base.model_copy(update={"repos": bindings, "roles": global_roles})
         _resolve_bindings(effective)
         # `model_copy` skips `Config`'s model_validators, so DB-sourced role
