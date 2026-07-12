@@ -166,6 +166,13 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
     )
 
 
+def _queue_scope(binding: RepoBinding) -> str:
+    """`tracker_queue.scope` for a binding: `_binding_key` minus the team
+    (already its own column), so two bindings on one team never clobber each
+    other's snapshot rows."""
+    return "#".join(_binding_key(binding)[1:])
+
+
 def _register_configured_trackers(
     registry: TrackerRegistry,
     config: Config,
@@ -375,6 +382,10 @@ class _OrchestratorBase:
         # (and their review/merge/acceptance follow-ups) are unaffected. In
         # memory only: a daemon restart clears it back to running.
         self._dispatch_paused = False
+        # One-shot guard: prune `tracker_queue` rows from binding scopes that
+        # are no longer configured (removed/renamed repos, labels, trackers)
+        # on the first poll tick, so stale queue lanes can't linger in the UI.
+        self._tracker_queue_pruned = False
         # Serializes toggling `_dispatch_paused` against the final
         # check-then-insert in `_dispatch_one`, so a pause request can never
         # land in the middle of that critical section.
@@ -801,6 +812,18 @@ class _OrchestratorBase:
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
         await self._restore_operator_waits()
+        if not self._tracker_queue_pruned:
+            try:
+                await db.tracker_queue.prune_scopes(
+                    self._conn,
+                    keep=[
+                        (binding.linear_team_key, _queue_scope(binding))
+                        for binding in self.config.repos
+                    ],
+                )
+                self._tracker_queue_pruned = True
+            except Exception:  # noqa: BLE001 — must not kill the loop
+                log.exception("tracker queue scope prune failed")
         self._merged_linear_state_reconcile_ticks += 1
         if (
             self._merged_linear_state_reconcile_ticks % MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL

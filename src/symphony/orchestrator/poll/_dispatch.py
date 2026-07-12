@@ -36,18 +36,12 @@ from ._base import (
     BindingKey,
     _binding_key,
     _OrchestratorBase,
+    _queue_scope,
     _tracker_context_for_binding,
 )
 from ._helpers import _pr_view_is_closed, _pr_view_is_merged
 
 log = logging.getLogger(__name__)
-
-
-def _queue_scope(binding: RepoBinding) -> str:
-    """`tracker_queue.scope` for a binding: `_binding_key` minus the team
-    (already its own column), so two bindings on one team never clobber each
-    other's snapshot rows."""
-    return "#".join(_binding_key(binding)[1:])
 
 
 class _DispatchMixin(_OrchestratorBase):
@@ -190,7 +184,14 @@ class _DispatchMixin(_OrchestratorBase):
             )
             for issue in ready_issues
         ]
+        # The Ready and Waiting fetches run concurrently, so an issue moving
+        # between them can appear in both — the ready row wins (a duplicate
+        # insert would violate the snapshot's primary key).
+        seen_ids = {issue.id for issue in ready_issues}
         for issue in waiting_issues:
+            if issue.id in seen_ids:
+                continue
+            seen_ids.add(issue.id)
             if binding.issue_label and binding.issue_label not in issue.labels:
                 continue
             if issue.id in unblocked_ids:

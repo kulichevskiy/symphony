@@ -471,12 +471,15 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
                  '2026-07-10T08:00:00Z', '2026-07-10T09:00:00Z', 1000, 200)
             """
         )
-        # Historical codex usage for the requeued issue — the provider filter
-        # must keep it even though it is only reachable via the queue.
+        # Mixed historical usage for the requeued issue — the provider filter
+        # must keep it (codex history exists) and scope its totals to the
+        # matching slice only.
         await conn.execute(
             """
             INSERT INTO run_model_usage (run_id, provider, model, input_tokens, output_tokens)
-            VALUES ('r-2', 'codex', 'gpt-5', 1000, 200)
+            VALUES
+                ('r-2', 'codex', 'gpt-5', 700, 150),
+                ('r-2', 'claude', 'claude-opus-4-8', 300, 50)
             """
         )
         await conn.execute(
@@ -599,14 +602,30 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
     assert [issue["identifier"] for issue in done.json()] == []
 
     # Under a provider filter, queue-only rows drop out (no runs), but the
-    # requeued issue with matching historical codex usage stays.
+    # requeued issue with matching historical codex usage stays — with totals
+    # scoped to the codex slice, not the whole-run sums.
     assert filtered.status_code == 200
-    assert [issue["identifier"] for issue in filtered.json()] == ["ADJ-2"]
+    filtered_rows = {issue["identifier"]: issue for issue in filtered.json()}
+    assert list(filtered_rows) == ["ADJ-2"]
+    assert filtered_rows["ADJ-2"]["input_tokens"] == 700
+    assert filtered_rows["ADJ-2"]["output_tokens"] == 150
 
     # A historical date window excludes today's queue rows (seen_at is
     # outside the window), keeping filtered views honest.
     assert windowed.status_code == 200
     assert [issue["identifier"] for issue in windowed.json()] == []
+
+
+def test_queue_fallback_id_qualifies_non_default_trackers() -> None:
+    from symphony.ui.api import _queue_fallback_id
+
+    default_row = {"scope": "org/repo#symphony#linear#default", "issue_id": "raw-1"}
+    assert _queue_fallback_id(default_row) == "raw-1"
+
+    jira_row = {"scope": "org/repo##jira#mysite", "issue_id": "raw-1"}
+    qualified = _queue_fallback_id(jira_row)
+    assert qualified != "raw-1"
+    assert "jira" in qualified and "mysite" in qualified
 
 
 @pytest.mark.asyncio

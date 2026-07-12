@@ -145,6 +145,39 @@ async def test_replace_scan_preserves_first_seen_while_queue_unchanged(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_prune_scopes_drops_unconfigured_bindings(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="org/repo#symphony#linear#default",
+            rows=[_row("ENG-1")],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+        # A binding that was since removed from the config.
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="OLD",
+            scope="org/gone##linear#default",
+            rows=[_row("OLD-1")],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+
+        await db.tracker_queue.prune_scopes(
+            conn, keep=[("ENG", "org/repo#symphony#linear#default")]
+        )
+        rows = await _rows(conn)
+        assert [r["identifier"] for r in rows] == ["ENG-1"]
+
+        # No configured bindings at all → the table empties.
+        await db.tracker_queue.prune_scopes(conn, keep=[])
+        assert await _rows(conn) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_mark_waiting_and_remove_adjust_single_rows(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -242,6 +275,15 @@ async def test_scan_persists_ready_and_waiting_queue_snapshot(tmp_path: Path) ->
                 # No open blockers left: auto-unblocked to Ready during the
                 # same scan, so the snapshot records it as ready already.
                 _issue("iss-4", "ENG-4", state_name="Waiting", labels=["symphony"]),
+                # Raced the concurrent Ready fetch (also in the ready list) —
+                # the ready row must win instead of violating the PK.
+                _issue(
+                    "iss-1",
+                    "ENG-1",
+                    state_name="Waiting",
+                    labels=["symphony"],
+                    blocked_by=[_open_blocker("ENG-9")],
+                ),
             ]
 
         linear.issues_in_state = AsyncMock(side_effect=issues_in_state)

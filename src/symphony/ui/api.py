@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ..db.issues import contextual_id
 from ..linear.slash import SlashKind
 from ..tracker import DEFAULT_PROVIDER, DEFAULT_SITE
 from .db import ReadOnlyDbPool
@@ -852,6 +853,19 @@ def _queue_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
     return (provider, site, str(row["issue_id"]))
 
 
+def _queue_fallback_id(row: Mapping[str, Any]) -> str:
+    """Response id for a queue row with no `issues` storage row.
+
+    Default-tracker rows keep the raw tracker id (what `issues.upsert` would
+    assign); non-default trackers get the same contextual id the storage
+    layer would use, so two trackers sharing a raw id never emit duplicate
+    React keys."""
+    provider, site = _queue_tracker_context(row)
+    if (provider, site) == (DEFAULT_PROVIDER, DEFAULT_SITE):
+        return str(row["issue_id"])
+    return contextual_id(id=str(row["issue_id"]), provider=provider, site=site)
+
+
 def _dedupe_queue_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse multi-binding snapshots to one row per tracker issue.
 
@@ -875,24 +889,31 @@ def _dedupe_queue_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(best.values())
 
 
+# Chunk size for queue-derived id lists. Keeps every generated statement well
+# under SQLite's bound-parameter and expression-depth limits, so a huge Todo
+# lane can never 503 the issues endpoint.
+_QUEUE_SQL_CHUNK = 300
+
+
 async def _resolve_queue_storage_ids(
     conn: aiosqlite.Connection,
     rows: list[dict[str, Any]],
 ) -> dict[tuple[str, str, str], str]:
     """Map queue rows' tracker identities to `issues` storage ids (if any)."""
-    if not rows:
-        return {}
-    keys = {_queue_key(row) for row in rows}
-    conds = " OR ".join("(provider = ? AND site = ? AND tracker_issue_id = ?)" for _ in keys)
-    params = tuple(value for key in keys for value in key)
-    cur = await conn.execute(
-        f"SELECT id, provider, site, tracker_issue_id FROM issues WHERE {conds}",
-        params,
-    )
-    return {
-        (str(row["provider"]), str(row["site"]), str(row["tracker_issue_id"])): str(row["id"])
-        for row in await cur.fetchall()
-    }
+    keys = sorted({_queue_key(row) for row in rows})
+    result: dict[tuple[str, str, str], str] = {}
+    for start in range(0, len(keys), _QUEUE_SQL_CHUNK):
+        chunk = keys[start : start + _QUEUE_SQL_CHUNK]
+        values = ",".join("(?, ?, ?)" for _ in chunk)
+        cur = await conn.execute(
+            "SELECT id, provider, site, tracker_issue_id FROM issues "
+            f"WHERE (provider, site, tracker_issue_id) IN (VALUES {values})",
+            tuple(value for key in chunk for value in key),
+        )
+        for row in await cur.fetchall():
+            key = (str(row["provider"]), str(row["site"]), str(row["tracker_issue_id"]))
+            result[key] = str(row["id"])
+    return result
 
 
 async def _queue_ids_matching_usage(
@@ -904,27 +925,89 @@ async def _queue_ids_matching_usage(
 ) -> set[str]:
     """Storage ids (of queued issues) whose historical usage matches the
     active provider/model filters — mirrors `_list_issues_query` semantics."""
-    if not storage_ids:
-        return set()
-    placeholders = ",".join("?" * len(storage_ids))
-    conds = [f"r.issue_id IN ({placeholders})"]
-    params: list[str] = list(storage_ids)
-    if provider is not None:
-        conds.append("u.provider = ?")
-        params.append(provider)
-    if models:
-        conds.append(_model_in_clause(models))
-        params.extend(_model_params(models))
-    cur = await conn.execute(
-        f"""
-        SELECT DISTINCT r.issue_id
-        FROM run_model_usage u
-        JOIN runs r ON r.id = u.run_id
-        WHERE {" AND ".join(conds)}
-        """,
-        tuple(params),
-    )
-    return {str(row["issue_id"]) for row in await cur.fetchall()}
+    ordered = sorted(storage_ids)
+    matching: set[str] = set()
+    for start in range(0, len(ordered), _QUEUE_SQL_CHUNK):
+        chunk = ordered[start : start + _QUEUE_SQL_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        conds = [f"r.issue_id IN ({placeholders})"]
+        params: list[str] = list(chunk)
+        if provider is not None:
+            conds.append("u.provider = ?")
+            params.append(provider)
+        if models:
+            conds.append(_model_in_clause(models))
+            params.extend(_model_params(models))
+        cur = await conn.execute(
+            f"""
+            SELECT DISTINCT r.issue_id
+            FROM run_model_usage u
+            JOIN runs r ON r.id = u.run_id
+            WHERE {" AND ".join(conds)}
+            """,
+            tuple(params),
+        )
+        matching.update(str(row["issue_id"]) for row in await cur.fetchall())
+    return matching
+
+
+async def _queue_issue_totals(
+    conn: aiosqlite.Connection,
+    storage_ids: set[str],
+    *,
+    provider: str | None,
+    models: list[tuple[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Historical token totals + latest activity for requeued issues.
+
+    Unfiltered requests sum whole runs; with a provider/model filter active
+    the totals come from the matching `run_model_usage` slice instead, so a
+    Todo card reconciles with the filtered tracked rows and spend views.
+    """
+    ordered = sorted(storage_ids)
+    filtered = provider is not None or bool(models)
+    totals: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(ordered), _QUEUE_SQL_CHUNK):
+        chunk = ordered[start : start + _QUEUE_SQL_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        if not filtered:
+            query = f"""
+                SELECT issue_id,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(cache_write_tokens) AS cache_write_tokens,
+                       SUM(cache_read_tokens) AS cache_read_tokens,
+                       MAX(COALESCE(ended_at, started_at)) AS latest_activity_ts
+                FROM runs
+                WHERE issue_id IN ({placeholders})
+                GROUP BY issue_id
+            """
+            params: list[str] = list(chunk)
+        else:
+            conds = [f"r.issue_id IN ({placeholders})"]
+            params = list(chunk)
+            if provider is not None:
+                conds.append("u.provider = ?")
+                params.append(provider)
+            if models:
+                conds.append(_model_in_clause(models))
+                params.extend(_model_params(models))
+            query = f"""
+                SELECT r.issue_id AS issue_id,
+                       SUM(u.input_tokens) AS input_tokens,
+                       SUM(u.output_tokens) AS output_tokens,
+                       SUM(u.cache_write_tokens) AS cache_write_tokens,
+                       SUM(u.cache_read_tokens) AS cache_read_tokens,
+                       MAX(COALESCE(r.ended_at, r.started_at)) AS latest_activity_ts
+                FROM run_model_usage u
+                JOIN runs r ON r.id = u.run_id
+                WHERE {" AND ".join(conds)}
+                GROUP BY r.issue_id
+            """
+        cur = await conn.execute(query, tuple(params))
+        for row in await cur.fetchall():
+            totals[str(row["issue_id"])] = dict(row)
+    return totals
 
 
 def _list_issues_query(
@@ -1168,22 +1251,12 @@ def create_api_router(
             if queue_storage_ids and not is_done:
                 # A requeued issue keeps its historical spend and activity —
                 # don't report zeros just because it is back in the queue.
-                placeholders = ",".join("?" * len(queue_storage_ids))
-                tcur = await conn.execute(
-                    f"""
-                    SELECT issue_id,
-                           SUM(input_tokens) AS input_tokens,
-                           SUM(output_tokens) AS output_tokens,
-                           SUM(cache_write_tokens) AS cache_write_tokens,
-                           SUM(cache_read_tokens) AS cache_read_tokens,
-                           MAX(COALESCE(ended_at, started_at)) AS latest_activity_ts
-                    FROM runs
-                    WHERE issue_id IN ({placeholders})
-                    GROUP BY issue_id
-                    """,
-                    tuple(queue_storage_ids.values()),
+                queue_totals = await _queue_issue_totals(
+                    conn,
+                    queued_storage_id_set,
+                    provider=provider_filter,
+                    models=model_filter,
                 )
-                queue_totals = {str(row["issue_id"]): dict(row) for row in await tcur.fetchall()}
             status_by_id = await compute_canonical_statuses(
                 conn,
                 [str(issue["id"]) for issue in issues],
@@ -1276,7 +1349,7 @@ def create_api_router(
             payloads.append(
                 IssueSummary.model_validate(
                     {
-                        "id": storage_id or str(row["issue_id"]),
+                        "id": storage_id or _queue_fallback_id(row),
                         "identifier": str(row["identifier"]),
                         "title": str(row["title"]),
                         "team_key": str(row["team_key"]),

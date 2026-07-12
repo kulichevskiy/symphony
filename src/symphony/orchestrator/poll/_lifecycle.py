@@ -48,6 +48,7 @@ from ._base import (
     _OrchestratorBase,
     _parse_local_review_model_usage,
     _PendingDelivery,
+    _queue_scope,
     _read_run_final_message,
     _record_run_model_usage,
 )
@@ -278,6 +279,15 @@ class _LifecycleMixin(_OrchestratorBase):
             )
             return None
         self._dispatch_run_ids[issue_id] = run_id
+        # The issue is leaving the Todo lane — drop its queue snapshot row so
+        # the UI board reflects the dispatch without waiting for the next
+        # scan (which may never come if the daemon stops first).
+        await db.tracker_queue.remove(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            issue_id=issue.id,
+        )
 
         in_progress_id = await self._resolve_dispatch_states(
             binding=binding,

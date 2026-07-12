@@ -25,6 +25,28 @@ class QueueRow:
     blocked_by: str = ""
 
 
+async def prune_scopes(
+    conn: aiosqlite.Connection,
+    *,
+    keep: list[tuple[str, str]],
+) -> None:
+    """Drop rows from binding scopes that are no longer configured.
+
+    `replace_scan` only rewrites scopes that still get scanned; a removed or
+    renamed binding (repo, label, provider, site) would otherwise leave its
+    queue rows visible forever. Called once at daemon startup.
+    """
+    if not keep:
+        await conn.execute("DELETE FROM tracker_queue")
+    else:
+        conds = " OR ".join("(team_key = ? AND scope = ?)" for _ in keep)
+        await conn.execute(
+            f"DELETE FROM tracker_queue WHERE NOT ({conds})",
+            tuple(value for pair in keep for value in pair),
+        )
+    await conn.commit()
+
+
 async def mark_waiting(
     conn: aiosqlite.Connection,
     *,
