@@ -689,6 +689,8 @@ class _OrchestratorBase:
         """One-time startup work: cache team workflow states, validate auth."""
         viewer_keys_by_ctx: dict[TrackerContext, list[str]] = {}
         for binding in self.config.repos:
+            if not binding.enabled:
+                continue
             ctx = _tracker_context_for_binding(binding)
             viewer_keys = viewer_keys_by_ctx.get(ctx)
             if viewer_keys is None:

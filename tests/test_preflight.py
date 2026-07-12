@@ -50,9 +50,18 @@ def _isolate_codex_home(tmp_path: Path, monkeypatch) -> Path:  # type: ignore[no
     return codex_home
 
 
-def _yaml_with_ready(ready: str = "Todo", *, waiting: str | None = None) -> str:
+def _db_path_lines(tmp_path: Path) -> str:
+    return (
+        f"db_path: {tmp_path / 'state.sqlite'}\n"
+        f"workspace_root: {tmp_path / 'workspaces'}\n"
+        f"log_root: {tmp_path / 'logs'}\n"
+    )
+
+
+def _yaml_with_ready(tmp_path: Path, ready: str = "Todo", *, waiting: str | None = None) -> str:
     waiting_line = f"      waiting: {waiting}\n" if waiting is not None else ""
     return f"""
+{_db_path_lines(tmp_path)}
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -69,6 +78,7 @@ repos:
 
 
 def _yaml_with_review_lanes(
+    tmp_path: Path,
     *,
     local_review: bool,
     remote_review: bool,
@@ -80,6 +90,7 @@ def _yaml_with_review_lanes(
         f"      local_code_review: {local_code_review}\n" if local_code_review is not None else ""
     )
     return f"""
+{_db_path_lines(tmp_path)}
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -105,8 +116,11 @@ _STD_STATES = {
 }
 
 
-def _yaml_with_role_effort(effort: str, *, agent: str = "claude", model: str) -> str:
+def _yaml_with_role_effort(
+    tmp_path: Path, effort: str, *, agent: str = "claude", model: str
+) -> str:
     return f"""
+{_db_path_lines(tmp_path)}
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -216,7 +230,7 @@ def test_preflight_exits_cleanly_when_fetcher_http_errors(tmp_path: Path, monkey
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _raise)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("high", model="sonnet"))
+    p.write_text(_yaml_with_role_effort(tmp_path, "high", model="sonnet"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
@@ -236,7 +250,7 @@ def test_preflight_accepts_supported_model_effort_pair(tmp_path: Path, monkeypat
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
     _fake_claude_caps(monkeypatch, ["low", "medium", "high", "max"])
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("high", model="sonnet"))
+    p.write_text(_yaml_with_role_effort(tmp_path, "high", model="sonnet"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert "claude model 'sonnet' supports effort 'high'" in result.output
@@ -255,7 +269,7 @@ def test_preflight_skips_claude_check_when_api_key_missing(tmp_path: Path, monke
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _no_key)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("high", model="sonnet"))
+    p.write_text(_yaml_with_role_effort(tmp_path, "high", model="sonnet"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert "skipping claude model 'sonnet' effort validation" in result.output
@@ -281,7 +295,8 @@ def test_preflight_validates_with_binding_supplied_api_key(tmp_path: Path, monke
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
     p = tmp_path / "cfg.yaml"
     p.write_text(
-        """
+        f"""
+{_db_path_lines(tmp_path)}
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -335,7 +350,8 @@ def test_preflight_exercises_each_binding_api_key(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
     p = tmp_path / "cfg.yaml"
     p.write_text(
-        """
+        f"""
+{_db_path_lines(tmp_path)}
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -401,7 +417,8 @@ def test_preflight_empty_binding_key_override_is_not_masked_by_parent(
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
     p = tmp_path / "cfg.yaml"
     p.write_text(
-        """
+        f"""
+{_db_path_lines(tmp_path)}
 repos:
   - linear_team_key: ENG
     github_repo: org/api-svc
@@ -436,7 +453,7 @@ def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeyp
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
     _fake_claude_caps(monkeypatch, ["low", "medium", "high", "max"])
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("xhigh", model="sonnet"))
+    p.write_text(_yaml_with_role_effort(tmp_path, "xhigh", model="sonnet"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code != 0
     assert (
@@ -457,7 +474,7 @@ def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _boom)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort("high", agent="codex", model="gpt-5.1-codex"))
+    p.write_text(_yaml_with_role_effort(tmp_path, "high", agent="codex", model="gpt-5.1-codex"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert "codex model 'gpt-5.1-codex' supports effort 'high'" in result.output
@@ -482,7 +499,7 @@ def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     )
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready("Todo"))
+    p.write_text(_yaml_with_ready(tmp_path, "Todo"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     assert not (codex_home / "config.toml").exists()
@@ -497,7 +514,8 @@ def test_preflight_allows_jira_binding_without_linear_key(tmp_path: Path, monkey
     _isolate_codex_home(tmp_path, monkeypatch)
     p = tmp_path / "cfg.yaml"
     p.write_text(
-        """
+        f"""
+{_db_path_lines(tmp_path)}
 repos:
   - provider: jira
     project_key: SYM
@@ -535,7 +553,7 @@ def test_preflight_notes_codex_bypass_when_binding_uses_codex_agent(
     )
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready("Todo").replace("agent: claude", "agent: codex"))
+    p.write_text(_yaml_with_ready(tmp_path, "Todo").replace("agent: claude", "agent: codex"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     # codex runs bypass its OS sandbox; no permissions profile is provisioned.
@@ -563,7 +581,9 @@ def test_preflight_notes_codex_bypass_when_local_reviewer_uses_codex(
     )
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready("Todo").replace("review_strategy: remote", "local_review: true"))
+    p.write_text(
+        _yaml_with_ready(tmp_path, "Todo").replace("review_strategy: remote", "local_review: true")
+    )
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code == 0, result.output
     # codex runs bypass its OS sandbox; no permissions profile is provisioned.
@@ -590,7 +610,7 @@ def test_preflight_fails_when_ready_not_in_team_states(tmp_path: Path, monkeypat
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
     # Binding asks for a "Backlog" ready state that the team's workflow lacks.
-    p.write_text(_yaml_with_ready("Backlog"))
+    p.write_text(_yaml_with_ready(tmp_path, "Backlog"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code != 0
     assert "Backlog" in result.output
@@ -613,7 +633,7 @@ def test_preflight_fails_when_waiting_not_in_team_states(tmp_path: Path, monkeyp
     )
     _install_fake(monkeypatch, fake)
     p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready("Todo", waiting="Waiting"))
+    p.write_text(_yaml_with_ready(tmp_path, "Todo", waiting="Waiting"))
     result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
     assert result.exit_code != 0
     assert "Waiting" in result.output
@@ -641,6 +661,7 @@ def test_preflight_checks_local_code_review_when_local_review_enabled(
     p = tmp_path / "cfg.yaml"
     p.write_text(
         _yaml_with_review_lanes(
+            tmp_path,
             local_review=True,
             remote_review=True,
             local_code_review="Local Review",
@@ -674,6 +695,7 @@ def test_preflight_allows_empty_review_lanes_when_both_reviews_disabled(
     p = tmp_path / "cfg.yaml"
     p.write_text(
         _yaml_with_review_lanes(
+            tmp_path,
             local_review=False,
             remote_review=False,
             code_review='""',
@@ -708,6 +730,7 @@ def test_preflight_allows_omitted_review_lanes_when_both_reviews_disabled(
     p = tmp_path / "cfg.yaml"
     p.write_text(
         _yaml_with_review_lanes(
+            tmp_path,
             local_review=False,
             remote_review=False,
             code_review=None,
@@ -741,6 +764,7 @@ def test_preflight_allows_local_only_without_code_review_lane(tmp_path: Path, mo
     p = tmp_path / "cfg.yaml"
     p.write_text(
         _yaml_with_review_lanes(
+            tmp_path,
             local_review=True,
             remote_review=False,
             code_review='""',
@@ -776,6 +800,7 @@ def test_preflight_allows_remote_only_without_local_code_review_lane(
     p = tmp_path / "cfg.yaml"
     p.write_text(
         _yaml_with_review_lanes(
+            tmp_path,
             local_review=False,
             remote_review=True,
             code_review="In Review",
@@ -810,6 +835,7 @@ def test_preflight_requires_code_review_when_remote_review_enabled(
     p = tmp_path / "cfg.yaml"
     p.write_text(
         _yaml_with_review_lanes(
+            tmp_path,
             local_review=False,
             remote_review=True,
             code_review='""',

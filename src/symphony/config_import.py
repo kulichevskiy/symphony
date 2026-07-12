@@ -28,6 +28,7 @@ from .config import (
     RepoBinding,
     RoleConfig,
     RoleName,
+    Secrets,
     binding_natural_key,
 )
 
@@ -170,6 +171,14 @@ async def import_config(
     # *key names*, not values.
     cfg = Config.model_validate(raw)
     raw_repos: list[dict[str, Any]] = list(raw.get("repos", []) or [])
+    # `model_validate` derives `tracker_site` with no global `jira_base_url`,
+    # so a Jira binding relying on that global (no per-binding `base_url`)
+    # would key on the "default" placeholder instead of the site it actually
+    # resolves to at runtime — re-derive it here so the persisted natural key
+    # matches `assemble_effective_config`'s resolution byte-for-byte.
+    jira_base_url = Secrets().jira_base_url
+    for binding in cfg.repos:
+        binding.apply_tracker_secret_defaults(jira_base_url=jira_base_url)
 
     # The delete, every row insert, and the globals write land in one
     # transaction: a later failure (duplicate natural key, bad payload) rolls
