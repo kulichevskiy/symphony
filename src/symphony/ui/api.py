@@ -290,15 +290,17 @@ DONE_SCOPE_DEFAULT_LIMIT = 50
 
 def _started_at_window(date_from: str | None, date_to: str | None) -> tuple[list[str], list[str]]:
     """SQL conditions + params windowing `runs.started_at` to a UTC-day range.
-    Timestamps are stored as UTC ISO strings, so the first 10 chars are the
-    calendar day and a lexicographic compare is date-correct."""
+    Timestamps are stored as UTC ISO strings, so a plain lexicographic range on
+    the raw column is date-correct AND sargable (an index can serve it): the
+    lower bound compares against the day, the upper bound against the day after
+    so any intra-day time on `date_to` is still included."""
     conds: list[str] = []
     params: list[str] = []
     if date_from is not None:
-        conds.append("substr(r.started_at, 1, 10) >= ?")
+        conds.append("r.started_at >= ?")
         params.append(date_from)
     if date_to is not None:
-        conds.append("substr(r.started_at, 1, 10) <= ?")
+        conds.append("r.started_at < date(?, '+1 day')")
         params.append(date_to)
     return conds, params
 
@@ -542,7 +544,7 @@ def _spend_heatmap_query(
     )
     if teams:
         from_sql += "\n        JOIN issues i ON i.id = r.issue_id"
-    cond = ["substr(r.started_at, 1, 10) >= ?"]
+    cond = ["r.started_at >= ?"]
     params: list[str] = [start]
     if provider is not None:
         cond.append("u.provider = ?")
@@ -1070,12 +1072,13 @@ def _list_issues_query(
 
     if scope is IssueScope.ACTIVE:
         where.append("i.id IN (SELECT issue_id FROM active_issue_ids)")
-        # Date applies to active issues by their last activity day.
+        # Date applies to active issues by their last activity day. Plain
+        # lexicographic range on the ISO-UTC timestamp (sargable, day-correct).
         if date_from is not None:
-            where.append("substr(la.latest_activity_ts, 1, 10) >= ?")
+            where.append("la.latest_activity_ts >= ?")
             where_params.append(date_from)
         if date_to is not None:
-            where.append("substr(la.latest_activity_ts, 1, 10) <= ?")
+            where.append("la.latest_activity_ts < date(?, '+1 day')")
             where_params.append(date_to)
     elif scope is IssueScope.DONE:
         # Candidate prefilter: completion (latest PR merge, else last activity)
@@ -1083,10 +1086,10 @@ def _list_issues_query(
         # check runs in Python on this small set.
         completion = "COALESCE(pr.max_merged_at, la.latest_activity_ts)"
         if date_from is not None:
-            where.append(f"substr({completion}, 1, 10) >= ?")
+            where.append(f"{completion} >= ?")
             where_params.append(date_from)
         if date_to is not None:
-            where.append(f"substr({completion}, 1, 10) <= ?")
+            where.append(f"{completion} < date(?, '+1 day')")
             where_params.append(date_to)
 
     if q_cond is not None:
