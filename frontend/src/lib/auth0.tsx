@@ -172,7 +172,10 @@ export function AuthGate({ children }: { children: ReactNode }) {
  * Only 403 is terminal (retrying it can't change the allowlist verdict).
  * Every other failure — a 401 from a not-yet-refreshed ID token, a 5xx, a
  * network blip — retries a few times, since `fetchMeta` re-fetches a fresh
- * token/response each attempt and these are typically transient.
+ * token/response each attempt and these are typically transient. If those
+ * retries are exhausted, the probe is unreachable enough that the dashboard
+ * queries are too, so it shows a notice instead of silently mounting a
+ * dashboard that can't load anything.
  */
 function AllowlistGate({ children }: { children: ReactNode }) {
   const { logout } = useAuth0();
@@ -189,6 +192,14 @@ function AllowlistGate({ children }: { children: ReactNode }) {
     return (
       <AccessDenied
         onSignOut={() => void logout({ logoutParams: { returnTo: RETURN_TO() } })}
+      />
+    );
+  }
+  if (error) {
+    return (
+      <AuthNotice
+        title="Couldn't verify access"
+        detail="Check your connection, then reload the page."
       />
     );
   }

@@ -132,4 +132,15 @@ describe("AuthGate", () => {
     expect(await findByText("Access denied")).toBeTruthy();
     expect(fetchMeta).toHaveBeenCalledTimes(1);
   });
+
+  it("shows a notice instead of the dashboard once non-403 retries are exhausted", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(500));
+
+    const { findByText, queryByTestId } = renderGate();
+
+    expect(await findByText("Couldn't verify access")).toBeTruthy();
+    expect(queryByTestId("dashboard")).toBeNull();
+    await waitFor(() => expect(fetchMeta).toHaveBeenCalledTimes(4));
+  });
 });
