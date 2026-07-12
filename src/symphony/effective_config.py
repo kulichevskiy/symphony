@@ -64,7 +64,10 @@ def _resolve_bindings(cfg: Config) -> None:
     literal `.env` key *name* into that agent's environment instead of the
     secret value. A disabled binding whose key has since been removed from
     `.env` must not block boot, so a missing key is logged and skipped rather
-    than raised for disabled bindings only.
+    than raised for disabled bindings only — but `resolve_env` raises before
+    mutating anything, so `binding.env` is left holding the unresolved key
+    *names*. Clear it in that case: leaving it would make the preflight
+    capability check see those key names as truthy configured values.
     """
     env_source: dict[str, str] = {
         key: value for key, value in dotenv_values(".env").items() if value is not None
@@ -79,6 +82,7 @@ def _resolve_bindings(cfg: Config) -> None:
                 binding.resolve_env(env_source)
             except ValueError as e:
                 _log.warning("disabled binding: %s", e)
+                binding.env = {}
 
 
 async def assemble_effective_config(
@@ -107,7 +111,13 @@ async def assemble_effective_config(
     gracefully to the YAML topology on an empty DB so they keep working during
     the transition (before the operator has run the importer).
     """
-    stored = await db.config_bindings.list_all(conn)
+    try:
+        stored = await db.config_bindings.list_all(conn)
+    except ValueError as e:
+        # `list_all` decodes each row's payload JSON eagerly; a hand-edited or
+        # restored row with malformed JSON must fail boot with the same clean
+        # error every other config problem gets, not a raw traceback.
+        raise ConfigBootError(f"malformed config binding payload in the DB: {e}") from e
     globals_row = await db.config_globals.get(conn)
 
     if not stored:

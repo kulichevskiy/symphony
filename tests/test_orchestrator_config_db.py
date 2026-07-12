@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from symphony import db
-from symphony.config import Config
+from symphony.config import Config, LinearStates, RepoBinding
 from symphony.effective_config import assemble_effective_config
 from tests.harness import Harness, ManualClock
 
@@ -65,6 +65,69 @@ async def test_db_binding_is_scanned_and_dispatched(tmp_path: Path) -> None:
         scheduled = await harness.step()
         assert len(scheduled) == 1
         # The seeded issue left the ready lane (it was picked up).
+        assert harness.sim.issues[issue.id].state_name != READY
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_binding_recovers_pidless_local_review_run(tmp_path: Path) -> None:
+    """A binding disabled while it has a pidless `local_review` run must
+    still recover it: startup reconcile moves the issue back to Ready using
+    the disabled binding (kept in `cfg.repos` for exactly this), and the next
+    poll tick must notice and dispatch it rather than stranding it in Ready
+    forever."""
+    config = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "config.sqlite",
+        repos=[
+            RepoBinding(
+                linear_team_key=TEAM,
+                github_repo=REPO,
+                enabled=False,
+                local_review=False,
+                remote_review=False,
+                linear_states=LinearStates(
+                    ready=READY,
+                    in_progress="In Progress",
+                    code_review="Needs Approval",
+                    done=DONE,
+                ),
+            )
+        ],
+    )
+
+    clock = ManualClock()
+    harness = await Harness.create(tmp_path, config=config, clock=clock)
+    try:
+        issue = harness.sim.seed_issue(
+            identifier="ENG-1",
+            team_key=TEAM,
+            state_name="Local Code Review",
+            title="crash recovery",
+        )
+        storage_id = await db.issues.upsert(
+            harness.conn, id=issue.id, identifier=issue.identifier, team_key=TEAM, title=issue.title
+        )
+        await db.runs.create(
+            harness.conn,
+            id="pidless-local-review",
+            issue_id=storage_id,
+            stage="local_review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+
+        # warmup() runs startup reconcile: the pidless run has no PID, so it
+        # is flipped interrupted and the issue moved back to Ready using the
+        # disabled binding.
+        await harness.warmup()
+        assert harness.sim.issues[issue.id].state_name == READY
+
+        scheduled = await harness.step()
+        assert len(scheduled) == 1
         assert harness.sim.issues[issue.id].state_name != READY
     finally:
         await harness.close()

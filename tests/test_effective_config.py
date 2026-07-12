@@ -216,6 +216,11 @@ async def test_disabled_binding_with_unresolvable_env_does_not_block_boot(tmp_pa
     )
     cfg = await assemble_effective_config(conn, _base(tmp_path))
     assert [b.project_key for b in cfg.repos] == ["ENG"]
+    (binding,) = cfg.repos
+    # The unresolved key *name* must not leak in as if it were the secret
+    # value — a truthy `env` here would fool the preflight capability check
+    # into thinking this credential is configured.
+    assert binding.env == {}
     await conn.close()
 
 
@@ -308,5 +313,26 @@ async def test_invalid_db_role_combo_refuses_boot(tmp_path: Path) -> None:
         conn, roles={"implement": {"agent": "codex", "model": "opus"}}, migrated_at="t"
     )
     with pytest.raises(ConfigBootError, match="invalid role configuration"):
+        await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_binding_payload_json_refuses_boot_cleanly(tmp_path: Path) -> None:
+    """A hand-edited or restored row with malformed payload JSON must surface
+    as `ConfigBootError` — the same clean failure every other config problem
+    gets — not a raw `json.JSONDecodeError` traceback out of `list_all`."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await conn.execute(
+        """
+        INSERT INTO config_bindings (
+            payload, version, enabled, priority, updated_at, updated_by,
+            project_key, github_repo, issue_label, tracker_provider, tracker_site
+        )
+        VALUES ('{not json', 1, 1, 0, '', '', 'ENG', 'org/api', '', 'linear', 'default')
+        """
+    )
+    await conn.commit()
+    with pytest.raises(ConfigBootError, match="malformed config binding payload"):
         await assemble_effective_config(conn, _base(tmp_path))
     await conn.close()

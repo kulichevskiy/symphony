@@ -159,6 +159,47 @@ class _DispatchMixin(_OrchestratorBase):
                 break
         return scheduled
 
+    async def _scan_disabled_binding_recovery(
+        self, binding: RepoBinding
+    ) -> list[asyncio.Task[None]]:
+        """Recovery-only scan for a disabled binding's Ready lane.
+
+        A disabled binding gets no normal `_scan_binding` (no new issues, no
+        tracker-queue lane — see the binding lifecycle contract), but
+        `reconcile()` moves a pidless `local_review` run's issue back to Ready
+        to recover it, resolving the binding by iterating the still-loaded
+        disabled one. That redispatch is a follow-up stage of already-started
+        work, not a first dispatch, so it should proceed same as a fix-run or
+        review iteration would — but nothing else ever re-scans a disabled
+        binding's Ready lane to notice it. Gate on prior run history (the same
+        already-started-work signal) so a genuinely new Ready issue placed on
+        a disabled binding is left alone, and skip the queue snapshot entirely
+        so a disabled binding's tracker-queue lane stays cleared.
+        """
+        scheduled: list[asyncio.Task[None]] = []
+        tracker = self.tracker(binding)
+        try:
+            issues = await tracker.issues_in_state(
+                binding.linear_team_key, binding.linear_states.ready, binding.issue_label
+            )
+        except LinearError as e:
+            log.warning(
+                "disabled-binding recovery scan failed for %s: %s",
+                binding.linear_team_key,
+                e,
+            )
+            return scheduled
+        for issue in issues:
+            storage_id = await self._storage_issue_id_for_tracker_issue(
+                issue.id, _tracker_context_for_binding(binding)
+            )
+            if not await db.runs.history_for_issue(self._conn, storage_id):
+                continue
+            task = await self._schedule_ready_issue(binding, issue)
+            if task is not None:
+                scheduled.append(task)
+        return scheduled
+
     async def _persist_queue_snapshot(
         self,
         binding: RepoBinding,

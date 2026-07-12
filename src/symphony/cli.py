@@ -168,22 +168,38 @@ def _auth0_settings(cfg: Config) -> Auth0Settings | None:
         raise click.ClickException(str(exc)) from exc
 
 
-def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
-    enabled_bindings = [
-        binding for binding in cfg.repos if binding.enabled and binding.webhook_enabled
-    ]
+async def _github_webhook_settings(
+    cfg: Config, conn: aiosqlite.Connection
+) -> GitHubWebhookSettings | None:
+    """Repos this daemon accepts GitHub webhooks for.
+
+    A disabled binding normally drops out — no new dispatch, no reason to
+    route its webhooks — but `assemble_effective_config` keeps a disabled
+    binding with an open tracked PR in `cfg.repos` precisely so that PR keeps
+    draining (merge/review polling). That draining depends on GitHub webhook
+    events for the same repo (review comments, checks) still routing here
+    too, so a disabled binding with an open PR stays in webhook routing.
+    """
+    routable_bindings = []
+    for binding in cfg.repos:
+        if not binding.webhook_enabled:
+            continue
+        if binding.enabled or await db.issue_prs.has_open_for_repo(
+            conn, github_repo=binding.github_repo
+        ):
+            routable_bindings.append(binding)
     repo_secrets = {
         binding.github_repo: binding.webhook_secret
-        for binding in enabled_bindings
+        for binding in routable_bindings
         if binding.webhook_secret
     }
-    if not enabled_bindings and not cfg.github_webhook_secret and not repo_secrets:
+    if not routable_bindings and not cfg.github_webhook_secret and not repo_secrets:
         return None
     try:
         return GitHubWebhookSettings(
             secret=cfg.github_webhook_secret,
             repo_secrets=repo_secrets,
-            enabled_repos=frozenset(binding.github_repo for binding in enabled_bindings),
+            enabled_repos=frozenset(binding.github_repo for binding in routable_bindings),
             dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
         )
     except ValueError as e:
@@ -382,7 +398,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
-            github_webhook_settings = _github_webhook_settings(cfg)
+            github_webhook_settings = await _github_webhook_settings(cfg, conn)
             if cfg.linear_webhook_secret or github_webhook_settings or cfg.ui.enabled:
                 import uvicorn
 

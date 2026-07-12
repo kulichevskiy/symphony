@@ -821,6 +821,53 @@ async def test_unseen_issue_webhook_probes_configured_tracker_contexts(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_unseen_issue_webhook_skips_context_with_no_registered_tracker(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A binding disabled with no live DB work gets no tracker registered
+    (`cli._configured_tracker_registry`) but stays loaded in `cfg.repos`. A
+    webhook for an unrelated, not-yet-seen issue must skip that unregistered
+    context instead of crashing the whole delivery with `KeyError`."""
+    from symphony import db
+    from symphony.tracker import TrackerRegistry
+
+    unregistered_binding = _binding()
+    unregistered_binding.tracker_site = "skipped"
+    registered_binding = _binding()
+    registered_binding.tracker_site = "registered"
+    issue = _issue()
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        registered_tracker = AsyncMock()
+        registered_tracker.lookup_issue = AsyncMock(return_value=issue)
+        orch = Orchestrator(
+            Config(repos=[unregistered_binding, registered_binding]),
+            AsyncMock(),
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        # Only the second context has a registered tracker — mirrors cli.py
+        # skipping a disabled, no-live-work binding when building the registry.
+        orch._trackers = TrackerRegistry()  # noqa: SLF001
+        orch._trackers.register("linear", "registered", registered_tracker)  # noqa: SLF001
+        scheduled_task = object()
+        orch._schedule_dispatch = MagicMock(return_value=scheduled_task)  # type: ignore[method-assign]  # noqa: SLF001
+
+        result = await orch.handle_linear_webhook(
+            {
+                "type": "Issue",
+                "action": "create",
+                "data": {"id": issue.id},
+            }
+        )
+
+        assert result.handled is True
+        registered_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        orch._schedule_dispatch.assert_called_once_with(registered_binding, issue)  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_unseen_issue_webhook_probes_non_default_tracker_provider(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from symphony import db
 

@@ -106,7 +106,8 @@ def test_github_webhook_settings_require_secret_for_enabled_repos() -> None:
         )
 
 
-def test_cli_rejects_enabled_github_webhook_repo_without_secret() -> None:
+@pytest.mark.asyncio
+async def test_cli_rejects_enabled_github_webhook_repo_without_secret(tmp_path: Path) -> None:
     cfg = Config(
         repos=[
             _binding(webhook_secret=REPO_SECRET),
@@ -118,14 +119,66 @@ def test_cli_rejects_enabled_github_webhook_repo_without_secret() -> None:
         ]
     )
 
-    with pytest.raises(ClickException, match="enabled repos lack webhook_secret: org/web"):
-        _github_webhook_settings(cfg)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        with pytest.raises(ClickException, match="enabled repos lack webhook_secret: org/web"):
+            await _github_webhook_settings(cfg, conn)
+    finally:
+        await conn.close()
 
 
-def test_cli_skips_github_webhook_settings_when_repos_are_disabled() -> None:
+@pytest.mark.asyncio
+async def test_cli_skips_github_webhook_settings_when_repos_are_disabled(tmp_path: Path) -> None:
     cfg = Config(repos=[_binding(webhook_enabled=False)])
 
-    assert _github_webhook_settings(cfg) is None
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        assert await _github_webhook_settings(cfg, conn) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_cli_keeps_webhook_routing_for_disabled_binding_with_open_pr(
+    tmp_path: Path,
+) -> None:
+    """A binding disabled after opening a PR must keep receiving GitHub
+    webhooks — the merge/review pollers depend on them to drain that PR."""
+    cfg = Config(
+        repos=[
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                enabled=False,
+                webhook_secret=REPO_SECRET,
+                linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+            )
+        ]
+    )
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue_id = await db.issues.upsert(
+            conn,
+            id="issue-1",
+            identifier="ENG-1",
+            title="Do the thing",
+            team_key="ENG",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue_id,
+            github_repo="org/repo",
+            pr_number=1,
+            pr_url="https://github.com/org/repo/pull/1",
+            created_at=NOW.isoformat(),
+        )
+
+        settings = await _github_webhook_settings(cfg, conn)
+        assert settings is not None
+        assert settings.enabled_repos == frozenset({"org/repo"})
+    finally:
+        await conn.close()
 
 
 async def _delivery_rows(conn: object) -> list[tuple[str, str]]:
