@@ -12,7 +12,9 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from ..db.issues import contextual_id
 from ..linear.slash import SlashKind
+from ..tracker import DEFAULT_PROVIDER, DEFAULT_SITE
 from .db import ReadOnlyDbPool
 from .status import (
     DEFAULT_STUCK_THRESHOLDS,
@@ -42,6 +44,10 @@ class IssueSummary(BaseModel):
     latest_activity_ts: str | None
     latest_activity_age_secs: int | None
     canonical_status: CanonicalStatusPayload
+    # False for issues known only from the tracker's dispatch queue (Todo /
+    # Waiting in Linear) — the daemon has no runs/PRs for them, so there is no
+    # issue page to link to. Excluded from responses when True (the default).
+    tracked: bool = True
     warnings: list[str] = Field(default_factory=list)
     # Set only on the `done` scope — the time the issue completed (latest PR
     # merge, else latest activity). Excluded from active/recent/all responses.
@@ -816,6 +822,218 @@ def _build_spend_summary(
     )
 
 
+def _queue_status_dict(row: Mapping[str, Any]) -> dict[str, str | int | None]:
+    """Canonical-status payload for an issue sitting in the dispatch queue."""
+    waiting = str(row["queue"]) == "waiting"
+    blocked_by = str(row["blocked_by"] or "")
+    subtitle = f"blocked by {blocked_by}" if waiting and blocked_by else str(row["state_name"])
+    return {
+        "state": "waiting" if waiting else "todo",
+        "since": str(row["seen_at"]),
+        "subtitle": subtitle,
+        "stuck_for": None,
+    }
+
+
+def _queue_row_matches(
+    row: Mapping[str, Any],
+    *,
+    q: str | None,
+    teams: list[str] | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> bool:
+    if teams and str(row["team_key"]) not in teams:
+        return False
+    # Mirror the tracked issues' latest-activity window: `seen_at` is when the
+    # issue entered its current queue, so out-of-window rows stay out of
+    # historical views.
+    day = str(row["seen_at"])[:10]
+    if date_from is not None and day < date_from:
+        return False
+    if date_to is not None and day > date_to:
+        return False
+    needle = (q or "").strip().lower()
+    if (
+        needle
+        and needle not in str(row["identifier"]).lower()
+        and needle not in str(row["title"]).lower()
+    ):
+        return False
+    return True
+
+
+def _queue_tracker_context(row: Mapping[str, Any]) -> tuple[str, str]:
+    """(provider, site) from a queue row's binding scope (`repo#label#provider#site`)."""
+    parts = str(row.get("scope") or "").rsplit("#", 2)
+    if len(parts) == 3:
+        return (parts[1], parts[2])
+    return (DEFAULT_PROVIDER, DEFAULT_SITE)
+
+
+def _queue_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Full tracker identity of a queue row: (provider, site, tracker issue id)."""
+    provider, site = _queue_tracker_context(row)
+    return (provider, site, str(row["issue_id"]))
+
+
+def _queue_fallback_id(row: Mapping[str, Any]) -> str:
+    """Response id for a queue row with no `issues` storage row.
+
+    Default-tracker rows keep the raw tracker id (what `issues.upsert` would
+    assign); non-default trackers get the same contextual id the storage
+    layer would use, so two trackers sharing a raw id never emit duplicate
+    React keys."""
+    provider, site = _queue_tracker_context(row)
+    if (provider, site) == (DEFAULT_PROVIDER, DEFAULT_SITE):
+        return str(row["issue_id"])
+    return contextual_id(id=str(row["issue_id"]), provider=provider, site=site)
+
+
+def _dedupe_queue_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse multi-binding snapshots to one row per tracker issue.
+
+    Two bindings on one team can both see the same queued issue; the board
+    must show one card. Prefer the ready row (the daemon will dispatch it),
+    then the earliest sighting. The key carries the tracker identity, so the
+    same raw id from two different trackers never collapses.
+    """
+    best: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row["team_key"]), *_queue_key(row))
+        cur = best.get(key)
+        if (
+            cur is None
+            or (str(cur["queue"]) == "waiting" and str(row["queue"]) == "ready")
+            or (
+                str(cur["queue"]) == str(row["queue"]) and str(row["seen_at"]) < str(cur["seen_at"])
+            )
+        ):
+            best[key] = row
+    return list(best.values())
+
+
+# Chunk size for queue-derived id lists. Keeps every generated statement well
+# under SQLite's bound-parameter and expression-depth limits, so a huge Todo
+# lane can never 503 the issues endpoint.
+_QUEUE_SQL_CHUNK = 300
+
+
+async def _resolve_queue_storage_ids(
+    conn: aiosqlite.Connection,
+    rows: list[dict[str, Any]],
+) -> dict[tuple[str, str, str], str]:
+    """Map queue rows' tracker identities to `issues` storage ids (if any)."""
+    keys = sorted({_queue_key(row) for row in rows})
+    result: dict[tuple[str, str, str], str] = {}
+    for start in range(0, len(keys), _QUEUE_SQL_CHUNK):
+        chunk = keys[start : start + _QUEUE_SQL_CHUNK]
+        values = ",".join("(?, ?, ?)" for _ in chunk)
+        cur = await conn.execute(
+            "SELECT id, provider, site, tracker_issue_id FROM issues "
+            f"WHERE (provider, site, tracker_issue_id) IN (VALUES {values})",
+            tuple(value for key in chunk for value in key),
+        )
+        for row in await cur.fetchall():
+            key = (str(row["provider"]), str(row["site"]), str(row["tracker_issue_id"]))
+            result[key] = str(row["id"])
+    return result
+
+
+async def _queue_ids_matching_usage(
+    conn: aiosqlite.Connection,
+    storage_ids: set[str],
+    *,
+    provider: str | None,
+    models: list[tuple[str, str]],
+) -> set[str]:
+    """Storage ids (of queued issues) whose historical usage matches the
+    active provider/model filters — mirrors `_list_issues_query` semantics."""
+    ordered = sorted(storage_ids)
+    matching: set[str] = set()
+    for start in range(0, len(ordered), _QUEUE_SQL_CHUNK):
+        chunk = ordered[start : start + _QUEUE_SQL_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        conds = [f"r.issue_id IN ({placeholders})"]
+        params: list[str] = list(chunk)
+        if provider is not None:
+            conds.append("u.provider = ?")
+            params.append(provider)
+        if models:
+            conds.append(_model_in_clause(models))
+            params.extend(_model_params(models))
+        cur = await conn.execute(
+            f"""
+            SELECT DISTINCT r.issue_id
+            FROM run_model_usage u
+            JOIN runs r ON r.id = u.run_id
+            WHERE {" AND ".join(conds)}
+            """,
+            tuple(params),
+        )
+        matching.update(str(row["issue_id"]) for row in await cur.fetchall())
+    return matching
+
+
+async def _queue_issue_totals(
+    conn: aiosqlite.Connection,
+    storage_ids: set[str],
+    *,
+    provider: str | None,
+    models: list[tuple[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Historical token totals + latest activity for requeued issues.
+
+    Unfiltered requests sum whole runs; with a provider/model filter active
+    the totals come from the matching `run_model_usage` slice instead, so a
+    Todo card reconciles with the filtered tracked rows and spend views.
+    """
+    ordered = sorted(storage_ids)
+    filtered = provider is not None or bool(models)
+    totals: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(ordered), _QUEUE_SQL_CHUNK):
+        chunk = ordered[start : start + _QUEUE_SQL_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        if not filtered:
+            query = f"""
+                SELECT issue_id,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(cache_write_tokens) AS cache_write_tokens,
+                       SUM(cache_read_tokens) AS cache_read_tokens,
+                       MAX(COALESCE(ended_at, started_at)) AS latest_activity_ts
+                FROM runs
+                WHERE issue_id IN ({placeholders})
+                GROUP BY issue_id
+            """
+            params: list[str] = list(chunk)
+        else:
+            conds = [f"r.issue_id IN ({placeholders})"]
+            params = list(chunk)
+            if provider is not None:
+                conds.append("u.provider = ?")
+                params.append(provider)
+            if models:
+                conds.append(_model_in_clause(models))
+                params.extend(_model_params(models))
+            query = f"""
+                SELECT r.issue_id AS issue_id,
+                       SUM(u.input_tokens) AS input_tokens,
+                       SUM(u.output_tokens) AS output_tokens,
+                       SUM(u.cache_write_tokens) AS cache_write_tokens,
+                       SUM(u.cache_read_tokens) AS cache_read_tokens,
+                       MAX(COALESCE(r.ended_at, r.started_at)) AS latest_activity_ts
+                FROM run_model_usage u
+                JOIN runs r ON r.id = u.run_id
+                WHERE {" AND ".join(conds)}
+                GROUP BY r.issue_id
+            """
+        cur = await conn.execute(query, tuple(params))
+        for row in await cur.fetchall():
+            totals[str(row["issue_id"])] = dict(row)
+    return totals
+
+
 def _list_issues_query(
     scope: IssueScope,
     q: str | None,
@@ -1037,6 +1255,57 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             issues = [dict(row) for row in rows]
+            qcur = await conn.execute(
+                """
+                SELECT team_key, scope, issue_id, identifier, title, queue,
+                       state_name, blocked_by, seen_at
+                FROM tracker_queue
+                """
+            )
+            raw_queue = [dict(row) for row in await qcur.fetchall()]
+            queue_rows: list[dict[str, Any]] = []
+            if not is_done:
+                queue_rows = _dedupe_queue_rows(
+                    [
+                        row
+                        for row in raw_queue
+                        if _queue_row_matches(
+                            row, q=q, teams=team_filter, date_from=date_from, date_to=date_to
+                        )
+                    ]
+                )
+            # Queue issues the daemon has seen before (a requeued issue, or
+            # dispatch paused) have an `issues` row and thus an issue page —
+            # resolve their storage ids so they stay internal links. Keyed by
+            # the full tracker identity (provider, site, tracker issue id)
+            # carried in the snapshot's scope — display identifiers are not
+            # unique across tracker providers/sites. The done scope resolves
+            # every queued row so it can suppress issues that were requeued.
+            resolve_rows = raw_queue if is_done else queue_rows
+            queue_storage_ids = await _resolve_queue_storage_ids(conn, resolve_rows)
+            queued_storage_id_set = set(queue_storage_ids.values())
+            if not is_done and (provider_filter is not None or model_filter):
+                # Usage filters: queue-only rows have no runs and drop out,
+                # but a requeued issue with matching historical usage stays.
+                matching = await _queue_ids_matching_usage(
+                    conn,
+                    queued_storage_id_set,
+                    provider=provider_filter,
+                    models=model_filter,
+                )
+                queue_rows = [
+                    row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) in matching
+                ]
+            queue_totals: dict[str, dict[str, Any]] = {}
+            if queue_storage_ids and not is_done:
+                # A requeued issue keeps its historical spend and activity —
+                # don't report zeros just because it is back in the queue.
+                queue_totals = await _queue_issue_totals(
+                    conn,
+                    queued_storage_id_set,
+                    provider=provider_filter,
+                    models=model_filter,
+                )
             status_by_id = await compute_canonical_statuses(
                 conn,
                 [str(issue["id"]) for issue in issues],
@@ -1057,6 +1326,10 @@ def create_api_router(
             kept: list[tuple[dict[str, Any], Any, str | None]] = []
             for issue, status in statuses:
                 if status.state != "done":
+                    continue
+                # A completed issue that was requeued (back in Todo/Waiting)
+                # shows in the active scope's queue lanes — not in Done too.
+                if str(issue["id"]) in queued_storage_id_set:
                     continue
                 completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
                 if completed_at is None:
@@ -1081,6 +1354,11 @@ def create_api_router(
             )
             triples = [(issue, status, None) for issue, status in statuses]
 
+        queue_by_storage_id = {
+            queue_storage_ids[_queue_key(row)]: row
+            for row in queue_rows
+            if _queue_key(row) in queue_storage_ids
+        }
         payloads: list[IssueSummary] = []
         for issue, status, completed_at in triples:
             warnings = issue_warnings(
@@ -1092,12 +1370,49 @@ def create_api_router(
                 **issue,
                 "canonical_status": status.to_dict(),
             }
+            # A tracked issue with no daemon state that sits in the dispatch
+            # queue is really Todo/Waiting, not idle — reflect the queue.
+            queue_row = queue_by_storage_id.get(str(issue["id"]))
+            if queue_row is not None and status.state == CanonicalState.IDLE:
+                payload["canonical_status"] = _queue_status_dict(queue_row)
             payload.pop("max_merged_at", None)
             if completed_at is not None:
                 payload["completed_at"] = completed_at
             if warnings:
                 payload["warnings"] = warnings
             payloads.append(IssueSummary.model_validate(payload))
+
+        # Queue issues absent from the active scope: no live daemon state, so
+        # they surface with their queue status to keep the Todo/Waiting lanes
+        # honest. Ones with an `issues` row keep their storage id, issue page,
+        # and historical totals; the rest are untracked and link out to the
+        # tracker.
+        active_ids = {str(issue["id"]) for issue, _ in statuses}
+        extras = [
+            row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) not in active_ids
+        ]
+        extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
+        for row in extras:
+            storage_id = queue_storage_ids.get(_queue_key(row))
+            totals = queue_totals.get(storage_id or "", {})
+            payloads.append(
+                IssueSummary.model_validate(
+                    {
+                        "id": storage_id or _queue_fallback_id(row),
+                        "identifier": str(row["identifier"]),
+                        "title": str(row["title"]),
+                        "team_key": str(row["team_key"]),
+                        "input_tokens": int(totals.get("input_tokens") or 0),
+                        "output_tokens": int(totals.get("output_tokens") or 0),
+                        "cache_write_tokens": int(totals.get("cache_write_tokens") or 0),
+                        "cache_read_tokens": int(totals.get("cache_read_tokens") or 0),
+                        "latest_activity_ts": totals.get("latest_activity_ts"),
+                        "latest_activity_age_secs": None,
+                        "canonical_status": _queue_status_dict(row),
+                        "tracked": storage_id is not None,
+                    }
+                )
+            )
         return payloads
 
     @router.get("/spend/summary", response_model=SpendSummary)

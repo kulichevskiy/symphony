@@ -27,6 +27,7 @@ from . import (
     run_model_usage,
     runs,
     state_transitions,
+    tracker_queue,
     webhook_deliveries,
 )
 from .schema import apply_schema, connect
@@ -47,5 +48,6 @@ __all__ = [
     "run_model_usage",
     "runs",
     "state_transitions",
+    "tracker_queue",
     "webhook_deliveries",
 ]

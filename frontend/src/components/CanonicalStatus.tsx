@@ -15,6 +15,8 @@ const STATE_LABELS: Record<CanonicalStatusState, string> = {
   pr_open: "PR open",
   done: "done",
   idle: "idle",
+  todo: "todo",
+  waiting: "waiting",
 };
 
 const STATE_CLASSES: Record<CanonicalStatusState, string> = {
@@ -38,6 +40,10 @@ const STATE_CLASSES: Record<CanonicalStatusState, string> = {
     "border-green-300 bg-green-50 text-green-900 dark:border-green-700 dark:bg-green-950/40 dark:text-green-200",
   idle:
     "border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300",
+  todo:
+    "border-gray-300 bg-gray-50 text-gray-700 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300",
+  waiting:
+    "border-gray-300 bg-gray-100 text-gray-600 dark:border-gray-700 dark:bg-gray-800/40 dark:text-gray-400",
 };
 
 function useRelativeClock() {

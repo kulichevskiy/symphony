@@ -439,6 +439,196 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        # A tracked issue with a live run — must keep its canonical status even
+        # though it also (stale-ly) appears in the queue snapshot.
+        await db.issues.upsert(
+            conn, id="issue-run", identifier="ADJ-1", title="Running", team_key="ADJ"
+        )
+        # A tracked issue with no daemon state sitting in the ready queue —
+        # requeued after a finished run, so it keeps its history.
+        await db.issues.upsert(
+            conn, id="issue-idle", identifier="ADJ-2", title="Queued", team_key="ADJ"
+        )
+        # A completed (merged-PR) issue requeued in the tracker — must show as
+        # todo in the active scope and be suppressed from Done.
+        await db.issues.upsert(
+            conn, id="issue-done", identifier="ADJ-4", title="Redo", team_key="ADJ"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, ended_at,
+                input_tokens, output_tokens
+            )
+            VALUES
+                ('r-1', 'issue-run', 'implement', 'running', NULL,
+                 '2026-07-12T08:00:00Z', NULL, 0, 0),
+                ('r-2', 'issue-idle', 'implement', 'failed', NULL,
+                 '2026-07-10T08:00:00Z', '2026-07-10T09:00:00Z', 1000, 200)
+            """
+        )
+        # Mixed historical usage for the requeued issue — the provider filter
+        # must keep it (codex history exists) and scope its totals to the
+        # matching slice only.
+        await conn.execute(
+            """
+            INSERT INTO run_model_usage (run_id, provider, model, input_tokens, output_tokens)
+            VALUES
+                ('r-2', 'codex', 'gpt-5', 700, 150),
+                ('r-2', 'claude', 'claude-opus-4-8', 300, 50)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (issue_id, github_repo, pr_number, pr_url, created_at, merged_at)
+            VALUES ('issue-done', 'org/repo', 7, 'https://x/pr/7',
+                    '2026-07-01T08:00:00Z', '2026-07-02T08:00:00Z')
+            """
+        )
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ADJ",
+            scope="org/repo#",
+            rows=[
+                db.tracker_queue.QueueRow(
+                    issue_id="issue-run",
+                    identifier="ADJ-1",
+                    title="Running",
+                    queue="ready",
+                    state_name="Todo",
+                ),
+                db.tracker_queue.QueueRow(
+                    issue_id="issue-idle",
+                    identifier="ADJ-2",
+                    title="Queued",
+                    queue="ready",
+                    state_name="Todo",
+                ),
+                # Never tracked by the daemon: appended as an untracked row.
+                db.tracker_queue.QueueRow(
+                    issue_id="lin-wait",
+                    identifier="ADJ-3",
+                    title="Blocked work",
+                    queue="waiting",
+                    state_name="Waiting",
+                    blocked_by="ADJ-2",
+                ),
+                db.tracker_queue.QueueRow(
+                    issue_id="issue-done",
+                    identifier="ADJ-4",
+                    title="Redo",
+                    queue="ready",
+                    state_name="Todo",
+                ),
+            ],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+        # A second binding on the same team sees the same waiting issue — the
+        # response must still carry it exactly once (earliest sighting wins).
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ADJ",
+            scope="org/other#",
+            rows=[
+                db.tracker_queue.QueueRow(
+                    issue_id="lin-wait",
+                    identifier="ADJ-3",
+                    title="Blocked work",
+                    queue="waiting",
+                    state_name="Waiting",
+                    blocked_by="ADJ-2",
+                ),
+            ],
+            seen_at="2026-07-12T09:30:00Z",
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_dist_dir=_dist(tmp_path),
+            ui_db_path=db_path,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            active = await client.get("/api/issues?scope=active")
+            done = await client.get("/api/issues?scope=done")
+            filtered = await client.get("/api/issues?scope=active&provider=codex")
+            windowed = await client.get("/api/issues?scope=active&from=2026-07-01&to=2026-07-05")
+    finally:
+        await conn.close()
+
+    assert active.status_code == 200
+    # The duplicate ADJ-3 rows from the two binding scopes collapse to one.
+    identifiers = [issue["identifier"] for issue in active.json()]
+    assert identifiers.count("ADJ-3") == 1
+    by_identifier = {issue["identifier"]: issue for issue in active.json()}
+    # Daemon state wins over the queue snapshot.
+    assert by_identifier["ADJ-1"]["canonical_status"]["state"] == "running"
+    # Requeued tracked issue: absent from the active scope's own rows, so it
+    # surfaces through the queue snapshot as todo — keeping its storage id
+    # (its issue page exists), its historical totals, and staying tracked.
+    requeued = by_identifier["ADJ-2"]
+    assert requeued["canonical_status"]["state"] == "todo"
+    assert requeued["id"] == "issue-idle"
+    assert "tracked" not in requeued  # default True is excluded
+    assert requeued["input_tokens"] == 1000
+    assert requeued["output_tokens"] == 200
+    assert requeued["latest_activity_ts"] == "2026-07-10T09:00:00Z"
+    # Queue-only issue: untracked, zero tokens, waiting with blocker subtitle.
+    wait = by_identifier["ADJ-3"]
+    assert wait["tracked"] is False
+    assert wait["id"] == "lin-wait"
+    assert wait["canonical_status"] == {
+        "state": "waiting",
+        "since": "2026-07-12T09:00:00Z",
+        "subtitle": "blocked by ADJ-2",
+        "stuck_for": None,
+    }
+    assert wait["output_tokens"] == 0
+    # The requeued done issue shows in the queue lanes...
+    assert by_identifier["ADJ-4"]["canonical_status"]["state"] == "todo"
+    assert by_identifier["ADJ-4"]["id"] == "issue-done"
+
+    # ...and is suppressed from Done while queued — no double counting.
+    assert done.status_code == 200
+    assert [issue["identifier"] for issue in done.json()] == []
+
+    # Under a provider filter, queue-only rows drop out (no runs), but the
+    # requeued issue with matching historical codex usage stays — with totals
+    # scoped to the codex slice, not the whole-run sums.
+    assert filtered.status_code == 200
+    filtered_rows = {issue["identifier"]: issue for issue in filtered.json()}
+    assert list(filtered_rows) == ["ADJ-2"]
+    assert filtered_rows["ADJ-2"]["input_tokens"] == 700
+    assert filtered_rows["ADJ-2"]["output_tokens"] == 150
+
+    # A historical date window excludes today's queue rows (seen_at is
+    # outside the window), keeping filtered views honest.
+    assert windowed.status_code == 200
+    assert [issue["identifier"] for issue in windowed.json()] == []
+
+
+def test_queue_fallback_id_qualifies_non_default_trackers() -> None:
+    from symphony.ui.api import _queue_fallback_id
+
+    default_row = {"scope": "org/repo#symphony#linear#default", "issue_id": "raw-1"}
+    assert _queue_fallback_id(default_row) == "raw-1"
+
+    jira_row = {"scope": "org/repo##jira#mysite", "issue_id": "raw-1"}
+    qualified = _queue_fallback_id(jira_row)
+    assert qualified != "raw-1"
+    assert "jira" in qualified and "mysite" in qualified
+
+
+@pytest.mark.asyncio
 async def test_api_namespace_keeps_placeholder_404(tmp_path: Path) -> None:
     app = create_app(
         _Handler(),

@@ -680,56 +680,89 @@ export function SectionTotals({ issues }: { issues: IssueSummary[] }) {
   );
 }
 
-/** Kanban lanes in pipeline order. Each canonical status maps to exactly one
- *  lane; `mixed` lanes hold several statuses, so their cards keep a status
- *  badge to disambiguate. */
+/** Kanban lanes in pipeline order. `mixed` lanes hold several statuses, so
+ *  their cards keep a status badge to disambiguate. Running issues are placed
+ *  by their stage (the canonical status subtitle), everything else by state. */
 export const BOARD_COLUMNS: Array<{
   key: string;
   label: string;
-  states: string[];
   dot: string;
   mixed?: boolean;
 }> = [
-  { key: "queued", label: "Queued", states: ["idle"], dot: "bg-slate-400" },
-  { key: "working", label: "Working", states: ["running"], dot: "bg-blue-500" },
-  {
-    key: "review",
-    label: "Review",
-    states: ["awaiting_review_trigger", "pr_open"],
-    dot: "bg-violet-500",
-    mixed: true,
-  },
-  { key: "merge", label: "Merge", states: ["awaiting_merge"], dot: "bg-cyan-500" },
-  {
-    key: "attention",
-    label: "Needs attention",
-    states: ["failed", "halted", "paused", "drift_detected"],
-    dot: "bg-red-500",
-    mixed: true,
-  },
-  { key: "done", label: "Done", states: ["done"], dot: "bg-green-500" },
+  { key: "todo", label: "Todo", dot: "bg-slate-400" },
+  { key: "waiting", label: "Waiting", dot: "bg-slate-500" },
+  { key: "implement", label: "Implement", dot: "bg-blue-500" },
+  { key: "attention", label: "Needs attention", dot: "bg-red-500", mixed: true },
+  { key: "local_review", label: "Local review", dot: "bg-cyan-500" },
+  { key: "review", label: "Review", dot: "bg-violet-500", mixed: true },
+  { key: "merge", label: "Merge", dot: "bg-emerald-500", mixed: true },
+  { key: "done", label: "Done", dot: "bg-green-500" },
 ];
 
-const STATE_TO_COLUMN: Record<string, string> = Object.fromEntries(
-  BOARD_COLUMNS.flatMap((c) => c.states.map((s) => [s, c.key])),
-);
+/** Which lane a live run sits in, by its stage (fix stages ride with their
+ *  parent stage; verify is the local pre-PR gate; acceptance gates the
+ *  merge). Unknown stages → Implement. */
+const RUNNING_STAGE_LANE: Record<string, string> = {
+  implement: "implement",
+  implement_fix: "implement",
+  local_review: "local_review",
+  local_review_fix: "local_review",
+  verify: "local_review",
+  verify_fix: "local_review",
+  review: "review",
+  review_fix: "review",
+  merge: "merge",
+  acceptance: "merge",
+  acceptance_fix: "merge",
+  done: "merge",
+};
 
-/** Bucket issues into board lanes: active issues by canonical status (unknown
- *  statuses land in "Needs attention" — never silently dropped), done-scope
- *  issues into Done. Newest activity first within a lane. */
+const STATE_TO_COLUMN: Record<string, string> = {
+  todo: "todo",
+  idle: "todo",
+  waiting: "waiting",
+  failed: "attention",
+  halted: "attention",
+  paused: "attention",
+  drift_detected: "attention",
+  awaiting_review_trigger: "review",
+  pr_open: "review",
+  awaiting_merge: "merge",
+  done: "done",
+};
+
+/** Lane key for one issue: running runs go by stage, other statuses by the
+ *  state map; unknown states land in "Needs attention" — never dropped. */
+export function boardLane(issue: IssueSummary): string {
+  const { state, subtitle } = issue.canonical_status;
+  if (state === "running") {
+    return RUNNING_STAGE_LANE[subtitle ?? ""] ?? "implement";
+  }
+  return STATE_TO_COLUMN[state] ?? "attention";
+}
+
+/** Bucket issues into board lanes, done-scope issues into Done. Newest
+ *  activity first within a lane; the Todo/Waiting queue lanes keep the
+ *  tracker's dispatch order (by identifier) instead. */
 export function groupForBoard(
   active: IssueSummary[],
   done: IssueSummary[],
 ): Map<string, IssueSummary[]> {
   const lanes = new Map<string, IssueSummary[]>(BOARD_COLUMNS.map((c) => [c.key, []]));
   for (const i of active) {
-    const key = STATE_TO_COLUMN[i.canonical_status.state] ?? "attention";
+    const key = boardLane(i);
     lanes.get(key === "done" ? "done" : key)!.push(i);
   }
   for (const i of done) {
     lanes.get("done")!.push(i);
   }
   for (const [key, issues] of lanes) {
+    if (key === "todo" || key === "waiting") {
+      issues.sort((a, b) =>
+        a.identifier.localeCompare(b.identifier, undefined, { numeric: true }),
+      );
+      continue;
+    }
     issues.sort((a, b) => {
       const ta = (key === "done" ? a.completed_at : a.latest_activity_ts) ?? "";
       const tb = (key === "done" ? b.completed_at : b.latest_activity_ts) ?? "";
@@ -751,15 +784,18 @@ function BoardCard({
   const ts =
     issue.canonical_status.state === "done"
       ? issue.completed_at ?? issue.latest_activity_ts
-      : issue.latest_activity_ts;
-  return (
-    <Link
-      to={`/issue/${encodeURIComponent(issue.id)}`}
-      className="group block rounded-md border border-border bg-background p-2.5 transition-colors hover:border-blue-400 dark:hover:border-blue-600"
-    >
+      : issue.latest_activity_ts ?? issue.canonical_status.since;
+  // Queue-only issues (tracked === false) have no daemon runs and thus no
+  // issue page — their card opens the issue in Linear instead.
+  const untracked = issue.tracked === false;
+  const body = (
+    <>
       <div className="flex items-center justify-between gap-2">
-        <span className="font-mono text-xs font-semibold text-primary underline-offset-2 group-hover:underline">
+        <span className="flex items-center gap-1 font-mono text-xs font-semibold text-primary underline-offset-2 group-hover:underline">
           {issue.identifier}
+          {untracked ? (
+            <Icon name="external" size={11} className="text-muted-foreground" />
+          ) : null}
         </span>
         <span
           className="shrink-0 font-mono text-[11px] text-muted-foreground"
@@ -785,6 +821,26 @@ function BoardCard({
           <StatusBadge status={issue.canonical_status.state} live />
         ) : null}
       </div>
+    </>
+  );
+  const cardClass =
+    "group block rounded-md border border-border bg-background p-2.5 transition-colors hover:border-blue-400 dark:hover:border-blue-600";
+  if (untracked) {
+    return (
+      <a
+        href={linearIssueUrl(issue.identifier)}
+        target="_blank"
+        rel="noreferrer"
+        title={`Open ${issue.identifier} in Linear`}
+        className={cardClass}
+      >
+        {body}
+      </a>
+    );
+  }
+  return (
+    <Link to={`/issue/${encodeURIComponent(issue.id)}`} className={cardClass}>
+      {body}
     </Link>
   );
 }
@@ -884,22 +940,50 @@ export function IssueTable({
         </thead>
         <tbody>
           {issues.map((issue) => {
-            const ts = mode === "done" ? issue.completed_at : issue.latest_activity_ts;
+            const state = issue.canonical_status.state;
+            // Queued issues carry their age in canonical_status.since (time
+            // they entered the Todo/Waiting lane), not latest_activity_ts.
+            const queued = state === "todo" || state === "waiting";
+            const ts =
+              mode === "done"
+                ? issue.completed_at
+                : issue.latest_activity_ts ??
+                  (queued ? issue.canonical_status.since : null);
+            // Queue-only rows have no issue page — the row and identifier
+            // both open Linear instead of a 404.
+            const untracked = issue.tracked === false;
             return (
               <tr
                 key={issue.id}
                 className="group cursor-pointer border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
-                onClick={() => onOpen(issue.id)}
+                onClick={() =>
+                  untracked
+                    ? window.open(linearIssueUrl(issue.identifier), "_blank", "noreferrer")
+                    : onOpen(issue.id)
+                }
               >
                 <td className="whitespace-nowrap px-3 py-2.5 font-medium">
                   <span className="flex items-center gap-1.5">
-                    <Link
-                      to={`/issue/${encodeURIComponent(issue.id)}`}
-                      onClick={(e) => e.stopPropagation()}
-                      className="text-primary underline-offset-4 hover:underline"
-                    >
-                      {issue.identifier}
-                    </Link>
+                    {untracked ? (
+                      <a
+                        href={linearIssueUrl(issue.identifier)}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        title={`Open ${issue.identifier} in Linear`}
+                        className="text-primary underline-offset-4 hover:underline"
+                      >
+                        {issue.identifier}
+                      </a>
+                    ) : (
+                      <Link
+                        to={`/issue/${encodeURIComponent(issue.id)}`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="text-primary underline-offset-4 hover:underline"
+                      >
+                        {issue.identifier}
+                      </Link>
+                    )}
                     <a
                       href={linearIssueUrl(issue.identifier)}
                       target="_blank"

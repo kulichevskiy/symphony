@@ -47,15 +47,17 @@ query LookupIssue($id: String!) {
 """
 
 ISSUES_IN_STATE = """
-query IssuesInState($team: String!, $stateName: String!, $label: String) {
+query IssuesInState($team: String!, $stateName: String!, $label: String, $cursor: String) {
   issues(
     filter: {
       team: { key: { eq: $team } },
       state: { name: { eq: $stateName } },
       labels: { name: { eq: $label } }
     },
-    first: 50
+    first: 50,
+    after: $cursor
   ) {
+    pageInfo { hasNextPage endCursor }
     nodes {
       id identifier title description url updatedAt
       state { id name type }
@@ -87,14 +89,16 @@ query IssuesInState($team: String!, $stateName: String!, $label: String) {
 """
 
 ISSUES_IN_STATE_NO_LABEL = """
-query IssuesInState($team: String!, $stateName: String!) {
+query IssuesInState($team: String!, $stateName: String!, $cursor: String) {
   issues(
     filter: {
       team: { key: { eq: $team } },
       state: { name: { eq: $stateName } }
     },
-    first: 50
+    first: 50,
+    after: $cursor
   ) {
+    pageInfo { hasNextPage endCursor }
     nodes {
       id identifier title description url updatedAt
       state { id name type }

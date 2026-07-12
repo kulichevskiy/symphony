@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
@@ -35,6 +36,7 @@ from ._base import (
     BindingKey,
     _binding_key,
     _OrchestratorBase,
+    _queue_scope,
     _tracker_context_for_binding,
 )
 from ._helpers import _pr_view_is_closed, _pr_view_is_merged
@@ -130,7 +132,12 @@ class _DispatchMixin(_OrchestratorBase):
             ready_state,
             f" with label '{binding.issue_label}'" if binding.issue_label else "",
         )
-        await self._auto_unblock_waiting(binding, waiting_issues)
+        # Unblock first so the snapshot reflects the moves — an issue promoted
+        # to Ready must not linger in the UI's Waiting lane until the next poll.
+        unblocked_ids = await self._auto_unblock_waiting(binding, waiting_issues)
+        await self._persist_queue_snapshot(
+            binding, issues, waiting_issues, unblocked_ids=unblocked_ids
+        )
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
             log.info(
                 "scan %s: dispatch capacity is zero (global=%d, binding=%d)",
@@ -152,12 +159,77 @@ class _DispatchMixin(_OrchestratorBase):
                 break
         return scheduled
 
+    async def _persist_queue_snapshot(
+        self,
+        binding: RepoBinding,
+        ready_issues: Sequence[LinearIssue],
+        waiting_issues: Sequence[LinearIssue],
+        *,
+        unblocked_ids: AbstractSet[str] = frozenset(),
+    ) -> None:
+        """Mirror the scan result into `tracker_queue` for the UI board.
+
+        The waiting fetch is not label-filtered (auto-unblock covers the whole
+        lane), so apply the binding's label here to keep the snapshot scoped to
+        issues Symphony would actually dispatch. Waiting issues that
+        `_auto_unblock_waiting` just moved to Ready are recorded as ready.
+        """
+        rows = [
+            db.tracker_queue.QueueRow(
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                title=issue.title,
+                queue="ready",
+                state_name=issue.state_name,
+            )
+            for issue in ready_issues
+        ]
+        # The Ready and Waiting fetches run concurrently, so an issue moving
+        # between them can appear in both — the ready row wins (a duplicate
+        # insert would violate the snapshot's primary key).
+        seen_ids = {issue.id for issue in ready_issues}
+        for issue in waiting_issues:
+            if issue.id in seen_ids:
+                continue
+            seen_ids.add(issue.id)
+            if binding.issue_label and binding.issue_label not in issue.labels:
+                continue
+            if issue.id in unblocked_ids:
+                rows.append(
+                    db.tracker_queue.QueueRow(
+                        issue_id=issue.id,
+                        identifier=issue.identifier,
+                        title=issue.title,
+                        queue="ready",
+                        state_name=binding.linear_states.ready,
+                    )
+                )
+                continue
+            rows.append(
+                db.tracker_queue.QueueRow(
+                    issue_id=issue.id,
+                    identifier=issue.identifier,
+                    title=issue.title,
+                    queue="waiting",
+                    state_name=issue.state_name,
+                    blocked_by=", ".join(open_blocker_ids(issue)),
+                )
+            )
+        await db.tracker_queue.replace_scan(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            rows=rows,
+            seen_at=self._now().isoformat(),
+        )
+
     async def _auto_unblock_waiting(
         self, binding: RepoBinding, waiting_issues: list[LinearIssue]
-    ) -> None:
+    ) -> set[str]:
+        """Move no-longer-blocked Waiting issues to Ready; return moved ids."""
         unblocked_issues = [issue for issue in waiting_issues if not is_blocked(issue)]
         if not unblocked_issues:
-            return
+            return set()
         try:
             states = await self._states_for_binding(binding)
         except LinearError as e:
@@ -166,7 +238,7 @@ class _DispatchMixin(_OrchestratorBase):
                 binding.linear_team_key,
                 e,
             )
-            return
+            return set()
         ready_id = states.get(binding.linear_states.ready)
         if ready_id is None:
             log.warning(
@@ -174,9 +246,10 @@ class _DispatchMixin(_OrchestratorBase):
                 binding.linear_team_key,
                 binding.linear_states.ready,
             )
-            return
+            return set()
 
         tracker = self.tracker(binding)
+        moved: set[str] = set()
         for issue in unblocked_issues:
             try:
                 await tracker.move_issue(issue.id, ready_id)
@@ -184,6 +257,8 @@ class _DispatchMixin(_OrchestratorBase):
                 log.warning("could not auto-unblock %s to Ready: %s", issue.identifier, e)
                 continue
             log.info("auto-unblocked %s -> Ready", issue.identifier)
+            moved.add(issue.id)
+        return moved
 
     def _dispatch_capacity(self, binding: RepoBinding) -> int:
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
@@ -440,6 +515,15 @@ class _DispatchMixin(_OrchestratorBase):
                     )
                     return
 
+        # The guard moved the issue out of the queue lanes — drop its
+        # just-written snapshot row so the board reflects the park now.
+        await db.tracker_queue.remove(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            issue_id=issue.id,
+        )
+
         try:
             await self.tracker(binding).post_comment(issue.id, truncate_body(body))
         except LinearError as e:
@@ -526,6 +610,17 @@ class _DispatchMixin(_OrchestratorBase):
             issue.identifier,
             waiting,
             ", ".join(blockers),
+        )
+        # Same-tick park: flip the just-written queue row so the UI doesn't
+        # show a Todo card for an issue this very poll moved to Waiting.
+        await db.tracker_queue.mark_waiting(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            issue_id=issue.id,
+            state_name=waiting,
+            blocked_by=", ".join(blockers),
+            seen_at=self._now().isoformat(),
         )
 
     def _ready_binding_for_issue(

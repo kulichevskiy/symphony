@@ -22,7 +22,11 @@ export type CanonicalStatusState =
   | "awaiting_review_trigger"
   | "pr_open"
   | "done"
-  | "idle";
+  | "idle"
+  // Dispatch-queue states mirrored from the tracker (Linear Todo / Waiting
+  // lanes) — the daemon has not necessarily started these yet.
+  | "todo"
+  | "waiting";
 
 export type CanonicalStatus = {
   state: CanonicalStatusState;
@@ -63,6 +67,9 @@ export interface IssueSummary {
   latest_activity_ts: string | null;
   latest_activity_age_secs: number | null;
   canonical_status: CanonicalStatus;
+  /** False for queue-only issues (known from Linear Todo/Waiting, never run by
+   *  the daemon) — there is no issue page for them. Omitted means true. */
+  tracked?: boolean;
   warnings?: IssueWarning[];
   completed_at?: string | null;
 }

@@ -162,20 +162,33 @@ class LinearTracker:
         the label argument to be non-null at validation time, so we use a
         separate query when no label is configured.
         """
-        if label:
-            data = await self._query(
-                queries.ISSUES_IN_STATE,
-                {"team": team_key, "stateName": state_name, "label": label},
-            )
-        else:
-            data = await self._query(
-                queries.ISSUES_IN_STATE_NO_LABEL,
-                {"team": team_key, "stateName": state_name},
-            )
-        nodes = data["issues"]["nodes"]
         issues: list[LinearIssue] = []
-        for node in nodes:
-            issues.append(await self._issue_from_node(node))
+        cursor: str | None = None
+        while True:
+            if label:
+                data = await self._query(
+                    queries.ISSUES_IN_STATE,
+                    {
+                        "team": team_key,
+                        "stateName": state_name,
+                        "label": label,
+                        "cursor": cursor,
+                    },
+                )
+            else:
+                data = await self._query(
+                    queries.ISSUES_IN_STATE_NO_LABEL,
+                    {"team": team_key, "stateName": state_name, "cursor": cursor},
+                )
+            connection = data["issues"]
+            for node in connection["nodes"]:
+                issues.append(await self._issue_from_node(node))
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                break
         return issues
 
     async def comments_since(self, issue_uuid: str, after: datetime) -> list[LinearComment]:
