@@ -101,13 +101,21 @@ describe("IssueTable affordances", () => {
           id: "lin-uuid",
           identifier: "VIB-9",
           tracked: false,
-          canonical_status: { state: "todo", since: null, subtitle: "Todo", stuck_for: null },
+          canonical_status: {
+            state: "todo",
+            since: "2026-05-17T10:00:00Z",
+            subtitle: "Todo",
+            stuck_for: null,
+          },
         }),
       ],
       "active",
     );
     expect(markup).not.toContain('href="/issue/lin-uuid"');
     expect(markup).toContain('href="https://linear.app/issue/VIB-9"');
+    // Queue age comes from canonical_status.since (latest_activity_ts is
+    // null for queue rows) — the Last activity cell must not show "—".
+    expect(markup).toContain("2h ago");
   });
 });
 

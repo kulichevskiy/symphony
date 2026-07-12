@@ -449,15 +449,21 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
             conn, id="issue-run", identifier="ADJ-1", title="Running", team_key="ADJ"
         )
         # A tracked issue with no daemon state sitting in the ready queue —
-        # its idle status is overridden to todo.
+        # requeued after a finished run, so it keeps its history.
         await db.issues.upsert(
             conn, id="issue-idle", identifier="ADJ-2", title="Queued", team_key="ADJ"
         )
         await conn.execute(
             """
-            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
-            VALUES ('r-1', 'issue-run', 'implement', 'running', NULL,
-                    '2026-07-12T08:00:00Z')
+            INSERT INTO runs (
+                id, issue_id, stage, status, pid, started_at, ended_at,
+                input_tokens, output_tokens
+            )
+            VALUES
+                ('r-1', 'issue-run', 'implement', 'running', NULL,
+                 '2026-07-12T08:00:00Z', NULL, 0, 0),
+                ('r-2', 'issue-idle', 'implement', 'failed', NULL,
+                 '2026-07-10T08:00:00Z', '2026-07-10T09:00:00Z', 1000, 200)
             """
         )
         await db.tracker_queue.replace_scan(
@@ -466,14 +472,14 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
             scope="org/repo#",
             rows=[
                 db.tracker_queue.QueueRow(
-                    issue_id="lin-run",
+                    issue_id="issue-run",
                     identifier="ADJ-1",
                     title="Running",
                     queue="ready",
                     state_name="Todo",
                 ),
                 db.tracker_queue.QueueRow(
-                    issue_id="lin-idle",
+                    issue_id="issue-idle",
                     identifier="ADJ-2",
                     title="Queued",
                     queue="ready",
@@ -491,6 +497,24 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
             ],
             seen_at="2026-07-12T09:00:00Z",
         )
+        # A second binding on the same team sees the same waiting issue — the
+        # response must still carry it exactly once (earliest sighting wins).
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ADJ",
+            scope="org/other#",
+            rows=[
+                db.tracker_queue.QueueRow(
+                    issue_id="lin-wait",
+                    identifier="ADJ-3",
+                    title="Blocked work",
+                    queue="waiting",
+                    state_name="Waiting",
+                    blocked_by="ADJ-2",
+                ),
+            ],
+            seen_at="2026-07-12T09:30:00Z",
+        )
         await conn.commit()
         app = create_app(
             _Handler(),
@@ -507,19 +531,27 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
             active = await client.get("/api/issues?scope=active")
             done = await client.get("/api/issues?scope=done")
             filtered = await client.get("/api/issues?scope=active&provider=codex")
+            windowed = await client.get("/api/issues?scope=active&from=2026-07-01&to=2026-07-05")
     finally:
         await conn.close()
 
     assert active.status_code == 200
+    # The duplicate ADJ-3 rows from the two binding scopes collapse to one.
+    identifiers = [issue["identifier"] for issue in active.json()]
+    assert identifiers.count("ADJ-3") == 1
     by_identifier = {issue["identifier"]: issue for issue in active.json()}
     # Daemon state wins over the queue snapshot.
     assert by_identifier["ADJ-1"]["canonical_status"]["state"] == "running"
-    # Tracked but with no activity: absent from the active scope's own rows,
-    # so it surfaces through the queue snapshot as todo — keeping its storage
-    # id (its issue page exists) and staying tracked.
-    assert by_identifier["ADJ-2"]["canonical_status"]["state"] == "todo"
-    assert by_identifier["ADJ-2"]["id"] == "issue-idle"
-    assert "tracked" not in by_identifier["ADJ-2"]  # default True is excluded
+    # Requeued tracked issue: absent from the active scope's own rows, so it
+    # surfaces through the queue snapshot as todo — keeping its storage id
+    # (its issue page exists), its historical totals, and staying tracked.
+    requeued = by_identifier["ADJ-2"]
+    assert requeued["canonical_status"]["state"] == "todo"
+    assert requeued["id"] == "issue-idle"
+    assert "tracked" not in requeued  # default True is excluded
+    assert requeued["input_tokens"] == 1000
+    assert requeued["output_tokens"] == 200
+    assert requeued["latest_activity_ts"] == "2026-07-10T09:00:00Z"
     # Queue-only issue: untracked, zero tokens, waiting with blocker subtitle.
     wait = by_identifier["ADJ-3"]
     assert wait["tracked"] is False
@@ -539,6 +571,11 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
     # Queue rows have no runs, so provider/model-filtered views exclude them.
     assert filtered.status_code == 200
     assert [issue["identifier"] for issue in filtered.json()] == []
+
+    # A historical date window excludes today's queue rows (seen_at is
+    # outside the window), keeping filtered views honest.
+    assert windowed.status_code == 200
+    assert [issue["identifier"] for issue in windowed.json()] == []
 
 
 @pytest.mark.asyncio

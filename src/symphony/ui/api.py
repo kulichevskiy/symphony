@@ -814,8 +814,18 @@ def _queue_row_matches(
     *,
     q: str | None,
     teams: list[str] | None,
+    date_from: str | None,
+    date_to: str | None,
 ) -> bool:
     if teams and str(row["team_key"]) not in teams:
+        return False
+    # Mirror the tracked issues' latest-activity window: `seen_at` is when the
+    # issue entered its current queue, so out-of-window rows stay out of
+    # historical views.
+    day = str(row["seen_at"])[:10]
+    if date_from is not None and day < date_from:
+        return False
+    if date_to is not None and day > date_to:
         return False
     needle = (q or "").strip().lower()
     if (
@@ -825,6 +835,28 @@ def _queue_row_matches(
     ):
         return False
     return True
+
+
+def _dedupe_queue_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse multi-binding snapshots to one row per tracker issue.
+
+    Two bindings on one team can both see the same queued issue; the board
+    must show one card. Prefer the ready row (the daemon will dispatch it),
+    then the earliest sighting.
+    """
+    best: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row["team_key"]), str(row["issue_id"]))
+        cur = best.get(key)
+        if (
+            cur is None
+            or (str(cur["queue"]) == "waiting" and str(row["queue"]) == "ready")
+            or (
+                str(cur["queue"]) == str(row["queue"]) and str(row["seen_at"]) < str(cur["seen_at"])
+            )
+        ):
+            best[key] = row
+    return list(best.values())
 
 
 def _list_issues_query(
@@ -1034,24 +1066,51 @@ def create_api_router(
                     FROM tracker_queue
                     """
                 )
-                queue_rows = [
-                    row
-                    for row in map(dict, await qcur.fetchall())
-                    if _queue_row_matches(row, q=q, teams=team_filter)
-                ]
+                queue_rows = _dedupe_queue_rows(
+                    [
+                        row
+                        for row in map(dict, await qcur.fetchall())
+                        if _queue_row_matches(
+                            row, q=q, teams=team_filter, date_from=date_from, date_to=date_to
+                        )
+                    ]
+                )
             # Queue issues the daemon has seen before (a requeued issue, or
             # dispatch paused) have an `issues` row and thus an issue page —
-            # resolve their storage ids so they stay internal links.
+            # resolve their storage ids so they stay internal links. Keyed by
+            # the tracker's own issue id, not the display identifier, which is
+            # not unique across tracker providers/sites.
             queue_storage_ids: dict[str, str] = {}
+            queue_totals: dict[str, dict[str, Any]] = {}
             if queue_rows:
                 placeholders = ",".join("?" * len(queue_rows))
                 icur = await conn.execute(
-                    f"SELECT id, identifier FROM issues WHERE identifier IN ({placeholders})",
-                    tuple(str(row["identifier"]) for row in queue_rows),
+                    "SELECT id, tracker_issue_id FROM issues "
+                    f"WHERE tracker_issue_id IN ({placeholders})",
+                    tuple(str(row["issue_id"]) for row in queue_rows),
                 )
                 queue_storage_ids = {
-                    str(row["identifier"]): str(row["id"]) for row in await icur.fetchall()
+                    str(row["tracker_issue_id"]): str(row["id"]) for row in await icur.fetchall()
                 }
+            if queue_storage_ids:
+                # A requeued issue keeps its historical spend and activity —
+                # don't report zeros just because it is back in the queue.
+                placeholders = ",".join("?" * len(queue_storage_ids))
+                tcur = await conn.execute(
+                    f"""
+                    SELECT issue_id,
+                           SUM(input_tokens) AS input_tokens,
+                           SUM(output_tokens) AS output_tokens,
+                           SUM(cache_write_tokens) AS cache_write_tokens,
+                           SUM(cache_read_tokens) AS cache_read_tokens,
+                           MAX(COALESCE(ended_at, started_at)) AS latest_activity_ts
+                    FROM runs
+                    WHERE issue_id IN ({placeholders})
+                    GROUP BY issue_id
+                    """,
+                    tuple(queue_storage_ids.values()),
+                )
+                queue_totals = {str(row["issue_id"]): dict(row) for row in await tcur.fetchall()}
             status_by_id = await compute_canonical_statuses(
                 conn,
                 [str(issue["id"]) for issue in issues],
@@ -1096,7 +1155,11 @@ def create_api_router(
             )
             triples = [(issue, status, None) for issue, status in statuses]
 
-        queue_by_identifier = {str(row["identifier"]): row for row in queue_rows}
+        queue_by_storage_id = {
+            queue_storage_ids[str(row["issue_id"])]: row
+            for row in queue_rows
+            if str(row["issue_id"]) in queue_storage_ids
+        }
         payloads: list[IssueSummary] = []
         for issue, status, completed_at in triples:
             warnings = issue_warnings(
@@ -1110,7 +1173,7 @@ def create_api_router(
             }
             # A tracked issue with no daemon state that sits in the dispatch
             # queue is really Todo/Waiting, not idle — reflect the queue.
-            queue_row = queue_by_identifier.get(str(issue["identifier"]))
+            queue_row = queue_by_storage_id.get(str(issue["id"]))
             if queue_row is not None and status.state == CanonicalState.IDLE:
                 payload["canonical_status"] = _queue_status_dict(queue_row)
             payload.pop("max_merged_at", None)
@@ -1122,13 +1185,19 @@ def create_api_router(
 
         # Queue issues absent from the active scope: no live daemon state, so
         # they surface with their queue status to keep the Todo/Waiting lanes
-        # honest. Ones with an `issues` row keep their storage id (their issue
-        # page exists); the rest are untracked and link out to the tracker.
-        tracked_identifiers = {str(issue["identifier"]) for issue, _ in statuses}
-        extras = [row for row in queue_rows if str(row["identifier"]) not in tracked_identifiers]
+        # honest. Ones with an `issues` row keep their storage id, issue page,
+        # and historical totals; the rest are untracked and link out to the
+        # tracker.
+        active_ids = {str(issue["id"]) for issue, _ in statuses}
+        extras = [
+            row
+            for row in queue_rows
+            if queue_storage_ids.get(str(row["issue_id"])) not in active_ids
+        ]
         extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
         for row in extras:
-            storage_id = queue_storage_ids.get(str(row["identifier"]))
+            storage_id = queue_storage_ids.get(str(row["issue_id"]))
+            totals = queue_totals.get(storage_id or "", {})
             payloads.append(
                 IssueSummary.model_validate(
                     {
@@ -1136,11 +1205,11 @@ def create_api_router(
                         "identifier": str(row["identifier"]),
                         "title": str(row["title"]),
                         "team_key": str(row["team_key"]),
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cache_write_tokens": 0,
-                        "cache_read_tokens": 0,
-                        "latest_activity_ts": None,
+                        "input_tokens": int(totals.get("input_tokens") or 0),
+                        "output_tokens": int(totals.get("output_tokens") or 0),
+                        "cache_write_tokens": int(totals.get("cache_write_tokens") or 0),
+                        "cache_read_tokens": int(totals.get("cache_read_tokens") or 0),
+                        "latest_activity_ts": totals.get("latest_activity_ts"),
                         "latest_activity_age_secs": None,
                         "canonical_status": _queue_status_dict(row),
                         "tracked": storage_id is not None,

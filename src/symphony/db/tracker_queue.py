@@ -25,6 +25,45 @@ class QueueRow:
     blocked_by: str = ""
 
 
+async def mark_waiting(
+    conn: aiosqlite.Connection,
+    *,
+    team_key: str,
+    scope: str,
+    issue_id: str,
+    state_name: str,
+    blocked_by: str,
+    seen_at: str,
+) -> None:
+    """Reflect a same-tick park to Waiting without waiting for the next scan."""
+
+    await conn.execute(
+        """
+        UPDATE tracker_queue
+           SET queue = 'waiting', state_name = ?, blocked_by = ?, seen_at = ?
+         WHERE team_key = ? AND scope = ? AND issue_id = ? AND queue != 'waiting'
+        """,
+        (state_name, blocked_by, seen_at, team_key, scope, issue_id),
+    )
+    await conn.commit()
+
+
+async def remove(
+    conn: aiosqlite.Connection,
+    *,
+    team_key: str,
+    scope: str,
+    issue_id: str,
+) -> None:
+    """Drop an issue that a guard just moved out of the queue lanes entirely."""
+
+    await conn.execute(
+        "DELETE FROM tracker_queue WHERE team_key = ? AND scope = ? AND issue_id = ?",
+        (team_key, scope, issue_id),
+    )
+    await conn.commit()
+
+
 async def replace_scan(
     conn: aiosqlite.Connection,
     *,

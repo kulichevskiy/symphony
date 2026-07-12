@@ -43,6 +43,13 @@ from ._helpers import _pr_view_is_closed, _pr_view_is_merged
 log = logging.getLogger(__name__)
 
 
+def _queue_scope(binding: RepoBinding) -> str:
+    """`tracker_queue.scope` for a binding: `_binding_key` minus the team
+    (already its own column), so two bindings on one team never clobber each
+    other's snapshot rows."""
+    return "#".join(_binding_key(binding)[1:])
+
+
 class _DispatchMixin(_OrchestratorBase):
     """Dispatch domain of the poll loop; `Orchestrator` extends it."""
 
@@ -207,13 +214,10 @@ class _DispatchMixin(_OrchestratorBase):
                     blocked_by=", ".join(open_blocker_ids(issue)),
                 )
             )
-        # The scope mirrors `_binding_key` minus the team (already a column),
-        # so two bindings on one team never clobber each other's snapshot.
-        scope = "#".join(_binding_key(binding)[1:])
         await db.tracker_queue.replace_scan(
             self._conn,
             team_key=binding.linear_team_key,
-            scope=scope,
+            scope=_queue_scope(binding),
             rows=rows,
             seen_at=self._now().isoformat(),
         )
@@ -510,6 +514,15 @@ class _DispatchMixin(_OrchestratorBase):
                     )
                     return
 
+        # The guard moved the issue out of the queue lanes — drop its
+        # just-written snapshot row so the board reflects the park now.
+        await db.tracker_queue.remove(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            issue_id=issue.id,
+        )
+
         try:
             await self.tracker(binding).post_comment(issue.id, truncate_body(body))
         except LinearError as e:
@@ -596,6 +609,17 @@ class _DispatchMixin(_OrchestratorBase):
             issue.identifier,
             waiting,
             ", ".join(blockers),
+        )
+        # Same-tick park: flip the just-written queue row so the UI doesn't
+        # show a Todo card for an issue this very poll moved to Waiting.
+        await db.tracker_queue.mark_waiting(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            issue_id=issue.id,
+            state_name=waiting,
+            blocked_by=", ".join(blockers),
+            seen_at=self._now().isoformat(),
         )
 
     def _ready_binding_for_issue(

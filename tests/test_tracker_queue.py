@@ -144,6 +144,38 @@ async def test_replace_scan_preserves_first_seen_while_queue_unchanged(tmp_path:
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_mark_waiting_and_remove_adjust_single_rows(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="s",
+            rows=[_row("ENG-1"), _row("ENG-2")],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+        # A same-tick park flips ready → waiting with the blocker list.
+        await db.tracker_queue.mark_waiting(
+            conn,
+            team_key="ENG",
+            scope="s",
+            issue_id="iss-ENG-1",
+            state_name="Waiting",
+            blocked_by="ENG-0",
+            seen_at="2026-07-12T09:00:30Z",
+        )
+        # A guard that moves an issue out of the queue lanes drops the row.
+        await db.tracker_queue.remove(conn, team_key="ENG", scope="s", issue_id="iss-ENG-2")
+
+        rows = await _rows(conn)
+        assert [(r["identifier"], r["queue"], r["blocked_by"]) for r in rows] == [
+            ("ENG-1", "waiting", "ENG-0"),
+        ]
+    finally:
+        await conn.close()
+
+
 def _issue(
     uid: str,
     ident: str,

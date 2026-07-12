@@ -940,7 +940,15 @@ export function IssueTable({
         </thead>
         <tbody>
           {issues.map((issue) => {
-            const ts = mode === "done" ? issue.completed_at : issue.latest_activity_ts;
+            const state = issue.canonical_status.state;
+            // Queued issues carry their age in canonical_status.since (time
+            // they entered the Todo/Waiting lane), not latest_activity_ts.
+            const queued = state === "todo" || state === "waiting";
+            const ts =
+              mode === "done"
+                ? issue.completed_at
+                : issue.latest_activity_ts ??
+                  (queued ? issue.canonical_status.since : null);
             // Queue-only rows have no issue page — the row and identifier
             // both open Linear instead of a 404.
             const untracked = issue.tracked === false;
