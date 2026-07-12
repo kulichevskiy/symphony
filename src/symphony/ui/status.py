@@ -113,16 +113,6 @@ OPERATOR_WAIT_SUPERSEDED_BY_STAGES: Mapping[str, tuple[str, ...]] = {
 }
 
 
-async def _fetch_one(
-    conn: aiosqlite.Connection,
-    query: str,
-    params: tuple[object, ...],
-) -> dict[str, Any] | None:
-    cur = await conn.execute(query, params)
-    row = await cur.fetchone()
-    return dict(row) if row is not None else None
-
-
 async def _fetch_all(
     conn: aiosqlite.Connection,
     query: str,
@@ -172,32 +162,31 @@ def _run_supersedes_operator_wait(
     return wait_created is not None and run_progressed is not None and run_progressed > wait_created
 
 
-async def _operator_wait_superseding_run(
-    conn: aiosqlite.Connection,
+# Union of every stage that can supersede an operator wait, used to prefetch
+# the superseding-run candidates for the whole issue batch in one query. The
+# per-issue stage filter (by the wait's kind) is applied in Python.
+_SUPERSEDE_STAGES: tuple[str, ...] = tuple(
+    sorted({stage for stages in OPERATOR_WAIT_SUPERSEDED_BY_STAGES.values() for stage in stages})
+)
+
+
+def _find_superseding_run(
+    runs: Sequence[Mapping[str, Any]],
     *,
-    issue_id: str,
     wait_kind: str | None,
     wait_created_at: str | None,
-) -> dict[str, Any] | None:
+) -> Mapping[str, Any] | None:
+    """First run (of the wait kind's stages) that supersedes the operator wait.
+
+    `runs` are the issue's `running`/`completed` runs across all supersede
+    stages, ordered newest-progress-first; mirrors the single-issue query which
+    filters to the kind's stages then takes the top 10 before iterating.
+    """
     stages = OPERATOR_WAIT_SUPERSEDED_BY_STAGES.get(wait_kind or "")
     if not stages:
         return None
-
-    placeholders = ",".join("?" * len(stages))
-    rows = await _fetch_all(
-        conn,
-        f"""
-        SELECT stage, status, started_at, ended_at
-        FROM runs
-        WHERE issue_id = ?
-          AND stage IN ({placeholders})
-          AND status IN ('running', 'completed')
-        ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC, id DESC
-        LIMIT 10
-        """,
-        (issue_id, *stages),
-    )
-    for run in rows:
+    relevant = [run for run in runs if _as_str(run.get("stage")) in stages][:10]
+    for run in relevant:
         if _run_supersedes_operator_wait(run, wait_created_at):
             return run
     return None
@@ -283,42 +272,38 @@ def _drift_status(
     )
 
 
-async def compute_canonical_status(
-    conn: aiosqlite.Connection,
-    issue_id: str,
+@dataclass(frozen=True)
+class _StatusInputs:
+    """Prefetched status ingredients for a single issue.
+
+    The single-issue and batch paths both resolve these (per-issue queries vs
+    one grouped query per source table) and feed the same decision logic, so
+    their results stay byte-identical.
+    """
+
+    operator_wait: Mapping[str, Any] | None
+    superseding_runs: Sequence[Mapping[str, Any]]
+    running_run: Mapping[str, Any] | None
+    latest_run: Mapping[str, Any] | None
+    open_pr: Mapping[str, Any] | None
+    latest_pr: Mapping[str, Any] | None
+    review_state: Mapping[str, Any] | None
+    latest_comment: Mapping[str, Any] | None
+
+
+def _decide_canonical_status(
+    inputs: _StatusInputs,
     *,
-    now: datetime | None = None,
-    thresholds: Mapping[CanonicalState, timedelta] = DEFAULT_STUCK_THRESHOLDS,
-    external_snapshot: ExternalStatusSnapshot | None = None,
+    now: datetime,
+    thresholds: Mapping[CanonicalState, timedelta],
 ) -> CanonicalStatus:
-    """Return the first matching canonical UI status for an issue."""
+    """Return the first matching canonical UI status from prefetched inputs."""
 
-    effective_now = _normalize_now(now or datetime.now(UTC))
-    if external_snapshot is not None:
-        status = _drift_status(
-            external_snapshot,
-            now=effective_now,
-            thresholds=thresholds,
-        )
-        if status is not None:
-            return status
-
-    operator_wait = await _fetch_one(
-        conn,
-        """
-        SELECT kind, created_at
-        FROM operator_waits
-        WHERE issue_id = ?
-        ORDER BY created_at DESC, run_id DESC
-        LIMIT 1
-        """,
-        (issue_id,),
-    )
+    operator_wait = inputs.operator_wait
     if operator_wait is not None:
         wait_kind = _as_str(operator_wait["kind"])
-        superseding_run = await _operator_wait_superseding_run(
-            conn,
-            issue_id=issue_id,
+        superseding_run = _find_superseding_run(
+            inputs.superseding_runs,
             wait_kind=wait_kind,
             wait_created_at=_as_str(operator_wait["created_at"]),
         )
@@ -327,7 +312,7 @@ async def compute_canonical_status(
                 CanonicalState.RUNNING,
                 since=_as_str(superseding_run["started_at"]),
                 subtitle=_as_str(superseding_run["stage"]),
-                now=effective_now,
+                now=now,
                 thresholds=thresholds,
             )
         if superseding_run is None:
@@ -335,52 +320,22 @@ async def compute_canonical_status(
                 OPERATOR_WAIT_STATES.get(wait_kind or "", CanonicalState.PAUSED),
                 since=_as_str(operator_wait["created_at"]),
                 subtitle=wait_kind,
-                now=effective_now,
+                now=now,
                 thresholds=thresholds,
             )
 
-    running_run = await _fetch_one(
-        conn,
-        """
-        SELECT stage, started_at
-        FROM runs
-        WHERE issue_id = ? AND status = 'running'
-        ORDER BY started_at DESC, id DESC
-        LIMIT 1
-        """,
-        (issue_id,),
-    )
+    running_run = inputs.running_run
     if running_run is not None:
         return _status(
             CanonicalState.RUNNING,
             since=_as_str(running_run["started_at"]),
             subtitle=_as_str(running_run["stage"]),
-            now=effective_now,
+            now=now,
             thresholds=thresholds,
         )
 
-    latest_run = await _fetch_one(
-        conn,
-        """
-        SELECT stage, status, started_at, ended_at, termination_kind
-        FROM runs
-        WHERE issue_id = ? AND status != 'superseded'
-        ORDER BY started_at DESC, COALESCE(ended_at, '') DESC, id DESC
-        LIMIT 1
-        """,
-        (issue_id,),
-    )
-    open_pr = await _fetch_one(
-        conn,
-        """
-        SELECT pr_number, created_at
-        FROM issue_prs
-        WHERE issue_id = ? AND merged_at IS NULL
-        ORDER BY created_at DESC, github_repo ASC
-        LIMIT 1
-        """,
-        (issue_id,),
-    )
+    latest_run = inputs.latest_run
+    open_pr = inputs.open_pr
     if latest_run is not None and latest_run["status"] in DEAD_RUN_STATUSES:
         # An orphaned `interrupted` run (host PID died on a restart, or a run
         # we deliberately superseded) is not a real failure when the PR is
@@ -405,7 +360,7 @@ async def compute_canonical_status(
                 CanonicalState.FAILED,
                 since=_as_str(latest_run["ended_at"]) or _as_str(latest_run["started_at"]),
                 subtitle=subtitle,
-                now=effective_now,
+                now=now,
                 thresholds=thresholds,
             )
 
@@ -414,51 +369,23 @@ async def compute_canonical_status(
             CanonicalState.PR_OPEN,
             since=_as_str(open_pr["created_at"]),
             subtitle=f"#{int(open_pr['pr_number'])}",
-            now=effective_now,
+            now=now,
             thresholds=thresholds,
         )
 
-    latest_pr = await _fetch_one(
-        conn,
-        """
-        SELECT pr_number, merged_at
-        FROM issue_prs
-        WHERE issue_id = ?
-        ORDER BY COALESCE(merged_at, '') DESC, created_at DESC, github_repo ASC
-        LIMIT 1
-        """,
-        (issue_id,),
-    )
+    latest_pr = inputs.latest_pr
     if latest_pr is not None:
         return _status(
             CanonicalState.DONE,
             since=_as_str(latest_pr["merged_at"]),
             subtitle=None,
-            now=effective_now,
+            now=now,
             thresholds=thresholds,
         )
 
-    review_state = await _fetch_one(
-        conn,
-        """
-        SELECT iteration
-        FROM review_state
-        WHERE issue_id = ? AND iteration > 0
-        """,
-        (issue_id,),
-    )
+    review_state = inputs.review_state
     if review_state is not None:
-        latest_comment = await _fetch_one(
-            conn,
-            """
-            SELECT seen_at
-            FROM comment_events
-            WHERE issue_id = ?
-            ORDER BY seen_at DESC, comment_id DESC
-            LIMIT 1
-            """,
-            (issue_id,),
-        )
+        latest_comment = inputs.latest_comment
         since = None
         if latest_comment is not None:
             since = _as_str(latest_comment["seen_at"])
@@ -468,7 +395,7 @@ async def compute_canonical_status(
             CanonicalState.AWAITING_REVIEW_TRIGGER,
             since=since,
             subtitle=f"iteration={int(review_state['iteration'])}",
-            now=effective_now,
+            now=now,
             thresholds=thresholds,
         )
 
@@ -476,9 +403,237 @@ async def compute_canonical_status(
         CanonicalState.IDLE,
         since=None,
         subtitle=None,
+        now=now,
+        thresholds=thresholds,
+    )
+
+
+def _index_by_issue(rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Map issue_id -> row, keeping the first row seen per issue (rn=1)."""
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        issue_id = str(row["issue_id"])
+        if issue_id not in out:
+            out[issue_id] = dict(row)
+    return out
+
+
+def _group_by_issue(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Map issue_id -> ordered list of rows (query order preserved per issue)."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        out.setdefault(str(row["issue_id"]), []).append(dict(row))
+    return out
+
+
+async def compute_canonical_statuses(
+    conn: aiosqlite.Connection,
+    issue_ids: Sequence[str],
+    *,
+    now: datetime | None = None,
+    thresholds: Mapping[CanonicalState, timedelta] = DEFAULT_STUCK_THRESHOLDS,
+) -> dict[str, CanonicalStatus]:
+    """Canonical status for many issues in a bounded number of SQL queries.
+
+    Prefetches each status ingredient for the whole candidate set (one grouped
+    query per source table) and runs the same decision logic as the
+    single-issue path in Python. Every requested id gets an entry (IDLE when it
+    has no rows). External drift is not considered here (the batch caller does
+    not supply snapshots).
+    """
+
+    effective_now = _normalize_now(now or datetime.now(UTC))
+    ids = list(dict.fromkeys(str(issue_id) for issue_id in issue_ids))
+    if not ids:
+        return {}
+
+    ph = ",".join("?" * len(ids))
+    params = tuple(ids)
+
+    operator_waits_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, kind, created_at FROM (
+                SELECT issue_id, kind, created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY issue_id ORDER BY created_at DESC, run_id DESC
+                    ) AS rn
+                FROM operator_waits
+                WHERE issue_id IN ({ph})
+            )
+            WHERE rn = 1
+            """,
+            params,
+        )
+    )
+
+    superseding_runs_by = _group_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, stage, status, started_at, ended_at
+            FROM runs
+            WHERE issue_id IN ({ph})
+              AND stage IN ({",".join("?" * len(_SUPERSEDE_STAGES))})
+              AND status IN ('running', 'completed')
+            ORDER BY issue_id,
+                COALESCE(ended_at, started_at) DESC, started_at DESC, id DESC
+            """,
+            (*ids, *_SUPERSEDE_STAGES),
+        )
+    )
+
+    running_run_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, stage, started_at FROM (
+                SELECT issue_id, stage, started_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY issue_id ORDER BY started_at DESC, id DESC
+                    ) AS rn
+                FROM runs
+                WHERE issue_id IN ({ph}) AND status = 'running'
+            )
+            WHERE rn = 1
+            """,
+            params,
+        )
+    )
+
+    latest_run_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, stage, status, started_at, ended_at, termination_kind FROM (
+                SELECT issue_id, stage, status, started_at, ended_at, termination_kind,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY issue_id
+                        ORDER BY started_at DESC, COALESCE(ended_at, '') DESC, id DESC
+                    ) AS rn
+                FROM runs
+                WHERE issue_id IN ({ph}) AND status != 'superseded'
+            )
+            WHERE rn = 1
+            """,
+            params,
+        )
+    )
+
+    open_pr_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, pr_number, created_at FROM (
+                SELECT issue_id, pr_number, created_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY issue_id ORDER BY created_at DESC, github_repo ASC
+                    ) AS rn
+                FROM issue_prs
+                WHERE issue_id IN ({ph}) AND merged_at IS NULL
+            )
+            WHERE rn = 1
+            """,
+            params,
+        )
+    )
+
+    latest_pr_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, pr_number, merged_at FROM (
+                SELECT issue_id, pr_number, merged_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY issue_id
+                        ORDER BY COALESCE(merged_at, '') DESC, created_at DESC, github_repo ASC
+                    ) AS rn
+                FROM issue_prs
+                WHERE issue_id IN ({ph})
+            )
+            WHERE rn = 1
+            """,
+            params,
+        )
+    )
+
+    review_state_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, iteration
+            FROM review_state
+            WHERE issue_id IN ({ph}) AND iteration > 0
+            """,
+            params,
+        )
+    )
+
+    latest_comment_by = _index_by_issue(
+        await _fetch_all(
+            conn,
+            f"""
+            SELECT issue_id, seen_at FROM (
+                SELECT issue_id, seen_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY issue_id ORDER BY seen_at DESC, comment_id DESC
+                    ) AS rn
+                FROM comment_events
+                WHERE issue_id IN ({ph})
+            )
+            WHERE rn = 1
+            """,
+            params,
+        )
+    )
+
+    return {
+        issue_id: _decide_canonical_status(
+            _StatusInputs(
+                operator_wait=operator_waits_by.get(issue_id),
+                superseding_runs=superseding_runs_by.get(issue_id, []),
+                running_run=running_run_by.get(issue_id),
+                latest_run=latest_run_by.get(issue_id),
+                open_pr=open_pr_by.get(issue_id),
+                latest_pr=latest_pr_by.get(issue_id),
+                review_state=review_state_by.get(issue_id),
+                latest_comment=latest_comment_by.get(issue_id),
+            ),
+            now=effective_now,
+            thresholds=thresholds,
+        )
+        for issue_id in ids
+    }
+
+
+async def compute_canonical_status(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    now: datetime | None = None,
+    thresholds: Mapping[CanonicalState, timedelta] = DEFAULT_STUCK_THRESHOLDS,
+    external_snapshot: ExternalStatusSnapshot | None = None,
+) -> CanonicalStatus:
+    """Return the first matching canonical UI status for an issue."""
+
+    effective_now = _normalize_now(now or datetime.now(UTC))
+    if external_snapshot is not None:
+        status = _drift_status(
+            external_snapshot,
+            now=effective_now,
+            thresholds=thresholds,
+        )
+        if status is not None:
+            return status
+
+    statuses = await compute_canonical_statuses(
+        conn,
+        [issue_id],
         now=effective_now,
         thresholds=thresholds,
     )
+    return statuses[issue_id]
 
 
 def canonical_status_sort_key(status: CanonicalStatus) -> tuple[int, int, datetime]:
