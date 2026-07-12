@@ -131,3 +131,44 @@ async def test_disabled_binding_recovers_pidless_local_review_run(tmp_path: Path
         assert harness.sim.issues[issue.id].state_name != READY
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_tick_skips_disabled_binding_with_no_registered_tracker(tmp_path: Path) -> None:
+    """A disabled binding with no live DB work gets no tracker registered at
+    boot (`cli._configured_tracker_registry` skips it) but stays loaded in
+    `cfg.repos`. `_tick()`'s recovery scan over that binding must not crash
+    the whole tick with `KeyError` — every existing disabled-binding test
+    builds the Orchestrator with a single tracker, which registers one for
+    every binding (including disabled ones) and so never exercises this."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from symphony.orchestrator.poll import Orchestrator
+    from symphony.tracker import TrackerRegistry
+
+    disabled_binding = RepoBinding(
+        linear_team_key=TEAM,
+        github_repo=REPO,
+        enabled=False,
+        linear_states=LinearStates(ready=READY, code_review="Needs Approval"),
+    )
+    conn = await db.connect(tmp_path / "config.sqlite")
+    try:
+        orch = Orchestrator(
+            Config(repos=[disabled_binding]),
+            TrackerRegistry(),
+            conn,
+            gh=MagicMock(),
+            workspace=MagicMock(),
+        )
+        orch._restore_operator_waits = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._poll_merge_candidates = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._poll_review_runs = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._resurrect_review_runs = AsyncMock(return_value=[])  # type: ignore[method-assign]  # noqa: SLF001
+        orch._poll_slash_commands = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        scheduled = await orch._tick()  # noqa: SLF001
+
+        assert scheduled == []
+    finally:
+        await conn.close()

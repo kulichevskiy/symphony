@@ -177,7 +177,10 @@ class _DispatchMixin(_OrchestratorBase):
         so a disabled binding's tracker-queue lane stays cleared.
         """
         scheduled: list[asyncio.Task[None]] = []
-        tracker = self.tracker(binding)
+        try:
+            tracker = self.tracker(binding)
+        except KeyError:
+            return scheduled
         try:
             issues = await tracker.issues_in_state(
                 binding.linear_team_key, binding.linear_states.ready, binding.issue_label
