@@ -114,10 +114,15 @@ the existing YAML topology into the DB.
   `updated_by`; and a single-document table for global config (the global
   roles matrix, migration marker) carrying the same `version` column so
   fleet-wide role edits get the same optimistic-locking protection as
-  binding edits. A unique index on the binding's natural key — (provider,
-  tracker site, project key, github repo, issue label), the same tuple the
-  orchestrator already uses as the binding key — rejects duplicates at the
-  DB layer.
+  binding edits. A unique index on the binding's natural key rejects
+  duplicates at the DB layer. The persisted key mirrors the orchestrator's
+  binding key *exactly* — tracker provider (the registered provider name,
+  which can differ from the concrete tracker type when multiple providers of
+  the same type are registered), tracker site, project key, github repo, and
+  issue label — and the label is normalized to the empty string in the index
+  (SQLite treats NULLs as distinct, so a nullable label column would let the
+  common unlabeled catch-all binding be configured twice and dispatch the
+  same issue twice).
 - **JSON payload, not normalized columns — and sparse.** The binding model
   has ~40 fields and grows steadily; nested structures (roles, states,
   acceptance, MCP servers) don't normalize well. Pydantic remains the single
@@ -133,20 +138,37 @@ the existing YAML topology into the DB.
   system-level knobs: ports, paths, poll/reconcile intervals, global caps,
   timeouts, UI thresholds. Those still require a restart to change, which is
   acceptable at their change frequency.
-- **Migration is a one-off script**, run manually once per environment. It
-  reads the YAML, normalizes the six legacy top-level role fields (agent,
-  codex_model, reviewer_agent, reviewer_codex_model, and the two
-  local-review claude model fields) into the roles matrix, and inserts the
-  bindings and global matrix into the DB. No auto-seed at boot. The DB is
-  legacy-free from day one, so the legacy/matrix conflict guard is not part
-  of the UI path.
+- **Migration is a manually-run importer**, executed once per environment at
+  cutover. It reads a YAML document, normalizes the six legacy top-level
+  role fields (agent, codex_model, reviewer_agent, reviewer_codex_model, and
+  the two local-review claude model fields) into the roles matrix, and
+  inserts the bindings and global matrix into the DB, stamping the migration
+  marker. No auto-seed at boot. The same script doubles as the restore path
+  for an export (refusing to overwrite existing rows unless explicitly told
+  to replace them). The DB is legacy-free from day one, so the legacy/matrix
+  conflict guard is not part of the UI path.
+- **Boot gate against a zero-binding start over live work.** Loading zero
+  bindings is only safe on a fresh install. If the DB has no bindings and no
+  migration marker but *does* contain unresolved work (active runs, tracked
+  open PRs, or parked operator waits — all of which resolve their binding by
+  iterating the loaded set), the daemon refuses to start with an error
+  naming the migration script. This makes "deploy the DB-backed build, then
+  run the migration" safe in either order: the daemon fails loudly instead
+  of silently orphaning in-flight work.
 - **Hot-apply at the tick boundary.** The orchestrator re-reads *all*
   bindings — enabled and disabled — from the DB at the start of every poll
   tick (the daemon and the UI API share one process and one SQLite
   connection, so no IPC is needed). Contract: a change affects the *next*
   dispatch; in-flight runs keep the configuration they captured at dispatch.
   The one-shot tracker-queue scope prune becomes a reaction to the binding
-  set changing rather than a boot flag.
+  set changing rather than a boot flag. Two pieces of in-memory state must
+  follow the reload: the tracker registry (built once at boot today) hot-adds
+  a client when a binding introduces a provider/site context the process
+  hasn't seen — with the save failing closed if the required tracker
+  credentials are absent from the environment — and per-binding concurrency
+  limiters are rebuilt when a binding's cap changes, so an edited
+  `max_concurrent` actually takes effect instead of the first-use semaphore
+  enforcing the old capacity forever.
 - **Binding lifecycle.** New `enabled` flag on the binding: disabled means
   the *dispatch scan* skips it — no new issues start — while the binding
   stays loaded and visible to every follow-up poller (review monitors,
@@ -154,10 +176,14 @@ the existing YAML topology into the DB.
   by iterating the loaded set), so in-flight work drains to completion
   instead of stalling. Disabling also clears the binding's tracker-queue
   lanes. Delete — and any edit that changes the natural key — is allowed
-  only for a *drained* binding: no running runs, no tracked open PRs, and no
+  only for a *drained* binding: no running runs, no tracked open PRs, no
   parked operator waits in its scope (a parked issue awaiting `$retry` or
   approval resolves its binding by the original natural key, so a rename
-  would strand it); otherwise the API returns a conflict with the list of
+  would strand it), and no in-memory scheduled dispatch or fix-run slots —
+  the daemon reserves a slot before the run row exists, so the guard must
+  consult that reservation state too (same process, directly queryable) or a
+  delete racing a scan could remove the binding a scheduled task is about to
+  start with. Otherwise the API returns a conflict with the list of
   blockers.
 - **Form scope.** The existing `/ui/config` page is extended in place:
   binding cards become editable (drawer/form), a create button and per-card
@@ -207,6 +233,12 @@ the existing YAML topology into the DB.
   their agent, model, *and* effort from the matrix — and removing the
   legacy-field reads from dispatch paths. Otherwise a DB-only role edit
   saves successfully while some stages keep running old defaults.
+- **One effective-config assembly for every consumer.** The composition
+  "YAML system knobs + DB bindings + DB global matrix" lives in a single
+  assembly step that every topology consumer goes through — the daemon, the
+  UI API, *and* the non-daemon CLI paths (preflight checks, manual issue
+  dispatch), which today assemble topology from the YAML loader and would
+  otherwise silently operate over an empty binding set.
 - **API surface.** REST under the config prefix: list/create bindings,
   get/update/delete a binding by id, get/put the global roles matrix (with
   the same version check), get options, and a YAML export of the current
@@ -220,26 +252,33 @@ a script produces — never the internals that produce them.
 
 - **Primary seam — HTTP API**, using the existing app test harness (real
   FastAPI app over a real temp SQLite): CRUD round-trips, duplicate natural
-  key rejected, version-conflict on stale writes, drain guard returning the
-  blocker list, webhook-secret masking on read and write-only replace,
-  fail-closed env-key validation, options payload, YAML export shape, field
-  validation errors carrying paths, and the diversity warning as a
-  non-blocking response element. Prior art: the existing `/api/issues` and
-  command-endpoint tests.
+  key rejected — including two unlabeled bindings on the same project/repo —
+  version-conflict on stale writes (bindings and the global matrix), drain
+  guard returning the blocker list (runs, PRs, operator waits, scheduled
+  slots), webhook-secret masking on read, preserve-on-omit and write-only
+  replace, fail-closed env-key validation, options payload, YAML export
+  shape, field validation errors carrying paths, and the diversity warning
+  as a non-blocking response element. Prior art: the existing `/api/issues`
+  and command-endpoint tests.
 - **Orchestrator seam**, using the existing orchestrator harness (real DB,
   mocked tracker): a binding inserted into the DB is scanned on the next
   tick; a disabled binding stops dispatching but stays visible to review and
   merge pollers and to operator-wait resolution, leaving in-flight work
-  untouched; a binding-set change re-prunes tracker-queue scopes. Prior art:
-  the tracker-queue scan tests.
+  untouched; a binding-set change re-prunes tracker-queue scopes; a binding
+  added with a previously unseen tracker provider/site context gets a
+  hot-added registry client and is scanned; a `max_concurrent` edit is
+  enforced by the rebuilt limiter on the next scheduling pass; the boot gate
+  refuses a zero-binding start over live work but allows a fresh install.
+  Prior art: the tracker-queue scan tests.
+- **Migration seam**: the script as a callable — YAML fixture in, DB rows
+  out, legacy fields normalized into the matrix, refusal to double-import
+  without the explicit replace flag, and a round-trip through export →
+  import-in-replace-mode. Prior art: DAO-level tests over a temp DB.
 - **Command-construction seam**: for each of the five roles, a matrix
   override of agent/model/effort is asserted against the actual argv the
   stage builds (including the fix and local-review paths that today read
   legacy fields, and the effort flag on every runner command). Prior art:
   the existing runner-command/prompt construction tests.
-- **Migration seam**: the script as a callable — YAML fixture in, DB rows
-  out, legacy fields normalized into the matrix, second invocation refuses
-  to double-import. Prior art: DAO-level tests over a temp DB.
 - **Frontend**, extending the existing ConfigPage vitest suite: form renders
   from fetched data, dropdowns populate from the options response, inherit
   vs. override display, warning banner, conflict and validation error
@@ -269,14 +308,19 @@ a script produces — never the internals that produce them.
   key stays stable for anything the daemon currently tracks, which is what
   keeps workspace paths, tracker-queue scopes, and issue storage ids
   coherent without a data migration.
-- The export endpoint is the rollback story *for non-secret config*: the
-  export is a valid `repos:`/`roles:` YAML section to paste back into the
-  config file, except that write-only webhook secrets are emitted as an
-  explicit placeholder (never the stored value — the no-secrets-in-responses
-  contract holds everywhere). A rollback for a binding that relies on a
-  repo-specific webhook secret therefore requires re-entering that secret by
-  hand; the export marks exactly which bindings need it.
-- Production note: the deploy that ships this must be followed by running
-  the migration script inside the container (the YAML is readable there);
-  until the script runs, the daemon sees zero bindings and idles — safe, but
-  worth doing in the same maintenance window.
+- The export endpoint serves two distinct recovery scenarios, and only one
+  of them is "paste into YAML". (1) *Downgrade*: rolling back to a pre-DB
+  build whose loader still reads `repos:` from YAML — there the export is a
+  valid section to paste into the config file. (2) *Restore on the DB-backed
+  build* (bad bulk edit, corrupted rows): the YAML is fed back through the
+  migration/import script in replace mode, since the DB-backed loader
+  ignores YAML bindings by design. In both cases write-only webhook secrets
+  are emitted as an explicit placeholder (never the stored value — the
+  no-secrets-in-responses contract holds everywhere) and must be re-entered
+  by hand; the export marks exactly which bindings need it.
+- Production note: the deploy that ships this must be paired with running
+  the migration script inside the container (the YAML is readable there).
+  Order doesn't matter for safety — the boot gate refuses a zero-binding
+  start while live work exists, so a deploy that lands before the migration
+  fails loudly instead of orphaning in-flight issues — but doing both in one
+  maintenance window avoids the crash-loop window entirely.
