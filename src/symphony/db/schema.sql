@@ -56,6 +56,14 @@ CREATE INDEX IF NOT EXISTS idx_runs_status_pid ON runs(status, pid);
 -- runs.cost_usd); it no longer gates runs.
 CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
 
+-- "Latest run per issue" lookups and the issue-detail runs ordering
+-- (ORDER BY started_at within an issue).
+CREATE INDEX IF NOT EXISTS idx_runs_issue_started ON runs(issue_id, started_at);
+
+-- Date-window range scans over run start day (spend summary/heatmap/series,
+-- polled every 30-60s). Lexicographic ISO-UTC compare is sargable on this.
+CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+
 -- Per-(provider, model) token attribution for a run. A child of `runs`:
 -- the run-level token columns stay authoritative and the rows here sum
 -- back to them (±0 for Claude's exact `modelUsage` split; within the
@@ -144,7 +152,11 @@ CREATE TABLE IF NOT EXISTS comment_events (
     seen_at    TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_comment_events_issue ON comment_events(issue_id);
+-- Composite (issue_id, seen_at) serves both the issue-only membership checks
+-- and `ORDER BY seen_at DESC LIMIT 1` per issue; supersedes the issue-only index.
+DROP INDEX IF EXISTS idx_comment_events_issue;
+CREATE INDEX IF NOT EXISTS idx_comment_events_issue_seen
+    ON comment_events(issue_id, seen_at);
 
 -- Webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
 -- pruned opportunistically before each insert based on the configured TTL.
