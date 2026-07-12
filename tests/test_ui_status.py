@@ -11,6 +11,7 @@ from symphony.ui.status import (
     ExternalDriftFlag,
     ExternalStatusSnapshot,
     compute_canonical_status,
+    compute_canonical_statuses,
 )
 from symphony.ui.warnings import issue_warnings
 
@@ -841,3 +842,237 @@ async def test_canonical_status_defaults_to_idle(tmp_path: Path) -> None:
         "subtitle": None,
         "stuck_for": None,
     }
+
+
+async def _seed_all_tricky_states(conn: aiosqlite.Connection) -> list[str]:
+    """Seed one issue per tricky canonical state; return their ids."""
+    # operator wait superseded by a running fix-run -> RUNNING
+    await _issue(conn, "wait-running")
+    await _run(
+        conn,
+        run_id="wait-running-fix",
+        issue_id="wait-running",
+        stage="review_fix",
+        status="running",
+        started_at="2026-05-17T09:09:55Z",
+    )
+    await _operator_wait(
+        conn,
+        issue_id="wait-running",
+        run_id="wait-running-monitor",
+        kind=db.operator_waits.KIND_REVIEW_FAILED,
+        created_at="2026-05-17T09:16:55Z",
+    )
+
+    # operator wait with no superseding run -> HALTED
+    await _issue(conn, "wait-halted")
+    await _operator_wait(
+        conn,
+        issue_id="wait-halted",
+        run_id="wait-halted-monitor",
+        kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+        created_at="2026-05-17T11:00:00Z",
+    )
+
+    # operator wait superseded by a *completed* fix, open PR -> falls through PR_OPEN
+    await _issue(conn, "wait-completed")
+    await _run(
+        conn,
+        run_id="wait-completed-fix",
+        issue_id="wait-completed",
+        stage="review_fix",
+        status="completed",
+        started_at="2026-05-17T09:09:55Z",
+        ended_at="2026-05-17T09:18:18Z",
+    )
+    await _operator_wait(
+        conn,
+        issue_id="wait-completed",
+        run_id="wait-completed-monitor",
+        kind=db.operator_waits.KIND_REVIEW_FAILED,
+        created_at="2026-05-17T09:16:55Z",
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'wait-completed', 'org/repo', 'ENG|org/repo', 201,
+            'https://github.com/org/repo/pull/201', '2026-05-17T09:00:00Z', NULL
+        )
+        """
+    )
+
+    # interrupted + orphaned run with open PR -> PR_OPEN (fall-through)
+    await _issue(conn, "orphan-pr")
+    await _run(
+        conn,
+        run_id="orphan-pr-run",
+        issue_id="orphan-pr",
+        stage="merge",
+        status="interrupted",
+        started_at="2026-05-17T11:40:00Z",
+        ended_at="2026-05-17T11:55:00Z",
+        termination_kind="orphaned",
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'orphan-pr', 'org/repo', 'ENG|org/repo', 42,
+            'https://github.com/org/repo/pull/42', '2026-05-16T11:00:00Z', NULL
+        )
+        """
+    )
+
+    # genuine failed run with open PR -> FAILED (masks PR)
+    await _issue(conn, "failed-pr")
+    await _run(
+        conn,
+        run_id="failed-pr-run",
+        issue_id="failed-pr",
+        stage="merge",
+        status="failed",
+        started_at="2026-05-17T11:40:00Z",
+        ended_at="2026-05-17T11:55:00Z",
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'failed-pr', 'org/repo', 'ENG|org/repo', 43,
+            'https://github.com/org/repo/pull/43', '2026-05-16T11:00:00Z', NULL
+        )
+        """
+    )
+
+    # superseded latest run is ignored; open PR wins -> PR_OPEN
+    await _issue(conn, "superseded")
+    await _run(
+        conn,
+        run_id="superseded-run",
+        issue_id="superseded",
+        stage="implement",
+        status="superseded",
+        started_at="2026-05-17T11:50:00Z",
+        ended_at="2026-05-17T11:55:00Z",
+    )
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'superseded', 'org/repo', 'ENG|org/repo', 44,
+            'https://github.com/org/repo/pull/44', '2026-05-16T11:00:00Z', NULL
+        )
+        """
+    )
+
+    # review_state iteration > 0 with a latest comment -> AWAITING_REVIEW_TRIGGER
+    await _issue(conn, "review-iter")
+    await _run(
+        conn,
+        run_id="review-iter-run",
+        issue_id="review-iter",
+        stage="review",
+        status="completed",
+        started_at="2026-05-17T11:00:00Z",
+        ended_at="2026-05-17T11:20:00Z",
+    )
+    await conn.execute("INSERT INTO review_state (issue_id, iteration) VALUES ('review-iter', 3)")
+    await conn.execute(
+        """
+        INSERT INTO comment_events (comment_id, issue_id, seen_at)
+        VALUES ('comment-review-iter', 'review-iter', '2026-05-17T11:40:00Z')
+        """
+    )
+
+    # done (all PRs merged)
+    await _issue(conn, "done-issue")
+    await conn.execute(
+        """
+        INSERT INTO issue_prs (
+            issue_id, github_repo, binding_key, pr_number, pr_url, created_at, merged_at
+        )
+        VALUES (
+            'done-issue', 'org/repo', 'ENG|org/repo', 45,
+            'https://github.com/org/repo/pull/45', '2026-05-16T11:00:00Z', '2026-05-17T10:00:00Z'
+        )
+        """
+    )
+
+    # running
+    await _issue(conn, "running-issue")
+    await _run(
+        conn,
+        run_id="running-issue-run",
+        issue_id="running-issue",
+        stage="implement",
+        status="running",
+        started_at="2026-05-17T11:00:00Z",
+    )
+
+    # idle
+    await _issue(conn, "idle-issue")
+
+    await conn.commit()
+    return [
+        "wait-running",
+        "wait-halted",
+        "wait-completed",
+        "orphan-pr",
+        "failed-pr",
+        "superseded",
+        "review-iter",
+        "done-issue",
+        "running-issue",
+        "idle-issue",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_matches_per_issue_across_tricky_states(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        ids = await _seed_all_tricky_states(conn)
+        batched = await compute_canonical_statuses(conn, ids, now=NOW)
+        per_issue = {
+            issue_id: await compute_canonical_status(conn, issue_id, now=NOW) for issue_id in ids
+        }
+    finally:
+        await conn.close()
+
+    assert set(batched) == set(ids)
+    for issue_id in ids:
+        assert batched[issue_id].to_dict() == per_issue[issue_id].to_dict(), issue_id
+
+
+@pytest.mark.asyncio
+async def test_batch_returns_idle_for_unknown_and_dedupes(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        await _issue(conn, "known")
+        result = await compute_canonical_statuses(conn, ["known", "known", "ghost"], now=NOW)
+    finally:
+        await conn.close()
+
+    assert set(result) == {"known", "ghost"}
+    assert result["known"].state == "idle"
+    assert result["ghost"].state == "idle"
+
+
+@pytest.mark.asyncio
+async def test_batch_empty_input_returns_empty(tmp_path: Path) -> None:
+    conn = await _connect(tmp_path)
+    try:
+        result = await compute_canonical_statuses(conn, [], now=NOW)
+    finally:
+        await conn.close()
+
+    assert result == {}

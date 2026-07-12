@@ -1069,7 +1069,7 @@ async def test_api_issues_maps_canonical_status_db_errors_to_503(
     async def raise_db_error(*_args: object, **_kwargs: object) -> object:
         raise aiosqlite.OperationalError("database is locked")
 
-    monkeypatch.setattr(ui_api, "compute_canonical_status", raise_db_error)
+    monkeypatch.setattr(ui_api, "compute_canonical_statuses", raise_db_error)
 
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)

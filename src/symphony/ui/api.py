@@ -18,7 +18,7 @@ from .status import (
     DEFAULT_STUCK_THRESHOLDS,
     CanonicalState,
     canonical_status_sort_key,
-    compute_canonical_status,
+    compute_canonical_statuses,
 )
 from .warnings import DEFAULT_PR_NO_PROGRESS_THRESHOLD, issue_warnings
 
@@ -988,18 +988,13 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             issues = [dict(row) for row in rows]
-            statuses = [
-                (
-                    issue,
-                    await compute_canonical_status(
-                        conn,
-                        str(issue["id"]),
-                        now=request_now,
-                        thresholds=thresholds,
-                    ),
-                )
-                for issue in issues
-            ]
+            status_by_id = await compute_canonical_statuses(
+                conn,
+                [str(issue["id"]) for issue in issues],
+                now=request_now,
+                thresholds=thresholds,
+            )
+            statuses = [(issue, status_by_id[str(issue["id"])]) for issue in issues]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503,
