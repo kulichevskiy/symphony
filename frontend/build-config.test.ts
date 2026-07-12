@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import config from "./vite.config";
+import config from "./vite.config.ts";
 
 // The config may be a function or an object depending on defineConfig usage;
 // our config is a plain object.
