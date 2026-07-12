@@ -5,14 +5,16 @@ import {
   aggregateRunsByStage,
   CmdButton,
   ConfirmBar,
+  deriveCockpit,
   FinalLogCard,
+  NowCard,
   pickDefaultRun,
   pickLiveRun,
-  PrCard,
   StageSpendCard,
   TokensCard,
 } from "./IssuePage";
 import { applicability, COMMANDS } from "./issueControls";
+import type { IssueDetail } from "@/lib/api";
 
 function run(stage: string, tok: Partial<Record<string, number | string | boolean | null>>) {
   return {
@@ -477,16 +479,74 @@ describe("FinalLogCard", () => {
   });
 });
 
-describe("PrCard", () => {
-  it("renders the PR link, mergeable badge and check summary", () => {
-    const markup = renderToStaticMarkup(<PrCard pr={cockpit.pr} />);
+function detailWith(
+  state: IssueDetail["canonical_status"]["state"],
+  runs: IssueDetail["runs"],
+): IssueDetail {
+  return {
+    issue: { id: "i1", identifier: "HQ-96", title: "t", team_key: "HQ" },
+    tokens_by_model: [],
+    canonical_status: { state, since: null, subtitle: null, stuck_for: null },
+    runs,
+    issue_prs: [],
+    operator_waits: [],
+    review_state: null,
+  } as unknown as IssueDetail;
+}
+
+describe("deriveCockpit reason", () => {
+  const failedRun = run("implement", {
+    status: "failed",
+    termination_detail: "implement run exited 0 but did not satisfy the completion contract",
+  }) as IssueDetail["runs"][number];
+  const doneRun = run("merge", {
+    status: "done",
+    started_at: "2026-06-07T13:00:00Z",
+  }) as IssueDetail["runs"][number];
+
+  it("keeps the old run's error out of a completed issue", () => {
+    const c = deriveCockpit(detailWith("done", [doneRun, failedRun]), undefined);
+    expect(c.runState).toBe("completed");
+    expect(c.reason).toBeNull();
+  });
+
+  it("still surfaces the error while the issue is failed", () => {
+    const c = deriveCockpit(detailWith("failed", [failedRun]), undefined);
+    expect(c.reason).toContain("completion contract");
+  });
+});
+
+describe("NowCard", () => {
+  const nowMs = Date.parse("2026-06-07T17:00:00Z");
+
+  it("inlines the PR link, mergeable badge and check summary once a PR exists", () => {
+    const markup = renderToStaticMarkup(<NowCard c={cockpit} nowMs={nowMs} />);
     expect(markup).toContain("#412");
     expect(markup).toContain("mergeable");
     expect(markup).toContain("11✓ 0✕ 1⋯");
+    expect(markup).toContain("kulichevskiy/adjust_os");
   });
 
-  it("handles the no-PR state", () => {
-    const markup = renderToStaticMarkup(<PrCard pr={null} />);
-    expect(markup).toContain("No PR opened yet");
+  it("renders no PR row before a PR exists", () => {
+    const markup = renderToStaticMarkup(
+      <NowCard c={{ ...cockpit, pr: null }} nowMs={nowMs} />,
+    );
+    expect(markup).not.toContain("#412");
+    expect(markup).not.toContain("gitPr");
+  });
+
+  it("shows a failure reason only when one is set — a completed issue stays clean", () => {
+    const failed = {
+      ...cockpit,
+      runState: "failed" as const,
+      reason: "implement run exited 0 but did not satisfy the completion contract",
+    };
+    expect(renderToStaticMarkup(<NowCard c={failed} nowMs={nowMs} />)).toContain(
+      "completion contract",
+    );
+    const done = { ...cockpit, runState: "completed" as const, reason: null };
+    expect(renderToStaticMarkup(<NowCard c={done} nowMs={nowMs} />)).not.toContain(
+      "completion contract",
+    );
   });
 });
