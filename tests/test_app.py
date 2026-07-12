@@ -3485,14 +3485,10 @@ def test_list_issues_query_scopes_activity_sources_to_candidates() -> None:
     candidate issue set, so MAX(ts) never scans issues outside the response."""
     # Six UNION ALL branches feed latest_activity_sources; each must be gated by
     # the candidate set.
-    active_query, _ = ui_api._list_issues_query(
-        ui_api.IssueScope.ACTIVE, None, now=UI_NOW
-    )
+    active_query, _ = ui_api._list_issues_query(ui_api.IssueScope.ACTIVE, None, now=UI_NOW)
     assert active_query.count("SELECT issue_id FROM activity_candidates") == 6
     # Active candidates are exactly the active issue ids.
     assert "SELECT issue_id FROM active_issue_ids\n" in active_query
 
-    done_query, _ = ui_api._list_issues_query(
-        ui_api.IssueScope.DONE, None, now=UI_NOW
-    )
+    done_query, _ = ui_api._list_issues_query(ui_api.IssueScope.DONE, None, now=UI_NOW)
     assert done_query.count("SELECT issue_id FROM activity_candidates") == 6
