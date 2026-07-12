@@ -141,6 +141,51 @@ async def test_disabled_bindings_not_dispatched(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalid_db_global_role_enum_refuses_boot(tmp_path: Path) -> None:
+    """A corrupt/hand-edited/restored DB row with a bad enum value must raise
+    `ConfigBootError`, not a raw `pydantic.ValidationError` — the callers in
+    `cli._run`/`_preflight`/`_dispatch` only catch `ConfigBootError`."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    await db.config_globals.set_globals(
+        conn, roles={"implement": {"agent": "bogus"}}, migrated_at="t"
+    )
+    with pytest.raises(ConfigBootError):
+        await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_disabled_binding_with_unresolvable_env_does_not_block_boot(tmp_path: Path) -> None:
+    """A disabled binding is kept only so restart/restore paths can resolve
+    it; it must never block boot because an operator has since removed the
+    `env:` secret it refers to."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+            "env": {"SOME_VAR": "MISSING_ENV_KEY"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+        enabled=False,
+    )
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    assert [b.project_key for b in cfg.repos] == ["ENG"]
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_invalid_db_role_combo_refuses_boot(tmp_path: Path) -> None:
     """DB roles bypass `Config`'s constructor validators via `model_copy`;
     assembly must re-run the same family check YAML `repos:`/`roles:` gets."""

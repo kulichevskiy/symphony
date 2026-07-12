@@ -120,7 +120,17 @@ def build_payload(
 ) -> dict[str, Any]:
     """Sparse, legacy-free payload for one binding: the operator-set non-role
     fields verbatim, plus the consolidated roles matrix (if any)."""
-    payload = {k: v for k, v in raw_repo.items() if k not in _LEGACY_ROLE_FIELDS and k != "roles"}
+    payload = {
+        k: v
+        for k, v in raw_repo.items()
+        if k not in _LEGACY_ROLE_FIELDS and k not in ("roles", "review_strategy")
+    }
+    if "review_strategy" in raw_repo:
+        # Deprecated enum, already resolved into `operator.local_review` /
+        # `remote_review` by the model validator; materialize the booleans so
+        # the payload never re-fires the field's deprecation warning on load.
+        payload.setdefault("local_review", operator.local_review)
+        payload.setdefault("remote_review", operator.remote_review)
     matrix = _sparse_matrix(operator, _base_binding(raw_repo), global_roles)
     if matrix:
         payload["roles"] = matrix

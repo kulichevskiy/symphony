@@ -83,6 +83,31 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_review_strategy_stripped_and_materialized(tmp_path: Path) -> None:
+    """A legacy `review_strategy:` key is not in `_LEGACY_ROLE_FIELDS` (it's not
+    a role field), so it must be dropped explicitly rather than surviving
+    verbatim into the "legacy-free" payload and re-firing its deprecation
+    warning on every reload."""
+    conn, _result, rows, _g = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    review_strategy: local
+{_STATES}
+""",
+    )
+    payload = rows[0].payload
+    assert "review_strategy" not in payload
+    assert payload["local_review"] is True
+    assert payload["remote_review"] is False
+    # Reload never re-triggers the review_strategy deprecation warning.
+    RepoBinding.model_validate(payload)
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_codex_reviewer_inherits_binding_codex_model(tmp_path: Path) -> None:
     """`reviewer_agent: codex` + `codex_model` (no reviewer model pinned): the
     reviewer inherits the binding codex model, and that inheritance is baked

@@ -24,6 +24,7 @@ import os
 
 import aiosqlite
 from dotenv import dotenv_values
+from pydantic import ValidationError
 
 from . import db
 from .config import Config, RepoBinding, RoleConfig
@@ -50,14 +51,20 @@ async def _has_unresolved_work(conn: aiosqlite.Connection) -> bool:
 
 def _resolve_bindings(cfg: Config) -> None:
     """Apply tracker-context defaults and resolve `env:` key names to values on
-    each assembled binding — mirrors what `Config.load` does for YAML repos."""
+    each assembled binding — mirrors what `Config.load` does for YAML repos.
+
+    Disabled bindings skip `resolve_env`: they're kept around only so
+    restart/restore paths can resolve them, and must never block boot because
+    an operator has since removed the `env:` secret they refer to.
+    """
     env_source: dict[str, str] = {
         key: value for key, value in dotenv_values(".env").items() if value is not None
     }
     env_source.update(os.environ)
     for binding in cfg.repos:
         binding.apply_tracker_secret_defaults(jira_base_url=cfg.jira_base_url)
-        binding.resolve_env(env_source)
+        if binding.enabled:
+            binding.resolve_env(env_source)
 
 
 async def assemble_effective_config(
@@ -107,21 +114,21 @@ async def assemble_effective_config(
     # — restart/restore paths (open PRs, operator waits, live runs) resolve
     # their binding by iterating it — but marked `enabled=False` so dispatch
     # and manual-dispatch skip them for new work.
-    bindings = [
-        RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored
-    ]
-    global_roles = (
-        {name: RoleConfig.model_validate(cell) for name, cell in globals_row.roles.items()}
-        if globals_row
-        else {}
-    )
-    effective = base.model_copy(update={"repos": bindings, "roles": global_roles})
-    _resolve_bindings(effective)
     try:
+        bindings = [
+            RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored
+        ]
+        global_roles = (
+            {name: RoleConfig.model_validate(cell) for name, cell in globals_row.roles.items()}
+            if globals_row
+            else {}
+        )
+        effective = base.model_copy(update={"repos": bindings, "roles": global_roles})
+        _resolve_bindings(effective)
         # `model_copy` skips `Config`'s model_validators, so DB-sourced role
         # combos (family/effort mismatches, legacy-field conflicts) never ran
         # through the same check YAML `repos:`/`roles:` gets at load time.
         effective.validate_roles_matrix()
-    except ValueError as e:
+    except (ValidationError, ValueError) as e:
         raise ConfigBootError(f"invalid role configuration in the config DB: {e}") from e
     return effective
