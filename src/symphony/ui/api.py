@@ -42,6 +42,10 @@ class IssueSummary(BaseModel):
     latest_activity_ts: str | None
     latest_activity_age_secs: int | None
     canonical_status: CanonicalStatusPayload
+    # False for issues known only from the tracker's dispatch queue (Todo /
+    # Waiting in Linear) — the daemon has no runs/PRs for them, so there is no
+    # issue page to link to. Excluded from responses when True (the default).
+    tracked: bool = True
     warnings: list[str] = Field(default_factory=list)
     # Set only on the `done` scope — the time the issue completed (latest PR
     # merge, else latest activity). Excluded from active/recent/all responses.
@@ -792,6 +796,37 @@ def _build_spend_summary(
     )
 
 
+def _queue_status_dict(row: Mapping[str, Any]) -> dict[str, str | int | None]:
+    """Canonical-status payload for an issue sitting in the dispatch queue."""
+    waiting = str(row["queue"]) == "waiting"
+    blocked_by = str(row["blocked_by"] or "")
+    subtitle = f"blocked by {blocked_by}" if waiting and blocked_by else str(row["state_name"])
+    return {
+        "state": "waiting" if waiting else "todo",
+        "since": str(row["seen_at"]),
+        "subtitle": subtitle,
+        "stuck_for": None,
+    }
+
+
+def _queue_row_matches(
+    row: Mapping[str, Any],
+    *,
+    q: str | None,
+    teams: list[str] | None,
+) -> bool:
+    if teams and str(row["team_key"]) not in teams:
+        return False
+    needle = (q or "").strip().lower()
+    if (
+        needle
+        and needle not in str(row["identifier"]).lower()
+        and needle not in str(row["title"]).lower()
+    ):
+        return False
+    return True
+
+
 def _list_issues_query(
     scope: IssueScope,
     q: str | None,
@@ -988,6 +1023,20 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             issues = [dict(row) for row in rows]
+            queue_rows: list[dict[str, Any]] = []
+            if not is_done:
+                qcur = await conn.execute(
+                    """
+                    SELECT team_key, issue_id, identifier, title, queue,
+                           state_name, blocked_by, seen_at
+                    FROM tracker_queue
+                    """
+                )
+                queue_rows = [
+                    row
+                    for row in map(dict, await qcur.fetchall())
+                    if _queue_row_matches(row, q=q, teams=team_filter)
+                ]
             statuses = [
                 (
                     issue,
@@ -1037,6 +1086,7 @@ def create_api_router(
             )
             triples = [(issue, status, None) for issue, status in statuses]
 
+        queue_by_identifier = {str(row["identifier"]): row for row in queue_rows}
         payloads: list[IssueSummary] = []
         for issue, status, completed_at in triples:
             warnings = issue_warnings(
@@ -1048,12 +1098,42 @@ def create_api_router(
                 **issue,
                 "canonical_status": status.to_dict(),
             }
+            # A tracked issue with no daemon state that sits in the dispatch
+            # queue is really Todo/Waiting, not idle — reflect the queue.
+            queue_row = queue_by_identifier.get(str(issue["identifier"]))
+            if queue_row is not None and status.state == CanonicalState.IDLE:
+                payload["canonical_status"] = _queue_status_dict(queue_row)
             payload.pop("max_merged_at", None)
             if completed_at is not None:
                 payload["completed_at"] = completed_at
             if warnings:
                 payload["warnings"] = warnings
             payloads.append(IssueSummary.model_validate(payload))
+
+        # Queue issues the daemon has never touched: no runs, no tokens, no
+        # issue page — surfaced so the board's Todo/Waiting lanes are honest.
+        tracked_identifiers = {str(issue["identifier"]) for issue, _ in statuses}
+        extras = [row for row in queue_rows if str(row["identifier"]) not in tracked_identifiers]
+        extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
+        for row in extras:
+            payloads.append(
+                IssueSummary.model_validate(
+                    {
+                        "id": str(row["issue_id"]),
+                        "identifier": str(row["identifier"]),
+                        "title": str(row["title"]),
+                        "team_key": str(row["team_key"]),
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "latest_activity_ts": None,
+                        "latest_activity_age_secs": None,
+                        "canonical_status": _queue_status_dict(row),
+                        "tracked": False,
+                    }
+                )
+            )
         return payloads
 
     @router.get("/spend/summary", response_model=SpendSummary)

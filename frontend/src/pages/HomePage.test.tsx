@@ -99,18 +99,49 @@ describe("groupForBoard", () => {
   it("buckets active issues into lanes by canonical status and done into Done", () => {
     const lanes = groupForBoard(
       [
-        issue({ id: "a", canonical_status: { state: "running", since: null, subtitle: null, stuck_for: null } }),
+        issue({ id: "a", canonical_status: { state: "running", since: null, subtitle: "implement", stuck_for: null } }),
         issue({ id: "b", canonical_status: { state: "pr_open", since: null, subtitle: null, stuck_for: null } }),
         issue({ id: "c", canonical_status: { state: "failed", since: null, subtitle: null, stuck_for: null } }),
         issue({ id: "d", canonical_status: { state: "idle", since: null, subtitle: null, stuck_for: null } }),
+        issue({ id: "t", canonical_status: { state: "todo", since: null, subtitle: "Todo", stuck_for: null } }),
+        issue({ id: "w", canonical_status: { state: "waiting", since: null, subtitle: "blocked by VIB-1", stuck_for: null } }),
+        issue({ id: "m", canonical_status: { state: "awaiting_merge", since: null, subtitle: null, stuck_for: null } }),
       ],
       [issue({ id: "e", canonical_status: { state: "done", since: null, subtitle: null, stuck_for: null } })],
     );
-    expect(lanes.get("working")!.map((i) => i.id)).toEqual(["a"]);
+    expect(lanes.get("implement")!.map((i) => i.id)).toEqual(["a"]);
     expect(lanes.get("review")!.map((i) => i.id)).toEqual(["b"]);
     expect(lanes.get("attention")!.map((i) => i.id)).toEqual(["c"]);
-    expect(lanes.get("queued")!.map((i) => i.id)).toEqual(["d"]);
+    // Tracked-but-stateless (idle) issues ride in the Todo lane.
+    expect(lanes.get("todo")!.map((i) => i.id)).toEqual(["d", "t"]);
+    expect(lanes.get("waiting")!.map((i) => i.id)).toEqual(["w"]);
+    expect(lanes.get("merge")!.map((i) => i.id)).toEqual(["m"]);
     expect(lanes.get("done")!.map((i) => i.id)).toEqual(["e"]);
+  });
+
+  it("places running issues by their stage subtitle", () => {
+    const running = (id: string, stage: string | null) =>
+      issue({ id, canonical_status: { state: "running", since: null, subtitle: stage, stuck_for: null } });
+    const lanes = groupForBoard(
+      [
+        running("imp", "implement"),
+        running("lr", "local_review"),
+        running("rev", "review"),
+        running("rf", "review_fix"),
+        running("acc", "acceptance"),
+        running("unk", "mystery_stage"),
+        running("none", null),
+      ],
+      [],
+    );
+    expect(lanes.get("implement")!.map((i) => i.id)).toEqual(
+      expect.arrayContaining(["imp", "unk", "none"]),
+    );
+    expect(lanes.get("local_review")!.map((i) => i.id)).toEqual(["lr"]);
+    expect(lanes.get("review")!.map((i) => i.id)).toEqual(
+      expect.arrayContaining(["rev", "rf"]),
+    );
+    expect(lanes.get("merge")!.map((i) => i.id)).toEqual(["acc"]);
   });
 
   it("never drops an issue: unknown statuses land in Needs attention", () => {
@@ -132,8 +163,19 @@ describe("groupForBoard", () => {
         issue({ id: "d-new", completed_at: "2026-05-15T10:00:00Z" }),
       ],
     );
-    expect(lanes.get("working")!.map((i) => i.id)).toEqual(["new", "old"]);
+    expect(lanes.get("implement")!.map((i) => i.id)).toEqual(["new", "old"]);
     expect(lanes.get("done")!.map((i) => i.id)).toEqual(["d-new", "d-old"]);
+  });
+
+  it("orders the Todo/Waiting queue lanes by identifier (dispatch order)", () => {
+    const lanes = groupForBoard(
+      [
+        issue({ id: "b", identifier: "SYM-180", canonical_status: { state: "todo", since: null, subtitle: null, stuck_for: null } }),
+        issue({ id: "a", identifier: "SYM-9", canonical_status: { state: "todo", since: null, subtitle: null, stuck_for: null } }),
+      ],
+      [],
+    );
+    expect(lanes.get("todo")!.map((i) => i.identifier)).toEqual(["SYM-9", "SYM-180"]);
   });
 });
 
@@ -178,6 +220,23 @@ describe("KanbanBoard", () => {
   it("marks empty lanes instead of hiding them", () => {
     const markup = renderBoard([], []);
     expect(markup.match(/empty/g)?.length).toBe(BOARD_COLUMNS.length);
+  });
+
+  it("links queue-only (untracked) cards to Linear, not the issue page", () => {
+    const markup = renderBoard(
+      [
+        issue({
+          id: "lin-uuid",
+          identifier: "VIB-9",
+          tracked: false,
+          canonical_status: { state: "todo", since: "2026-07-12T08:00:00Z", subtitle: "Todo", stuck_for: null },
+        }),
+      ],
+      [],
+    );
+    expect(markup).toContain('href="https://linear.app/issue/VIB-9"');
+    expect(markup).not.toContain('href="/issue/lin-uuid"');
+    expect(markup).toContain("Open VIB-9 in Linear");
   });
 });
 

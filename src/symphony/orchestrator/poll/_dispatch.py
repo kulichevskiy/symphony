@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
@@ -130,6 +130,7 @@ class _DispatchMixin(_OrchestratorBase):
             ready_state,
             f" with label '{binding.issue_label}'" if binding.issue_label else "",
         )
+        await self._persist_queue_snapshot(binding, issues, waiting_issues)
         await self._auto_unblock_waiting(binding, waiting_issues)
         if self.config.global_max_concurrent <= 0 or binding.max_concurrent <= 0:
             log.info(
@@ -151,6 +152,47 @@ class _DispatchMixin(_OrchestratorBase):
             if len(scheduled) >= capacity:
                 break
         return scheduled
+
+    async def _persist_queue_snapshot(
+        self,
+        binding: RepoBinding,
+        ready_issues: Sequence[LinearIssue],
+        waiting_issues: Sequence[LinearIssue],
+    ) -> None:
+        """Mirror the scan result into `tracker_queue` for the UI board.
+
+        The waiting fetch is not label-filtered (auto-unblock covers the whole
+        lane), so apply the binding's label here to keep the snapshot scoped to
+        issues Symphony would actually dispatch.
+        """
+        rows = [
+            db.tracker_queue.QueueRow(
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                title=issue.title,
+                queue="ready",
+                state_name=issue.state_name,
+            )
+            for issue in ready_issues
+        ]
+        rows.extend(
+            db.tracker_queue.QueueRow(
+                issue_id=issue.id,
+                identifier=issue.identifier,
+                title=issue.title,
+                queue="waiting",
+                state_name=issue.state_name,
+                blocked_by=", ".join(open_blocker_ids(issue)),
+            )
+            for issue in waiting_issues
+            if not binding.issue_label or binding.issue_label in issue.labels
+        )
+        await db.tracker_queue.replace_team_scan(
+            self._conn,
+            team_key=binding.linear_team_key,
+            rows=rows,
+            seen_at=self._now().isoformat(),
+        )
 
     async def _auto_unblock_waiting(
         self, binding: RepoBinding, waiting_issues: list[LinearIssue]

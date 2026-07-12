@@ -397,6 +397,100 @@ async def test_api_issues_returns_seeded_issues_sorted(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        # A tracked issue with a live run — must keep its canonical status even
+        # though it also (stale-ly) appears in the queue snapshot.
+        await db.issues.upsert(
+            conn, id="issue-run", identifier="ADJ-1", title="Running", team_key="ADJ"
+        )
+        # A tracked issue with no daemon state sitting in the ready queue —
+        # its idle status is overridden to todo.
+        await db.issues.upsert(
+            conn, id="issue-idle", identifier="ADJ-2", title="Queued", team_key="ADJ"
+        )
+        await conn.execute(
+            """
+            INSERT INTO runs (id, issue_id, stage, status, pid, started_at)
+            VALUES ('r-1', 'issue-run', 'implement', 'running', NULL,
+                    '2026-07-12T08:00:00Z')
+            """
+        )
+        await db.tracker_queue.replace_team_scan(
+            conn,
+            team_key="ADJ",
+            rows=[
+                db.tracker_queue.QueueRow(
+                    issue_id="lin-run",
+                    identifier="ADJ-1",
+                    title="Running",
+                    queue="ready",
+                    state_name="Todo",
+                ),
+                db.tracker_queue.QueueRow(
+                    issue_id="lin-idle",
+                    identifier="ADJ-2",
+                    title="Queued",
+                    queue="ready",
+                    state_name="Todo",
+                ),
+                # Never tracked by the daemon: appended as an untracked row.
+                db.tracker_queue.QueueRow(
+                    issue_id="lin-wait",
+                    identifier="ADJ-3",
+                    title="Blocked work",
+                    queue="waiting",
+                    state_name="Waiting",
+                    blocked_by="ADJ-2",
+                ),
+            ],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_dist_dir=_dist(tmp_path),
+            ui_db_path=db_path,
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            active = await client.get("/api/issues?scope=active")
+            done = await client.get("/api/issues?scope=done")
+    finally:
+        await conn.close()
+
+    assert active.status_code == 200
+    by_identifier = {issue["identifier"]: issue for issue in active.json()}
+    # Daemon state wins over the queue snapshot.
+    assert by_identifier["ADJ-1"]["canonical_status"]["state"] == "running"
+    # Tracked but with no activity: absent from the active scope's own rows,
+    # so it surfaces through the queue snapshot as todo.
+    assert by_identifier["ADJ-2"]["canonical_status"]["state"] == "todo"
+    # Queue-only issue: untracked, zero tokens, waiting with blocker subtitle.
+    wait = by_identifier["ADJ-3"]
+    assert wait["tracked"] is False
+    assert wait["id"] == "lin-wait"
+    assert wait["canonical_status"] == {
+        "state": "waiting",
+        "since": "2026-07-12T09:00:00Z",
+        "subtitle": "blocked by ADJ-2",
+        "stuck_for": None,
+    }
+    assert wait["output_tokens"] == 0
+
+    # The done scope never includes queue rows.
+    assert done.status_code == 200
+    assert [issue["identifier"] for issue in done.json()] == []
+
+
+@pytest.mark.asyncio
 async def test_api_namespace_keeps_placeholder_404(tmp_path: Path) -> None:
     app = create_app(
         _Handler(),

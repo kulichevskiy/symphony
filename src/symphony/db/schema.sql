@@ -291,3 +291,20 @@ CREATE TABLE IF NOT EXISTS pending_notifications (
     event_key TEXT PRIMARY KEY,
     text      TEXT NOT NULL
 );
+
+-- Snapshot of the tracker's dispatch queue (SYM board lanes). Rewritten
+-- wholesale per team on every poll scan: the issues currently sitting in the
+-- binding's ready ("Todo") and waiting states, whether or not the daemon has
+-- tracked them yet. `blocked_by` is a comma-joined list of open blocker
+-- identifiers (waiting queue only).
+CREATE TABLE IF NOT EXISTS tracker_queue (
+    team_key   TEXT NOT NULL,
+    issue_id   TEXT NOT NULL,
+    identifier TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    queue      TEXT NOT NULL,      -- 'ready' | 'waiting'
+    state_name TEXT NOT NULL,
+    blocked_by TEXT NOT NULL DEFAULT '',
+    seen_at    TEXT NOT NULL,
+    PRIMARY KEY (team_key, issue_id)
+);

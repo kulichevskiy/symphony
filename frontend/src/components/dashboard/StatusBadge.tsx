@@ -12,6 +12,8 @@ export const STATE_LABELS: Record<string, string> = {
   pr_open: "PR open",
   done: "done",
   idle: "idle",
+  todo: "todo",
+  waiting: "waiting",
 };
 
 export const STATE_CLASSES: Record<string, string> = {
@@ -33,6 +35,9 @@ export const STATE_CLASSES: Record<string, string> = {
     "border-cyan-300 bg-cyan-50 text-cyan-900 dark:border-cyan-700 dark:bg-cyan-950/40 dark:text-cyan-200",
   done: "border-green-300 bg-green-50 text-green-900 dark:border-green-700 dark:bg-green-950/40 dark:text-green-200",
   idle: "border-slate-300 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300",
+  todo: "border-slate-300 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300",
+  waiting:
+    "border-slate-300 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800/40 dark:text-slate-400",
 };
 
 export function LiveDot({ tone = "current" }: { tone?: string }) {
