@@ -131,7 +131,14 @@ the existing YAML topology into the DB.
   validates selector disjointness among *enabled* bindings: two enabled
   bindings in the same tracker scope are rejected when their labels are
   equal or either is unlabeled. Disabled bindings are exempt, so an operator
-  can stage a replacement binding before switching over.
+  can stage a replacement binding before switching over. One ambiguity
+  survives validation by nature: issues can carry multiple labels, so an
+  issue tagged with two different bindings' labels matches both. That
+  cannot double-dispatch (per-issue active-run dedupe already guarantees at
+  most one live run per issue), but which binding wins must be deterministic
+  — bindings are evaluated in stable natural-key order, and the spec
+  documents that a multi-labeled issue goes to the first matching enabled
+  binding in that order.
 - **JSON payload, not normalized columns — and sparse.** The binding model
   has ~40 fields and grows steadily; nested structures (roles, states,
   acceptance, MCP servers) don't normalize well. Pydantic remains the single
@@ -142,22 +149,30 @@ the existing YAML topology into the DB.
   validation. The write path additionally rejects payloads that contain any
   legacy role field outright, so the DB stays legacy-free by construction.
 - **YAML loses bindings entirely.** The config loader stops reading `repos:`
-  and `roles:` from YAML — if present they are ignored (a one-line startup
-  warning is logged for discoverability, nothing more). YAML keeps
+  and `roles:` from YAML — when the DB has bindings, their presence is
+  ignored with a one-line startup warning; when the DB has none, it is a
+  boot error (see the boot gate below). YAML keeps
   system-level knobs: ports, paths, poll/reconcile intervals, global caps,
   timeouts, UI thresholds. Those still require a restart to change, which is
   acceptable at their change frequency.
 - **Migration is a manually-run importer**, executed once per environment at
   cutover. It reads a YAML document and converts the six legacy top-level
   role fields (agent, codex_model, reviewer_agent, reviewer_codex_model, and
-  the two local-review claude model fields) into the roles matrix by running
-  each role through the *existing legacy resolution logic* and persisting
-  the resolved result — not by naive field-to-cell copying, which would drop
-  cross-field inheritance (e.g. codex review roles inheriting the binding's
-  codex model when no reviewer model is pinned) or write a codex model under
-  a claude builder role and fail family validation. It then inserts the
-  bindings and global matrix into the DB and stamps the migration marker. No
-  auto-seed at boot. The same script doubles as the restore path for an
+  the two local-review claude model fields) into the roles matrix by
+  applying the *existing legacy resolution logic over operator-set fields
+  only*: a matrix cell is persisted when it derives from a field the
+  operator actually set — including documented cross-field inheritance,
+  e.g. codex review roles inheriting an operator-set binding codex model
+  when no reviewer model is pinned — and left absent (true inherit)
+  otherwise. Persisting the fully-resolved matrix would freeze every
+  default as a per-binding override, cutting those bindings off from future
+  global-matrix edits and making the UI's "inherit" display a lie; naive
+  field-to-cell copying would drop the inheritance cases or fail family
+  validation. It then inserts the bindings and global matrix into the DB,
+  stamps the migration marker, and backfills the binding-key stamp onto any
+  still-active run rows (resolvable issue→binding at import time), so the
+  drain guard is correct for work that was dispatched by the pre-DB build.
+  No auto-seed at boot. The same script doubles as the restore path for an
   export (refusing to overwrite existing rows unless explicitly told to
   replace them). The DB is legacy-free from day one, so the legacy/matrix
   conflict guard is not part of the UI path.
@@ -169,7 +184,11 @@ the existing YAML topology into the DB.
   error naming the migration/import script. The check deliberately does
   *not* key off the migration marker: a bad bulk delete or DB restore after
   a successful cutover leaves the same hazard, and the gate must catch that
-  too. Fresh installs boot fine because they have no unresolved work.
+  too. A second, independent gate covers the quiet-window cutover: if the DB
+  has zero bindings but the YAML still contains an (ignored) `repos:`
+  section, the daemon also refuses to start — booting "successfully" while
+  silently dispatching nothing is the worse failure. A true fresh install —
+  no unresolved work, no YAML topology — boots fine.
 - **Hot-apply at the tick boundary.** The orchestrator re-reads *all*
   bindings — enabled and disabled — from the DB at the start of every poll
   tick (the daemon and the UI API share one process and one SQLite
@@ -184,19 +203,28 @@ the existing YAML topology into the DB.
   set changing rather than a boot flag. Two pieces of in-memory state must
   follow the reload: the tracker registry (built once at boot today) hot-adds
   a client when a binding introduces a provider/site context the process
-  hasn't seen — with the save failing closed if the required tracker
+  hasn't seen — keyed by the *full binding context* (for Jira that includes
+  the project, not just provider/site, since the registry keys Jira trackers
+  per project) and failing the save closed if the required tracker
   credentials are absent from the environment — and per-binding concurrency
   limiters are rebuilt when a binding's cap changes, so an edited
   `max_concurrent` actually takes effect instead of the first-use semaphore
-  enforcing the old capacity forever.
+  enforcing the old capacity forever. The same rule covers the webhook
+  verifier: it is initialized from settings at app startup today, so a
+  repo-secret replacement from the UI must hot-swap the verifier's view of
+  repo secrets, or GitHub signs with the new secret while Symphony checks
+  the old one until a restart.
 - **Binding lifecycle.** New `enabled` flag on the binding: disabled means
   the *dispatch scan* skips it — no new issues start — while the binding
   stays loaded and visible to every follow-up poller (review monitors,
   merge-candidate polling, operator-wait resolution all locate their binding
   by iterating the loaded set), so in-flight work drains to completion
   instead of stalling. Disabling also clears the binding's tracker-queue
-  lanes. Delete — and any edit that changes the natural key — is allowed
-  only for a *drained* binding: no running runs, no tracked open PRs, no
+  lanes. Delete — and any edit that changes the natural key *or a
+  branch-affecting field* (branch prefix, base branch: later stages resolve
+  branches from the current row after hot reload, so changing these mid-PR
+  would point fix, delivery, and reconciliation paths at a different branch
+  than was dispatched) — is allowed only for a *drained* binding: no running runs, no tracked open PRs, no
   parked operator waits in its scope (a parked issue awaiting `$retry` or
   approval resolves its binding by the original natural key, so a rename
   would strand it), and no in-memory scheduled dispatch or fix-run slots —
@@ -239,10 +267,17 @@ the existing YAML topology into the DB.
   away.) The webhook secret is stored *per GitHub repo*, not per binding —
   webhook signature verification is keyed by repo today, so two bindings on
   the same repo can only ever use one secret; per-binding storage would let
-  the UI save a secret that verification never consults. The binding form
+  the UI save a secret that verification never consults. The repo-secret
+  record carries its own `version` participating in the optimistic-locking
+  check (binding-row versions can't protect it: two tabs editing different
+  bindings of the same repo would otherwise race on the shared secret
+  without a conflict). The binding form
   surfaces it as the repo's secret (shared across that repo's bindings), and
   it is write-only: responses carry only a set/unset flag, and the advanced
-  JSON view masks it too. Update semantics preserve it across ordinary
+  JSON view masks it too. Audit diffs redact secret-bearing fields
+  unconditionally — the field-level diff logs only set/cleared/changed
+  flags for them, never values, so routine secret rotation can't leak
+  credentials into daemon logs. Update semantics preserve it across ordinary
   edits — an omitted or masked value means "keep the stored secret";
   replacing requires sending a new value and clearing requires an explicit
   clear marker, so a routine save of unrelated fields can never wipe or
@@ -271,8 +306,10 @@ the existing YAML topology into the DB.
   otherwise silently operate over an empty binding set.
 - **API surface.** REST under the config prefix: list/create bindings,
   get/update/delete a binding by id, get/put the global roles matrix (with
-  the same version check), get options, and a YAML export of the current
-  bindings for backup.
+  the same version check), get options, and a YAML export for backup — the
+  export always carries the global roles matrix alongside the bindings,
+  since sparse binding payloads inherit from it and a bindings-only export
+  would silently revert fleet-wide role defaults on restore.
 
 ## Testing Decisions
 
@@ -346,13 +383,18 @@ a script produces — never the internals that produce them.
 - The export endpoint serves two distinct recovery scenarios, and only one
   of them is "paste into YAML". (1) *Downgrade*: rolling back to a pre-DB
   build whose loader still reads `repos:` from YAML — there the export is a
-  valid section to paste into the config file. (2) *Restore on the DB-backed
-  build* (bad bulk edit, corrupted rows): the YAML is fed back through the
-  migration/import script in replace mode, since the DB-backed loader
-  ignores YAML bindings by design. In both cases write-only webhook secrets
-  are emitted as an explicit placeholder (never the stored value — the
-  no-secrets-in-responses contract holds everywhere) and must be re-entered
-  by hand; the export marks exactly which bindings need it.
+  valid section to paste into the config file. Because the pre-DB build has
+  no `enabled` semantics and would silently re-enable a paused binding, the
+  downgrade export emits disabled bindings commented out with an explicit
+  note, so re-enabling is a deliberate uncomment. (2) *Restore on the
+  DB-backed build* (bad bulk edit, corrupted rows): the YAML is fed back
+  through the migration/import script in replace mode, since the DB-backed
+  loader ignores YAML bindings by design; disabled state round-trips intact
+  here. In both cases the export includes the global roles matrix, and
+  write-only webhook secrets are emitted as an explicit placeholder (never
+  the stored value — the no-secrets-in-responses contract holds everywhere)
+  and must be re-entered by hand; the export marks exactly which bindings
+  need it.
 - Production note: the deploy that ships this must be paired with running
   the migration script inside the container (the YAML is readable there).
   Order doesn't matter for safety — the boot gate refuses a zero-binding
