@@ -343,6 +343,7 @@ export function fetchIssues({
   provider,
   teams,
   models,
+  limit,
 }: {
   q?: string;
   scope?: IssueScope;
@@ -353,6 +354,9 @@ export function fetchIssues({
   provider?: string;
   teams?: string[];
   models?: string[];
+  /** Cap on the returned issues (done scope only; server defaults to 50). A
+   *  full page (`length === limit`) implies more done history exists. */
+  limit?: number;
 } = {}): Promise<IssueSummary[]> {
   const params = new URLSearchParams({ scope });
   const normalizedQ = q?.trim();
@@ -370,6 +374,9 @@ export function fetchIssues({
   }
   applyList(params, "teams", teams);
   applyList(params, "models", models);
+  if (limit !== undefined) {
+    params.set("limit", String(limit));
+  }
 
   return fetchJson<IssueSummary[]>(
     `/api/issues?${params.toString()}`,

@@ -282,6 +282,11 @@ def _optional_int(value: object) -> int | None:
 # Day-string param shape (`YYYY-MM-DD`) for the `from`/`to` date-window filters.
 DAY_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
+# Default cap on the done scope of /api/issues when no `limit` is given. The
+# done window defaults to 12 months, so returning the whole history every poll
+# is wasteful; the newest N is enough for the dashboard's Done lane + table.
+DONE_SCOPE_DEFAULT_LIMIT = 50
+
 
 def _started_at_window(date_from: str | None, date_to: str | None) -> tuple[list[str], list[str]]:
     """SQL conditions + params windowing `runs.started_at` to a UTC-day range.
@@ -1230,6 +1235,7 @@ def create_api_router(
         provider: Annotated[str | None, Query()] = None,
         teams: Annotated[str | None, Query()] = None,
         models: Annotated[str | None, Query()] = None,
+        limit: Annotated[int | None, Query(ge=1, le=500)] = None,
     ) -> list[IssueSummary]:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
@@ -1344,7 +1350,9 @@ def create_api_router(
                 key=lambda item: (item[2], _identifier_sort_key(str(item[0]["identifier"]))),
                 reverse=True,
             )
-            triples = kept
+            # Return only the newest N done issues (default 50). `len == limit`
+            # implies more done history exists beyond the window's cutoff.
+            triples = kept[: DONE_SCOPE_DEFAULT_LIMIT if limit is None else limit]
         else:
             statuses.sort(
                 key=lambda item: (

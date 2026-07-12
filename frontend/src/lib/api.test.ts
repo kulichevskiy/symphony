@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, fetchMeta, fetchPauseState, setPauseState } from "./api";
+import {
+  ApiError,
+  fetchIssues,
+  fetchMeta,
+  fetchPauseState,
+  setPauseState,
+} from "./api";
 import { registerTokenProvider } from "./auth";
 
 afterEach(() => {
@@ -36,6 +42,25 @@ describe("fetchJson", () => {
 
     await expect(fetchMeta()).rejects.toBeInstanceOf(ApiError);
     await expect(fetchMeta()).rejects.toMatchObject({ status: 403 });
+  });
+});
+
+describe("fetchIssues", () => {
+  it("passes limit for the done scope and omits it otherwise", async () => {
+    const fetchMock = vi.fn(
+      (_input: RequestInfo | URL, _init?: RequestInit) =>
+        Promise.resolve(new Response("[]", { status: 200 })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchIssues({ scope: "done", limit: 50 });
+    await fetchIssues({ scope: "active" });
+
+    const doneUrl = fetchMock.mock.calls[0][0] as string;
+    const activeUrl = fetchMock.mock.calls[1][0] as string;
+    expect(doneUrl).toContain("scope=done");
+    expect(doneUrl).toContain("limit=50");
+    expect(activeUrl).not.toContain("limit");
   });
 });
 

@@ -845,23 +845,40 @@ function BoardCard({
   );
 }
 
+/** Max cards rendered in the Done lane before collapsing to a "+N more"
+ *  affordance. The done feed is capped server-side (default 50); this keeps the
+ *  board readable and nudges deeper browsing into the Table view. */
+export const DONE_LANE_CARD_CAP = 30;
+
+/** How many done issues the home feed fetches (matches the API's own default).
+ *  The kanban shows the newest `DONE_LANE_CARD_CAP`; the rest are reachable via
+ *  the "+N more" affordance / Table view. */
+const DONE_SCOPE_LIMIT = 50;
+
 /** The issues kanban: one lane per pipeline step, every tracked issue exactly
  *  once. Cards are links to the issue page (⌘-click works); the identifier
- *  underlines on hover to signal it. */
+ *  underlines on hover to signal it. The Done lane caps its card list and, when
+ *  it overflows, shows a "+N more" button that calls `onShowMore` (the Table
+ *  view sees the full fetched set). */
 export function KanbanBoard({
   active,
   done,
   nowMs,
+  onShowMore,
 }: {
   active: IssueSummary[];
   done: IssueSummary[];
   nowMs: number;
+  onShowMore?: () => void;
 }) {
   const lanes = groupForBoard(active, done);
   return (
     <div className="flex gap-3 overflow-x-auto pb-1">
       {BOARD_COLUMNS.map((col) => {
         const issues = lanes.get(col.key) ?? [];
+        const shown =
+          col.key === "done" ? issues.slice(0, DONE_LANE_CARD_CAP) : issues;
+        const overflow = issues.length - shown.length;
         return (
           <div
             key={col.key}
@@ -875,8 +892,8 @@ export function KanbanBoard({
               </span>
             </div>
             <div className="flex flex-col gap-2 p-2">
-              {issues.length ? (
-                issues.map((i) => (
+              {shown.length ? (
+                shown.map((i) => (
                   <BoardCard
                     key={i.id}
                     issue={i}
@@ -889,6 +906,15 @@ export function KanbanBoard({
                   empty
                 </p>
               )}
+              {overflow > 0 ? (
+                <button
+                  type="button"
+                  onClick={onShowMore}
+                  className="rounded-md border border-dashed border-border py-2 text-center text-xs font-medium text-muted-foreground transition-colors hover:border-blue-400 hover:text-foreground dark:hover:border-blue-600"
+                >
+                  +{overflow} more — view in table
+                </button>
+              ) : null}
             </div>
           </div>
         );
@@ -1094,6 +1120,7 @@ export function HomePage() {
         from: dateFrom,
         to: dateTo,
         models: modelsFilter,
+        limit: DONE_SCOPE_LIMIT,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
@@ -1148,7 +1175,12 @@ export function HomePage() {
         </div>
 
         {issueView === "board" ? (
-          <KanbanBoard active={active} done={done} nowMs={nowMs} />
+          <KanbanBoard
+            active={active}
+            done={done}
+            nowMs={nowMs}
+            onShowMore={() => setIssueView("table")}
+          />
         ) : (
           <>
             <div className="mb-2.5 flex flex-wrap items-center justify-between gap-3">

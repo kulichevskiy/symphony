@@ -9,6 +9,7 @@ import { DEFAULT_DATE, FiltersProvider } from "@/lib/filters";
 import {
   BOARD_COLUMNS,
   BreakdownTable,
+  DONE_LANE_CARD_CAP,
   groupForBoard,
   HomePage,
   IssueTable,
@@ -264,6 +265,25 @@ describe("KanbanBoard", () => {
     expect(markup).toContain('href="https://linear.app/issue/VIB-9"');
     expect(markup).not.toContain('href="/issue/lin-uuid"');
     expect(markup).toContain("Open VIB-9 in Linear");
+  });
+
+  it("caps the Done lane and shows a '+N more' overflow affordance", () => {
+    const overflow = 5;
+    const done = Array.from({ length: DONE_LANE_CARD_CAP + overflow }, (_, n) =>
+      issue({
+        id: `d-${n}`,
+        identifier: `VIB-${n}`,
+        completed_at: `2026-05-${String(10 + n).padStart(2, "0")}T10:00:00Z`,
+        canonical_status: { state: "done", since: null, subtitle: null, stuck_for: null },
+      }),
+    );
+    const markup = renderBoard([], done);
+    // Overflow count is relative to the fetched data; header count is the full total.
+    expect(markup).toContain(`+${overflow} more`);
+    expect(markup).toContain(`>${DONE_LANE_CARD_CAP + overflow}<`);
+    // Only the cap's worth of cards render; the (cap+1)-th done issue is hidden.
+    const cardLinks = markup.match(/href="\/issue\/d-\d+"/g) ?? [];
+    expect(cardLinks.length).toBe(DONE_LANE_CARD_CAP);
   });
 });
 
