@@ -33,6 +33,16 @@ class WorkspaceError(RuntimeError):
     """Raised when a git operation against a workspace fails."""
 
 
+# In-progress git operations that survive a host restart. Marker paths are
+# relative to `.git`; the abort command restores the pre-operation branch
+# tip, which is already pushed, so the next run simply redoes the work.
+_INTERRUPTED_OPS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("rebase-merge", "rebase-apply"), ("rebase", "--abort")),
+    (("MERGE_HEAD",), ("merge", "--abort")),
+    (("CHERRY_PICK_HEAD",), ("cherry-pick", "--abort")),
+)
+
+
 class Workspace:
     """Manages per-issue clones rooted at `root`.
 
@@ -106,6 +116,7 @@ class Workspace:
         async with self._hold_lock(path):
             if (path / ".git").exists():
                 path.touch(exist_ok=True)
+                await self._abort_interrupted_ops(path)
                 await self._git(path, "fetch", "origin")
             else:
                 if path.exists():
@@ -265,6 +276,20 @@ class Workspace:
             except Exception:  # noqa: BLE001 — must not kill the loop
                 log.exception("ttl sweep failed")
             await asyncio.sleep(interval_secs)
+
+    async def _abort_interrupted_ops(self, path: Path) -> None:
+        # A host restart can kill an agent mid-rebase/merge. The leftover
+        # .git state makes every later `git switch` fail ("cannot switch
+        # branch while rebasing"), wedging the issue in a retry loop.
+        git_dir = path / ".git"
+        for markers, abort_cmd in _INTERRUPTED_OPS:
+            if any((git_dir / marker).exists() for marker in markers):
+                log.warning(
+                    "workspace %s has an interrupted git %s; aborting it",
+                    path,
+                    abort_cmd[0],
+                )
+                await self._git(path, *abort_cmd)
 
     async def _ensure_branch(self, path: Path, branch: str) -> None:
         # Prefer an existing local branch (preserves agent commits made
