@@ -131,13 +131,18 @@ the existing YAML topology into the DB.
   *supported* routing shape today — a labeled binding plus an unlabeled
   catch-all in the same team, resolved by first-match order over the config
   list (the CLI mirrors the same rule). So the write path rejects only
-  *exact duplicate* selectors among enabled bindings (same tracker scope and
-  the same normalized label — with disabled bindings exempt so a
-  replacement can be staged), and every other overlap — catch-all fallback,
-  multi-labeled issues matching two labeled bindings — is resolved by an
-  explicit per-binding `priority` field: dispatch and the CLI evaluate
-  enabled bindings in priority order and the first match wins, exactly the
-  role the YAML list order plays today. The migration stamps priority from
+  *exact duplicate* selectors among enabled bindings — same tracker scope,
+  the same normalized label, *and* the same configured ready state, since
+  two lanes of one team (e.g. Backlog vs Todo) with the same label can never
+  claim the same issue (an issue has one state) and are a legitimate setup —
+  with disabled bindings exempt so a replacement can be staged. Every other
+  overlap — catch-all fallback, multi-labeled issues matching two labeled
+  bindings — is resolved by an explicit per-binding `priority` field:
+  dispatch and the CLI evaluate enabled bindings in priority order and the
+  first match wins, exactly the role the YAML list order plays today. Ties
+  are broken by a stable secondary sort on the natural key (two new rows
+  sharing the default priority must not route differently across reloads
+  with SQLite row order). The migration stamps priority from
   YAML order, so existing routing (including which binding takes a
   multi-labeled ticket) is preserved bit-for-bit; the UI exposes reordering.
   Double dispatch remains impossible regardless — per-issue active-run
@@ -177,12 +182,17 @@ the existing YAML topology into the DB.
   stamps the migration marker, migrates per-binding YAML webhook secrets
   into the repo-secret table (the values are in the YAML at import time, so
   webhook verification survives cutover without manual re-entry), and
-  backfills the binding-key stamp onto any still-active run rows. That
-  backfill is only trivially resolvable when one binding serves the team;
-  with multiple label bindings the persisted rows don't record the issue's
-  labels, so the importer resolves ambiguous runs by fetching the issue's
-  labels from the tracker, and refuses the cutover (listing the runs) when
-  a run still can't be attributed — drain those first. Legacy full Claude
+  backfills the binding-key stamp onto still-active run rows *and* onto
+  open-PR rows whose stored binding key is empty (older-schema rows recover
+  by team+repo today, which is ambiguous once one repo has multiple
+  label/catch-all bindings — the drain guard and follow-up pollers need the
+  real key). Backfill is only automatic when it is unambiguous (one
+  candidate binding). Ambiguous rows are *not* guessed from the issue's
+  current tracker labels — labels are mutable, and a wrong key would let
+  the real binding be deleted or route follow-ups to the wrong repo.
+  Instead the importer refuses the cutover listing the unattributable
+  rows; the operator either drains them first or supplies an explicit
+  issue→binding mapping to the script. Legacy full Claude
   model IDs in the local-review fields are normalized to their matrix alias
   where one exists; the matrix validation is extended to also accept full
   `claude-*` model IDs verbatim (they already flow through `--model`
@@ -197,7 +207,8 @@ the existing YAML topology into the DB.
   tracked open PRs, or parked operator waits — all of which resolve their
   binding by iterating the loaded set), the daemon refuses to start with an
   error naming the migration/import script. The check deliberately does
-  *not* key off the migration marker: a bad bulk delete or DB restore after
+  *not* key off the migration marker: a bad bulk delete or DB restore
+  after
   a successful cutover leaves the same hazard, and the gate must catch that
   too. A second, independent gate covers the quiet-window cutover: if the DB
   has zero bindings but the YAML still contains an (ignored) `repos:`
@@ -206,8 +217,14 @@ the existing YAML topology into the DB.
   no unresolved work, no YAML topology — boots fine.
 - **Hot-apply at the tick boundary.** The orchestrator re-reads *all*
   bindings — enabled and disabled — from the DB at the start of every poll
-  tick (the daemon and the UI API share one process and one SQLite
-  connection, so no IPC is needed). The contract is *per stage*, stated
+  tick (the daemon and the UI API share one process, so no IPC is needed —
+  but *not* a bare shared connection for this data: config writes span
+  multiple rows (binding + repo secret + global matrix), and on the single
+  shared `aiosqlite` connection a tick reload could interleave with an
+  uncommitted multi-row save and dispatch config that was never
+  successfully committed. Each config write runs as one transaction under
+  an in-process lock that the tick's binding reload also takes, so the
+  reload only ever observes committed state). The contract is *per stage*, stated
   precisely: a running agent process is immutable once spawned (its argv and
   env were captured at dispatch), but each subsequent stage of the same
   issue — the next fix-run, the review monitor's decisions, the merge — uses
@@ -281,8 +298,13 @@ the existing YAML topology into the DB.
   validated server-side by the same pydantic model. Legacy role fields are
   not exposed in the UI at all.
 - **Options endpoint.** A read endpoint serves the allowed enum values —
-  agent families, supported codex models, claude model aliases, both effort
-  sets, merge strategies — so the frontend hardcodes nothing.
+  agent families, supported codex models, claude model aliases, effort
+  sets, merge strategies — so the frontend hardcodes nothing. Claude
+  efforts are *per model*, not family-wide: the capability check that
+  preflight already runs per model is the source of truth, so the endpoint
+  returns efforts keyed by model and the save path re-runs the same
+  capability check — otherwise the UI could offer and save an effort the
+  selected model rejects, moving the failure from the form to dispatch.
 - **Validation.** On every write the server validates the payload through
   the binding model, then assembles the full effective config (YAML system
   knobs + all DB bindings + global matrix) and runs the existing model
@@ -370,7 +392,8 @@ a script produces — never the internals that produce them.
   FastAPI app over a real temp SQLite): CRUD round-trips, duplicate natural
   key rejected — including two unlabeled bindings on the same project/repo —
   exact-duplicate selector rejection (same tracker scope + same normalized
-  label) with disabled bindings exempt, version-conflict on stale writes
+  label + same ready state) with disabled bindings exempt and same-label
+  different-lane pairs accepted, version-conflict on stale writes
   (bindings, the global matrix, and the repo-secret record), drain guard
   returning the blocker list
   (runs attributed via their stamped binding key, PRs, operator waits,
@@ -401,8 +424,9 @@ a script produces — never the internals that produce them.
   (including the codex-reviewer-model inheritance case) rather than copied
   field-to-cell, priority stamped from YAML order, per-binding webhook
   secrets landed in the repo-secret table, full Claude model IDs
-  normalized/preserved, ambiguous active-run backfill resolved via tracker
-  labels or refused with the run list, refusal to double-import without the
+  normalized/preserved, unambiguous run and open-PR binding-key backfill
+  with ambiguous rows refused (or resolved via an explicit mapping) rather
+  than guessed, refusal to double-import without the
   explicit replace flag,
   and a round-trip through export → import-in-replace-mode. Prior art:
   DAO-level tests over a temp DB.
