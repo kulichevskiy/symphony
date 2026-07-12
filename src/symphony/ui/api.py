@@ -185,8 +185,7 @@ class PauseController(Protocol):
     async def set_dispatch_paused(self, paused: bool) -> None: ...
 
 
-_ISSUE_SCOPE_CTES = """
-WITH active_issue_ids(issue_id) AS (
+_ACTIVE_ISSUE_IDS_CTE = """active_issue_ids(issue_id) AS (
     SELECT issue_id FROM runs WHERE status = 'running'
     UNION
     SELECT issue_id FROM operator_waits
@@ -200,29 +199,54 @@ WITH active_issue_ids(issue_id) AS (
           SELECT 1 FROM issue_prs ip
           WHERE ip.issue_id = rs.issue_id
       )
-),
-latest_activity_sources(issue_id, ts) AS (
+)"""
+
+
+# latest_activity, with every UNION ALL source narrowed to `activity_candidates`
+# (the issues that can appear in the response) so MAX(ts) never scans history
+# belonging to issues outside that set. Mirrors issues.py::_latest_activity,
+# whose per-issue variant already restricts each branch to a single issue.
+_LATEST_ACTIVITY_CTE = """latest_activity_sources(issue_id, ts) AS (
     SELECT issue_id, COALESCE(ended_at, started_at) FROM runs
+    WHERE issue_id IN (SELECT issue_id FROM activity_candidates)
     UNION ALL
     SELECT issue_id, ts FROM state_transitions
+    WHERE issue_id IN (SELECT issue_id FROM activity_candidates)
     UNION ALL
     SELECT issue_id, seen_at FROM comment_events
+    WHERE issue_id IN (SELECT issue_id FROM activity_candidates)
     UNION ALL
     SELECT r.issue_id, m.last_event_at
     FROM activity_comment_marks m
     JOIN runs r ON r.id = m.run_id
     WHERE m.last_event_at IS NOT NULL
+      AND r.issue_id IN (SELECT issue_id FROM activity_candidates)
     UNION ALL
     SELECT issue_id, COALESCE(merged_at, created_at) FROM issue_prs
+    WHERE issue_id IN (SELECT issue_id FROM activity_candidates)
     UNION ALL
     SELECT issue_id, created_at FROM operator_waits
+    WHERE issue_id IN (SELECT issue_id FROM activity_candidates)
 ),
 latest_activity(issue_id, latest_activity_ts) AS (
     SELECT issue_id, MAX(ts)
     FROM latest_activity_sources
     WHERE ts IS NOT NULL
     GROUP BY issue_id
-)
+)"""
+
+
+def _issue_scope_ctes(candidate_sql: str) -> str:
+    """WITH block for the issue list. `candidate_sql` defines the
+    `activity_candidates(issue_id)` set that the latest_activity sources are
+    restricted to: the active issue ids for the active scope, or the
+    activity-independent prefilter (team/q) of issues for the done scope."""
+    return f"""
+WITH {_ACTIVE_ISSUE_IDS_CTE},
+activity_candidates(issue_id) AS (
+    {candidate_sql}
+),
+{_LATEST_ACTIVITY_CTE}
 """
 
 
@@ -807,6 +831,20 @@ def _list_issues_query(
     where: list[str] = []
     where_params: list[str] = []
 
+    # Activity-independent filters (team, q) reused both in the WHERE clause and,
+    # for the done scope, in the activity_candidates prefilter.
+    normalized_q = q.strip().lower() if q is not None else ""
+    q_cond: str | None = None
+    q_params: list[str] = []
+    if normalized_q:
+        q_cond = "(instr(lower(i.identifier), ?) > 0 OR instr(lower(i.title), ?) > 0)"
+        q_params = [normalized_q, normalized_q]
+    team_cond: str | None = None
+    team_params: list[str] = []
+    if teams:
+        team_cond = _team_in_clause(teams)
+        team_params = list(teams)
+
     if scope is IssueScope.ACTIVE:
         where.append("i.id IN (SELECT issue_id FROM active_issue_ids)")
         # Date applies to active issues by their last activity day.
@@ -828,14 +866,25 @@ def _list_issues_query(
             where.append(f"substr({completion}, 1, 10) <= ?")
             where_params.append(date_to)
 
-    normalized_q = q.strip().lower() if q is not None else ""
-    if normalized_q:
-        where.append("(instr(lower(i.identifier), ?) > 0 OR instr(lower(i.title), ?) > 0)")
-        where_params.extend([normalized_q, normalized_q])
+    if q_cond is not None:
+        where.append(q_cond)
+        where_params.extend(q_params)
+    if team_cond is not None:
+        where.append(team_cond)
+        where_params.extend(team_params)
 
-    if teams:
-        where.append(_team_in_clause(teams))
-        where_params.extend(teams)
+    # Scope the activity aggregate to only the issues that can appear in the
+    # response. Active: the active issue ids. Done: the completion window still
+    # needs latest_activity (chicken-and-egg), so narrow by the
+    # activity-independent filters — a superset of the response's done set.
+    if scope is IssueScope.ACTIVE:
+        candidate_sql = "SELECT issue_id FROM active_issue_ids"
+        candidate_params: list[str] = []
+    else:
+        cand_conds = [c for c in (q_cond, team_cond) if c is not None]
+        cand_where = f"WHERE {' AND '.join(cand_conds)}" if cand_conds else ""
+        candidate_sql = f"SELECT i.id AS issue_id FROM issues i {cand_where}"
+        candidate_params = [*q_params, *team_params]
 
     # Token columns: when a provider and/or models filter is active, scope the
     # per-issue sums to the matching run_model_usage rows (provider AND the OR-ed
@@ -879,11 +928,11 @@ def _list_issues_query(
         ) ru ON ru.issue_id = i.id
         """
 
-    params = [_utc_iso(now), *token_params, *where_params]
+    params = [*candidate_params, _utc_iso(now), *token_params, *where_params]
     where_sql = "" if not where else f"WHERE {' AND '.join(where)}"
     return (
         f"""
-        {_ISSUE_SCOPE_CTES}
+        {_issue_scope_ctes(candidate_sql)}
         SELECT
             i.id,
             i.identifier,
