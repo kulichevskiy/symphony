@@ -1,10 +1,38 @@
 import react from "@vitejs/plugin-react";
 import path from "node:path";
-import { defineConfig } from "vite";
+import { defineConfig, type HtmlTagDescriptor, type Plugin } from "vite";
+
+/** Preconnect <link> hints for the build-time Auth0 domain so the browser can
+ *  open the TLS connection while the bundle downloads. Data-independent: the
+ *  runtime /api/auth-config may point elsewhere, in which case this is a
+ *  harmless unused hint. Empty when the domain wasn't set at build time. */
+export function auth0PreconnectTags(domain?: string): HtmlTagDescriptor[] {
+  if (!domain) return [];
+  return [
+    {
+      tag: "link",
+      attrs: { rel: "preconnect", href: `https://${domain}`, crossorigin: true },
+      injectTo: "head",
+    },
+  ];
+}
+
+function auth0Preconnect(): Plugin {
+  let domain: string | undefined;
+  return {
+    name: "auth0-preconnect",
+    configResolved(resolved) {
+      domain = resolved.env.VITE_AUTH0_DOMAIN;
+    },
+    transformIndexHtml() {
+      return auth0PreconnectTags(domain);
+    },
+  };
+}
 
 export default defineConfig({
   base: "/ui/",
-  plugins: [react()],
+  plugins: [react(), auth0Preconnect()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

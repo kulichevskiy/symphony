@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import config from "./vite.config.ts";
+import config, { auth0PreconnectTags } from "./vite.config.ts";
 
 // The config may be a function or an object depending on defineConfig usage;
 // our config is a plain object.
@@ -42,5 +42,22 @@ describe("vite build.manualChunks", () => {
     expect(chunk(`${NM}/react/index.js`)).not.toBe(
       chunk(`${NM}/react-router/dist/index.js`),
     );
+  });
+});
+
+describe("auth0PreconnectTags", () => {
+  it("emits a preconnect link for a known build-time domain", () => {
+    const tags = auth0PreconnectTags("example.us.auth0.com");
+    expect(tags).toHaveLength(1);
+    expect(tags[0]).toMatchObject({
+      tag: "link",
+      attrs: { rel: "preconnect", href: "https://example.us.auth0.com" },
+      injectTo: "head",
+    });
+  });
+
+  it("emits nothing when the domain is unknown", () => {
+    expect(auth0PreconnectTags(undefined)).toEqual([]);
+    expect(auth0PreconnectTags("")).toEqual([]);
   });
 });

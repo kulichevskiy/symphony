@@ -91,4 +91,24 @@ describe("AuthGate", () => {
       expect.objectContaining({ appState: expect.objectContaining({ returnTo: expect.any(String) }) }),
     );
   });
+
+  it("renders children while the allowlist probe is still in flight", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    // Never resolves: the gate must not block on it.
+    fetchMeta.mockReturnValue(new Promise(() => {}));
+
+    const { findByTestId, queryByText } = renderGate();
+
+    expect(await findByTestId("dashboard")).toBeTruthy();
+    expect(queryByText("Access denied")).toBeNull();
+  });
+
+  it("switches to AccessDenied when the probe returns 403", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(403));
+
+    const { findByText } = renderGate();
+
+    expect(await findByText("Access denied")).toBeTruthy();
+  });
 });

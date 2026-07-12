@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ApiError, fetchAuthConfig, fetchMeta } from "@/lib/api";
+import { ApiError, fetchAuthConfig, fetchMeta, type AuthConfig } from "@/lib/api";
 import { registerTokenProvider, type TokenProvider } from "@/lib/auth";
 
 // Build-time fallback only — used when the runtime `/api/auth-config` call
@@ -12,6 +12,15 @@ import { registerTokenProvider, type TokenProvider } from "@/lib/auth";
 // AUTH0_CLIENT_ID differ from (or weren't set at) build time.
 const BUILD_DOMAIN = import.meta.env.VITE_AUTH0_DOMAIN;
 const BUILD_CLIENT_ID = import.meta.env.VITE_AUTH0_CLIENT_ID;
+
+declare global {
+  interface Window {
+    /** The `/api/auth-config` fetch kicked off by the inline script in
+     *  `index.html` so it overlaps bundle download/parse. `resolveAuthConfig`
+     *  consumes it, falling back to its own fetch if absent. */
+    __authConfig?: Promise<AuthConfig>;
+  }
+}
 
 /** Whether the mounted app is running behind the Auth0 gate. `App` reads this
  *  to decide whether to show the logout control; it's only ever read once
@@ -34,7 +43,9 @@ interface ResolvedAuthConfig {
  *  bundle at build time. */
 async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
   try {
-    const config = await fetchAuthConfig();
+    // Prefer the in-flight fetch the inline script started; fall back to our
+    // own request if it isn't present (e.g. bundle loaded outside index.html).
+    const config = await (window.__authConfig ?? fetchAuthConfig());
     if (config.enabled && config.domain && config.client_id) {
       return { domain: config.domain, clientId: config.client_id };
     }
@@ -151,31 +162,26 @@ export function AuthGate({ children }: { children: ReactNode }) {
   return <AllowlistGate>{children}</AllowlistGate>;
 }
 
-/** Probes the gated API once logged in: a 403 means the email isn't allowlisted. */
+/**
+ * Probes the gated API once logged in: a 403 means the email isn't allowlisted.
+ * Non-blocking — renders children (so the dashboard queries start) while the
+ * probe is in flight, and only swaps to the access-denied screen on a 403. A
+ * non-allowlisted user's dashboard queries fail auth identically anyway, so
+ * running them in parallel with the probe costs nothing and saves a round-trip.
+ */
 function AllowlistGate({ children }: { children: ReactNode }) {
   const { logout } = useAuth0();
-  const { error, isLoading } = useQuery({
+  const { error } = useQuery({
     queryKey: ["auth-probe"],
     queryFn: fetchMeta,
     retry: false,
     staleTime: Infinity,
   });
 
-  if (isLoading) {
-    return <AuthNotice title="Loading…" />;
-  }
   if (error instanceof ApiError && error.status === 403) {
     return (
       <AccessDenied
         onSignOut={() => void logout({ logoutParams: { returnTo: RETURN_TO() } })}
-      />
-    );
-  }
-  if (error) {
-    return (
-      <AuthNotice
-        title="Sign-in check failed"
-        detail={error instanceof ApiError ? `Server returned ${error.status}.` : String(error)}
       />
     );
   }

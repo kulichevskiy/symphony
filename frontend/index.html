@@ -5,6 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="dark" />
     <title>symphony</title>
+    <!-- Kick off the auth-config fetch before the bundle downloads/parses so it
+         overlaps that ~600 kB of JS instead of waiting behind it. `auth0.tsx`
+         consumes window.__authConfig. -->
+    <script>
+      window.__authConfig = fetch("/api/auth-config", {
+        headers: { Accept: "application/json" },
+      }).then(function (r) {
+        return r.ok ? r.json() : Promise.reject(r);
+      });
+    </script>
   </head>
   <body>
     <div id="root"></div>
