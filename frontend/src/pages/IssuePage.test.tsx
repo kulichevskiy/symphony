@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   aggregateRunsByStage,
@@ -10,6 +10,7 @@ import {
   NowCard,
   pickDefaultRun,
   pickLiveRun,
+  rawDetailJson,
   StageSpendCard,
   TokensCard,
 } from "./IssuePage";
@@ -493,6 +494,28 @@ function detailWith(
     review_state: null,
   } as unknown as IssueDetail;
 }
+
+describe("rawDetailJson", () => {
+  const detail = detailWith("running", [
+    run("implement", { output_tokens: 5 }),
+  ] as IssueDetail["runs"]);
+
+  it("does zero serialization while the section is collapsed", () => {
+    // The page re-renders every 5s (detail poll) + 10s (nowMs tick); a
+    // collapsed Raw JSON must not pay the stringify cost each time.
+    const spy = vi.spyOn(JSON, "stringify");
+    const out = rawDetailJson(detail, false);
+    expect(out).toBe("");
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("serializes the detail once opened", () => {
+    const out = rawDetailJson(detail, true);
+    expect(out).toBe(JSON.stringify(detail, null, 2));
+    expect(out).toContain("implement");
+  });
+});
 
 describe("deriveCockpit reason", () => {
   const failedRun = run("implement", {

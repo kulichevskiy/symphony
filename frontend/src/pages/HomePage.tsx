@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router";
 
 import {
@@ -397,8 +397,13 @@ export function BreakdownTable({
 }
 
 /** The token overview card: heatmap + all-time stat rail on top, then a single
- *  unified breakdown table toggled between By team / By model. */
-export function TokenOverview({
+ *  unified breakdown table toggled between By team / By model.
+ *
+ *  Memoized: none of its props depend on the 10s `useNowMs` tick, so the ticker
+ *  re-renders of HomePage skip re-rendering this heavy card (371-cell heatmap +
+ *  breakdown table). Callers must pass a stable `window` reference (HomePage
+ *  memoizes it) since the other props are already reference-stable. */
+function TokenOverviewImpl({
   summary,
   heatmap,
   provider,
@@ -659,6 +664,8 @@ export function TokenOverview({
     </Card>
   );
 }
+
+export const TokenOverview = memo(TokenOverviewImpl);
 
 export function SectionTotals({ issues }: { issues: IssueSummary[] }) {
   const tot = issues.reduce(
@@ -1075,6 +1082,9 @@ export function HomePage() {
   const { from, to } = resolveDateWindow(date, nowMs);
   const dateFrom = from ?? undefined;
   const dateTo = to ?? undefined;
+  // Stable reference across the 10s `nowMs` ticker (from/to are day-granular),
+  // so the memoized TokenOverview isn't re-rendered by a bare object literal.
+  const dateWindow = useMemo(() => ({ from, to }), [from, to]);
 
   const providerFilter = provider === "all" ? undefined : provider;
   // Stable cache keys for the selections (order-independent).
@@ -1171,7 +1181,7 @@ export function HomePage() {
         heatmap={heatmapQuery.data}
         provider={provider}
         date={date}
-        window={{ from, to }}
+        window={dateWindow}
       />
 
       <section className="mt-7">
