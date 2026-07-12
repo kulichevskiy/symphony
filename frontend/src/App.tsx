@@ -22,14 +22,19 @@ function lazyWithReload<T extends { default: ComponentType<unknown> }>(
   key: string,
   factory: () => Promise<T>,
 ) {
+  const reloadedKey = `symphony:chunk-reload:${key}`;
   return lazy(() =>
-    factory().catch((error: unknown) => {
-      const reloadedKey = `symphony:chunk-reload:${key}`;
-      if (sessionStorage.getItem(reloadedKey)) throw error;
-      sessionStorage.setItem(reloadedKey, "1");
-      window.location.reload();
-      return new Promise<T>(() => {});
-    }),
+    factory()
+      .then((module) => {
+        sessionStorage.removeItem(reloadedKey);
+        return module;
+      })
+      .catch((error: unknown) => {
+        if (sessionStorage.getItem(reloadedKey)) throw error;
+        sessionStorage.setItem(reloadedKey, "1");
+        window.location.reload();
+        return new Promise<T>(() => {});
+      }),
   );
 }
 
