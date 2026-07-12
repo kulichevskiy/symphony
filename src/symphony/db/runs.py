@@ -892,6 +892,27 @@ async def history_for_issue(conn: aiosqlite.Connection, issue_id: str) -> list[R
     return [_row_to_run(r) for r in rows]
 
 
+async def has_any_for_scope(
+    conn: aiosqlite.Connection, *, provider: str, site: str, team_key: str
+) -> bool:
+    """Whether any run exists for an issue under this tracker scope.
+
+    Cheap DB-only pre-check for a disabled binding's recovery scan: skips the
+    tracker API call entirely when the binding's team has never had a run,
+    since a redispatch-worthy issue always leaves run history behind."""
+    cur = await conn.execute(
+        """
+        SELECT 1
+          FROM runs r
+          JOIN issues i ON i.id = r.issue_id
+         WHERE i.provider = ? AND i.site = ? AND i.team_key = ?
+         LIMIT 1
+        """,
+        (provider, site, team_key),
+    )
+    return await cur.fetchone() is not None
+
+
 async def latest_for_issue_stage(
     conn: aiosqlite.Connection,
     *,

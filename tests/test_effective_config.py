@@ -336,3 +336,28 @@ async def test_malformed_binding_payload_json_refuses_boot_cleanly(tmp_path: Pat
     with pytest.raises(ConfigBootError, match="malformed config binding payload"):
         await assemble_effective_config(conn, _base(tmp_path))
     await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_malformed_globals_roles_json_refuses_boot_cleanly(tmp_path: Path) -> None:
+    """A hand-edited or restored `config_globals.roles` with malformed JSON
+    must surface as `ConfigBootError`, not a raw `json.JSONDecodeError`
+    traceback out of `db.config_globals.get`."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    await conn.execute(
+        "INSERT INTO config_globals (id, roles, migrated_at, version) "
+        "VALUES (1, '{not json', 't', 1)"
+    )
+    await conn.commit()
+    with pytest.raises(ConfigBootError, match="malformed config globals payload"):
+        await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()

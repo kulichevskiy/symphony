@@ -9,7 +9,9 @@ stamps `priority` from YAML list order, and writes the sparse binding payloads
 plus the global roles matrix and the migration marker into the DB.
 
 It refuses to double-import unless `replace=True` (which also serves the
-export→restore path). Payloads are sparse and legacy-free by construction.
+export→restore path — a restored YAML binding's `enabled: false` is preserved
+on its row rather than reset). Payloads are sparse and legacy-free by
+construction.
 """
 
 from __future__ import annotations
@@ -120,11 +122,13 @@ def build_payload(
     global_roles: dict[RoleName, RoleConfig],
 ) -> dict[str, Any]:
     """Sparse, legacy-free payload for one binding: the operator-set non-role
-    fields verbatim, plus the consolidated roles matrix (if any)."""
+    fields verbatim, plus the consolidated roles matrix (if any). `enabled` is
+    excluded — it lives in its own `config_bindings` column, not the payload
+    (see the caller, which stamps that column from `binding.enabled`)."""
     payload = {
         k: v
         for k, v in raw_repo.items()
-        if k not in _LEGACY_ROLE_FIELDS and k not in ("roles", "review_strategy")
+        if k not in _LEGACY_ROLE_FIELDS and k not in ("roles", "review_strategy", "enabled")
     }
     if "review_strategy" in raw_repo:
         # Deprecated enum, already resolved into `operator.local_review` /
@@ -194,7 +198,7 @@ async def import_config(
                 conn,
                 payload=payload,
                 key=binding_natural_key(binding),
-                enabled=True,
+                enabled=binding.enabled,
                 priority=priority,
                 updated_at=now,
                 updated_by=updated_by,

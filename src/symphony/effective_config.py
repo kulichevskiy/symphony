@@ -118,7 +118,13 @@ async def assemble_effective_config(
         # restored row with malformed JSON must fail boot with the same clean
         # error every other config problem gets, not a raw traceback.
         raise ConfigBootError(f"malformed config binding payload in the DB: {e}") from e
-    globals_row = await db.config_globals.get(conn)
+    try:
+        globals_row = await db.config_globals.get(conn)
+    except ValueError as e:
+        # Same concern as above: `get` decodes `roles` JSON eagerly, and a
+        # restored or hand-edited row with malformed JSON must not raise
+        # `JSONDecodeError` (a `ValueError` subclass) past this assembly.
+        raise ConfigBootError(f"malformed config globals payload in the DB: {e}") from e
 
     if not stored:
         if not boot_gates:

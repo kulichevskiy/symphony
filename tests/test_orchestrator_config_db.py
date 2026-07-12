@@ -134,6 +134,62 @@ async def test_disabled_binding_recovers_pidless_local_review_run(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_disabled_binding_recovery_skips_tracker_call_with_no_run_history(
+    tmp_path: Path,
+) -> None:
+    """A disabled binding with zero run history anywhere under its team must
+    not hit the tracker API at all — most disabled bindings share a
+    registered tracker (e.g. Linear's default context) regardless of whether
+    they have unresolved work, so a registered tracker is not by itself a
+    reason to scan."""
+    config = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "config.sqlite",
+        repos=[
+            RepoBinding(
+                linear_team_key=TEAM,
+                github_repo=REPO,
+                enabled=False,
+                local_review=False,
+                remote_review=False,
+                linear_states=LinearStates(
+                    ready=READY,
+                    in_progress="In Progress",
+                    code_review="Needs Approval",
+                    done=DONE,
+                ),
+            )
+        ],
+    )
+
+    clock = ManualClock()
+    harness = await Harness.create(tmp_path, config=config, clock=clock)
+    try:
+        # A Ready issue exists on the disabled binding's team, but no run has
+        # ever been created for it — nothing to recover.
+        harness.sim.seed_issue(
+            identifier="ENG-1", team_key=TEAM, state_name=READY, title="never dispatched"
+        )
+        calls = 0
+        real_issues_in_state = harness.linear.issues_in_state
+
+        async def _counting_issues_in_state(*args, **kwargs):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            calls += 1
+            return await real_issues_in_state(*args, **kwargs)
+
+        harness.linear.issues_in_state = _counting_issues_in_state  # type: ignore[method-assign]
+
+        await harness.warmup()
+        scheduled = await harness.step()
+        assert scheduled == []
+        assert calls == 0
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_tick_skips_disabled_binding_with_no_registered_tracker(tmp_path: Path) -> None:
     """A disabled binding with no live DB work gets no tracker registered at
     boot (`cli._configured_tracker_registry` skips it) but stays loaded in

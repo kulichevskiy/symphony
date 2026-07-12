@@ -207,6 +207,27 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_replace_preserves_disabled_binding(tmp_path: Path) -> None:
+    """A restore/export YAML binding with `enabled: false` must land disabled
+    in the DB rather than silently re-enabled — and `enabled` must not leak
+    into the sparse payload (it's the row's own column)."""
+    conn, _result, rows, _g = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    enabled: false
+{_STATES}
+""",
+        replace=True,
+    )
+    assert rows[0].enabled is False
+    assert "enabled" not in rows[0].payload
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_replace_does_not_delete_existing_bindings(tmp_path: Path) -> None:
     """A `--replace` import that fails partway (duplicate natural key across
     two unlabeled bindings on the same scope) must roll back the delete too —

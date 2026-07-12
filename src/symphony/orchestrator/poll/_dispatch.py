@@ -175,8 +175,26 @@ class _DispatchMixin(_OrchestratorBase):
         already-started-work signal) so a genuinely new Ready issue placed on
         a disabled binding is left alone, and skip the queue snapshot entirely
         so a disabled binding's tracker-queue lane stays cleared.
+
+        A team-scoped run-history check gates the tracker API call itself:
+        most disabled bindings share a registered tracker (e.g. Linear's
+        default context) regardless of whether they have unresolved work, so
+        `self.tracker(binding)` succeeding is not evidence this binding needs
+        scanning — only a prior run under its team does.
         """
         scheduled: list[asyncio.Task[None]] = []
+        tracker_ctx = _tracker_context_for_binding(binding)
+        # Cheap DB-only gate before the tracker API call: most disabled
+        # bindings share a registered tracker (e.g. Linear's default context)
+        # even though they have no recoverable work, so `self.tracker(binding)`
+        # succeeding is not evidence this binding needs a scan.
+        if not await db.runs.has_any_for_scope(
+            self._conn,
+            provider=tracker_ctx.provider,
+            site=tracker_ctx.site,
+            team_key=binding.linear_team_key,
+        ):
+            return scheduled
         try:
             tracker = self.tracker(binding)
         except KeyError:
@@ -193,9 +211,7 @@ class _DispatchMixin(_OrchestratorBase):
             )
             return scheduled
         for issue in issues:
-            storage_id = await self._storage_issue_id_for_tracker_issue(
-                issue.id, _tracker_context_for_binding(binding)
-            )
+            storage_id = await self._storage_issue_id_for_tracker_issue(issue.id, tracker_ctx)
             if not await db.runs.history_for_issue(self._conn, storage_id):
                 continue
             task = await self._schedule_ready_issue(binding, issue)
