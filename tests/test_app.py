@@ -293,9 +293,7 @@ async def test_ui_cache_control_headers(tmp_path: Path) -> None:
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        revalidated = await client.get(
-            "/ui/", headers={"if-none-match": root.headers["etag"]}
-        )
+        revalidated = await client.get("/ui/", headers={"if-none-match": root.headers["etag"]})
     assert revalidated.status_code == 304
     assert revalidated.headers["cache-control"] == "no-cache"
 
