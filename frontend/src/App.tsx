@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { lazy, Suspense, useState } from "react";
+import { ComponentType, lazy, Suspense, useState } from "react";
 import { Link, Route, Routes } from "react-router";
 
 import { FilterBar } from "@/components/dashboard/FilterBar";
@@ -14,10 +14,29 @@ import { HomePage } from "@/pages/HomePage";
 
 // Lazy-load the secondary routes so the initial (home) route only parses
 // HomePage code; each becomes its own chunk.
-const IssuePage = lazy(() =>
+//
+// A tab left open across a deploy still holds the old content-hashed chunk
+// URLs, which 404 once the new build's assets replace them. Reload once to
+// pick up the fresh chunk manifest instead of surfacing a broken route.
+function lazyWithReload<T extends { default: ComponentType<unknown> }>(
+  key: string,
+  factory: () => Promise<T>,
+) {
+  return lazy(() =>
+    factory().catch((error: unknown) => {
+      const reloadedKey = `symphony:chunk-reload:${key}`;
+      if (sessionStorage.getItem(reloadedKey)) throw error;
+      sessionStorage.setItem(reloadedKey, "1");
+      window.location.reload();
+      return new Promise<T>(() => {});
+    }),
+  );
+}
+
+const IssuePage = lazyWithReload("issue", () =>
   import("@/pages/IssuePage").then((m) => ({ default: m.IssuePage })),
 );
-const ConfigPage = lazy(() =>
+const ConfigPage = lazyWithReload("config", () =>
   import("@/pages/ConfigPage").then((m) => ({ default: m.ConfigPage })),
 );
 
