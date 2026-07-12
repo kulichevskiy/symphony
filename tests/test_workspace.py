@@ -15,7 +15,7 @@ import pytest
 
 from symphony.config import LinearStates, RepoBinding
 from symphony.linear.client import LinearIssue
-from symphony.workspace import Workspace
+from symphony.workspace import Workspace, WorkspaceError
 
 
 async def _run(*args: str, cwd: Path | None = None) -> None:
@@ -156,6 +156,87 @@ async def test_acquire_recovers_from_non_git_residue(tmp_path: Path) -> None:
     path = await ws.acquire(_binding(), _issue("ENG-9"))
     assert (path / ".git").exists()
     assert not (path / "stale.txt").exists()
+
+
+async def _run_ok(*args: str, cwd: Path) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+    return proc.returncode == 0
+
+
+async def _seed_conflicting_target(path: Path) -> None:
+    """Create a `target` branch whose README conflicts with the issue branch."""
+    await _run("git", "config", "user.email", "test@example.com", cwd=path)
+    await _run("git", "config", "user.name", "Tester", cwd=path)
+    issue_branch = "symphony/eng-5"
+    (path / "README.md").write_text("ours\n")
+    await _run("git", "commit", "-aqm", "ours", cwd=path)
+    await _run("git", "switch", "-qc", "target", "main", cwd=path)
+    (path / "README.md").write_text("theirs\n")
+    await _run("git", "commit", "-aqm", "theirs", cwd=path)
+    await _run("git", "switch", "-q", issue_branch, cwd=path)
+
+
+@pytest.mark.asyncio
+async def test_acquire_aborts_interrupted_rebase(tmp_path: Path) -> None:
+    # A host restart mid-rebase (e.g. during a merge-conflict fix-run)
+    # leaves .git/rebase-merge behind; acquire must clear it instead of
+    # failing "cannot switch branch while rebasing" forever.
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+    path = await ws.acquire(_binding(), _issue("ENG-5"))
+    await _seed_conflicting_target(path)
+
+    assert not await _run_ok("git", "rebase", "target", cwd=path)
+    assert (path / ".git" / "rebase-merge").exists()
+
+    # The restart cleared in-memory liveness along with the process.
+    ws.release(_binding(), _issue("ENG-5"))
+    path = await ws.acquire(_binding(), _issue("ENG-5"))
+
+    assert not (path / ".git" / "rebase-merge").exists()
+    assert (await _run_ok("git", "switch", "-q", "main", cwd=path)) is True
+    assert (path / "README.md").read_text() == "hello\n"
+
+
+@pytest.mark.asyncio
+async def test_acquire_aborts_interrupted_merge(tmp_path: Path) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+    path = await ws.acquire(_binding(), _issue("ENG-5"))
+    await _seed_conflicting_target(path)
+
+    assert not await _run_ok("git", "merge", "target", cwd=path)
+    assert (path / ".git" / "MERGE_HEAD").exists()
+
+    ws.release(_binding(), _issue("ENG-5"))
+    path = await ws.acquire(_binding(), _issue("ENG-5"))
+
+    assert not (path / ".git" / "MERGE_HEAD").exists()
+    assert (path / "README.md").read_text() == "ours\n"
+
+
+@pytest.mark.asyncio
+async def test_acquire_keeps_live_rebase_of_an_in_use_workspace(tmp_path: Path) -> None:
+    # A racing duplicate dispatch must not abort a rebase that a live
+    # fix-run is actively resolving; it fails to acquire (and dedupes
+    # out) exactly as before the healing was added.
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(root=tmp_path / "ws", clone_fn=_make_clone_fn(remote))
+    path = await ws.acquire(_binding(), _issue("ENG-5"))
+    await _seed_conflicting_target(path)
+
+    assert not await _run_ok("git", "rebase", "target", cwd=path)
+    assert (path / ".git" / "rebase-merge").exists()
+
+    with pytest.raises(WorkspaceError):
+        await ws.acquire(_binding(), _issue("ENG-5"))
+    assert (path / ".git" / "rebase-merge").exists(), "live rebase must survive"
 
 
 @pytest.mark.asyncio
