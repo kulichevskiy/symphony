@@ -411,7 +411,8 @@ repos:
 
 
 def test_resolve_repos_false_ignores_stale_yaml_roles_too(
-    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
 ) -> None:
     """When the DB owns bindings *and* the global roles matrix, a leftover
     YAML `roles:` block is ignored just like `repos:` — it shouldn't be able
