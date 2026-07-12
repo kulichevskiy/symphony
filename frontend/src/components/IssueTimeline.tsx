@@ -99,7 +99,7 @@ export function mergeTimelineEvents(
   const byKey = new Map<string, TimelineEvent>();
   for (const page of pages) {
     for (const event of page) {
-      byKey.set(`${event.ts}:${event.kind}`, event);
+      byKey.set(`${event.ts}:${event.kind}:${JSON.stringify(event.payload)}`, event);
     }
   }
   return [...byKey.values()].sort((left, right) => left.ts.localeCompare(right.ts));

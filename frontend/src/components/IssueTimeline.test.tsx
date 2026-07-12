@@ -13,8 +13,12 @@ import {
   type TimelineEvent,
 } from "./IssueTimeline";
 
-function event(ts: string, kind = "run_started"): TimelineEvent {
-  return { ts, kind, payload: {} };
+function event(
+  ts: string,
+  kind = "run_started",
+  payload: Record<string, unknown> = {},
+): TimelineEvent {
+  return { ts, kind, payload };
 }
 
 describe("buildTimelineUrl", () => {
@@ -62,6 +66,14 @@ describe("mergeTimelineEvents", () => {
       "2026-05-17T10:04:30Z",
       "2026-05-17T10:05:00Z",
     ]);
+  });
+
+  it("keeps distinct events that share a ts+kind (e.g. two comment_seen rows with GitHub's second-precision ts)", () => {
+    const ts = "2026-05-17T10:04:30Z";
+    const first = event(ts, "comment_seen", { comment_id: 1 });
+    const second = event(ts, "comment_seen", { comment_id: 2 });
+    const merged = mergeTimelineEvents([first, second]);
+    expect(merged.length).toBe(2);
   });
 });
 
