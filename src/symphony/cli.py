@@ -293,7 +293,9 @@ async def _run(config_path: Path, *, once: bool) -> None:
         has_db_bindings = await db.config_bindings.count(conn) > 0
         base = Config.load(config_path, resolve_repos=not has_db_bindings)
         try:
-            cfg = await assemble_effective_config(conn, base)
+            cfg = await assemble_effective_config(
+                conn, base, yaml_has_repos_topology=Config.peek_repos_topology(config_path)
+            )
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
@@ -570,7 +572,12 @@ async def _preflight(config_path: Path) -> None:
     try:
         has_db_bindings = await db.config_bindings.count(conn) > 0
         base = Config.load(config_path, resolve_repos=not has_db_bindings)
-        cfg = await assemble_effective_config(conn, base, boot_gates=False)
+        cfg = await assemble_effective_config(
+            conn,
+            base,
+            boot_gates=False,
+            yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+        )
     except ConfigBootError as e:
         click.echo(str(e), err=True)
         sys.exit(2)
@@ -1111,7 +1118,12 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
             click.echo("LINEAR_API_KEY is empty", err=True)
             sys.exit(2)
         try:
-            cfg = await assemble_effective_config(conn, base, boot_gates=False)
+            cfg = await assemble_effective_config(
+                conn,
+                base,
+                boot_gates=False,
+                yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+            )
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)

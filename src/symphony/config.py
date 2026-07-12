@@ -830,7 +830,23 @@ class Config(BaseModel):
         """
         raw = yaml.safe_load(path.read_text()) or {}
         default = cls.model_fields["db_path"].default
-        return _expand(Path(raw.get("db_path", default)))
+        # `.get(..., default)` only falls back when the key is absent; an
+        # explicit `db_path: null` still returns `None` and crashes `Path()`.
+        return _expand(Path(raw.get("db_path") or default))
+
+    @classmethod
+    def peek_repos_topology(cls, path: Path) -> bool:
+        """Whether `path`'s YAML still declares a non-empty `repos:`/`roles:`
+        topology, without validating or resolving it.
+
+        Independent of `resolve_repos`: `load(resolve_repos=False)` strips
+        those keys before validation, so the resulting `Config`'s `repos`/
+        `roles` can never reflect a leftover YAML topology once the DB owns
+        bindings. Callers that need to warn/gate on that leftover topology
+        must check the raw YAML instead of the loaded `Config`.
+        """
+        raw = yaml.safe_load(path.read_text()) or {}
+        return bool(raw.get("repos")) or bool(raw.get("roles"))
 
     @classmethod
     def load(cls, path: Path, *, resolve_repos: bool = True) -> Config:

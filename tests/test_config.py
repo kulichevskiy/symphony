@@ -436,6 +436,34 @@ repos:
     assert cfg.roles == {}
 
 
+def test_peek_db_path_null_falls_back_to_default(tmp_path: Path) -> None:
+    """An explicit `db_path: null` must fall back to the default, not crash
+    `Path(None)` — `.get(key, default)` only falls back when the key is
+    absent, not when it's present with a null value (SYM-188 review)."""
+    absent = tmp_path / "absent.yaml"
+    absent.write_text("poll_interval_secs: 60\n")
+    explicit_null = tmp_path / "null.yaml"
+    explicit_null.write_text("db_path: null\n")
+    assert Config.peek_db_path(explicit_null) == Config.peek_db_path(absent)
+
+
+def test_peek_repos_topology(tmp_path: Path) -> None:
+    p = tmp_path / "cfg.yaml"
+    p.write_text("repos: []\n")
+    assert Config.peek_repos_topology(p) is False
+
+    p.write_text(f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+{_BINDING_STATES}
+""")
+    assert Config.peek_repos_topology(p) is True
+
+    p.write_text("roles:\n  implement:\n    agent: codex\n")
+    assert Config.peek_repos_topology(p) is True
+
+
 def test_linear_states_ready_has_no_default() -> None:
     """`ready` must be supplied explicitly — there is no safe default."""
     with pytest.raises(ValidationError):

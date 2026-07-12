@@ -68,12 +68,23 @@ def _resolve_bindings(cfg: Config) -> None:
 
 
 async def assemble_effective_config(
-    conn: aiosqlite.Connection, base: Config, *, boot_gates: bool = True
+    conn: aiosqlite.Connection,
+    base: Config,
+    *,
+    boot_gates: bool = True,
+    yaml_has_repos_topology: bool = False,
 ) -> Config:
     """Assemble the effective `Config` from `base` (YAML system knobs) + the DB.
 
     `base` is a `Config.load`-produced config; its `repos`/`roles` are replaced
     by the DB's bindings and global matrix.
+
+    `yaml_has_repos_topology` reports whether the source YAML still declares a
+    `repos:`/`roles:` section, per `Config.peek_repos_topology`. It must come
+    from the caller rather than `base.repos`: once the DB owns bindings,
+    callers load `base` with `resolve_repos=False`, which strips `repos:`/
+    `roles:` before validation — so `base.repos` is always empty at that point
+    and can never reveal a leftover YAML topology.
 
     `boot_gates` (the daemon path) enforces the two zero-binding gates — refuse
     a start that would orphan live work or silently dispatch nothing. The
@@ -95,7 +106,7 @@ async def assemble_effective_config(
                 "(active runs, tracked open PRs, or parked operator waits); "
                 f"refusing to start and orphan it — {_IMPORT_HINT}"
             )
-        if base.repos:
+        if yaml_has_repos_topology:
             raise ConfigBootError(
                 "the config DB has zero bindings but the YAML still contains a "
                 f"`repos:` section (now ignored); {_IMPORT_HINT} before starting"
@@ -103,7 +114,7 @@ async def assemble_effective_config(
         # True fresh install: no bindings, no work, no YAML topology.
         return base.model_copy(update={"repos": [], "roles": {}})
 
-    if base.repos:
+    if yaml_has_repos_topology:
         _log.warning(
             "YAML `repos:`/`roles:` are ignored; %d binding(s) load from the DB",
             len(stored),

@@ -50,7 +50,9 @@ async def test_fresh_install_boots(tmp_path: Path) -> None:
 async def test_zero_bindings_with_yaml_repos_refuses(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     with pytest.raises(ConfigBootError, match="repos:"):
-        await assemble_effective_config(conn, _base(tmp_path, repos=True))
+        await assemble_effective_config(
+            conn, _base(tmp_path, repos=False), yaml_has_repos_topology=True
+        )
     await conn.close()
 
 
@@ -75,7 +77,9 @@ async def test_zero_bindings_over_live_work_refuses(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bindings_from_db_assembled_in_priority_order(tmp_path: Path) -> None:
+async def test_bindings_from_db_assembled_in_priority_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     await db.config_bindings.insert(
         conn,
@@ -100,11 +104,17 @@ async def test_bindings_from_db_assembled_in_priority_order(tmp_path: Path) -> N
     await db.config_globals.set_globals(
         conn, roles={"implement": {"agent": "codex"}}, migrated_at="t"
     )
-    # YAML still has repos — ignored because the DB has bindings (not an error).
-    cfg = await assemble_effective_config(conn, _base(tmp_path, repos=True))
+    # Production shape once the DB owns bindings: `base` is loaded with
+    # `resolve_repos=False`, so `base.repos` is always empty — the leftover
+    # YAML topology is only knowable via `yaml_has_repos_topology`.
+    with caplog.at_level("WARNING"):
+        cfg = await assemble_effective_config(
+            conn, _base(tmp_path, repos=False), yaml_has_repos_topology=True
+        )
     assert [b.project_key for b in cfg.repos] == ["ENG", "WEB"]
     # Global matrix flows through and resolves.
     assert cfg.repos[0].resolved_role("implement", cfg.roles).agent == "codex"
+    assert "YAML `repos:`/`roles:` are ignored" in caplog.text
     await conn.close()
 
 
@@ -182,6 +192,48 @@ async def test_disabled_binding_with_unresolvable_env_does_not_block_boot(tmp_pa
     )
     cfg = await assemble_effective_config(conn, _base(tmp_path))
     assert [b.project_key for b in cfg.repos] == ["ENG"]
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_warns_on_leftover_yaml_repos_via_real_load_path(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduces the actual production shape end-to-end: a YAML file with a
+    `repos:` block, loaded with `resolve_repos=False` (as every caller does
+    once the DB has bindings), leaves `base.repos == []` — the warning must
+    still fire from `Config.peek_repos_topology`, not from `base.repos`."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"""
+workspace_root: {tmp_path / "ws"}
+log_root: {tmp_path / "logs"}
+db_path: {tmp_path / "state.sqlite"}
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    linear_states: {{ready: Todo, code_review: In Review}}
+"""
+    )
+    base = Config.load(p, resolve_repos=False)
+    assert base.repos == []
+
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    with caplog.at_level("WARNING"):
+        await assemble_effective_config(
+            conn, base, yaml_has_repos_topology=Config.peek_repos_topology(p)
+        )
+    assert "YAML `repos:`/`roles:` are ignored" in caplog.text
     await conn.close()
 
 
