@@ -2163,14 +2163,10 @@ async def test_issue_timeline_api_pages_newest_first_without_gaps(tmp_path: Path
             page1 = await client.get("/api/issues/iss-timeline/timeline?limit=5")
             body1 = page1.json()
             oldest1 = body1[0]["ts"]
-            page2 = await client.get(
-                f"/api/issues/iss-timeline/timeline?limit=5&before={oldest1}"
-            )
+            page2 = await client.get(f"/api/issues/iss-timeline/timeline?limit=5&before={oldest1}")
             body2 = page2.json()
             oldest2 = body2[0]["ts"]
-            page3 = await client.get(
-                f"/api/issues/iss-timeline/timeline?limit=5&before={oldest2}"
-            )
+            page3 = await client.get(f"/api/issues/iss-timeline/timeline?limit=5&before={oldest2}")
             body3 = page3.json()
     finally:
         await conn.close()
