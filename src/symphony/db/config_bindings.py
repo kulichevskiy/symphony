@@ -109,9 +109,7 @@ def _row_to_binding(row: aiosqlite.Row) -> StoredBinding:
     try:
         payload = json.loads(row["payload"])
     except json.JSONDecodeError as e:
-        raise ValueError(
-            f"config binding row {row['id']} has malformed payload JSON: {e}"
-        ) from e
+        raise ValueError(f"config binding row {row['id']} has malformed payload JSON: {e}") from e
     return StoredBinding(
         id=int(row["id"]),
         payload=payload,
