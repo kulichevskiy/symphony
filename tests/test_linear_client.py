@@ -60,6 +60,55 @@ async def test_comments_since_paginates_all_matching_comments() -> None:
     assert [call["cursor"] for call in calls] == [None, "cursor-1"]
 
 
+def _state_issue_node(uid: str, ident: str) -> dict[str, Any]:
+    return {
+        "id": uid,
+        "identifier": ident,
+        "title": f"t {ident}",
+        "description": "",
+        "url": "https://linear.app/x",
+        "updatedAt": "2026-07-12T09:00:00Z",
+        "state": {"id": "s1", "name": "Todo", "type": "unstarted"},
+        "team": {"id": "t1", "key": "ENG"},
+        "labels": {"nodes": []},
+        "relations": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+        "inverseRelations": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+    }
+
+
+@pytest.mark.asyncio
+async def test_issues_in_state_paginates_past_the_first_page() -> None:
+    linear = Linear("test-key")
+    calls: list[dict[str, Any]] = []
+    pages = [
+        {
+            "issues": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                "nodes": [_state_issue_node("iss-1", "ENG-1")],
+            }
+        },
+        {
+            "issues": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [_state_issue_node("iss-2", "ENG-2")],
+            }
+        },
+    ]
+
+    async def fake_query(_gql: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append(variables)
+        return pages.pop(0)
+
+    linear._query = fake_query  # type: ignore[method-assign]
+    try:
+        issues = await linear.issues_in_state("ENG", "Todo", "symphony")
+    finally:
+        await linear.aclose()
+
+    assert [i.identifier for i in issues] == ["ENG-1", "ENG-2"]
+    assert [call["cursor"] for call in calls] == [None, "cursor-1"]
+
+
 @pytest.mark.asyncio
 async def test_issue_external_snapshot_returns_latest_comments_desc() -> None:
     linear = Linear("test-key")

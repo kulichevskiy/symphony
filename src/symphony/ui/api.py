@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..linear.slash import SlashKind
+from ..tracker import DEFAULT_PROVIDER, DEFAULT_SITE
 from .db import ReadOnlyDbPool
 from .status import (
     DEFAULT_STUCK_THRESHOLDS,
@@ -837,16 +838,31 @@ def _queue_row_matches(
     return True
 
 
+def _queue_tracker_context(row: Mapping[str, Any]) -> tuple[str, str]:
+    """(provider, site) from a queue row's binding scope (`repo#label#provider#site`)."""
+    parts = str(row.get("scope") or "").rsplit("#", 2)
+    if len(parts) == 3:
+        return (parts[1], parts[2])
+    return (DEFAULT_PROVIDER, DEFAULT_SITE)
+
+
+def _queue_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Full tracker identity of a queue row: (provider, site, tracker issue id)."""
+    provider, site = _queue_tracker_context(row)
+    return (provider, site, str(row["issue_id"]))
+
+
 def _dedupe_queue_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Collapse multi-binding snapshots to one row per tracker issue.
 
     Two bindings on one team can both see the same queued issue; the board
     must show one card. Prefer the ready row (the daemon will dispatch it),
-    then the earliest sighting.
+    then the earliest sighting. The key carries the tracker identity, so the
+    same raw id from two different trackers never collapses.
     """
-    best: dict[tuple[str, str], dict[str, Any]] = {}
+    best: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for row in rows:
-        key = (str(row["team_key"]), str(row["issue_id"]))
+        key = (str(row["team_key"]), *_queue_key(row))
         cur = best.get(key)
         if (
             cur is None
@@ -857,6 +873,58 @@ def _dedupe_queue_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ):
             best[key] = row
     return list(best.values())
+
+
+async def _resolve_queue_storage_ids(
+    conn: aiosqlite.Connection,
+    rows: list[dict[str, Any]],
+) -> dict[tuple[str, str, str], str]:
+    """Map queue rows' tracker identities to `issues` storage ids (if any)."""
+    if not rows:
+        return {}
+    keys = {_queue_key(row) for row in rows}
+    conds = " OR ".join("(provider = ? AND site = ? AND tracker_issue_id = ?)" for _ in keys)
+    params = tuple(value for key in keys for value in key)
+    cur = await conn.execute(
+        f"SELECT id, provider, site, tracker_issue_id FROM issues WHERE {conds}",
+        params,
+    )
+    return {
+        (str(row["provider"]), str(row["site"]), str(row["tracker_issue_id"])): str(row["id"])
+        for row in await cur.fetchall()
+    }
+
+
+async def _queue_ids_matching_usage(
+    conn: aiosqlite.Connection,
+    storage_ids: set[str],
+    *,
+    provider: str | None,
+    models: list[tuple[str, str]],
+) -> set[str]:
+    """Storage ids (of queued issues) whose historical usage matches the
+    active provider/model filters — mirrors `_list_issues_query` semantics."""
+    if not storage_ids:
+        return set()
+    placeholders = ",".join("?" * len(storage_ids))
+    conds = [f"r.issue_id IN ({placeholders})"]
+    params: list[str] = list(storage_ids)
+    if provider is not None:
+        conds.append("u.provider = ?")
+        params.append(provider)
+    if models:
+        conds.append(_model_in_clause(models))
+        params.extend(_model_params(models))
+    cur = await conn.execute(
+        f"""
+        SELECT DISTINCT r.issue_id
+        FROM run_model_usage u
+        JOIN runs r ON r.id = u.run_id
+        WHERE {" AND ".join(conds)}
+        """,
+        tuple(params),
+    )
+    return {str(row["issue_id"]) for row in await cur.fetchall()}
 
 
 def _list_issues_query(
@@ -1055,21 +1123,20 @@ def create_api_router(
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             issues = [dict(row) for row in rows]
-            # Queue rows describe issues with no runs, so they can't satisfy a
-            # provider/model filter — skip the merge entirely when one is set.
+            qcur = await conn.execute(
+                """
+                SELECT team_key, scope, issue_id, identifier, title, queue,
+                       state_name, blocked_by, seen_at
+                FROM tracker_queue
+                """
+            )
+            raw_queue = [dict(row) for row in await qcur.fetchall()]
             queue_rows: list[dict[str, Any]] = []
-            if not is_done and provider_filter is None and not model_filter:
-                qcur = await conn.execute(
-                    """
-                    SELECT team_key, issue_id, identifier, title, queue,
-                           state_name, blocked_by, seen_at
-                    FROM tracker_queue
-                    """
-                )
+            if not is_done:
                 queue_rows = _dedupe_queue_rows(
                     [
                         row
-                        for row in map(dict, await qcur.fetchall())
+                        for row in raw_queue
                         if _queue_row_matches(
                             row, q=q, teams=team_filter, date_from=date_from, date_to=date_to
                         )
@@ -1078,21 +1145,27 @@ def create_api_router(
             # Queue issues the daemon has seen before (a requeued issue, or
             # dispatch paused) have an `issues` row and thus an issue page —
             # resolve their storage ids so they stay internal links. Keyed by
-            # the tracker's own issue id, not the display identifier, which is
-            # not unique across tracker providers/sites.
-            queue_storage_ids: dict[str, str] = {}
-            queue_totals: dict[str, dict[str, Any]] = {}
-            if queue_rows:
-                placeholders = ",".join("?" * len(queue_rows))
-                icur = await conn.execute(
-                    "SELECT id, tracker_issue_id FROM issues "
-                    f"WHERE tracker_issue_id IN ({placeholders})",
-                    tuple(str(row["issue_id"]) for row in queue_rows),
+            # the full tracker identity (provider, site, tracker issue id)
+            # carried in the snapshot's scope — display identifiers are not
+            # unique across tracker providers/sites. The done scope resolves
+            # every queued row so it can suppress issues that were requeued.
+            resolve_rows = raw_queue if is_done else queue_rows
+            queue_storage_ids = await _resolve_queue_storage_ids(conn, resolve_rows)
+            queued_storage_id_set = set(queue_storage_ids.values())
+            if not is_done and (provider_filter is not None or model_filter):
+                # Usage filters: queue-only rows have no runs and drop out,
+                # but a requeued issue with matching historical usage stays.
+                matching = await _queue_ids_matching_usage(
+                    conn,
+                    queued_storage_id_set,
+                    provider=provider_filter,
+                    models=model_filter,
                 )
-                queue_storage_ids = {
-                    str(row["tracker_issue_id"]): str(row["id"]) for row in await icur.fetchall()
-                }
-            if queue_storage_ids:
+                queue_rows = [
+                    row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) in matching
+                ]
+            queue_totals: dict[str, dict[str, Any]] = {}
+            if queue_storage_ids and not is_done:
                 # A requeued issue keeps its historical spend and activity —
                 # don't report zeros just because it is back in the queue.
                 placeholders = ",".join("?" * len(queue_storage_ids))
@@ -1132,6 +1205,10 @@ def create_api_router(
             for issue, status in statuses:
                 if status.state != "done":
                     continue
+                # A completed issue that was requeued (back in Todo/Waiting)
+                # shows in the active scope's queue lanes — not in Done too.
+                if str(issue["id"]) in queued_storage_id_set:
+                    continue
                 completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
                 if completed_at is None:
                     continue
@@ -1156,9 +1233,9 @@ def create_api_router(
             triples = [(issue, status, None) for issue, status in statuses]
 
         queue_by_storage_id = {
-            queue_storage_ids[str(row["issue_id"])]: row
+            queue_storage_ids[_queue_key(row)]: row
             for row in queue_rows
-            if str(row["issue_id"]) in queue_storage_ids
+            if _queue_key(row) in queue_storage_ids
         }
         payloads: list[IssueSummary] = []
         for issue, status, completed_at in triples:
@@ -1190,13 +1267,11 @@ def create_api_router(
         # tracker.
         active_ids = {str(issue["id"]) for issue, _ in statuses}
         extras = [
-            row
-            for row in queue_rows
-            if queue_storage_ids.get(str(row["issue_id"])) not in active_ids
+            row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) not in active_ids
         ]
         extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
         for row in extras:
-            storage_id = queue_storage_ids.get(str(row["issue_id"]))
+            storage_id = queue_storage_ids.get(_queue_key(row))
             totals = queue_totals.get(storage_id or "", {})
             payloads.append(
                 IssueSummary.model_validate(

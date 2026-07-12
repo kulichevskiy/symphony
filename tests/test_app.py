@@ -453,6 +453,11 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
         await db.issues.upsert(
             conn, id="issue-idle", identifier="ADJ-2", title="Queued", team_key="ADJ"
         )
+        # A completed (merged-PR) issue requeued in the tracker — must show as
+        # todo in the active scope and be suppressed from Done.
+        await db.issues.upsert(
+            conn, id="issue-done", identifier="ADJ-4", title="Redo", team_key="ADJ"
+        )
         await conn.execute(
             """
             INSERT INTO runs (
@@ -464,6 +469,21 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
                  '2026-07-12T08:00:00Z', NULL, 0, 0),
                 ('r-2', 'issue-idle', 'implement', 'failed', NULL,
                  '2026-07-10T08:00:00Z', '2026-07-10T09:00:00Z', 1000, 200)
+            """
+        )
+        # Historical codex usage for the requeued issue — the provider filter
+        # must keep it even though it is only reachable via the queue.
+        await conn.execute(
+            """
+            INSERT INTO run_model_usage (run_id, provider, model, input_tokens, output_tokens)
+            VALUES ('r-2', 'codex', 'gpt-5', 1000, 200)
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (issue_id, github_repo, pr_number, pr_url, created_at, merged_at)
+            VALUES ('issue-done', 'org/repo', 7, 'https://x/pr/7',
+                    '2026-07-01T08:00:00Z', '2026-07-02T08:00:00Z')
             """
         )
         await db.tracker_queue.replace_scan(
@@ -493,6 +513,13 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
                     queue="waiting",
                     state_name="Waiting",
                     blocked_by="ADJ-2",
+                ),
+                db.tracker_queue.QueueRow(
+                    issue_id="issue-done",
+                    identifier="ADJ-4",
+                    title="Redo",
+                    queue="ready",
+                    state_name="Todo",
                 ),
             ],
             seen_at="2026-07-12T09:00:00Z",
@@ -563,14 +590,18 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
         "stuck_for": None,
     }
     assert wait["output_tokens"] == 0
+    # The requeued done issue shows in the queue lanes...
+    assert by_identifier["ADJ-4"]["canonical_status"]["state"] == "todo"
+    assert by_identifier["ADJ-4"]["id"] == "issue-done"
 
-    # The done scope never includes queue rows.
+    # ...and is suppressed from Done while queued — no double counting.
     assert done.status_code == 200
     assert [issue["identifier"] for issue in done.json()] == []
 
-    # Queue rows have no runs, so provider/model-filtered views exclude them.
+    # Under a provider filter, queue-only rows drop out (no runs), but the
+    # requeued issue with matching historical codex usage stays.
     assert filtered.status_code == 200
-    assert [issue["identifier"] for issue in filtered.json()] == []
+    assert [issue["identifier"] for issue in filtered.json()] == ["ADJ-2"]
 
     # A historical date window excludes today's queue rows (seen_at is
     # outside the window), keeping filtered views honest.
