@@ -324,3 +324,39 @@ CREATE TABLE IF NOT EXISTS tracker_queue (
     seen_at    TEXT NOT NULL,
     PRIMARY KEY (team_key, scope, issue_id)
 );
+
+-- Config source of truth (SYM-188). Repo bindings and the global roles matrix
+-- live here, not in YAML. One row per binding: a *sparse* JSON payload of the
+-- operator-set RepoBinding fields only (no defaults materialized, no legacy
+-- top-level role fields). The natural-key columns are byte-compatible with the
+-- orchestrator's `_binding_key` tuple — same components in the same order
+-- (project key, github repo, issue label, tracker provider, tracker site) —
+-- and `issue_label` is normalized to '' so the unlabeled catch-all binding
+-- can't be configured twice (SQLite treats NULLs as distinct).
+CREATE TABLE IF NOT EXISTS config_bindings (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    payload          TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1,
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    priority         INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL DEFAULT '',
+    updated_by       TEXT NOT NULL DEFAULT '',
+    project_key      TEXT NOT NULL,
+    github_repo      TEXT NOT NULL,
+    issue_label      TEXT NOT NULL DEFAULT '',
+    tracker_provider TEXT NOT NULL,
+    tracker_site     TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_config_bindings_natural_key
+    ON config_bindings(project_key, github_repo, issue_label, tracker_provider, tracker_site);
+
+-- Single-document global config: the global roles matrix (JSON) plus the
+-- one-off migration marker (`migrated_at`, empty until the importer runs).
+-- `version` participates in the same optimistic-locking check as bindings.
+CREATE TABLE IF NOT EXISTS config_globals (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    roles       TEXT NOT NULL DEFAULT '{}',
+    migrated_at TEXT NOT NULL DEFAULT '',
+    version     INTEGER NOT NULL DEFAULT 1
+);

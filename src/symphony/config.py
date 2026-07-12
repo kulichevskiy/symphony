@@ -116,7 +116,10 @@ def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) 
         return True
     if agent == "codex":
         return model in SUPPORTED_CODEX_MODELS
-    return model in CLAUDE_MODEL_ALIASES
+    # Aliases (opus/sonnet/haiku) plus full `claude-*` IDs verbatim — the
+    # latter already flow through `--model` today, and the importer preserves
+    # a pinned full ID when no alias applies (SYM-188).
+    return model in CLAUDE_MODEL_ALIASES or model.startswith("claude-")
 
 
 def _role_effort_in_family(agent: Literal["claude", "codex"], effort: str | None) -> bool:
@@ -552,6 +555,20 @@ class RepoBinding(BaseModel):
         # `effort` has no legacy top-level field, so its only source is the
         # `roles:` blocks; unset stays None (no flag).
         return ResolvedRole(agent=agent, model=model, effort=effort)
+
+
+def binding_natural_key(binding: RepoBinding) -> tuple[str, str, str, str, str]:
+    """The binding's natural key — the components the orchestrator's
+    `_binding_key` uses, in the same order (project key, github repo, issue
+    label normalized to '', tracker provider, tracker site). Persisted as the
+    `config_bindings` unique key and used for the stable dispatch tiebreak."""
+    return (
+        binding.project_key,
+        binding.github_repo,
+        binding.issue_label or "",
+        binding.tracker_provider,
+        binding.tracker_site,
+    )
 
 
 class Secrets(BaseSettings):

@@ -45,7 +45,7 @@ from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
-from ...config import Config, RepoBinding
+from ...config import Config, RepoBinding, binding_natural_key
 from ...github.client import GitHub, GitHubClient, GitHubError
 from ...github.webhook import GitHubWebhookEvent
 from ...linear.client import LinearError, comment_from_webhook_payload
@@ -157,13 +157,9 @@ def _state_cache_key(binding: RepoBinding) -> StateCacheKey:
 
 
 def _binding_key(binding: RepoBinding) -> BindingKey:
-    return (
-        binding.linear_team_key,
-        binding.github_repo,
-        binding.issue_label or "",
-        binding.tracker_provider,
-        binding.tracker_site,
-    )
+    # Single source of truth for the tuple layout — the persisted
+    # `config_bindings` natural key must stay byte-compatible with this.
+    return binding_natural_key(binding)
 
 
 def _queue_scope(binding: RepoBinding) -> str:

@@ -37,6 +37,23 @@ class _FakeRunner:
         pass
 
 
+def _seed_bindings_from_yaml(cfg_path: Path, db_path: Path) -> None:
+    """Import a YAML config's bindings into the config DB — the daemon boots
+    its topology from SQLite (SYM-188)."""
+    import asyncio
+
+    from symphony.config_import import import_config
+
+    async def _seed() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await import_config(cfg_path, conn, now="seed")
+        finally:
+            await conn.close()
+
+    asyncio.run(_seed())
+
+
 def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Stub the heavy components Orchestrator constructs by default so
     `dispatch` CLI tests do not need a live `gh`, `git push`, or agent
@@ -375,6 +392,9 @@ def test_once_drains_scheduled_dispatch_before_exit(tmp_path: Path, monkeypatch)
     db_path = tmp_path / "state.sqlite"
     cfg_path = tmp_path / "cfg.yaml"
     cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+    # The daemon boots bindings from the DB (SYM-188), so import the YAML
+    # topology first — mirrors the operator's one-off `config-import`.
+    _seed_bindings_from_yaml(cfg_path, db_path)
 
     issue = LinearIssue(
         id="iss-once",
@@ -453,6 +473,52 @@ def _install_fake_linear(monkeypatch, fake: _FakeLinear) -> None:  # type: ignor
 
     monkeypatch.setattr("symphony.cli.Linear", _factory)
     monkeypatch.setattr("symphony.cli.for_binding", _for_binding)
+
+
+def test_dispatch_resolves_binding_from_db_not_yaml(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Manual dispatch operates over the assembled config: the binding lives
+    only in the DB and the YAML carries no `repos:` at all (SYM-188)."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    db_path = tmp_path / "state.sqlite"
+    # Import the topology, then hand dispatch a config file with NO repos:.
+    seed_yaml = tmp_path / "seed.yaml"
+    seed_yaml.write_text(_yaml(team="ENG", db_path=db_path))
+    _seed_bindings_from_yaml(seed_yaml, db_path)
+    cfg_path = tmp_path / "cfg.yaml"
+    cfg_path.write_text(
+        f"db_path: {db_path}\n"
+        f"log_root: {db_path.parent / 'logs'}\n"
+        f"workspace_root: {db_path.parent / 'workspaces'}\n"
+    )
+
+    issue = LinearIssue(
+        id="iss-db",
+        identifier="ENG-7",
+        title="from db binding",
+        description="",
+        url="https://linear.app/x",
+        state_id="state-todo",
+        state_name="Todo",
+        state_type="unstarted",
+        team_key="ENG",
+    )
+    fake = _FakeLinear(issue)
+    _install_fake_linear(monkeypatch, fake)
+    _install_fake_runtime(monkeypatch)
+
+    result = CliRunner().invoke(main, ["dispatch", "ENG-7", "--config", str(cfg_path)])
+    assert result.exit_code == 0, result.output
+    assert "org/api-svc" in result.output
+
+    async def _check() -> None:
+        conn = await db.connect(db_path)
+        try:
+            history = await db.runs.history_for_issue(conn, "iss-db")
+            assert [r.stage for r in history][:1] == ["implement"]
+        finally:
+            await conn.close()
+
+    asyncio.run(_check())
 
 
 def test_dispatch_creates_run_for_known_team_binding(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
