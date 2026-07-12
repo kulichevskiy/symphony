@@ -111,4 +111,25 @@ describe("AuthGate", () => {
 
     expect(await findByText("Access denied")).toBeTruthy();
   });
+
+  it("retries a non-403 probe failure instead of giving up immediately", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValueOnce(new ApiError(401)).mockResolvedValue({});
+
+    const { findByTestId, queryByText } = renderGate();
+
+    expect(await findByTestId("dashboard")).toBeTruthy();
+    await waitFor(() => expect(fetchMeta).toHaveBeenCalledTimes(2));
+    expect(queryByText("Access denied")).toBeNull();
+  });
+
+  it("never retries a 403 probe failure", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(403));
+
+    const { findByText } = renderGate();
+
+    expect(await findByText("Access denied")).toBeTruthy();
+    expect(fetchMeta).toHaveBeenCalledTimes(1);
+  });
 });

@@ -168,13 +168,20 @@ export function AuthGate({ children }: { children: ReactNode }) {
  * probe is in flight, and only swaps to the access-denied screen on a 403. A
  * non-allowlisted user's dashboard queries fail auth identically anyway, so
  * running them in parallel with the probe costs nothing and saves a round-trip.
+ *
+ * Only 403 is terminal (retrying it can't change the allowlist verdict).
+ * Every other failure — a 401 from a not-yet-refreshed ID token, a 5xx, a
+ * network blip — retries a few times, since `fetchMeta` re-fetches a fresh
+ * token/response each attempt and these are typically transient.
  */
 function AllowlistGate({ children }: { children: ReactNode }) {
   const { logout } = useAuth0();
   const { error } = useQuery({
     queryKey: ["auth-probe"],
     queryFn: fetchMeta,
-    retry: false,
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && error.status === 403) && failureCount < 3,
+    retryDelay: 0,
     staleTime: Infinity,
   });
 
