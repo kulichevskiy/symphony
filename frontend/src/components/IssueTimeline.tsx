@@ -90,6 +90,21 @@ export function hasEarlierEvents(pageLength: number): boolean {
   return pageLength >= TIMELINE_PAGE_LIMIT;
 }
 
+// Merges pages keyed on ts+kind and re-sorts, so a moving "newest" window
+// (refetched on the interval) can never drift apart from loaded earlier
+// pages and silently drop the events between them.
+export function mergeTimelineEvents(
+  ...pages: TimelineEvent[][]
+): TimelineEvent[] {
+  const byKey = new Map<string, TimelineEvent>();
+  for (const page of pages) {
+    for (const event of page) {
+      byKey.set(`${event.ts}:${event.kind}`, event);
+    }
+  }
+  return [...byKey.values()].sort((left, right) => left.ts.localeCompare(right.ts));
+}
+
 async function fetchIssueTimeline(id: string, before?: string): Promise<TimelineEvent[]> {
   const response = await fetch(buildTimelineUrl(id, before), {
     headers: await authHeaders(),
@@ -372,27 +387,35 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     staleTime: 0,
   });
 
-  // Older pages loaded on demand, kept ascending and older than `data`.
-  const [earlier, setEarlier] = useState<TimelineEvent[]>([]);
+  // All loaded events (auto-refreshing newest page + any earlier pages),
+  // merged and re-sorted on every update so the moving newest window and the
+  // on-demand earlier pages can never drift apart and drop events between them.
+  const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [earlierError, setEarlierError] = useState<string | null>(null);
+  const [earlierLoadedOnce, setEarlierLoadedOnce] = useState(false);
 
   useEffect(() => {
-    setEarlier([]);
+    setEvents([]);
     setHasMoreEarlier(false);
     setEarlierError(null);
+    setEarlierLoadedOnce(false);
   }, [issueId]);
 
-  // Seed the load-earlier control from the auto-refreshing newest page, without
-  // clobbering pages the user already loaded.
+  // Fold each refetch of the newest page into the accumulator instead of
+  // replacing it, so events already merged in from earlier pages survive.
   useEffect(() => {
-    if (data && earlier.length === 0) {
+    if (!data) {
+      return;
+    }
+    setEvents((prev) => mergeTimelineEvents(prev, data));
+    // Seed the load-earlier control from the newest page's size, without
+    // clobbering it once the user has started paging back manually.
+    if (!earlierLoadedOnce) {
       setHasMoreEarlier(hasEarlierEvents(data.length));
     }
-  }, [data, earlier.length]);
-
-  const events = useMemo(() => [...earlier, ...(data ?? [])], [earlier, data]);
+  }, [data, earlierLoadedOnce]);
 
   async function loadEarlier() {
     const cursor = oldestLoadedTs(events);
@@ -403,8 +426,9 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     setEarlierError(null);
     try {
       const page = await fetchIssueTimeline(issueId, cursor);
-      setEarlier((prev) => [...page, ...prev]);
+      setEvents((prev) => mergeTimelineEvents(prev, page));
       setHasMoreEarlier(hasEarlierEvents(page.length));
+      setEarlierLoadedOnce(true);
     } catch (loadError) {
       setEarlierError((loadError as Error).message);
     } finally {
