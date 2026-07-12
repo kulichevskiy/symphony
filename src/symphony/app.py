@@ -44,7 +44,12 @@ _DEFAULT_UI_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
 class SPAStaticFiles(StaticFiles):
-    """StaticFiles variant that falls back to index.html for client routes."""
+    """StaticFiles variant that falls back to index.html for client routes.
+
+    Vite content-hashes filenames under ``assets/``, so those are immutable and
+    cached for a year; ``index.html`` is served ``no-cache`` so deploys are
+    picked up immediately via ETag revalidation of just the one small document.
+    """
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         try:
@@ -53,6 +58,21 @@ class SPAStaticFiles(StaticFiles):
             if exc.status_code != 404:
                 raise
         return await super().get_response("index.html", scope)
+
+    def file_response(
+        self,
+        full_path: os.PathLike[str] | str,
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        path = Path(full_path)
+        if path.parent.name == "assets":
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path.name == "index.html":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def create_app(
