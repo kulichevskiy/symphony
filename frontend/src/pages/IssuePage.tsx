@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router";
 
 import {
@@ -768,18 +768,48 @@ function DebugSection({
   title,
   children,
   defaultOpen,
+  onToggle,
 }: {
   title: string;
   children: ReactNode;
   defaultOpen?: boolean;
+  onToggle?: (open: boolean) => void;
 }) {
   return (
-    <details className="border-t border-border py-3" open={defaultOpen}>
+    <details
+      className="border-t border-border py-3"
+      open={defaultOpen}
+      onToggle={
+        onToggle ? (e) => onToggle((e.target as HTMLDetailsElement).open) : undefined
+      }
+    >
       <summary className="cursor-pointer select-none text-sm font-medium text-muted-foreground hover:text-foreground">
         {title}
       </summary>
       <div className="mt-3">{children}</div>
     </details>
+  );
+}
+
+/** The raw detail JSON, serialized only while the section is open. The page
+ *  re-renders every 5s (detail poll) + 10s (nowMs tick); a collapsed section
+ *  must not pay the `JSON.stringify` cost each time. */
+export function rawDetailJson(detail: IssueDetail, open: boolean): string {
+  return open ? JSON.stringify(detail, null, 2) : "";
+}
+
+/** Advanced/Debug "Raw JSON" pane: tracks its own open state (like
+ *  {@link TimelineSection}) and serializes `detail` only while open, memoized
+ *  on `detail` so re-renders at the same open state don't re-stringify. */
+function RawJsonSection({ detail }: { detail: IssueDetail }) {
+  const [open, setOpen] = useState(false);
+  const json = useMemo(() => rawDetailJson(detail, open), [detail, open]);
+  return (
+    <DebugSection title="Raw JSON" onToggle={setOpen}>
+      <pre className="max-h-[420px] overflow-auto rounded-md border border-border bg-background p-3 text-xs leading-relaxed">
+        {json}
+      </pre>
+    </DebugSection>
   );
 }
 
@@ -1211,11 +1241,7 @@ export function IssuePage() {
                     }
                   />
                 </DebugSection>
-                <DebugSection title="Raw JSON">
-                  <pre className="max-h-[420px] overflow-auto rounded-md border border-border bg-background p-3 text-xs leading-relaxed">
-                    {JSON.stringify(detail, null, 2)}
-                  </pre>
-                </DebugSection>
+                <RawJsonSection detail={detail} />
               </div>
             </details>
           </section>
