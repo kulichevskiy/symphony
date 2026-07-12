@@ -32,15 +32,16 @@ class ApiError extends Error {
 }
 
 const fetchMeta = vi.fn();
+const fetchAuthConfig = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   ApiError,
   fetchMeta: (...args: unknown[]) => fetchMeta(...args),
-  fetchAuthConfig: vi.fn(),
+  fetchAuthConfig: (...args: unknown[]) => fetchAuthConfig(...args),
 }));
 
 // Imported after the mocks are registered.
-const { AccessDenied, AuthGate } = await import("./auth0");
+const { AccessDenied, AuthGate, resolveAuthConfig } = await import("./auth0");
 
 function renderGate() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -54,6 +55,37 @@ function renderGate() {
     </StrictMode>,
   );
 }
+
+describe("resolveAuthConfig", () => {
+  beforeEach(() => {
+    fetchAuthConfig.mockReset();
+    delete window.__authConfig;
+  });
+
+  it("retries with a fresh request when the preloaded fetch rejected", async () => {
+    window.__authConfig = Promise.reject(new Error("network blip"));
+    fetchAuthConfig.mockResolvedValue({
+      enabled: true,
+      domain: "example.us.auth0.com",
+      client_id: "abc123",
+    });
+
+    const resolved = await resolveAuthConfig();
+
+    expect(resolved).toEqual({ domain: "example.us.auth0.com", clientId: "abc123" });
+    expect(fetchAuthConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the build-time config only after the retry also fails", async () => {
+    window.__authConfig = Promise.reject(new Error("network blip"));
+    fetchAuthConfig.mockRejectedValue(new Error("still down"));
+
+    const resolved = await resolveAuthConfig();
+
+    expect(resolved).toBeNull();
+    expect(fetchAuthConfig).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("AccessDenied", () => {
   it("shows an access-denied message with a sign-out action", () => {
@@ -112,9 +144,9 @@ describe("AuthGate", () => {
     expect(await findByText("Access denied")).toBeTruthy();
   });
 
-  it("retries a non-403 probe failure instead of giving up immediately", async () => {
+  it("retries a non-401/403 probe failure instead of giving up immediately", async () => {
     authState = { isLoading: false, isAuthenticated: true, error: null };
-    fetchMeta.mockRejectedValueOnce(new ApiError(401)).mockResolvedValue({});
+    fetchMeta.mockRejectedValueOnce(new ApiError(500)).mockResolvedValue({});
 
     const { findByTestId, queryByText } = renderGate();
 
@@ -130,6 +162,16 @@ describe("AuthGate", () => {
     const { findByText } = renderGate();
 
     expect(await findByText("Access denied")).toBeTruthy();
+    expect(fetchMeta).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries a 401 probe failure (authHeaders already redirected)", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(401));
+
+    const { findByText } = renderGate();
+
+    expect(await findByText("Couldn't verify access")).toBeTruthy();
     expect(fetchMeta).toHaveBeenCalledTimes(1);
   });
 

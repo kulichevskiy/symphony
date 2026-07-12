@@ -52,7 +52,7 @@ describe("auth0PreconnectTags", () => {
     expect(tags[0]).toMatchObject({
       tag: "link",
       attrs: { rel: "preconnect", href: "https://example.us.auth0.com" },
-      injectTo: "head",
+      injectTo: "head-prepend",
     });
   });
 

@@ -12,7 +12,7 @@ export function auth0PreconnectTags(domain?: string): HtmlTagDescriptor[] {
     {
       tag: "link",
       attrs: { rel: "preconnect", href: `https://${domain}`, crossorigin: true },
-      injectTo: "head",
+      injectTo: "head-prepend",
     },
   ];
 }

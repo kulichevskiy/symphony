@@ -36,24 +36,33 @@ interface ResolvedAuthConfig {
   clientId: string;
 }
 
+function toResolvedConfig(config: AuthConfig): ResolvedAuthConfig | null {
+  return config.enabled && config.domain && config.client_id
+    ? { domain: config.domain, clientId: config.client_id }
+    : null;
+}
+
 /** The running daemon's `/api/auth-config` is authoritative for whether/how
  *  to run the Auth0 flow. Only falls back to the build-time `VITE_AUTH0_*`
- *  vars when that call fails outright (e.g. network hiccup), so a reachable
- *  daemon's runtime config always wins over whatever was baked into this
- *  bundle at build time. */
-async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
+ *  vars when a fresh retry also fails outright (e.g. sustained network
+ *  outage), so a reachable daemon's runtime config always wins over whatever
+ *  was baked into this bundle at build time. */
+export async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
   try {
     // Prefer the in-flight fetch the inline script started; fall back to our
     // own request if it isn't present (e.g. bundle loaded outside index.html).
-    const config = await (window.__authConfig ?? fetchAuthConfig());
-    if (config.enabled && config.domain && config.client_id) {
-      return { domain: config.domain, clientId: config.client_id };
-    }
-    return null;
+    return toResolvedConfig(await (window.__authConfig ?? fetchAuthConfig()));
   } catch {
-    return BUILD_DOMAIN && BUILD_CLIENT_ID
-      ? { domain: BUILD_DOMAIN, clientId: BUILD_CLIENT_ID }
-      : null;
+    // The preload may have failed transiently (dev proxy/API not ready yet, a
+    // brief 5xx/network blip) before the bundle even ran. Retry with a fresh
+    // request before falling back to the build-time config.
+    try {
+      return toResolvedConfig(await fetchAuthConfig());
+    } catch {
+      return BUILD_DOMAIN && BUILD_CLIENT_ID
+        ? { domain: BUILD_DOMAIN, clientId: BUILD_CLIENT_ID }
+        : null;
+    }
   }
 }
 
@@ -169,13 +178,15 @@ export function AuthGate({ children }: { children: ReactNode }) {
  * non-allowlisted user's dashboard queries fail auth identically anyway, so
  * running them in parallel with the probe costs nothing and saves a round-trip.
  *
- * Only 403 is terminal (retrying it can't change the allowlist verdict).
- * Every other failure — a 401 from a not-yet-refreshed ID token, a 5xx, a
- * network blip — retries a few times, since `fetchMeta` re-fetches a fresh
- * token/response each attempt and these are typically transient. If those
- * retries are exhausted, the probe is unreachable enough that the dashboard
- * queries are too, so it shows a notice instead of silently mounting a
- * dashboard that can't load anything.
+ * 403 and 401 are both terminal, not retried: retrying a 403 can't change the
+ * allowlist verdict, and a 401 here means `authHeaders()` already couldn't
+ * renew the session and dispatched its own `loginWithRedirect()` before
+ * sending the probe without a token — retrying would just fire off another
+ * redirect. Every other failure — a 5xx, a network blip — retries a few
+ * times, since `fetchMeta` re-fetches a fresh token/response each attempt and
+ * these are typically transient. If those retries are exhausted, the probe is
+ * unreachable enough that the dashboard queries are too, so it shows a notice
+ * instead of silently mounting a dashboard that can't load anything.
  */
 function AllowlistGate({ children }: { children: ReactNode }) {
   const { logout } = useAuth0();
@@ -183,7 +194,8 @@ function AllowlistGate({ children }: { children: ReactNode }) {
     queryKey: ["auth-probe"],
     queryFn: fetchMeta,
     retry: (failureCount, error) =>
-      !(error instanceof ApiError && error.status === 403) && failureCount < 3,
+      !(error instanceof ApiError && (error.status === 403 || error.status === 401)) &&
+      failureCount < 3,
     retryDelay: 0,
     staleTime: Infinity,
   });
