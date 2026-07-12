@@ -120,7 +120,12 @@ async def assemble_effective_config(
                 "(active runs, tracked open PRs, or parked operator waits); "
                 f"refusing to start and orphan it — {_IMPORT_HINT}"
             )
-        if yaml_has_repos_topology:
+        # A migrated DB already owns topology — a lingering YAML `repos:` here
+        # just means the operator hasn't cleaned up the file, not that the
+        # importer was never run (e.g. every binding was later deleted via the
+        # UI). Only gate on it pre-migration, where it signals a forgotten
+        # importer run.
+        if yaml_has_repos_topology and not (globals_row and globals_row.migrated_at):
             raise ConfigBootError(
                 "the config DB has zero bindings but the YAML still contains a "
                 f"`repos:` section (now ignored); {_IMPORT_HINT} before starting"

@@ -169,7 +169,9 @@ def _auth0_settings(cfg: Config) -> Auth0Settings | None:
 
 
 def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
-    enabled_bindings = [binding for binding in cfg.repos if binding.webhook_enabled]
+    enabled_bindings = [
+        binding for binding in cfg.repos if binding.enabled and binding.webhook_enabled
+    ]
     repo_secrets = {
         binding.github_repo: binding.webhook_secret
         for binding in enabled_bindings
@@ -220,7 +222,7 @@ def _config_can_run_codex_cli(cfg: Config) -> bool:
 
 
 def _config_has_linear_bindings(cfg: Config) -> bool:
-    return any(binding.provider == "linear" for binding in cfg.repos)
+    return any(binding.provider == "linear" and binding.enabled for binding in cfg.repos)
 
 
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
@@ -451,6 +453,8 @@ async def _preflight_configured_bindings(cfg: Config, trackers: TrackerRegistry)
     visible_by_ctx: dict[TrackerContext, list[str]] = {}
     ok = True
     for binding in cfg.repos:
+        if not binding.enabled:
+            continue
         ctx = _tracker_context_for_binding(binding)
         tracker = trackers.resolve(ctx)
         visible = visible_by_ctx.get(ctx)
