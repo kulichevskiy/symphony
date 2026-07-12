@@ -32,15 +32,16 @@ class ApiError extends Error {
 }
 
 const fetchMeta = vi.fn();
+const fetchAuthConfig = vi.fn();
 
 vi.mock("@/lib/api", () => ({
   ApiError,
   fetchMeta: (...args: unknown[]) => fetchMeta(...args),
-  fetchAuthConfig: vi.fn(),
+  fetchAuthConfig: (...args: unknown[]) => fetchAuthConfig(...args),
 }));
 
 // Imported after the mocks are registered.
-const { AccessDenied, AuthGate } = await import("./auth0");
+const { AccessDenied, AuthGate, resolveAuthConfig } = await import("./auth0");
 
 function renderGate() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -54,6 +55,37 @@ function renderGate() {
     </StrictMode>,
   );
 }
+
+describe("resolveAuthConfig", () => {
+  beforeEach(() => {
+    fetchAuthConfig.mockReset();
+    delete window.__authConfig;
+  });
+
+  it("retries with a fresh request when the preloaded fetch rejected", async () => {
+    window.__authConfig = Promise.reject(new Error("network blip"));
+    fetchAuthConfig.mockResolvedValue({
+      enabled: true,
+      domain: "example.us.auth0.com",
+      client_id: "abc123",
+    });
+
+    const resolved = await resolveAuthConfig();
+
+    expect(resolved).toEqual({ domain: "example.us.auth0.com", clientId: "abc123" });
+    expect(fetchAuthConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the build-time config only after the retry also fails", async () => {
+    window.__authConfig = Promise.reject(new Error("network blip"));
+    fetchAuthConfig.mockRejectedValue(new Error("still down"));
+
+    const resolved = await resolveAuthConfig();
+
+    expect(resolved).toBeNull();
+    expect(fetchAuthConfig).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("AccessDenied", () => {
   it("shows an access-denied message with a sign-out action", () => {
@@ -90,5 +122,67 @@ describe("AuthGate", () => {
     expect(loginWithRedirect).toHaveBeenCalledWith(
       expect.objectContaining({ appState: expect.objectContaining({ returnTo: expect.any(String) }) }),
     );
+  });
+
+  it("renders children while the allowlist probe is still in flight", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    // Never resolves: the gate must not block on it.
+    fetchMeta.mockReturnValue(new Promise(() => {}));
+
+    const { findByTestId, queryByText } = renderGate();
+
+    expect(await findByTestId("dashboard")).toBeTruthy();
+    expect(queryByText("Access denied")).toBeNull();
+  });
+
+  it("switches to AccessDenied when the probe returns 403", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(403));
+
+    const { findByText } = renderGate();
+
+    expect(await findByText("Access denied")).toBeTruthy();
+  });
+
+  it("retries a non-401/403 probe failure instead of giving up immediately", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValueOnce(new ApiError(500)).mockResolvedValue({});
+
+    const { findByTestId, queryByText } = renderGate();
+
+    expect(await findByTestId("dashboard")).toBeTruthy();
+    await waitFor(() => expect(fetchMeta).toHaveBeenCalledTimes(2));
+    expect(queryByText("Access denied")).toBeNull();
+  });
+
+  it("never retries a 403 probe failure", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(403));
+
+    const { findByText } = renderGate();
+
+    expect(await findByText("Access denied")).toBeTruthy();
+    expect(fetchMeta).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries a 401 probe failure (authHeaders already redirected)", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(401));
+
+    const { findByText } = renderGate();
+
+    expect(await findByText("Couldn't verify access")).toBeTruthy();
+    expect(fetchMeta).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a notice instead of the dashboard once non-403 retries are exhausted", async () => {
+    authState = { isLoading: false, isAuthenticated: true, error: null };
+    fetchMeta.mockRejectedValue(new ApiError(500));
+
+    const { findByText, queryByTestId } = renderGate();
+
+    expect(await findByText("Couldn't verify access")).toBeTruthy();
+    expect(queryByTestId("dashboard")).toBeNull();
+    await waitFor(() => expect(fetchMeta).toHaveBeenCalledTimes(4));
   });
 });

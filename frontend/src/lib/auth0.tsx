@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
-import { ApiError, fetchAuthConfig, fetchMeta } from "@/lib/api";
+import { ApiError, fetchAuthConfig, fetchMeta, type AuthConfig } from "@/lib/api";
 import { registerTokenProvider, type TokenProvider } from "@/lib/auth";
 
 // Build-time fallback only — used when the runtime `/api/auth-config` call
@@ -12,6 +12,15 @@ import { registerTokenProvider, type TokenProvider } from "@/lib/auth";
 // AUTH0_CLIENT_ID differ from (or weren't set at) build time.
 const BUILD_DOMAIN = import.meta.env.VITE_AUTH0_DOMAIN;
 const BUILD_CLIENT_ID = import.meta.env.VITE_AUTH0_CLIENT_ID;
+
+declare global {
+  interface Window {
+    /** The `/api/auth-config` fetch kicked off by the inline script in
+     *  `index.html` so it overlaps bundle download/parse. `resolveAuthConfig`
+     *  consumes it, falling back to its own fetch if absent. */
+    __authConfig?: Promise<AuthConfig>;
+  }
+}
 
 /** Whether the mounted app is running behind the Auth0 gate. `App` reads this
  *  to decide whether to show the logout control; it's only ever read once
@@ -27,22 +36,33 @@ interface ResolvedAuthConfig {
   clientId: string;
 }
 
+function toResolvedConfig(config: AuthConfig): ResolvedAuthConfig | null {
+  return config.enabled && config.domain && config.client_id
+    ? { domain: config.domain, clientId: config.client_id }
+    : null;
+}
+
 /** The running daemon's `/api/auth-config` is authoritative for whether/how
  *  to run the Auth0 flow. Only falls back to the build-time `VITE_AUTH0_*`
- *  vars when that call fails outright (e.g. network hiccup), so a reachable
- *  daemon's runtime config always wins over whatever was baked into this
- *  bundle at build time. */
-async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
+ *  vars when a fresh retry also fails outright (e.g. sustained network
+ *  outage), so a reachable daemon's runtime config always wins over whatever
+ *  was baked into this bundle at build time. */
+export async function resolveAuthConfig(): Promise<ResolvedAuthConfig | null> {
   try {
-    const config = await fetchAuthConfig();
-    if (config.enabled && config.domain && config.client_id) {
-      return { domain: config.domain, clientId: config.client_id };
-    }
-    return null;
+    // Prefer the in-flight fetch the inline script started; fall back to our
+    // own request if it isn't present (e.g. bundle loaded outside index.html).
+    return toResolvedConfig(await (window.__authConfig ?? fetchAuthConfig()));
   } catch {
-    return BUILD_DOMAIN && BUILD_CLIENT_ID
-      ? { domain: BUILD_DOMAIN, clientId: BUILD_CLIENT_ID }
-      : null;
+    // The preload may have failed transiently (dev proxy/API not ready yet, a
+    // brief 5xx/network blip) before the bundle even ran. Retry with a fresh
+    // request before falling back to the build-time config.
+    try {
+      return toResolvedConfig(await fetchAuthConfig());
+    } catch {
+      return BUILD_DOMAIN && BUILD_CLIENT_ID
+        ? { domain: BUILD_DOMAIN, clientId: BUILD_CLIENT_ID }
+        : null;
+    }
   }
 }
 
@@ -151,19 +171,35 @@ export function AuthGate({ children }: { children: ReactNode }) {
   return <AllowlistGate>{children}</AllowlistGate>;
 }
 
-/** Probes the gated API once logged in: a 403 means the email isn't allowlisted. */
+/**
+ * Probes the gated API once logged in: a 403 means the email isn't allowlisted.
+ * Non-blocking — renders children (so the dashboard queries start) while the
+ * probe is in flight, and only swaps to the access-denied screen on a 403. A
+ * non-allowlisted user's dashboard queries fail auth identically anyway, so
+ * running them in parallel with the probe costs nothing and saves a round-trip.
+ *
+ * 403 and 401 are both terminal, not retried: retrying a 403 can't change the
+ * allowlist verdict, and a 401 here means `authHeaders()` already couldn't
+ * renew the session and dispatched its own `loginWithRedirect()` before
+ * sending the probe without a token — retrying would just fire off another
+ * redirect. Every other failure — a 5xx, a network blip — retries a few
+ * times, since `fetchMeta` re-fetches a fresh token/response each attempt and
+ * these are typically transient. If those retries are exhausted, the probe is
+ * unreachable enough that the dashboard queries are too, so it shows a notice
+ * instead of silently mounting a dashboard that can't load anything.
+ */
 function AllowlistGate({ children }: { children: ReactNode }) {
   const { logout } = useAuth0();
-  const { error, isLoading } = useQuery({
+  const { error } = useQuery({
     queryKey: ["auth-probe"],
     queryFn: fetchMeta,
-    retry: false,
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && (error.status === 403 || error.status === 401)) &&
+      failureCount < 3,
+    retryDelay: 0,
     staleTime: Infinity,
   });
 
-  if (isLoading) {
-    return <AuthNotice title="Loading…" />;
-  }
   if (error instanceof ApiError && error.status === 403) {
     return (
       <AccessDenied
@@ -174,8 +210,8 @@ function AllowlistGate({ children }: { children: ReactNode }) {
   if (error) {
     return (
       <AuthNotice
-        title="Sign-in check failed"
-        detail={error instanceof ApiError ? `Server returned ${error.status}.` : String(error)}
+        title="Couldn't verify access"
+        detail="Check your connection, then reload the page."
       />
     );
   }
