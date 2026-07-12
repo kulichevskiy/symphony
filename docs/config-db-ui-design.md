@@ -1,7 +1,7 @@
 # Config in the DB, editable via UI
 
 Spec for moving repo bindings and the roles matrix out of `config.local.yaml`
-into SQLite, with full CRUD on the existing `/ui/config` page.
+into SQLite, with full CRUD on the existing config page (the UI's `/config` route).
 
 ## Problem Statement
 
@@ -11,14 +11,14 @@ production, is mounted read-only into the container from the host. The
 operator must SSH to the host, edit `/opt/symphony/config.local.yaml` with
 sudo, and restart the daemon. A restart mid-run is exactly the failure mode
 that recently wedged an issue in a retry loop (interrupted rebase incident),
-so every config tweak carries operational risk. The `/ui/config` page already
+so every config tweak carries operational risk. The config page (the UI's `/config` route) already
 renders bindings and the resolved role matrix, but it is read-only — the
 operator can see the config but cannot act on it.
 
 ## Solution
 
 Bindings and the roles matrix move into SQLite as the single source of truth.
-The existing `/ui/config` page grows from read-only cards into full CRUD: the
+The existing config page (the `/config` route of the UI) grows from read-only cards into full CRUD: the
 operator creates, edits, disables, and deletes bindings from the browser, and
 picks agent, model, and effort per pipeline role from dropdowns whose allowed
 values come from the backend. Changes are picked up by the orchestrator at
@@ -126,22 +126,22 @@ the existing YAML topology into the DB.
   layout positionally. The label is normalized to the empty string in the
   index (SQLite treats NULLs as distinct, so a nullable label column would
   let the common unlabeled catch-all binding be configured twice).
-- **Selector disjointness, not just key uniqueness.** Dispatch matches
-  issues by tracker scope and label, not by GitHub repo, so key uniqueness
-  alone still allows two enabled bindings to compete for the same issues
-  (same tracker scope + label with different repos, or an unlabeled
-  catch-all overlapping every labeled binding in its scope). The write path
-  validates selector disjointness among *enabled* bindings: two enabled
-  bindings in the same tracker scope are rejected when their labels are
-  equal or either is unlabeled. Disabled bindings are exempt, so an operator
-  can stage a replacement binding before switching over. One ambiguity
-  survives validation by nature: issues can carry multiple labels, so an
-  issue tagged with two different bindings' labels matches both. That
-  cannot double-dispatch (per-issue active-run dedupe already guarantees at
-  most one live run per issue), but which binding wins must be deterministic
-  — bindings are evaluated in stable natural-key order, and the spec
-  documents that a multi-labeled issue goes to the first matching enabled
-  binding in that order.
+- **Explicit priority, plus exact-duplicate rejection.** Dispatch matches
+  issues by tracker scope and label, not by GitHub repo, and overlap is a
+  *supported* routing shape today — a labeled binding plus an unlabeled
+  catch-all in the same team, resolved by first-match order over the config
+  list (the CLI mirrors the same rule). So the write path rejects only
+  *exact duplicate* selectors among enabled bindings (same tracker scope and
+  the same normalized label — with disabled bindings exempt so a
+  replacement can be staged), and every other overlap — catch-all fallback,
+  multi-labeled issues matching two labeled bindings — is resolved by an
+  explicit per-binding `priority` field: dispatch and the CLI evaluate
+  enabled bindings in priority order and the first match wins, exactly the
+  role the YAML list order plays today. The migration stamps priority from
+  YAML order, so existing routing (including which binding takes a
+  multi-labeled ticket) is preserved bit-for-bit; the UI exposes reordering.
+  Double dispatch remains impossible regardless — per-issue active-run
+  dedupe guarantees at most one live run per issue.
 - **JSON payload, not normalized columns — and sparse.** The binding model
   has ~40 fields and grows steadily; nested structures (roles, states,
   acceptance, MCP servers) don't normalize well. Pydantic remains the single
@@ -174,9 +174,19 @@ the existing YAML topology into the DB.
   global-matrix edits and making the UI's "inherit" display a lie; naive
   field-to-cell copying would drop the inheritance cases or fail family
   validation. It then inserts the bindings and global matrix into the DB,
-  stamps the migration marker, and backfills the binding-key stamp onto any
-  still-active run rows (resolvable issue→binding at import time), so the
-  drain guard is correct for work that was dispatched by the pre-DB build.
+  stamps the migration marker, migrates per-binding YAML webhook secrets
+  into the repo-secret table (the values are in the YAML at import time, so
+  webhook verification survives cutover without manual re-entry), and
+  backfills the binding-key stamp onto any still-active run rows. That
+  backfill is only trivially resolvable when one binding serves the team;
+  with multiple label bindings the persisted rows don't record the issue's
+  labels, so the importer resolves ambiguous runs by fetching the issue's
+  labels from the tracker, and refuses the cutover (listing the runs) when
+  a run still can't be attributed — drain those first. Legacy full Claude
+  model IDs in the local-review fields are normalized to their matrix alias
+  where one exists; the matrix validation is extended to also accept full
+  `claude-*` model IDs verbatim (they already flow through `--model`
+  today), so an existing pin is never silently dropped.
   No auto-seed at boot. The same script doubles as the restore path for an
   export (refusing to overwrite existing rows unless explicitly told to
   replace them). The DB is legacy-free from day one, so the legacy/matrix
@@ -214,22 +224,31 @@ the existing YAML topology into the DB.
   credentials are absent from the environment — and per-binding concurrency
   limiters are rebuilt when a binding's cap changes, so an edited
   `max_concurrent` actually takes effect instead of the first-use semaphore
-  enforcing the old capacity forever. Rebuilding must account for current
-  occupancy: a fresh full-capacity semaphore is blind to holders and waiters
-  of the old one, so lowering a cap would otherwise admit new work on top of
-  still-running old holders. The replacement limiter is seeded from the
-  binding's active + scheduled count (a lowered cap admits nothing new until
-  occupancy falls below it; running work is never killed). The same rule
+  enforcing the old capacity forever. Semaphore-object surgery alone can't
+  deliver correct cap semantics — queued tasks hold references to the *old*
+  semaphore and would launch as old holders release, and a fresh
+  full-capacity semaphore is blind to both. The authoritative check is the
+  launch gate (above): immediately before an agent spawns, it re-validates
+  occupancy — running plus launched-but-not-finished work for the binding —
+  against the *current* cap, so a lowered cap admits nothing new until
+  occupancy falls below it regardless of which semaphore a task waited on,
+  and running work is never killed. The same hot-swap rule
   covers the webhook
   verifier: it is initialized from settings at app startup today, so a
   repo-secret replacement from the UI must hot-swap the verifier's view of
   repo secrets, or GitHub signs with the new secret while Symphony checks
   the old one until a restart.
 - **Binding lifecycle.** New `enabled` flag on the binding: disabled means
-  no new work starts — the dispatch scan skips it, *and* already-scheduled
-  dispatch/fix-run tasks (which reserve slots and can sit behind semaphores
-  before spawning) re-check the flag at launch and abort instead of
-  starting an agent — while the binding
+  no new *issues* start. The dispatch scan skips the binding, and a single
+  launch gate re-validates against the current binding row immediately
+  before any agent spawn — a scheduled task can sit behind semaphores for a
+  while, so scan-time checks alone are stale by launch time. The gate
+  distinguishes first dispatch of an issue (aborts when disabled) from
+  follow-up stages of already-started work (fix-runs, review iterations,
+  acceptance, merge-conflict rebases — these proceed, because they are how
+  in-flight work drains; aborting them would stall a disabled binding's
+  open PRs until re-enable). The same gate re-checks capacity against the
+  current cap (see the limiter note below). Meanwhile the binding
   stays loaded and visible to every follow-up poller (review monitors,
   merge-candidate polling, operator-wait resolution all locate their binding
   by iterating the loaded set), so in-flight work drains to completion
@@ -252,7 +271,7 @@ the existing YAML topology into the DB.
   current schema would either miss a live implement run or over-block every
   binding sharing the team. The stamped key also gives audit and the UI a
   stable answer to "which binding ran this".
-- **Form scope.** The existing `/ui/config` page is extended in place:
+- **Form scope.** The existing config page (`/config` route) is extended in place:
   binding cards become editable (drawer/form), a create button and per-card
   enabled toggle and delete are added, and the global roles matrix gets its
   own editor card. The form gives dedicated widgets to the frequently-used
@@ -350,14 +369,17 @@ a script produces — never the internals that produce them.
 - **Primary seam — HTTP API**, using the existing app test harness (real
   FastAPI app over a real temp SQLite): CRUD round-trips, duplicate natural
   key rejected — including two unlabeled bindings on the same project/repo —
-  selector-overlap rejection (same tracker scope, equal labels or one
-  unlabeled) with disabled bindings exempt, version-conflict on stale writes
-  (bindings and the global matrix), drain guard returning the blocker list
+  exact-duplicate selector rejection (same tracker scope + same normalized
+  label) with disabled bindings exempt, version-conflict on stale writes
+  (bindings, the global matrix, and the repo-secret record), drain guard
+  returning the blocker list
   (runs attributed via their stamped binding key, PRs, operator waits,
   scheduled slots), repo-scoped webhook-secret masking on read,
   preserve-on-omit and write-only
-  replace, fail-closed env-key validation, options payload, YAML export
-  shape, field validation errors carrying paths, and the diversity warning
+  replace, fail-closed env-key validation, options payload, both YAML
+  export modes (restore emits `enabled: false`; downgrade comments disabled
+  bindings out), field validation errors carrying paths, and the diversity
+  warning
   as a non-blocking response element. Prior art: the existing `/api/issues`
   and command-endpoint tests.
 - **Orchestrator seam**, using the existing orchestrator harness (real DB,
@@ -366,14 +388,22 @@ a script produces — never the internals that produce them.
   merge pollers and to operator-wait resolution, leaving in-flight work
   untouched; a binding-set change re-prunes tracker-queue scopes; a binding
   added with a previously unseen tracker provider/site context gets a
-  hot-added registry client and is scanned; a `max_concurrent` edit is
-  enforced by the rebuilt limiter on the next scheduling pass; the boot gate
+  hot-added registry client and is scanned; a multi-labeled issue routes to
+  the highest-priority matching binding (and a labeled + catch-all pair
+  routes by priority, matching today's YAML-order behavior); the launch
+  gate blocks a queued first dispatch after disable but lets a queued
+  fix-run proceed, and blocks a spawn that would exceed a freshly lowered
+  cap; the boot gate
   refuses a zero-binding start over live work but allows a fresh install.
   Prior art: the tracker-queue scan tests.
 - **Migration seam**: the script as a callable — YAML fixture in, DB rows
   out, legacy fields resolved through the existing legacy-default logic
   (including the codex-reviewer-model inheritance case) rather than copied
-  field-to-cell, refusal to double-import without the explicit replace flag,
+  field-to-cell, priority stamped from YAML order, per-binding webhook
+  secrets landed in the repo-secret table, full Claude model IDs
+  normalized/preserved, ambiguous active-run backfill resolved via tracker
+  labels or refused with the run list, refusal to double-import without the
+  explicit replace flag,
   and a round-trip through export → import-in-replace-mode. Prior art:
   DAO-level tests over a temp DB.
 - **Command-construction seam**: for each of the five roles, a matrix
@@ -414,16 +444,17 @@ a script produces — never the internals that produce them.
   keeps workspace paths, tracker-queue scopes, and issue storage ids
   coherent without a data migration.
 - The export endpoint serves two distinct recovery scenarios, and only one
-  of them is "paste into YAML". (1) *Downgrade*: rolling back to a pre-DB
-  build whose loader still reads `repos:` from YAML — there the export is a
-  valid section to paste into the config file. Because the pre-DB build has
-  no `enabled` semantics and would silently re-enable a paused binding, the
-  downgrade export emits disabled bindings commented out with an explicit
-  note, so re-enabling is a deliberate uncomment. (2) *Restore on the
-  DB-backed build* (bad bulk edit, corrupted rows): the YAML is fed back
-  through the migration/import script in replace mode, since the DB-backed
-  loader ignores YAML bindings by design; disabled state round-trips intact
-  here. In both cases the export includes the global roles matrix, and
+  of them is "paste into YAML" — and they need *different output formats*,
+  selected by an explicit export mode (comments don't survive YAML parsing,
+  so one format can't serve both). (1) *Downgrade mode*: rolling back to a
+  pre-DB build whose loader still reads `repos:` from YAML — the export is
+  a valid section to paste into the config file, with disabled bindings
+  commented out plus an explicit note (the pre-DB build has no `enabled`
+  semantics and would silently re-enable a paused binding; re-enabling is a
+  deliberate uncomment). (2) *Restore mode* (the default): fed back through
+  the migration/import script in replace mode on the DB-backed build —
+  disabled bindings are emitted as real YAML with `enabled: false` so the
+  round-trip preserves them. In both cases the export includes the global roles matrix, and
   write-only webhook secrets are emitted as an explicit placeholder (never
   the stored value — the no-secrets-in-responses contract holds everywhere)
   and must be re-entered by hand; the export marks exactly which bindings
