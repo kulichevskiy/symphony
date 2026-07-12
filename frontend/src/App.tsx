@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { Link, Route, Routes } from "react-router";
 
 import { FilterBar } from "@/components/dashboard/FilterBar";
@@ -10,9 +10,16 @@ import { fetchMeta } from "@/lib/api";
 import { authEnabled, LogoutButton } from "@/lib/auth0";
 import { FiltersProvider } from "@/lib/filters";
 import { useTheme } from "@/lib/useTheme";
-import { ConfigPage } from "@/pages/ConfigPage";
 import { HomePage } from "@/pages/HomePage";
-import { IssuePage } from "@/pages/IssuePage";
+
+// Lazy-load the secondary routes so the initial (home) route only parses
+// HomePage code; each becomes its own chunk.
+const IssuePage = lazy(() =>
+  import("@/pages/IssuePage").then((m) => ({ default: m.IssuePage })),
+);
+const ConfigPage = lazy(() =>
+  import("@/pages/ConfigPage").then((m) => ({ default: m.ConfigPage })),
+);
 
 function Wordmark() {
   return (
@@ -94,11 +101,19 @@ export function App() {
 
         <FilterBar />
 
-        <Routes>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/issue/:id" element={<IssuePage />} />
-          <Route path="/config" element={<ConfigPage />} />
-        </Routes>
+        <Suspense
+          fallback={
+            <p className="mx-auto w-full max-w-[1200px] px-4 py-6 text-sm text-muted-foreground sm:px-6 lg:px-8">
+              Loading…
+            </p>
+          }
+        >
+          <Routes>
+            <Route path="/" element={<HomePage />} />
+            <Route path="/issue/:id" element={<IssuePage />} />
+            <Route path="/config" element={<ConfigPage />} />
+          </Routes>
+        </Suspense>
       </div>
     </FiltersProvider>
   );
