@@ -1039,6 +1039,19 @@ def create_api_router(
                     for row in map(dict, await qcur.fetchall())
                     if _queue_row_matches(row, q=q, teams=team_filter)
                 ]
+            # Queue issues the daemon has seen before (a requeued issue, or
+            # dispatch paused) have an `issues` row and thus an issue page —
+            # resolve their storage ids so they stay internal links.
+            queue_storage_ids: dict[str, str] = {}
+            if queue_rows:
+                placeholders = ",".join("?" * len(queue_rows))
+                icur = await conn.execute(
+                    f"SELECT id, identifier FROM issues WHERE identifier IN ({placeholders})",
+                    tuple(str(row["identifier"]) for row in queue_rows),
+                )
+                queue_storage_ids = {
+                    str(row["identifier"]): str(row["id"]) for row in await icur.fetchall()
+                }
             status_by_id = await compute_canonical_statuses(
                 conn,
                 [str(issue["id"]) for issue in issues],
@@ -1107,16 +1120,19 @@ def create_api_router(
                 payload["warnings"] = warnings
             payloads.append(IssueSummary.model_validate(payload))
 
-        # Queue issues the daemon has never touched: no runs, no tokens, no
-        # issue page — surfaced so the board's Todo/Waiting lanes are honest.
+        # Queue issues absent from the active scope: no live daemon state, so
+        # they surface with their queue status to keep the Todo/Waiting lanes
+        # honest. Ones with an `issues` row keep their storage id (their issue
+        # page exists); the rest are untracked and link out to the tracker.
         tracked_identifiers = {str(issue["identifier"]) for issue, _ in statuses}
         extras = [row for row in queue_rows if str(row["identifier"]) not in tracked_identifiers]
         extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
         for row in extras:
+            storage_id = queue_storage_ids.get(str(row["identifier"]))
             payloads.append(
                 IssueSummary.model_validate(
                     {
-                        "id": str(row["issue_id"]),
+                        "id": storage_id or str(row["issue_id"]),
                         "identifier": str(row["identifier"]),
                         "title": str(row["title"]),
                         "team_key": str(row["team_key"]),
@@ -1127,7 +1143,7 @@ def create_api_router(
                         "latest_activity_ts": None,
                         "latest_activity_age_secs": None,
                         "canonical_status": _queue_status_dict(row),
-                        "tracked": False,
+                        "tracked": storage_id is not None,
                     }
                 )
             )

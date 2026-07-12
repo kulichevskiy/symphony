@@ -23,76 +23,123 @@ from symphony.tracker import Blocker
 async def _rows(conn: aiosqlite.Connection) -> list[dict[str, object]]:
     cur = await conn.execute(
         """
-        SELECT team_key, issue_id, identifier, queue, state_name, blocked_by
+        SELECT team_key, scope, issue_id, identifier, queue, state_name, blocked_by, seen_at
         FROM tracker_queue
-        ORDER BY team_key, identifier
+        ORDER BY team_key, scope, identifier
         """
     )
     return [dict(r) for r in await cur.fetchall()]
 
 
+def _row(
+    ident: str,
+    *,
+    queue: str = "ready",
+    state_name: str = "Todo",
+    blocked_by: str = "",
+) -> db.tracker_queue.QueueRow:
+    return db.tracker_queue.QueueRow(
+        issue_id=f"iss-{ident}",
+        identifier=ident,
+        title=f"title {ident}",
+        queue=queue,
+        state_name=state_name,
+        blocked_by=blocked_by,
+    )
+
+
 @pytest.mark.asyncio
-async def test_replace_team_scan_rewrites_only_that_team(tmp_path: Path) -> None:
+async def test_replace_scan_rewrites_only_that_team_and_scope(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        await db.tracker_queue.replace_team_scan(
+        await db.tracker_queue.replace_scan(
             conn,
             team_key="ENG",
-            rows=[
-                db.tracker_queue.QueueRow(
-                    issue_id="iss-1",
-                    identifier="ENG-1",
-                    title="one",
-                    queue="ready",
-                    state_name="Todo",
-                )
-            ],
+            scope="org/repo#symphony",
+            rows=[_row("ENG-1")],
             seen_at="2026-07-12T09:00:00Z",
         )
-        await db.tracker_queue.replace_team_scan(
+        # A second binding on the same team writes under its own scope.
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="org/other#",
+            rows=[_row("ENG-7")],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+        await db.tracker_queue.replace_scan(
             conn,
             team_key="WEB",
-            rows=[
-                db.tracker_queue.QueueRow(
-                    issue_id="iss-9",
-                    identifier="WEB-9",
-                    title="nine",
-                    queue="waiting",
-                    state_name="Waiting",
-                    blocked_by="WEB-8",
-                )
-            ],
+            scope="org/web#",
+            rows=[_row("WEB-9", queue="waiting", state_name="Waiting", blocked_by="WEB-8")],
             seen_at="2026-07-12T09:00:00Z",
         )
 
-        # A later ENG scan with a different set replaces ENG, leaves WEB alone.
-        await db.tracker_queue.replace_team_scan(
+        # A later scan of the first binding replaces only its own rows.
+        await db.tracker_queue.replace_scan(
             conn,
             team_key="ENG",
-            rows=[
-                db.tracker_queue.QueueRow(
-                    issue_id="iss-2",
-                    identifier="ENG-2",
-                    title="two",
-                    queue="ready",
-                    state_name="Todo",
-                )
-            ],
+            scope="org/repo#symphony",
+            rows=[_row("ENG-2")],
             seen_at="2026-07-12T09:05:00Z",
         )
 
         rows = await _rows(conn)
-        assert [(r["team_key"], r["identifier"], r["queue"]) for r in rows] == [
-            ("ENG", "ENG-2", "ready"),
-            ("WEB", "WEB-9", "waiting"),
+        assert [(r["team_key"], r["scope"], r["identifier"]) for r in rows] == [
+            ("ENG", "org/other#", "ENG-7"),
+            ("ENG", "org/repo#symphony", "ENG-2"),
+            ("WEB", "org/web#", "WEB-9"),
         ]
 
-        # An empty scan clears the team's lanes.
-        await db.tracker_queue.replace_team_scan(
-            conn, team_key="ENG", rows=[], seen_at="2026-07-12T09:10:00Z"
+        # An empty scan clears the scope's lanes.
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="org/repo#symphony",
+            rows=[],
+            seen_at="2026-07-12T09:10:00Z",
         )
         rows = await _rows(conn)
-        assert [r["team_key"] for r in rows] == ["WEB"]
+        assert [(r["team_key"], r["identifier"]) for r in rows] == [
+            ("ENG", "ENG-7"),
+            ("WEB", "WEB-9"),
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_replace_scan_preserves_first_seen_while_queue_unchanged(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="s",
+            rows=[_row("ENG-1", queue="waiting", state_name="Waiting", blocked_by="ENG-0")],
+            seen_at="2026-07-12T09:00:00Z",
+        )
+        # Re-scan: still waiting → seen_at keeps the first sighting.
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="s",
+            rows=[_row("ENG-1", queue="waiting", state_name="Waiting", blocked_by="ENG-0")],
+            seen_at="2026-07-12T09:05:00Z",
+        )
+        rows = await _rows(conn)
+        assert rows[0]["seen_at"] == "2026-07-12T09:00:00Z"
+
+        # Queue change (waiting → ready) resets the clock.
+        await db.tracker_queue.replace_scan(
+            conn,
+            team_key="ENG",
+            scope="s",
+            rows=[_row("ENG-1")],
+            seen_at="2026-07-12T09:10:00Z",
+        )
+        rows = await _rows(conn)
+        assert rows[0]["seen_at"] == "2026-07-12T09:10:00Z"
     finally:
         await conn.close()
 
@@ -160,9 +207,13 @@ async def test_scan_persists_ready_and_waiting_queue_snapshot(tmp_path: Path) ->
                     state_name="Waiting",
                     blocked_by=[_open_blocker("ENG-1")],
                 ),
+                # No open blockers left: auto-unblocked to Ready during the
+                # same scan, so the snapshot records it as ready already.
+                _issue("iss-4", "ENG-4", state_name="Waiting", labels=["symphony"]),
             ]
 
         linear.issues_in_state = AsyncMock(side_effect=issues_in_state)
+        linear.move_issue = AsyncMock()
         orch = Orchestrator(
             cfg,
             linear,
@@ -172,14 +223,18 @@ async def test_scan_persists_ready_and_waiting_queue_snapshot(tmp_path: Path) ->
             workspace=MagicMock(),
             push_fn=AsyncMock(),
         )
+        orch._states = {"ENG": {"Todo": "state-todo"}}  # noqa: SLF001
 
         tasks = await orch._scan_binding(binding)  # noqa: SLF001
         assert tasks == []
 
+        linear.move_issue.assert_awaited_once_with("iss-4", "state-todo")
         rows = await _rows(conn)
         assert [(r["identifier"], r["queue"], r["state_name"], r["blocked_by"]) for r in rows] == [
             ("ENG-1", "ready", "Todo", ""),
             ("ENG-2", "waiting", "Waiting", "ENG-1"),
+            ("ENG-4", "ready", "Todo", ""),
         ]
+        assert all(r["scope"] == "org/repo#symphony#linear#default" for r in rows)
     finally:
         await conn.close()

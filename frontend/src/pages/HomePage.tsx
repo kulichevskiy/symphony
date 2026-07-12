@@ -700,15 +700,21 @@ export const BOARD_COLUMNS: Array<{
 ];
 
 /** Which lane a live run sits in, by its stage (fix stages ride with their
- *  parent stage; acceptance gates the merge). Unknown stages → Implement. */
+ *  parent stage; verify is the local pre-PR gate; acceptance gates the
+ *  merge). Unknown stages → Implement. */
 const RUNNING_STAGE_LANE: Record<string, string> = {
   implement: "implement",
+  implement_fix: "implement",
   local_review: "local_review",
+  local_review_fix: "local_review",
+  verify: "local_review",
+  verify_fix: "local_review",
   review: "review",
   review_fix: "review",
   merge: "merge",
   acceptance: "merge",
   acceptance_fix: "merge",
+  done: "merge",
 };
 
 const STATE_TO_COLUMN: Record<string, string> = {
@@ -935,21 +941,41 @@ export function IssueTable({
         <tbody>
           {issues.map((issue) => {
             const ts = mode === "done" ? issue.completed_at : issue.latest_activity_ts;
+            // Queue-only rows have no issue page — the row and identifier
+            // both open Linear instead of a 404.
+            const untracked = issue.tracked === false;
             return (
               <tr
                 key={issue.id}
                 className="group cursor-pointer border-b border-border/70 transition-colors last:border-0 hover:bg-secondary/50"
-                onClick={() => onOpen(issue.id)}
+                onClick={() =>
+                  untracked
+                    ? window.open(linearIssueUrl(issue.identifier), "_blank", "noreferrer")
+                    : onOpen(issue.id)
+                }
               >
                 <td className="whitespace-nowrap px-3 py-2.5 font-medium">
                   <span className="flex items-center gap-1.5">
-                    <Link
-                      to={`/issue/${encodeURIComponent(issue.id)}`}
-                      onClick={(e) => e.stopPropagation()}
-                      className="text-primary underline-offset-4 hover:underline"
-                    >
-                      {issue.identifier}
-                    </Link>
+                    {untracked ? (
+                      <a
+                        href={linearIssueUrl(issue.identifier)}
+                        target="_blank"
+                        rel="noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        title={`Open ${issue.identifier} in Linear`}
+                        className="text-primary underline-offset-4 hover:underline"
+                      >
+                        {issue.identifier}
+                      </a>
+                    ) : (
+                      <Link
+                        to={`/issue/${encodeURIComponent(issue.id)}`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="text-primary underline-offset-4 hover:underline"
+                      >
+                        {issue.identifier}
+                      </Link>
+                    )}
                     <a
                       href={linearIssueUrl(issue.identifier)}
                       target="_blank"

@@ -460,9 +460,10 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
                     '2026-07-12T08:00:00Z')
             """
         )
-        await db.tracker_queue.replace_team_scan(
+        await db.tracker_queue.replace_scan(
             conn,
             team_key="ADJ",
+            scope="org/repo#",
             rows=[
                 db.tracker_queue.QueueRow(
                     issue_id="lin-run",
@@ -505,6 +506,7 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
         ) as client:
             active = await client.get("/api/issues?scope=active")
             done = await client.get("/api/issues?scope=done")
+            filtered = await client.get("/api/issues?scope=active&provider=codex")
     finally:
         await conn.close()
 
@@ -513,8 +515,11 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
     # Daemon state wins over the queue snapshot.
     assert by_identifier["ADJ-1"]["canonical_status"]["state"] == "running"
     # Tracked but with no activity: absent from the active scope's own rows,
-    # so it surfaces through the queue snapshot as todo.
+    # so it surfaces through the queue snapshot as todo — keeping its storage
+    # id (its issue page exists) and staying tracked.
     assert by_identifier["ADJ-2"]["canonical_status"]["state"] == "todo"
+    assert by_identifier["ADJ-2"]["id"] == "issue-idle"
+    assert "tracked" not in by_identifier["ADJ-2"]  # default True is excluded
     # Queue-only issue: untracked, zero tokens, waiting with blocker subtitle.
     wait = by_identifier["ADJ-3"]
     assert wait["tracked"] is False
@@ -530,6 +535,10 @@ async def test_api_issues_merges_tracker_queue_into_active_scope(tmp_path: Path)
     # The done scope never includes queue rows.
     assert done.status_code == 200
     assert [issue["identifier"] for issue in done.json()] == []
+
+    # Queue rows have no runs, so provider/model-filtered views exclude them.
+    assert filtered.status_code == 200
+    assert [issue["identifier"] for issue in filtered.json()] == []
 
 
 @pytest.mark.asyncio

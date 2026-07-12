@@ -93,6 +93,22 @@ describe("IssueTable affordances", () => {
     expect(markup).toContain("Some issue title");
     expect(markup).not.toContain('>Some issue title</a>');
   });
+
+  it("links untracked (queue-only) rows to Linear, not the issue page", () => {
+    const markup = renderTable(
+      [
+        issue({
+          id: "lin-uuid",
+          identifier: "VIB-9",
+          tracked: false,
+          canonical_status: { state: "todo", since: null, subtitle: "Todo", stuck_for: null },
+        }),
+      ],
+      "active",
+    );
+    expect(markup).not.toContain('href="/issue/lin-uuid"');
+    expect(markup).toContain('href="https://linear.app/issue/VIB-9"');
+  });
 });
 
 describe("groupForBoard", () => {
@@ -126,6 +142,7 @@ describe("groupForBoard", () => {
       [
         running("imp", "implement"),
         running("lr", "local_review"),
+        running("ver", "verify"),
         running("rev", "review"),
         running("rf", "review_fix"),
         running("acc", "acceptance"),
@@ -137,7 +154,9 @@ describe("groupForBoard", () => {
     expect(lanes.get("implement")!.map((i) => i.id)).toEqual(
       expect.arrayContaining(["imp", "unk", "none"]),
     );
-    expect(lanes.get("local_review")!.map((i) => i.id)).toEqual(["lr"]);
+    expect(lanes.get("local_review")!.map((i) => i.id)).toEqual(
+      expect.arrayContaining(["lr", "ver"]),
+    );
     expect(lanes.get("review")!.map((i) => i.id)).toEqual(
       expect.arrayContaining(["rev", "rf"]),
     );
