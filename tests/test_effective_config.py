@@ -196,6 +196,33 @@ async def test_disabled_binding_with_unresolvable_env_does_not_block_boot(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_disabled_binding_env_is_resolved_not_left_as_key_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restart/restore paths spawn agents against a disabled binding's `env`
+    regardless of `enabled` (they resolve the binding by iterating `cfg.repos`,
+    not by checking the flag). If assembly left `env` unresolved, that agent
+    would get the literal `.env` key *name* instead of the secret value."""
+    monkeypatch.setenv("AGENT_TOKEN", "the-real-secret")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+            "env": {"AGENT_TOKEN": "AGENT_TOKEN"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+        enabled=False,
+    )
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    (binding,) = cfg.repos
+    assert binding.env == {"AGENT_TOKEN": "the-real-secret"}
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_warns_on_leftover_yaml_repos_via_real_load_path(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

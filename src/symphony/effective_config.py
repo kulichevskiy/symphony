@@ -53,9 +53,13 @@ def _resolve_bindings(cfg: Config) -> None:
     """Apply tracker-context defaults and resolve `env:` key names to values on
     each assembled binding — mirrors what `Config.load` does for YAML repos.
 
-    Disabled bindings skip `resolve_env`: they're kept around only so
-    restart/restore paths can resolve them, and must never block boot because
-    an operator has since removed the `env:` secret they refer to.
+    Disabled bindings still get `resolve_env` (best-effort): restart/restore
+    paths spawn agents against `binding.env` regardless of `enabled`
+    (`_binding_for_pr` ignores it), and an unresolved binding would leak the
+    literal `.env` key *name* into that agent's environment instead of the
+    secret value. A disabled binding whose key has since been removed from
+    `.env` must not block boot, so a missing key is logged and skipped rather
+    than raised for disabled bindings only.
     """
     env_source: dict[str, str] = {
         key: value for key, value in dotenv_values(".env").items() if value is not None
@@ -65,6 +69,11 @@ def _resolve_bindings(cfg: Config) -> None:
         binding.apply_tracker_secret_defaults(jira_base_url=cfg.jira_base_url)
         if binding.enabled:
             binding.resolve_env(env_source)
+        else:
+            try:
+                binding.resolve_env(env_source)
+            except ValueError as e:
+                _log.warning("disabled binding: %s", e)
 
 
 async def assemble_effective_config(
