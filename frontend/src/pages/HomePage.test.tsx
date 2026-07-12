@@ -7,9 +7,12 @@ import type { IssueSummary, SpendHeatmap, SpendSummary } from "@/lib/api";
 import { DEFAULT_DATE, FiltersProvider } from "@/lib/filters";
 
 import {
+  BOARD_COLUMNS,
   BreakdownTable,
+  groupForBoard,
   HomePage,
   IssueTable,
+  KanbanBoard,
   MixLegend,
   PauseToggle,
   SectionTotals,
@@ -70,6 +73,111 @@ describe("IssueTable", () => {
     );
     expect(markup).toContain(">Completed</th>");
     expect(markup).toContain("done");
+  });
+});
+
+describe("IssueTable affordances", () => {
+  it("identifier links to the issue page, Linear opens via a labelled external icon", () => {
+    const markup = renderTable([issue()], "active");
+    // Internal navigation: identifier is a router link to /issue/:id.
+    expect(markup).toContain('href="/issue/iss-1"');
+    // External: separate anchor to Linear with an explanatory tooltip.
+    expect(markup).toContain('href="https://linear.app/issue/VIB-16"');
+    expect(markup).toContain("Open VIB-16 in Linear");
+    // Trailing chevron signals that the whole row navigates.
+    expect(markup).toContain('"m9 18 6-6-6-6"');
+  });
+
+  it("renders the title as plain text — the row itself opens the issue", () => {
+    const markup = renderTable([issue({ title: "Some issue title" })], "active");
+    expect(markup).toContain("Some issue title");
+    expect(markup).not.toContain('>Some issue title</a>');
+  });
+});
+
+describe("groupForBoard", () => {
+  it("buckets active issues into lanes by canonical status and done into Done", () => {
+    const lanes = groupForBoard(
+      [
+        issue({ id: "a", canonical_status: { state: "running", since: null, subtitle: null, stuck_for: null } }),
+        issue({ id: "b", canonical_status: { state: "pr_open", since: null, subtitle: null, stuck_for: null } }),
+        issue({ id: "c", canonical_status: { state: "failed", since: null, subtitle: null, stuck_for: null } }),
+        issue({ id: "d", canonical_status: { state: "idle", since: null, subtitle: null, stuck_for: null } }),
+      ],
+      [issue({ id: "e", canonical_status: { state: "done", since: null, subtitle: null, stuck_for: null } })],
+    );
+    expect(lanes.get("working")!.map((i) => i.id)).toEqual(["a"]);
+    expect(lanes.get("review")!.map((i) => i.id)).toEqual(["b"]);
+    expect(lanes.get("attention")!.map((i) => i.id)).toEqual(["c"]);
+    expect(lanes.get("queued")!.map((i) => i.id)).toEqual(["d"]);
+    expect(lanes.get("done")!.map((i) => i.id)).toEqual(["e"]);
+  });
+
+  it("never drops an issue: unknown statuses land in Needs attention", () => {
+    const lanes = groupForBoard(
+      [issue({ id: "x", canonical_status: { state: "mystery" as never, since: null, subtitle: null, stuck_for: null } })],
+      [],
+    );
+    expect(lanes.get("attention")!.map((i) => i.id)).toEqual(["x"]);
+  });
+
+  it("orders lanes newest-activity-first (Done by completed_at)", () => {
+    const lanes = groupForBoard(
+      [
+        issue({ id: "old", latest_activity_ts: "2026-05-16T10:00:00Z" }),
+        issue({ id: "new", latest_activity_ts: "2026-05-17T10:00:00Z" }),
+      ],
+      [
+        issue({ id: "d-old", completed_at: "2026-05-10T10:00:00Z" }),
+        issue({ id: "d-new", completed_at: "2026-05-15T10:00:00Z" }),
+      ],
+    );
+    expect(lanes.get("working")!.map((i) => i.id)).toEqual(["new", "old"]);
+    expect(lanes.get("done")!.map((i) => i.id)).toEqual(["d-new", "d-old"]);
+  });
+});
+
+describe("KanbanBoard", () => {
+  function renderBoard(active: IssueSummary[], done: IssueSummary[]): string {
+    return renderToStaticMarkup(
+      <MemoryRouter>
+        <KanbanBoard active={active} done={done} nowMs={NOW_MS} />
+      </MemoryRouter>,
+    );
+  }
+
+  it("renders every lane with its count, cards linking to the issue page", () => {
+    const markup = renderBoard(
+      [issue({ id: "a", identifier: "VIB-1" })],
+      [issue({ id: "b", identifier: "VIB-2", canonical_status: { state: "done", since: null, subtitle: null, stuck_for: null } })],
+    );
+    for (const col of BOARD_COLUMNS) {
+      expect(markup).toContain(col.label);
+    }
+    expect(markup).toContain('href="/issue/a"');
+    expect(markup).toContain('href="/issue/b"');
+    expect(markup).toContain("VIB-1");
+    expect(markup).toContain("VIB-2");
+  });
+
+  it("shows a status badge only in mixed lanes (review / needs attention)", () => {
+    const single = renderBoard(
+      [issue({ id: "a", canonical_status: { state: "running", since: null, subtitle: null, stuck_for: null } })],
+      [],
+    );
+    // Working lane is single-status: no badge inside the card.
+    expect(single).not.toContain(">running<");
+
+    const mixed = renderBoard(
+      [issue({ id: "b", canonical_status: { state: "pr_open", since: null, subtitle: null, stuck_for: null } })],
+      [],
+    );
+    expect(mixed).toContain("PR open");
+  });
+
+  it("marks empty lanes instead of hiding them", () => {
+    const markup = renderBoard([], []);
+    expect(markup.match(/empty/g)?.length).toBe(BOARD_COLUMNS.length);
   });
 });
 
@@ -395,8 +503,8 @@ describe("TokenOverview", () => {
   });
 });
 
-describe("HomePage filtered empty states", () => {
-  it("renders the filtered empty-state copy for the Active and Done sections", () => {
+describe("HomePage issues section", () => {
+  it("defaults to the kanban board with a Board/Table toggle", () => {
     const markup = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
         <MemoryRouter>
@@ -406,7 +514,10 @@ describe("HomePage filtered empty states", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    expect(markup).toContain("No active issues match your filters");
-    expect(markup).toContain("No completed issues match your filters");
+    expect(markup).toContain("Board");
+    expect(markup).toContain("Table");
+    for (const col of BOARD_COLUMNS) {
+      expect(markup).toContain(col.label);
+    }
   });
 });
