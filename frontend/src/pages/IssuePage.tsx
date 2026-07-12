@@ -43,10 +43,10 @@ import { cn } from "@/lib/utils";
 
 import {
   applicability,
+  COMMAND_ORDER,
   COMMANDS,
   type CommandId,
   type CommandMeta,
-  GROUPS,
   waitLabel,
 } from "./issueControls";
 
@@ -84,7 +84,7 @@ function runStateFor(status: string): Cockpit["runState"] {
   return "waiting";
 }
 
-function deriveCockpit(
+export function deriveCockpit(
   detail: IssueDetail,
   external: IssueExternalSnapshot | undefined,
 ): Cockpit {
@@ -93,10 +93,12 @@ function deriveCockpit(
     (a, b) => Date.parse(b.started_at) - Date.parse(a.started_at),
   );
   const latest = runs[0];
+  // Only surface a failure reason while the issue is actually in a failed
+  // state — a done/running issue must not resurrect an old run's error.
   const failed = runs.find((r) => r.status === "failed" && r.termination_detail);
   let reason: string | null = null;
-  if (failed) {
-    reason = failed.termination_detail;
+  if (status === "failed" || status === "halted") {
+    reason = failed?.termination_detail ?? detail.canonical_status.subtitle;
   } else if (status === "drift_detected" || status === "paused") {
     reason = detail.canonical_status.subtitle;
   }
@@ -182,7 +184,7 @@ function CockpitCard({
   );
 }
 
-function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
+export function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
   const tone =
     {
       running: "text-blue-600 dark:text-blue-400",
@@ -223,7 +225,33 @@ function NowCard({ c, nowMs }: { c: Cockpit; nowMs: number }) {
           <span className="font-mono text-xs leading-relaxed">{c.reason}</span>
         </div>
       ) : null}
+      {c.pr ? <PrLine pr={c.pr} /> : null}
     </CockpitCard>
+  );
+}
+
+/** Compact PR row inside "What's happening now": link, merge-state badge,
+ *  repo and CI check summary on one line. Appears once a PR exists. */
+function PrLine({ pr }: { pr: NonNullable<Cockpit["pr"]> }) {
+  const badge = pr.merged ? "merged" : pr.mergeable;
+  const tone = MERGE_TONES[badge] ?? MERGE_TONES.unknown;
+  return (
+    <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border pt-3">
+      <a
+        href={pr.url || `https://github.com/${pr.repo}/pull/${pr.number}`}
+        target="_blank"
+        rel="noreferrer"
+        className="inline-flex items-center gap-1.5 text-sm font-medium text-primary underline-offset-4 hover:underline"
+      >
+        <Icon name="gitPr" size={15} /> #{pr.number}
+        <Icon name="external" size={12} className="text-muted-foreground" />
+      </a>
+      <Badge className={cn("capitalize", tone)}>{badge}</Badge>
+      <span className="truncate font-mono text-xs text-muted-foreground">{pr.repo}</span>
+      <span className="ml-auto">
+        <CheckSummary checks={pr.checks} />
+      </span>
+    </div>
   );
 }
 
@@ -507,35 +535,6 @@ const MERGE_TONES: Record<string, string> = {
     "border-slate-300 bg-slate-50 text-slate-700 dark:border-slate-700 dark:bg-slate-800/60 dark:text-slate-300",
 };
 
-export function PrCard({ pr }: { pr: Cockpit["pr"] }) {
-  if (!pr) {
-    return (
-      <CockpitCard title="Pull request">
-        <p className="text-sm text-muted-foreground">No PR opened yet</p>
-      </CockpitCard>
-    );
-  }
-  const badge = pr.merged ? "merged" : pr.mergeable;
-  const tone = MERGE_TONES[badge] ?? MERGE_TONES.unknown;
-  return (
-    <CockpitCard title="Pull request" aside={<CheckSummary checks={pr.checks} />}>
-      <div className="flex flex-wrap items-center gap-2">
-        <a
-          href={pr.url || `https://github.com/${pr.repo}/pull/${pr.number}`}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1.5 text-sm font-medium text-primary underline-offset-4 hover:underline"
-        >
-          <Icon name="gitPr" size={15} /> #{pr.number}
-          <Icon name="external" size={12} className="text-muted-foreground" />
-        </a>
-        <Badge className={cn("capitalize", tone)}>{badge}</Badge>
-      </div>
-      <p className="mt-2 truncate font-mono text-xs text-muted-foreground">{pr.repo}</p>
-    </CockpitCard>
-  );
-}
-
 function WaitCard({ waitingOn }: { waitingOn: string | null }) {
   if (!waitingOn) return null;
   return (
@@ -678,26 +677,17 @@ function Controls({
   }
 
   return (
-    <div className="grid gap-3 sm:grid-cols-3">
-      {GROUPS.map((g) => (
-        <div key={g.key} className="rounded-md border border-border bg-secondary/20 p-3">
-          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-            {g.label}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {g.cmds.map((id) => (
-              <CmdButton
-                key={id}
-                id={id}
-                enabled={en[id]}
-                why={why[id]}
-                applied={applied === id}
-                busy={busy}
-                onClick={handle}
-              />
-            ))}
-          </div>
-        </div>
+    <div className="flex flex-wrap gap-2">
+      {COMMAND_ORDER.map((id) => (
+        <CmdButton
+          key={id}
+          id={id}
+          enabled={en[id]}
+          why={why[id]}
+          applied={applied === id}
+          busy={busy}
+          onClick={handle}
+        />
       ))}
     </div>
   );
@@ -793,6 +783,26 @@ function DebugSection({
   );
 }
 
+/** Collapsed-by-default timeline. The event list (and its query) only mounts
+ *  once the section is opened — the run log above already tells the story;
+ *  this is the audit trail for when you need it. */
+function TimelineSection({ issueId }: { issueId: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details
+      className="rounded-lg border border-border bg-secondary/20 px-4"
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+    >
+      <summary className="flex cursor-pointer select-none items-center gap-2 py-3 text-sm font-semibold">
+        <Icon name="chevronRight" size={15} className="chev transition-transform" />
+        Timeline
+        <span className="font-normal text-muted-foreground">— full event history</span>
+      </summary>
+      <div className="pb-3">{open ? <IssueTimeline issueId={issueId} /> : null}</div>
+    </details>
+  );
+}
+
 function useNowMs(): number {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
@@ -875,16 +885,19 @@ function formatDuration(startedAt: string, endedAt: string | null): string {
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
-const RUN_STATUS_TONE: Record<string, string> = {
-  done: "text-green-600 dark:text-green-400",
-  completed: "text-green-600 dark:text-green-400",
-  failed: "text-red-600 dark:text-red-400",
-  interrupted: "text-red-600 dark:text-red-400",
-  halted: "text-red-600 dark:text-red-400",
-  needs_approval: "text-amber-600 dark:text-amber-400",
-  running: "text-blue-600 dark:text-blue-400",
+const RUN_STATUS_DOT: Record<string, string> = {
+  done: "bg-green-500",
+  completed: "bg-green-500",
+  failed: "bg-red-500",
+  interrupted: "bg-red-500",
+  halted: "bg-red-500",
+  needs_approval: "bg-amber-500",
+  running: "bg-blue-500",
 };
 
+/** Compact run navigation: one chip per run (status dot, stage, duration),
+ *  newest first, wrapping horizontally. Status text and start time live in
+ *  the tooltip so the row stays one line tall per ~6 runs. */
 function RunPicker({
   runs,
   selectedId,
@@ -895,7 +908,7 @@ function RunPicker({
   onSelect: (id: string) => void;
 }) {
   return (
-    <div className="mb-3 flex flex-col gap-1.5">
+    <div className="mb-3 flex flex-wrap gap-1.5">
       {runs.map((r) => {
         const selected = r.id === selectedId;
         return (
@@ -903,24 +916,25 @@ function RunPicker({
             key={r.id}
             type="button"
             onClick={() => onSelect(r.id)}
+            title={`${r.status} · ${formatUtc(r.started_at)}`}
             className={cn(
-              "flex w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border px-3 py-2 text-left text-xs transition-colors",
+              "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors",
               selected
                 ? "border-blue-400 bg-blue-50 dark:border-blue-700 dark:bg-blue-950/40"
                 : "border-border bg-secondary/20 hover:bg-secondary/40",
             )}
           >
+            <span
+              className={cn(
+                "h-1.5 w-1.5 shrink-0 rounded-full",
+                RUN_STATUS_DOT[r.status] ?? "bg-slate-400",
+              )}
+            />
             <span className="font-medium capitalize text-foreground">
               {STAGE_LABEL[r.stage] ?? r.stage}
             </span>
-            <span className={cn("font-medium", RUN_STATUS_TONE[r.status] ?? "text-muted-foreground")}>
-              {r.status}
-            </span>
-            <span className="ml-auto font-mono text-muted-foreground" title={formatUtc(r.started_at)}>
-              {formatUtc(r.started_at)}
-            </span>
             <span className="font-mono text-muted-foreground">
-              · {formatDuration(r.started_at, r.ended_at)}
+              {formatDuration(r.started_at, r.ended_at)}
             </span>
           </button>
         );
@@ -1087,6 +1101,25 @@ export function IssuePage() {
 
           <div className="mt-4 space-y-4">
             <NowCard c={cockpit} nowMs={nowMs} />
+            <CockpitCard
+              title="Controls"
+              aside={
+                <span className="font-mono text-[11px] text-muted-foreground">
+                  writes apply instantly
+                </span>
+              }
+            >
+              <Controls
+                status={cockpit.status}
+                applied={applied}
+                busy={mutation.isPending}
+                onRun={(cmd) => mutation.mutate(cmd)}
+              />
+              {error ? (
+                <p className="mt-2 text-xs text-red-600 dark:text-red-400">{error}</p>
+              ) : null}
+              <ActionLog entries={log} />
+            </CockpitCard>
             {liveRun ? (
               <CockpitCard title="Live output">
                 <LiveFeed runId={liveRun.id} active />
@@ -1108,33 +1141,9 @@ export function IssuePage() {
             ) : (
               <FinalLogCard runs={detail.runs} />
             )}
-            <div className="grid gap-4 sm:grid-cols-2">
-              <TokensCard c={cockpit} />
-              <PrCard pr={cockpit.pr} />
-            </div>
+            <TokensCard c={cockpit} />
             <StageSpendCard runs={detail.runs} />
-            <CockpitCard
-              title="Controls"
-              aside={
-                <span className="font-mono text-[11px] text-muted-foreground">
-                  writes apply instantly
-                </span>
-              }
-            >
-              <Controls
-                status={cockpit.status}
-                applied={applied}
-                busy={mutation.isPending}
-                onRun={(cmd) => mutation.mutate(cmd)}
-              />
-              {error ? (
-                <p className="mt-2 text-xs text-red-600 dark:text-red-400">{error}</p>
-              ) : null}
-              <ActionLog entries={log} />
-            </CockpitCard>
-            <CockpitCard title="Timeline">
-              <IssueTimeline issueId={detail.issue.id} />
-            </CockpitCard>
+            <TimelineSection issueId={detail.issue.id} />
           </div>
 
           <section className="mt-8">

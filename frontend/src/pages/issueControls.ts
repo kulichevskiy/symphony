@@ -30,15 +30,13 @@ export const COMMANDS: Record<CommandId, CommandMeta> = {
   stop: { label: "Stop", cmd: "$stop", icon: "square", group: "lifecycle", destructive: true },
 };
 
-export const GROUPS: Array<{ key: string; label: string; cmds: CommandId[] }> = [
-  { key: "review", label: "Review", cmds: ["approve", "reject", "skip-review"] },
-  { key: "acceptance", label: "Acceptance", cmds: ["skip-acceptance", "retry-acceptance"] },
-  { key: "lifecycle", label: "Lifecycle", cmds: ["retry", "stop"] },
-];
-
-const ALL_CMDS: CommandId[] = [
+/** Display order for the single flat controls row: primary action first,
+ *  skips/retries in the middle, destructive last. */
+export const COMMAND_ORDER: CommandId[] = [
   "approve", "reject", "skip-review", "skip-acceptance", "retry-acceptance", "retry", "stop",
 ];
+
+const ALL_CMDS: CommandId[] = COMMAND_ORDER;
 
 export type Applicability = {
   en: Record<CommandId, boolean>;
