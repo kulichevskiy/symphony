@@ -845,23 +845,44 @@ function BoardCard({
   );
 }
 
+/** Max cards rendered in the Done lane before collapsing to a "+N more"
+ *  affordance. The done feed is capped server-side (default 50); this keeps the
+ *  board readable and nudges deeper browsing into the Table view. */
+export const DONE_LANE_CARD_CAP = 30;
+
+/** How many done issues the home feed fetches by default (matches the API's
+ *  own default). The kanban shows the newest `DONE_LANE_CARD_CAP`; the rest
+ *  are reachable via the "+N more" affordance / Table view's "Load more". */
+const DONE_SCOPE_LIMIT = 50;
+
+/** Ceiling for the done scope's `limit` param (matches the API's `le=500`).
+ *  "Load more" in the Table view steps toward this instead of unbounded growth. */
+const DONE_SCOPE_MAX_LIMIT = 500;
+
 /** The issues kanban: one lane per pipeline step, every tracked issue exactly
  *  once. Cards are links to the issue page (⌘-click works); the identifier
- *  underlines on hover to signal it. */
+ *  underlines on hover to signal it. The Done lane caps its card list and, when
+ *  it overflows, shows a "+N more" button that calls `onShowMore` (the Table
+ *  view sees the full fetched set). */
 export function KanbanBoard({
   active,
   done,
   nowMs,
+  onShowMore,
 }: {
   active: IssueSummary[];
   done: IssueSummary[];
   nowMs: number;
+  onShowMore?: () => void;
 }) {
   const lanes = groupForBoard(active, done);
   return (
     <div className="flex gap-3 overflow-x-auto pb-1">
       {BOARD_COLUMNS.map((col) => {
         const issues = lanes.get(col.key) ?? [];
+        const shown =
+          col.key === "done" ? issues.slice(0, DONE_LANE_CARD_CAP) : issues;
+        const overflow = issues.length - shown.length;
         return (
           <div
             key={col.key}
@@ -875,8 +896,8 @@ export function KanbanBoard({
               </span>
             </div>
             <div className="flex flex-col gap-2 p-2">
-              {issues.length ? (
-                issues.map((i) => (
+              {shown.length ? (
+                shown.map((i) => (
                   <BoardCard
                     key={i.id}
                     issue={i}
@@ -889,6 +910,15 @@ export function KanbanBoard({
                   empty
                 </p>
               )}
+              {overflow > 0 ? (
+                <button
+                  type="button"
+                  onClick={onShowMore}
+                  className="rounded-md border border-dashed border-border py-2 text-center text-xs font-medium text-muted-foreground transition-colors hover:border-blue-400 hover:text-foreground dark:hover:border-blue-600"
+                >
+                  +{overflow} more — view in table
+                </button>
+              ) : null}
             </div>
           </div>
         );
@@ -1053,6 +1083,18 @@ export function HomePage() {
   const modelsKey = [...models].sort().join(",");
   const modelsFilter = models.length ? models : undefined;
 
+  // How many done issues to request; grows via the Table view's "Load more".
+  // Reset to the default whenever the filters change — done synchronously
+  // during render (not in a useEffect) so the reset lands before the done
+  // query runs with the new filters, instead of one render later.
+  const doneFilterKey = `${provider}|${teamsKey}|${modelsKey}|${from}|${to}`;
+  const [doneLimit, setDoneLimit] = useState(DONE_SCOPE_LIMIT);
+  const [prevDoneFilterKey, setPrevDoneFilterKey] = useState(doneFilterKey);
+  if (doneFilterKey !== prevDoneFilterKey) {
+    setPrevDoneFilterKey(doneFilterKey);
+    setDoneLimit(DONE_SCOPE_LIMIT);
+  }
+
   const summaryQuery = useQuery({
     queryKey: ["spend-summary", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
@@ -1084,8 +1126,12 @@ export function HomePage() {
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
+  // Over-fetch by one beyond `doneLimit` so an exact page boundary (50, 100,
+  // …) can be told apart from "there's really more": if the extra row comes
+  // back, there's a next page; if not, `doneLimit` was already everything.
+  const doneRequestLimit = Math.min(doneLimit + 1, DONE_SCOPE_MAX_LIMIT);
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to],
+    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to, doneRequestLimit],
     queryFn: () =>
       fetchIssues({
         scope: "done",
@@ -1094,14 +1140,17 @@ export function HomePage() {
         from: dateFrom,
         to: dateTo,
         models: modelsFilter,
+        limit: doneRequestLimit,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
 
   const active = activeQuery.data ?? [];
-  const done = doneQuery.data ?? [];
+  const doneFetched = doneQuery.data ?? [];
+  const done = doneFetched.slice(0, doneLimit);
   const tracked = summaryQuery.data?.totals.issues ?? 0;
+  const hasMoreDone = doneFetched.length > doneLimit && doneLimit < DONE_SCOPE_MAX_LIMIT;
 
   const openIssue = (id: string) => navigate(`/issue/${encodeURIComponent(id)}`);
 
@@ -1148,7 +1197,12 @@ export function HomePage() {
         </div>
 
         {issueView === "board" ? (
-          <KanbanBoard active={active} done={done} nowMs={nowMs} />
+          <KanbanBoard
+            active={active}
+            done={done}
+            nowMs={nowMs}
+            onShowMore={() => setIssueView("table")}
+          />
         ) : (
           <>
             <div className="mb-2.5 flex flex-wrap items-center justify-between gap-3">
@@ -1181,7 +1235,21 @@ export function HomePage() {
               </h3>
             </div>
             {done.length ? (
-              <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
+              <>
+                <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
+                {hasMoreDone ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setDoneLimit((l) => Math.min(l + DONE_SCOPE_LIMIT, DONE_SCOPE_MAX_LIMIT))
+                    }
+                    disabled={doneQuery.isFetching}
+                    className="mt-2 w-full rounded-md border border-dashed border-border py-2 text-center text-xs font-medium text-muted-foreground transition-colors hover:border-blue-400 hover:text-foreground disabled:opacity-50 dark:hover:border-blue-600"
+                  >
+                    {doneQuery.isFetching ? "Loading…" : "Load more"}
+                  </button>
+                ) : null}
+              </>
             ) : (
               <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
                 No completed issues match your filters

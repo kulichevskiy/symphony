@@ -3453,6 +3453,117 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_api_issues_done_scope_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        # Three done issues, merged at increasing times (ENG-3 newest).
+        merges = {
+            1: "2026-05-14T10:00:00Z",
+            2: "2026-05-15T10:00:00Z",
+            3: "2026-05-16T10:00:00Z",
+        }
+        for i, merged in merges.items():
+            await db.issues.upsert(
+                conn, id=f"done-{i}", identifier=f"ENG-{i}", title=f"t{i}", team_key="ENG"
+            )
+            await conn.execute(
+                "INSERT INTO issue_prs (issue_id, github_repo, binding_key, pr_number, "
+                "pr_url, created_at, merged_at) VALUES (?, 'o/r', 'k', ?, 'u', ?, ?)",
+                (f"done-{i}", i, "2026-05-10T08:00:00Z", merged),
+            )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            limited = await client.get("/api/issues?scope=done&limit=2")
+            defaulted = await client.get("/api/issues?scope=done")
+            bad_low = await client.get("/api/issues?scope=done&limit=0")
+            bad_high = await client.get("/api/issues?scope=done&limit=501")
+    finally:
+        await conn.close()
+
+    assert limited.status_code == 200
+    # limit=N returns the N newest completed, ordering unchanged.
+    assert [i["identifier"] for i in limited.json()] == ["ENG-3", "ENG-2"]
+    assert limited.json()[0]["completed_at"] == "2026-05-16T10:00:00Z"
+    # Omitting limit defaults to 50 → all three.
+    assert [i["identifier"] for i in defaulted.json()] == ["ENG-3", "ENG-2", "ENG-1"]
+    # Bounds validated ge=1 le=500.
+    assert bad_low.status_code == 422
+    assert bad_high.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_api_issues_active_scope_ignores_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        for i in (1, 2, 3):
+            await db.issues.upsert(
+                conn, id=f"act-{i}", identifier=f"ENG-{i}", title=f"t{i}", team_key="ENG"
+            )
+            await conn.execute(
+                "INSERT INTO runs (id, issue_id, stage, status, pid, started_at) "
+                "VALUES (?, ?, 'implement', 'running', ?, '2026-05-16T09:00:00Z')",
+                (f"r{i}", f"act-{i}", i),
+            )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            resp = await client.get("/api/issues?scope=active&limit=1")
+    finally:
+        await conn.close()
+
+    assert resp.status_code == 200
+    # Active scope stays unpaginated — limit does not truncate it.
+    assert len(resp.json()) == 3
+
+
+@pytest.mark.asyncio
+async def test_api_issues_active_scope_ignores_out_of_range_limit(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        await db.issues.upsert(conn, id="act-1", identifier="ENG-1", title="t1", team_key="ENG")
+        await conn.execute(
+            "INSERT INTO runs (id, issue_id, stage, status, pid, started_at) "
+            "VALUES ('r1', 'act-1', 'implement', 'running', 1, '2026-05-16T09:00:00Z')",
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            resp = await client.get("/api/issues?scope=active&limit=0")
+    finally:
+        await conn.close()
+
+    # `limit` is meaningless for active scope, so an out-of-range value (valid
+    # only for the done scope's `ge=1 le=500`) is not rejected.
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
+
+
+@pytest.mark.asyncio
 async def test_api_issues_active_scope_filters_by_date_window(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)

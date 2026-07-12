@@ -282,6 +282,11 @@ def _optional_int(value: object) -> int | None:
 # Day-string param shape (`YYYY-MM-DD`) for the `from`/`to` date-window filters.
 DAY_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
+# Default cap on the done scope of /api/issues when no `limit` is given. The
+# done window defaults to 12 months, so returning the whole history every poll
+# is wasteful; the newest N is enough for the dashboard's Done lane + table.
+DONE_SCOPE_DEFAULT_LIMIT = 50
+
 
 def _started_at_window(date_from: str | None, date_to: str | None) -> tuple[list[str], list[str]]:
     """SQL conditions + params windowing `runs.started_at` to a UTC-day range.
@@ -1230,6 +1235,7 @@ def create_api_router(
         provider: Annotated[str | None, Query()] = None,
         teams: Annotated[str | None, Query()] = None,
         models: Annotated[str | None, Query()] = None,
+        limit: Annotated[int | None, Query()] = None,
     ) -> list[IssueSummary]:
         if ui_db_pool is None:
             raise HTTPException(status_code=503, detail="UI database is not configured")
@@ -1239,6 +1245,12 @@ def create_api_router(
         team_filter = _parse_teams(teams)
         model_filter = _parse_models(models)
         is_done = scope is IssueScope.DONE
+        # Active scope ignores `limit` entirely, so an out-of-range value there
+        # is harmless and shouldn't 422 (only the done scope's bounds matter).
+        if is_done and limit is not None and not (1 <= limit <= 500):
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+
+        triples: list[tuple[dict[str, Any], Any, str | None]]
         try:
             conn = await ui_db_pool.connection()
             request_now = now()
@@ -1306,53 +1318,75 @@ def create_api_router(
                     provider=provider_filter,
                     models=model_filter,
                 )
-            status_by_id = await compute_canonical_statuses(
-                conn,
-                [str(issue["id"]) for issue in issues],
-                now=request_now,
-                thresholds=thresholds,
-            )
-            statuses = [(issue, status_by_id[str(issue["id"])]) for issue in issues]
+
+            statuses: list[tuple[dict[str, Any], Any]] = []
+            if is_done:
+                # Newest N done issues (default 50). `len == limit` implies more
+                # done history exists beyond what's returned.
+                effective_limit = DONE_SCOPE_DEFAULT_LIMIT if limit is None else limit
+                # Sort by the SQL-computed completion timestamp — no canonical
+                # status needed for that — so the status fan-out below can stop
+                # as soon as `effective_limit` done issues are found instead of
+                # computing status for the whole (possibly all-time) window.
+                issues.sort(
+                    key=lambda issue: (
+                        str(issue.get("max_merged_at") or issue.get("latest_activity_ts") or ""),
+                        _identifier_sort_key(str(issue["identifier"])),
+                    ),
+                    reverse=True,
+                )
+                triples = []
+                chunk_size = max(effective_limit, DONE_SCOPE_DEFAULT_LIMIT)
+                for start in range(0, len(issues), chunk_size):
+                    chunk = issues[start : start + chunk_size]
+                    status_by_id = await compute_canonical_statuses(
+                        conn,
+                        [str(issue["id"]) for issue in chunk],
+                        now=request_now,
+                        thresholds=thresholds,
+                    )
+                    for issue in chunk:
+                        status = status_by_id[str(issue["id"])]
+                        if status.state != "done":
+                            continue
+                        # A completed issue that was requeued (back in
+                        # Todo/Waiting) shows in the active scope's queue
+                        # lanes — not in Done too.
+                        if str(issue["id"]) in queued_storage_id_set:
+                            continue
+                        completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
+                        if completed_at is None:
+                            continue
+                        completed_day = str(completed_at)[:10]
+                        if date_from is not None and completed_day < date_from:
+                            continue
+                        if date_to is not None and completed_day > date_to:
+                            continue
+                        triples.append((issue, status, str(completed_at)))
+                        if len(triples) >= effective_limit:
+                            break
+                    if len(triples) >= effective_limit:
+                        break
+            else:
+                status_by_id = await compute_canonical_statuses(
+                    conn,
+                    [str(issue["id"]) for issue in issues],
+                    now=request_now,
+                    thresholds=thresholds,
+                )
+                statuses = [(issue, status_by_id[str(issue["id"])]) for issue in issues]
+                statuses.sort(
+                    key=lambda item: (
+                        *canonical_status_sort_key(item[1]),
+                        _identifier_sort_key(str(item[0]["identifier"])),
+                    )
+                )
+                triples = [(issue, status, None) for issue, status in statuses]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503,
                 detail="UI database is not available",
             ) from exc
-
-        if is_done:
-            # Keep only canonically-done issues whose completion lands inside the
-            # window, newest first. The window is open-ended when a bound is
-            # omitted (all-time done by default).
-            kept: list[tuple[dict[str, Any], Any, str | None]] = []
-            for issue, status in statuses:
-                if status.state != "done":
-                    continue
-                # A completed issue that was requeued (back in Todo/Waiting)
-                # shows in the active scope's queue lanes — not in Done too.
-                if str(issue["id"]) in queued_storage_id_set:
-                    continue
-                completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
-                if completed_at is None:
-                    continue
-                completed_day = str(completed_at)[:10]
-                if date_from is not None and completed_day < date_from:
-                    continue
-                if date_to is not None and completed_day > date_to:
-                    continue
-                kept.append((issue, status, str(completed_at)))
-            kept.sort(
-                key=lambda item: (item[2], _identifier_sort_key(str(item[0]["identifier"]))),
-                reverse=True,
-            )
-            triples = kept
-        else:
-            statuses.sort(
-                key=lambda item: (
-                    *canonical_status_sort_key(item[1]),
-                    _identifier_sort_key(str(item[0]["identifier"])),
-                )
-            )
-            triples = [(issue, status, None) for issue, status in statuses]
 
         queue_by_storage_id = {
             queue_storage_ids[_queue_key(row)]: row
