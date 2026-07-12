@@ -257,6 +257,50 @@ async def test_ui_mount_serves_index_and_spa_fallback(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ui_cache_control_headers(tmp_path: Path) -> None:
+    dist = _dist(tmp_path)
+    assets = dist / "assets"
+    assets.mkdir()
+    (assets / "index-abc123.js").write_text("console.log(1)")
+    (assets / "index-def456.css").write_text("body{}")
+
+    app = create_app(
+        _Handler(),
+        object(),  # type: ignore[arg-type]
+        ui_enabled=True,
+        ui_dist_dir=dist,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        js = await client.get("/ui/assets/index-abc123.js")
+        css = await client.get("/ui/assets/index-def456.css")
+        root = await client.get("/ui/")
+        fallback = await client.get("/ui/some/nested/path")
+
+    immutable = "public, max-age=31536000, immutable"
+    assert js.headers["cache-control"] == immutable
+    assert css.headers["cache-control"] == immutable
+    assert root.headers["cache-control"] == "no-cache"
+    assert fallback.headers["cache-control"] == "no-cache"
+
+    # index.html still revalidates via ETag.
+    assert "etag" in root.headers
+    revalidated = None
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        revalidated = await client.get(
+            "/ui/", headers={"if-none-match": root.headers["etag"]}
+        )
+    assert revalidated.status_code == 304
+    assert revalidated.headers["cache-control"] == "no-cache"
+
+
+@pytest.mark.asyncio
 async def test_ui_disabled_skips_ui_and_api_mounts(tmp_path: Path) -> None:
     app = create_app(
         _Handler(),
