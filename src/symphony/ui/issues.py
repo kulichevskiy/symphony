@@ -248,6 +248,157 @@ def _timeline_event(row: dict[str, Any]) -> dict[str, Any]:
     return {"ts": row["ts"], "kind": kind, "payload": payload}
 
 
+# Merged, oldest-first timeline of every issue event. Each subquery filters by
+# a single `issue_id` placeholder (11 placeholders total, in this order).
+_TIMELINE_UNION_SQL = """
+    SELECT started_at AS ts, 'run_started' AS kind,
+           id AS run_id, stage, pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
+           NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM runs
+    WHERE issue_id = ?
+
+    UNION ALL
+
+    SELECT ended_at AS ts, 'run_ended' AS kind,
+           id AS run_id, stage, NULL AS pid, status,
+           NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
+           NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM runs
+    WHERE issue_id = ? AND ended_at IS NOT NULL
+
+    UNION ALL
+
+    SELECT created_at AS ts, 'pr_opened' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           github_repo, pr_number, pr_url,
+           NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM issue_prs
+    WHERE issue_id = ?
+
+    UNION ALL
+
+    SELECT merged_at AS ts, 'pr_merged' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           github_repo, pr_number, NULL AS pr_url,
+           NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM issue_prs
+    WHERE issue_id = ? AND merged_at IS NOT NULL
+
+    UNION ALL
+
+    SELECT seen_at AS ts, 'comment_seen' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM comment_events
+    WHERE issue_id = ?
+
+    UNION ALL
+
+    SELECT m.last_posted_at AS ts, 'activity_comment_posted' AS kind,
+           m.run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, NULL AS comment_id, m.last_fingerprint AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM activity_comment_marks m
+    JOIN runs r ON r.id = m.run_id
+    WHERE r.issue_id = ? AND m.last_posted_at IS NOT NULL
+
+    UNION ALL
+
+    SELECT ts, 'review_state_changed' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+           field, old_value, new_value, NULL AS wait_kind,
+           NULL AS external_source, NULL AS drift_kind,
+           NULL AS action_taken
+    FROM state_transitions
+    WHERE issue_id = ? AND table_name = 'review_state'
+
+    UNION ALL
+
+    SELECT ts, 'operator_wait_ended' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           old_value AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM state_transitions
+    WHERE issue_id = ?
+      AND table_name = 'operator_waits'
+      AND field = 'kind'
+      AND old_value IS NOT NULL
+
+    UNION ALL
+
+    SELECT ts, 'operator_wait_started' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           new_value AS wait_kind, NULL AS external_source,
+           NULL AS drift_kind, NULL AS action_taken
+    FROM state_transitions
+    WHERE issue_id = ?
+      AND table_name = 'operator_waits'
+      AND field = 'kind'
+      AND new_value IS NOT NULL
+
+    UNION ALL
+
+    SELECT observed_at AS ts,
+           CASE
+               WHEN action_taken = 'cleared' THEN 'external_cleared'
+               ELSE 'external_observed'
+           END AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+           NULL AS field, NULL AS old_value, NULL AS new_value,
+           NULL AS wait_kind, source AS external_source,
+           drift_kind, action_taken
+    FROM external_observations
+    WHERE issue_id = ? AND action_taken != 'noted'
+
+    UNION ALL
+
+    SELECT ts, 'external_state_change' AS kind,
+           NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
+           NULL AS github_repo, NULL AS pr_number,
+           NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
+           field, old_value, new_value, NULL AS wait_kind,
+           old_value AS external_source, NULL AS drift_kind,
+           NULL AS action_taken
+    FROM state_transitions
+    WHERE issue_id = ?
+      AND table_name = 'external_observations'
+      AND field = 'external_state_change'
+"""
+
+# Number of `issue_id` placeholders in `_TIMELINE_UNION_SQL`.
+_TIMELINE_UNION_PARAM_COUNT = 11
+
+
 def create_issue_detail_router(
     pool: ReadOnlyDbPool,
     *,
@@ -470,7 +621,11 @@ def create_issue_detail_router(
         ]
 
     @router.get("/issues/{issue_id}/timeline")
-    async def issue_timeline(issue_id: str) -> list[dict[str, Any]]:
+    async def issue_timeline(
+        issue_id: str,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 200,
+        before: Annotated[str | None, Query()] = None,
+    ) -> list[dict[str, Any]]:
         conn = await pool.connection()
         issue = await _fetch_one(
             conn,
@@ -480,169 +635,36 @@ def create_issue_detail_router(
         if issue is None:
             raise HTTPException(status_code=404, detail="Issue not found")
 
+        issue_params = (issue_id,) * _TIMELINE_UNION_PARAM_COUNT
+        # Find the ts of the `limit`-th newest event at or before the cursor.
+        # `before` is an exclusive ts cursor; ts values are same-format ISO UTC
+        # strings, so lexicographic comparison matches the total order. Anchoring
+        # the page at this ts (not an offset row) lets us pull the *whole* tie
+        # group sharing it, so a ts-only cursor never splits ties.
+        cutoff_row = await _fetch_one(
+            conn,
+            f"""
+            WITH events AS ({_TIMELINE_UNION_SQL})
+            SELECT ts
+            FROM events
+            WHERE (? IS NULL OR ts < ?)
+            ORDER BY ts DESC, kind DESC
+            LIMIT 1 OFFSET ?
+            """,
+            (*issue_params, before, before, limit - 1),
+        )
+        cutoff = cutoff_row["ts"] if cutoff_row is not None else None
         rows = await _fetch_all(
             conn,
-            """
+            f"""
+            WITH events AS ({_TIMELINE_UNION_SQL})
             SELECT *
-            FROM (
-                SELECT started_at AS ts, 'run_started' AS kind,
-                       id AS run_id, stage, pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
-                       NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM runs
-                WHERE issue_id = ?
-
-                UNION ALL
-
-                SELECT ended_at AS ts, 'run_ended' AS kind,
-                       id AS run_id, stage, NULL AS pid, status,
-                       NULL AS github_repo, NULL AS pr_number, NULL AS pr_url,
-                       NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM runs
-                WHERE issue_id = ? AND ended_at IS NOT NULL
-
-                UNION ALL
-
-                SELECT created_at AS ts, 'pr_opened' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       github_repo, pr_number, pr_url,
-                       NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM issue_prs
-                WHERE issue_id = ?
-
-                UNION ALL
-
-                SELECT merged_at AS ts, 'pr_merged' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       github_repo, pr_number, NULL AS pr_url,
-                       NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM issue_prs
-                WHERE issue_id = ? AND merged_at IS NOT NULL
-
-                UNION ALL
-
-                SELECT seen_at AS ts, 'comment_seen' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM comment_events
-                WHERE issue_id = ?
-
-                UNION ALL
-
-                SELECT m.last_posted_at AS ts, 'activity_comment_posted' AS kind,
-                       m.run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, m.last_fingerprint AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM activity_comment_marks m
-                JOIN runs r ON r.id = m.run_id
-                WHERE r.issue_id = ? AND m.last_posted_at IS NOT NULL
-
-                UNION ALL
-
-                SELECT ts, 'review_state_changed' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       field, old_value, new_value, NULL AS wait_kind,
-                       NULL AS external_source, NULL AS drift_kind,
-                       NULL AS action_taken
-                FROM state_transitions
-                WHERE issue_id = ? AND table_name = 'review_state'
-
-                UNION ALL
-
-                SELECT ts, 'operator_wait_ended' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       old_value AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM state_transitions
-                WHERE issue_id = ?
-                  AND table_name = 'operator_waits'
-                  AND field = 'kind'
-                  AND old_value IS NOT NULL
-
-                UNION ALL
-
-                SELECT ts, 'operator_wait_started' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       new_value AS wait_kind, NULL AS external_source,
-                       NULL AS drift_kind, NULL AS action_taken
-                FROM state_transitions
-                WHERE issue_id = ?
-                  AND table_name = 'operator_waits'
-                  AND field = 'kind'
-                  AND new_value IS NOT NULL
-
-                UNION ALL
-
-                SELECT observed_at AS ts,
-                       CASE
-                           WHEN action_taken = 'cleared' THEN 'external_cleared'
-                           ELSE 'external_observed'
-                       END AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       NULL AS field, NULL AS old_value, NULL AS new_value,
-                       NULL AS wait_kind, source AS external_source,
-                       drift_kind, action_taken
-                FROM external_observations
-                WHERE issue_id = ? AND action_taken != 'noted'
-
-                UNION ALL
-
-                SELECT ts, 'external_state_change' AS kind,
-                       NULL AS run_id, NULL AS stage, NULL AS pid, NULL AS status,
-                       NULL AS github_repo, NULL AS pr_number,
-                       NULL AS pr_url, NULL AS comment_id, NULL AS fingerprint,
-                       field, old_value, new_value, NULL AS wait_kind,
-                       old_value AS external_source, NULL AS drift_kind,
-                       NULL AS action_taken
-                FROM state_transitions
-                WHERE issue_id = ?
-                  AND table_name = 'external_observations'
-                  AND field = 'external_state_change'
-            )
+            FROM events
+            WHERE (? IS NULL OR ts < ?)
+              AND (? IS NULL OR ts >= ?)
             ORDER BY ts ASC, kind ASC
             """,
-            (
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-                issue_id,
-            ),
+            (*issue_params, before, before, cutoff, cutoff),
         )
         return [_timeline_event(row) for row in rows]
 

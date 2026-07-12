@@ -13,11 +13,14 @@ import {
 import { authHeaders } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 
-type TimelineEvent = {
+export type TimelineEvent = {
   ts: string;
   kind: string;
   payload: Record<string, unknown>;
 };
+
+// Default page size; must match the backend `limit` default.
+export const TIMELINE_PAGE_LIMIT = 200;
 
 type TimelineVariant = "line" | "table";
 type SortDirection = "asc" | "desc";
@@ -67,8 +70,28 @@ const KIND_COLORS: Record<string, string> = {
   external_state_change: "bg-indigo-600",
 };
 
-async function fetchIssueTimeline(id: string): Promise<TimelineEvent[]> {
-  const response = await fetch(`/api/issues/${encodeURIComponent(id)}/timeline`, {
+export function buildTimelineUrl(id: string, before?: string): string {
+  const params = new URLSearchParams({ limit: String(TIMELINE_PAGE_LIMIT) });
+  if (before) {
+    params.set("before", before);
+  }
+  return `/api/issues/${encodeURIComponent(id)}/timeline?${params.toString()}`;
+}
+
+// Events come back oldest-first, so the oldest loaded ts (the paging cursor) is
+// at index 0 and older pages prepend ahead of what we already have.
+export function oldestLoadedTs(events: TimelineEvent[]): string | undefined {
+  return events[0]?.ts;
+}
+
+// A full page (>= limit; the backend may exceed it to keep a tie group intact)
+// means older events may still exist.
+export function hasEarlierEvents(pageLength: number): boolean {
+  return pageLength >= TIMELINE_PAGE_LIMIT;
+}
+
+async function fetchIssueTimeline(id: string, before?: string): Promise<TimelineEvent[]> {
+  const response = await fetch(buildTimelineUrl(id, before), {
     headers: await authHeaders(),
   });
   if (!response.ok) {
@@ -348,7 +371,46 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     refetchOnWindowFocus: true,
     staleTime: 0,
   });
-  const events = data ?? [];
+
+  // Older pages loaded on demand, kept ascending and older than `data`.
+  const [earlier, setEarlier] = useState<TimelineEvent[]>([]);
+  const [hasMoreEarlier, setHasMoreEarlier] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [earlierError, setEarlierError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEarlier([]);
+    setHasMoreEarlier(false);
+    setEarlierError(null);
+  }, [issueId]);
+
+  // Seed the load-earlier control from the auto-refreshing newest page, without
+  // clobbering pages the user already loaded.
+  useEffect(() => {
+    if (data && earlier.length === 0) {
+      setHasMoreEarlier(hasEarlierEvents(data.length));
+    }
+  }, [data, earlier.length]);
+
+  const events = useMemo(() => [...earlier, ...(data ?? [])], [earlier, data]);
+
+  async function loadEarlier() {
+    const cursor = oldestLoadedTs(events);
+    if (!cursor || loadingEarlier) {
+      return;
+    }
+    setLoadingEarlier(true);
+    setEarlierError(null);
+    try {
+      const page = await fetchIssueTimeline(issueId, cursor);
+      setEarlier((prev) => [...page, ...prev]);
+      setHasMoreEarlier(hasEarlierEvents(page.length));
+    } catch (loadError) {
+      setEarlierError((loadError as Error).message);
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
 
   return (
     <section className="border-t py-5">
@@ -367,6 +429,16 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
       ) : null}
       {!isLoading && !error && events.length === 0 ? (
         <p className="text-sm text-muted-foreground">(none)</p>
+      ) : null}
+      {events.length > 0 && hasMoreEarlier ? (
+        <div className="mb-3 flex items-center gap-3">
+          <Button type="button" variant="secondary" onClick={loadEarlier} disabled={loadingEarlier}>
+            {loadingEarlier ? "Loading" : "Load earlier events"}
+          </Button>
+          {earlierError ? (
+            <span className="text-sm text-red-600 dark:text-red-400">{earlierError}</span>
+          ) : null}
+        </div>
       ) : null}
       {events.length > 0 && variant === "line" ? (
         <TimelineLine events={events} now={now} />
