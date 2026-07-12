@@ -76,6 +76,18 @@ describe("mergeTimelineEvents", () => {
     const merged = mergeTimelineEvents([first, second]);
     expect(merged.length).toBe(2);
   });
+
+  it("orders mixed ts shapes chronologically, not lexicographically", () => {
+    // A second-precision `Z` ts string-sorts *after* a later sub-second
+    // `+00:00` one ('.' < 'Z'), even though it happened first.
+    const earlierZ = event("2026-05-17T10:00:00Z");
+    const laterOffset = event("2026-05-17T10:00:00.500000+00:00");
+    const merged = mergeTimelineEvents([laterOffset, earlierZ]);
+    expect(merged.map((e) => e.ts)).toEqual([
+      "2026-05-17T10:00:00Z",
+      "2026-05-17T10:00:00.500000+00:00",
+    ]);
+  });
 });
 
 describe("mergeNewestPage", () => {
@@ -98,6 +110,26 @@ describe("mergeNewestPage", () => {
     // where `stalePost` used to live.
     const merged = mergeNewestPage(prev, [anchor, refreshedPost]);
     expect(merged).toEqual([anchor, refreshedPost]);
+  });
+
+  it("drops a stale current-state row even when it sits older than the fresh window", () => {
+    // The mark was loaded from an earlier page while its last_posted_at was
+    // still old; it has since moved into the fresh page's window under a new
+    // ts, but the old copy's ts (older than the window) means a plain ts
+    // check wouldn't touch it - identity must.
+    const older = event("2026-05-17T09:00:00Z");
+    const staleMark = event("2026-05-17T09:30:00Z", "activity_comment_posted", {
+      run_id: "run-1",
+      fingerprint: "fp-old",
+    });
+    const prev = [older, staleMark];
+    const windowAnchor = event("2026-05-17T10:00:00Z");
+    const freshMark = event("2026-05-17T10:05:00Z", "activity_comment_posted", {
+      run_id: "run-1",
+      fingerprint: "fp-new",
+    });
+    const merged = mergeNewestPage(prev, [windowAnchor, freshMark]);
+    expect(merged).toEqual([older, windowAnchor, freshMark]);
   });
 
   it("keeps earlier events outside the newest page's window", () => {
@@ -191,6 +223,48 @@ describe("IssueTimeline", () => {
     expect(renderedTimes).toContain(tsAt(810));
     expect(renderedTimes).toEqual([...renderedTimes].sort());
     expect(new Set(renderedTimes).size).toBe(renderedTimes.length);
+  });
+
+  it("detects a gap when the newest page jumps ahead with no overlap", async () => {
+    // Mount: minutes 800..999.
+    const newestPage = Array.from({ length: TIMELINE_PAGE_LIMIT }, (_, i) => eventAt(800 + i));
+    // Refetch lands with a window that shares no ts with what's loaded: more
+    // than a full page of events must have arrived since the last refetch.
+    const jumpedPage = Array.from({ length: TIMELINE_PAGE_LIMIT }, (_, i) => eventAt(5000 + i));
+
+    const fetchMock = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(newestPage),
+      } as Response),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <IssueTimeline issueId="iss-1" />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText("200 events");
+    expect(screen.queryByText(/Missed some events/)).toBeNull();
+
+    await act(async () => {
+      client.setQueryData(["issue-timeline", "iss-1"], jumpedPage);
+      await Promise.resolve();
+    });
+
+    // Reset to just the fresh page instead of pretending the stale
+    // accumulation is still contiguous with it.
+    await screen.findByText("200 events");
+    await screen.findByText(/Missed some events/);
+    const renderedTimes = [
+      ...document.querySelectorAll("time[datetime]"),
+    ].map((node) => node.getAttribute("datetime"));
+    expect(renderedTimes).not.toContain(tsAt(810));
+    expect(renderedTimes).toContain(tsAt(5010));
   });
 
   it("drops a load-earlier response for an issue the user navigated away from before it resolved", async () => {

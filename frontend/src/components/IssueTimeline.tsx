@@ -90,9 +90,33 @@ export function hasEarlierEvents(pageLength: number): boolean {
   return pageLength >= TIMELINE_PAGE_LIMIT;
 }
 
-// Merges pages keyed on ts+kind and re-sorts, so a moving "newest" window
-// (refetched on the interval) can never drift apart from loaded earlier
-// pages and silently drop the events between them.
+// Sources don't all format `ts` the same way (e.g. `2026-05-17T10:00:00Z`
+// from comments vs `2026-05-17T10:00:00.500000+00:00` from internally
+// generated ones), so raw string comparison isn't reliably order-preserving
+// across pages. Always compare/sort on the parsed instant instead.
+function tsValue(ts: string): number {
+  return new Date(ts).getTime();
+}
+
+function isTsBefore(a: string, b: string): boolean {
+  return tsValue(a) < tsValue(b);
+}
+
+// Stable identity for timeline rows backed by a current-state table (i.e. a
+// single row per key that can move to a new ts), independent of their ts and
+// payload. Used to drop a stale copy of the same row even when it now lives
+// outside the fresh page's ts window. Append-only sources return undefined
+// and keep the default ts+kind+payload identity.
+function timelineEntityKey(event: TimelineEvent): string | undefined {
+  if (event.kind === "activity_comment_posted") {
+    return `activity_comment_posted:${String(event.payload.run_id)}`;
+  }
+  return undefined;
+}
+
+// Merges pages keyed on ts+kind+payload and re-sorts, so a moving "newest"
+// window (refetched on the interval) can never drift apart from loaded
+// earlier pages and silently drop the events between them.
 export function mergeTimelineEvents(
   ...pages: TimelineEvent[][]
 ): TimelineEvent[] {
@@ -102,19 +126,31 @@ export function mergeTimelineEvents(
       byKey.set(`${event.ts}:${event.kind}:${JSON.stringify(event.payload)}`, event);
     }
   }
-  return [...byKey.values()].sort((left, right) => left.ts.localeCompare(right.ts));
+  return [...byKey.values()].sort((left, right) => tsValue(left.ts) - tsValue(right.ts));
 }
 
 // The newest-page fetch is authoritative for everything at or after its
 // oldest ts: some sources are current-state rows that collapse to a single
 // row per key (e.g. activity_comment_marks), so a value that changed or
 // disappeared there must be dropped, not merged in on top of the stale one.
+// A current-state row can also have moved *into* the fresh window from a ts
+// that used to sit outside it (loaded from an earlier page before it moved),
+// so entity identity - not just the ts window - decides what's stale.
 export function mergeNewestPage(
   prev: TimelineEvent[],
   page: TimelineEvent[],
 ): TimelineEvent[] {
   const windowStart = oldestLoadedTs(page);
-  const kept = windowStart === undefined ? prev : prev.filter((event) => event.ts < windowStart);
+  const freshEntityKeys = new Set(
+    page.map(timelineEntityKey).filter((key): key is string => key !== undefined),
+  );
+  const kept = prev.filter((event) => {
+    if (windowStart !== undefined && !isTsBefore(event.ts, windowStart)) {
+      return false;
+    }
+    const entityKey = timelineEntityKey(event);
+    return entityKey === undefined || !freshEntityKeys.has(entityKey);
+  });
   return mergeTimelineEvents(kept, page);
 }
 
@@ -408,11 +444,16 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [earlierError, setEarlierError] = useState<string | null>(null);
   const [earlierLoadedOnce, setEarlierLoadedOnce] = useState(false);
+  const [gapDetected, setGapDetected] = useState(false);
 
   // Lets in-flight requests notice they were issued for an issue the user has
   // since navigated away from, so their responses can be dropped instead of
   // being merged into the now-current issue's timeline.
   const issueIdRef = useRef(issueId);
+
+  // Newest ts covered by the last-folded newest-page fetch, so the next
+  // refetch can tell whether its window still overlaps what came before.
+  const newestCoveredTsRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     issueIdRef.current = issueId;
@@ -421,6 +462,8 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     setLoadingEarlier(false);
     setEarlierError(null);
     setEarlierLoadedOnce(false);
+    setGapDetected(false);
+    newestCoveredTsRef.current = undefined;
   }, [issueId]);
 
   // Fold each refetch of the newest page into the accumulator instead of
@@ -429,11 +472,33 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
     if (!data) {
       return;
     }
-    setEvents((prev) => mergeNewestPage(prev, data));
-    // Seed the load-earlier control from the newest page's size, without
-    // clobbering it once the user has started paging back manually.
-    if (!earlierLoadedOnce) {
+    const windowStart = oldestLoadedTs(data);
+    const previousNewestTs = newestCoveredTsRef.current;
+    // If more than a full page of events arrived since the last refetch, the
+    // fresh newest-page window no longer overlaps what we'd already loaded:
+    // there's a gap of events we never fetched and can't recover with only a
+    // `before` cursor, so surface it instead of pretending the accumulation
+    // is still contiguous.
+    const gapped =
+      previousNewestTs !== undefined &&
+      windowStart !== undefined &&
+      isTsBefore(previousNewestTs, windowStart);
+    if (gapped) {
+      setEvents(data);
+      setEarlierLoadedOnce(false);
+      setGapDetected(true);
       setHasMoreEarlier(hasEarlierEvents(data.length));
+    } else {
+      setEvents((prev) => mergeNewestPage(prev, data));
+      // Seed the load-earlier control from the newest page's size, without
+      // clobbering it once the user has started paging back manually.
+      if (!earlierLoadedOnce) {
+        setHasMoreEarlier(hasEarlierEvents(data.length));
+      }
+    }
+    const windowEnd = data[data.length - 1]?.ts;
+    if (windowEnd !== undefined) {
+      newestCoveredTsRef.current = windowEnd;
     }
   }, [data, earlierLoadedOnce]);
 
@@ -480,6 +545,11 @@ export function IssueTimeline({ issueId }: { issueId: string }) {
       ) : null}
       {!isLoading && !error && events.length === 0 ? (
         <p className="text-sm text-muted-foreground">(none)</p>
+      ) : null}
+      {gapDetected ? (
+        <p className="mb-3 text-sm text-amber-600 dark:text-amber-400">
+          Missed some events while this view was idle - showing only the latest window.
+        </p>
       ) : null}
       {events.length > 0 && hasMoreEarlier ? (
         <div className="mb-3 flex items-center gap-3">
