@@ -132,5 +132,33 @@ async def test_disabled_bindings_not_dispatched(tmp_path: Path) -> None:
         enabled=True,
     )
     cfg = await assemble_effective_config(conn, _base(tmp_path))
-    assert [b.project_key for b in cfg.repos] == ["WEB"]
+    # Disabled bindings stay in `cfg.repos` — restart/restore paths (open PRs,
+    # operator waits, live runs) resolve their binding by iterating it — but
+    # marked `enabled=False` so dispatch skips them for new work.
+    assert {b.project_key: b.enabled for b in cfg.repos} == {"ENG": False, "WEB": True}
+    assert [b.project_key for b in cfg.repos if b.enabled] == ["WEB"]
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_db_role_combo_refuses_boot(tmp_path: Path) -> None:
+    """DB roles bypass `Config`'s constructor validators via `model_copy`;
+    assembly must re-run the same family check YAML `repos:`/`roles:` gets."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    # `codex` agent paired with a Claude-only model alias — invalid combo the
+    # YAML loader's `_validate_roles` would reject at construction time.
+    await db.config_globals.set_globals(
+        conn, roles={"implement": {"agent": "codex", "model": "opus"}}, migrated_at="t"
+    )
+    with pytest.raises(ConfigBootError, match="invalid role configuration"):
+        await assemble_effective_config(conn, _base(tmp_path))
     await conn.close()

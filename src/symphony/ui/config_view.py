@@ -64,6 +64,7 @@ def build_config_view(config: Config) -> ConfigView:
             },
         )
         for binding in config.repos
+        if binding.enabled
     ]
     return ConfigView(
         global_max_concurrent=config.global_max_concurrent,

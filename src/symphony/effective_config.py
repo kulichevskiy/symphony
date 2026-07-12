@@ -103,8 +103,13 @@ async def assemble_effective_config(
         )
 
     # `list_all` already returns dispatch-evaluation order (priority, then the
-    # stable natural-key tiebreak). Only enabled bindings are dispatched.
-    bindings = [RepoBinding.model_validate(row.payload) for row in stored if row.enabled]
+    # stable natural-key tiebreak). Disabled bindings are kept in `cfg.repos`
+    # — restart/restore paths (open PRs, operator waits, live runs) resolve
+    # their binding by iterating it — but marked `enabled=False` so dispatch
+    # and manual-dispatch skip them for new work.
+    bindings = [
+        RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored
+    ]
     global_roles = (
         {name: RoleConfig.model_validate(cell) for name, cell in globals_row.roles.items()}
         if globals_row
@@ -112,4 +117,11 @@ async def assemble_effective_config(
     )
     effective = base.model_copy(update={"repos": bindings, "roles": global_roles})
     _resolve_bindings(effective)
+    try:
+        # `model_copy` skips `Config`'s model_validators, so DB-sourced role
+        # combos (family/effort mismatches, legacy-field conflicts) never ran
+        # through the same check YAML `repos:`/`roles:` gets at load time.
+        effective.validate_roles_matrix()
+    except ValueError as e:
+        raise ConfigBootError(f"invalid role configuration in the config DB: {e}") from e
     return effective

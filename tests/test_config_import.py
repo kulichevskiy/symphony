@@ -179,3 +179,36 @@ repos:
     assert result.replaced is True
     assert await db.config_bindings.count(conn) == 1
     await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_replace_does_not_delete_existing_bindings(tmp_path: Path) -> None:
+    """A `--replace` import that fails partway (duplicate natural key across
+    two unlabeled bindings on the same scope) must roll back the delete too —
+    not leave the DB with the old bindings gone and nothing written back."""
+    conn, _result, _rows, _globals_row = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+""",
+    )
+    bad_path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: WEB
+    github_repo: org/web
+{_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_STATES}
+""",
+    )
+    with pytest.raises(Exception):  # noqa: B017 — sqlite3.IntegrityError, not wrapped
+        await import_config(bad_path, conn, replace=True, now="t2")
+    rows = await db.config_bindings.list_all(conn)
+    assert [r.project_key for r in rows] == ["ENG"]
+    await conn.close()

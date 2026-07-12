@@ -66,9 +66,16 @@ async def insert(
     updated_at: str = "",
     updated_by: str = "",
     version: int = 1,
+    commit: bool = True,
 ) -> int:
     """Insert one binding row. Raises `ValueError` on legacy role fields in the
-    payload and `sqlite3.IntegrityError` on a duplicate natural key."""
+    payload and `sqlite3.IntegrityError` on a duplicate natural key.
+
+    `commit=False` lets a caller batch several inserts (plus other writes)
+    into one atomic transaction it commits itself — e.g. a `--replace`
+    import, where committing each row individually would leave a partial,
+    unrecoverable state on a later failure.
+    """
     _reject_legacy_fields(payload)
     project_key, github_repo, issue_label, tracker_provider, tracker_site = key
     cur = await conn.execute(
@@ -93,7 +100,8 @@ async def insert(
             tracker_site,
         ),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()
     return int(cur.lastrowid or 0)
 
 

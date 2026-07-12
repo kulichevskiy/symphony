@@ -117,7 +117,7 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
     silently routed manual dispatches to the wrong repo when one team was
     fanned out to multiple repos via labels.
     """
-    team_bindings = [b for b in cfg.repos if b.linear_team_key == issue.team_key]
+    team_bindings = [b for b in cfg.repos if b.enabled and b.linear_team_key == issue.team_key]
     if not team_bindings:
         configured = sorted({b.linear_team_key for b in cfg.repos})
         click.echo(
@@ -286,9 +286,12 @@ def _enforce_require_auth0(cfg: Config) -> None:
 
 
 async def _run(config_path: Path, *, once: bool) -> None:
-    base = Config.load(config_path)
-    conn = await db.connect(base.db_path)
+    conn = await db.connect(Config.peek_db_path(config_path))
     try:
+        # A migrated deployment's leftover YAML `repos:` is ignored — don't
+        # pay for (or risk boot-crashing on) validating/resolving it.
+        has_db_bindings = await db.config_bindings.count(conn) > 0
+        base = Config.load(config_path, resolve_repos=not has_db_bindings)
         try:
             cfg = await assemble_effective_config(conn, base)
         except ConfigBootError as e:
@@ -392,8 +395,10 @@ async def _config_import(config_path: Path, *, replace: bool) -> None:
 
     from .config_import import ConfigImportError, import_config
 
-    base = Config.load(config_path)
-    conn = await db.connect(base.db_path)
+    # The importer re-validates the YAML itself (`Config.model_validate`,
+    # no secrets); don't require a fully-resolvable `.env` just to import.
+    db_path = Config.peek_db_path(config_path)
+    conn = await db.connect(db_path)
     try:
         now = datetime.now(UTC).isoformat()
         result = await import_config(config_path, conn, replace=replace, now=now)
@@ -403,7 +408,7 @@ async def _config_import(config_path: Path, *, replace: bool) -> None:
     finally:
         await conn.close()
     verb = "replaced" if result.replaced else "imported"
-    click.echo(f"{verb} {result.bindings} binding(s) into {base.db_path}")
+    click.echo(f"{verb} {result.bindings} binding(s) into {db_path}")
 
 
 @main.command()
@@ -561,9 +566,10 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
 
 
 async def _preflight(config_path: Path) -> None:
-    base = Config.load(config_path)
-    conn = await db.connect(base.db_path)
+    conn = await db.connect(Config.peek_db_path(config_path))
     try:
+        has_db_bindings = await db.config_bindings.count(conn) > 0
+        base = Config.load(config_path, resolve_repos=not has_db_bindings)
         cfg = await assemble_effective_config(conn, base, boot_gates=False)
     except ConfigBootError as e:
         click.echo(str(e), err=True)
@@ -1097,12 +1103,13 @@ def dispatch(linear_id: str, config_path: Path) -> None:
 
 
 async def _dispatch(linear_id: str, config_path: Path) -> None:
-    base = Config.load(config_path)
-    if not base.linear_api_key:
-        click.echo("LINEAR_API_KEY is empty", err=True)
-        sys.exit(2)
-    conn = await db.connect(base.db_path)
+    conn = await db.connect(Config.peek_db_path(config_path))
     try:
+        has_db_bindings = await db.config_bindings.count(conn) > 0
+        base = Config.load(config_path, resolve_repos=not has_db_bindings)
+        if not base.linear_api_key:
+            click.echo("LINEAR_API_KEY is empty", err=True)
+            sys.exit(2)
         try:
             cfg = await assemble_effective_config(conn, base, boot_gates=False)
         except ConfigBootError as e:

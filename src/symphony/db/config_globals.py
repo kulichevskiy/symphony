@@ -40,8 +40,13 @@ async def set_globals(
     roles: dict[str, Any],
     migrated_at: str = "",
     version: int = 1,
+    commit: bool = True,
 ) -> None:
-    """Upsert the single global-config row."""
+    """Upsert the single global-config row.
+
+    `commit=False` lets a caller fold this write into a larger atomic
+    transaction it commits itself.
+    """
     await conn.execute(
         """
         INSERT INTO config_globals (id, roles, migrated_at, version)
@@ -53,4 +58,5 @@ async def set_globals(
         """,
         (json.dumps(roles, separators=(",", ":")), migrated_at, version),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()

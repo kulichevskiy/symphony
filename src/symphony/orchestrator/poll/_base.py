@@ -851,6 +851,8 @@ class _OrchestratorBase:
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("review resurrection failed")
         for binding in self.config.repos:
+            if not binding.enabled:
+                continue
             scheduled.extend(await self._scan_binding(binding))
         try:
             await self._poll_slash_commands()

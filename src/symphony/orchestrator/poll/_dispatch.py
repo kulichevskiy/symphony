@@ -628,6 +628,8 @@ class _DispatchMixin(_OrchestratorBase):
     ) -> RepoBinding | None:
         issue_labels = set(issue.labels)
         for binding in self.config.repos:
+            if not binding.enabled:
+                continue
             if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if binding.linear_team_key != issue.team_key:

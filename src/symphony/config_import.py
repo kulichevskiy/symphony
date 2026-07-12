@@ -161,26 +161,36 @@ async def import_config(
     cfg = Config.model_validate(raw)
     raw_repos: list[dict[str, Any]] = list(raw.get("repos", []) or [])
 
-    if replace:
-        await conn.execute("DELETE FROM config_bindings")
-        await conn.commit()
+    # The delete, every row insert, and the globals write land in one
+    # transaction: a later failure (duplicate natural key, bad payload) rolls
+    # back the whole import instead of leaving `--replace` having deleted the
+    # current bindings with nothing written in their place.
+    try:
+        if replace:
+            await conn.execute("DELETE FROM config_bindings")
 
-    for priority, (raw_repo, binding) in enumerate(zip(raw_repos, cfg.repos, strict=True)):
-        payload = build_payload(raw_repo, binding, cfg.roles)
-        await db.config_bindings.insert(
+        for priority, (raw_repo, binding) in enumerate(zip(raw_repos, cfg.repos, strict=True)):
+            payload = build_payload(raw_repo, binding, cfg.roles)
+            await db.config_bindings.insert(
+                conn,
+                payload=payload,
+                key=binding_natural_key(binding),
+                enabled=True,
+                priority=priority,
+                updated_at=now,
+                updated_by=updated_by,
+                commit=False,
+            )
+
+        await db.config_globals.set_globals(
             conn,
-            payload=payload,
-            key=binding_natural_key(binding),
-            enabled=True,
-            priority=priority,
-            updated_at=now,
-            updated_by=updated_by,
+            roles=_global_roles_dump(cfg),
+            migrated_at=now or "migrated",
+            version=1,
+            commit=False,
         )
-
-    await db.config_globals.set_globals(
-        conn,
-        roles=_global_roles_dump(cfg),
-        migrated_at=now or "migrated",
-        version=1,
-    )
+    except Exception:
+        await conn.rollback()
+        raise
+    await conn.commit()
     return ImportResult(bindings=len(cfg.repos), replaced=replace)
