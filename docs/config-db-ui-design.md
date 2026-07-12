@@ -110,17 +110,23 @@ the existing YAML topology into the DB.
 ## Implementation Decisions
 
 - **Source of truth: SQLite.** Two new tables: one row per binding with a
-  JSON payload column (the full binding document, validated by the existing
-  pydantic binding model), plus `version`, `enabled`, `updated_at`,
+  JSON payload column, plus `version`, `enabled`, `updated_at`,
   `updated_by`; and a single-document table for global config (the global
-  roles matrix, migration marker). A unique index on the binding's natural
-  key — (provider, tracker site, project key, github repo, issue label), the
-  same tuple the orchestrator already uses as the binding key — rejects
-  duplicates at the DB layer.
-- **JSON payload, not normalized columns.** The binding model has ~40 fields
-  and grows steadily; nested structures (roles, states, acceptance, MCP
-  servers) don't normalize well. Pydantic remains the single schema; adding
-  a field requires no DB migration.
+  roles matrix, migration marker) carrying the same `version` column so
+  fleet-wide role edits get the same optimistic-locking protection as
+  binding edits. A unique index on the binding's natural key — (provider,
+  tracker site, project key, github repo, issue label), the same tuple the
+  orchestrator already uses as the binding key — rejects duplicates at the
+  DB layer.
+- **JSON payload, not normalized columns — and sparse.** The binding model
+  has ~40 fields and grows steadily; nested structures (roles, states,
+  acceptance, MCP servers) don't normalize well. Pydantic remains the single
+  schema; adding a field requires no DB migration. The payload stores only
+  operator-set fields (never a full dump with defaults materialized):
+  a full dump would serialize legacy role defaults as if the operator had
+  set them, tripping the existing legacy/matrix conflict guard on the next
+  validation. The write path additionally rejects payloads that contain any
+  legacy role field outright, so the DB stays legacy-free by construction.
 - **YAML loses bindings entirely.** The config loader stops reading `repos:`
   and `roles:` from YAML — if present they are ignored (a one-line startup
   warning is logged for discoverability, nothing more). YAML keeps
@@ -134,19 +140,25 @@ the existing YAML topology into the DB.
   bindings and global matrix into the DB. No auto-seed at boot. The DB is
   legacy-free from day one, so the legacy/matrix conflict guard is not part
   of the UI path.
-- **Hot-apply at the tick boundary.** The orchestrator re-reads enabled
-  bindings from the DB at the start of every poll tick (the daemon and the
-  UI API share one process and one SQLite connection, so no IPC is needed).
-  Contract: a change affects the *next* dispatch; in-flight runs keep the
-  configuration they captured at dispatch. The one-shot tracker-queue scope
-  prune becomes a reaction to the binding set changing rather than a boot
-  flag.
+- **Hot-apply at the tick boundary.** The orchestrator re-reads *all*
+  bindings — enabled and disabled — from the DB at the start of every poll
+  tick (the daemon and the UI API share one process and one SQLite
+  connection, so no IPC is needed). Contract: a change affects the *next*
+  dispatch; in-flight runs keep the configuration they captured at dispatch.
+  The one-shot tracker-queue scope prune becomes a reaction to the binding
+  set changing rather than a boot flag.
 - **Binding lifecycle.** New `enabled` flag on the binding: disabled means
-  no new dispatches, in-flight work finishes normally, and the binding's
-  tracker-queue lanes are cleared. Delete — and any edit that changes the
-  natural key — is allowed only for a *drained* binding: no running runs and
-  no tracked open PRs in its scope; otherwise the API returns a conflict
-  with the list of blockers.
+  the *dispatch scan* skips it — no new issues start — while the binding
+  stays loaded and visible to every follow-up poller (review monitors,
+  merge-candidate polling, operator-wait resolution all locate their binding
+  by iterating the loaded set), so in-flight work drains to completion
+  instead of stalling. Disabling also clears the binding's tracker-queue
+  lanes. Delete — and any edit that changes the natural key — is allowed
+  only for a *drained* binding: no running runs, no tracked open PRs, and no
+  parked operator waits in its scope (a parked issue awaiting `$retry` or
+  approval resolves its binding by the original natural key, so a rename
+  would strand it); otherwise the API returns a conflict with the list of
+  blockers.
 - **Form scope.** The existing `/ui/config` page is extended in place:
   binding cards become editable (drawer/form), a create button and per-card
   enabled toggle and delete are added, and the global roles matrix gets its
@@ -167,19 +179,38 @@ the existing YAML topology into the DB.
   maps to inputs; the same-family review-diversity warning is returned as a
   non-blocking warning and rendered as a banner — the save succeeds.
 - **Secrets.** Agent-env entries store secret key *names* only (unchanged
-  semantics); resolution against the server env happens on each DB read, and
-  saves fail closed listing available key names when a name is unknown. The
-  webhook secret is write-only: responses carry only a set/unset flag; the
-  advanced JSON view masks it too.
+  semantics), and saves fail closed listing available key names when a name
+  is unknown. Resolution has two strictly separated read paths: the
+  storage/API path always serves raw key names and never resolves; a
+  resolved copy of the binding is materialized only at the moment a binding
+  is handed to dispatch, and that copy is never written back or served. (The
+  current loader resolves in place at boot; that in-place mutation goes
+  away.) The webhook secret is write-only: responses carry only a set/unset
+  flag, and the advanced JSON view masks it too. Update semantics preserve
+  it across ordinary edits — an omitted or masked value means "keep the
+  stored secret"; replacing requires sending a new value and clearing
+  requires an explicit clear marker, so a routine save of unrelated fields
+  can never wipe or corrupt a repo's webhook secret.
 - **Concurrency and audit.** Optimistic locking via a per-row version — the
   UI sends the version it loaded and receives a conflict on mismatch. Every
   write stamps `updated_at`/`updated_by` (email from the auth token) and
   logs a field-level diff to the daemon log. No role-based access control:
   every authenticated user is a config admin, matching the single-operator
   deployment model.
+- **Roles matrix reaches every command path.** Editable agent/model/effort
+  is only honest if every stage actually consumes it: today several dispatch
+  paths still read the legacy per-binding fields (implementer agent/model on
+  the binding, the local-review claude model fields), and the fix-runner
+  command builder does not accept an effort flag. Part of this work is
+  routing all five roles through the resolved-role lookup — implement,
+  review_find, review_verify, fix, and accept command construction all take
+  their agent, model, *and* effort from the matrix — and removing the
+  legacy-field reads from dispatch paths. Otherwise a DB-only role edit
+  saves successfully while some stages keep running old defaults.
 - **API surface.** REST under the config prefix: list/create bindings,
-  get/update/delete a binding by id, get/put the global roles matrix, get
-  options, and a YAML export of the current bindings for backup.
+  get/update/delete a binding by id, get/put the global roles matrix (with
+  the same version check), get options, and a YAML export of the current
+  bindings for backup.
 
 ## Testing Decisions
 
@@ -197,9 +228,15 @@ a script produces — never the internals that produce them.
   command-endpoint tests.
 - **Orchestrator seam**, using the existing orchestrator harness (real DB,
   mocked tracker): a binding inserted into the DB is scanned on the next
-  tick; a disabled binding stops dispatching but leaves the in-flight run
+  tick; a disabled binding stops dispatching but stays visible to review and
+  merge pollers and to operator-wait resolution, leaving in-flight work
   untouched; a binding-set change re-prunes tracker-queue scopes. Prior art:
   the tracker-queue scan tests.
+- **Command-construction seam**: for each of the five roles, a matrix
+  override of agent/model/effort is asserted against the actual argv the
+  stage builds (including the fix and local-review paths that today read
+  legacy fields, and the effort flag on every runner command). Prior art:
+  the existing runner-command/prompt construction tests.
 - **Migration seam**: the script as a callable — YAML fixture in, DB rows
   out, legacy fields normalized into the matrix, second invocation refuses
   to double-import. Prior art: DAO-level tests over a temp DB.
@@ -232,9 +269,13 @@ a script produces — never the internals that produce them.
   key stays stable for anything the daemon currently tracks, which is what
   keeps workspace paths, tracker-queue scopes, and issue storage ids
   coherent without a data migration.
-- The export endpoint doubles as the rollback story: if the feature has to
-  be reverted, the export is a valid `repos:`/`roles:` YAML section to paste
-  back into the config file.
+- The export endpoint is the rollback story *for non-secret config*: the
+  export is a valid `repos:`/`roles:` YAML section to paste back into the
+  config file, except that write-only webhook secrets are emitted as an
+  explicit placeholder (never the stored value — the no-secrets-in-responses
+  contract holds everywhere). A rollback for a binding that relies on a
+  repo-specific webhook secret therefore requires re-entering that secret by
+  hand; the export marks exactly which bindings need it.
 - Production note: the deploy that ships this must be followed by running
   the migration script inside the container (the YAML is readable there);
   until the script runs, the daemon sees zero bindings and idles — safe, but
