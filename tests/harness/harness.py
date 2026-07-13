@@ -125,6 +125,7 @@ def _build_runtime(
     existing_linear: FakeLinear | None = None,
     existing_github: FakeGitHub | None = None,
     existing_runner: FakeRunner | None = None,
+    reload_bindings: bool = False,
 ) -> tuple[FakeLinear, FakeGitHub, FakeRunner, Orchestrator]:
     """Construct the fakes + a fresh Orchestrator over the given Sim/clock/conn.
 
@@ -164,6 +165,7 @@ def _build_runtime(
         clock=clock,
         push_fn=_push_fn,
         force_push_fn=_force_push_fn,
+        reload_bindings_from_db=reload_bindings,
     )
     return linear, github, runner, orch
 
@@ -199,6 +201,7 @@ class Harness:
         runner: FakeRunner,
         orch: Orchestrator,
         db_path: Path,
+        reload_bindings: bool = False,
     ) -> None:
         self.config = config
         self.conn = conn
@@ -209,6 +212,7 @@ class Harness:
         self.runner = runner
         self.orch = orch
         self._db_path = db_path
+        self._reload_bindings = reload_bindings
 
     @classmethod
     async def create(
@@ -217,6 +221,7 @@ class Harness:
         *,
         config: Config | None = None,
         clock: ManualClock | None = None,
+        reload_bindings: bool = False,
     ) -> Harness:
         clock = clock or ManualClock()
         config = config or _default_config(tmp_path)
@@ -228,7 +233,9 @@ class Harness:
 
         db_path = tmp_path / "symphony.sqlite"
         conn = await db.connect(db_path)
-        linear, github, runner, orch = _build_runtime(config, conn, sim, clock)
+        linear, github, runner, orch = _build_runtime(
+            config, conn, sim, clock, reload_bindings=reload_bindings
+        )
         return cls(
             config=config,
             conn=conn,
@@ -239,6 +246,7 @@ class Harness:
             runner=runner,
             orch=orch,
             db_path=db_path,
+            reload_bindings=reload_bindings,
         )
 
     def advance(self, secs: float) -> None:
@@ -336,6 +344,7 @@ class Harness:
             existing_linear=self.linear,
             existing_github=self.github,
             existing_runner=self.runner,
+            reload_bindings=self._reload_bindings,
         )
         await self.warmup()
 

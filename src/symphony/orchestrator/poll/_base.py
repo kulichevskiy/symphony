@@ -46,6 +46,7 @@ from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...config import Config, RepoBinding, binding_natural_key
+from ...effective_config import ConfigBootError, assemble_effective_config
 from ...github.client import GitHub, GitHubClient, GitHubError
 from ...github.webhook import GitHubWebhookEvent
 from ...linear.client import LinearError, comment_from_webhook_payload
@@ -292,6 +293,10 @@ class _OrchestratorBase:
     # --- attribute annotations (single source of truth for the whole class) ---
     config: Config
     _trackers: TrackerRegistry
+    _tracker_factory: Callable[[RepoBinding], IssueTracker] | None
+    _reload_bindings_from_db: bool
+    _config_write_lock: asyncio.Lock
+    _binding_keys: frozenset[BindingKey] | None
     _conn: aiosqlite.Connection
     _shutdown: asyncio.Event
     _wake: asyncio.Event
@@ -358,13 +363,22 @@ class _OrchestratorBase:
         push_fn: PushFn | None = None,
         force_push_fn: PushFn | None = None,
         clock: Callable[[], datetime] | None = None,
+        reload_bindings_from_db: bool = False,
+        tracker_factory: Callable[[RepoBinding], IssueTracker] | None = None,
     ) -> None:
         self.config = config
         if isinstance(tracker_or_registry, TrackerRegistry):
             self._trackers = tracker_or_registry
+            # A production registry that can grow: `tracker_factory` builds a
+            # real client from `Secrets` when a reload introduces a context the
+            # registry never saw at boot.
+            self._tracker_factory = tracker_factory
         else:
             self._trackers = TrackerRegistry()
             _register_configured_trackers(self._trackers, config, tracker_or_registry)
+            # Single-tracker deployments (and the test harness) hot-add by
+            # reusing the one tracker for any new context.
+            self._tracker_factory = tracker_factory or (lambda _binding: tracker_or_registry)
         self._conn = conn
         self._shutdown = asyncio.Event()
         # Operator commands submitted from the web UI. Enqueued by the HTTP
@@ -378,10 +392,22 @@ class _OrchestratorBase:
         # (and their review/merge/acceptance follow-ups) are unaffected. In
         # memory only: a daemon restart clears it back to running.
         self._dispatch_paused = False
-        # One-shot guard: prune `tracker_queue` rows from binding scopes that
-        # are no longer configured (removed/renamed repos, labels, trackers)
-        # on the first poll tick, so stale queue lanes can't linger in the UI.
-        self._tracker_queue_pruned = False
+        # Hot-apply at the tick boundary (SYM-189): when True, `_tick` re-reads
+        # all bindings from the config DB via the shared effective-config
+        # assembly at the start of every poll. Off for YAML/single-tracker
+        # deployments and the test harness, whose config is fixed at boot.
+        self._reload_bindings_from_db = reload_bindings_from_db
+        # Serializes a config write's multi-row transaction against the tick's
+        # binding reload on the shared connection, so a reload never observes an
+        # uncommitted save (the write path itself lands in a later slice). The
+        # reload takes it; a config write will take it too.
+        self._config_write_lock = asyncio.Lock()
+        # The binding natural keys applied on the last reload. `None` until the
+        # first tick, so the first pass always reacts (prunes stale
+        # `tracker_queue` scopes + registers trackers), and every later pass
+        # reacts only when the set actually changed — the one-shot boot prune
+        # becomes a reaction to the binding set changing.
+        self._binding_keys: frozenset[BindingKey] | None = None
         # Serializes toggling `_dispatch_paused` against the final
         # check-then-insert in `_dispatch_one`, so a pause request can never
         # land in the middle of that critical section.
@@ -807,19 +833,18 @@ class _OrchestratorBase:
 
     async def _tick(self) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
-        await self._restore_operator_waits()
-        if not self._tracker_queue_pruned:
+        if self._reload_bindings_from_db:
             try:
-                await db.tracker_queue.prune_scopes(
-                    self._conn,
-                    keep=[
-                        (binding.linear_team_key, _queue_scope(binding))
-                        for binding in self.config.repos
-                    ],
-                )
-                self._tracker_queue_pruned = True
+                await self._reload_bindings()
             except Exception:  # noqa: BLE001 — must not kill the loop
-                log.exception("tracker queue scope prune failed")
+                log.exception("binding reload failed")
+        # React to the current binding set — the first tick always fires (prunes
+        # stale `tracker_queue` scopes, registers boot trackers), later ticks
+        # only when a reload changed the set. Runs before the scan loop so a
+        # hot-added binding's tracker is registered before `_scan_binding`
+        # resolves it.
+        await self._react_to_binding_set()
+        await self._restore_operator_waits()
         self._merged_linear_state_reconcile_ticks += 1
         if (
             self._merged_linear_state_reconcile_ticks % MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL
@@ -857,6 +882,100 @@ class _OrchestratorBase:
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("slash command poll failed")
         return scheduled
+
+    @property
+    def config_write_lock(self) -> asyncio.Lock:
+        """Guards a config write's multi-row transaction against the tick's
+        binding reload on the shared connection (SYM-189). A config write must
+        run its whole transaction while holding this lock so the reload — which
+        also takes it — only ever observes committed state."""
+        return self._config_write_lock
+
+    async def _reload_bindings(self) -> None:
+        """Re-read all bindings (enabled + disabled) from the config DB and
+        hot-apply them to `self.config` (SYM-189).
+
+        Taken under `_config_write_lock` so the reload never reads a config
+        write's uncommitted multi-row transaction off the shared connection.
+        Uses `boot_gates=False`: a mid-run assembly must never crash the loop —
+        a bad edit or a transient DB error keeps the last good config.
+
+        The per-stage contract lives here: the assembly rebuilds fresh
+        `RepoBinding` objects from the raw DB payloads (env key names resolved
+        on these copies, never written back), so a stage that starts after this
+        reload reads the current row, while an already-spawned agent keeps the
+        argv/env captured at its dispatch. `_react_to_binding_set` (called next
+        in `_tick`) reconciles the tracker registry and queue scopes.
+        """
+        async with self._config_write_lock:
+            try:
+                effective = await assemble_effective_config(
+                    self._conn, self.config, boot_gates=False
+                )
+            except ConfigBootError:
+                log.exception("binding reload rejected invalid config; keeping current")
+                return
+        self.config = effective
+        # The reconciler resolves bindings by iterating its own `config.repos`;
+        # keep it pointed at the same effective config the poll loop uses.
+        self._reconciler.config = effective
+
+    async def _react_to_binding_set(self) -> None:
+        """Reconcile in-memory state that must follow the binding set: register
+        trackers for newly-seen contexts and prune `tracker_queue` scopes for
+        bindings that are gone. A no-op when the set is unchanged."""
+        keys = frozenset(_binding_key(binding) for binding in self.config.repos)
+        if keys == self._binding_keys:
+            return
+        self._hot_add_trackers()
+        # Only commit the new key set once the prune succeeds, so a transient
+        # prune failure is retried on the next tick instead of stranding stale
+        # scopes until the set changes again.
+        if await self._prune_tracker_queue_scopes():
+            self._binding_keys = keys
+
+    def _hot_add_trackers(self) -> None:
+        """Register a tracker client for any binding whose provider/site (for
+        Jira, /project) context the registry never saw at boot."""
+        for binding in self.config.repos:
+            ctx = _tracker_context_for_binding(binding)
+            if self._tracker_context_registered(ctx):
+                continue
+            if self._tracker_factory is None:
+                log.warning("cannot hot-add tracker for %s: no tracker factory", ctx)
+                continue
+            try:
+                tracker = self._tracker_factory(binding)
+            except Exception:  # noqa: BLE001 — must not kill the loop
+                log.exception("failed to build tracker for hot-add: %s", ctx)
+                continue
+            self._trackers.register(ctx.provider, ctx.site, tracker, project_key=ctx.project_key)
+            log.info("hot-added tracker for %s", ctx)
+
+    def _tracker_context_registered(self, ctx: TrackerContext) -> bool:
+        try:
+            self._trackers.resolve(ctx)
+        except KeyError:
+            return False
+        return True
+
+    async def _prune_tracker_queue_scopes(self) -> bool:
+        """Drop `tracker_queue` rows from scopes no longer configured, so a
+        removed/renamed binding's lanes can't linger in the UI. Returns whether
+        the prune committed (False on a transient failure, so the caller retries
+        next tick)."""
+        try:
+            await db.tracker_queue.prune_scopes(
+                self._conn,
+                keep=[
+                    (binding.linear_team_key, _queue_scope(binding))
+                    for binding in self.config.repos
+                ],
+            )
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("tracker queue scope prune failed")
+            return False
+        return True
 
     async def handle_linear_webhook(
         self, payload: dict[str, Any], *, provider: str | None = None

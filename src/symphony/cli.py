@@ -38,6 +38,7 @@ from .tokens import effective_tokens
 from .tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
+    IssueTracker,
     TrackerContext,
     TrackerRegistry,
     context_for_binding,
@@ -320,7 +321,21 @@ async def _run(config_path: Path, *, once: bool) -> None:
             sys.exit(2)
         _enforce_require_auth0(cfg)
         async with _configured_tracker_registry(cfg) as (trackers, external_linear):
-            orch = Orchestrator(cfg, trackers, conn)
+            # When the DB owns topology, hot-apply binding edits at each tick
+            # boundary (SYM-189). A reload introducing a provider/site the
+            # process never saw at boot builds a real client from `Secrets`.
+            reload_secrets = Secrets()
+
+            def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
+                return for_binding(binding, reload_secrets)
+
+            orch = Orchestrator(
+                cfg,
+                trackers,
+                conn,
+                reload_bindings_from_db=db_owns_topology,
+                tracker_factory=_hot_add_tracker if db_owns_topology else None,
+            )
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
                 await orch.warmup()
