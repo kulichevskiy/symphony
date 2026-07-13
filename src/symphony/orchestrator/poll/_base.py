@@ -924,9 +924,13 @@ class _OrchestratorBase:
         argv/env captured at its dispatch. `_react_to_binding_set` (called next
         in `_tick`) reconciles the tracker registry and queue scopes.
         """
-        previous_states_by_key = {
-            _binding_key(binding): binding.linear_states for binding in self.config.repos
-        }
+        previous_states_by_state_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
+        previous_max_concurrent_by_key: dict[BindingKey, int] = {}
+        for binding in self.config.repos:
+            previous_states_by_state_key.setdefault(_state_cache_key(binding), {})[
+                _binding_key(binding)
+            ] = binding.linear_states
+            previous_max_concurrent_by_key[_binding_key(binding)] = binding.max_concurrent
         async with self._config_write_lock:
             try:
                 effective = await assemble_effective_config(
@@ -938,11 +942,32 @@ class _OrchestratorBase:
         # A `waiting`-state gate only ran on a cache miss (see `_states_for_binding`),
         # so an edit to an already-warmed binding's `linear_states` was never
         # re-validated. Evict the stale entry so the next lookup re-runs
-        # `_validate_waiting_state` against the edited row (SYM-189).
+        # `_validate_waiting_state` against the edited row (SYM-189). The cache
+        # is keyed by `_state_cache_key` (provider, site, team), coarser than the
+        # binding's natural key, so compare at that granularity — an edit that
+        # changes `linear_states` together with a natural-key component absent
+        # from the state-cache-key (e.g. `github_repo`) must still evict.
+        new_states_by_state_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
         for binding in effective.repos:
-            previous_states = previous_states_by_key.get(_binding_key(binding))
-            if previous_states is not None and previous_states != binding.linear_states:
-                self._states.pop(_state_cache_key(binding), None)
+            new_states_by_state_key.setdefault(_state_cache_key(binding), {})[
+                _binding_key(binding)
+            ] = binding.linear_states
+        for state_key, new_states in new_states_by_state_key.items():
+            if new_states != previous_states_by_state_key.get(state_key):
+                self._states.pop(state_key, None)
+        # `_binding_dispatch_sems`/`_review_fix_binding_sems` are sized once
+        # from `binding.max_concurrent` via `setdefault` and never resized in
+        # place — dropping the stale entry here lets the next dispatch recreate
+        # it at the new capacity (SYM-189). In-flight work already holding the
+        # old semaphore object is unaffected and drains under the old cap.
+        for binding in effective.repos:
+            key = _binding_key(binding)
+            previous_max_concurrent = previous_max_concurrent_by_key.get(key)
+            if previous_max_concurrent is None:
+                continue
+            if previous_max_concurrent != binding.max_concurrent:
+                self._binding_dispatch_sems.pop(key, None)
+                self._review_fix_binding_sems.pop(key, None)
         self.config = effective
         # The reconciler resolves bindings by iterating its own `config.repos`;
         # keep it pointed at the same effective config the poll loop uses.

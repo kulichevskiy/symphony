@@ -203,7 +203,7 @@ async def test_reload_never_observes_uncommitted_write(tmp_path: Path) -> None:
                 (json.dumps(_payload("OPS", "org/ops")),),
             )
             reload_task = asyncio.create_task(harness.orch._reload_bindings())  # noqa: SLF001
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.05)
             # The reload cannot proceed while the writer holds the lock, so it
             # never sees the uncommitted OPS row.
             assert not reload_task.done()
