@@ -207,6 +207,32 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_import_refused_after_ui_roles_put_on_fresh_db(tmp_path: Path) -> None:
+    """A UI `PUT /api/config/roles` on a fresh, never-migrated DB creates the
+    `config_globals` row with `migrated_at=""` (config_globals.update_roles).
+    A later import without `replace=True` must still refuse — not silently
+    overwrite the operator's globals — even though no migration marker was
+    ever stamped."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_globals.update_roles(
+        conn, roles={"implement": {"agent": "codex"}}, expected_version=0
+    )
+    body = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+"""
+    path = _write(tmp_path, body)
+    with pytest.raises(ConfigImportError, match="already imported"):
+        await import_config(path, conn, now="t1")
+    globals_row = await db.config_globals.get(conn)
+    assert globals_row is not None
+    assert globals_row.roles == {"implement": {"agent": "codex"}}
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_import_refuses_disabled_binding(tmp_path: Path) -> None:
     """`enabled: false` input is refused outright: this slice gives the
     `enabled` column no runtime semantics (the lifecycle ships in SYM-193),

@@ -758,7 +758,11 @@ async def test_duplicate_rejected_across_jira_bindings_relying_on_global_base_ur
 
 
 @pytest.mark.asyncio
-async def test_options_payload(tmp_path: Path) -> None:
+async def test_options_payload(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
     conn, db_path = await _open(tmp_path)
     try:
         app = _app(conn, db_path)
@@ -1009,5 +1013,57 @@ async def test_save_rejects_unsupported_claude_effort(tmp_path: Path, monkeypatc
             )
             assert resp.status_code == 422, resp.text
             assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_effort_on_unrelated_binding_does_not_block_save(
+    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    """A now-unsupported claude (model, effort) on binding A (e.g. saved
+    fail-open before ANTHROPIC_API_KEY was configured) must not fail a save on
+    unrelated binding B: `_reject_unsupported_efforts` is scoped to the
+    candidate for a single-binding save."""
+
+    caps: list[str] = ["low", "medium", "high", "xhigh", "max"]
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return caps
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created_a = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        project_key="ENG-A",
+                        github_repo="org/repo-a",
+                        roles={
+                            "implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}
+                        },
+                    )
+                },
+            )
+            assert created_a.status_code == 201, created_a.text
+
+            # Capability check now rejects binding A's stored effort — as if
+            # the key/model capabilities changed after A was saved.
+            caps[:] = ["low", "medium"]
+
+            created_b = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        project_key="ENG-B",
+                        github_repo="org/repo-b",
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "low"}},
+                    )
+                },
+            )
+            assert created_b.status_code == 201, created_b.text
     finally:
         await conn.close()

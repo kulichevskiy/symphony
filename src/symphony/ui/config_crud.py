@@ -405,7 +405,11 @@ async def _assemble_and_validate(
 
     trial = base.model_copy(update={"repos": [*others, candidate], "roles": global_roles})
     caught = _run_matrix_validators(trial)
-    await _reject_unsupported_efforts(trial)
+    # Scoped to the candidate alone: a stale/now-unsupported claude pair on an
+    # unrelated binding (e.g. saved fail-open before ANTHROPIC_API_KEY was set)
+    # must not block *this* save. The all-bindings sweep is reserved for
+    # `put_roles`, where a global change really does reach every binding.
+    await _reject_unsupported_efforts(trial, bindings=[candidate])
     # `validate_roles_matrix` warns for every binding in the trial set; only the
     # candidate's own warnings are relevant to this save (others are unchanged).
     prefix = f"binding {candidate.project_key}/{candidate.github_repo}:"
@@ -445,7 +449,9 @@ def _binding_anthropic_key(
     return env_source.get(binding.env["ANTHROPIC_API_KEY"], "")
 
 
-async def _reject_unsupported_efforts(trial: Config) -> None:
+async def _reject_unsupported_efforts(
+    trial: Config, *, bindings: list[RepoBinding] | None = None
+) -> None:
     """Re-run the preflight capability check for every resolved *claude*
     `(model, effort)` pair in `trial` — the same online Models-API source
     preflight uses, keyed the same way (per binding, its own `env:`
@@ -456,15 +462,19 @@ async def _reject_unsupported_efforts(trial: Config) -> None:
     `validate_roles_matrix`). A `None` result (no ANTHROPIC_API_KEY anywhere
     for that binding, or a Models-API error) skips the pair: the daemon may
     run claude via CLI auth, and the structural family check already ran —
-    exactly preflight's fail-open-on-cannot-validate behavior."""
+    exactly preflight's fail-open-on-cannot-validate behavior.
+
+    `bindings` scopes the sweep: `_assemble_and_validate` passes just the
+    candidate, so a stale pair on an unrelated binding can't block this save.
+    `put_roles` leaves it `None` (all of `trial.repos`) since a global change
+    reaches every binding; zero bindings there falls back to the synthetic
+    binding so an unsupported global pair still can't save silently."""
     env_source = _env_key_source()
     process_key = env_source.get("ANTHROPIC_API_KEY", "")
     pairs: set[tuple[str, str, str]] = set()  # (key, model, effort)
-    # Zero bindings would otherwise skip this loop and let an unsupported
-    # global `(model, effort)` pair save silently (SYM-191 review); the
-    # synthetic binding resolves the global cell the same way a first real
-    # binding eventually would.
-    for binding in trial.repos or [_synthetic_matrix_validation_binding()]:
+    for binding in bindings if bindings is not None else (
+        trial.repos or [_synthetic_matrix_validation_binding()]
+    ):
         binding_key = _binding_anthropic_key(binding, env_source, process_key)
         for name in get_args(RoleName):
             role = binding.resolved_role(name, trial.roles)

@@ -164,7 +164,12 @@ async def import_config(
     second import without `replace=True` raises `ConfigImportError`."""
     existing = await db.config_bindings.count(conn)
     globals_row = await db.config_globals.get(conn)
-    already_imported = existing > 0 or (globals_row is not None and bool(globals_row.migrated_at))
+    # Any existing globals row counts as "already touched", not just one with a
+    # migration marker: a UI `PUT /api/config/roles` on a fresh DB creates the
+    # row with `migrated_at=""` (see config_globals.update_roles), and a truly
+    # fresh DB has no row at all — so `globals_row is not None` alone is the
+    # correct guard.
+    already_imported = existing > 0 or globals_row is not None
     if already_imported and not replace:
         raise ConfigImportError(
             "config already imported (DB has bindings or a migration marker); "
