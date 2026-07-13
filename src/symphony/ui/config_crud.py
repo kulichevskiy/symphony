@@ -360,17 +360,16 @@ def _validate_tracker_credentials(binding: RepoBinding, base: Config) -> None:
             )
 
 
-async def _assemble_and_validate(
+async def _other_bindings(
     conn: aiosqlite.Connection,
     base: Config,
-    candidate: RepoBinding,
     *,
     exclude_id: int | None,
-) -> list[str]:
-    """Assemble the trial effective config (system knobs + all DB bindings, the
-    candidate swapped in for `exclude_id`, + global matrix) and re-run the
-    roles-matrix validators. Returns non-blocking warnings (lost review-family
-    diversity). Raises a 422 on a duplicate selector or a validator error."""
+) -> list[RepoBinding]:
+    """All enabled/disabled bindings but `exclude_id`, re-listed fresh from the
+    DB. Cheap (no network) — safe to call again right before a write, inside
+    the lock, to see a binding that landed during an earlier network-bound
+    check (SYM-191 review)."""
     existing = await config_bindings.list_all(conn)
     others: list[RepoBinding] = []
     for row in existing:
@@ -384,17 +383,42 @@ async def _assemble_and_validate(
         # candidate's real site against this row's stale "default" placeholder.
         other.apply_tracker_secret_defaults(jira_base_url=base.jira_base_url)
         others.append(other)
+    return others
 
-    if candidate.enabled:
-        candidate_selector = _selector(candidate)
-        for other in others:
-            if other.enabled and _selector(other) == candidate_selector:
-                raise _validation_error(
-                    ["issue_label"],
-                    "an enabled binding with the same tracker scope, label and "
-                    "ready state already exists (exact-duplicate selector); "
-                    "change the label, the ready state, or disable one",
-                )
+
+def _reject_duplicate_selector(candidate: RepoBinding, others: list[RepoBinding]) -> None:
+    """Raise a 422 if enabled `candidate` shares its dispatch selector with an
+    enabled binding in `others`. Must be re-run against a fresh `others`
+    (`_other_bindings`) inside `lock` immediately before the insert/update it
+    guards — the pre-lock trial in `_assemble_and_validate` only reflects DB
+    state as of before the (potentially slow) capability check, so a binding
+    that lands during that wait would otherwise be missed (SYM-191 review)."""
+    if not candidate.enabled:
+        return
+    candidate_selector = _selector(candidate)
+    for other in others:
+        if other.enabled and _selector(other) == candidate_selector:
+            raise _validation_error(
+                ["issue_label"],
+                "an enabled binding with the same tracker scope, label and "
+                "ready state already exists (exact-duplicate selector); "
+                "change the label, the ready state, or disable one",
+            )
+
+
+async def _assemble_and_validate(
+    conn: aiosqlite.Connection,
+    base: Config,
+    candidate: RepoBinding,
+    *,
+    exclude_id: int | None,
+) -> list[str]:
+    """Assemble the trial effective config (system knobs + all DB bindings, the
+    candidate swapped in for `exclude_id`, + global matrix) and re-run the
+    roles-matrix validators. Returns non-blocking warnings (lost review-family
+    diversity). Raises a 422 on a duplicate selector or a validator error."""
+    others = await _other_bindings(conn, base, exclude_id=exclude_id)
+    _reject_duplicate_selector(candidate, others)
 
     globals_row = await config_globals.get(conn)
     global_roles: dict[RoleName, RoleConfig] = {}
@@ -716,6 +740,15 @@ def create_config_crud_router(
         # acquired — see the matching comment in `put_roles` for why.
         wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
         async with lock:
+            # Re-check the cheap, DB-state-dependent duplicate-selector
+            # invariant against a fresh listing, now that the lock excludes
+            # concurrent writers — the trial above ran before the lock (and
+            # after the slow capability check), so a same-selector binding
+            # from a racing create/update could have landed since (SYM-191
+            # review).
+            _reject_duplicate_selector(
+                binding, await _other_bindings(conn, base, exclude_id=None)
+            )
             try:
                 new_id = await config_bindings.insert(
                     conn,
@@ -786,6 +819,10 @@ def create_config_crud_router(
         # lands as a 409, not a lost update.
         wgs = await _assemble_and_validate(conn, base, binding, exclude_id=binding_id)
         async with lock:
+            # Same re-check as `create_binding` — see that comment.
+            _reject_duplicate_selector(
+                binding, await _other_bindings(conn, base, exclude_id=binding_id)
+            )
             try:
                 row = await config_bindings.update(
                     conn,
