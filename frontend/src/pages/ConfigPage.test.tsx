@@ -185,6 +185,26 @@ describe("BindingForm", () => {
     await waitFor(() => expect(screen.getByText("field required")).toBeTruthy());
   });
 
+  it("renders a 422 error on a checkbox-only field (auto_merge)", async () => {
+    mockFetch(422, { detail: [{ loc: ["auto_merge"], msg: "not allowed with this merge strategy" }] });
+    render(
+      <BindingForm binding={null} options={OPTIONS} onSaved={() => {}} onCancel={() => {}} />,
+    );
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(screen.getByText("not allowed with this merge strategy")).toBeTruthy(),
+    );
+  });
+
+  it("rejects non-object raw JSON (e.g. null) instead of storing it", () => {
+    render(
+      <BindingForm binding={null} options={OPTIONS} onSaved={() => {}} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByLabelText("raw_payload"), { target: { value: "null" } });
+    expect(screen.getByText("must be a JSON object")).toBeTruthy();
+    expect((screen.getByText("Save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("renders a 422 roles error under the advanced section with its path", async () => {
     mockFetch(422, { detail: [{ loc: ["roles"], msg: "unknown Codex model 'x'" }] });
     render(
@@ -265,7 +285,10 @@ describe("BindingsPanel", () => {
     render(
       <BindingsPanel
         bindings={[
-          record({ id: 1, priority: 0, version: 2 }),
+          // Equal priority: natural-key tiebreak (matching the daemon's
+          // dispatch order), not `id`, decides which row is "first" — pick
+          // repos that alphabetize the same way the ids are given.
+          record({ id: 1, priority: 0, version: 2, github_repo: "org/aaa" }),
           record({ id: 2, priority: 0, version: 3, github_repo: "org/other" }),
         ]}
         options={OPTIONS}

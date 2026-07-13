@@ -160,6 +160,41 @@ async def test_same_label_different_ready_state_accepted(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_same_scope_different_ready_state_same_repo_rolls_back(tmp_path: Path) -> None:
+    """Same project/repo/label/site with a different ready state passes the
+    selector duplicate check (ready state makes it a legitimate two-lane
+    setup) but the DB's unique index — keyed on natural-key columns only, no
+    ready state — still catches it. The resulting `IntegrityError` must roll
+    back the write transaction the failed `INSERT` opened, or it holds the
+    write lock until some later, unrelated commit closes it."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            first = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="bug", states={"ready": "Backlog"})},
+            )
+            assert first.status_code == 201, first.text
+            dup = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="bug", states={"ready": "Todo"})},
+            )
+            assert dup.status_code == 422
+            assert dup.json()["detail"][0]["loc"] == ["github_repo"]
+            assert not conn.in_transaction
+
+            # The connection must still be writable afterwards.
+            follow_up = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/other")},
+            )
+            assert follow_up.status_code == 201, follow_up.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_disabled_write_rejected(tmp_path: Path) -> None:
     """`enabled: false` has no runtime effect until SYM-193 — the write path
     rejects it outright rather than let an operator believe a binding is
@@ -463,6 +498,44 @@ async def test_jira_tracker_site_normalized_from_global_base_url(tmp_path: Path)
             )
             assert resp.status_code == 201, resp.text
             assert resp.json()["tracker_site"] == "https://issues.example.com"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_rejected_across_jira_bindings_relying_on_global_base_url(
+    tmp_path: Path,
+) -> None:
+    """The duplicate-selector check must normalize *existing* rows the same
+    way it normalizes the candidate: a stored Jira binding with no per-binding
+    `base_url` has no `tracker_site` of its own in its payload, and without
+    re-deriving it from the global `jira_base_url` it would compare against
+    the "default" placeholder instead of the site it actually resolves to —
+    letting an exact duplicate slip through."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(
+                jira_base_url="https://issues.example.com",
+                github_webhook_secret="test-global-secret",
+            ),
+        )
+        async with _client(app) as client:
+            first = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(provider="jira", github_repo="org/a")},
+            )
+            assert first.status_code == 201, first.text
+            dup = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(provider="jira", github_repo="org/b")},
+            )
+            assert dup.status_code == 422
+            assert dup.json()["detail"][0]["loc"] == ["issue_label"]
     finally:
         await conn.close()
 

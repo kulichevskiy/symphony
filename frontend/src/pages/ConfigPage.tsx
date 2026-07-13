@@ -219,6 +219,10 @@ export function BindingForm({
     setRaw(text);
     try {
       const parsed = JSON.parse(text);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        setRawError("must be a JSON object");
+        return;
+      }
       setPayload(parsed);
       setRawError(null);
     } catch (e) {
@@ -267,6 +271,22 @@ export function BindingForm({
         {node}
         {err ? <span className="block text-xs text-destructive" role="alert">{err}</span> : null}
       </label>
+    );
+  }
+
+  /** Checkbox variant of `field` — checked-state input plus the same
+   *  curated-key error rendering (these keys are excluded from the advanced
+   *  list, so without this the error would render nowhere). */
+  function checkboxField(label: string, key: string, node: ReactNode) {
+    const err = bindingErrorFor(fieldErrors, key);
+    return (
+      <div className="space-y-1">
+        <label className="flex items-center gap-2 text-sm">
+          {node}
+          {label}
+        </label>
+        {err ? <span className="block text-xs text-destructive" role="alert">{err}</span> : null}
+      </div>
     );
   }
 
@@ -385,24 +405,26 @@ export function BindingForm({
             aria-label="priority"
           />
         </label>
-        <label className="flex items-center gap-2 text-sm">
+        {checkboxField(
+          "Local review",
+          "local_review",
           <input
             type="checkbox"
             checked={Boolean(get(payload, "local_review"))}
             onChange={(e) => setKey("local_review", e.target.checked)}
             aria-label="local_review"
-          />
-          Local review
-        </label>
-        <label className="flex items-center gap-2 text-sm">
+          />,
+        )}
+        {checkboxField(
+          "Remote review",
+          "remote_review",
           <input
             type="checkbox"
             checked={get(payload, "remote_review") !== false}
             onChange={(e) => setKey("remote_review", e.target.checked)}
             aria-label="remote_review"
-          />
-          Remote review
-        </label>
+          />,
+        )}
         {field(
           "Merge strategy",
           "merge_strategy",
@@ -418,15 +440,16 @@ export function BindingForm({
             ))}
           </Select>,
         )}
-        <label className="flex items-center gap-2 text-sm">
+        {checkboxField(
+          "Auto merge",
+          "auto_merge",
           <input
             type="checkbox"
             checked={get(payload, "auto_merge") !== false}
             onChange={(e) => setKey("auto_merge", e.target.checked)}
             aria-label="auto_merge"
-          />
-          Auto merge
-        </label>
+          />,
+        )}
         {field(
           "Verify command",
           "verify_cmd",
@@ -560,8 +583,17 @@ export function BindingsPanel({
   const [error, setError] = useState<string | null>(null);
   const [savedWarnings, setSavedWarnings] = useState<string[] | null>(null);
 
+  // Mirror the backend dispatch order (`db/config_bindings.list_all`): equal
+  // priorities break ties by the natural key, not `id` — otherwise this panel
+  // shows a different order than the daemon actually dispatches in.
   const ordered = [...bindings].sort(
-    (a, b) => a.priority - b.priority || a.id - b.id,
+    (a, b) =>
+      a.priority - b.priority ||
+      a.project_key.localeCompare(b.project_key) ||
+      a.github_repo.localeCompare(b.github_repo) ||
+      a.issue_label.localeCompare(b.issue_label) ||
+      a.tracker_provider.localeCompare(b.tracker_provider) ||
+      a.tracker_site.localeCompare(b.tracker_site),
   );
 
   async function remove(b: BindingRecord) {

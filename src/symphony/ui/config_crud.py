@@ -225,7 +225,14 @@ async def _assemble_and_validate(
     for row in existing:
         if row.id == exclude_id:
             continue
-        others.append(RepoBinding.model_validate({**row.payload, "enabled": row.enabled}))
+        other = RepoBinding.model_validate({**row.payload, "enabled": row.enabled})
+        # A stored Jira binding relying on the global `jira_base_url` (no
+        # per-binding `base_url`) has no `tracker_site` of its own in the
+        # payload; re-derive it the same way `_validate_binding` does for the
+        # candidate, or the duplicate check below would compare the
+        # candidate's real site against this row's stale "default" placeholder.
+        other.apply_tracker_secret_defaults(jira_base_url=base.jira_base_url)
+        others.append(other)
 
     if candidate.enabled:
         candidate_selector = _selector(candidate)
@@ -366,6 +373,12 @@ def create_config_crud_router(
                     updated_by=updated_by,
                 )
             except sqlite3.IntegrityError as e:
+                # The failed `INSERT` left a write transaction open on the
+                # shared connection (never committed) — roll it back before
+                # raising, or it holds the write lock until some unrelated
+                # later commit closes it (same concern as the stale-version
+                # paths in `db/config_bindings.py`).
+                await conn.rollback()
                 raise _validation_error(
                     ["github_repo"],
                     "a binding with this project/repo/label/provider/site already exists",
@@ -426,6 +439,9 @@ def create_config_crud_router(
                     },
                 ) from e
             except sqlite3.IntegrityError as e:
+                # Same concern as `create_binding`: roll back the open write
+                # transaction from the failed `UPDATE` before raising.
+                await conn.rollback()
                 raise _validation_error(
                     ["github_repo"],
                     "a binding with this project/repo/label/provider/site already exists",
