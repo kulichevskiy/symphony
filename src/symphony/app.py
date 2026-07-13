@@ -98,6 +98,7 @@ def create_app(
     ui_command_sink: CommandSink | None = None,
     ui_pause_controller: PauseController | None = None,
     ui_config_write_lock: object | None = None,
+    ui_db_owns_topology: bool = True,
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
     clock: Clock | None = None,
@@ -213,16 +214,24 @@ def create_app(
         # Binding CRUD (create/edit/delete + options) — writes against the
         # daemon's shared connection under the config write lock (SYM-189), so
         # a write's multi-row transaction never interleaves with a tick reload.
-        app.include_router(
-            create_config_crud_router(
-                conn,
-                config_provider=ui_external_config,
-                write_lock=ui_config_write_lock,
-                auth_dependency=auth_dep,
-                clock=clock,
-            ),
-            dependencies=api_dependencies,
-        )
+        # Gated on `ui_db_owns_topology` (default True so callers that don't
+        # pass it — tests, any future non-daemon entrypoint — keep today's
+        # behavior): a legacy YAML topology not yet imported keeps the daemon
+        # reading `repos:` from YAML (`reload_bindings_from_db=False`), so
+        # writes here would round-trip through the API looking successful
+        # while the daemon silently never applies them. `cli._run` is the only
+        # caller that computes and passes the real value.
+        if ui_db_owns_topology:
+            app.include_router(
+                create_config_crud_router(
+                    conn,
+                    config_provider=ui_external_config,
+                    write_lock=ui_config_write_lock,
+                    auth_dependency=auth_dep,
+                    clock=clock,
+                ),
+                dependencies=api_dependencies,
+            )
 
         def _ui_teams() -> list[str] | None:
             current = ui_external_config() if callable(ui_external_config) else ui_external_config

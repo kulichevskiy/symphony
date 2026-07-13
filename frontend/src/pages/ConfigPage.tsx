@@ -140,6 +140,8 @@ const CURATED_KEYS = [
   "auto_merge",
   "allow_auto_merge",
   "verify_cmd",
+  "webhook_enabled",
+  "webhook_secret",
 ];
 
 function get(payload: Record<string, unknown>, key: string): unknown {
@@ -184,11 +186,18 @@ export function BindingForm({
 }) {
   const initial = useMemo<Record<string, unknown>>(() => {
     if (binding) return canonicalizePayload(binding.payload);
-    return { provider: "linear", states: { ready: "" } };
-  }, [binding]);
+    return {
+      provider: "linear",
+      states: { ready: "" },
+      // Without a global `GITHUB_WEBHOOK_SECRET`, the field's own default of
+      // `true` would make the write path reject the create until the
+      // operator also sets a per-binding secret — default it off instead so
+      // a first-time create just works; the checkbox lets them turn it on.
+      webhook_enabled: options.github_webhook_secret_configured,
+    };
+  }, [binding, options.github_webhook_secret_configured]);
 
   const [payload, setPayload] = useState<Record<string, unknown>>(initial);
-  const [enabled, setEnabled] = useState(binding ? binding.enabled : true);
   const [priority, setPriority] = useState(binding ? binding.priority : 0);
   const [raw, setRaw] = useState(() => JSON.stringify(initial, null, 2));
   const [rawError, setRawError] = useState<string | null>(null);
@@ -237,7 +246,9 @@ export function BindingForm({
     setConflict(false);
     const body: BindingWrite = {
       payload,
-      enabled,
+      // Disabling has no runtime effect until SYM-193 — the write path
+      // rejects `enabled: false` outright, so there's no toggle for it here.
+      enabled: true,
       priority,
       version: binding ? binding.version : undefined,
     };
@@ -323,16 +334,6 @@ export function BindingForm({
       ) : null}
 
       <div className="space-y-4">
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            aria-label="enabled"
-          />
-          Enabled
-        </label>
-
         {field(
           "Provider",
           "provider",
@@ -458,6 +459,35 @@ export function BindingForm({
             onChange={(e) => setKey("verify_cmd", e.target.value)}
             aria-label="verify_cmd"
           />,
+        )}
+        {checkboxField(
+          "Webhook enabled",
+          "webhook_enabled",
+          <input
+            type="checkbox"
+            checked={get(payload, "webhook_enabled") !== false}
+            onChange={(e) => setKey("webhook_enabled", e.target.checked)}
+            aria-label="webhook_enabled"
+          />,
+        )}
+        {field(
+          "Webhook secret",
+          "webhook_secret",
+          <>
+            <Input
+              type="password"
+              value={str(get(payload, "webhook_secret"))}
+              onChange={(e) => setKey("webhook_secret", e.target.value)}
+              aria-label="webhook_secret"
+              placeholder={binding?.webhook_secret_set ? "set — leave blank to keep" : ""}
+            />
+            {!options.github_webhook_secret_configured ? (
+              <span className="block text-xs text-muted-foreground">
+                No global GITHUB_WEBHOOK_SECRET configured — required here when
+                webhook enabled is on.
+              </span>
+            ) : null}
+          </>,
         )}
 
         <details className="rounded-md border border-border p-3">

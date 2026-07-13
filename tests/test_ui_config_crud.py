@@ -39,17 +39,20 @@ def _app(
     *,
     auth: bool = False,
     github_webhook_secret: str = "test-global-secret",
+    linear_api_key: str = "test-linear-key",
 ) -> Any:
-    # A global secret is set by default so tests unrelated to webhooks don't
-    # trip the write-time check that a `webhook_enabled` binding (the
-    # default) needs a resolvable secret; `test_webhook_enabled_without_secret_rejected`
-    # below overrides this to exercise that check directly.
+    # A global secret/key is set by default so tests unrelated to a specific
+    # check don't trip it; the tests for each check override the relevant
+    # kwarg to empty to exercise it directly.
     return create_app(
         _Handler(),
         conn,
         ui_enabled=True,
         ui_db_path=db_path,
-        ui_external_config=Config(github_webhook_secret=github_webhook_secret),
+        ui_external_config=Config(
+            github_webhook_secret=github_webhook_secret,
+            linear_api_key=linear_api_key,
+        ),
         auth0_settings=_settings() if auth else None,
     )
 
@@ -474,6 +477,51 @@ async def test_webhook_enabled_without_secret_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_linear_binding_without_api_key_rejected(tmp_path: Path) -> None:
+    """A fresh DB-owned install boots with zero bindings, so `cli._run`'s
+    boot-time `LINEAR_API_KEY` check never fires before the first linear
+    binding is created via the UI — this write path must be the fail-closed
+    gate instead, or the binding saves cleanly and then silently never
+    dispatches (`Orchestrator._reload_bindings` swallows the resulting
+    `for_binding` `ValueError` and just logs it)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path, linear_api_key="")
+        async with _client(app) as client:
+            resp = await client.post("/api/config/bindings", json={"payload": _payload()})
+            assert resp.status_code == 422
+            assert resp.json()["detail"][0]["loc"] == ["provider"]
+            assert "LINEAR_API_KEY" in resp.json()["detail"][0]["msg"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_jira_binding_without_credentials_rejected(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(github_webhook_secret="test-global-secret"),
+        )
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings", json={"payload": _payload(provider="jira")}
+            )
+            assert resp.status_code == 422
+            assert resp.json()["detail"][0]["loc"] == ["provider"]
+            msg = resp.json()["detail"][0]["msg"]
+            assert "JIRA_BASE_URL" in msg
+            assert "JIRA_EMAIL" in msg
+            assert "JIRA_API_TOKEN" in msg
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_jira_tracker_site_normalized_from_global_base_url(tmp_path: Path) -> None:
     """A Jira binding with no per-binding `base_url` keys on the global
     `jira_base_url`, matching `assemble_effective_config`'s resolution — not
@@ -488,6 +536,8 @@ async def test_jira_tracker_site_normalized_from_global_base_url(tmp_path: Path)
             ui_db_path=db_path,
             ui_external_config=Config(
                 jira_base_url="https://issues.example.com",
+                jira_email="jira@example.com",
+                jira_api_token="test-jira-token",
                 github_webhook_secret="test-global-secret",
             ),
         )
@@ -521,6 +571,8 @@ async def test_duplicate_rejected_across_jira_bindings_relying_on_global_base_ur
             ui_db_path=db_path,
             ui_external_config=Config(
                 jira_base_url="https://issues.example.com",
+                jira_email="jira@example.com",
+                jira_api_token="test-jira-token",
                 github_webhook_secret="test-global-secret",
             ),
         )
@@ -574,5 +626,33 @@ async def test_updated_by_uses_auth_email(tmp_path: Path) -> None:
             # Unauthenticated write is rejected by the shared gate.
             unauth = await client.post("/api/config/bindings", json={"payload": _payload()})
             assert unauth.status_code == 401
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_crud_router_not_mounted_when_yaml_owns_topology(tmp_path: Path) -> None:
+    # A legacy YAML topology not yet imported keeps `reload_bindings_from_db`
+    # off, so the daemon never applies a write made here — the router must not
+    # mount rather than accept writes it will silently ignore.
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(github_webhook_secret="test-global-secret"),
+            ui_db_owns_topology=False,
+        )
+        async with _client(app) as client:
+            options = await client.get("/api/config/options")
+            bindings = await client.get("/api/config/bindings")
+            created = await client.post(
+                "/api/config/bindings", json={"payload": _payload()}
+            )
+        assert options.status_code == 404
+        assert bindings.status_code == 404
+        assert created.status_code == 404
     finally:
         await conn.close()

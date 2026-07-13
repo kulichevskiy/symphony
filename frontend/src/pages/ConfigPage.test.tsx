@@ -39,6 +39,7 @@ const OPTIONS: ConfigOptions = {
   codex_efforts: ["high", "low", "medium", "minimal"],
   claude_efforts: ["high", "low", "max", "medium", "xhigh"],
   merge_strategies: ["squash", "merge", "rebase"],
+  github_webhook_secret_configured: true,
 };
 
 function record(overrides: Partial<BindingRecord> = {}): BindingRecord {
@@ -176,6 +177,49 @@ describe("BindingForm", () => {
     expect(sent.payload.max_concurrent).toBe(6);
   });
 
+  it("has no toggle for the unsupported disabled state and always saves enabled", async () => {
+    const fetchMock = mockFetch(200, record({ enabled: false, version: 5 }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={record({ enabled: false })}
+        options={OPTIONS}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText("enabled")).toBeNull();
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.enabled).toBe(true);
+  });
+
+  it("defaults webhook_enabled off when no global secret is configured", async () => {
+    const fetchMock = mockFetch(201, { ...record(), id: 9 });
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={null}
+        options={{ ...OPTIONS, github_webhook_secret_configured: false }}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("webhook_enabled") as HTMLInputElement).checked,
+    ).toBe(false);
+    fireEvent.change(screen.getByLabelText("project_key"), { target: { value: "ENG" } });
+    fireEvent.change(screen.getByLabelText("github_repo"), { target: { value: "org/repo" } });
+    fireEvent.change(screen.getByLabelText("ready_state"), { target: { value: "Todo" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.payload.webhook_enabled).toBe(false);
+  });
+
   it("renders a 422 validation error on the exact field", async () => {
     mockFetch(422, { detail: [{ loc: ["project_key"], msg: "field required" }] });
     render(
@@ -193,6 +237,28 @@ describe("BindingForm", () => {
     fireEvent.click(screen.getByText("Save"));
     await waitFor(() =>
       expect(screen.getByText("not allowed with this merge strategy")).toBeTruthy(),
+    );
+  });
+
+  it("renders a 422 webhook_secret error on the curated field, not hidden in advanced", async () => {
+    mockFetch(422, {
+      detail: [
+        {
+          loc: ["webhook_secret"],
+          msg: "webhook_enabled requires a webhook_secret when no global GITHUB_WEBHOOK_SECRET is configured",
+        },
+      ],
+    });
+    render(
+      <BindingForm binding={null} options={OPTIONS} onSaved={() => {}} onCancel={() => {}} />,
+    );
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "webhook_enabled requires a webhook_secret when no global GITHUB_WEBHOOK_SECRET is configured",
+        ),
+      ).toBeTruthy(),
     );
   });
 

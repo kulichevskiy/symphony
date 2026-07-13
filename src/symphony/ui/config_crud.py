@@ -22,6 +22,14 @@ Every write:
     the global `GITHUB_WEBHOOK_SECRET`) — the daemon's hot-reload path
     (`cli._live_github_webhook_settings`) swallows that misconfiguration by
     disabling *every* repo's webhook verification, not just this one;
+  * rejects a binding whose provider has no resolvable tracker credentials
+    (`LINEAR_API_KEY`, or `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`) — a
+    fresh DB-owned install boots with zero bindings, skipping `cli._run`'s
+    boot-time credential check, so this write path is the only gate the first
+    binding of a kind ever passes through; without it the binding saves
+    cleanly and then fails every hot-reload tick
+    (`Orchestrator._reload_bindings` swallows the `for_binding` `ValueError`
+    and just logs it) with nothing surfacing to the operator;
   * rejects an exact-duplicate selector (same tracker scope + normalized label
     + ready state) among *enabled* bindings — disabled bindings are exempt so a
     replacement can be staged;
@@ -209,6 +217,42 @@ def _validate_webhook_secret(binding: RepoBinding, base: Config) -> None:
         )
 
 
+def _validate_tracker_credentials(binding: RepoBinding, base: Config) -> None:
+    """Fail closed at save time: a binding whose provider has no resolvable
+    tracker credentials in `base` (the daemon's live `Config`, populated from
+    `Secrets` at boot) would otherwise save cleanly and then fail every
+    hot-reload tick — `Orchestrator._reload_bindings` swallows the resulting
+    `for_binding` `ValueError` and just logs it, so the binding never
+    dispatches and nothing surfaces to the operator. A fresh DB-owned install
+    boots with zero bindings, skipping `cli._run`'s boot-time
+    `LINEAR_API_KEY` check, so this is the only gate the first binding of a
+    kind ever passes through.
+    """
+    if binding.provider == "linear" and not base.linear_api_key:
+        raise _validation_error(
+            ["provider"],
+            "LINEAR_API_KEY is not configured in the server env; set it "
+            "before saving a linear binding",
+        )
+    if binding.provider == "jira":
+        missing = [
+            name
+            for name, value in (
+                ("JIRA_BASE_URL", binding.base_url or base.jira_base_url),
+                ("JIRA_EMAIL", base.jira_email),
+                ("JIRA_API_TOKEN", base.jira_api_token),
+            )
+            if not value
+        ]
+        if missing:
+            raise _validation_error(
+                ["provider"],
+                f"{', '.join(missing)} not configured in the server env; set "
+                f"them (or the binding's own base_url) before saving a jira "
+                f"binding",
+            )
+
+
 async def _assemble_and_validate(
     conn: aiosqlite.Connection,
     base: Config,
@@ -336,6 +380,11 @@ def create_config_crud_router(
             "codex_efforts": sorted(SUPPORTED_CODEX_EFFORTS),
             "claude_efforts": sorted(SUPPORTED_CLAUDE_EFFORTS),
             "merge_strategies": ["squash", "merge", "rebase"],
+            # Lets the form default a new binding's `webhook_enabled` to what
+            # will actually save: without a global secret, the write path
+            # rejects the field's own `True` default unless the operator also
+            # sets a per-binding `webhook_secret`.
+            "github_webhook_secret_configured": bool(_base_config().github_webhook_secret),
         }
 
     @router.get("/bindings")
@@ -360,6 +409,7 @@ def create_config_crud_router(
         binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
         binding.enabled = body.enabled
         _validate_webhook_secret(binding, base)
+        _validate_tracker_credentials(binding, base)
         async with lock:
             wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
             try:
@@ -417,6 +467,7 @@ def create_config_crud_router(
             binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
             binding.enabled = body.enabled
             _validate_webhook_secret(binding, base)
+            _validate_tracker_credentials(binding, base)
             wgs = await _assemble_and_validate(conn, base, binding, exclude_id=binding_id)
             try:
                 row = await config_bindings.update(

@@ -460,6 +460,10 @@ export interface ConfigOptions {
   codex_efforts: string[];
   claude_efforts: string[];
   merge_strategies: string[];
+  /** Whether a global `GITHUB_WEBHOOK_SECRET` is configured — when false, a
+   *  new binding's default `webhook_enabled: true` needs a per-binding
+   *  `webhook_secret` or the write is rejected. */
+  github_webhook_secret_configured: boolean;
 }
 
 /** One persisted binding row. `payload` is the sparse operator-set field dict;
