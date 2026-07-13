@@ -6,11 +6,22 @@ picked up by the daemon at the next tick (SYM-189). Companion to the read-only
 
 Every write:
   * validates the payload through `RepoBinding.model_validate` (field errors
-    carry `loc` paths the form maps to inputs), then assembles the full
-    effective config and re-runs the roles-matrix validators (family/effort
-    cross-checks) exactly as boot does;
+    carry `loc` paths the form maps to inputs), re-derives `tracker_site` from
+    the global `jira_base_url` so a Jira binding without its own `base_url`
+    keys on the site it actually resolves to at runtime (not the "default"
+    placeholder), then assembles the full effective config and re-runs the
+    roles-matrix validators (family/effort cross-checks) exactly as boot does;
   * rejects legacy top-level role fields and env `key` names unknown to the
     server env (fail closed, listing the available names);
+  * rejects `enabled: false` outright, mirroring the importer
+    (`config_import.py`): the binding lifecycle (dispatch skip, launch gate,
+    drain guard) ships in SYM-193, and until then every DB row dispatches
+    regardless of this column, so persisting a disabled row would silently
+    keep dispatching it;
+  * rejects `webhook_enabled: true` with no resolvable secret (per-binding or
+    the global `GITHUB_WEBHOOK_SECRET`) — the daemon's hot-reload path
+    (`cli._live_github_webhook_settings`) swallows that misconfiguration by
+    disabling *every* repo's webhook verification, not just this one;
   * rejects an exact-duplicate selector (same tracker scope + normalized label
     + ready state) among *enabled* bindings — disabled bindings are exempt so a
     replacement can be staged;
@@ -132,7 +143,7 @@ def _env_key_source() -> dict[str, str]:
     return source
 
 
-def _validate_binding(payload: dict[str, Any]) -> RepoBinding:
+def _validate_binding(payload: dict[str, Any], *, jira_base_url: str) -> RepoBinding:
     """Field-level validation. Raises a 422 `HTTPException` carrying `loc`
     paths for pydantic errors, legacy role fields, and unknown env key names."""
     legacy = sorted(_LEGACY_ROLE_FIELDS & payload.keys())
@@ -149,6 +160,13 @@ def _validate_binding(payload: dict[str, Any]) -> RepoBinding:
             status_code=422,
             detail=[{"loc": list(err["loc"]), "msg": err["msg"]} for err in e.errors()],
         ) from e
+    # `model_validate` derives `tracker_site` with no global `jira_base_url`,
+    # so a Jira binding relying on that global (no per-binding `base_url`)
+    # would key on the "default" placeholder instead of the site it actually
+    # resolves to at runtime — re-derive it here so the persisted natural key
+    # matches `assemble_effective_config`'s resolution byte-for-byte (same fix
+    # as `config_import.py`).
+    binding.apply_tracker_secret_defaults(jira_base_url=jira_base_url)
     source = _env_key_source()
     unknown = sorted(name for name in binding.env.values() if name not in source)
     if unknown:
@@ -159,6 +177,36 @@ def _validate_binding(payload: dict[str, Any]) -> RepoBinding:
             f"available: {available}",
         )
     return binding
+
+
+def _reject_disabled_write(enabled: bool) -> None:
+    """Mirror the importer's refusal (`config_import.py`): the binding
+    lifecycle (dispatch skip, launch gate, drain guard) ships in SYM-193, and
+    until then `assemble_effective_config` dispatches every DB row as enabled
+    regardless of this column — so persisting `enabled: false` would silently
+    keep dispatching the row anyway."""
+    if not enabled:
+        raise _validation_error(
+            ["enabled"],
+            "disabling a binding has no effect yet; the binding lifecycle "
+            "(disable/drain) ships in SYM-193 and this build would dispatch "
+            "the row anyway — leave it enabled or delete it",
+        )
+
+
+def _validate_webhook_secret(binding: RepoBinding, base: Config) -> None:
+    """Fail closed at save time: a `webhook_enabled` binding with no
+    resolvable secret (its own `webhook_secret` or the global
+    `GITHUB_WEBHOOK_SECRET`) makes `cli._live_github_webhook_settings` swallow
+    the resulting error on the daemon's next hot reload and silently disable
+    *every* repo's webhook verification, not just this one."""
+    if binding.webhook_enabled and not binding.webhook_secret and not base.github_webhook_secret:
+        raise _validation_error(
+            ["webhook_secret"],
+            "webhook_enabled requires a webhook_secret when no global "
+            "GITHUB_WEBHOOK_SECRET is configured; set one or disable "
+            "webhook_enabled",
+        )
 
 
 async def _assemble_and_validate(
@@ -299,11 +347,14 @@ def create_config_crud_router(
         body: BindingWrite = Body(...),  # noqa: B008
         updated_by: str = Depends(_updated_by),  # noqa: B008
     ) -> dict[str, Any]:
+        _reject_disabled_write(body.enabled)
         payload = _sanitize_payload(body.payload)
-        binding = _validate_binding(payload)
+        base = _base_config()
+        binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
         binding.enabled = body.enabled
+        _validate_webhook_secret(binding, base)
         async with lock:
-            wgs = await _assemble_and_validate(conn, _base_config(), binding, exclude_id=None)
+            wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
             try:
                 new_id = await config_bindings.insert(
                     conn,
@@ -337,7 +388,9 @@ def create_config_crud_router(
     ) -> dict[str, Any]:
         if body.version is None:
             raise _validation_error(["version"], "version is required for an update")
+        _reject_disabled_write(body.enabled)
         payload = _sanitize_payload(body.payload)
+        base = _base_config()
         async with lock:
             old = await config_bindings.get(conn, binding_id)
             if old is None:
@@ -348,9 +401,10 @@ def create_config_crud_router(
             # explicit (even empty) value in the payload still overrides it.
             if "webhook_secret" not in payload and old.payload.get("webhook_secret"):
                 payload["webhook_secret"] = old.payload["webhook_secret"]
-            binding = _validate_binding(payload)
+            binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
             binding.enabled = body.enabled
-            wgs = await _assemble_and_validate(conn, _base_config(), binding, exclude_id=binding_id)
+            _validate_webhook_secret(binding, base)
+            wgs = await _assemble_and_validate(conn, base, binding, exclude_id=binding_id)
             try:
                 row = await config_bindings.update(
                     conn,

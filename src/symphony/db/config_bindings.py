@@ -202,6 +202,10 @@ async def update(
         ),
     )
     if cur.rowcount == 0:
+        # The `UPDATE` already opened a write transaction; leaving it open on
+        # this path holds the write lock until some later, unrelated commit
+        # closes it — roll back before raising.
+        await conn.rollback()
         existing = await get(conn, binding_id)
         raise StaleVersionError(binding_id, existing.version if existing else None)
     if commit:
@@ -226,6 +230,9 @@ async def delete(
         (binding_id, expected_version),
     )
     if cur.rowcount == 0:
+        # Same concern as `update`: the `DELETE` already opened a write
+        # transaction; roll it back before raising instead of leaving it open.
+        await conn.rollback()
         existing = await get(conn, binding_id)
         raise StaleVersionError(binding_id, existing.version if existing else None)
     if commit:

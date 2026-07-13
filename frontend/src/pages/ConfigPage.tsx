@@ -150,6 +150,26 @@ function str(v: unknown): string {
   return v === undefined || v === null ? "" : String(v);
 }
 
+/** Imported bindings intentionally keep YAML aliases (`linear_team_key`,
+ * `linear_states`) in their payload — `RepoBinding` accepts either name, but
+ * the curated fields below read only the canonical ones. Canonicalize before
+ * the form initializes from it so an edit of an imported binding doesn't
+ * appear to have lost its project key / states. */
+function canonicalizePayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...payload };
+  if (next.project_key === undefined && next.linear_team_key !== undefined) {
+    next.project_key = next.linear_team_key;
+    delete next.linear_team_key;
+  }
+  if (next.states === undefined && next.linear_states !== undefined) {
+    next.states = next.linear_states;
+    delete next.linear_states;
+  }
+  return next;
+}
+
 /** The drawer form for one binding (create when `binding` is null). */
 export function BindingForm({
   binding,
@@ -163,7 +183,7 @@ export function BindingForm({
   onCancel: () => void;
 }) {
   const initial = useMemo<Record<string, unknown>>(() => {
-    if (binding) return { ...binding.payload };
+    if (binding) return canonicalizePayload(binding.payload);
     return { provider: "linear", states: { ready: "" } };
   }, [binding]);
 

@@ -118,6 +118,25 @@ describe("BindingForm", () => {
     expect(merge.value).toBe("rebase");
   });
 
+  it("canonicalizes imported YAML aliases before rendering the form", () => {
+    render(
+      <BindingForm
+        binding={record({
+          payload: {
+            linear_team_key: "ENG",
+            github_repo: "org/repo",
+            linear_states: { ready: "Backlog" },
+          },
+        })}
+        options={OPTIONS}
+        onSaved={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect((screen.getByLabelText("project_key") as HTMLInputElement).value).toBe("ENG");
+    expect((screen.getByLabelText("ready_state") as HTMLInputElement).value).toBe("Backlog");
+  });
+
   it("posts a create with the edited payload", async () => {
     const fetchMock = mockFetch(201, { ...record(), id: 9 });
     const onSaved = vi.fn();

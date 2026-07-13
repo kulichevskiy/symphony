@@ -33,13 +33,23 @@ def _payload(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-def _app(conn: Any, db_path: Path, *, auth: bool = False) -> Any:
+def _app(
+    conn: Any,
+    db_path: Path,
+    *,
+    auth: bool = False,
+    github_webhook_secret: str = "test-global-secret",
+) -> Any:
+    # A global secret is set by default so tests unrelated to webhooks don't
+    # trip the write-time check that a `webhook_enabled` binding (the
+    # default) needs a resolvable secret; `test_webhook_enabled_without_secret_rejected`
+    # below overrides this to exercise that check directly.
     return create_app(
         _Handler(),
         conn,
         ui_enabled=True,
         ui_db_path=db_path,
-        ui_external_config=Config(),
+        ui_external_config=Config(github_webhook_secret=github_webhook_secret),
         auth0_settings=_settings() if auth else None,
     )
 
@@ -83,12 +93,11 @@ async def test_crud_round_trip(tmp_path: Path) -> None:
                 json={
                     "payload": _payload(max_concurrent=5),
                     "version": 1,
-                    "enabled": False,
                 },
             )
             assert updated.status_code == 200, updated.text
             assert updated.json()["version"] == 2
-            assert updated.json()["enabled"] is False
+            assert updated.json()["enabled"] is True
             assert updated.json()["payload"]["max_concurrent"] == 5
 
             deleted = await client.delete(f"/api/config/bindings/{bid}?version=2")
@@ -151,17 +160,31 @@ async def test_same_label_different_ready_state_accepted(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_disabled_binding_exempt_from_selector_check(tmp_path: Path) -> None:
+async def test_disabled_write_rejected(tmp_path: Path) -> None:
+    """`enabled: false` has no runtime effect until SYM-193 — the write path
+    rejects it outright rather than let an operator believe a binding is
+    disabled when the daemon still dispatches it (see effective_config.py)."""
     conn, db_path = await _open(tmp_path)
     try:
         app = _app(conn, db_path)
         async with _client(app) as client:
-            await client.post("/api/config/bindings", json={"payload": _payload()})
-            staged = await client.post(
+            created_disabled = await client.post(
                 "/api/config/bindings",
-                json={"payload": _payload(github_repo="org/other"), "enabled": False},
+                json={"payload": _payload(), "enabled": False},
             )
-            assert staged.status_code == 201, staged.text
+            assert created_disabled.status_code == 422
+            assert created_disabled.json()["detail"][0]["loc"] == ["enabled"]
+
+            created = await client.post("/api/config/bindings", json={"payload": _payload()})
+            assert created.status_code == 201, created.text
+            bid = created.json()["id"]
+
+            updated_disabled = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={"payload": _payload(), "version": 1, "enabled": False},
+            )
+            assert updated_disabled.status_code == 422
+            assert updated_disabled.json()["detail"][0]["loc"] == ["enabled"]
     finally:
         await conn.close()
 
@@ -184,6 +207,17 @@ async def test_stale_version_conflict(tmp_path: Path) -> None:
             # DELETE with a stale version conflicts too.
             del_stale = await client.delete(f"/api/config/bindings/{bid}?version=99")
             assert del_stale.status_code == 409
+            # Neither conflict left a write transaction open on the shared
+            # connection (both roll back before raising).
+            assert conn.in_transaction is False
+
+            # A same-connection write right after the conflicts still lands
+            # cleanly — proof the dangling transaction isn't blocking it.
+            retry = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={"payload": _payload(max_concurrent=4), "version": 1},
+            )
+            assert retry.status_code == 200, retry.text
     finally:
         await conn.close()
 
@@ -372,6 +406,63 @@ async def test_same_family_review_returns_nonblocking_warning(tmp_path: Path) ->
             )
             assert resp.status_code == 201, resp.text
             assert any("diversity" in w for w in resp.json()["warnings"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_enabled_without_secret_rejected(tmp_path: Path) -> None:
+    """`webhook_enabled: true` with no per-binding secret and no global
+    `GITHUB_WEBHOOK_SECRET` must fail closed at save time — otherwise the
+    daemon's hot-reload path (`cli._live_github_webhook_settings`) swallows
+    the misconfiguration and silently disables *every* repo's webhook
+    verification, not just this one."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path, github_webhook_secret="")
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True)},
+            )
+            assert resp.status_code == 422
+            assert resp.json()["detail"][0]["loc"] == ["webhook_secret"]
+
+            # A per-binding secret satisfies it.
+            with_secret = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True, webhook_secret="s3cr3t")},
+            )
+            assert with_secret.status_code == 201, with_secret.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_jira_tracker_site_normalized_from_global_base_url(tmp_path: Path) -> None:
+    """A Jira binding with no per-binding `base_url` keys on the global
+    `jira_base_url`, matching `assemble_effective_config`'s resolution — not
+    the "default" placeholder `RepoBinding.model_validate` alone would leave
+    it with."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(
+                jira_base_url="https://issues.example.com",
+                github_webhook_secret="test-global-secret",
+            ),
+        )
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(provider="jira")},
+            )
+            assert resp.status_code == 201, resp.text
+            assert resp.json()["tracker_site"] == "https://issues.example.com"
     finally:
         await conn.close()
 
