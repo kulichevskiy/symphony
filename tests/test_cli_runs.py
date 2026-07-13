@@ -878,8 +878,26 @@ async def test_db_owns_topology_true_after_migration_with_zero_bindings(
 
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
-        assert await _db_owns_topology(conn) is False
+        # Not yet migrated, and the YAML still declares `repos:` — legacy
+        # YAML deployment, DB doesn't own topology yet.
+        assert await _db_owns_topology(conn, yaml_has_repos_topology=True) is False
         await db.config_globals.set_globals(conn, roles={}, migrated_at="t")
-        assert await _db_owns_topology(conn) is True
+        assert await _db_owns_topology(conn, yaml_has_repos_topology=True) is True
+    finally:
+        await conn.close()
+
+
+async def test_db_owns_topology_true_for_fresh_install_with_no_yaml_topology(
+    tmp_path: Path,
+) -> None:
+    """A true fresh install — zero bindings, never migrated, no YAML
+    `repos:` to fall back to — must still count as DB-owned so `_run`'s
+    tick-boundary reload (SYM-189) stays enabled and a binding added via the
+    UI/importer after boot is scanned without a restart."""
+    from symphony.cli import _db_owns_topology
+
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        assert await _db_owns_topology(conn, yaml_has_repos_topology=False) is True
     finally:
         await conn.close()

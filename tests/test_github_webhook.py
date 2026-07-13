@@ -14,7 +14,7 @@ from click import ClickException
 
 from symphony import db
 from symphony.app import create_app
-from symphony.cli import _github_webhook_settings
+from symphony.cli import _github_webhook_settings, _live_github_webhook_settings
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.github.webhook import GitHubWebhookEvent, GitHubWebhookSettings
 
@@ -126,6 +126,26 @@ def test_cli_skips_github_webhook_settings_when_repos_are_disabled() -> None:
     cfg = Config(repos=[_binding(webhook_enabled=False)])
 
     assert _github_webhook_settings(cfg) is None
+
+
+def test_live_github_webhook_settings_disables_repos_instead_of_raising() -> None:
+    """A DB reload can hot-add/edit a webhook-enabled repo without a secret
+    while `GITHUB_WEBHOOK_SECRET` is empty. The per-request callable passed
+    to the router must not let `_github_webhook_settings`'s boot-time
+    `ClickException` escape into a live request — it should disable every
+    repo instead, matching the router's own `None`-provider fallback
+    (SYM-189 review fix)."""
+    cfg = Config(
+        repos=[
+            RepoBinding(
+                linear_team_key="WEB",
+                github_repo="org/web",
+                linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+            )
+        ]
+    )
+
+    assert _live_github_webhook_settings(cfg) is None
 
 
 async def _delivery_rows(conn: object) -> list[tuple[str, str]]:

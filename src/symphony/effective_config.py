@@ -131,6 +131,7 @@ async def assemble_effective_config(
     *,
     boot_gates: bool = True,
     yaml_has_repos_topology: bool = False,
+    is_reload: bool = False,
 ) -> Config:
     """Assemble the effective `Config` from `base` (YAML system knobs) + the DB.
 
@@ -150,6 +151,13 @@ async def assemble_effective_config(
     `boot_gates=False`: they still prefer DB bindings when present, but degrade
     gracefully to the YAML topology on an empty DB so they keep working during
     the transition (before the operator has run the importer).
+
+    `is_reload` (the daemon's mid-run tick reload, SYM-189) also implies
+    `boot_gates=False` semantics but must never degrade to the YAML topology
+    on an empty DB: the DB already owns topology past boot, so "zero bindings"
+    here means every binding was deleted, not "importer never ran". Returning
+    `base` unchanged in that case would keep serving a deleted binding's
+    `repos` forever, so this returns an empty topology instead.
     """
     try:
         stored = await db.config_bindings.list_all(conn)
@@ -167,6 +175,12 @@ async def assemble_effective_config(
         raise ConfigBootError(f"malformed config globals payload in the DB: {e}") from e
 
     if not stored:
+        if is_reload:
+            # Mid-run reload, empty DB: every binding was deleted since boot —
+            # collapse to an empty topology rather than falling through to the
+            # one-shot-CLI "degrade to YAML" behavior below, which would leave
+            # `base.repos` (the *previous* effective config's bindings) intact.
+            return base.model_copy(update={"repos": [], "roles": {}})
         if not boot_gates:
             # One-shot CLI, empty DB: operate over the YAML topology as-is.
             return base

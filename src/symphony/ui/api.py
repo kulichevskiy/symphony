@@ -1206,7 +1206,7 @@ def create_api_router(
     no_progress_threshold: timedelta | None = None,
     command_sink: CommandSink | None = None,
     pause_controller: PauseController | None = None,
-    teams: list[str] | None = None,
+    teams: list[str] | Callable[[], list[str] | None] | None = None,
     webhook_public_url: str | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api")
@@ -1214,10 +1214,17 @@ def create_api_router(
     # cloudflared quick-tunnel), surfaced in /meta so the UI can show the
     # paste-ready Linear webhook URL. None in normal/prod runs.
     webhook_base = (webhook_public_url or "").strip().rstrip("/") or None
-    # Always-unscoped team keys from config, surfaced in /spend/summary to
-    # populate the Teams filter popover. Sorted for a stable popover order.
-    config_teams = sorted(teams or [])
     thresholds = status_thresholds or DEFAULT_STUCK_THRESHOLDS
+
+    def _config_teams() -> list[str]:
+        # Always-unscoped team keys from config, surfaced in /spend/summary to
+        # populate the Teams filter popover. `teams` may be a callable so a
+        # DB-owned topology's popover reflects the daemon's live,
+        # hot-reloaded bindings instead of a snapshot frozen at
+        # app-creation time (SYM-189). Sorted for a stable popover order.
+        resolved = teams() if callable(teams) else teams
+        return sorted(resolved or [])
+
     pr_no_progress_threshold = (
         DEFAULT_PR_NO_PROGRESS_THRESHOLD if no_progress_threshold is None else no_progress_threshold
     )
@@ -1497,7 +1504,7 @@ def create_api_router(
             rows,
             model_rows,
             provider_issue_rows,
-            teams=config_teams,
+            teams=_config_teams(),
             models=available_models,
             stage_rows=stage_rows,
         )

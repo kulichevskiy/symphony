@@ -38,6 +38,7 @@ from .tokens import effective_tokens
 from .tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
+    IssueTracker,
     TrackerContext,
     TrackerRegistry,
     context_for_binding,
@@ -188,6 +189,23 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
         raise click.ClickException(str(e)) from e
 
 
+def _live_github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
+    """Like `_github_webhook_settings`, but for the per-request callable a
+    DB-owned topology passes to the webhook router (SYM-189): a hot-reloaded
+    edit that adds/enables a repo without a secret while
+    `GITHUB_WEBHOOK_SECRET` is empty must not raise `click.ClickException`
+    into a live request — that exception type is only meaningful at CLI
+    boot. The router already treats a `None` settings provider as "disable
+    every repo"; do that here too instead of crashing the request."""
+    try:
+        return _github_webhook_settings(cfg)
+    except click.ClickException as e:
+        logging.getLogger(__name__).warning(
+            "live github webhook settings invalid, disabling all repos until fixed: %s", e
+        )
+        return None
+
+
 # Review-lane roles only spawn a subprocess when the binding's local review
 # is enabled; the builder roles (implement/fix/accept) always can.
 _REVIEW_LANE_ROLES: tuple[str, ...] = ("review_find", "review_verify")
@@ -227,19 +245,28 @@ def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
 
 
-async def _db_owns_topology(conn: aiosqlite.Connection) -> bool:
-    """Whether the DB is the topology source of truth: bindings exist now, or
-    the importer has migrated it before (`config_globals.migrated_at` set).
+async def _db_owns_topology(conn: aiosqlite.Connection, *, yaml_has_repos_topology: bool) -> bool:
+    """Whether the DB is the topology source of truth: bindings exist now, the
+    importer has migrated it before (`config_globals.migrated_at` set), or
+    there is no YAML `repos:` topology to fall back to (a true fresh install).
 
     The marker matters on its own because a migrated DB can have zero
     *current* bindings — e.g. every binding was deleted via the UI — and
     leftover YAML `repos:` must stay ignored (not resolved/validated) in that
-    case too, same as when bindings are still present.
+    case too, same as when bindings are still present. A true fresh install
+    (no bindings, never migrated, and no YAML `repos:` either) must also
+    count as DB-owned — otherwise `_run`'s tick-boundary reload (SYM-189)
+    stays disabled forever and a binding added via the UI/importer after boot
+    is never picked up without a restart. Only a not-yet-migrated legacy YAML
+    deployment (bindings absent, `repos:` still present in the YAML) stays
+    YAML-owned until the importer runs.
     """
     if await db.config_bindings.count(conn) > 0:
         return True
     globals_row = await db.config_globals.get(conn)
-    return bool(globals_row and globals_row.migrated_at)
+    if globals_row and globals_row.migrated_at:
+        return True
+    return not yaml_has_repos_topology
 
 
 @asynccontextmanager
@@ -257,6 +284,18 @@ async def _configured_tracker_registry(
                 external_linear = cast(Linear, tracker)
                 registry.register(DEFAULT_PROVIDER, DEFAULT_SITE, tracker)
         yield registry, external_linear
+
+
+def _external_linear_tracker(trackers: TrackerRegistry) -> Linear | None:
+    """Resolve the daemon's current default Linear tracker, live — a fresh
+    DB-owned install can boot with no Linear binding and hot-add one later
+    (SYM-189), so `create_app`'s external-snapshot service must re-resolve
+    this on every call instead of a boot-time snapshot that stays `None`
+    forever."""
+    try:
+        return cast(Linear, trackers.resolve(TrackerContext()))
+    except KeyError:
+        return None
 
 
 @click.group(invoke_without_command=True)
@@ -306,11 +345,14 @@ async def _run(config_path: Path, *, once: bool) -> None:
     try:
         # A migrated deployment's leftover YAML `repos:` is ignored — don't
         # pay for (or risk boot-crashing on) validating/resolving it.
-        db_owns_topology = await _db_owns_topology(conn)
+        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
         base = Config.load(config_path, resolve_repos=not db_owns_topology)
         try:
             cfg = await assemble_effective_config(
-                conn, base, yaml_has_repos_topology=Config.peek_repos_topology(config_path)
+                conn, base, yaml_has_repos_topology=yaml_has_repos_topology
             )
         except ConfigBootError as e:
             click.echo(str(e), err=True)
@@ -319,18 +361,44 @@ async def _run(config_path: Path, *, once: bool) -> None:
             click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
             sys.exit(2)
         _enforce_require_auth0(cfg)
-        async with _configured_tracker_registry(cfg) as (trackers, external_linear):
-            orch = Orchestrator(cfg, trackers, conn)
+        async with _configured_tracker_registry(cfg) as (trackers, _):
+            # When the DB owns topology, hot-apply binding edits at each tick
+            # boundary (SYM-189). A reload introducing a provider/site the
+            # process never saw at boot builds a real client from `Secrets`.
+            reload_secrets = Secrets()
+
+            def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
+                return for_binding(binding, reload_secrets)
+
+            orch = Orchestrator(
+                cfg,
+                trackers,
+                conn,
+                reload_bindings_from_db=db_owns_topology,
+                tracker_factory=_hot_add_tracker if db_owns_topology else None,
+            )
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access
                 await orch.drain_dispatch_tasks()
+                await orch.aclose_hot_added_trackers()
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
             github_webhook_settings = _github_webhook_settings(cfg)
-            if cfg.linear_webhook_secret or github_webhook_settings or cfg.ui.enabled:
+            # A DB-owned topology can hot-enable a repo's webhook (or add a
+            # binding needing one) at any later tick — the boot-time booleans
+            # above can't see that yet, so a headless (`ui.enabled=False`)
+            # deployment with nothing webhook-enabled at boot must still
+            # start the HTTP surface, or a hot-enabled repo would need a
+            # restart to get a live endpoint (SYM-189).
+            if (
+                cfg.linear_webhook_secret
+                or github_webhook_settings
+                or cfg.ui.enabled
+                or db_owns_topology
+            ):
                 import uvicorn
 
                 webhook_settings = (
@@ -346,13 +414,23 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     orch,
                     conn,
                     webhook_settings,
-                    github_webhook_settings,
+                    # A DB-owned topology hot-applies binding edits onto
+                    # `orch.config` (SYM-189) — resolve the webhook settings
+                    # from it on every request instead of baking in this
+                    # boot-time snapshot, so an edited/added repo's
+                    # enabled/secret state doesn't need a restart. The
+                    # callable is always passed (even when nothing is
+                    # webhook-enabled at boot) so a binding hot-added later
+                    # doesn't need one either — the router itself no-ops
+                    # (ignores every repo) when the resolved settings are
+                    # `None`.
+                    lambda: _live_github_webhook_settings(orch.config),
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_log_root=cfg.log_root,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
-                    ui_external_config=cfg,
-                    ui_external_linear=external_linear,
+                    ui_external_config=lambda: orch.config,
+                    ui_external_linear=lambda: _external_linear_tracker(trackers),
                     ui_external_github=cast(GitHubExternalClient, orch._gh),
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
@@ -385,6 +463,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 if webhook_server is not None and webhook_task is not None:
                     webhook_server.should_exit = True  # type: ignore[attr-defined]
                     await webhook_task
+                await orch.aclose_hot_added_trackers()
     finally:
         await conn.close()
 
@@ -586,13 +665,16 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
 async def _preflight(config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        db_owns_topology = await _db_owns_topology(conn)
+        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
         base = Config.load(config_path, resolve_repos=not db_owns_topology)
         cfg = await assemble_effective_config(
             conn,
             base,
             boot_gates=False,
-            yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+            yaml_has_repos_topology=yaml_has_repos_topology,
         )
     except ConfigBootError as e:
         click.echo(str(e), err=True)
@@ -1128,7 +1210,10 @@ def dispatch(linear_id: str, config_path: Path) -> None:
 async def _dispatch(linear_id: str, config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        db_owns_topology = await _db_owns_topology(conn)
+        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
         base = Config.load(config_path, resolve_repos=not db_owns_topology)
         if not base.linear_api_key:
             click.echo("LINEAR_API_KEY is empty", err=True)
@@ -1138,7 +1223,7 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
                 conn,
                 base,
                 boot_gates=False,
-                yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+                yaml_has_repos_topology=yaml_has_repos_topology,
             )
         except ConfigBootError as e:
             click.echo(str(e), err=True)

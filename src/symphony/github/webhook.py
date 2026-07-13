@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from collections.abc import Awaitable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, Protocol, runtime_checkable
@@ -122,15 +122,25 @@ def _matches_any_secret(
 def create_github_webhook_router(
     handler: GitHubWebhookHandler,
     conn: aiosqlite.Connection,
-    settings: GitHubWebhookSettings,
+    settings_provider: GitHubWebhookSettings | Callable[[], GitHubWebhookSettings | None],
     *,
     clock: Clock | None = None,
 ) -> APIRouter:
+    """`settings_provider` may be a callable so a DB-owned topology's
+    `enabled_repos`/per-repo secrets reflect the daemon's live, hot-reloaded
+    bindings instead of a snapshot frozen at app-creation time (SYM-189) —
+    resolved fresh on every request rather than once here. A callable
+    returning `None` (every webhook-eligible binding removed at runtime, no
+    global secret configured) disables every repo rather than crashing."""
     router = APIRouter()
     now_fn = clock if clock is not None else lambda: datetime.now(UTC)
 
     @router.post("/github/webhook")
     async def github_webhook(request: Request) -> JSONResponse:
+        resolved = settings_provider() if callable(settings_provider) else settings_provider
+        settings = (
+            resolved if resolved is not None else GitHubWebhookSettings(enabled_repos=frozenset())
+        )
         body = await request.body()
         signature = request.headers.get(GITHUB_SIGNATURE_HEADER)
         if not _matches_any_secret(settings.all_secrets(), body, signature):

@@ -315,6 +315,9 @@ class FakeLinear:
     async def upload_issue_attachment(self, *, issue_uuid: str, path: Path, title: str) -> str:
         return f"https://sim.invalid/attachments/{issue_uuid}/{title}"
 
+    async def aclose(self) -> None:
+        pass
+
 
 class FakeGitHub:
     """Backs the orchestrator-facing subset of `GitHub` with a single `Sim`."""

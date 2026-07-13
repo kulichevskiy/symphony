@@ -85,6 +85,8 @@ class IssueTracker(Protocol):
         title: str,
     ) -> str: ...
 
+    async def aclose(self) -> None: ...
+
 
 class TrackerRegistry:
     def __init__(self) -> None:
@@ -98,6 +100,26 @@ class TrackerRegistry:
         project_key: str = "",
     ) -> None:
         self._trackers[(provider, site, project_key)] = tracker
+
+    def discard(self, provider: str, site: str, project_key: str = "") -> None:
+        """Remove a context's registration, e.g. once its client is closed
+        because the binding introducing it is gone — a binding reintroducing
+        the same context later must hot-add a fresh client, not resolve the
+        closed one."""
+        self._trackers.pop((provider, site, project_key), None)
+
+    def get(self, ctx: TrackerContext) -> IssueTracker | None:
+        """Exact-match lookup, unlike `resolve` — no site-wide/project-key
+        fallback, so a caller replacing a specific context's client never
+        risks reading (and later closing) a different context's tracker."""
+        return self._trackers.get((ctx.provider, ctx.site, ctx.project_key))
+
+    def has_tracker(self, tracker: IssueTracker) -> bool:
+        """Whether `tracker` is still registered under any context, including
+        ones registered directly (e.g. at boot) rather than tracked as a
+        hot-add — a caller must not close a client another live context
+        still shares (SYM-189)."""
+        return any(registered is tracker for registered in self._trackers.values())
 
     def resolve(self, ctx: TrackerContext | None = None) -> IssueTracker:
         key = (

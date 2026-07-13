@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -79,7 +79,9 @@ def create_app(
     handler: WebhookHandler,
     conn: aiosqlite.Connection,
     webhook_settings: WebhookSettings | None = None,
-    github_webhook_settings: GitHubWebhookSettings | None = None,
+    github_webhook_settings: (
+        GitHubWebhookSettings | Callable[[], GitHubWebhookSettings | None] | None
+    ) = None,
     *,
     github_handler: GitHubWebhookHandler | None = None,
     ui_enabled: bool = True,
@@ -87,8 +89,8 @@ def create_app(
     ui_log_root: Path | None = None,
     ui_dist_dir: Path | None = None,
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
-    ui_external_config: Config | None = None,
-    ui_external_linear: Linear | None = None,
+    ui_external_config: Config | Callable[[], Config | None] | None = None,
+    ui_external_linear: Linear | Callable[[], Linear | None] | None = None,
     ui_external_github: GitHubExternalClient | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,
@@ -204,11 +206,12 @@ def create_app(
             dependencies=api_dependencies,
         )
 
-        ui_teams = (
-            sorted({b.linear_team_key for b in ui_external_config.repos})
-            if ui_external_config is not None
-            else None
-        )
+        def _ui_teams() -> list[str] | None:
+            current = ui_external_config() if callable(ui_external_config) else ui_external_config
+            if current is None:
+                return None
+            return sorted({b.linear_team_key for b in current.repos})
+
         app.include_router(
             create_api_router(
                 ui_pool,
@@ -217,7 +220,7 @@ def create_app(
                 no_progress_threshold=ui_pr_no_progress_threshold,
                 command_sink=ui_command_sink,
                 pause_controller=ui_pause_controller,
-                teams=ui_teams,
+                teams=_ui_teams,
                 webhook_public_url=ui_webhook_public_url,
             ),
             dependencies=api_dependencies,
