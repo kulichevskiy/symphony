@@ -648,9 +648,7 @@ async def test_crud_router_not_mounted_when_yaml_owns_topology(tmp_path: Path) -
         async with _client(app) as client:
             options = await client.get("/api/config/options")
             bindings = await client.get("/api/config/bindings")
-            created = await client.post(
-                "/api/config/bindings", json={"payload": _payload()}
-            )
+            created = await client.post("/api/config/bindings", json={"payload": _payload()})
         assert options.status_code == 404
         assert bindings.status_code == 404
         assert created.status_code == 404
