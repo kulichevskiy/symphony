@@ -90,7 +90,7 @@ def create_app(
     ui_dist_dir: Path | None = None,
     ui_status_thresholds: Mapping[CanonicalState, timedelta] | None = None,
     ui_external_config: Config | Callable[[], Config | None] | None = None,
-    ui_external_linear: Linear | None = None,
+    ui_external_linear: Linear | Callable[[], Linear | None] | None = None,
     ui_external_github: GitHubExternalClient | None = None,
     ui_external_service: ExternalSnapshotService | None = None,
     ui_pr_no_progress_threshold: timedelta | None = None,

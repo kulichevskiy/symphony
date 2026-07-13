@@ -260,6 +260,18 @@ async def _configured_tracker_registry(
         yield registry, external_linear
 
 
+def _external_linear_tracker(trackers: TrackerRegistry) -> Linear | None:
+    """Resolve the daemon's current default Linear tracker, live — a fresh
+    DB-owned install can boot with no Linear binding and hot-add one later
+    (SYM-189), so `create_app`'s external-snapshot service must re-resolve
+    this on every call instead of a boot-time snapshot that stays `None`
+    forever."""
+    try:
+        return cast(Linear, trackers.resolve(TrackerContext()))
+    except KeyError:
+        return None
+
+
 @click.group(invoke_without_command=True)
 @click.option(
     "--config",
@@ -320,7 +332,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
             click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
             sys.exit(2)
         _enforce_require_auth0(cfg)
-        async with _configured_tracker_registry(cfg) as (trackers, external_linear):
+        async with _configured_tracker_registry(cfg) as (trackers, _):
             # When the DB owns topology, hot-apply binding edits at each tick
             # boundary (SYM-189). A reload introducing a provider/site the
             # process never saw at boot builds a real client from `Secrets`.
@@ -366,20 +378,19 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     # `orch.config` (SYM-189) — resolve the webhook settings
                     # from it on every request instead of baking in this
                     # boot-time snapshot, so an edited/added repo's
-                    # enabled/secret state doesn't need a restart. Whether the
-                    # router mounts at all is still decided once, here, from
-                    # boot state.
-                    (
-                        (lambda: _github_webhook_settings(orch.config))
-                        if github_webhook_settings is not None
-                        else None
-                    ),
+                    # enabled/secret state doesn't need a restart. The
+                    # callable is always passed (even when nothing is
+                    # webhook-enabled at boot) so a binding hot-added later
+                    # doesn't need one either — the router itself no-ops
+                    # (ignores every repo) when the resolved settings are
+                    # `None`.
+                    lambda: _github_webhook_settings(orch.config),
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_log_root=cfg.log_root,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
                     ui_external_config=lambda: orch.config,
-                    ui_external_linear=external_linear,
+                    ui_external_linear=lambda: _external_linear_tracker(trackers),
                     ui_external_github=cast(GitHubExternalClient, orch._gh),
                     ui_pr_no_progress_threshold=(
                         cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()

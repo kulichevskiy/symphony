@@ -443,7 +443,7 @@ class ExternalSnapshotService:
     def __init__(
         self,
         config: Config | Callable[[], Config | None] | None,
-        linear: LinearExternalClient,
+        linear: LinearExternalClient | Callable[[], LinearExternalClient | None],
         github: GitHubExternalClient,
         *,
         cache: ExternalSnapshotCache | None = None,
@@ -451,15 +451,21 @@ class ExternalSnapshotService:
     ) -> None:
         # A callable re-reads the daemon's live, hot-reloaded topology on
         # every call instead of the `Config` snapshot at app-creation time
-        # (SYM-189).
+        # (SYM-189). `linear` is a callable too, so a DB-owned deployment that
+        # boots with no Linear binding still gets snapshots once one is
+        # hot-added — the client isn't fixed at app-creation time either.
         self._config_provider = config
-        self._issue_tracker_client = linear
+        self._linear_provider = linear
         self._github = github
         self.cache = cache or ExternalSnapshotCache()
         self._clock = clock
 
     def _config(self) -> Config | None:
         provider = self._config_provider
+        return provider() if callable(provider) else provider
+
+    def _linear(self) -> LinearExternalClient | None:
+        provider = self._linear_provider
         return provider() if callable(provider) else provider
 
     def _now(self) -> datetime:
@@ -517,8 +523,12 @@ class ExternalSnapshotService:
         if backoff_error is not None:
             return self.cache.source_error(issue_id, SOURCE_LINEAR, backoff_error)
 
+        linear = self._linear()
+        if linear is None:
+            return {"error": "No Linear client is configured"}
+
         try:
-            payload = await self._issue_tracker_client.issue_external_snapshot(issue_id)
+            payload = await linear.issue_external_snapshot(issue_id)
             payload["comments"] = [
                 _truncate_comment(comment)
                 for comment in payload.get("comments", [])

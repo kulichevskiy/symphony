@@ -922,10 +922,14 @@ class _OrchestratorBase:
             log.exception("review resurrection failed")
         for binding in self.config.repos:
             ctx = _tracker_context_for_binding(binding)
-            if not self._tracker_context_registered(ctx):
+            # A stale context's registered tracker is the pre-edit client
+            # pending a rebuild (`_hot_add_trackers`) — scanning with it would
+            # serve a constructor payload (e.g. Jira states) the binding no
+            # longer declares (SYM-189 review fix).
+            if not self._tracker_context_registered(ctx) or ctx in self._stale_tracker_contexts:
                 log.warning(
                     "skipping scan for %s: tracker context %s not registered "
-                    "(hot-add likely failed)",
+                    "or pending rebuild (hot-add likely failed)",
                     binding.linear_team_key,
                     ctx,
                 )
@@ -1063,9 +1067,10 @@ class _OrchestratorBase:
     async def _react_to_binding_set(self) -> None:
         """Reconcile in-memory state that must follow the binding set: register
         trackers for newly-seen contexts, rebuild any whose constructor
-        payload changed under an unchanged natural key, and prune
-        `tracker_queue` scopes for bindings that are gone. A no-op when the
-        set is unchanged and no tracker context is pending a rebuild."""
+        payload changed under an unchanged natural key, prune `tracker_queue`
+        scopes for bindings that are gone, and publish only bindings whose
+        tracker actually registered. A no-op when the set is unchanged and no
+        tracker context is pending a rebuild."""
         keys = frozenset(_binding_key(binding) for binding in self.config.repos)
         if keys == self._binding_keys and not self._stale_tracker_contexts:
             return
@@ -1075,8 +1080,27 @@ class _OrchestratorBase:
         # tick instead of stranding an unscanned binding or stale scopes
         # until the set changes again.
         prune_ok = await self._prune_tracker_queue_scopes()
+        self._publish_registered_bindings()
         if hot_add_ok and prune_ok:
             self._binding_keys = keys
+
+    def _publish_registered_bindings(self) -> None:
+        """Drop a binding whose tracker context never got registered (e.g. a
+        missing/invalid secret failed `_tracker_factory`) from `self.config`/
+        the reconciler's config, so every other consumer — not just the
+        tick's own scan-loop guard — can't act on a binding backed by no
+        tracker. `_reload_bindings` re-derives `self.config` fresh from the DB
+        every tick, so this never permanently drops a binding: the next
+        tick's hot-add attempt retries it (SYM-189 review fix)."""
+        registered = [
+            binding
+            for binding in self.config.repos
+            if self._tracker_context_registered(_tracker_context_for_binding(binding))
+        ]
+        if len(registered) == len(self.config.repos):
+            return
+        self.config = self.config.model_copy(update={"repos": registered})
+        self._reconciler.config = self.config
 
     async def _hot_add_trackers(self) -> bool:
         """Register a tracker client for any binding whose provider/site (for
@@ -1377,6 +1401,7 @@ class _OrchestratorBase:
 
     async def _restore_operator_waits(self) -> None:
         waits = await db.operator_waits.list_all(self._conn)
+        matched_run_ids: set[str] = set()
         for wait in waits:
             if wait.kind not in (
                 db.operator_waits.KIND_IMPLEMENT_FAILED,
@@ -1408,7 +1433,30 @@ class _OrchestratorBase:
                     wait.issue_label,
                 )
                 continue
+            matched_run_ids.add(wait.run_id)
             self._register_operator_wait_binding(wait, binding)
+        self._evict_unmatched_operator_waits(matched_run_ids)
+
+    def _evict_unmatched_operator_waits(self, matched_run_ids: set[str]) -> None:
+        """Drop a previously-restored wait whose binding a reload removed (or
+        whose row is gone) from the in-memory tracking this restore pass
+        populates — otherwise it lingers forever, since this pass only ever
+        adds entries that still match `self.config` (SYM-189 review fix)."""
+        stale_run_ids = self._operator_wait_run_ids - matched_run_ids
+        if not stale_run_ids:
+            return
+        for run_id in stale_run_ids:
+            self._operator_wait_run_ids.discard(run_id)
+            self._implement_failed_run_bindings.pop(run_id, None)
+            self._implement_blocked_run_bindings.pop(run_id, None)
+            self._deliver_failed_run_bindings.pop(run_id, None)
+            self._review_failed_run_bindings.pop(run_id, None)
+            self._merge_needs_approval_bindings.pop(run_id, None)
+            self._acceptance_rejected_run_bindings.pop(run_id, None)
+            self._budget_exceeded_run_bindings.pop(run_id, None)
+        for issue_id, run_id in list(self._dispatch_run_ids.items()):
+            if run_id in stale_run_ids:
+                self._dispatch_run_ids.pop(issue_id, None)
 
     def _register_operator_wait_binding(
         self, wait: db.operator_waits.OperatorWait, binding: RepoBinding
