@@ -1,7 +1,26 @@
 import { useQuery } from "@tanstack/react-query";
+import { type ReactNode, useMemo, useState } from "react";
 
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { type BindingView, type ConfigView, fetchConfigView } from "@/lib/api";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import {
+  ApiError,
+  type BindingRecord,
+  type BindingWrite,
+  ConfigWriteError,
+  type ConfigOptions,
+  type ConfigView,
+  createBinding,
+  deleteBinding,
+  fetchBindings,
+  fetchConfigOptions,
+  fetchConfigView,
+  type FieldError,
+  updateBinding,
+} from "@/lib/api";
 
 // Pipeline roles in dispatch order; the config view keys its `roles` map by
 // these names.
@@ -13,8 +32,8 @@ const ROLE_ORDER = [
   "accept",
 ] as const;
 
-/** One binding's card: identity + concurrency cap + the resolved role matrix. */
-function BindingCard({ binding }: { binding: BindingView }) {
+/** One binding's resolved role matrix (read-only projection). */
+function BindingCard({ binding }: { binding: ConfigView["bindings"][number] }) {
   return (
     <Card className="p-5">
       <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
@@ -69,7 +88,7 @@ function BindingCard({ binding }: { binding: BindingView }) {
   );
 }
 
-/** Pure presentation of the loaded config — no fetching. */
+/** Pure presentation of the resolved config — no fetching. */
 export function ConfigDetails({ config }: { config: ConfigView }) {
   return (
     <div className="space-y-6">
@@ -90,37 +109,737 @@ export function ConfigDetails({ config }: { config: ConfigView }) {
   );
 }
 
+// --- Editable binding CRUD ---------------------------------------------------
+
+/** First validation message anchored at `key` (loc[0]); undefined if none. */
+export function bindingErrorFor(
+  errors: FieldError[],
+  key: string,
+): string | undefined {
+  const hit = errors.find((e) => e.loc[0] === key);
+  return hit?.msg;
+}
+
+/** Errors not anchored on a curated field (e.g. `roles`, cross-binding) — the
+ *  advanced-JSON section renders these with their path. */
+function advancedErrors(errors: FieldError[], curated: string[]): FieldError[] {
+  return errors.filter(
+    (e) => e.loc[0] !== "_" && !curated.includes(String(e.loc[0])),
+  );
+}
+
+const CURATED_KEYS = [
+  "provider",
+  "project_key",
+  "github_repo",
+  "issue_label",
+  "states",
+  "max_concurrent",
+  "local_review",
+  "remote_review",
+  "merge_strategy",
+  "auto_merge",
+  "verify_cmd",
+  "webhook_enabled",
+  "webhook_secret",
+];
+
+function get(payload: Record<string, unknown>, key: string): unknown {
+  return payload[key];
+}
+
+function str(v: unknown): string {
+  return v === undefined || v === null ? "" : String(v);
+}
+
+/** Imported bindings intentionally keep YAML aliases (`linear_team_key`,
+ * `linear_states`) in their payload — `RepoBinding` accepts either name, but
+ * the curated fields below read only the canonical ones. Canonicalize before
+ * the form initializes from it so an edit of an imported binding doesn't
+ * appear to have lost its project key / states. */
+function canonicalizePayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...payload };
+  if (next.project_key === undefined && next.linear_team_key !== undefined) {
+    next.project_key = next.linear_team_key;
+    delete next.linear_team_key;
+  }
+  if (next.states === undefined && next.linear_states !== undefined) {
+    next.states = next.linear_states;
+    delete next.linear_states;
+  }
+  return next;
+}
+
+/** The drawer form for one binding (create when `binding` is null). */
+export function BindingForm({
+  binding,
+  options,
+  onSaved,
+  onCancel,
+}: {
+  binding: BindingRecord | null;
+  options: ConfigOptions;
+  onSaved: (warnings?: string[]) => void;
+  onCancel: () => void;
+}) {
+  const initial = useMemo<Record<string, unknown>>(() => {
+    if (binding) return canonicalizePayload(binding.payload);
+    return {
+      provider: "linear",
+      states: { ready: "" },
+      // Without a global `GITHUB_WEBHOOK_SECRET`, the field's own default of
+      // `true` would make the write path reject the create until the
+      // operator also sets a per-binding secret — default it off instead so
+      // a first-time create just works; the checkbox lets them turn it on.
+      webhook_enabled: options.github_webhook_secret_configured,
+    };
+  }, [binding, options.github_webhook_secret_configured]);
+
+  const [payload, setPayload] = useState<Record<string, unknown>>(initial);
+  const [priority, setPriority] = useState(binding ? binding.priority : 0);
+  const [raw, setRaw] = useState(() => JSON.stringify(initial, null, 2));
+  const [rawError, setRawError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
+  const [conflict, setConflict] = useState<number | null | false>(false);
+  const [saving, setSaving] = useState(false);
+
+  function patch(next: Record<string, unknown>) {
+    setPayload(next);
+    setRaw(JSON.stringify(next, null, 2));
+    setRawError(null);
+  }
+
+  function setKey(key: string, value: unknown) {
+    const next = { ...payload };
+    if (value === "" || value === undefined) delete next[key];
+    else next[key] = value;
+    patch(next);
+  }
+
+  function setReady(value: string) {
+    const states = { ...(payload.states as Record<string, unknown> | undefined) };
+    states.ready = value;
+    patch({ ...payload, states });
+  }
+
+  function onRawChange(text: string) {
+    setRaw(text);
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        setRawError("must be a JSON object");
+        return;
+      }
+      setPayload(parsed);
+      setRawError(null);
+    } catch (e) {
+      setRawError(e instanceof Error ? e.message : "invalid JSON");
+    }
+  }
+
+  async function submit() {
+    if (rawError) return;
+    setSaving(true);
+    setFieldErrors([]);
+    setConflict(false);
+    const body: BindingWrite = {
+      payload,
+      // Disabling has no runtime effect until SYM-193 — the write path
+      // rejects `enabled: false` outright, so there's no toggle for it here.
+      enabled: true,
+      priority,
+      version: binding ? binding.version : undefined,
+    };
+    try {
+      const saved = binding
+        ? await updateBinding(binding.id, body)
+        : await createBinding(body);
+      onSaved(saved.warnings);
+    } catch (e) {
+      if (e instanceof ConfigWriteError) {
+        if (e.status === 422) setFieldErrors(e.fieldErrors);
+        else if (e.status === 409) setConflict(e.conflictVersion);
+        else setFieldErrors([{ loc: ["_"], msg: e.message }]);
+      } else {
+        setFieldErrors([{ loc: ["_"], msg: "Unexpected error" }]);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const states = (payload.states as Record<string, unknown> | undefined) ?? {};
+  const advanced = advancedErrors(fieldErrors, CURATED_KEYS);
+  const topError = bindingErrorFor(fieldErrors, "_");
+
+  function field(label: string, key: string, node: ReactNode) {
+    const err = bindingErrorFor(fieldErrors, key);
+    return (
+      <label className="block space-y-1">
+        <span className="text-xs font-medium text-muted-foreground">{label}</span>
+        {node}
+        {err ? <span className="block text-xs text-destructive" role="alert">{err}</span> : null}
+      </label>
+    );
+  }
+
+  /** Checkbox variant of `field` — checked-state input plus the same
+   *  curated-key error rendering (these keys are excluded from the advanced
+   *  list, so without this the error would render nowhere). */
+  function checkboxField(label: string, key: string, node: ReactNode) {
+    const err = bindingErrorFor(fieldErrors, key);
+    return (
+      <div className="space-y-1">
+        <label className="flex items-center gap-2 text-sm">
+          {node}
+          {label}
+        </label>
+        {err ? <span className="block text-xs text-destructive" role="alert">{err}</span> : null}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="fixed inset-y-0 right-0 z-50 flex w-full max-w-md flex-col overflow-y-auto border-l border-border bg-background p-6 shadow-xl"
+      role="dialog"
+      aria-label={binding ? "Edit binding" : "Create binding"}
+    >
+      <div className="mb-4 flex items-center justify-between">
+        <h2 className="text-lg font-semibold">
+          {binding ? `Edit ${binding.project_key} → ${binding.github_repo}` : "New binding"}
+        </h2>
+        <Button variant="ghost" onClick={onCancel} type="button">
+          Close
+        </Button>
+      </div>
+
+      {conflict !== false ? (
+        <Alert className="mb-4 border-destructive/50" role="alert">
+          <AlertTitle>Edit conflict</AlertTitle>
+          <AlertDescription>
+            This binding changed since you loaded it
+            {conflict != null ? ` (now version ${conflict})` : ""}. Reload and
+            reapply your edit.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {topError ? (
+        <Alert className="mb-4 border-destructive/50" role="alert">
+          <AlertDescription>{topError}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <div className="space-y-4">
+        {field(
+          "Provider",
+          "provider",
+          <Select
+            value={str(get(payload, "provider")) || "linear"}
+            onChange={(e) => setKey("provider", e.target.value)}
+            aria-label="provider"
+          >
+            <option value="linear">linear</option>
+            <option value="jira">jira</option>
+          </Select>,
+        )}
+        {field(
+          "Project key",
+          "project_key",
+          <Input
+            value={str(get(payload, "project_key"))}
+            onChange={(e) => setKey("project_key", e.target.value)}
+            aria-label="project_key"
+          />,
+        )}
+        {field(
+          "GitHub repo",
+          "github_repo",
+          <Input
+            value={str(get(payload, "github_repo"))}
+            onChange={(e) => setKey("github_repo", e.target.value)}
+            aria-label="github_repo"
+          />,
+        )}
+        {field(
+          "Issue label",
+          "issue_label",
+          <Input
+            value={str(get(payload, "issue_label"))}
+            onChange={(e) => setKey("issue_label", e.target.value)}
+            aria-label="issue_label"
+          />,
+        )}
+        {field(
+          "Ready state",
+          "states",
+          <Input
+            value={str(states.ready)}
+            onChange={(e) => setReady(e.target.value)}
+            aria-label="ready_state"
+          />,
+        )}
+        {field(
+          "Max concurrent",
+          "max_concurrent",
+          <Input
+            type="number"
+            value={str(get(payload, "max_concurrent"))}
+            onChange={(e) =>
+              setKey(
+                "max_concurrent",
+                e.target.value === "" ? "" : Number(e.target.value),
+              )
+            }
+            aria-label="max_concurrent"
+          />,
+        )}
+        <label className="block space-y-1">
+          <span className="text-xs font-medium text-muted-foreground">Priority</span>
+          <Input
+            type="number"
+            value={String(priority)}
+            onChange={(e) => setPriority(Number(e.target.value))}
+            aria-label="priority"
+          />
+        </label>
+        {checkboxField(
+          "Local review",
+          "local_review",
+          <input
+            type="checkbox"
+            checked={Boolean(get(payload, "local_review"))}
+            onChange={(e) => setKey("local_review", e.target.checked)}
+            aria-label="local_review"
+          />,
+        )}
+        {checkboxField(
+          "Remote review",
+          "remote_review",
+          <input
+            type="checkbox"
+            checked={get(payload, "remote_review") !== false}
+            onChange={(e) => setKey("remote_review", e.target.checked)}
+            aria-label="remote_review"
+          />,
+        )}
+        {field(
+          "Merge strategy",
+          "merge_strategy",
+          <Select
+            value={str(get(payload, "merge_strategy")) || "squash"}
+            onChange={(e) => setKey("merge_strategy", e.target.value)}
+            aria-label="merge_strategy"
+          >
+            {options.merge_strategies.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </Select>,
+        )}
+        {checkboxField(
+          "Auto merge",
+          "auto_merge",
+          <input
+            type="checkbox"
+            checked={get(payload, "auto_merge") !== false}
+            onChange={(e) => setKey("auto_merge", e.target.checked)}
+            aria-label="auto_merge"
+          />,
+        )}
+        {field(
+          "Verify command",
+          "verify_cmd",
+          <Input
+            value={str(get(payload, "verify_cmd"))}
+            onChange={(e) => setKey("verify_cmd", e.target.value)}
+            aria-label="verify_cmd"
+          />,
+        )}
+        {checkboxField(
+          "Webhook enabled",
+          "webhook_enabled",
+          <input
+            type="checkbox"
+            checked={get(payload, "webhook_enabled") !== false}
+            onChange={(e) => setKey("webhook_enabled", e.target.checked)}
+            aria-label="webhook_enabled"
+          />,
+        )}
+        {field(
+          "Webhook secret",
+          "webhook_secret",
+          <>
+            <Input
+              type="password"
+              value={str(get(payload, "webhook_secret"))}
+              onChange={(e) => setKey("webhook_secret", e.target.value)}
+              aria-label="webhook_secret"
+              placeholder={binding?.webhook_secret_set ? "set — leave blank to keep" : ""}
+            />
+            {!options.github_webhook_secret_configured ? (
+              <span className="block text-xs text-muted-foreground">
+                No global GITHUB_WEBHOOK_SECRET configured — required here when
+                webhook enabled is on.
+              </span>
+            ) : null}
+          </>,
+        )}
+
+        <details className="rounded-md border border-border p-3">
+          <summary className="cursor-pointer text-sm font-medium">
+            Advanced (raw JSON)
+          </summary>
+          <textarea
+            className="mt-2 h-48 w-full rounded-md border border-input bg-background p-2 font-mono text-xs"
+            value={raw}
+            onChange={(e) => onRawChange(e.target.value)}
+            aria-label="raw_payload"
+          />
+          {rawError ? (
+            <span className="block text-xs text-destructive" role="alert">
+              {rawError}
+            </span>
+          ) : null}
+          {advanced.map((e) => (
+            <span
+              key={e.loc.join(".")}
+              className="block text-xs text-destructive"
+              role="alert"
+            >
+              {e.loc.join(".")}: {e.msg}
+            </span>
+          ))}
+        </details>
+      </div>
+
+      <div className="mt-6 flex gap-2">
+        <Button onClick={submit} disabled={saving || Boolean(rawError)} type="button">
+          {saving ? "Saving…" : "Save"}
+        </Button>
+        <Button variant="secondary" onClick={onCancel} type="button">
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** One editable binding row with enable/edit/delete/reorder controls. */
+function EditableBindingCard({
+  binding,
+  onEdit,
+  onDelete,
+  onReorder,
+  isFirst,
+  isLast,
+}: {
+  binding: BindingRecord;
+  onEdit: () => void;
+  onDelete: () => void;
+  onReorder: (dir: -1 | 1) => void;
+  isFirst: boolean;
+  isLast: boolean;
+}) {
+  return (
+    <Card className="flex flex-wrap items-center justify-between gap-3 p-4">
+      <div className="flex items-center gap-2">
+        <span className="rounded bg-secondary px-1.5 py-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+          {binding.tracker_provider || "linear"}
+        </span>
+        <span className="font-mono text-sm font-semibold">
+          {binding.project_key}
+        </span>
+        <span className="text-muted-foreground">→</span>
+        <span className="font-mono text-sm">{binding.github_repo}</span>
+        {binding.issue_label ? (
+          <span className="rounded bg-secondary px-1.5 py-0.5 text-xs">
+            {binding.issue_label}
+          </span>
+        ) : null}
+        {!binding.enabled ? (
+          <span className="text-xs text-muted-foreground">(disabled)</span>
+        ) : null}
+      </div>
+      <div className="flex items-center gap-1">
+        <span className="mr-2 font-mono text-xs text-muted-foreground">
+          priority {binding.priority}
+        </span>
+        <Button
+          variant="ghost"
+          type="button"
+          aria-label={`move up ${binding.id}`}
+          disabled={isFirst}
+          onClick={() => onReorder(-1)}
+        >
+          ↑
+        </Button>
+        <Button
+          variant="ghost"
+          type="button"
+          aria-label={`move down ${binding.id}`}
+          disabled={isLast}
+          onClick={() => onReorder(1)}
+        >
+          ↓
+        </Button>
+        <Button variant="secondary" type="button" onClick={onEdit}>
+          Edit
+        </Button>
+        <Button variant="ghost" type="button" onClick={onDelete}>
+          Delete
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+/** The editable bindings list + create button + drawer form. */
+export function BindingsPanel({
+  bindings,
+  options,
+  onChanged,
+}: {
+  bindings: BindingRecord[];
+  options: ConfigOptions;
+  onChanged: () => void;
+}) {
+  const [editing, setEditing] = useState<BindingRecord | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedWarnings, setSavedWarnings] = useState<string[] | null>(null);
+
+  // Mirror the backend dispatch order (`db/config_bindings.list_all`): equal
+  // priorities break ties by the natural key, not `id` — otherwise this panel
+  // shows a different order than the daemon actually dispatches in.
+  const ordered = [...bindings].sort(
+    (a, b) =>
+      a.priority - b.priority ||
+      a.project_key.localeCompare(b.project_key) ||
+      a.github_repo.localeCompare(b.github_repo) ||
+      a.issue_label.localeCompare(b.issue_label) ||
+      a.tracker_provider.localeCompare(b.tracker_provider) ||
+      a.tracker_site.localeCompare(b.tracker_site),
+  );
+
+  async function remove(b: BindingRecord) {
+    if (!window.confirm(`Delete binding ${b.project_key} → ${b.github_repo}?`)) {
+      return;
+    }
+    setError(null);
+    try {
+      await deleteBinding(b.id, b.version);
+      onChanged();
+    } catch (e) {
+      setError(
+        e instanceof ConfigWriteError && e.status === 409
+          ? "Binding changed since load — reload and retry the delete."
+          : "Failed to delete binding.",
+      );
+    }
+  }
+
+  async function reorder(index: number, dir: -1 | 1) {
+    const other = index + dir;
+    if (!ordered[index] || !ordered[other]) return;
+    setError(null);
+
+    const moved = [...ordered];
+    [moved[index], moved[other]] = [moved[other], moved[index]];
+
+    // Renumber against the new positions so the swap is never a no-op (e.g.
+    // every new binding defaults to priority 0) — a plain value swap between
+    // two equal priorities writes nothing and the sort order never changes.
+    // Disabled rows are excluded: the backend rejects any write carrying
+    // `enabled: false` (the lifecycle guard ships in SYM-193), so renumbering
+    // one would 422 the whole reorder even though its priority display value
+    // never actually changes anything today.
+    const writes = ordered
+      .map((b) => ({ b, priority: moved.findIndex((m) => m.id === b.id) }))
+      .filter(({ b, priority }) => b.enabled && b.priority !== priority);
+
+    try {
+      for (const { b, priority } of writes) {
+        await updateBinding(b.id, {
+          payload: b.payload,
+          enabled: b.enabled,
+          priority,
+          version: b.version,
+        });
+      }
+      onChanged();
+    } catch {
+      setError("Failed to reorder — reload and retry.");
+      // A partial renumber may have landed — refetch so the UI reflects the
+      // actual DB state instead of showing the stale pre-reorder order.
+      onChanged();
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold">Bindings</h2>
+        <Button type="button" onClick={() => setCreating(true)}>
+          New binding
+        </Button>
+      </div>
+
+      {error ? (
+        <Alert className="border-destructive/50" role="alert">
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {savedWarnings?.length ? (
+        <Alert role="status">
+          <AlertTitle>Saved with warnings</AlertTitle>
+          <AlertDescription>
+            {savedWarnings.map((w) => (
+              <div key={w}>{w}</div>
+            ))}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {ordered.length ? (
+        ordered.map((b, i) => (
+          <EditableBindingCard
+            key={b.id}
+            binding={b}
+            isFirst={i === 0}
+            isLast={i === ordered.length - 1}
+            onEdit={() => setEditing(b)}
+            onDelete={() => remove(b)}
+            onReorder={(dir) => reorder(i, dir)}
+          />
+        ))
+      ) : (
+        <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
+          No bindings yet — create one to start dispatching.
+        </div>
+      )}
+
+      {creating ? (
+        <BindingForm
+          key="new"
+          binding={null}
+          options={options}
+          onSaved={(warnings) => {
+            setCreating(false);
+            setSavedWarnings(warnings?.length ? warnings : null);
+            onChanged();
+          }}
+          onCancel={() => setCreating(false)}
+        />
+      ) : null}
+      {editing ? (
+        <BindingForm
+          key={editing.id}
+          binding={editing}
+          options={options}
+          onSaved={(warnings) => {
+            setEditing(null);
+            setSavedWarnings(warnings?.length ? warnings : null);
+            onChanged();
+          }}
+          onCancel={() => setEditing(null)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
 export function ConfigPage() {
-  const { data, error, isLoading } = useQuery({
+  const view = useQuery({
     queryKey: ["config"],
     queryFn: fetchConfigView,
     staleTime: Infinity,
   });
+  // A 404 means the CRUD router isn't mounted (legacy YAML topology owns
+  // bindings) — retrying can't change that, so resolve immediately instead
+  // of running the default 3 retries before the read-only notice can render.
+  const retryUnlessNotFound = (failureCount: number, error: unknown) =>
+    !(error instanceof ApiError && error.status === 404) && failureCount < 3;
+  const bindings = useQuery({
+    queryKey: ["config", "bindings"],
+    queryFn: fetchBindings,
+    staleTime: Infinity,
+    retry: retryUnlessNotFound,
+  });
+  const options = useQuery({
+    queryKey: ["config", "options"],
+    queryFn: fetchConfigOptions,
+    staleTime: Infinity,
+    retry: retryUnlessNotFound,
+  });
+
+  function refetchAll() {
+    void bindings.refetch();
+    void view.refetch();
+  }
+
+  // The backend intentionally doesn't mount `/api/config/{options,bindings}`
+  // when a legacy YAML topology still owns bindings — DB writes here would
+  // round-trip looking successful while the daemon silently never applies
+  // them (`ui_db_owns_topology=False`). A 404 on either query means that, not
+  // a real failure — show the resolved (read-only) config below instead of
+  // an error banner.
+  const isReadOnlyConfig =
+    (bindings.error instanceof ApiError && bindings.error.status === 404) ||
+    (options.error instanceof ApiError && options.error.status === 404);
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-5">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-xl font-semibold tracking-tight">Configuration</h1>
-          <span className="rounded-md border border-border px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Read-only
-          </span>
-        </div>
+        <h1 className="text-xl font-semibold tracking-tight">Configuration</h1>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          Effective config as loaded at daemon startup. Secrets are omitted.
-          Editing is not supported here.
+          Bindings live in the database and are picked up by the daemon on the
+          next tick. Secrets are never shown.
         </p>
       </div>
 
-      {isLoading ? (
+      {bindings.data && options.data ? (
+        <div className="mb-8">
+          <BindingsPanel
+            bindings={bindings.data}
+            options={options.data}
+            onChanged={refetchAll}
+          />
+        </div>
+      ) : isReadOnlyConfig ? (
+        <div className="mb-8 rounded-md border border-border p-6 text-sm text-muted-foreground">
+          Bindings are still configured via the legacy YAML file, not the
+          database — editing here isn't available yet. The resolved config
+          below reflects what the daemon actually runs.
+        </div>
+      ) : bindings.isLoading || options.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
-      ) : error ? (
+      ) : bindings.isError || options.isError ? (
+        <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
+          Failed to load bindings
+        </div>
+      ) : null}
+
+      <div className="mb-2 mt-6">
+        <h2 className="text-lg font-semibold">Resolved role matrix</h2>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          Effective per-stage agent/model/effort as the daemon would dispatch.
+        </p>
+      </div>
+      {view.data ? (
+        <ConfigDetails config={view.data} />
+      ) : view.isLoading ? (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : (
         <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
           Failed to load config
         </div>
-      ) : data ? (
-        <ConfigDetails config={data} />
-      ) : null}
+      )}
     </main>
   );
 }

@@ -26,8 +26,9 @@ from .github.webhook import (
 )
 from .linear.client import Linear
 from .ui.api import CommandSink, PauseController, create_api_router
+from .ui.config_crud import create_config_crud_router
 from .ui.config_view import create_config_router
-from .ui.db import ReadOnlyDbPool
+from .ui.db import ReadOnlyDbPool, WriteDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
 from .ui.live import create_live_stream_router
@@ -96,6 +97,8 @@ def create_app(
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
     ui_pause_controller: PauseController | None = None,
+    ui_config_write_lock: object | None = None,
+    ui_db_owns_topology: bool = True,
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
     clock: Clock | None = None,
@@ -117,6 +120,13 @@ def create_app(
             ".env, or unset SYMPHONY_REQUIRE_AUTH0 for a local-only stack."
         )
     ui_pool = ReadOnlyDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
+    # A dedicated write connection for the config-CRUD router — never the
+    # `conn` shared with the orchestrator (SYM-190; see `WriteDbPool`).
+    config_write_pool = (
+        WriteDbPool(ui_db_path)
+        if ui_enabled and ui_db_owns_topology and ui_db_path is not None
+        else None
+    )
     external_service = ui_external_service
     if (
         external_service is None
@@ -139,9 +149,13 @@ def create_app(
                 external_service.cache.clear()
             if ui_pool is not None:
                 await ui_pool.close()
+            if config_write_pool is not None:
+                await config_write_pool.close()
 
     app = FastAPI(
-        lifespan=lifespan if ui_pool is not None or external_service is not None else None
+        lifespan=lifespan
+        if ui_pool is not None or external_service is not None or config_write_pool is not None
+        else None
     )
     if external_service is not None:
         app.state.external_snapshot_cache = external_service.cache
@@ -176,11 +190,13 @@ def create_app(
         # must run the Auth0 login flow before calling the gated routes below.
         app.include_router(create_auth_config_router(auth0_settings))
 
-        # Single gate shared by the two /api/* routers. Webhook routes are
-        # mounted above, outside this gate (they verify their own HMAC).
-        api_dependencies = (
-            [Depends(create_auth_dependency(auth0_settings))] if auth0_settings is not None else []
-        )
+        # Single gate shared by the /api/* routers. Webhook routes are mounted
+        # above, outside this gate (they verify their own HMAC). Built once so
+        # the config-CRUD router can reuse the same dependency instance to read
+        # the caller's email for `updated_by` — FastAPI dedupes by identity, so
+        # verification still runs only once per request.
+        auth_dep = create_auth_dependency(auth0_settings) if auth0_settings is not None else None
+        api_dependencies = [Depends(auth_dep)] if auth_dep is not None else []
         if ui_pool is not None:
             app.include_router(
                 create_issue_detail_router(
@@ -205,6 +221,32 @@ def create_app(
             create_config_router(ui_external_config),
             dependencies=api_dependencies,
         )
+
+        # Binding CRUD (create/edit/delete + options) — writes go through
+        # `config_write_pool`'s own connection (never the daemon's shared
+        # `conn`; see `WriteDbPool`), serialized against the daemon's
+        # tick-boundary binding reload by the config write lock (SYM-189) so
+        # a write's multi-row transaction never interleaves with a reload.
+        # Gated on `ui_db_owns_topology` (default True so callers that don't
+        # pass it — tests, any future non-daemon entrypoint — keep today's
+        # behavior): a legacy YAML topology not yet imported keeps the daemon
+        # reading `repos:` from YAML (`reload_bindings_from_db=False`), so
+        # writes here would round-trip through the API looking successful
+        # while the daemon silently never applies them. `cli._run` is the only
+        # caller that computes and passes the real value. Also requires
+        # `ui_db_path` (always passed alongside it by `cli._run`) to open the
+        # dedicated connection; without one the router simply doesn't mount.
+        if ui_db_owns_topology and config_write_pool is not None:
+            app.include_router(
+                create_config_crud_router(
+                    config_write_pool.connection,
+                    config_provider=ui_external_config,
+                    write_lock=ui_config_write_lock,
+                    auth_dependency=auth_dep,
+                    clock=clock,
+                ),
+                dependencies=api_dependencies,
+            )
 
         def _ui_teams() -> list[str] | None:
             current = ui_external_config() if callable(ui_external_config) else ui_external_config

@@ -451,6 +451,140 @@ export function fetchConfigView(): Promise<ConfigView> {
   );
 }
 
+/** Allowed enum values for the binding form, served by the backend so the UI
+ *  hardcodes nothing (per-model Claude efforts arrive in a later slice). */
+export interface ConfigOptions {
+  agent_families: string[];
+  codex_models: string[];
+  claude_aliases: string[];
+  codex_efforts: string[];
+  claude_efforts: string[];
+  merge_strategies: string[];
+  /** Whether a global `GITHUB_WEBHOOK_SECRET` is configured — when false, a
+   *  new binding's default `webhook_enabled: true` needs a per-binding
+   *  `webhook_secret` or the write is rejected. */
+  github_webhook_secret_configured: boolean;
+}
+
+/** One persisted binding row. `payload` is the sparse operator-set field dict;
+ *  `webhook_secret` never appears in it (see `webhook_secret_set`). */
+export interface BindingRecord {
+  id: number;
+  version: number;
+  enabled: boolean;
+  priority: number;
+  updated_at: string;
+  updated_by: string;
+  project_key: string;
+  github_repo: string;
+  issue_label: string;
+  tracker_provider: string;
+  tracker_site: string;
+  webhook_secret_set: boolean;
+  payload: Record<string, unknown>;
+  /** Non-blocking warnings from the last write (e.g. lost review diversity). */
+  warnings?: string[];
+}
+
+/** Create/update body. `version` is required for updates (optimistic lock). */
+export interface BindingWrite {
+  payload: Record<string, unknown>;
+  enabled: boolean;
+  priority: number;
+  version?: number;
+}
+
+/** One field-level validation error the form maps back to an input. */
+export interface FieldError {
+  loc: (string | number)[];
+  msg: string;
+}
+
+/** A 409 (stale version) or 422 (validation) from a binding write. The form
+ *  renders `fieldErrors` inline and `conflictVersion` as a conflict banner. */
+export class ConfigWriteError extends ApiError {
+  constructor(
+    message: string,
+    status: number,
+    readonly fieldErrors: FieldError[] = [],
+    readonly conflictVersion: number | null = null,
+  ) {
+    super(message, status);
+    this.name = "ConfigWriteError";
+  }
+}
+
+export function fetchConfigOptions(): Promise<ConfigOptions> {
+  return fetchJson<ConfigOptions>(
+    "/api/config/options",
+    "Options not found",
+    "Failed to load options",
+  );
+}
+
+export function fetchBindings(): Promise<BindingRecord[]> {
+  return fetchJson<BindingRecord[]>(
+    "/api/config/bindings",
+    "Bindings not found",
+    "Failed to load bindings",
+  );
+}
+
+async function writeBinding(
+  path: string,
+  method: "POST" | "PUT",
+  body: BindingWrite,
+): Promise<BindingRecord> {
+  const response = await fetch(path, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(await authHeaders()),
+    },
+    body: JSON.stringify(body),
+  });
+  if (response.ok) {
+    return (await response.json()) as BindingRecord;
+  }
+  const detail = await response.json().catch(() => null);
+  if (response.status === 422 && Array.isArray(detail?.detail)) {
+    throw new ConfigWriteError(
+      "Validation failed",
+      422,
+      detail.detail as FieldError[],
+    );
+  }
+  if (response.status === 409) {
+    throw new ConfigWriteError("Binding was modified by another writer", 409, [], detail?.detail?.current_version ?? null);
+  }
+  throw new ConfigWriteError("Failed to save binding", response.status);
+}
+
+export function createBinding(body: BindingWrite): Promise<BindingRecord> {
+  return writeBinding("/api/config/bindings", "POST", body);
+}
+
+export function updateBinding(
+  id: number,
+  body: BindingWrite,
+): Promise<BindingRecord> {
+  return writeBinding(`/api/config/bindings/${id}`, "PUT", body);
+}
+
+export async function deleteBinding(id: number, version: number): Promise<void> {
+  const response = await fetch(
+    `/api/config/bindings/${id}?version=${version}`,
+    { method: "DELETE", headers: { ...(await authHeaders()) } },
+  );
+  if (response.ok) return;
+  if (response.status === 409) {
+    const detail = await response.json().catch(() => null);
+    throw new ConfigWriteError("Binding was modified by another writer", 409, [], detail?.detail?.current_version ?? null);
+  }
+  throw new ConfigWriteError("Failed to delete binding", response.status);
+}
+
 export function fetchAuthConfig(): Promise<AuthConfig> {
   return fetchJson<AuthConfig>(
     "/api/auth-config",

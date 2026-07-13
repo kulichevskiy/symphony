@@ -437,6 +437,8 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ),
                     ui_command_sink=orch,
                     ui_pause_controller=orch,
+                    ui_config_write_lock=orch.config_write_lock,
+                    ui_db_owns_topology=db_owns_topology,
                     ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
                     auth0_settings=_auth0_settings(cfg) if cfg.ui.enabled else None,
                 )
