@@ -39,7 +39,11 @@ Every write:
     to set/cleared/changed flags, never values).
 
 Secrets never appear in a response: `webhook_secret` is dropped from the served
-payload in favour of a `webhook_secret_set` flag.
+payload in favour of a `webhook_secret_set` flag. `mcp_servers` entries have no
+`resolve_env`-style name indirection (unlike the top-level `env` field), so an
+operator embeds literal credentials straight into a server's `env`/`headers` —
+those are redacted to per-key `true` flags the same way, and restored from the
+stored row on write when the operator round-trips them untouched.
 """
 
 from __future__ import annotations
@@ -73,6 +77,10 @@ _log = logging.getLogger(__name__)
 # Fields whose *values* must never leave the process or reach the daemon log.
 _SECRET_FIELDS = frozenset({"webhook_secret"})
 
+# Sub-fields of an `mcp_servers` entry that may carry literal credential
+# material: a stdio server's `env`, or an http/sse server's auth `headers`.
+_MCP_SECRET_SUBFIELDS = frozenset({"env", "headers"})
+
 # Control keys owned by dedicated columns, never part of the sparse payload.
 _CONTROL_KEYS = frozenset({"enabled", "priority", "version", "id"})
 
@@ -104,10 +112,59 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if k not in _CONTROL_KEYS}
 
 
+def _redact_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
+    """Replace each server's secret-bearing sub-field values with `True` (key
+    names only, never values) so a GET response — or the daemon log — never
+    carries a literal `mcp_servers` credential."""
+    redacted: dict[str, Any] = {}
+    for name, entry in mcp_servers.items():
+        if not isinstance(entry, dict):
+            redacted[name] = entry
+            continue
+        out = dict(entry)
+        for sub in _MCP_SECRET_SUBFIELDS:
+            sub_value = out.get(sub)
+            if isinstance(sub_value, dict):
+                out[sub] = {k: True for k in sub_value}
+        redacted[name] = out
+    return redacted
+
+
+def _restore_mcp_secrets(old_servers: Any, new_servers: dict[str, Any]) -> dict[str, Any]:
+    """Undo `_redact_mcp_servers` on write: a sub-field value of exactly
+    `True` means the operator round-tripped the redacted GET payload
+    untouched for that key — restore the real value from the stored row. Any
+    other value (including an explicit empty string) is a real edit and
+    passes through unchanged."""
+    old_servers = old_servers if isinstance(old_servers, dict) else {}
+    restored: dict[str, Any] = {}
+    for name, entry in new_servers.items():
+        if not isinstance(entry, dict):
+            restored[name] = entry
+            continue
+        old_entry = old_servers.get(name)
+        old_entry = old_entry if isinstance(old_entry, dict) else {}
+        out = dict(entry)
+        for sub in _MCP_SECRET_SUBFIELDS:
+            sub_value = out.get(sub)
+            if not isinstance(sub_value, dict):
+                continue
+            old_sub = old_entry.get(sub)
+            old_sub = old_sub if isinstance(old_sub, dict) else {}
+            out[sub] = {
+                k: (old_sub[k] if v is True and k in old_sub else v) for k, v in sub_value.items()
+            }
+        restored[name] = out
+    return restored
+
+
 def _serialize(row: config_bindings.StoredBinding) -> dict[str, Any]:
     """One binding for the API — secret values redacted."""
     payload = dict(row.payload)
     webhook_secret_set = bool(payload.pop("webhook_secret", None))
+    mcp_servers = payload.get("mcp_servers")
+    if isinstance(mcp_servers, dict):
+        payload["mcp_servers"] = _redact_mcp_servers(mcp_servers)
     return {
         "id": row.id,
         "version": row.version,
@@ -343,6 +400,12 @@ def _diff(
             continue
         if key in _SECRET_FIELDS:
             changes[key] = "changed" if before and after else ("cleared" if before else "set")
+        elif key == "mcp_servers":
+            # `mcp_servers` entries carry literal credentials (see module
+            # docstring) — log which servers changed, never their contents.
+            before_names = sorted(before) if isinstance(before, dict) else []
+            after_names = sorted(after) if isinstance(after, dict) else []
+            changes[key] = {"servers_before": before_names, "servers_after": after_names}
         else:
             changes[key] = {"from": before, "to": after}
     if old is None or old.enabled != enabled:
@@ -353,7 +416,7 @@ def _diff(
 
 
 def create_config_crud_router(
-    conn: aiosqlite.Connection,
+    conn_provider: Callable[[], Awaitable[aiosqlite.Connection]],
     *,
     config_provider: Config | Callable[[], Config | None] | None,
     write_lock: Any = None,
@@ -362,9 +425,16 @@ def create_config_crud_router(
 ) -> APIRouter:
     """Router mounting the binding CRUD + options endpoints under `/api/config`.
 
+    `conn_provider` resolves a connection dedicated to this router — never the
+    daemon's shared connection. The DAO methods below `commit()` on success;
+    a `commit()` on a connection the orchestrator also writes through would
+    flush whatever unrelated, not-yet-committed statements the orchestrator
+    happened to have pending on it at that moment (SYM-190).
+
     `write_lock` guards each write's transaction against the daemon's
-    tick-boundary binding reload on the shared connection (SYM-189). When
-    `None` (tests without a daemon) a private lock is used.
+    tick-boundary binding reload, which runs on the orchestrator's own
+    connection (SYM-189). When `None` (tests without a daemon) a private lock
+    is used.
     """
     import asyncio
 
@@ -406,10 +476,12 @@ def create_config_crud_router(
 
     @router.get("/bindings")
     async def list_bindings() -> list[dict[str, Any]]:
+        conn = await conn_provider()
         return [_serialize(row) for row in await config_bindings.list_all(conn)]
 
     @router.get("/bindings/{binding_id}")
     async def get_binding(binding_id: int) -> dict[str, Any]:
+        conn = await conn_provider()
         row = await config_bindings.get(conn, binding_id)
         if row is None:
             raise HTTPException(status_code=404, detail="binding not found")
@@ -427,6 +499,7 @@ def create_config_crud_router(
         binding.enabled = body.enabled
         _validate_webhook_secret(binding, base)
         _validate_tracker_credentials(binding, base)
+        conn = await conn_provider()
         async with lock:
             wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
             try:
@@ -440,11 +513,11 @@ def create_config_crud_router(
                     updated_by=updated_by,
                 )
             except sqlite3.IntegrityError as e:
-                # The failed `INSERT` left a write transaction open on the
-                # shared connection (never committed) — roll it back before
-                # raising, or it holds the write lock until some unrelated
-                # later commit closes it (same concern as the stale-version
-                # paths in `db/config_bindings.py`).
+                # The failed `INSERT` left a write transaction open on this
+                # connection (never committed) — roll it back before raising,
+                # or it holds the write lock until some unrelated later
+                # commit closes it (same concern as the stale-version paths
+                # in `db/config_bindings.py`).
                 await conn.rollback()
                 raise _validation_error(
                     ["github_repo"],
@@ -471,6 +544,7 @@ def create_config_crud_router(
         _reject_disabled_write(body.enabled)
         payload = _sanitize_payload(body.payload)
         base = _base_config()
+        conn = await conn_provider()
         async with lock:
             old = await config_bindings.get(conn, binding_id)
             if old is None:
@@ -481,6 +555,12 @@ def create_config_crud_router(
             # explicit (even empty) value in the payload still overrides it.
             if "webhook_secret" not in payload and old.payload.get("webhook_secret"):
                 payload["webhook_secret"] = old.payload["webhook_secret"]
+            # Same round-trip concern for `mcp_servers`' redacted `env`/`headers`
+            # (see `_redact_mcp_servers`/`_restore_mcp_secrets`).
+            if isinstance(payload.get("mcp_servers"), dict):
+                payload["mcp_servers"] = _restore_mcp_secrets(
+                    old.payload.get("mcp_servers"), payload["mcp_servers"]
+                )
             binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
             binding.enabled = body.enabled
             _validate_webhook_secret(binding, base)
@@ -528,6 +608,7 @@ def create_config_crud_router(
         version: int = Query(...),
         updated_by: str = Depends(_updated_by),  # noqa: B008
     ) -> None:
+        conn = await conn_provider()
         async with lock:
             try:
                 await config_bindings.delete(conn, binding_id, expected_version=version)

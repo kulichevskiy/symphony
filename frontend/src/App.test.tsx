@@ -107,4 +107,42 @@ describe("App lazy routes", () => {
       expect(screen.getByText("No bindings configured")).toBeTruthy(),
     );
   });
+
+  it("treats a 404 from the CRUD router as read-only config, not a failure", async () => {
+    // A legacy YAML topology not yet imported into the DB (`ui_db_owns_topology
+    // =False`) means the backend never mounts `/api/config/{bindings,options}`
+    // — a 404 there, not a real failure — while the redacted `/api/config`
+    // view stays mounted.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          url.includes("/api/config/bindings") ||
+          url.includes("/api/config/options")
+        ) {
+          return Promise.resolve({
+            ok: false,
+            status: 404,
+            json: () => Promise.resolve({ detail: "not found" }),
+          } as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(stubBodyFor(url)),
+        } as Response);
+      }),
+    );
+    renderAt("/config");
+    await waitFor(() =>
+      expect(
+        screen.getByText(/still configured via the legacy YAML file/),
+      ).toBeTruthy(),
+    );
+    expect(screen.queryByText("Failed to load bindings")).toBeNull();
+    // The resolved role matrix (from the still-mounted `/api/config`) renders
+    // underneath the notice.
+    expect(screen.getByText("No bindings configured")).toBeTruthy();
+  });
 });

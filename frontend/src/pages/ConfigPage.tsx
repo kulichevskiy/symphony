@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import {
+  ApiError,
   type BindingRecord,
   type BindingWrite,
   ConfigWriteError,
@@ -759,21 +760,38 @@ export function ConfigPage() {
     queryFn: fetchConfigView,
     staleTime: Infinity,
   });
+  // A 404 means the CRUD router isn't mounted (legacy YAML topology owns
+  // bindings) — retrying can't change that, so resolve immediately instead
+  // of running the default 3 retries before the read-only notice can render.
+  const retryUnlessNotFound = (failureCount: number, error: unknown) =>
+    !(error instanceof ApiError && error.status === 404) && failureCount < 3;
   const bindings = useQuery({
     queryKey: ["config", "bindings"],
     queryFn: fetchBindings,
     staleTime: Infinity,
+    retry: retryUnlessNotFound,
   });
   const options = useQuery({
     queryKey: ["config", "options"],
     queryFn: fetchConfigOptions,
     staleTime: Infinity,
+    retry: retryUnlessNotFound,
   });
 
   function refetchAll() {
     void bindings.refetch();
     void view.refetch();
   }
+
+  // The backend intentionally doesn't mount `/api/config/{options,bindings}`
+  // when a legacy YAML topology still owns bindings — DB writes here would
+  // round-trip looking successful while the daemon silently never applies
+  // them (`ui_db_owns_topology=False`). A 404 on either query means that, not
+  // a real failure — show the resolved (read-only) config below instead of
+  // an error banner.
+  const isReadOnlyConfig =
+    (bindings.error instanceof ApiError && bindings.error.status === 404) ||
+    (options.error instanceof ApiError && options.error.status === 404);
 
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
@@ -792,6 +810,12 @@ export function ConfigPage() {
             options={options.data}
             onChanged={refetchAll}
           />
+        </div>
+      ) : isReadOnlyConfig ? (
+        <div className="mb-8 rounded-md border border-border p-6 text-sm text-muted-foreground">
+          Bindings are still configured via the legacy YAML file, not the
+          database — editing here isn't available yet. The resolved config
+          below reflects what the daemon actually runs.
         </div>
       ) : bindings.isLoading || options.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>

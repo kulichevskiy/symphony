@@ -18,6 +18,7 @@ import respx
 from symphony import db
 from symphony.app import create_app
 from symphony.config import Config
+from symphony.db import config_bindings
 
 from .test_auth import JWKS_URI, _jwks, _settings, _token
 from .test_webhook import _Handler
@@ -108,6 +109,27 @@ async def test_crud_round_trip(tmp_path: Path) -> None:
             assert (await client.get("/api/config/bindings")).json() == []
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_binding_crud_survives_shared_connection_being_closed(
+    tmp_path: Path,
+) -> None:
+    """The CRUD router must write through its own connection (`WriteDbPool`),
+    never the daemon's shared `conn` — a `commit()` on a connection the
+    orchestrator also writes through would flush whatever unrelated,
+    not-yet-committed statements it had pending at that moment (SYM-190).
+    Closing `conn` before any CRUD request proves the router never touches
+    it: with the old shared-connection wiring this would fail with
+    "Cannot operate on a closed database"."""
+    conn, db_path = await _open(tmp_path)
+    app = _app(conn, db_path)
+    await conn.close()
+    async with _client(app) as client:
+        created = await client.post("/api/config/bindings", json={"payload": _payload()})
+        assert created.status_code == 201, created.text
+        listed = await client.get("/api/config/bindings")
+        assert [b["id"] for b in listed.json()] == [created.json()["id"]]
 
 
 @pytest.mark.asyncio
@@ -423,6 +445,109 @@ async def test_webhook_secret_survives_edit_of_redacted_payload(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_mcp_server_secrets_redacted_on_read(tmp_path: Path) -> None:
+    """`mcp_servers` has no `resolve_env`-style name indirection (unlike the
+    top-level `env` field), so an operator embeds literal credentials
+    straight into a server's `env`/`headers` — those must never appear in a
+    response."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        mcp_servers={
+                            "supabase": {
+                                "command": "npx",
+                                "env": {"API_KEY": "sk-should-never-leak"},
+                            }
+                        }
+                    )
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert "sk-should-never-leak" not in created.text
+            assert created.json()["payload"]["mcp_servers"] == {
+                "supabase": {"command": "npx", "env": {"API_KEY": True}}
+            }
+
+            listed = await client.get("/api/config/bindings")
+            assert "sk-should-never-leak" not in listed.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_secrets_survive_edit_of_redacted_payload(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        mcp_servers={
+                            "supabase": {
+                                "command": "npx",
+                                "env": {"API_KEY": "sk-should-never-leak"},
+                            }
+                        }
+                    )
+                },
+            )
+            bid = created.json()["id"]
+            got = await client.get(f"/api/config/bindings/{bid}")
+
+            # Edit re-sends exactly the redacted GET payload (as the
+            # collapsible raw-JSON section does) plus an unrelated change —
+            # the stored secret must survive, not be overwritten with the
+            # `true` redaction placeholder.
+            put = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {**got.json()["payload"], "max_concurrent": 7},
+                    "enabled": got.json()["enabled"],
+                    "priority": got.json()["priority"],
+                    "version": got.json()["version"],
+                },
+            )
+            assert put.status_code == 200, put.text
+            assert "sk-should-never-leak" not in put.text
+
+            stored = await config_bindings.get(conn, bid)
+            assert stored is not None
+            assert stored.payload["mcp_servers"]["supabase"]["env"] == {
+                "API_KEY": "sk-should-never-leak"
+            }
+
+            # A real edit (a literal string, not the `true` placeholder)
+            # still overrides the stored secret.
+            rotated = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {
+                        **put.json()["payload"],
+                        "mcp_servers": {
+                            "supabase": {"command": "npx", "env": {"API_KEY": "sk-rotated"}}
+                        },
+                    },
+                    "enabled": put.json()["enabled"],
+                    "priority": put.json()["priority"],
+                    "version": put.json()["version"],
+                },
+            )
+            assert rotated.status_code == 200, rotated.text
+            stored = await config_bindings.get(conn, bid)
+            assert stored is not None
+            assert stored.payload["mcp_servers"]["supabase"]["env"] == {"API_KEY": "sk-rotated"}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_diff_logged_without_secret_values(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -433,13 +558,23 @@ async def test_diff_logged_without_secret_values(
         async with _client(app) as client:
             created = await client.post(
                 "/api/config/bindings",
-                json={"payload": _payload(webhook_secret="topsecret", max_concurrent=9)},
+                json={
+                    "payload": _payload(
+                        webhook_secret="topsecret",
+                        max_concurrent=9,
+                        mcp_servers={"supabase": {"env": {"API_KEY": "mcp-topsecret"}}},
+                    )
+                },
             )
             bid = created.json()["id"]
             await client.put(
                 f"/api/config/bindings/{bid}",
                 json={
-                    "payload": _payload(webhook_secret="rotated", max_concurrent=1),
+                    "payload": _payload(
+                        webhook_secret="rotated",
+                        max_concurrent=1,
+                        mcp_servers={"supabase": {"env": {"API_KEY": "mcp-rotated"}}},
+                    ),
                     "version": 1,
                 },
             )
@@ -447,8 +582,10 @@ async def test_diff_logged_without_secret_values(
         await conn.close()
     text = caplog.text
     assert "topsecret" not in text and "rotated" not in text
+    assert "mcp-topsecret" not in text and "mcp-rotated" not in text
     assert "webhook_secret" in text  # the flag, not the value
     assert "max_concurrent" in text
+    assert "mcp_servers" in text  # which servers changed, not their contents
 
 
 @pytest.mark.asyncio
