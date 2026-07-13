@@ -189,6 +189,23 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
         raise click.ClickException(str(e)) from e
 
 
+def _live_github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
+    """Like `_github_webhook_settings`, but for the per-request callable a
+    DB-owned topology passes to the webhook router (SYM-189): a hot-reloaded
+    edit that adds/enables a repo without a secret while
+    `GITHUB_WEBHOOK_SECRET` is empty must not raise `click.ClickException`
+    into a live request — that exception type is only meaningful at CLI
+    boot. The router already treats a `None` settings provider as "disable
+    every repo"; do that here too instead of crashing the request."""
+    try:
+        return _github_webhook_settings(cfg)
+    except click.ClickException as e:
+        logging.getLogger(__name__).warning(
+            "live github webhook settings invalid, disabling all repos until fixed: %s", e
+        )
+        return None
+
+
 # Review-lane roles only spawn a subprocess when the binding's local review
 # is enabled; the builder roles (implement/fix/accept) always can.
 _REVIEW_LANE_ROLES: tuple[str, ...] = ("review_find", "review_verify")
@@ -407,7 +424,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     # doesn't need one either — the router itself no-ops
                     # (ignores every repo) when the resolved settings are
                     # `None`.
-                    lambda: _github_webhook_settings(orch.config),
+                    lambda: _live_github_webhook_settings(orch.config),
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_log_root=cfg.log_root,

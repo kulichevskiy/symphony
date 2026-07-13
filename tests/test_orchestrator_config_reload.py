@@ -621,6 +621,78 @@ async def test_jira_binding_states_edit_rebuilds_and_closes_tracker(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_jira_binding_base_url_edit_rebuilds_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stable, explicit `tracker_site` keeps a Jira binding's natural key
+    (and so its tracker context / `state_key`) unchanged across a `base_url`
+    edit — `JiraTracker` bakes `base_url` in at construction, so this
+    state-only comparison must still rebuild + register a fresh client
+    instead of leaving the pre-edit URL live forever (SYM-189 review fix)."""
+    binding = RepoBinding(
+        linear_team_key="PROJ",
+        github_repo="org/repo",
+        provider="jira",
+        tracker_site="acme",
+        base_url="https://old.atlassian.net",
+        linear_states=LinearStates(ready="To Do", waiting="Blocked"),
+    )
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        repos=[binding],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+
+        class _FakeJiraTracker:
+            def __init__(self, *, base_url: str) -> None:
+                self.base_url = base_url
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        built: list[_FakeJiraTracker] = []
+
+        def _factory(b: RepoBinding) -> _FakeJiraTracker:
+            tracker = _FakeJiraTracker(base_url=b.base_url or "")
+            built.append(tracker)
+            return tracker
+
+        registry = TrackerRegistry()
+        first = _factory(binding)
+        registry.register("jira", "acme", first, project_key="PROJ")
+
+        orch = Orchestrator(
+            cfg, registry, conn, reload_bindings_from_db=True, tracker_factory=_factory
+        )
+        orch._binding_keys = frozenset({_binding_key(binding)})  # noqa: SLF001
+
+        edited = binding.model_copy(update={"base_url": "https://new.atlassian.net"})
+        edited_cfg = cfg.model_copy(update={"repos": [edited]})
+
+        async def _fake_assemble(conn, base, *, boot_gates, is_reload):
+            return edited_cfg
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._base.assemble_effective_config", _fake_assemble
+        )
+
+        await orch._reload_bindings()  # noqa: SLF001
+        await orch._react_to_binding_set()  # noqa: SLF001
+
+        assert len(built) == 2
+        assert built[1].base_url == "https://new.atlassian.net"
+        assert first.closed
+        ctx = TrackerContext(provider="jira", site="acme", project_key="PROJ")
+        assert registry.get(ctx) is built[1]
+    finally:
+        await conn.close()
+
+
 def _linear_binding(*, team: str, repo: str, site: str = "default") -> RepoBinding:
     return RepoBinding(
         linear_team_key=team,

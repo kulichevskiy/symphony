@@ -972,11 +972,23 @@ class _OrchestratorBase:
         """
         previous_states_by_state_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
         previous_max_concurrent_by_key: dict[BindingKey, int] = {}
+        # A Jira binding's `tracker_site` is its stable natural-key component —
+        # editing `base_url` alone leaves both it and `state_key` unchanged, so
+        # neither the hot-add "context already registered" check nor the
+        # states comparison below would ever rebuild the tracker. Track it
+        # per context (last-write-wins, mirroring `_hot_add_trackers`'
+        # `representative` selection) and mark the context stale below when it
+        # moves (SYM-189).
+        previous_jira_base_url_by_ctx: dict[TrackerContext, str | None] = {}
         for binding in self.config.repos:
             previous_states_by_state_key.setdefault(_state_cache_key(binding), {})[
                 _binding_key(binding)
             ] = binding.linear_states
             previous_max_concurrent_by_key[_binding_key(binding)] = binding.max_concurrent
+            if binding.provider == "jira":
+                previous_jira_base_url_by_ctx[_tracker_context_for_binding(binding)] = (
+                    binding.base_url
+                )
         async with self._config_write_lock:
             try:
                 effective = await assemble_effective_config(
@@ -985,6 +997,15 @@ class _OrchestratorBase:
             except ConfigBootError:
                 log.exception("binding reload rejected invalid config; keeping current")
                 return
+        for binding in effective.repos:
+            if binding.provider != "jira":
+                continue
+            ctx = _tracker_context_for_binding(binding)
+            if (
+                ctx in previous_jira_base_url_by_ctx
+                and previous_jira_base_url_by_ctx[ctx] != binding.base_url
+            ):
+                self._stale_tracker_contexts.add(ctx)
         # `_states_for_binding` caches team workflow states by `_state_cache_key`
         # (provider, site, team) — coarser than a binding's natural key, so two
         # bindings can share one entry — but validates each binding's own
