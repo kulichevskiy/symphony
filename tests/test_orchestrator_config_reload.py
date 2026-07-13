@@ -393,3 +393,46 @@ async def test_scan_failure_on_one_binding_does_not_starve_the_rest(
         assert harness.sim.issues[eng_issue.id].state_name != READY
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_hot_add_failure_is_retried_on_the_next_tick(tmp_path: Path) -> None:
+    """A transient `_tracker_factory` failure must not latch the binding set:
+    with the set unchanged, the next tick retries the hot-add and scans the
+    binding once it succeeds (SYM-189 review fix).
+    """
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG", repo="org/eng", priority=5)
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+        _seed_team(harness, "OPS")
+        await _insert(harness.conn, team="OPS", repo="org/ops", site="flaky-site", priority=0)
+        real_factory = harness.orch._tracker_factory  # noqa: SLF001
+        should_fail = True
+
+        def _flaky_factory(binding):
+            if binding.tracker_site == "flaky-site" and should_fail:
+                raise ValueError("boom")
+            return real_factory(binding)
+
+        harness.orch._tracker_factory = _flaky_factory  # noqa: SLF001
+
+        harness.sim.seed_issue(identifier="ENG-1", team_key="ENG", state_name=READY, title="eng")
+        ops_issue = harness.sim.seed_issue(
+            identifier="OPS-1", team_key="OPS", state_name=READY, title="unscanned until retry"
+        )
+
+        await harness.step()
+        assert harness.sim.issues[ops_issue.id].state_name == READY
+
+        # The binding set is unchanged, but the failed hot-add must not have
+        # latched — the factory now succeeds, so this tick retries and scans it.
+        should_fail = False
+        await harness.step()
+        assert harness.sim.issues[ops_issue.id].state_name != READY
+    finally:
+        await harness.close()

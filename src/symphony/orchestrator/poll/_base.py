@@ -955,6 +955,12 @@ class _OrchestratorBase:
         for state_key, new_states in new_states_by_state_key.items():
             if new_states != previous_states_by_state_key.get(state_key):
                 self._states.pop(state_key, None)
+        # A state-cache-key with no surviving binding is stale too — the loop
+        # above only ever touches keys still present in the new config, so a
+        # removed binding's entry would otherwise linger forever (SYM-189).
+        for state_key in list(self._states):
+            if state_key not in new_states_by_state_key:
+                self._states.pop(state_key, None)
         # `_binding_dispatch_sems`/`_review_fix_binding_sems` are sized once
         # from `binding.max_concurrent` via `setdefault` and never resized in
         # place — dropping the stale entry here lets the next dispatch recreate
@@ -968,6 +974,16 @@ class _OrchestratorBase:
             if previous_max_concurrent != binding.max_concurrent:
                 self._binding_dispatch_sems.pop(key, None)
                 self._review_fix_binding_sems.pop(key, None)
+        # A binding that's gone entirely leaves its semaphores behind forever
+        # otherwise — a long-running daemon with churny bindings would
+        # accumulate one stale entry per removed binding (SYM-189).
+        current_binding_keys = {_binding_key(binding) for binding in effective.repos}
+        for key in list(self._binding_dispatch_sems):
+            if key not in current_binding_keys:
+                self._binding_dispatch_sems.pop(key, None)
+        for key in list(self._review_fix_binding_sems):
+            if key not in current_binding_keys:
+                self._review_fix_binding_sems.pop(key, None)
         self.config = effective
         # The reconciler resolves bindings by iterating its own `config.repos`;
         # keep it pointed at the same effective config the poll loop uses.
@@ -980,30 +996,37 @@ class _OrchestratorBase:
         keys = frozenset(_binding_key(binding) for binding in self.config.repos)
         if keys == self._binding_keys:
             return
-        self._hot_add_trackers()
-        # Only commit the new key set once the prune succeeds, so a transient
-        # prune failure is retried on the next tick instead of stranding stale
-        # scopes until the set changes again.
-        if await self._prune_tracker_queue_scopes():
+        hot_add_ok = self._hot_add_trackers()
+        # Only commit the new key set once the hot-add and the prune both
+        # succeed, so a transient failure in either is retried on the next
+        # tick instead of stranding an unscanned binding or stale scopes
+        # until the set changes again.
+        prune_ok = await self._prune_tracker_queue_scopes()
+        if hot_add_ok and prune_ok:
             self._binding_keys = keys
 
-    def _hot_add_trackers(self) -> None:
+    def _hot_add_trackers(self) -> bool:
         """Register a tracker client for any binding whose provider/site (for
-        Jira, /project) context the registry never saw at boot."""
+        Jira, /project) context the registry never saw at boot. Returns
+        whether every binding's context is now registered."""
+        all_registered = True
         for binding in self.config.repos:
             ctx = _tracker_context_for_binding(binding)
             if self._tracker_context_registered(ctx):
                 continue
             if self._tracker_factory is None:
                 log.warning("cannot hot-add tracker for %s: no tracker factory", ctx)
+                all_registered = False
                 continue
             try:
                 tracker = self._tracker_factory(binding)
             except Exception:  # noqa: BLE001 — must not kill the loop
                 log.exception("failed to build tracker for hot-add: %s", ctx)
+                all_registered = False
                 continue
             self._trackers.register(ctx.provider, ctx.site, tracker, project_key=ctx.project_key)
             log.info("hot-added tracker for %s", ctx)
+        return all_registered
 
     def _tracker_context_registered(self, ctx: TrackerContext) -> bool:
         try:
