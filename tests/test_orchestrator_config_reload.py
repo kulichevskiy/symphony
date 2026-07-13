@@ -20,6 +20,7 @@ import pytest
 from symphony import db
 from symphony.config import Config
 from symphony.effective_config import assemble_effective_config
+from symphony.linear.client import LinearError
 from tests.harness import Harness
 
 REPO = "org/repo"
@@ -243,5 +244,78 @@ async def test_stage_after_edit_uses_new_row(tmp_path: Path) -> None:
         # The stage started before the edit captured its own binding object; the
         # reload rebuilds a fresh one rather than mutating the captured row.
         assert before.max_concurrent != 7
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_last_binding_removed_mid_run_empties_topology_and_prunes_scope(
+    tmp_path: Path,
+) -> None:
+    """Deleting every `config_bindings` row must collapse the topology to
+    empty, not keep scanning the deleted binding (SYM-189 review fix)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG", repo="org/eng", priority=0, max_concurrent=0)
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+        harness.sim.seed_issue(
+            identifier="ENG-1", team_key="ENG", state_name=READY, title="queued"
+        )
+        await harness.step()
+        scopes = await _queue_scopes(harness.conn)
+        assert any(team == "ENG" for team, _ in scopes)
+
+        await harness.conn.execute("DELETE FROM config_bindings")
+        await harness.conn.commit()
+        await harness.step()
+
+        assert harness.orch.config.repos == []
+        scopes = await _queue_scopes(harness.conn)
+        assert not scopes
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_hot_added_binding_bad_waiting_state_raises_on_first_load(
+    tmp_path: Path,
+) -> None:
+    """A binding whose states are first loaded mid-run (hot-added, never
+    covered by boot's `warmup`) must still get the `waiting`-state gate that
+    `warmup` runs for boot bindings, instead of silently mis-driving
+    auto-unblock (SYM-189 review fix)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG")
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+        _seed_team(harness, "OPS")
+        await _insert(
+            harness.conn,
+            team="OPS",
+            repo="org/ops",
+            priority=1,
+            linear_states={
+                "ready": READY,
+                "in_progress": "In Progress",
+                "code_review": "Needs Approval",
+                "done": DONE,
+                "waiting": "Blocked",  # never seeded for the OPS team above
+            },
+        )
+        await harness.step()
+
+        ops_binding = next(
+            b for b in harness.orch.config.repos if b.linear_team_key == "OPS"
+        )
+        with pytest.raises(LinearError, match="Blocked"):
+            await harness.orch._states_for_binding(ops_binding)  # noqa: SLF001
     finally:
         await harness.close()

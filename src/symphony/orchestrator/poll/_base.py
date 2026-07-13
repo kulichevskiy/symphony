@@ -675,6 +675,11 @@ class _OrchestratorBase:
                 self._states[state_key] = states
         if states is None:
             states = await self.tracker(binding).team_states(binding.linear_team_key)
+            # First time this binding's states are loaded — mirrors the check
+            # `warmup` runs for boot bindings, so a hot-added/mid-run binding
+            # with a `waiting` state absent from its Linear workflow fails
+            # loud instead of producing wrong auto-unblock behavior (SYM-189).
+            self._validate_waiting_state(binding, states)
             self._states[state_key] = states
         return states
 
@@ -910,7 +915,7 @@ class _OrchestratorBase:
         async with self._config_write_lock:
             try:
                 effective = await assemble_effective_config(
-                    self._conn, self.config, boot_gates=False
+                    self._conn, self.config, boot_gates=False, is_reload=True
                 )
             except ConfigBootError:
                 log.exception("binding reload rejected invalid config; keeping current")
