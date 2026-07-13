@@ -20,6 +20,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, cast, get_args
 
+import aiosqlite
 import click
 
 from . import db
@@ -28,6 +29,7 @@ from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
 from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
+from .effective_config import ConfigBootError, assemble_effective_config
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
 from .orchestrator.poll import Orchestrator
@@ -225,6 +227,21 @@ def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
 
 
+async def _db_owns_topology(conn: aiosqlite.Connection) -> bool:
+    """Whether the DB is the topology source of truth: bindings exist now, or
+    the importer has migrated it before (`config_globals.migrated_at` set).
+
+    The marker matters on its own because a migrated DB can have zero
+    *current* bindings — e.g. every binding was deleted via the UI — and
+    leftover YAML `repos:` must stay ignored (not resolved/validated) in that
+    case too, same as when bindings are still present.
+    """
+    if await db.config_bindings.count(conn) > 0:
+        return True
+    globals_row = await db.config_globals.get(conn)
+    return bool(globals_row and globals_row.migrated_at)
+
+
 @asynccontextmanager
 async def _configured_tracker_registry(
     cfg: Config,
@@ -285,14 +302,24 @@ def _enforce_require_auth0(cfg: Config) -> None:
 
 
 async def _run(config_path: Path, *, once: bool) -> None:
-    cfg = Config.load(config_path)
-    if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
-        click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
-        sys.exit(2)
-    _enforce_require_auth0(cfg)
-    async with _configured_tracker_registry(cfg) as (trackers, external_linear):
-        conn = await db.connect(cfg.db_path)
+    conn = await db.connect(Config.peek_db_path(config_path))
+    try:
+        # A migrated deployment's leftover YAML `repos:` is ignored — don't
+        # pay for (or risk boot-crashing on) validating/resolving it.
+        db_owns_topology = await _db_owns_topology(conn)
+        base = Config.load(config_path, resolve_repos=not db_owns_topology)
         try:
+            cfg = await assemble_effective_config(
+                conn, base, yaml_has_repos_topology=Config.peek_repos_topology(config_path)
+            )
+        except ConfigBootError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
+        if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
+            click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
+            sys.exit(2)
+        _enforce_require_auth0(cfg)
+        async with _configured_tracker_registry(cfg) as (trackers, external_linear):
             orch = Orchestrator(cfg, trackers, conn)
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
@@ -358,8 +385,48 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 if webhook_server is not None and webhook_task is not None:
                     webhook_server.should_exit = True  # type: ignore[attr-defined]
                     await webhook_task
-        finally:
-            await conn.close()
+    finally:
+        await conn.close()
+
+
+@main.command("config-import")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    required=True,
+    help="YAML topology to import (repos + roles).",
+)
+@click.option(
+    "--replace",
+    is_flag=True,
+    help="Overwrite existing bindings (restore path). Without it, a second import is refused.",
+)
+def config_import_cmd(config_path: Path, replace: bool) -> None:
+    """One-off: import YAML repo bindings + roles matrix into the config DB."""
+    _setup_logging()
+    asyncio.run(_config_import(config_path, replace=replace))
+
+
+async def _config_import(config_path: Path, *, replace: bool) -> None:
+    from datetime import UTC, datetime
+
+    from .config_import import ConfigImportError, import_config
+
+    # The importer re-validates the YAML itself (`Config.model_validate`,
+    # no secrets); don't require a fully-resolvable `.env` just to import.
+    db_path = Config.peek_db_path(config_path)
+    conn = await db.connect(db_path)
+    try:
+        now = datetime.now(UTC).isoformat()
+        result = await import_config(config_path, conn, replace=replace, now=now)
+    except ConfigImportError as e:
+        click.echo(str(e), err=True)
+        sys.exit(2)
+    finally:
+        await conn.close()
+    verb = "replaced" if result.replaced else "imported"
+    click.echo(f"{verb} {result.bindings} binding(s) into {db_path}")
 
 
 @main.command()
@@ -517,7 +584,21 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
 
 
 async def _preflight(config_path: Path) -> None:
-    cfg = Config.load(config_path)
+    conn = await db.connect(Config.peek_db_path(config_path))
+    try:
+        db_owns_topology = await _db_owns_topology(conn)
+        base = Config.load(config_path, resolve_repos=not db_owns_topology)
+        cfg = await assemble_effective_config(
+            conn,
+            base,
+            boot_gates=False,
+            yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+        )
+    except ConfigBootError as e:
+        click.echo(str(e), err=True)
+        sys.exit(2)
+    finally:
+        await conn.close()
     if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
         click.echo("LINEAR_API_KEY is empty", err=True)
         sys.exit(2)
@@ -1045,40 +1126,51 @@ def dispatch(linear_id: str, config_path: Path) -> None:
 
 
 async def _dispatch(linear_id: str, config_path: Path) -> None:
-    cfg = Config.load(config_path)
-    if not cfg.linear_api_key:
-        click.echo("LINEAR_API_KEY is empty", err=True)
-        sys.exit(2)
-    async with Linear(cfg.linear_api_key) as linear:
+    conn = await db.connect(Config.peek_db_path(config_path))
+    try:
+        db_owns_topology = await _db_owns_topology(conn)
+        base = Config.load(config_path, resolve_repos=not db_owns_topology)
+        if not base.linear_api_key:
+            click.echo("LINEAR_API_KEY is empty", err=True)
+            sys.exit(2)
         try:
-            issue = await linear.lookup_issue(linear_id)
-        except LinearError as e:
-            click.echo(f"linear lookup failed: {e}", err=True)
-            sys.exit(1)
-        binding = _resolve_binding(cfg, issue)
-        if binding is None:
-            sys.exit(1)
-        conn = await db.connect(cfg.db_path)
-        try:
+            cfg = await assemble_effective_config(
+                conn,
+                base,
+                boot_gates=False,
+                yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+            )
+        except ConfigBootError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
+        async with Linear(cfg.linear_api_key) as linear:
+            try:
+                issue = await linear.lookup_issue(linear_id)
+            except LinearError as e:
+                click.echo(f"linear lookup failed: {e}", err=True)
+                sys.exit(1)
+            binding = _resolve_binding(cfg, issue)
+            if binding is None:
+                sys.exit(1)
             orch = Orchestrator(cfg, linear, conn)
             run_id = await orch._dispatch_one(binding, issue)  # noqa: SLF001
             rwi = await db.runs.get_with_issue(conn, run_id) if run_id is not None else None
-        finally:
-            await conn.close()
-        if run_id is None:
-            click.echo(
-                f"{issue.identifier} already has a running run; refusing to "
-                f"start a duplicate. Inspect with `symphony runs ls`.",
-                err=True,
-            )
-            sys.exit(1)
-        if rwi is not None and rwi.run.status == "failed":
-            click.echo(
-                f"dispatch failed for {issue.identifier}; run {run_id} marked failed",
-                err=True,
-            )
-            sys.exit(1)
-        click.echo(f"dispatched {issue.identifier} → {binding.github_repo}")
+    finally:
+        await conn.close()
+    if run_id is None:
+        click.echo(
+            f"{issue.identifier} already has a running run; refusing to "
+            f"start a duplicate. Inspect with `symphony runs ls`.",
+            err=True,
+        )
+        sys.exit(1)
+    if rwi is not None and rwi.run.status == "failed":
+        click.echo(
+            f"dispatch failed for {issue.identifier}; run {run_id} marked failed",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(f"dispatched {issue.identifier} → {binding.github_repo}")
 
 
 if __name__ == "__main__":

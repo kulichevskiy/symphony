@@ -429,6 +429,14 @@ async def has_for_issue(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
     return row is not None
 
 
+async def has_open(conn: aiosqlite.Connection) -> bool:
+    """True when any tracked PR is still open (unmerged) — the boot-gate's
+    "tracked open PRs" signal for zero-binding starts (SYM-188)."""
+    cur = await conn.execute("SELECT 1 FROM issue_prs WHERE merged_at IS NULL LIMIT 1")
+    row = await cur.fetchone()
+    return row is not None
+
+
 async def has_orphaned_review_pr(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
     """True when review resurrection can pick up an issue's PR."""
     live_placeholders = ",".join("?" * len(LIVE_STATUSES))

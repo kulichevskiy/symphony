@@ -116,7 +116,10 @@ def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) 
         return True
     if agent == "codex":
         return model in SUPPORTED_CODEX_MODELS
-    return model in CLAUDE_MODEL_ALIASES
+    # Aliases (opus/sonnet/haiku) plus full `claude-*` IDs verbatim — the
+    # latter already flow through `--model` today, and the importer preserves
+    # a pinned full ID when no alias applies (SYM-188).
+    return model in CLAUDE_MODEL_ALIASES or model.startswith("claude-")
 
 
 def _role_effort_in_family(agent: Literal["claude", "codex"], effort: str | None) -> bool:
@@ -296,6 +299,12 @@ class RepoBinding(BaseModel):
     webhook_enabled: bool = True
     webhook_secret: str | None = None
     reconcile_enabled: bool = True
+    # DB-only: stamped from the `config_bindings` row's `enabled` column
+    # during effective-config assembly — never part of a YAML or DB payload
+    # itself. Carries NO runtime semantics yet: every loaded row is treated
+    # as enabled and the importer refuses `enabled: false` input. The binding
+    # lifecycle (dispatch skip + launch gate + drain guard) ships in SYM-193.
+    enabled: bool = True
     # Per-binding `{role: {agent, model}}` overrides. Deep-merged per field
     # over the global `Config.roles` default in `resolved_role`. An empty map
     # (the default) reproduces today's behavior via the legacy field mapping.
@@ -554,6 +563,20 @@ class RepoBinding(BaseModel):
         return ResolvedRole(agent=agent, model=model, effort=effort)
 
 
+def binding_natural_key(binding: RepoBinding) -> tuple[str, str, str, str, str]:
+    """The binding's natural key — the components the orchestrator's
+    `_binding_key` uses, in the same order (project key, github repo, issue
+    label normalized to '', tracker provider, tracker site). Persisted as the
+    `config_bindings` unique key and used for the stable dispatch tiebreak."""
+    return (
+        binding.project_key,
+        binding.github_repo,
+        binding.issue_label or "",
+        binding.tracker_provider,
+        binding.tracker_site,
+    )
+
+
 class Secrets(BaseSettings):
     """Secrets sourced from the environment.
 
@@ -720,12 +743,20 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def _validate_roles(self) -> Self:
+        self.validate_roles_matrix()
+        return self
+
+    def validate_roles_matrix(self) -> None:
         """Validate explicitly-declared role models and warn on lost diversity.
 
         Only models set inside a `roles:` block are family-checked; legacy
         top-level fields keep their existing (or absent) validation so a
         config with no `roles:` block is unaffected. A `review_*` role sharing
         the implementer's family warns — it forfeits cross-family blind spots.
+
+        Public so `effective_config.assemble_effective_config` can re-run it
+        after a `model_copy` (which, unlike normal construction, skips model
+        validators) swaps in DB-sourced bindings/roles.
         """
         for binding in self.repos:
             self._reject_legacy_matrix_conflicts(binding)
@@ -784,11 +815,46 @@ class Config(BaseModel):
                         UserWarning,
                         stacklevel=2,
                     )
-        return self
 
     @classmethod
-    def load(cls, path: Path) -> Config:
+    def peek_db_path(cls, path: Path) -> Path:
+        """Read just `db_path` from `path`'s YAML, without validating or
+        resolving `repos:` (family/effort checks, `env:` secret lookups).
+
+        Callers use this to check whether the DB already owns the bindings
+        topology *before* deciding whether `load`'s `repos:` resolution is
+        needed at all — a migrated deployment's leftover YAML `repos:` can
+        reference `env:` secrets an operator has since removed, or otherwise
+        fail validation, even though that YAML is now ignored.
+        """
+        raw = yaml.safe_load(path.read_text()) or {}
+        default = cls.model_fields["db_path"].default
+        # `.get(..., default)` only falls back when the key is absent; an
+        # explicit `db_path: null` still returns `None` and crashes `Path()`.
+        return _expand(Path(raw.get("db_path") or default))
+
+    @classmethod
+    def peek_repos_topology(cls, path: Path) -> bool:
+        """Whether `path`'s YAML still declares a non-empty `repos:`/`roles:`
+        topology, without validating or resolving it.
+
+        Independent of `resolve_repos`: `load(resolve_repos=False)` strips
+        those keys before validation, so the resulting `Config`'s `repos`/
+        `roles` can never reflect a leftover YAML topology once the DB owns
+        bindings. Callers that need to warn/gate on that leftover topology
+        must check the raw YAML instead of the loaded `Config`.
+        """
+        raw = yaml.safe_load(path.read_text()) or {}
+        return bool(raw.get("repos")) or bool(raw.get("roles"))
+
+    @classmethod
+    def load(cls, path: Path, *, resolve_repos: bool = True) -> Config:
         raw = yaml.safe_load(path.read_text())
+        if not resolve_repos:
+            # The DB already owns the topology (bindings + global roles);
+            # don't validate or resolve a `repos:`/`roles:` section that's
+            # now ignored.
+            raw = {k: v for k, v in (raw or {}).items() if k not in ("repos", "roles")}
         cfg = cls.model_validate(raw)
         secrets = Secrets()
         cfg = cfg.model_copy(
