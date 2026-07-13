@@ -450,7 +450,7 @@ def _binding_anthropic_key(
 
 
 async def _reject_unsupported_efforts(
-    trial: Config, *, bindings: list[RepoBinding] | None = None
+    trial: Config, *, bindings: list[RepoBinding] | None = None, only_inherited: bool = False
 ) -> None:
     """Re-run the preflight capability check for every resolved *claude*
     `(model, effort)` pair in `trial` — the same online Models-API source
@@ -466,9 +466,15 @@ async def _reject_unsupported_efforts(
 
     `bindings` scopes the sweep: `_assemble_and_validate` passes just the
     candidate, so a stale pair on an unrelated binding can't block this save.
-    `put_roles` leaves it `None` (all of `trial.repos`) since a global change
-    reaches every binding; zero bindings there falls back to the synthetic
-    binding so an unsupported global pair still can't save silently."""
+    `put_roles` leaves it `None` (all of `trial.repos`); zero bindings there
+    falls back to the synthetic binding so an unsupported global pair still
+    can't save silently.
+
+    `only_inherited` (set by `put_roles`) skips a binding/role pair whose
+    `model` *and* `effort` are both pinned by the binding itself — that
+    resolved pair is untouched by a global roles write, so a stale/unsupported
+    override on an unrelated role or binding can't block an otherwise-unrelated
+    global edit."""
     env_source = _env_key_source()
     process_key = env_source.get("ANTHROPIC_API_KEY", "")
     pairs: set[tuple[str, str, str]] = set()  # (key, model, effort)
@@ -477,6 +483,14 @@ async def _reject_unsupported_efforts(
     ):
         binding_key = _binding_anthropic_key(binding, env_source, process_key)
         for name in get_args(RoleName):
+            if only_inherited:
+                binding_role = binding.roles.get(name)
+                if (
+                    binding_role is not None
+                    and binding_role.model is not None
+                    and binding_role.effort is not None
+                ):
+                    continue
             role = binding.resolved_role(name, trial.roles)
             if role.agent == "claude" and role.model is not None and role.effort is not None:
                 pairs.add((binding_key, role.model, role.effort))
@@ -640,7 +654,11 @@ def create_config_crud_router(
             others.append(other)
         trial = base.model_copy(update={"repos": others, "roles": global_roles})
         caught = _run_matrix_validators(trial)
-        await _reject_unsupported_efforts(trial)
+        # Scoped to pairs that actually resolve through the edited global
+        # cells: a binding pinning its own explicit `(model, effort)` for a
+        # role is unaffected by this write and must not block it (SYM-191
+        # review) — that binding's own save already validated its pair.
+        await _reject_unsupported_efforts(trial, only_inherited=True)
         async with lock:
             try:
                 new_version = await config_globals.update_roles(

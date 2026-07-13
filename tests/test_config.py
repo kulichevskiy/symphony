@@ -1471,8 +1471,8 @@ def test_roles_effort_unset_defaults_to_none() -> None:
 def test_roles_effort_resolves_per_field_over_global(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Global `roles` effort default + per-binding override deep-merge per field.
 
-    Effort requires an explicit model (validated as a pair), so each role pins
-    a codex model; the assertion is about which `effort` wins per field.
+    Each role pins a codex model only to fix which family the assertion runs
+    against; the assertion itself is about which `effort` wins per field.
     """
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""

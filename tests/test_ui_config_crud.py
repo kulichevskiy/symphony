@@ -1067,3 +1067,46 @@ async def test_stale_effort_on_unrelated_binding_does_not_block_save(
             assert created_b.status_code == 201, created_b.text
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_global_roles_put_not_blocked_by_unrelated_binding_override(
+    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    """A binding pinning its own explicit `(model, effort)` for one role must
+    not block a global roles PUT that doesn't touch that role: the pair is
+    fully overridden, so it never resolves through the edited global cell
+    (SYM-191 review)."""
+
+    caps: list[str] = ["low", "medium", "high", "xhigh", "max"]
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return caps
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}}
+                    )
+                },
+            )
+            assert created.status_code == 201, created.text
+
+            # Capability check now rejects the binding's stored `implement`
+            # pair — as if the key/model capabilities changed after it saved.
+            caps[:] = ["low", "medium"]
+
+            # An unrelated global cell (`review_find`) must still save.
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"review_find": {"agent": "claude"}}, "version": 0},
+            )
+            assert put.status_code == 200, put.text
+    finally:
+        await conn.close()
