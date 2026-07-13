@@ -9,9 +9,11 @@ stamps `priority` from YAML list order, and writes the sparse binding payloads
 plus the global roles matrix and the migration marker into the DB.
 
 It refuses to double-import unless `replace=True` (which also serves the
-export→restore path — a restored YAML binding's `enabled: false` is preserved
-on its row rather than reset). Payloads are sparse and legacy-free by
-construction.
+export→restore path). A binding with `enabled: false` is refused outright:
+this slice gives the `enabled` column no runtime semantics (the lifecycle —
+dispatch skip, launch gate, drain guard — ships in SYM-193), so silently
+storing a disabled row would dispatch it anyway. Payloads are sparse and
+legacy-free by construction.
 """
 
 from __future__ import annotations
@@ -175,6 +177,14 @@ async def import_config(
     # *key names*, not values.
     cfg = Config.model_validate(raw)
     raw_repos: list[dict[str, Any]] = list(raw.get("repos", []) or [])
+    for raw_repo in raw_repos:
+        if raw_repo.get("enabled") is False:
+            raise ConfigImportError(
+                f"binding {raw_repo.get('linear_team_key')}/{raw_repo.get('github_repo')} "
+                "sets `enabled: false`, but the binding lifecycle (disable/drain) ships "
+                "in SYM-193 and this build would dispatch the row anyway — import it "
+                "enabled or drop the field"
+            )
     # `model_validate` derives `tracker_site` with no global `jira_base_url`,
     # so a Jira binding relying on that global (no per-binding `base_url`)
     # would key on the "default" placeholder instead of the site it actually

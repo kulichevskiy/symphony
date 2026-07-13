@@ -118,7 +118,7 @@ def _resolve_binding(cfg: Config, issue: LinearIssue) -> RepoBinding | None:
     silently routed manual dispatches to the wrong repo when one team was
     fanned out to multiple repos via labels.
     """
-    team_bindings = [b for b in cfg.repos if b.enabled and b.linear_team_key == issue.team_key]
+    team_bindings = [b for b in cfg.repos if b.linear_team_key == issue.team_key]
     if not team_bindings:
         configured = sorted({b.linear_team_key for b in cfg.repos})
         click.echo(
@@ -168,38 +168,20 @@ def _auth0_settings(cfg: Config) -> Auth0Settings | None:
         raise click.ClickException(str(exc)) from exc
 
 
-async def _github_webhook_settings(
-    cfg: Config, conn: aiosqlite.Connection
-) -> GitHubWebhookSettings | None:
-    """Repos this daemon accepts GitHub webhooks for.
-
-    A disabled binding normally drops out — no new dispatch, no reason to
-    route its webhooks — but `assemble_effective_config` keeps a disabled
-    binding with an open tracked PR in `cfg.repos` precisely so that PR keeps
-    draining (merge/review polling). That draining depends on GitHub webhook
-    events for the same repo (review comments, checks) still routing here
-    too, so a disabled binding with an open PR stays in webhook routing.
-    """
-    routable_bindings = []
-    for binding in cfg.repos:
-        if not binding.webhook_enabled:
-            continue
-        if binding.enabled or await db.issue_prs.has_open_for_repo(
-            conn, github_repo=binding.github_repo
-        ):
-            routable_bindings.append(binding)
+def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
+    enabled_bindings = [binding for binding in cfg.repos if binding.webhook_enabled]
     repo_secrets = {
         binding.github_repo: binding.webhook_secret
-        for binding in routable_bindings
+        for binding in enabled_bindings
         if binding.webhook_secret
     }
-    if not routable_bindings and not cfg.github_webhook_secret and not repo_secrets:
+    if not enabled_bindings and not cfg.github_webhook_secret and not repo_secrets:
         return None
     try:
         return GitHubWebhookSettings(
             secret=cfg.github_webhook_secret,
             repo_secrets=repo_secrets,
-            enabled_repos=frozenset(binding.github_repo for binding in routable_bindings),
+            enabled_repos=frozenset(binding.github_repo for binding in enabled_bindings),
             dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
         )
     except ValueError as e:
@@ -238,42 +220,11 @@ def _config_can_run_codex_cli(cfg: Config) -> bool:
 
 
 def _config_has_linear_bindings(cfg: Config) -> bool:
-    return any(binding.provider == "linear" and binding.enabled for binding in cfg.repos)
-
-
-_log = logging.getLogger(__name__)
+    return any(binding.provider == "linear" for binding in cfg.repos)
 
 
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
-
-
-async def _contexts_with_live_work(conn: aiosqlite.Connection) -> set[TrackerContext]:
-    """Tracker contexts with unresolved DB work (live runs / open tracked PRs /
-    parked operator waits) — mirrors `effective_config._has_unresolved_work`'s
-    per-table definitions, but resolved per-context via `issues` instead of
-    collapsed to one boot-gate bool."""
-    live_placeholders = ",".join("?" * len(db.runs.LIVE_STATUSES))
-    cur = await conn.execute(
-        f"""
-        SELECT DISTINCT provider, site, team_key FROM issues WHERE id IN (
-            SELECT issue_id FROM runs WHERE status IN ({live_placeholders})
-            UNION
-            SELECT issue_id FROM issue_prs WHERE merged_at IS NULL
-            UNION
-            SELECT issue_id FROM operator_waits
-        )
-        """,
-        db.runs.LIVE_STATUSES,
-    )
-    rows = await cur.fetchall()
-    contexts: set[TrackerContext] = set()
-    for row in rows:
-        provider = str(row["provider"] or "")
-        site = str(row["site"] or "")
-        project_key = str(row["team_key"] or "") if provider == "jira" else ""
-        contexts.add(TrackerContext(provider=provider, site=site, project_key=project_key))
-    return contexts
 
 
 async def _db_owns_topology(conn: aiosqlite.Connection) -> bool:
@@ -294,33 +245,13 @@ async def _db_owns_topology(conn: aiosqlite.Connection) -> bool:
 @asynccontextmanager
 async def _configured_tracker_registry(
     cfg: Config,
-    conn: aiosqlite.Connection | None = None,
 ) -> AsyncIterator[tuple[TrackerRegistry, Linear | None]]:
-    """`conn` (the daemon path) lets a disabled binding whose tracker context
-    still has live DB work (tracked open PRs / operator waits / active runs)
-    get a tracker anyway, best-effort, so reconcile/restore can act on that
-    work instead of just deferring it forever. One-shot CLI callers that pass
-    no `conn` keep the old behavior of skipping every disabled binding."""
     secrets = Secrets()
     registry = TrackerRegistry()
     external_linear: Linear | None = None
-    live_work_contexts = await _contexts_with_live_work(conn) if conn is not None else set()
     async with AsyncExitStack() as stack:
         for binding in cfg.repos:
-            if not binding.enabled:
-                # A disabled binding's stale/revoked credentials must not
-                # crash boot; reconcile() already tolerates a missing tracker
-                # for a given context (logs + defers). Skip unless that
-                # context has live work needing a real tracker to act on.
-                if context_for_binding(binding) not in live_work_contexts:
-                    continue
-                try:
-                    tracker = for_binding(binding, secrets, registry=registry)
-                except ValueError as e:
-                    _log.warning("disabled binding with live work: %s", e)
-                    continue
-            else:
-                tracker = for_binding(binding, secrets, registry=registry)
+            tracker = for_binding(binding, secrets, registry=registry)
             await stack.enter_async_context(cast(Any, tracker))
             if binding.provider == "linear" and external_linear is None:
                 external_linear = cast(Linear, tracker)
@@ -388,7 +319,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
             click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
             sys.exit(2)
         _enforce_require_auth0(cfg)
-        async with _configured_tracker_registry(cfg, conn) as (trackers, external_linear):
+        async with _configured_tracker_registry(cfg) as (trackers, external_linear):
             orch = Orchestrator(cfg, trackers, conn)
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
@@ -398,7 +329,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
-            github_webhook_settings = await _github_webhook_settings(cfg, conn)
+            github_webhook_settings = _github_webhook_settings(cfg)
             if cfg.linear_webhook_secret or github_webhook_settings or cfg.ui.enabled:
                 import uvicorn
 
@@ -515,8 +446,6 @@ async def _preflight_configured_bindings(cfg: Config, trackers: TrackerRegistry)
     visible_by_ctx: dict[TrackerContext, list[str]] = {}
     ok = True
     for binding in cfg.repos:
-        if not binding.enabled:
-            continue
         ctx = _tracker_context_for_binding(binding)
         tracker = trackers.resolve(ctx)
         visible = visible_by_ctx.get(ctx)

@@ -56,33 +56,73 @@ async def _has_unresolved_work(conn: aiosqlite.Connection) -> bool:
 
 def _resolve_bindings(cfg: Config) -> None:
     """Apply tracker-context defaults and resolve `env:` key names to values on
-    each assembled binding — mirrors what `Config.load` does for YAML repos.
-
-    Disabled bindings still get `resolve_env` (best-effort): restart/restore
-    paths spawn agents against `binding.env` regardless of `enabled`
-    (`_binding_for_pr` ignores it), and an unresolved binding would leak the
-    literal `.env` key *name* into that agent's environment instead of the
-    secret value. A disabled binding whose key has since been removed from
-    `.env` must not block boot, so a missing key is logged and skipped rather
-    than raised for disabled bindings only — but `resolve_env` raises before
-    mutating anything, so `binding.env` is left holding the unresolved key
-    *names*. Clear it in that case: leaving it would make the preflight
-    capability check see those key names as truthy configured values.
-    """
+    each assembled binding — mirrors what `Config.load` does for YAML repos."""
     env_source: dict[str, str] = {
         key: value for key, value in dotenv_values(".env").items() if value is not None
     }
     env_source.update(os.environ)
     for binding in cfg.repos:
         binding.apply_tracker_secret_defaults(jira_base_url=cfg.jira_base_url)
-        if binding.enabled:
-            binding.resolve_env(env_source)
-        else:
-            try:
-                binding.resolve_env(env_source)
-            except ValueError as e:
-                _log.warning("disabled binding: %s", e)
-                binding.env = {}
+        binding.resolve_env(env_source)
+
+
+_ROLE_NAMES: tuple[RoleName, ...] = ("implement", "review_find", "review_verify", "fix", "accept")
+
+
+def _synthesize_legacy_role_fields(cfg: Config) -> None:
+    """Bridge until every per-stage consumer reads `resolved_role` (SYM-192).
+
+    Several runtime paths still read the legacy top-level role fields directly
+    (`binding.agent` for codex resume/activity support and usage-cost
+    attribution, `binding.codex_model`, the reviewer/local-review model
+    fields). DB payloads are legacy-free by construction, so a migrated codex
+    binding would otherwise hit those paths with claude defaults — wrong final
+    -message parsing, wrong cost attribution, even claude spawned for fix
+    turns. Derive the legacy fields from the resolved matrix instead.
+
+    Synthesis must not change any `resolved_role` output (legacy fields are
+    the resolution *fallback*, so a per-role mixed matrix — e.g. a codex
+    implement cell over an inherited claude fix — could be altered by a
+    synthesized `agent`). Each binding's five roles are resolved before and
+    after; on any difference the synthesis is reverted for that binding and
+    the direct readers keep seeing defaults, exactly as they would for the
+    same exotic matrix in YAML.
+
+    Runs *after* `validate_roles_matrix()`: synthesized fields land in
+    `model_fields_set` and would otherwise trip the legacy/matrix conflict
+    guard, which exists to stop *operators* setting the same knob twice.
+    """
+    for binding in cfg.repos:
+        before = {name: binding.resolved_role(name, cfg.roles) for name in _ROLE_NAMES}
+        impl, fix, acc = before["implement"], before["fix"], before["accept"]
+        rf, rv = before["review_find"], before["review_verify"]
+        update: dict[str, str] = {}
+        if impl.agent == fix.agent == acc.agent:
+            update["agent"] = impl.agent
+            if impl.agent == "codex" and impl.model and impl.model == fix.model == acc.model:
+                update["codex_model"] = impl.model
+        if rf.agent == rv.agent:
+            update["reviewer_agent"] = rf.agent
+            if rf.agent == "codex" and rf.model and rf.model == rv.model:
+                update["reviewer_codex_model"] = rf.model
+        if rf.agent == "claude" and rf.model:
+            update["local_review_claude_model"] = rf.model
+        if rv.agent == "claude" and rv.model:
+            update["local_review_verifier_claude_model"] = rv.model
+        original = {field: getattr(binding, field) for field in update}
+        for field, value in update.items():
+            setattr(binding, field, value)
+        after = {name: binding.resolved_role(name, cfg.roles) for name in _ROLE_NAMES}
+        if after != before:
+            for field, value in original.items():
+                setattr(binding, field, value)
+            _log.warning(
+                "binding %s/%s: per-role matrix too mixed to synthesize legacy "
+                "role fields; direct legacy-field readers see defaults until "
+                "SYM-192 moves them to resolved_role",
+                binding.project_key,
+                binding.github_repo,
+            )
 
 
 async def assemble_effective_config(
@@ -156,10 +196,10 @@ async def assemble_effective_config(
         )
 
     # `list_all` already returns dispatch-evaluation order (priority, then the
-    # stable natural-key tiebreak). Disabled bindings are kept in `cfg.repos`
-    # — restart/restore paths (open PRs, operator waits, live runs) resolve
-    # their binding by iterating it — but marked `enabled=False` so dispatch
-    # and manual-dispatch skip them for new work.
+    # stable natural-key tiebreak). The row's `enabled` column is stamped onto
+    # each binding, but this slice gives it no semantics — every row loads and
+    # dispatches as enabled, and the importer refuses `enabled: false` input.
+    # The lifecycle (dispatch skip, launch gate, drain guard) ships in SYM-193.
     try:
         bindings = [
             RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored
@@ -173,4 +213,5 @@ async def assemble_effective_config(
         effective.validate_roles_matrix()
     except (ValidationError, ValueError) as e:
         raise ConfigBootError(f"invalid role configuration in the config DB: {e}") from e
+    _synthesize_legacy_role_fields(effective)
     return effective

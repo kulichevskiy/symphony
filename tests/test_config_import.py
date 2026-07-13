@@ -207,11 +207,12 @@ repos:
 
 
 @pytest.mark.asyncio
-async def test_replace_preserves_disabled_binding(tmp_path: Path) -> None:
-    """A restore/export YAML binding with `enabled: false` must land disabled
-    in the DB rather than silently re-enabled — and `enabled` must not leak
-    into the sparse payload (it's the row's own column)."""
-    conn, _result, rows, _g = await _import(
+async def test_import_refuses_disabled_binding(tmp_path: Path) -> None:
+    """`enabled: false` input is refused outright: this slice gives the
+    `enabled` column no runtime semantics (the lifecycle ships in SYM-193),
+    so silently storing a disabled row would dispatch it anyway."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    path = _write(
         tmp_path,
         f"""
 repos:
@@ -220,10 +221,46 @@ repos:
     enabled: false
 {_STATES}
 """,
-        replace=True,
     )
-    assert rows[0].enabled is False
-    assert "enabled" not in rows[0].payload
+    with pytest.raises(ConfigImportError, match="SYM-193"):
+        await import_config(path, conn, now="t1")
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_imported_codex_binding_assembles_with_legacy_fields(tmp_path: Path) -> None:
+    """End-to-end P1 guard: a migrated legacy codex binding, reloaded through
+    `assemble_effective_config`, must still expose `agent`/`codex_model` to
+    the runtime paths that read the legacy top-level fields directly (final
+    -message parsing, usage-cost attribution, fix-turn spawn) until SYM-192
+    moves them all to `resolved_role`."""
+    from symphony.config import Config
+    from symphony.effective_config import assemble_effective_config
+
+    conn, _result, _rows, _g = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    agent: codex
+    codex_model: gpt-5.1-codex-max
+{_STATES}
+""",
+    )
+    cfg = await assemble_effective_config(
+        conn,
+        Config(
+            workspace_root=tmp_path / "ws",
+            log_root=tmp_path / "logs",
+            db_path=tmp_path / "state.sqlite",
+        ),
+    )
+    (binding,) = cfg.repos
+    assert binding.agent == "codex"
+    assert binding.codex_model == "gpt-5.1-codex-max"
+    assert binding.reviewer_agent == "claude"
     await conn.close()
 
 

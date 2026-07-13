@@ -159,66 +159,6 @@ class _DispatchMixin(_OrchestratorBase):
                 break
         return scheduled
 
-    async def _scan_disabled_binding_recovery(
-        self, binding: RepoBinding
-    ) -> list[asyncio.Task[None]]:
-        """Recovery-only scan for a disabled binding's Ready lane.
-
-        A disabled binding gets no normal `_scan_binding` (no new issues, no
-        tracker-queue lane — see the binding lifecycle contract), but
-        `reconcile()` moves a pidless `local_review` run's issue back to Ready
-        to recover it, resolving the binding by iterating the still-loaded
-        disabled one. That redispatch is a follow-up stage of already-started
-        work, not a first dispatch, so it should proceed same as a fix-run or
-        review iteration would — but nothing else ever re-scans a disabled
-        binding's Ready lane to notice it. Gate on prior run history (the same
-        already-started-work signal) so a genuinely new Ready issue placed on
-        a disabled binding is left alone, and skip the queue snapshot entirely
-        so a disabled binding's tracker-queue lane stays cleared.
-
-        A team-scoped run-history check gates the tracker API call itself:
-        most disabled bindings share a registered tracker (e.g. Linear's
-        default context) regardless of whether they have unresolved work, so
-        `self.tracker(binding)` succeeding is not evidence this binding needs
-        scanning — only a prior run under its team does.
-        """
-        scheduled: list[asyncio.Task[None]] = []
-        tracker_ctx = _tracker_context_for_binding(binding)
-        # Cheap DB-only gate before the tracker API call: most disabled
-        # bindings share a registered tracker (e.g. Linear's default context)
-        # even though they have no recoverable work, so `self.tracker(binding)`
-        # succeeding is not evidence this binding needs a scan.
-        if not await db.runs.has_any_for_scope(
-            self._conn,
-            provider=tracker_ctx.provider,
-            site=tracker_ctx.site,
-            team_key=binding.linear_team_key,
-        ):
-            return scheduled
-        try:
-            tracker = self.tracker(binding)
-        except KeyError:
-            return scheduled
-        try:
-            issues = await tracker.issues_in_state(
-                binding.linear_team_key, binding.linear_states.ready, binding.issue_label
-            )
-        except LinearError as e:
-            log.warning(
-                "disabled-binding recovery scan failed for %s: %s",
-                binding.linear_team_key,
-                e,
-            )
-            return scheduled
-        for issue in issues:
-            storage_id = await self._storage_issue_id_for_tracker_issue(issue.id, tracker_ctx)
-            if not await db.runs.history_for_issue(self._conn, storage_id):
-                continue
-            task = await self._schedule_ready_issue(binding, issue)
-            if task is not None:
-                scheduled.append(task)
-        return scheduled
-
     async def _persist_queue_snapshot(
         self,
         binding: RepoBinding,
@@ -688,8 +628,6 @@ class _DispatchMixin(_OrchestratorBase):
     ) -> RepoBinding | None:
         issue_labels = set(issue.labels)
         for binding in self.config.repos:
-            if not binding.enabled:
-                continue
             if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if binding.linear_team_key != issue.team_key:

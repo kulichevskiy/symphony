@@ -299,12 +299,11 @@ class RepoBinding(BaseModel):
     webhook_enabled: bool = True
     webhook_secret: str | None = None
     reconcile_enabled: bool = True
-    # DB-only: whether this binding scans/dispatches new work. Set from the
-    # `config_bindings` row's `enabled` column during effective-config
-    # assembly (YAML bindings are always enabled) — never part of a YAML or
-    # DB payload itself. Disabling a binding stops new dispatch but keeps it
-    # resolvable for restart/restore paths (open PRs, operator waits, live
-    # runs), so in-flight work for it isn't orphaned.
+    # DB-only: stamped from the `config_bindings` row's `enabled` column
+    # during effective-config assembly — never part of a YAML or DB payload
+    # itself. Carries NO runtime semantics yet: every loaded row is treated
+    # as enabled and the importer refuses `enabled: false` input. The binding
+    # lifecycle (dispatch skip + launch gate + drain guard) ships in SYM-193.
     enabled: bool = True
     # Per-binding `{role: {agent, model}}` overrides. Deep-merged per field
     # over the global `Config.roles` default in `resolved_role`. An empty map

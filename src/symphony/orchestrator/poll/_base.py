@@ -266,10 +266,6 @@ class _OrchestratorBase:
 
         async def _scan_binding(self, binding: RepoBinding) -> list[asyncio.Task[None]]: ...
 
-        async def _scan_disabled_binding_recovery(
-            self, binding: RepoBinding
-        ) -> list[asyncio.Task[None]]: ...
-
         async def _schedule_parked_manual_merge_revival_for_issue_event(
             self,
             *,
@@ -621,30 +617,15 @@ class _OrchestratorBase:
 
     async def _lookup_webhook_issue(
         self, issue_id: str, *, provider: str | None = None
-    ) -> tuple[LinearIssue, TrackerContext] | None:
-        """Resolve `issue_id`'s tracker + context for a webhook event.
-
-        Returns `None` when every context that could own this issue has no
-        registered tracker — e.g. the issue's binding is disabled with no
-        live DB work, so `_configured_tracker_registry` (cli.py) never gave
-        it a tracker at boot. That is not an error, just nothing to do.
-        """
+    ) -> tuple[LinearIssue, TrackerContext]:
         stored_ctx = await self._stored_tracker_context_for_issue(issue_id, provider=provider)
         if stored_ctx is not None:
-            try:
-                tracker = self.tracker(stored_ctx)
-            except KeyError:
-                return None
-            return await tracker.lookup_issue(issue_id), stored_ctx
+            return await self.tracker(stored_ctx).lookup_issue(issue_id), stored_ctx
 
         not_found: LinearError | None = None
         for ctx in self._configured_tracker_contexts(provider=provider):
             try:
-                tracker = self.tracker(ctx)
-            except KeyError:
-                continue
-            try:
-                return await tracker.lookup_issue(issue_id), ctx
+                return await self.tracker(ctx).lookup_issue(issue_id), ctx
             except LinearError as exc:
                 if not str(exc).startswith(f"issue not found: {issue_id}"):
                     raise
@@ -652,11 +633,7 @@ class _OrchestratorBase:
         if not_found is not None:
             raise not_found
         ctx = TrackerContext(provider=provider or DEFAULT_PROVIDER, site=DEFAULT_SITE)
-        try:
-            tracker = self.tracker(ctx)
-        except KeyError:
-            return None
-        return await tracker.lookup_issue(issue_id), ctx
+        return await self.tracker(ctx).lookup_issue(issue_id), ctx
 
     async def _states_for_binding(self, binding: RepoBinding) -> dict[str, str]:
         state_key = _state_cache_key(binding)
@@ -712,8 +689,6 @@ class _OrchestratorBase:
         """One-time startup work: cache team workflow states, validate auth."""
         viewer_keys_by_ctx: dict[TrackerContext, list[str]] = {}
         for binding in self.config.repos:
-            if not binding.enabled:
-                continue
             ctx = _tracker_context_for_binding(binding)
             viewer_keys = viewer_keys_by_ctx.get(ctx)
             if viewer_keys is None:
@@ -840,7 +815,6 @@ class _OrchestratorBase:
                     keep=[
                         (binding.linear_team_key, _queue_scope(binding))
                         for binding in self.config.repos
-                        if binding.enabled
                     ],
                 )
                 self._tracker_queue_pruned = True
@@ -877,15 +851,6 @@ class _OrchestratorBase:
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("review resurrection failed")
         for binding in self.config.repos:
-            if not binding.enabled:
-                # No new issues on a disabled binding — but reconcile() moves a
-                # pidless local_review run's issue back to Ready to recover it,
-                # using this same disabled binding (kept in cfg.repos for
-                # exactly that). Without a recovery scan, that redispatch is
-                # stranded: nothing ever looks at a disabled binding's Ready
-                # lane again.
-                scheduled.extend(await self._scan_disabled_binding_recovery(binding))
-                continue
             scheduled.extend(await self._scan_binding(binding))
         try:
             await self._poll_slash_commands()
@@ -1027,12 +992,7 @@ class _OrchestratorBase:
         if not isinstance(issue_id, str) or not issue_id:
             return WebhookDispatchResult(kind="issue", handled=False, detail="missing issue id")
         state_changed = _linear_issue_state_changed(payload)
-        lookup = await self._lookup_webhook_issue(issue_id, provider=provider)
-        if lookup is None:
-            return WebhookDispatchResult(
-                kind="issue", handled=False, detail="no tracker for this issue's context"
-            )
-        issue, tracker_ctx = lookup
+        issue, tracker_ctx = await self._lookup_webhook_issue(issue_id, provider=provider)
         storage_issue_id = await self._storage_issue_id_for_tracker_issue(issue.id, tracker_ctx)
         if state_changed:
             self._schedule_reconcile_task(

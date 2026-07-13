@@ -119,7 +119,10 @@ async def test_bindings_from_db_assembled_in_priority_order(
 
 
 @pytest.mark.asyncio
-async def test_disabled_bindings_not_dispatched(tmp_path: Path) -> None:
+async def test_enabled_column_stamped_but_inert(tmp_path: Path) -> None:
+    """The row's `enabled` column is stamped onto the binding, but this slice
+    gives it no semantics — every row loads the same. The lifecycle (dispatch
+    skip, launch gate, drain guard) ships in SYM-193."""
     conn = await db.connect(tmp_path / "state.sqlite")
     await db.config_bindings.insert(
         conn,
@@ -142,11 +145,7 @@ async def test_disabled_bindings_not_dispatched(tmp_path: Path) -> None:
         enabled=True,
     )
     cfg = await assemble_effective_config(conn, _base(tmp_path))
-    # Disabled bindings stay in `cfg.repos` — restart/restore paths (open PRs,
-    # operator waits, live runs) resolve their binding by iterating it — but
-    # marked `enabled=False` so dispatch skips them for new work.
     assert {b.project_key: b.enabled for b in cfg.repos} == {"ENG": False, "WEB": True}
-    assert [b.project_key for b in cfg.repos if b.enabled] == ["WEB"]
     await conn.close()
 
 
@@ -198,40 +197,12 @@ async def test_unknown_db_global_role_name_refuses_boot(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_disabled_binding_with_unresolvable_env_does_not_block_boot(tmp_path: Path) -> None:
-    """A disabled binding is kept only so restart/restore paths can resolve
-    it; it must never block boot because an operator has since removed the
-    `env:` secret it refers to."""
-    conn = await db.connect(tmp_path / "state.sqlite")
-    await db.config_bindings.insert(
-        conn,
-        payload={
-            "linear_team_key": "ENG",
-            "github_repo": "org/api",
-            "linear_states": {"ready": "Todo", "code_review": "In Review"},
-            "env": {"SOME_VAR": "MISSING_ENV_KEY"},
-        },
-        key=("ENG", "org/api", "", "linear", "default"),
-        enabled=False,
-    )
-    cfg = await assemble_effective_config(conn, _base(tmp_path))
-    assert [b.project_key for b in cfg.repos] == ["ENG"]
-    (binding,) = cfg.repos
-    # The unresolved key *name* must not leak in as if it were the secret
-    # value — a truthy `env` here would fool the preflight capability check
-    # into thinking this credential is configured.
-    assert binding.env == {}
-    await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_disabled_binding_env_is_resolved_not_left_as_key_names(
+async def test_db_binding_env_is_resolved_not_left_as_key_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Restart/restore paths spawn agents against a disabled binding's `env`
-    regardless of `enabled` (they resolve the binding by iterating `cfg.repos`,
-    not by checking the flag). If assembly left `env` unresolved, that agent
-    would get the literal `.env` key *name* instead of the secret value."""
+    """Assembly resolves `env:` key names to values, mirroring `Config.load`
+    for YAML repos — an agent spawned against an unresolved binding would get
+    the literal `.env` key *name* instead of the secret value."""
     monkeypatch.setenv("AGENT_TOKEN", "the-real-secret")
     conn = await db.connect(tmp_path / "state.sqlite")
     await db.config_bindings.insert(
@@ -243,11 +214,76 @@ async def test_disabled_binding_env_is_resolved_not_left_as_key_names(
             "env": {"AGENT_TOKEN": "AGENT_TOKEN"},
         },
         key=("ENG", "org/api", "", "linear", "default"),
-        enabled=False,
     )
     cfg = await assemble_effective_config(conn, _base(tmp_path))
     (binding,) = cfg.repos
     assert binding.env == {"AGENT_TOKEN": "the-real-secret"}
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_role_fields_synthesized_for_codex_binding(tmp_path: Path) -> None:
+    """DB payloads are legacy-free, but several runtime paths still read the
+    legacy top-level fields directly (`binding.agent` for codex resume and
+    usage-cost attribution, `binding.codex_model`, ...). Assembly must
+    synthesize them from the resolved matrix so a migrated codex binding
+    doesn't run those paths with claude defaults (SYM-192 retires this)."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    # What the importer emits for a legacy `agent: codex` +
+    # `codex_model: gpt-5.1-codex-max` binding: agent/model cells on every
+    # builder role, plus explicit claude cells on the review roles (the
+    # legacy-free baseline would otherwise flip their opposite-family
+    # default to codex).
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+            "roles": {
+                "implement": {"agent": "codex", "model": "gpt-5.1-codex-max"},
+                "fix": {"agent": "codex", "model": "gpt-5.1-codex-max"},
+                "accept": {"agent": "codex", "model": "gpt-5.1-codex-max"},
+                "review_find": {"agent": "claude", "model": "sonnet"},
+                "review_verify": {"agent": "claude"},
+            },
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    (binding,) = cfg.repos
+    assert binding.agent == "codex"
+    assert binding.codex_model == "gpt-5.1-codex-max"
+    assert binding.reviewer_agent == "claude"
+    assert binding.local_review_claude_model == "sonnet"
+    # Synthesis must not have changed any resolved role.
+    assert binding.resolved_role("implement", cfg.roles).agent == "codex"
+    assert binding.resolved_role("review_find", cfg.roles).agent == "claude"
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_mixed_matrix_skips_legacy_synthesis_keeping_resolution(tmp_path: Path) -> None:
+    """A per-role mixed matrix (codex implement over inherited claude fix)
+    can't be represented by one legacy `agent` value without changing the
+    fallback resolution — synthesis must leave the binding untouched and the
+    resolved roles identical to what the matrix alone dictates."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await db.config_bindings.insert(
+        conn,
+        payload={
+            "linear_team_key": "ENG",
+            "github_repo": "org/api",
+            "linear_states": {"ready": "Todo", "code_review": "In Review"},
+            "roles": {"implement": {"agent": "codex"}},
+        },
+        key=("ENG", "org/api", "", "linear", "default"),
+    )
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    (binding,) = cfg.repos
+    assert binding.agent == "claude"
+    assert binding.resolved_role("implement", cfg.roles).agent == "codex"
+    assert binding.resolved_role("fix", cfg.roles).agent == "claude"
     await conn.close()
 
 

@@ -437,18 +437,6 @@ async def has_open(conn: aiosqlite.Connection) -> bool:
     return row is not None
 
 
-async def has_open_for_repo(conn: aiosqlite.Connection, *, github_repo: str) -> bool:
-    """True when `github_repo` has any tracked PR still open (unmerged) —
-    lets a disabled binding with in-flight work keep its GitHub webhook
-    routing (SYM-188)."""
-    cur = await conn.execute(
-        "SELECT 1 FROM issue_prs WHERE github_repo = ? AND merged_at IS NULL LIMIT 1",
-        (github_repo,),
-    )
-    row = await cur.fetchone()
-    return row is not None
-
-
 async def has_orphaned_review_pr(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
     """True when review resurrection can pick up an issue's PR."""
     live_placeholders = ",".join("?" * len(LIVE_STATUSES))
