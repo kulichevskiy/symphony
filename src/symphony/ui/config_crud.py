@@ -338,12 +338,18 @@ def create_config_crud_router(
         if body.version is None:
             raise _validation_error(["version"], "version is required for an update")
         payload = _sanitize_payload(body.payload)
-        binding = _validate_binding(payload)
-        binding.enabled = body.enabled
         async with lock:
             old = await config_bindings.get(conn, binding_id)
             if old is None:
                 raise HTTPException(status_code=404, detail="binding not found")
+            # The served payload redacts `webhook_secret` (see `_serialize`); if
+            # the write omits it, keep the stored secret rather than dropping it
+            # on every edit that round-trips the redacted GET response. An
+            # explicit (even empty) value in the payload still overrides it.
+            if "webhook_secret" not in payload and old.payload.get("webhook_secret"):
+                payload["webhook_secret"] = old.payload["webhook_secret"]
+            binding = _validate_binding(payload)
+            binding.enabled = body.enabled
             wgs = await _assemble_and_validate(conn, _base_config(), binding, exclude_id=binding_id)
             try:
                 row = await config_bindings.update(

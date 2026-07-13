@@ -288,6 +288,41 @@ async def test_webhook_secret_redacted_on_read(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_webhook_secret_survives_edit_of_redacted_payload(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="s3cr3t-should-never-leak")},
+            )
+            assert created.status_code == 201, created.text
+            bid = created.json()["id"]
+
+            got = await client.get(f"/api/config/bindings/{bid}")
+            assert got.json()["webhook_secret_set"] is True
+            assert "webhook_secret" not in got.json()["payload"]
+
+            # Edit re-sends exactly the redacted GET payload (as the form
+            # does) — the stored secret must survive, not be cleared.
+            put = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {**got.json()["payload"], "max_concurrent": 7},
+                    "enabled": got.json()["enabled"],
+                    "priority": got.json()["priority"],
+                    "version": got.json()["version"],
+                },
+            )
+            assert put.status_code == 200, put.text
+            assert put.json()["webhook_secret_set"] is True
+            assert "s3cr3t-should-never-leak" not in put.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_diff_logged_without_secret_values(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

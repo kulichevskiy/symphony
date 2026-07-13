@@ -122,7 +122,9 @@ export function bindingErrorFor(
 /** Errors not anchored on a curated field (e.g. `roles`, cross-binding) — the
  *  advanced-JSON section renders these with their path. */
 function advancedErrors(errors: FieldError[], curated: string[]): FieldError[] {
-  return errors.filter((e) => !curated.includes(String(e.loc[0])));
+  return errors.filter(
+    (e) => e.loc[0] !== "_" && !curated.includes(String(e.loc[0])),
+  );
 }
 
 const CURATED_KEYS = [
@@ -157,7 +159,7 @@ export function BindingForm({
 }: {
   binding: BindingRecord | null;
   options: ConfigOptions;
-  onSaved: () => void;
+  onSaved: (warnings?: string[]) => void;
   onCancel: () => void;
 }) {
   const initial = useMemo<Record<string, unknown>>(() => {
@@ -172,7 +174,6 @@ export function BindingForm({
   const [rawError, setRawError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
   const [conflict, setConflict] = useState<number | null | false>(false);
-  const [warnings, setWarnings] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
 
   function patch(next: Record<string, unknown>) {
@@ -210,7 +211,6 @@ export function BindingForm({
     setSaving(true);
     setFieldErrors([]);
     setConflict(false);
-    setWarnings([]);
     const body: BindingWrite = {
       payload,
       enabled,
@@ -221,10 +221,7 @@ export function BindingForm({
       const saved = binding
         ? await updateBinding(binding.id, body)
         : await createBinding(body);
-      if (saved.warnings?.length) {
-        setWarnings(saved.warnings);
-      }
-      onSaved();
+      onSaved(saved.warnings);
     } catch (e) {
       if (e instanceof ConfigWriteError) {
         if (e.status === 422) setFieldErrors(e.fieldErrors);
@@ -275,17 +272,6 @@ export function BindingForm({
             This binding changed since you loaded it
             {conflict != null ? ` (now version ${conflict})` : ""}. Reload and
             reapply your edit.
-          </AlertDescription>
-        </Alert>
-      ) : null}
-
-      {warnings.length ? (
-        <Alert className="mb-4" role="status">
-          <AlertTitle>Saved with warnings</AlertTitle>
-          <AlertDescription>
-            {warnings.map((w) => (
-              <div key={w}>{w}</div>
-            ))}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -552,6 +538,7 @@ export function BindingsPanel({
   const [editing, setEditing] = useState<BindingRecord | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [savedWarnings, setSavedWarnings] = useState<string[] | null>(null);
 
   const ordered = [...bindings].sort(
     (a, b) => a.priority - b.priority || a.id - b.id,
@@ -596,6 +583,10 @@ export function BindingsPanel({
       onChanged();
     } catch {
       setError("Failed to reorder — reload and retry.");
+      // A partial swap may have landed (one write succeeded, the other
+      // failed) — refetch so the UI reflects the actual DB state instead of
+      // showing the stale pre-swap order.
+      onChanged();
     }
   }
 
@@ -611,6 +602,17 @@ export function BindingsPanel({
       {error ? (
         <Alert className="border-destructive/50" role="alert">
           <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {savedWarnings?.length ? (
+        <Alert role="status">
+          <AlertTitle>Saved with warnings</AlertTitle>
+          <AlertDescription>
+            {savedWarnings.map((w) => (
+              <div key={w}>{w}</div>
+            ))}
+          </AlertDescription>
         </Alert>
       ) : null}
 
@@ -634,10 +636,12 @@ export function BindingsPanel({
 
       {creating ? (
         <BindingForm
+          key="new"
           binding={null}
           options={options}
-          onSaved={() => {
+          onSaved={(warnings) => {
             setCreating(false);
+            setSavedWarnings(warnings?.length ? warnings : null);
             onChanged();
           }}
           onCancel={() => setCreating(false)}
@@ -645,10 +649,12 @@ export function BindingsPanel({
       ) : null}
       {editing ? (
         <BindingForm
+          key={editing.id}
           binding={editing}
           options={options}
-          onSaved={() => {
+          onSaved={(warnings) => {
             setEditing(null);
+            setSavedWarnings(warnings?.length ? warnings : null);
             onChanged();
           }}
           onCancel={() => setEditing(null)}
