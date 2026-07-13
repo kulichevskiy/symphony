@@ -349,6 +349,7 @@ class _OrchestratorBase:
     _binding_dispatch_sems: dict[BindingKey, asyncio.Semaphore]
     _review_fix_sem: asyncio.Semaphore
     _review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore]
+    _pending_sem_resizes: set[BindingKey]
     _reconciler: Reconciler
     _reconcile_task: asyncio.Task[None] | None
     _merge_wait_reconcile_task: asyncio.Task[None] | None
@@ -510,6 +511,7 @@ class _OrchestratorBase:
         # review-fix concurrency independently.
         self._review_fix_sem = asyncio.Semaphore(max(config.global_max_concurrent, 1))
         self._review_fix_binding_sems: dict[BindingKey, asyncio.Semaphore] = {}
+        self._pending_sem_resizes: set[BindingKey] = set()
         self._reconciler = Reconciler(
             config,
             conn,
@@ -1016,10 +1018,19 @@ class _OrchestratorBase:
         # per binding_key, so a sibling binding's warm cache can't hide this
         # binding's own edited/never-checked `waiting` state (SYM-189).
         new_states_by_state_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
+        # `state_key[0]` is `tracker_provider`, which a Jira binding may
+        # override to a custom string distinct from the literal `"jira"` —
+        # track which state_keys actually belong to a `provider == "jira"`
+        # binding here instead of string-matching that component below
+        # (SYM-189 review fix).
+        jira_state_keys: set[StateCacheKey] = set()
         for binding in effective.repos:
-            new_states_by_state_key.setdefault(_state_cache_key(binding), {})[
-                _binding_key(binding)
-            ] = binding.linear_states
+            state_key = _state_cache_key(binding)
+            new_states_by_state_key.setdefault(state_key, {})[_binding_key(binding)] = (
+                binding.linear_states
+            )
+            if binding.provider == "jira":
+                jira_state_keys.add(state_key)
         for state_key, new_per_binding in new_states_by_state_key.items():
             previous_per_binding = previous_states_by_state_key.get(state_key, {})
             if new_per_binding != previous_per_binding:
@@ -1033,7 +1044,7 @@ class _OrchestratorBase:
                 # `linear_team_key` for Jira, so `state_key` already is the
                 # tracker context (SYM-189).
                 provider, site, team_key = state_key
-                if provider == "jira":
+                if state_key in jira_state_keys:
                     self._stale_tracker_contexts.add(
                         TrackerContext(provider=provider, site=site, project_key=team_key)
                     )
@@ -1057,17 +1068,26 @@ class _OrchestratorBase:
                 self._states.pop(state_key, None)
         # `_binding_dispatch_sems`/`_review_fix_binding_sems` are sized once
         # from `binding.max_concurrent` via `setdefault` and never resized in
-        # place — dropping the stale entry here lets the next dispatch recreate
-        # it at the new capacity (SYM-189). In-flight work already holding the
-        # old semaphore object is unaffected and drains under the old cap.
+        # place — dropping the stale entry lets the next dispatch recreate it
+        # at the new capacity (SYM-189). Popping immediately would lose track
+        # of the permits an in-flight task is still holding on the old
+        # semaphore object, letting a new dispatch's fresh full-capacity
+        # semaphore run alongside it and transiently exceed the new cap — so
+        # defer the pop until this binding has no scheduled work outstanding
+        # (SYM-189 review fix).
         for binding in effective.repos:
             key = _binding_key(binding)
             previous_max_concurrent = previous_max_concurrent_by_key.get(key)
             if previous_max_concurrent is None:
                 continue
             if previous_max_concurrent != binding.max_concurrent:
-                self._binding_dispatch_sems.pop(key, None)
-                self._review_fix_binding_sems.pop(key, None)
+                self._pending_sem_resizes.add(key)
+        for key in list(self._pending_sem_resizes):
+            if self._scheduled_binding_counts.get(key, 0):
+                continue
+            self._binding_dispatch_sems.pop(key, None)
+            self._review_fix_binding_sems.pop(key, None)
+            self._pending_sem_resizes.discard(key)
         # A binding that's gone entirely leaves its semaphores behind forever
         # otherwise — a long-running daemon with churny bindings would
         # accumulate one stale entry per removed binding (SYM-189).
@@ -1078,6 +1098,7 @@ class _OrchestratorBase:
         for key in list(self._review_fix_binding_sems):
             if key not in current_binding_keys:
                 self._review_fix_binding_sems.pop(key, None)
+        self._pending_sem_resizes.intersection_update(current_binding_keys)
         # Same accumulation risk as the semaphores above (SYM-189).
         for key in list(self._validated_waiting_state_bindings):
             if key not in current_binding_keys:
@@ -1119,12 +1140,20 @@ class _OrchestratorBase:
         tick's own scan-loop guard — can't act on a binding backed by no
         tracker. `_reload_bindings` re-derives `self.config` fresh from the DB
         every tick, so this never permanently drops a binding: the next
-        tick's hot-add attempt retries it (SYM-189 review fix)."""
-        registered = [
-            binding
-            for binding in self.config.repos
-            if self._tracker_context_registered(_tracker_context_for_binding(binding))
-        ]
+        tick's hot-add attempt retries it (SYM-189 review fix).
+
+        Also drops a binding whose context is still marked stale: a states/
+        base_url edit that leaves `_tracker_factory` failing keeps the old,
+        pre-edit tracker registered, so `_tracker_context_registered` alone
+        would publish this binding's new row against a client that never
+        picked up the edit (SYM-189 review fix)."""
+        registered = []
+        for binding in self.config.repos:
+            ctx = _tracker_context_for_binding(binding)
+            if ctx in self._stale_tracker_contexts:
+                continue
+            if self._tracker_context_registered(ctx):
+                registered.append(binding)
         if len(registered) == len(self.config.repos):
             return
         self.config = self.config.model_copy(update={"repos": registered})
@@ -1189,12 +1218,16 @@ class _OrchestratorBase:
         # later). Keep the alias pointed at whichever Linear context is first
         # in the current binding order, mirroring boot's own selection
         # (SYM-189 review fix).
+        default_ctx = TrackerContext()
         first_linear_ctx = next(
             (ctx for ctx in representative if ctx.provider == DEFAULT_PROVIDER), None
         )
-        if first_linear_ctx is not None:
+        # Skip entirely when a binding really targets `default_ctx` — the
+        # main hot-add loop above already registered its own tracker there,
+        # and aliasing a *different* non-default-site binding's tracker onto
+        # it would clobber that exact registration (SYM-189 review fix).
+        if first_linear_ctx is not None and default_ctx not in representative:
             first_linear_tracker = self._trackers.get(first_linear_ctx)
-            default_ctx = TrackerContext()
             if first_linear_tracker is not None and first_linear_tracker is not self._trackers.get(
                 default_ctx
             ):
@@ -1219,7 +1252,11 @@ class _OrchestratorBase:
                 self._trackers.discard(
                     default_ctx.provider, default_ctx.site, default_ctx.project_key
                 )
-            if tracker in self._hot_added_trackers.values():
+            # Checking only `_hot_added_trackers` misses a single-tracker
+            # deployment's boot-time registrations, which reuse the same
+            # client under contexts never recorded there — closing it would
+            # break those still-live contexts too (SYM-189 review fix).
+            if self._trackers.has_tracker(tracker):
                 continue
             try:
                 await tracker.aclose()

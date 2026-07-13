@@ -114,6 +114,13 @@ class TrackerRegistry:
         risks reading (and later closing) a different context's tracker."""
         return self._trackers.get((ctx.provider, ctx.site, ctx.project_key))
 
+    def has_tracker(self, tracker: IssueTracker) -> bool:
+        """Whether `tracker` is still registered under any context, including
+        ones registered directly (e.g. at boot) rather than tracked as a
+        hot-add — a caller must not close a client another live context
+        still shares (SYM-189)."""
+        return any(registered is tracker for registered in self._trackers.values())
+
     def resolve(self, ctx: TrackerContext | None = None) -> IssueTracker:
         key = (
             ctx.provider if ctx is not None else DEFAULT_PROVIDER,
