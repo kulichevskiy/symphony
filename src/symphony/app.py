@@ -26,6 +26,7 @@ from .github.webhook import (
 )
 from .linear.client import Linear
 from .ui.api import CommandSink, PauseController, create_api_router
+from .ui.config_crud import create_config_crud_router
 from .ui.config_view import create_config_router
 from .ui.db import ReadOnlyDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
@@ -96,6 +97,7 @@ def create_app(
     ui_pr_no_progress_threshold: timedelta | None = None,
     ui_command_sink: CommandSink | None = None,
     ui_pause_controller: PauseController | None = None,
+    ui_config_write_lock: object | None = None,
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
     clock: Clock | None = None,
@@ -176,11 +178,13 @@ def create_app(
         # must run the Auth0 login flow before calling the gated routes below.
         app.include_router(create_auth_config_router(auth0_settings))
 
-        # Single gate shared by the two /api/* routers. Webhook routes are
-        # mounted above, outside this gate (they verify their own HMAC).
-        api_dependencies = (
-            [Depends(create_auth_dependency(auth0_settings))] if auth0_settings is not None else []
-        )
+        # Single gate shared by the /api/* routers. Webhook routes are mounted
+        # above, outside this gate (they verify their own HMAC). Built once so
+        # the config-CRUD router can reuse the same dependency instance to read
+        # the caller's email for `updated_by` — FastAPI dedupes by identity, so
+        # verification still runs only once per request.
+        auth_dep = create_auth_dependency(auth0_settings) if auth0_settings is not None else None
+        api_dependencies = [Depends(auth_dep)] if auth_dep is not None else []
         if ui_pool is not None:
             app.include_router(
                 create_issue_detail_router(
@@ -203,6 +207,20 @@ def create_app(
         # /api routers; included before create_api_router's catch-all.
         app.include_router(
             create_config_router(ui_external_config),
+            dependencies=api_dependencies,
+        )
+
+        # Binding CRUD (create/edit/delete + options) — writes against the
+        # daemon's shared connection under the config write lock (SYM-189), so
+        # a write's multi-row transaction never interleaves with a tick reload.
+        app.include_router(
+            create_config_crud_router(
+                conn,
+                config_provider=ui_external_config,
+                write_lock=ui_config_write_lock,
+                auth_dependency=auth_dep,
+                clock=clock,
+            ),
             dependencies=api_dependencies,
         )
 

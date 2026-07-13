@@ -9,6 +9,19 @@ import { App } from "./App";
 /** Contract-valid stub bodies, keyed by endpoint, so pages that render as
  *  soon as their query resolves (no error boundary) don't crash on `{}`. */
 function stubBodyFor(url: string): unknown {
+  if (url.includes("/api/config/bindings")) {
+    return [];
+  }
+  if (url.includes("/api/config/options")) {
+    return {
+      agent_families: ["claude", "codex"],
+      codex_models: [],
+      claude_aliases: [],
+      codex_efforts: [],
+      claude_efforts: [],
+      merge_strategies: ["squash", "merge", "rebase"],
+    };
+  }
   if (url.includes("/api/config")) {
     return {
       read_only: true,

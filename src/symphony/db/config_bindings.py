@@ -44,6 +44,20 @@ class StoredBinding:
     tracker_site: str
 
 
+class StaleVersionError(Exception):
+    """Optimistic-locking conflict: the row's `version` no longer matches the
+    one the caller loaded (concurrent edit, or the row was deleted). Carries the
+    current version — `None` when the row is gone — so the API can render it."""
+
+    def __init__(self, binding_id: int, current_version: int | None) -> None:
+        self.binding_id = binding_id
+        self.current_version = current_version
+        super().__init__(
+            f"config binding {binding_id} version conflict "
+            f"(current={current_version}); reload and retry"
+        )
+
+
 def _reject_legacy_fields(payload: dict[str, Any]) -> None:
     from ..config import _LEGACY_ROLE_FIELDS
 
@@ -124,6 +138,98 @@ def _row_to_binding(row: aiosqlite.Row) -> StoredBinding:
         tracker_provider=str(row["tracker_provider"]),
         tracker_site=str(row["tracker_site"]),
     )
+
+
+_SELECT_COLUMNS = """
+    id, payload, version, enabled, priority, updated_at, updated_by,
+    project_key, github_repo, issue_label, tracker_provider, tracker_site
+"""
+
+
+async def get(conn: aiosqlite.Connection, binding_id: int) -> StoredBinding | None:
+    """One binding row by id, or `None` if it doesn't exist."""
+    cur = await conn.execute(
+        f"SELECT {_SELECT_COLUMNS} FROM config_bindings WHERE id = ?", (binding_id,)
+    )
+    row = await cur.fetchone()
+    return _row_to_binding(row) if row is not None else None
+
+
+async def update(
+    conn: aiosqlite.Connection,
+    binding_id: int,
+    *,
+    payload: dict[str, Any],
+    key: tuple[str, str, str, str, str],
+    enabled: bool = True,
+    priority: int = 0,
+    expected_version: int,
+    updated_at: str = "",
+    updated_by: str = "",
+    commit: bool = True,
+) -> StoredBinding:
+    """Replace one binding row under optimistic locking.
+
+    The write only lands when the stored `version` still equals
+    `expected_version`; otherwise a `StaleVersionError` is raised (a concurrent
+    edit bumped it, or the row was deleted). On success `version` is bumped to
+    `expected_version + 1`. Raises `ValueError` on legacy role fields and
+    `sqlite3.IntegrityError` on a duplicate natural key.
+    """
+    _reject_legacy_fields(payload)
+    project_key, github_repo, issue_label, tracker_provider, tracker_site = key
+    cur = await conn.execute(
+        """
+        UPDATE config_bindings
+           SET payload = ?, version = version + 1, enabled = ?, priority = ?,
+               updated_at = ?, updated_by = ?, project_key = ?, github_repo = ?,
+               issue_label = ?, tracker_provider = ?, tracker_site = ?
+         WHERE id = ? AND version = ?
+        """,
+        (
+            json.dumps(payload, separators=(",", ":")),
+            1 if enabled else 0,
+            priority,
+            updated_at,
+            updated_by,
+            project_key,
+            github_repo,
+            issue_label,
+            tracker_provider,
+            tracker_site,
+            binding_id,
+            expected_version,
+        ),
+    )
+    if cur.rowcount == 0:
+        existing = await get(conn, binding_id)
+        raise StaleVersionError(binding_id, existing.version if existing else None)
+    if commit:
+        await conn.commit()
+    refreshed = await get(conn, binding_id)
+    assert refreshed is not None  # just updated it under the same connection
+    return refreshed
+
+
+async def delete(
+    conn: aiosqlite.Connection,
+    binding_id: int,
+    *,
+    expected_version: int,
+    commit: bool = True,
+) -> None:
+    """Delete one binding row under optimistic locking. Raises
+    `StaleVersionError` when the version no longer matches (or the row is
+    already gone)."""
+    cur = await conn.execute(
+        "DELETE FROM config_bindings WHERE id = ? AND version = ?",
+        (binding_id, expected_version),
+    )
+    if cur.rowcount == 0:
+        existing = await get(conn, binding_id)
+        raise StaleVersionError(binding_id, existing.version if existing else None)
+    if commit:
+        await conn.commit()
 
 
 async def list_all(conn: aiosqlite.Connection) -> list[StoredBinding]:

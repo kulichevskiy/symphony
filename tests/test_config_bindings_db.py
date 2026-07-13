@@ -72,6 +72,89 @@ async def test_list_all_orders_by_priority_then_natural_key(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_get_returns_row_by_id(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    rid = await db.config_bindings.insert(
+        conn, payload={"project_key": "ENG"}, key=("ENG", "org/repo", "", "linear", "default")
+    )
+    row = await db.config_bindings.get(conn, rid)
+    assert row is not None and row.id == rid and row.payload == {"project_key": "ENG"}
+    assert await db.config_bindings.get(conn, rid + 999) is None
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_bumps_version_and_stamps_metadata(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    rid = await db.config_bindings.insert(
+        conn, payload={"project_key": "ENG"}, key=("ENG", "org/repo", "", "linear", "default")
+    )
+    updated = await db.config_bindings.update(
+        conn,
+        rid,
+        payload={"project_key": "ENG", "max_concurrent": 5},
+        key=("ENG", "org/repo", "", "linear", "default"),
+        enabled=False,
+        priority=7,
+        expected_version=1,
+        updated_at="2026-07-13T00:00:00Z",
+        updated_by="alice@example.com",
+    )
+    assert updated.version == 2
+    assert updated.payload["max_concurrent"] == 5
+    assert updated.enabled is False and updated.priority == 7
+    assert updated.updated_by == "alice@example.com"
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_stale_version_rejected(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    rid = await db.config_bindings.insert(
+        conn, payload={}, key=("ENG", "org/repo", "", "linear", "default")
+    )
+    with pytest.raises(db.config_bindings.StaleVersionError):
+        await db.config_bindings.update(
+            conn,
+            rid,
+            payload={},
+            key=("ENG", "org/repo", "", "linear", "default"),
+            expected_version=99,
+        )
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_rejects_legacy_fields(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    rid = await db.config_bindings.insert(
+        conn, payload={}, key=("ENG", "org/repo", "", "linear", "default")
+    )
+    with pytest.raises(ValueError, match="legacy role field"):
+        await db.config_bindings.update(
+            conn,
+            rid,
+            payload={"agent": "codex"},
+            key=("ENG", "org/repo", "", "linear", "default"),
+            expected_version=1,
+        )
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_by_id_with_version(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    rid = await db.config_bindings.insert(
+        conn, payload={}, key=("ENG", "org/repo", "", "linear", "default")
+    )
+    with pytest.raises(db.config_bindings.StaleVersionError):
+        await db.config_bindings.delete(conn, rid, expected_version=99)
+    await db.config_bindings.delete(conn, rid, expected_version=1)
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_payload_round_trips_verbatim(tmp_path: Path) -> None:
     conn = await _conn(tmp_path)
     payload = {"project_key": "ENG", "roles": {"implement": {"model": "sonnet"}}}
