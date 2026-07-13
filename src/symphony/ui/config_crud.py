@@ -429,33 +429,56 @@ def _run_matrix_validators(trial: Config) -> list[warnings.WarningMessage]:
     return caught
 
 
+def _binding_anthropic_key(
+    binding: RepoBinding, env_source: dict[str, str], process_key: str
+) -> str:
+    """Resolve the ANTHROPIC_API_KEY a binding actually runs with, mirroring
+    preflight's precedence (`cli._preflight_validate_capabilities`): a
+    binding's own (unresolved) `env: {ANTHROPIC_API_KEY: <source name>}`
+    overrides the process key entirely — even to "" for an unresolvable
+    source — since the runner merges `{**os.environ, **spec.env}` and an
+    empty override really does mean no key for that binding's subprocess.
+    `_validate_binding` already rejects an unresolvable source name, so the
+    lookup here is safe."""
+    if "ANTHROPIC_API_KEY" not in binding.env:
+        return process_key
+    return env_source.get(binding.env["ANTHROPIC_API_KEY"], "")
+
+
 async def _reject_unsupported_efforts(trial: Config) -> None:
     """Re-run the preflight capability check for every resolved *claude*
     `(model, effort)` pair in `trial` — the same online Models-API source
-    preflight uses — so an unsupported pair fails here at save, not silently at
-    dispatch. codex efforts are the fixed family enum (already checked
-    structurally by `validate_roles_matrix`). A `None` result (no
-    `ANTHROPIC_API_KEY` anywhere, or a Models-API error) skips the pair: the
-    daemon may run claude via CLI auth, and the structural family check already
-    ran — exactly preflight's fail-open-on-cannot-validate behavior."""
-    pairs: set[tuple[str, str]] = set()
+    preflight uses, keyed the same way (per binding, its own `env:`
+    ANTHROPIC_API_KEY taking precedence over the process key) — so a
+    deployment whose key lives only in a binding's `env:` is validated the
+    same way it will actually run, not silently skipped. codex efforts are
+    the fixed family enum (already checked structurally by
+    `validate_roles_matrix`). A `None` result (no ANTHROPIC_API_KEY anywhere
+    for that binding, or a Models-API error) skips the pair: the daemon may
+    run claude via CLI auth, and the structural family check already ran —
+    exactly preflight's fail-open-on-cannot-validate behavior."""
+    env_source = _env_key_source()
+    process_key = env_source.get("ANTHROPIC_API_KEY", "")
+    pairs: set[tuple[str, str, str]] = set()  # (key, model, effort)
     # Zero bindings would otherwise skip this loop and let an unsupported
     # global `(model, effort)` pair save silently (SYM-191 review); the
     # synthetic binding resolves the global cell the same way a first real
     # binding eventually would.
     for binding in trial.repos or [_synthetic_matrix_validation_binding()]:
+        binding_key = _binding_anthropic_key(binding, env_source, process_key)
         for name in get_args(RoleName):
             role = binding.resolved_role(name, trial.roles)
             if role.agent == "claude" and role.model is not None and role.effort is not None:
-                pairs.add((role.model, role.effort))
-    caps: dict[str, list[str] | None] = {}
-    for model, effort in sorted(pairs):
-        if model not in caps:
+                pairs.add((binding_key, role.model, role.effort))
+    caps: dict[tuple[str, str], list[str] | None] = {}
+    for key, model, effort in sorted(pairs):
+        cache_key = (key, model)
+        if cache_key not in caps:
             try:
-                caps[model] = await fetch_claude_effort_capabilities(model)
+                caps[cache_key] = await fetch_claude_effort_capabilities(model, key)
             except ValueError:
-                caps[model] = None
-        supported = caps[model]
+                caps[cache_key] = None
+        supported = caps[cache_key]
         if supported is not None and effort not in supported:
             raise _validation_error(
                 ["roles"],
@@ -592,16 +615,23 @@ def create_config_crud_router(
             ) from e
         stored = _dump_roles(global_roles)
         conn = await conn_provider()
+        # Assembly + validation (including the external Models-API capability
+        # check) runs before the lock is acquired: it's a read-only trial
+        # against the DB's current state, and the online check can take up to
+        # the full 30s httpx timeout — awaiting it inside the lock would
+        # serialize every other config write behind it (SYM-191 review). The
+        # actual write below re-validates the version, so a write that lands
+        # between this check and the lock still fails safe as a 409.
+        existing = await config_bindings.list_all(conn)
+        others: list[RepoBinding] = []
+        for row in existing:
+            other = RepoBinding.model_validate({**row.payload, "enabled": row.enabled})
+            other.apply_tracker_secret_defaults(jira_base_url=base.jira_base_url)
+            others.append(other)
+        trial = base.model_copy(update={"repos": others, "roles": global_roles})
+        caught = _run_matrix_validators(trial)
+        await _reject_unsupported_efforts(trial)
         async with lock:
-            existing = await config_bindings.list_all(conn)
-            others: list[RepoBinding] = []
-            for row in existing:
-                other = RepoBinding.model_validate({**row.payload, "enabled": row.enabled})
-                other.apply_tracker_secret_defaults(jira_base_url=base.jira_base_url)
-                others.append(other)
-            trial = base.model_copy(update={"repos": others, "roles": global_roles})
-            caught = _run_matrix_validators(trial)
-            await _reject_unsupported_efforts(trial)
             try:
                 new_version = await config_globals.update_roles(
                     conn, roles=stored, expected_version=body.version
@@ -646,8 +676,11 @@ def create_config_crud_router(
         _validate_webhook_secret(binding, base)
         _validate_tracker_credentials(binding, base)
         conn = await conn_provider()
+        # Assembly + validation (including the external Models-API capability
+        # check, up to the full 30s httpx timeout) runs before the lock is
+        # acquired — see the matching comment in `put_roles` for why.
+        wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
         async with lock:
-            wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
             try:
                 new_id = await config_bindings.insert(
                     conn,
@@ -691,27 +724,33 @@ def create_config_crud_router(
         payload = _sanitize_payload(body.payload)
         base = _base_config()
         conn = await conn_provider()
+        old = await config_bindings.get(conn, binding_id)
+        if old is None:
+            raise HTTPException(status_code=404, detail="binding not found")
+        # The served payload redacts `webhook_secret` (see `_serialize`); if
+        # the write omits it, keep the stored secret rather than dropping it
+        # on every edit that round-trips the redacted GET response. An
+        # explicit (even empty) value in the payload still overrides it.
+        if "webhook_secret" not in payload and old.payload.get("webhook_secret"):
+            payload["webhook_secret"] = old.payload["webhook_secret"]
+        # Same round-trip concern for `mcp_servers`' redacted `env`/`headers`
+        # (see `_redact_mcp_servers`/`_restore_mcp_secrets`).
+        if isinstance(payload.get("mcp_servers"), dict):
+            payload["mcp_servers"] = _restore_mcp_secrets(
+                old.payload.get("mcp_servers"), payload["mcp_servers"]
+            )
+        binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
+        binding.enabled = body.enabled
+        _validate_webhook_secret(binding, base)
+        _validate_tracker_credentials(binding, base)
+        # Assembly + validation (including the external Models-API capability
+        # check, up to the full 30s httpx timeout) runs before the lock is
+        # acquired — see the matching comment in `put_roles` for why. `old` is
+        # read here too (not inside the lock); the write below still carries
+        # its own optimistic-lock `version` check, so a concurrent change
+        # lands as a 409, not a lost update.
+        wgs = await _assemble_and_validate(conn, base, binding, exclude_id=binding_id)
         async with lock:
-            old = await config_bindings.get(conn, binding_id)
-            if old is None:
-                raise HTTPException(status_code=404, detail="binding not found")
-            # The served payload redacts `webhook_secret` (see `_serialize`); if
-            # the write omits it, keep the stored secret rather than dropping it
-            # on every edit that round-trips the redacted GET response. An
-            # explicit (even empty) value in the payload still overrides it.
-            if "webhook_secret" not in payload and old.payload.get("webhook_secret"):
-                payload["webhook_secret"] = old.payload["webhook_secret"]
-            # Same round-trip concern for `mcp_servers`' redacted `env`/`headers`
-            # (see `_redact_mcp_servers`/`_restore_mcp_secrets`).
-            if isinstance(payload.get("mcp_servers"), dict):
-                payload["mcp_servers"] = _restore_mcp_secrets(
-                    old.payload.get("mcp_servers"), payload["mcp_servers"]
-                )
-            binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
-            binding.enabled = body.enabled
-            _validate_webhook_secret(binding, base)
-            _validate_tracker_credentials(binding, base)
-            wgs = await _assemble_and_validate(conn, base, binding, exclude_id=binding_id)
             try:
                 row = await config_bindings.update(
                     conn,

@@ -124,6 +124,16 @@ export function RoleMatrixEditor({
               effort && !effortOptions.includes(effort)
                 ? [...effortOptions, effort]
                 : effortOptions;
+            // Same fallback for the model cell: a stored model may be absent
+            // from `modelsFor` either because the agent is inherited (family
+            // unknown client-side) or because it's a full `claude-*` ID not in
+            // the alias list — surface it as a selected option either way
+            // instead of silently rendering "inherit".
+            const modelOptions = modelsFor(options, agent);
+            const modelChoices =
+              model && !modelOptions.includes(model)
+                ? [...modelOptions, model]
+                : modelOptions;
             return (
               <tr key={role} className="border-b border-border/70 last:border-0">
                 <td className="px-3 py-2 font-mono text-xs">{role}</td>
@@ -146,10 +156,10 @@ export function RoleMatrixEditor({
                     value={model}
                     onChange={(e) => cellChange(role, "model", e.target.value)}
                     aria-label={`${scope} ${role} model`}
-                    disabled={agent === ""}
+                    disabled={agent === "" && !model}
                   >
                     <option value="">inherit</option>
-                    {modelsFor(options, agent).map((m) => (
+                    {modelChoices.map((m) => (
                       <option key={m} value={m}>
                         {m}
                       </option>
@@ -1092,12 +1102,16 @@ export function ConfigPage() {
             // The card tracks its own version/roles across saves (updating
             // from each PUT response), so it isn't keyed on the fetched
             // version — remounting would wipe the just-shown warning banner.
-            // A save refreshes the resolved matrix below via `onSaved`.
+            // `onSaved` still refetches the `roles` query itself (not just the
+            // resolved matrix below) so a later remount re-seeds from the
+            // bumped version instead of the stale `initialVersion` — otherwise
+            // the next save 409s against a version the server left behind.
             <GlobalRolesCard
               initialRoles={roles.data.roles}
               initialVersion={roles.data.version}
               options={options.data}
               onSaved={() => {
+                void roles.refetch();
                 void view.refetch();
               }}
             />

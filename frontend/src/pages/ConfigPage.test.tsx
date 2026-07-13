@@ -6,6 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -21,6 +22,7 @@ import {
   BindingForm,
   BindingsPanel,
   ConfigDetails,
+  ConfigPage,
   GlobalRolesCard,
   RoleMatrixEditor,
 } from "./ConfigPage";
@@ -595,6 +597,48 @@ describe("RoleMatrixEditor", () => {
     expect(effort.value).toBe("high");
     expect([...effort.options].map((o) => o.value)).toEqual(["", "low", "medium", "high"]);
   });
+
+  it("surfaces a model-only cell (inherited agent) as selected and editable, not blank/disabled", () => {
+    // Legacy shape from the SYM-188 importer: `{model: "opus"}` with no
+    // `agent` when the op's agent matched the baseline.
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ implement: { model: "opus" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
+    expect(model.value).toBe("opus");
+    expect([...model.options].map((o) => o.value)).toContain("opus");
+    expect(model.disabled).toBe(false);
+  });
+
+  it("disables the model cell only when both agent and model are inherited", () => {
+    render(
+      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
+    );
+    const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
+    expect(model.value).toBe("");
+    expect(model.disabled).toBe(true);
+  });
+
+  it("renders a stored model not in the current family list instead of blanking the select", () => {
+    // A full `claude-*` model ID (accepted by `_role_model_in_family` and
+    // preserved by the importer) has no entry in the alias list.
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ implement: { agent: "claude", model: "claude-opus-4-20250514" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
+    expect(model.value).toBe("claude-opus-4-20250514");
+    expect([...model.options].map((o) => o.value)).toContain("claude-opus-4-20250514");
+  });
 });
 
 const rolesResponse = (over: Partial<{ roles: RolesMatrix; version: number; warnings: string[] }> = {}) => ({
@@ -659,5 +703,55 @@ describe("GlobalRolesCard", () => {
     await waitFor(() =>
       expect(screen.getByText("unknown Claude effort 'turbo'")).toBeTruthy(),
     );
+  });
+});
+
+describe("ConfigPage", () => {
+  it("refetches the roles query (not just the resolved view) after a global matrix save", async () => {
+    let rolesGetCalls = 0;
+    const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      if (url === "/api/config" && method === "GET") {
+        return new Response(JSON.stringify(config), { status: 200 });
+      }
+      if (url === "/api/config/bindings" && method === "GET") {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url === "/api/config/options" && method === "GET") {
+        return new Response(JSON.stringify(OPTIONS), { status: 200 });
+      }
+      if (url === "/api/config/roles" && method === "GET") {
+        rolesGetCalls += 1;
+        return new Response(
+          JSON.stringify({ roles: {}, version: rolesGetCalls === 1 ? 0 : 1 }),
+          { status: 200 },
+        );
+      }
+      if (url === "/api/config/roles" && method === "PUT") {
+        return new Response(JSON.stringify({ roles: {}, version: 1, warnings: [] }), {
+          status: 200,
+        });
+      }
+      throw new Error(`unexpected request ${method} ${url}`);
+    });
+    vi.stubGlobal("fetch", fn);
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConfigPage />
+      </QueryClientProvider>,
+    );
+
+    await screen.findByText("Global roles matrix");
+    expect(rolesGetCalls).toBe(1);
+
+    fireEvent.click(screen.getByText("Save global matrix"));
+    // With `staleTime: Infinity`, a remount after a save would otherwise re-seed
+    // from the pre-save version and spuriously 409 the next save — asserting
+    // the GET fires again (not just the resolved-view GET) is the regression
+    // check for that.
+    await waitFor(() => expect(rolesGetCalls).toBe(2));
   });
 });
