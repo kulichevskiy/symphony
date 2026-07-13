@@ -239,4 +239,28 @@ describe("BindingsPanel", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/api/config/bindings/1");
     expect(firstBody.priority).toBe(1);
   });
+
+  it("still flips the order when both rows share the default priority", async () => {
+    const fetchMock = mockFetch(200, record());
+    const onChanged = vi.fn();
+    render(
+      <BindingsPanel
+        bindings={[
+          record({ id: 1, priority: 0, version: 2 }),
+          record({ id: 2, priority: 0, version: 3, github_repo: "org/other" }),
+        ]}
+        options={OPTIONS}
+        onChanged={onChanged}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("move down 1"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    // A swap of equal priority values would be a no-op; the reorder must
+    // instead renumber so binding 1 sorts after binding 2.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/config/bindings/1");
+    const body = JSON.parse(init?.body as string);
+    expect(body.priority).toBe(1);
+  });
 });

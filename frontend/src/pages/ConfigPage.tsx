@@ -562,30 +562,34 @@ export function BindingsPanel({
   }
 
   async function reorder(index: number, dir: -1 | 1) {
-    const a = ordered[index];
-    const b = ordered[index + dir];
-    if (!a || !b) return;
+    const other = index + dir;
+    if (!ordered[index] || !ordered[other]) return;
     setError(null);
+
+    const moved = [...ordered];
+    [moved[index], moved[other]] = [moved[other], moved[index]];
+
+    // Renumber against the new positions so the swap is never a no-op (e.g.
+    // every new binding defaults to priority 0) — a plain value swap between
+    // two equal priorities writes nothing and the sort order never changes.
+    const writes = ordered
+      .map((b) => ({ b, priority: moved.findIndex((m) => m.id === b.id) }))
+      .filter(({ b, priority }) => b.priority !== priority);
+
     try {
-      // Swap the two rows' priorities (each a versioned write).
-      await updateBinding(a.id, {
-        payload: a.payload,
-        enabled: a.enabled,
-        priority: b.priority,
-        version: a.version,
-      });
-      await updateBinding(b.id, {
-        payload: b.payload,
-        enabled: b.enabled,
-        priority: a.priority,
-        version: b.version,
-      });
+      for (const { b, priority } of writes) {
+        await updateBinding(b.id, {
+          payload: b.payload,
+          enabled: b.enabled,
+          priority,
+          version: b.version,
+        });
+      }
       onChanged();
     } catch {
       setError("Failed to reorder — reload and retry.");
-      // A partial swap may have landed (one write succeeded, the other
-      // failed) — refetch so the UI reflects the actual DB state instead of
-      // showing the stale pre-swap order.
+      // A partial renumber may have landed — refetch so the UI reflects the
+      // actual DB state instead of showing the stale pre-reorder order.
       onChanged();
     }
   }
@@ -706,6 +710,10 @@ export function ConfigPage() {
         </div>
       ) : bindings.isLoading || options.isLoading ? (
         <p className="text-sm text-muted-foreground">Loading…</p>
+      ) : bindings.isError || options.isError ? (
+        <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
+          Failed to load bindings
+        </div>
       ) : null}
 
       <div className="mb-2 mt-6">
