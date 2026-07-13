@@ -853,6 +853,31 @@ async def test_roles_get_put_round_trip(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_roles_put_rejects_bad_effort_with_zero_bindings(tmp_path: Path) -> None:
+    """A fresh DB has no bindings for the family/effort loop to walk — the
+    global matrix must still be validated on its own (SYM-191 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {"implement": {"agent": "claude", "effort": "turbo"}},
+                    "version": 0,
+                },
+            )
+            assert put.status_code == 422, put.text
+            assert put.json()["detail"][0]["loc"] == ["roles"]
+
+            # Rejected, not persisted — a reread still shows the empty matrix.
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {"roles": {}, "version": 0}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_roles_put_version_conflict(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:
@@ -895,9 +920,14 @@ async def test_roles_put_diversity_warning_non_blocking(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_effort_with_inherited_model_saves(tmp_path: Path) -> None:
+async def test_effort_with_inherited_model_saves(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """An effort override with no explicit model saves — it is family-checked
     against the resolved role, not rejected for lacking a model (SYM-191)."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
     conn, db_path = await _open(tmp_path)
     try:
         app = _app(conn, db_path)
@@ -931,9 +961,14 @@ async def test_options_claude_efforts_per_model(tmp_path: Path, monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_options_claude_efforts_fall_back_without_key(tmp_path: Path) -> None:
+async def test_options_claude_efforts_fall_back_without_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """No ANTHROPIC_API_KEY → the capability fetch returns None; the endpoint
     falls back to the family-wide effort set rather than an empty list."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
     conn, db_path = await _open(tmp_path)
     try:
         app = _app(conn, db_path)

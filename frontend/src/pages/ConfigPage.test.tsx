@@ -538,6 +538,63 @@ describe("RoleMatrixEditor", () => {
     });
     expect(roles.implement).toEqual({ agent: "codex" });
   });
+
+  it("drops an effort the new model doesn't support when the model changes", () => {
+    // opus supports high; sonnet (per OPTIONS) only offers low/medium.
+    let roles: RolesMatrix = {
+      implement: { agent: "claude", model: "opus", effort: "high" },
+    };
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement model"), {
+      target: { value: "sonnet" },
+    });
+    expect(roles.implement).toEqual({ agent: "claude", model: "sonnet" });
+  });
+
+  it("keeps a still-supported effort when the model changes", () => {
+    let roles: RolesMatrix = {
+      implement: { agent: "claude", model: "opus", effort: "medium" },
+    };
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement model"), {
+      target: { value: "sonnet" },
+    });
+    expect(roles.implement).toEqual({ agent: "claude", model: "sonnet", effort: "medium" });
+  });
+
+  it("renders a stored effort not in the current option list instead of blanking the select", () => {
+    // sonnet only offers low/medium (per OPTIONS); a stale "high" cell must
+    // still show up as a selectable, selected option rather than going blank.
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ implement: { agent: "claude", model: "sonnet", effort: "high" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    const effort = screen.getByLabelText("binding implement effort") as HTMLSelectElement;
+    expect(effort.value).toBe("high");
+    expect([...effort.options].map((o) => o.value)).toEqual(["", "low", "medium", "high"]);
+  });
 });
 
 const rolesResponse = (over: Partial<{ roles: RolesMatrix; version: number; warnings: string[] }> = {}) => ({

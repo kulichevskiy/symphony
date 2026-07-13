@@ -563,6 +563,22 @@ class RepoBinding(BaseModel):
         return ResolvedRole(agent=agent, model=model, effort=effort)
 
 
+def _synthetic_matrix_validation_binding() -> RepoBinding:
+    """A placeholder binding used only to family/effort-check the *global*
+    roles matrix when there are zero real bindings to loop over (SYM-191
+    review). Every field but the required identity/`states` ones takes its
+    class default, so a role resolves exactly as it would for a brand-new
+    default binding — good enough to catch an invalid global cell before it's
+    persisted; `config_crud._reject_unsupported_efforts` reuses it for the
+    same reason.
+    """
+    return RepoBinding(
+        project_key="_global_",
+        github_repo="_global_",
+        states=TrackerStates(ready="_global_"),
+    )
+
+
 def binding_natural_key(binding: RepoBinding) -> tuple[str, str, str, str, str]:
     """The binding's natural key — the components the orchestrator's
     `_binding_key` uses, in the same order (project key, github repo, issue
@@ -757,8 +773,15 @@ class Config(BaseModel):
         Public so `effective_config.assemble_effective_config` can re-run it
         after a `model_copy` (which, unlike normal construction, skips model
         validators) swaps in DB-sourced bindings/roles.
+
+        A fresh DB has zero `self.repos`, which would otherwise skip this
+        entire loop and let an invalid *global* cell (e.g. `effort: "turbo"`)
+        save silently — the operator then can't create a first binding
+        either, since assembly re-validates the now-stored global cell
+        (SYM-191 review). Falling back to a synthetic default-shaped binding
+        family/effort-checks the global matrix on its own.
         """
-        for binding in self.repos:
+        for binding in self.repos or [_synthetic_matrix_validation_binding()]:
             self._reject_legacy_matrix_conflicts(binding)
             declared = set(self.roles) | set(binding.roles)
             for name in declared:
@@ -798,6 +821,10 @@ class Config(BaseModel):
                         f"{role.effort!r}; supported: "
                         f"{', '.join(supported)}"
                     )
+            if not self.repos:
+                # The synthetic binding isn't a real one; its own diversity
+                # posture isn't the operator's to fix here.
+                continue
             implement = binding.resolved_role("implement", self.roles)
             for review_name in ("review_find", "review_verify"):
                 review = binding.resolved_role(review_name, self.roles)

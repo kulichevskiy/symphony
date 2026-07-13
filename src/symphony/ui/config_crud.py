@@ -76,6 +76,7 @@ from ..config import (
     RepoBinding,
     RoleConfig,
     RoleName,
+    _synthetic_matrix_validation_binding,
     binding_natural_key,
 )
 from ..db import config_bindings, config_globals
@@ -438,7 +439,11 @@ async def _reject_unsupported_efforts(trial: Config) -> None:
     daemon may run claude via CLI auth, and the structural family check already
     ran — exactly preflight's fail-open-on-cannot-validate behavior."""
     pairs: set[tuple[str, str]] = set()
-    for binding in trial.repos:
+    # Zero bindings would otherwise skip this loop and let an unsupported
+    # global `(model, effort)` pair save silently (SYM-191 review); the
+    # synthetic binding resolves the global cell the same way a first real
+    # binding eventually would.
+    for binding in trial.repos or [_synthetic_matrix_validation_binding()]:
         for name in get_args(RoleName):
             role = binding.resolved_role(name, trial.roles)
             if role.agent == "claude" and role.model is not None and role.effort is not None:

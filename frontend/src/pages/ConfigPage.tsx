@@ -85,6 +85,15 @@ export function RoleMatrixEditor({
       delete cell.model;
       delete cell.effort;
     }
+    // Switching the model can strand an effort the new model doesn't offer
+    // (e.g. sonnet has no "high") — drop it so the Select never holds a
+    // stored value with no matching <option>.
+    if (field === "model" && cell.effort) {
+      const agentForEfforts = String(cell.agent ?? "");
+      if (!effortsFor(options, agentForEfforts, value).includes(cell.effort)) {
+        delete cell.effort;
+      }
+    }
     if (Object.keys(cell).length === 0) delete next[role];
     else next[role] = cell;
     onChange(next);
@@ -107,6 +116,14 @@ export function RoleMatrixEditor({
             const agent = String(cell.agent ?? "");
             const model = String(cell.model ?? "");
             const effort = String(cell.effort ?? "");
+            // Include a stored effort not in the current option list (e.g.
+            // loaded before a model change tightened the set) so the Select
+            // never renders a value with no matching <option>.
+            const effortOptions = effortsFor(options, agent, model);
+            const effortChoices =
+              effort && !effortOptions.includes(effort)
+                ? [...effortOptions, effort]
+                : effortOptions;
             return (
               <tr key={role} className="border-b border-border/70 last:border-0">
                 <td className="px-3 py-2 font-mono text-xs">{role}</td>
@@ -146,7 +163,7 @@ export function RoleMatrixEditor({
                     aria-label={`${scope} ${role} effort`}
                   >
                     <option value="">inherit</option>
-                    {effortsFor(options, agent, model).map((ef) => (
+                    {effortChoices.map((ef) => (
                       <option key={ef} value={ef}>
                         {ef}
                       </option>
