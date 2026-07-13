@@ -21,6 +21,18 @@ class ConfigGlobals:
     version: int = 1
 
 
+class StaleVersionError(Exception):
+    """Optimistic-locking conflict on the single global-config row: the stored
+    `version` no longer matches the one the caller loaded (a concurrent edit).
+    Carries the current version so the API can render it."""
+
+    def __init__(self, current_version: int) -> None:
+        self.current_version = current_version
+        super().__init__(
+            f"config globals version conflict (current={current_version}); reload and retry"
+        )
+
+
 async def get(conn: aiosqlite.Connection) -> ConfigGlobals | None:
     """Return the global-config document, or `None` if it was never written."""
     cur = await conn.execute("SELECT roles, migrated_at, version FROM config_globals WHERE id = 1")
@@ -60,3 +72,32 @@ async def set_globals(
     )
     if commit:
         await conn.commit()
+
+
+async def update_roles(
+    conn: aiosqlite.Connection,
+    *,
+    roles: dict[str, Any],
+    expected_version: int,
+    commit: bool = True,
+) -> int:
+    """Replace the global roles matrix under optimistic locking.
+
+    The write only lands when the stored `version` still equals
+    `expected_version` (0 when no row exists yet — a fresh, never-migrated DB);
+    otherwise a `StaleVersionError` is raised. `migrated_at` is preserved. On
+    success `version` is bumped to `expected_version + 1` and returned.
+    """
+    current = await get(conn)
+    current_version = current.version if current is not None else 0
+    if current_version != expected_version:
+        raise StaleVersionError(current_version)
+    new_version = current_version + 1
+    await set_globals(
+        conn,
+        roles=roles,
+        migrated_at=current.migrated_at if current is not None else "",
+        version=new_version,
+        commit=commit,
+    )
+    return new_version

@@ -38,6 +38,13 @@ Every write:
     without Auth0) and logs a field-level diff (secret-bearing fields redacted
     to set/cleared/changed flags, never values).
 
+The global roles matrix is edited through the same router (SYM-191):
+`GET/PUT /api/config/roles` carries its own optimistic-lock `version`, and every
+save (binding *and* matrix) re-runs the preflight per-model claude capability
+check so an unsupported `(model, effort)` pair fails in the form, not at
+dispatch. `GET /api/config/options` serves claude efforts *per model* from the
+same source.
+
 Secrets never appear in a response: `webhook_secret` is dropped from the served
 payload in favour of a `webhook_secret_set` flag. `mcp_servers` entries have no
 `resolve_env`-style name indirection (unlike the top-level `env` field), so an
@@ -53,12 +60,13 @@ import sqlite3
 import warnings
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 
 import aiosqlite
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from ..agent.claude_models import fetch_claude_effort_capabilities
 from ..agent.codex_models import SUPPORTED_CODEX_EFFORTS, SUPPORTED_CODEX_MODELS
 from ..config import (
     _LEGACY_ROLE_FIELDS,
@@ -71,6 +79,8 @@ from ..config import (
     binding_natural_key,
 )
 from ..db import config_bindings, config_globals
+
+_ROLES_ADAPTER: TypeAdapter[dict[RoleName, RoleConfig]] = TypeAdapter(dict[RoleName, RoleConfig])
 
 _log = logging.getLogger(__name__)
 
@@ -99,6 +109,28 @@ class BindingWrite(BaseModel):
     enabled: bool = True
     priority: int = 0
     version: int | None = None
+
+
+class RolesWrite(BaseModel):
+    """Global roles-matrix write. `roles` is the `{role: {agent, model,
+    effort}}` matrix; `version` is the optimistic-lock version the client
+    loaded (0 on a fresh, never-migrated DB)."""
+
+    roles: dict[str, Any]
+    version: int
+
+
+def _dump_roles(roles: dict[RoleName, RoleConfig]) -> dict[str, dict[str, Any]]:
+    """Sparse dump of a validated roles matrix — drop unset (`None`) cell
+    fields and any role whose cell is entirely empty, so an "inherit" choice is
+    stored as absence, not as an explicit null the UI would misread as a set
+    value."""
+    out: dict[str, dict[str, Any]] = {}
+    for name, role in roles.items():
+        cell = role.model_dump(exclude_none=True)
+        if cell:
+            out[name] = cell
+    return out
 
 
 def _now_iso(clock: Callable[[], datetime] | None) -> str:
@@ -371,12 +403,8 @@ async def _assemble_and_validate(
         global_roles = TypeAdapter(dict[RoleName, RoleConfig]).validate_python(globals_row.roles)
 
     trial = base.model_copy(update={"repos": [*others, candidate], "roles": global_roles})
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        try:
-            trial.validate_roles_matrix()
-        except (ValidationError, ValueError) as e:
-            raise _validation_error(["roles"], str(e)) from e
+    caught = _run_matrix_validators(trial)
+    await _reject_unsupported_efforts(trial)
     # `validate_roles_matrix` warns for every binding in the trial set; only the
     # candidate's own warnings are relevant to this save (others are unchanged).
     prefix = f"binding {candidate.project_key}/{candidate.github_repo}:"
@@ -385,6 +413,50 @@ async def _assemble_and_validate(
         for w in caught
         if issubclass(w.category, UserWarning) and str(w.message).startswith(prefix)
     ]
+
+
+def _run_matrix_validators(trial: Config) -> list[warnings.WarningMessage]:
+    """Run the roles-matrix validators over `trial`, returning the captured
+    warnings. Raises a 422 on any validator error (family/effort structural
+    check, legacy/matrix conflict, duplicate)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            trial.validate_roles_matrix()
+        except (ValidationError, ValueError) as e:
+            raise _validation_error(["roles"], str(e)) from e
+    return caught
+
+
+async def _reject_unsupported_efforts(trial: Config) -> None:
+    """Re-run the preflight capability check for every resolved *claude*
+    `(model, effort)` pair in `trial` — the same online Models-API source
+    preflight uses — so an unsupported pair fails here at save, not silently at
+    dispatch. codex efforts are the fixed family enum (already checked
+    structurally by `validate_roles_matrix`). A `None` result (no
+    `ANTHROPIC_API_KEY` anywhere, or a Models-API error) skips the pair: the
+    daemon may run claude via CLI auth, and the structural family check already
+    ran — exactly preflight's fail-open-on-cannot-validate behavior."""
+    pairs: set[tuple[str, str]] = set()
+    for binding in trial.repos:
+        for name in get_args(RoleName):
+            role = binding.resolved_role(name, trial.roles)
+            if role.agent == "claude" and role.model is not None and role.effort is not None:
+                pairs.add((role.model, role.effort))
+    caps: dict[str, list[str] | None] = {}
+    for model, effort in sorted(pairs):
+        if model not in caps:
+            try:
+                caps[model] = await fetch_claude_effort_capabilities(model)
+            except ValueError:
+                caps[model] = None
+        supported = caps[model]
+        if supported is not None and effort not in supported:
+            raise _validation_error(
+                ["roles"],
+                f"claude model {model!r} does not support effort {effort!r}; "
+                f"supported: {', '.join(supported)}",
+            )
 
 
 def _diff(
@@ -460,12 +532,28 @@ def create_config_crud_router(
 
     @router.get("/options")
     async def get_options() -> dict[str, Any]:
+        # Claude efforts are *per model*: the same Models-API capability source
+        # preflight and the save path use, so the form's effort dropdown offers
+        # exactly what the selected model accepts. A `None`/error result (no
+        # ANTHROPIC_API_KEY, or an API error) falls back to the family-wide set
+        # so the dropdown is never empty; the save path re-checks regardless.
+        family_efforts = sorted(SUPPORTED_CLAUDE_EFFORTS)
+        claude_efforts_by_model: dict[str, list[str]] = {}
+        for alias in sorted(CLAUDE_MODEL_ALIASES):
+            try:
+                caps = await fetch_claude_effort_capabilities(alias)
+            except ValueError:
+                caps = None
+            claude_efforts_by_model[alias] = caps if caps is not None else family_efforts
         return {
             "agent_families": ["claude", "codex"],
             "codex_models": sorted(SUPPORTED_CODEX_MODELS),
             "claude_aliases": sorted(CLAUDE_MODEL_ALIASES),
             "codex_efforts": sorted(SUPPORTED_CODEX_EFFORTS),
-            "claude_efforts": sorted(SUPPORTED_CLAUDE_EFFORTS),
+            # Family-wide union — the fallback the form uses for a full
+            # `claude-*` model ID typed in advanced JSON (no per-alias entry).
+            "claude_efforts": family_efforts,
+            "claude_efforts_by_model": claude_efforts_by_model,
             "merge_strategies": ["squash", "merge", "rebase"],
             # Lets the form default a new binding's `webhook_enabled` to what
             # will actually save: without a global secret, the write path
@@ -473,6 +561,59 @@ def create_config_crud_router(
             # sets a per-binding `webhook_secret`.
             "github_webhook_secret_configured": bool(_base_config().github_webhook_secret),
         }
+
+    @router.get("/roles")
+    async def get_roles() -> dict[str, Any]:
+        conn = await conn_provider()
+        row = await config_globals.get(conn)
+        if row is None:
+            # Fresh, never-migrated DB: no globals row → empty matrix at
+            # version 0, the version a first PUT must send.
+            return {"roles": {}, "version": 0}
+        return {"roles": row.roles, "version": row.version}
+
+    @router.put("/roles")
+    async def put_roles(
+        body: RolesWrite = Body(...),  # noqa: B008
+        updated_by: str = Depends(_updated_by),  # noqa: B008
+    ) -> dict[str, Any]:
+        base = _base_config()
+        try:
+            global_roles = _ROLES_ADAPTER.validate_python(body.roles)
+        except ValidationError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=[{"loc": ["roles", *err["loc"]], "msg": err["msg"]} for err in e.errors()],
+            ) from e
+        stored = _dump_roles(global_roles)
+        conn = await conn_provider()
+        async with lock:
+            existing = await config_bindings.list_all(conn)
+            others: list[RepoBinding] = []
+            for row in existing:
+                other = RepoBinding.model_validate({**row.payload, "enabled": row.enabled})
+                other.apply_tracker_secret_defaults(jira_base_url=base.jira_base_url)
+                others.append(other)
+            trial = base.model_copy(update={"repos": others, "roles": global_roles})
+            caught = _run_matrix_validators(trial)
+            await _reject_unsupported_efforts(trial)
+            try:
+                new_version = await config_globals.update_roles(
+                    conn, roles=stored, expected_version=body.version
+                )
+            except config_globals.StaleVersionError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "msg": "roles matrix was modified by another writer; reload and retry",
+                        "current_version": e.current_version,
+                    },
+                ) from e
+        # A global-matrix edit reaches every binding, so every binding's
+        # diversity warning is relevant here (unlike a single-binding save).
+        wgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+        _log.info("config roles matrix updated by %s → version %s", updated_by, new_version)
+        return {"roles": stored, "version": new_version, "warnings": wgs}
 
     @router.get("/bindings")
     async def list_bindings() -> list[dict[str, Any]]:

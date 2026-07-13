@@ -1273,7 +1273,10 @@ repos:
         Config.load(p)
 
 
-def test_roles_effort_without_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_roles_effort_without_model_validates_resolved_role(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """An effort override with no explicit model is family-checked against the
+    *resolved* role (SYM-191 relaxation): agent codex + effort `high` resolves
+    to a codex role and validates, no explicit model required."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1287,7 +1290,28 @@ repos:
 """
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
-    with pytest.raises(ValidationError, match="effort.*requires.*model"):
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "high"
+
+
+def test_roles_effort_without_model_bad_family_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The resolved-role effort check still rejects an effort outside the
+    resolved agent's family even with no explicit model: agent codex + effort
+    `xhigh` (a Claude-only level) fails against the resolved codex role."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    roles:
+      implement:
+        effort: xhigh
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Codex effort"):
         Config.load(p)
 
 

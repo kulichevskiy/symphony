@@ -18,8 +18,12 @@ import {
   fetchBindings,
   fetchConfigOptions,
   fetchConfigView,
+  fetchRoles,
   type FieldError,
+  type RoleCell,
+  type RolesMatrix,
   updateBinding,
+  updateRoles,
 } from "@/lib/api";
 
 // Pipeline roles in dispatch order; the config view keys its `roles` map by
@@ -31,6 +35,132 @@ const ROLE_ORDER = [
   "fix",
   "accept",
 ] as const;
+
+// --- Role matrix editing (SYM-191) -------------------------------------------
+
+/** Models offered for an explicitly-picked agent. An inherited (empty) agent
+ *  leaves the family unknown client-side, so the model cell only offers
+ *  "inherit" — the server resolves the inherited model. */
+function modelsFor(options: ConfigOptions, agent: string): string[] {
+  if (agent === "codex") return options.codex_models;
+  if (agent === "claude") return options.claude_aliases;
+  return [];
+}
+
+/** Efforts offered for an (agent, model) pick. Claude efforts are per model
+ *  (the live capability set); an inherited agent offers the union so an effort
+ *  override over an inherited model is still selectable — the server
+ *  family-checks it against the resolved role. */
+function effortsFor(options: ConfigOptions, agent: string, model: string): string[] {
+  if (agent === "codex") return options.codex_efforts;
+  if (agent === "claude") {
+    return options.claude_efforts_by_model[model] ?? options.claude_efforts;
+  }
+  return [...new Set([...options.claude_efforts, ...options.codex_efforts])].sort();
+}
+
+/** The 5-role × (agent, model, effort) matrix editor. Every cell offers an
+ *  explicit "inherit" (empty value); a set value is an override. Used for both
+ *  the per-binding matrix and the global card, distinguished by `scope` (which
+ *  also namespaces the aria-labels so both can render on one page). */
+export function RoleMatrixEditor({
+  scope,
+  roles,
+  options,
+  onChange,
+}: {
+  scope: string;
+  roles: RolesMatrix;
+  options: ConfigOptions;
+  onChange: (next: RolesMatrix) => void;
+}) {
+  function cellChange(role: string, field: keyof RoleCell, value: string) {
+    const next: RolesMatrix = { ...roles };
+    const cell: RoleCell = { ...(next[role] ?? {}) };
+    if (value === "") delete cell[field];
+    else cell[field] = value;
+    // Switching the agent can strand an out-of-family model/effort — clear
+    // them so the row never carries a pair the new agent would reject.
+    if (field === "agent") {
+      delete cell.model;
+      delete cell.effort;
+    }
+    if (Object.keys(cell).length === 0) delete next[role];
+    else next[role] = cell;
+    onChange(next);
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-md border border-border">
+      <table className="w-full caption-bottom text-sm">
+        <thead>
+          <tr className="border-b border-border bg-secondary/40 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            <th className="px-3 py-1.5 text-left font-medium">Role</th>
+            <th className="px-3 py-1.5 text-left font-medium">Agent</th>
+            <th className="px-3 py-1.5 text-left font-medium">Model</th>
+            <th className="px-3 py-1.5 text-left font-medium">Effort</th>
+          </tr>
+        </thead>
+        <tbody>
+          {ROLE_ORDER.map((role) => {
+            const cell = roles[role] ?? {};
+            const agent = String(cell.agent ?? "");
+            const model = String(cell.model ?? "");
+            const effort = String(cell.effort ?? "");
+            return (
+              <tr key={role} className="border-b border-border/70 last:border-0">
+                <td className="px-3 py-2 font-mono text-xs">{role}</td>
+                <td className="px-3 py-2">
+                  <Select
+                    value={agent}
+                    onChange={(e) => cellChange(role, "agent", e.target.value)}
+                    aria-label={`${scope} ${role} agent`}
+                  >
+                    <option value="">inherit</option>
+                    {options.agent_families.map((a) => (
+                      <option key={a} value={a}>
+                        {a}
+                      </option>
+                    ))}
+                  </Select>
+                </td>
+                <td className="px-3 py-2">
+                  <Select
+                    value={model}
+                    onChange={(e) => cellChange(role, "model", e.target.value)}
+                    aria-label={`${scope} ${role} model`}
+                    disabled={agent === ""}
+                  >
+                    <option value="">inherit</option>
+                    {modelsFor(options, agent).map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </Select>
+                </td>
+                <td className="px-3 py-2">
+                  <Select
+                    value={effort}
+                    onChange={(e) => cellChange(role, "effort", e.target.value)}
+                    aria-label={`${scope} ${role} effort`}
+                  >
+                    <option value="">inherit</option>
+                    {effortsFor(options, agent, model).map((ef) => (
+                      <option key={ef} value={ef}>
+                        {ef}
+                      </option>
+                    ))}
+                  </Select>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 /** One binding's resolved role matrix (read-only projection). */
 function BindingCard({ binding }: { binding: ConfigView["bindings"][number] }) {
@@ -142,6 +272,7 @@ const CURATED_KEYS = [
   "verify_cmd",
   "webhook_enabled",
   "webhook_secret",
+  "roles",
 ];
 
 function get(payload: Record<string, unknown>, key: string): unknown {
@@ -490,6 +621,29 @@ export function BindingForm({
           </>,
         )}
 
+        <div className="space-y-1">
+          <span className="text-xs font-medium text-muted-foreground">
+            Roles (per-binding overrides — inherit falls back to the global
+            matrix)
+          </span>
+          <RoleMatrixEditor
+            scope="binding"
+            roles={(payload.roles as RolesMatrix | undefined) ?? {}}
+            options={options}
+            onChange={(next) => {
+              const cleaned = { ...payload };
+              if (Object.keys(next).length === 0) delete cleaned.roles;
+              else cleaned.roles = next;
+              patch(cleaned);
+            }}
+          />
+          {bindingErrorFor(fieldErrors, "roles") ? (
+            <span className="block text-xs text-destructive" role="alert">
+              {bindingErrorFor(fieldErrors, "roles")}
+            </span>
+          ) : null}
+        </div>
+
         <details className="rounded-md border border-border p-3">
           <summary className="cursor-pointer text-sm font-medium">
             Advanced (raw JSON)
@@ -754,6 +908,106 @@ export function BindingsPanel({
   );
 }
 
+/** Editor for the fleet-wide global roles matrix (its own version + conflict
+ *  handling). Non-blocking diversity warnings render as a banner; the save
+ *  still succeeds. */
+export function GlobalRolesCard({
+  initialRoles,
+  initialVersion,
+  options,
+  onSaved,
+}: {
+  initialRoles: RolesMatrix;
+  initialVersion: number;
+  options: ConfigOptions;
+  onSaved?: () => void;
+}) {
+  const [roles, setRoles] = useState<RolesMatrix>(initialRoles);
+  const [version, setVersion] = useState(initialVersion);
+  const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
+  const [conflict, setConflict] = useState<number | null | false>(false);
+  const [warnings, setWarnings] = useState<string[] | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setSaving(true);
+    setFieldErrors([]);
+    setConflict(false);
+    setWarnings(null);
+    try {
+      const saved = await updateRoles({ roles, version });
+      setVersion(saved.version);
+      setRoles(saved.roles);
+      setWarnings(saved.warnings?.length ? saved.warnings : null);
+      onSaved?.();
+    } catch (e) {
+      if (e instanceof ConfigWriteError) {
+        if (e.status === 422) setFieldErrors(e.fieldErrors);
+        else if (e.status === 409) setConflict(e.conflictVersion);
+        else setFieldErrors([{ loc: ["_"], msg: e.message }]);
+      } else {
+        setFieldErrors([{ loc: ["_"], msg: "Unexpected error" }]);
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const rolesErr =
+    bindingErrorFor(fieldErrors, "roles") ?? bindingErrorFor(fieldErrors, "_");
+
+  return (
+    <Card className="space-y-4 p-5">
+      <div>
+        <h2 className="text-lg font-semibold">Global roles matrix</h2>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          Fleet-wide default agent/model/effort per role. Per-binding cells set
+          to inherit fall back here.
+        </p>
+      </div>
+
+      {conflict !== false ? (
+        <Alert className="border-destructive/50" role="alert">
+          <AlertTitle>Edit conflict</AlertTitle>
+          <AlertDescription>
+            The global matrix changed since you loaded it
+            {conflict != null ? ` (now version ${conflict})` : ""}. Reload and
+            reapply your edit.
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {rolesErr ? (
+        <Alert className="border-destructive/50" role="alert">
+          <AlertDescription>{rolesErr}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      {warnings?.length ? (
+        <Alert role="status">
+          <AlertTitle>Saved with warnings</AlertTitle>
+          <AlertDescription>
+            {warnings.map((w) => (
+              <div key={w}>{w}</div>
+            ))}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      <RoleMatrixEditor
+        scope="global"
+        roles={roles}
+        options={options}
+        onChange={setRoles}
+      />
+
+      <Button onClick={save} disabled={saving} type="button">
+        {saving ? "Saving…" : "Save global matrix"}
+      </Button>
+    </Card>
+  );
+}
+
 export function ConfigPage() {
   const view = useQuery({
     queryKey: ["config"],
@@ -777,9 +1031,16 @@ export function ConfigPage() {
     staleTime: Infinity,
     retry: retryUnlessNotFound,
   });
+  const roles = useQuery({
+    queryKey: ["config", "roles"],
+    queryFn: fetchRoles,
+    staleTime: Infinity,
+    retry: retryUnlessNotFound,
+  });
 
   function refetchAll() {
     void bindings.refetch();
+    void roles.refetch();
     void view.refetch();
   }
 
@@ -804,12 +1065,26 @@ export function ConfigPage() {
       </div>
 
       {bindings.data && options.data ? (
-        <div className="mb-8">
+        <div className="mb-8 space-y-8">
           <BindingsPanel
             bindings={bindings.data}
             options={options.data}
             onChanged={refetchAll}
           />
+          {roles.data ? (
+            // The card tracks its own version/roles across saves (updating
+            // from each PUT response), so it isn't keyed on the fetched
+            // version — remounting would wipe the just-shown warning banner.
+            // A save refreshes the resolved matrix below via `onSaved`.
+            <GlobalRolesCard
+              initialRoles={roles.data.roles}
+              initialVersion={roles.data.version}
+              options={options.data}
+              onSaved={() => {
+                void view.refetch();
+              }}
+            />
+          ) : null}
         </div>
       ) : isReadOnlyConfig ? (
         <div className="mb-8 rounded-md border border-border p-6 text-sm text-muted-foreground">

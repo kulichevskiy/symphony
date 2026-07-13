@@ -782,27 +782,22 @@ class Config(BaseModel):
                         f"role {name!r}: unknown {family} model {role.model!r}; "
                         f"supported: {', '.join(supported)}"
                     )
-                if explicit_effort:
-                    # The effort/model pair is validated together (a model can
-                    # constrain its valid efforts), and only the model pins the
-                    # family — so effort without an explicit model can't be
-                    # checked locally.
-                    if not explicit_model:
-                        raise ValueError(
-                            f"role {name!r}: effort {role.effort!r} requires an "
-                            f"explicit model (the effort/model pair can't be "
-                            f"validated otherwise)"
-                        )
-                    if not _role_effort_in_family(role.agent, role.effort):
-                        if role.agent == "codex":
-                            family, supported = "Codex", sorted(SUPPORTED_CODEX_EFFORTS)
-                        else:
-                            family, supported = "Claude", sorted(SUPPORTED_CLAUDE_EFFORTS)
-                        raise ValueError(
-                            f"role {name!r}: unknown {family} effort "
-                            f"{role.effort!r}; supported: "
-                            f"{', '.join(supported)}"
-                        )
+                if explicit_effort and not _role_effort_in_family(role.agent, role.effort):
+                    # The effort is family-checked against the *resolved* role,
+                    # not the explicit cell: server-side assembly resolves the
+                    # inherited agent (and model) so an effort override over an
+                    # inherited model still validates (SYM-191). The exact
+                    # `(model, effort)` capability pair is a separate online
+                    # check the save path and preflight run.
+                    if role.agent == "codex":
+                        family, supported = "Codex", sorted(SUPPORTED_CODEX_EFFORTS)
+                    else:
+                        family, supported = "Claude", sorted(SUPPORTED_CLAUDE_EFFORTS)
+                    raise ValueError(
+                        f"role {name!r}: unknown {family} effort "
+                        f"{role.effort!r}; supported: "
+                        f"{', '.join(supported)}"
+                    )
             implement = binding.resolved_role("implement", self.roles)
             for review_name in ("review_find", "review_verify"):
                 review = binding.resolved_role(review_name, self.roles)

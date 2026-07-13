@@ -458,7 +458,12 @@ export interface ConfigOptions {
   codex_models: string[];
   claude_aliases: string[];
   codex_efforts: string[];
+  /** Family-wide Claude effort union — the fallback for a full `claude-*`
+   *  model ID with no per-alias entry. */
   claude_efforts: string[];
+  /** Claude efforts keyed by model alias — the selected model's dropdown; the
+   *  live capability source, so an unsupported pair can't be offered. */
+  claude_efforts_by_model: Record<string, string[]>;
   merge_strategies: string[];
   /** Whether a global `GITHUB_WEBHOOK_SECRET` is configured — when false, a
    *  new binding's default `webhook_enabled: true` needs a per-binding
@@ -583,6 +588,64 @@ export async function deleteBinding(id: number, version: number): Promise<void> 
     throw new ConfigWriteError("Binding was modified by another writer", 409, [], detail?.detail?.current_version ?? null);
   }
   throw new ConfigWriteError("Failed to delete binding", response.status);
+}
+
+/** One pipeline-role override cell. Any field left undefined "inherits" (the
+ *  global matrix, then the back-compat default). */
+export interface RoleCell {
+  agent?: string | null;
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** A roles matrix keyed by role name (`implement`, `review_find`, …). */
+export type RolesMatrix = Record<string, RoleCell>;
+
+/** The global roles matrix with its own optimistic-lock version. */
+export interface RolesResponse {
+  roles: RolesMatrix;
+  version: number;
+  /** Non-blocking warnings from the last write (e.g. lost review diversity). */
+  warnings?: string[];
+}
+
+export function fetchRoles(): Promise<RolesResponse> {
+  return fetchJson<RolesResponse>(
+    "/api/config/roles",
+    "Roles not found",
+    "Failed to load roles matrix",
+  );
+}
+
+export async function updateRoles(body: {
+  roles: RolesMatrix;
+  version: number;
+}): Promise<RolesResponse> {
+  const response = await fetch("/api/config/roles", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(await authHeaders()),
+    },
+    body: JSON.stringify(body),
+  });
+  if (response.ok) {
+    return (await response.json()) as RolesResponse;
+  }
+  const detail = await response.json().catch(() => null);
+  if (response.status === 422 && Array.isArray(detail?.detail)) {
+    throw new ConfigWriteError("Validation failed", 422, detail.detail as FieldError[]);
+  }
+  if (response.status === 409) {
+    throw new ConfigWriteError(
+      "Roles matrix was modified by another writer",
+      409,
+      [],
+      detail?.detail?.current_version ?? null,
+    );
+  }
+  throw new ConfigWriteError("Failed to save roles matrix", response.status);
 }
 
 export function fetchAuthConfig(): Promise<AuthConfig> {

@@ -9,10 +9,21 @@ import {
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { BindingRecord, ConfigOptions, ConfigView } from "@/lib/api";
+import type {
+  BindingRecord,
+  ConfigOptions,
+  ConfigView,
+  RolesMatrix,
+} from "@/lib/api";
 import { registerTokenProvider } from "@/lib/auth";
 
-import { BindingForm, BindingsPanel, ConfigDetails } from "./ConfigPage";
+import {
+  BindingForm,
+  BindingsPanel,
+  ConfigDetails,
+  GlobalRolesCard,
+  RoleMatrixEditor,
+} from "./ConfigPage";
 
 const config: ConfigView = {
   read_only: true,
@@ -38,6 +49,11 @@ const OPTIONS: ConfigOptions = {
   claude_aliases: ["haiku", "opus", "sonnet"],
   codex_efforts: ["high", "low", "medium", "minimal"],
   claude_efforts: ["high", "low", "max", "medium", "xhigh"],
+  claude_efforts_by_model: {
+    opus: ["low", "medium", "high"],
+    sonnet: ["low", "medium"],
+    haiku: ["low"],
+  },
   merge_strategies: ["squash", "merge", "rebase"],
   github_webhook_secret_configured: true,
 };
@@ -271,15 +287,18 @@ describe("BindingForm", () => {
     expect((screen.getByText("Save") as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("renders a 422 roles error under the advanced section with its path", async () => {
+  it("renders a 422 roles error at the roles matrix, not hidden in advanced", async () => {
     mockFetch(422, { detail: [{ loc: ["roles"], msg: "unknown Codex model 'x'" }] });
     render(
       <BindingForm binding={null} options={OPTIONS} onSaved={() => {}} onCancel={() => {}} />,
     );
     fireEvent.click(screen.getByText("Save"));
+    // Curated now — rendered as the raw message at the matrix, not prefixed
+    // with its `roles.` path under the advanced JSON section.
     await waitFor(() =>
-      expect(screen.getByText("roles: unknown Codex model 'x'")).toBeTruthy(),
+      expect(screen.getByText("unknown Codex model 'x'")).toBeTruthy(),
     );
+    expect(screen.queryByText("roles: unknown Codex model 'x'")).toBeNull();
   });
 
   it("renders a 422 allow_auto_merge error under the advanced section, not silently", async () => {
@@ -295,6 +314,49 @@ describe("BindingForm", () => {
         screen.getByText("allow_auto_merge: input should be a valid boolean"),
       ).toBeTruthy(),
     );
+  });
+
+  it("includes a per-binding role override in the saved payload", async () => {
+    const fetchMock = mockFetch(200, record({ version: 5 }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm binding={record()} options={OPTIONS} onSaved={onSaved} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByLabelText("binding review_find agent"), {
+      target: { value: "codex" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.payload.roles.review_find).toEqual({ agent: "codex" });
+  });
+
+  it("renders an existing per-binding role override as a set cell", () => {
+    render(
+      <BindingForm
+        binding={record({
+          payload: {
+            project_key: "ENG",
+            github_repo: "org/repo",
+            states: { ready: "Todo" },
+            roles: { implement: { agent: "codex", model: "gpt-5.1-codex" } },
+          },
+        })}
+        options={OPTIONS}
+        onSaved={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("binding implement agent") as HTMLSelectElement).value,
+    ).toBe("codex");
+    expect(
+      (screen.getByLabelText("binding implement model") as HTMLSelectElement).value,
+    ).toBe("gpt-5.1-codex");
+    // A role left unset stays at inherit.
+    expect(
+      (screen.getByLabelText("binding fix agent") as HTMLSelectElement).value,
+    ).toBe("");
   });
 
   it("shows a conflict banner on a 409", async () => {
@@ -412,5 +474,133 @@ describe("BindingsPanel", () => {
     // backend 422s any write carrying `enabled: false`.
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/config/bindings/1");
+  });
+});
+
+describe("RoleMatrixEditor", () => {
+  it("offers an explicit inherit option in every cell", () => {
+    render(
+      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
+    );
+    const agent = screen.getByLabelText("binding implement agent") as HTMLSelectElement;
+    expect([...agent.options].map((o) => o.value)).toEqual(["", "claude", "codex"]);
+    expect(agent.value).toBe("");
+  });
+
+  it("varies Claude effort options by the selected model", () => {
+    // opus supports low/medium/high; sonnet only low/medium (per OPTIONS).
+    let roles: RolesMatrix = {
+      implement: { agent: "claude", model: "opus" },
+    };
+    const { rerender } = render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    const effortOpts = () =>
+      [...(screen.getByLabelText("binding implement effort") as HTMLSelectElement).options].map(
+        (o) => o.value,
+      );
+    expect(effortOpts()).toEqual(["", "low", "medium", "high"]);
+
+    rerender(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ implement: { agent: "claude", model: "sonnet" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(effortOpts()).toEqual(["", "low", "medium"]);
+  });
+
+  it("clears model/effort when the agent changes families", () => {
+    let roles: RolesMatrix = {
+      implement: { agent: "claude", model: "opus", effort: "high" },
+    };
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement agent"), {
+      target: { value: "codex" },
+    });
+    expect(roles.implement).toEqual({ agent: "codex" });
+  });
+});
+
+const rolesResponse = (over: Partial<{ roles: RolesMatrix; version: number; warnings: string[] }> = {}) => ({
+  roles: {},
+  version: 2,
+  ...over,
+});
+
+describe("GlobalRolesCard", () => {
+  it("saves the edited matrix carrying its version", async () => {
+    const fetchMock = mockFetch(200, rolesResponse({ version: 3 }));
+    const onSaved = vi.fn();
+    render(
+      <GlobalRolesCard
+        initialRoles={{}}
+        initialVersion={2}
+        options={OPTIONS}
+        onSaved={onSaved}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("global implement agent"), {
+      target: { value: "codex" },
+    });
+    fireEvent.click(screen.getByText("Save global matrix"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/config/roles");
+    expect(init?.method).toBe("PUT");
+    const sent = JSON.parse(init?.body as string);
+    expect(sent.version).toBe(2);
+    expect(sent.roles.implement).toEqual({ agent: "codex" });
+  });
+
+  it("shows a non-blocking warning banner and still succeeds", async () => {
+    mockFetch(200, rolesResponse({ warnings: ["cross-family review diversity is lost"] }));
+    render(
+      <GlobalRolesCard initialRoles={{}} initialVersion={0} options={OPTIONS} />,
+    );
+    fireEvent.click(screen.getByText("Save global matrix"));
+    await waitFor(() =>
+      expect(screen.getByText("cross-family review diversity is lost")).toBeTruthy(),
+    );
+    expect(screen.getByText("Saved with warnings")).toBeTruthy();
+  });
+
+  it("renders a conflict banner on a 409", async () => {
+    mockFetch(409, { detail: { current_version: 9, msg: "conflict" } });
+    render(
+      <GlobalRolesCard initialRoles={{}} initialVersion={2} options={OPTIONS} />,
+    );
+    fireEvent.click(screen.getByText("Save global matrix"));
+    await waitFor(() => expect(screen.getByText(/Edit conflict/)).toBeTruthy());
+    expect(screen.getByText(/now version 9/)).toBeTruthy();
+  });
+
+  it("renders a 422 validation error", async () => {
+    mockFetch(422, { detail: [{ loc: ["roles"], msg: "unknown Claude effort 'turbo'" }] });
+    render(
+      <GlobalRolesCard initialRoles={{}} initialVersion={2} options={OPTIONS} />,
+    );
+    fireEvent.click(screen.getByText("Save global matrix"));
+    await waitFor(() =>
+      expect(screen.getByText("unknown Claude effort 'turbo'")).toBeTruthy(),
+    );
   });
 });

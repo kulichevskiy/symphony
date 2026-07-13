@@ -819,3 +819,160 @@ async def test_crud_router_not_mounted_when_yaml_owns_topology(tmp_path: Path) -
         assert created.status_code == 404
     finally:
         await conn.close()
+
+
+# --- global roles matrix (SYM-191) -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_roles_get_put_round_trip(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            # Fresh DB: no globals row yet → empty matrix at version 0.
+            got = await client.get("/api/config/roles")
+            assert got.status_code == 200
+            assert got.json() == {"roles": {}, "version": 0}
+
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+            assert put.status_code == 200, put.text
+            assert put.json()["version"] == 1
+            assert put.json()["roles"] == {"implement": {"agent": "codex"}}
+
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {
+                "roles": {"implement": {"agent": "codex"}},
+                "version": 1,
+            }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_version_conflict(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            first = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+            assert first.status_code == 200
+            # A second write still carrying the stale version 0 → 409.
+            stale = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "claude"}}, "version": 0},
+            )
+            assert stale.status_code == 409
+            assert stale.json()["detail"]["current_version"] == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_diversity_warning_non_blocking(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post("/api/config/bindings", json={"payload": _payload()})
+            assert created.status_code == 201, created.text
+            # Bindings default implement→claude; forcing the reviewer to claude
+            # too loses cross-family diversity — a non-blocking warning.
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"review_find": {"agent": "claude"}}, "version": 0},
+            )
+            assert put.status_code == 200, put.text
+            assert any("diversity" in w for w in put.json()["warnings"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_effort_with_inherited_model_saves(tmp_path: Path) -> None:
+    """An effort override with no explicit model saves — it is family-checked
+    against the resolved role, not rejected for lacking a model (SYM-191)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(roles={"implement": {"effort": "high"}})},
+            )
+            assert created.status_code == 201, created.text
+            assert created.json()["payload"]["roles"] == {"implement": {"effort": "high"}}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_claude_efforts_per_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return {"opus": ["low", "high"], "sonnet": ["medium"]}.get(model, ["low"])
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        body = resp.json()
+        assert body["claude_efforts_by_model"]["opus"] == ["low", "high"]
+        assert body["claude_efforts_by_model"]["sonnet"] == ["medium"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_claude_efforts_fall_back_without_key(tmp_path: Path) -> None:
+    """No ANTHROPIC_API_KEY → the capability fetch returns None; the endpoint
+    falls back to the family-wide effort set rather than an empty list."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        body = resp.json()
+        assert set(body["claude_efforts_by_model"]["opus"]) == {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_save_rejects_unsupported_claude_effort(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A claude (model, effort) pair the live capability check rejects fails at
+    save with a `roles` field path — not silently at dispatch."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return ["low", "medium"]
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}}
+                    )
+                },
+            )
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
