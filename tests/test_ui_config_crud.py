@@ -965,6 +965,65 @@ async def test_options_claude_efforts_per_model(tmp_path: Path, monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_options_uses_dotenv_sourced_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """`ANTHROPIC_API_KEY` living only in `.env` (not `os.environ`) must still
+    drive the options capability fetch, matching the save path's key
+    resolution (`_env_key_source`) — otherwise the dropdown falls back to the
+    family-wide set while save validates against the narrower per-model set
+    (SYM-191 review)."""
+    seen_keys: list[str | None] = []
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        seen_keys.append(api_key)
+        return ["low", "medium"]
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    monkeypatch.setattr(
+        "symphony.ui.config_crud._env_key_source",
+        lambda: {"ANTHROPIC_API_KEY": "dotenv-only-key"},
+    )
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        assert resp.status_code == 200
+        assert seen_keys and all(key == "dotenv-only-key" for key in seen_keys)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_fetches_claude_efforts_concurrently(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Per-alias capability fetches must run concurrently, not sequentially —
+    a slow/unreachable Anthropic API should cost one wait, not one per alias
+    (SYM-191 review)."""
+    import asyncio
+
+    concurrent = 0
+    max_concurrent = 0
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        nonlocal concurrent, max_concurrent
+        concurrent += 1
+        max_concurrent = max(max_concurrent, concurrent)
+        await asyncio.sleep(0.05)
+        concurrent -= 1
+        return ["low"]
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        assert resp.status_code == 200
+        assert max_concurrent > 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_options_claude_efforts_fall_back_without_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """No ANTHROPIC_API_KEY → the capability fetch returns None; the endpoint
     falls back to the family-wide effort set rather than an empty list."""

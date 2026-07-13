@@ -590,13 +590,20 @@ def create_config_crud_router(
         # ANTHROPIC_API_KEY, or an API error) falls back to the family-wide set
         # so the dropdown is never empty; the save path re-checks regardless.
         family_efforts = sorted(SUPPORTED_CLAUDE_EFFORTS)
-        claude_efforts_by_model: dict[str, list[str]] = {}
-        for alias in sorted(CLAUDE_MODEL_ALIASES):
+        process_key = _env_key_source().get("ANTHROPIC_API_KEY", "")
+        aliases = sorted(CLAUDE_MODEL_ALIASES)
+
+        async def _caps(alias: str) -> list[str] | None:
             try:
-                caps = await fetch_claude_effort_capabilities(alias)
+                return await fetch_claude_effort_capabilities(alias, process_key)
             except ValueError:
-                caps = None
-            claude_efforts_by_model[alias] = caps if caps is not None else family_efforts
+                return None
+
+        results = await asyncio.gather(*(_caps(alias) for alias in aliases))
+        claude_efforts_by_model: dict[str, list[str]] = {
+            alias: caps if caps is not None else family_efforts
+            for alias, caps in zip(aliases, results, strict=True)
+        }
         return {
             "agent_families": ["claude", "codex"],
             "codex_models": sorted(SUPPORTED_CODEX_MODELS),
