@@ -302,6 +302,34 @@ async def test_legacy_role_field_rejected_with_loc(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_unknown_field_rejected_with_loc(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings", json={"payload": _payload(max_concurent=3)}
+            )
+            assert resp.status_code == 422
+            assert resp.json()["detail"][0]["loc"] == ["max_concurent"]
+
+            # Persisted `.env`/YAML-alias spellings are legal, not unknown.
+            aliased = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": {
+                        "linear_team_key": "ENG",
+                        "github_repo": "org/repo2",
+                        "linear_states": {"ready": "Todo"},
+                    }
+                },
+            )
+            assert aliased.status_code == 201
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_roles_matrix_error_shows_roles_path(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:

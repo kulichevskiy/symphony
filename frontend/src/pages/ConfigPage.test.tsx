@@ -282,6 +282,21 @@ describe("BindingForm", () => {
     );
   });
 
+  it("renders a 422 allow_auto_merge error under the advanced section, not silently", async () => {
+    mockFetch(422, {
+      detail: [{ loc: ["allow_auto_merge"], msg: "input should be a valid boolean" }],
+    });
+    render(
+      <BindingForm binding={null} options={OPTIONS} onSaved={() => {}} onCancel={() => {}} />,
+    );
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(
+        screen.getByText("allow_auto_merge: input should be a valid boolean"),
+      ).toBeTruthy(),
+    );
+  });
+
   it("shows a conflict banner on a 409", async () => {
     mockFetch(409, { detail: { current_version: 8, msg: "conflict" } });
     render(
@@ -370,5 +385,32 @@ describe("BindingsPanel", () => {
     expect(url).toBe("/api/config/bindings/1");
     const body = JSON.parse(init?.body as string);
     expect(body.priority).toBe(1);
+  });
+
+  it("excludes disabled rows from the reorder write set", async () => {
+    const fetchMock = mockFetch(200, record());
+    const onChanged = vi.fn();
+    render(
+      <BindingsPanel
+        bindings={[
+          record({ id: 1, priority: 0, version: 2, github_repo: "org/aaa" }),
+          record({
+            id: 2,
+            priority: 0,
+            version: 3,
+            enabled: false,
+            github_repo: "org/other",
+          }),
+        ]}
+        options={OPTIONS}
+        onChanged={onChanged}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("move down 1"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    // Both rows renumber, but the disabled one must not be written — the
+    // backend 422s any write carrying `enabled: false`.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/config/bindings/1");
   });
 });

@@ -76,6 +76,11 @@ _SECRET_FIELDS = frozenset({"webhook_secret"})
 # Control keys owned by dedicated columns, never part of the sparse payload.
 _CONTROL_KEYS = frozenset({"enabled", "priority", "version", "id"})
 
+# Legacy alias spellings `RepoBinding` accepts via `AliasChoices` in addition to
+# their canonical field names (`project_key`, `states`) — not in `model_fields`
+# but not "unknown" either.
+_FIELD_ALIASES = frozenset({"linear_team_key", "linear_states"})
+
 
 class BindingWrite(BaseModel):
     """Create/update request. `payload` is the sparse operator-set
@@ -168,6 +173,18 @@ def _validate_binding(payload: dict[str, Any], *, jira_base_url: str) -> RepoBin
             status_code=422,
             detail=[{"loc": list(err["loc"]), "msg": err["msg"]} for err in e.errors()],
         ) from e
+    # `RepoBinding` has no `extra="forbid"` (pydantic default `extra="ignore"`),
+    # so a typo'd key would otherwise pass validation, persist verbatim, and be
+    # silently ignored by the daemon forever — fail closed instead.
+    unknown = sorted(
+        k for k in payload if k not in RepoBinding.model_fields and k not in _FIELD_ALIASES
+    )
+    if unknown:
+        raise _validation_error(
+            [unknown[0]],
+            f"unknown field(s) {', '.join(unknown)}; not part of RepoBinding "
+            f"(known fields: {', '.join(sorted(RepoBinding.model_fields))})",
+        )
     # `model_validate` derives `tracker_site` with no global `jira_base_url`,
     # so a Jira binding relying on that global (no per-binding `base_url`)
     # would key on the "default" placeholder instead of the site it actually

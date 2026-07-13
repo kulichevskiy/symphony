@@ -138,7 +138,6 @@ const CURATED_KEYS = [
   "remote_review",
   "merge_strategy",
   "auto_merge",
-  "allow_auto_merge",
   "verify_cmd",
   "webhook_enabled",
   "webhook_secret",
@@ -654,9 +653,13 @@ export function BindingsPanel({
     // Renumber against the new positions so the swap is never a no-op (e.g.
     // every new binding defaults to priority 0) — a plain value swap between
     // two equal priorities writes nothing and the sort order never changes.
+    // Disabled rows are excluded: the backend rejects any write carrying
+    // `enabled: false` (the lifecycle guard ships in SYM-193), so renumbering
+    // one would 422 the whole reorder even though its priority display value
+    // never actually changes anything today.
     const writes = ordered
       .map((b) => ({ b, priority: moved.findIndex((m) => m.id === b.id) }))
-      .filter(({ b, priority }) => b.priority !== priority);
+      .filter(({ b, priority }) => b.enabled && b.priority !== priority);
 
     try {
       for (const { b, priority } of writes) {
