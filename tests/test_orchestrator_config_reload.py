@@ -129,12 +129,8 @@ async def test_binding_removed_mid_run_prunes_its_queue_scope(tmp_path: Path) ->
     try:
         _seed_team(harness, "OPS")
         await harness.warmup()
-        harness.sim.seed_issue(
-            identifier="ENG-1", team_key="ENG", state_name=READY, title="kept"
-        )
-        harness.sim.seed_issue(
-            identifier="OPS-1", team_key="OPS", state_name=READY, title="queued"
-        )
+        harness.sim.seed_issue(identifier="ENG-1", team_key="ENG", state_name=READY, title="kept")
+        harness.sim.seed_issue(identifier="OPS-1", team_key="OPS", state_name=READY, title="queued")
         await harness.step()
         scopes = await _queue_scopes(harness.conn)
         assert any(team == "OPS" for team, _ in scopes)
@@ -262,9 +258,7 @@ async def test_last_binding_removed_mid_run_empties_topology_and_prunes_scope(
     harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
     try:
         await harness.warmup()
-        harness.sim.seed_issue(
-            identifier="ENG-1", team_key="ENG", state_name=READY, title="queued"
-        )
+        harness.sim.seed_issue(identifier="ENG-1", team_key="ENG", state_name=READY, title="queued")
         await harness.step()
         scopes = await _queue_scopes(harness.conn)
         assert any(team == "ENG" for team, _ in scopes)
@@ -312,9 +306,7 @@ async def test_hot_added_binding_bad_waiting_state_raises_on_first_load(
         )
         await harness.step()
 
-        ops_binding = next(
-            b for b in harness.orch.config.repos if b.linear_team_key == "OPS"
-        )
+        ops_binding = next(b for b in harness.orch.config.repos if b.linear_team_key == "OPS")
         with pytest.raises(LinearError, match="Blocked"):
             await harness.orch._states_for_binding(ops_binding)  # noqa: SLF001
     finally:
@@ -378,9 +370,7 @@ async def test_scan_failure_on_one_binding_does_not_starve_the_rest(
         await harness.warmup()
         _seed_team(harness, "OPS")
         # A second binding on a tracker site whose hot-add will fail below.
-        await _insert(
-            harness.conn, team="OPS", repo="org/ops", site="broken-site", priority=0
-        )
+        await _insert(harness.conn, team="OPS", repo="org/ops", site="broken-site", priority=0)
         real_factory = harness.orch._tracker_factory  # noqa: SLF001
 
         def _flaky_factory(binding):
