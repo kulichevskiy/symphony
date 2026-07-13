@@ -881,7 +881,19 @@ class _OrchestratorBase:
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("review resurrection failed")
         for binding in self.config.repos:
-            scheduled.extend(await self._scan_binding(binding))
+            ctx = _tracker_context_for_binding(binding)
+            if not self._tracker_context_registered(ctx):
+                log.warning(
+                    "skipping scan for %s: tracker context %s not registered "
+                    "(hot-add likely failed)",
+                    binding.linear_team_key,
+                    ctx,
+                )
+                continue
+            try:
+                scheduled.extend(await self._scan_binding(binding))
+            except Exception:  # noqa: BLE001 — one dead lane must not starve the rest
+                log.exception("scan failed for binding %s", binding.linear_team_key)
         try:
             await self._poll_slash_commands()
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -912,6 +924,9 @@ class _OrchestratorBase:
         argv/env captured at its dispatch. `_react_to_binding_set` (called next
         in `_tick`) reconciles the tracker registry and queue scopes.
         """
+        previous_states_by_key = {
+            _binding_key(binding): binding.linear_states for binding in self.config.repos
+        }
         async with self._config_write_lock:
             try:
                 effective = await assemble_effective_config(
@@ -920,6 +935,14 @@ class _OrchestratorBase:
             except ConfigBootError:
                 log.exception("binding reload rejected invalid config; keeping current")
                 return
+        # A `waiting`-state gate only ran on a cache miss (see `_states_for_binding`),
+        # so an edit to an already-warmed binding's `linear_states` was never
+        # re-validated. Evict the stale entry so the next lookup re-runs
+        # `_validate_waiting_state` against the edited row (SYM-189).
+        for binding in effective.repos:
+            previous_states = previous_states_by_key.get(_binding_key(binding))
+            if previous_states is not None and previous_states != binding.linear_states:
+                self._states.pop(_state_cache_key(binding), None)
         self.config = effective
         # The reconciler resolves bindings by iterating its own `config.repos`;
         # keep it pointed at the same effective config the poll loop uses.

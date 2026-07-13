@@ -319,3 +319,87 @@ async def test_hot_added_binding_bad_waiting_state_raises_on_first_load(
             await harness.orch._states_for_binding(ops_binding)  # noqa: SLF001
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_edited_binding_waiting_state_is_revalidated_on_reload(
+    tmp_path: Path,
+) -> None:
+    """A binding whose states were already warmed (cache hit) must be
+    re-validated after an edit declares a `waiting` state absent from its
+    Linear workflow — the cache key is unchanged, so a stale entry would
+    silently skip `_validate_waiting_state` (SYM-189 review fix)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG")
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+        binding = harness.orch.config.repos[0]
+        # Warm the cache the same way a normal scan would.
+        await harness.orch._states_for_binding(binding)  # noqa: SLF001
+
+        edited = _payload("ENG")
+        edited["linear_states"]["waiting"] = "On Hold"  # never seeded above
+        await harness.conn.execute(
+            "UPDATE config_bindings SET payload = ? WHERE github_repo = ?",
+            (json.dumps(edited), REPO),
+        )
+        await harness.conn.commit()
+        await harness.orch._reload_bindings()  # noqa: SLF001
+
+        edited_binding = harness.orch.config.repos[0]
+        with pytest.raises(LinearError, match="On Hold"):
+            await harness.orch._states_for_binding(edited_binding)  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_failure_on_one_binding_does_not_starve_the_rest(
+    tmp_path: Path,
+) -> None:
+    """A hot-add tracker-factory failure leaves one binding's context
+    unregistered; the scan loop must skip that lane and still scan bindings
+    ordered after it instead of aborting the whole tick (SYM-189 review fix).
+    """
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    # Priority 5 so this binding sorts *after* the hot-added, broken OPS
+    # binding below (priority 0) — the scenario the review flagged is a
+    # broken lane starving every binding ordered at/after it.
+    await _insert(conn, team="ENG", repo="org/eng", priority=5)
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+        _seed_team(harness, "OPS")
+        # A second binding on a tracker site whose hot-add will fail below.
+        await _insert(
+            harness.conn, team="OPS", repo="org/ops", site="broken-site", priority=0
+        )
+        real_factory = harness.orch._tracker_factory  # noqa: SLF001
+
+        def _flaky_factory(binding):
+            if binding.tracker_site == "broken-site":
+                raise ValueError("boom")
+            return real_factory(binding)
+
+        harness.orch._tracker_factory = _flaky_factory  # noqa: SLF001
+
+        eng_issue = harness.sim.seed_issue(
+            identifier="ENG-1", team_key="ENG", state_name=READY, title="kept lane"
+        )
+        harness.sim.seed_issue(
+            identifier="OPS-1", team_key="OPS", state_name=READY, title="dead lane"
+        )
+        scheduled = await harness.step()
+
+        # The ENG lane (ordered after the broken OPS hot-add) still dispatches.
+        assert len(scheduled) == 1
+        assert harness.sim.issues[eng_issue.id].state_name != READY
+    finally:
+        await harness.close()
