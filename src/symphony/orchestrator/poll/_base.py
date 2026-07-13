@@ -297,6 +297,8 @@ class _OrchestratorBase:
     _reload_bindings_from_db: bool
     _config_write_lock: asyncio.Lock
     _binding_keys: frozenset[BindingKey] | None
+    _stale_tracker_contexts: set[TrackerContext]
+    _hot_added_trackers: list[IssueTracker]
     _conn: aiosqlite.Connection
     _shutdown: asyncio.Event
     _wake: asyncio.Event
@@ -309,6 +311,7 @@ class _OrchestratorBase:
     _clock: Callable[[], datetime] | None
     _notifier: TelegramNotifier
     _states: dict[StateCacheKey, dict[str, str]]
+    _validated_waiting_state_bindings: set[BindingKey]
     _dispatch_tasks: set[asyncio.Task[None]]
     _scheduled_issue_ids: set[str]
     _known_waiting_issue_ids: set[str]
@@ -408,6 +411,17 @@ class _OrchestratorBase:
         # reacts only when the set actually changed — the one-shot boot prune
         # becomes a reaction to the binding set changing.
         self._binding_keys: frozenset[BindingKey] | None = None
+        # Tracker contexts whose constructor payload (e.g. a Jira binding's
+        # declared `states`) changed on a reload that left the natural key —
+        # and so `_binding_keys` — unchanged. `_react_to_binding_set` must not
+        # skip its reaction just because the key set matches (SYM-189).
+        self._stale_tracker_contexts: set[TrackerContext] = set()
+        # Clients built by `_hot_add_trackers` for a provider/site/project
+        # never seen at boot (or rebuilt for a stale context). Unlike boot
+        # trackers — entered through `_configured_tracker_registry`'s
+        # `AsyncExitStack` — these have no owner until closed here at
+        # shutdown (SYM-189).
+        self._hot_added_trackers: list[IssueTracker] = []
         # Serializes toggling `_dispatch_paused` against the final
         # check-then-insert in `_dispatch_one`, so a pause request can never
         # land in the middle of that critical section.
@@ -430,6 +444,11 @@ class _OrchestratorBase:
         # Cache of ((provider, site, team_key) -> {state_name: state_uuid}).
         # Re-fetched on startup; never mutated at runtime.
         self._states: dict[StateCacheKey, dict[str, str]] = {}
+        # Bindings whose `linear_states.waiting` has been checked against the
+        # tracker's actual workflow — tracked separately from `_states` since
+        # a state_key cache hit can come from a sibling binding, not this
+        # one's own load (SYM-189).
+        self._validated_waiting_state_bindings: set[BindingKey] = set()
         self._dispatch_tasks: set[asyncio.Task[None]] = set()
         self._scheduled_issue_ids: set[str] = set()
         self._known_waiting_issue_ids: set[str] = set()
@@ -675,12 +694,19 @@ class _OrchestratorBase:
                 self._states[state_key] = states
         if states is None:
             states = await self.tracker(binding).team_states(binding.linear_team_key)
-            # First time this binding's states are loaded — mirrors the check
-            # `warmup` runs for boot bindings, so a hot-added/mid-run binding
-            # with a `waiting` state absent from its Linear workflow fails
-            # loud instead of producing wrong auto-unblock behavior (SYM-189).
-            self._validate_waiting_state(binding, states)
             self._states[state_key] = states
+        # Tracked per binding, not per state_key: a state_key cache hit can
+        # come from a *sibling* binding on the same team (e.g. a second
+        # hot-added github_repo) that warmed the cache first. Validating only
+        # on a state_key miss would let this binding's own `waiting` state go
+        # unchecked forever — mirrors the check `warmup` runs for boot
+        # bindings, so a hot-added/mid-run binding with a `waiting` state
+        # absent from its Linear workflow fails loud instead of producing
+        # wrong auto-unblock behavior (SYM-189).
+        binding_key = _binding_key(binding)
+        if binding_key not in self._validated_waiting_state_bindings:
+            self._validate_waiting_state(binding, states)
+            self._validated_waiting_state_bindings.add(binding_key)
         return states
 
     def _binding_for_issue(
@@ -738,6 +764,7 @@ class _OrchestratorBase:
                 binding.linear_team_key
             )
             self._validate_waiting_state(binding, self._states[state_key])
+            self._validated_waiting_state_bindings.add(_binding_key(binding))
 
     def _validate_waiting_state(self, binding: RepoBinding, states: dict[str, str]) -> None:
         waiting = binding.linear_states.waiting
@@ -754,6 +781,19 @@ class _OrchestratorBase:
     async def shutdown(self) -> None:
         self._shutdown.set()
         self._wake.set()
+
+    async def aclose_hot_added_trackers(self) -> None:
+        """Close every client `_hot_add_trackers` built at runtime. Boot
+        clients are entered through `_configured_tracker_registry`'s
+        `AsyncExitStack` and close there; a hot-added one has no other owner,
+        so it would otherwise leak its `httpx.AsyncClient` through process
+        exit (SYM-189). Call once, after `run()` returns."""
+        for tracker in self._hot_added_trackers:
+            try:
+                await tracker.aclose()
+            except Exception:  # noqa: BLE001 — must not block shutdown
+                log.exception("failed to close hot-added tracker")
+        self._hot_added_trackers.clear()
 
     async def run(self) -> None:
         """The single long-lived task. Cancellation-safe."""
@@ -939,22 +979,49 @@ class _OrchestratorBase:
             except ConfigBootError:
                 log.exception("binding reload rejected invalid config; keeping current")
                 return
-        # A `waiting`-state gate only ran on a cache miss (see `_states_for_binding`),
-        # so an edit to an already-warmed binding's `linear_states` was never
-        # re-validated. Evict the stale entry so the next lookup re-runs
-        # `_validate_waiting_state` against the edited row (SYM-189). The cache
-        # is keyed by `_state_cache_key` (provider, site, team), coarser than the
-        # binding's natural key, so compare at that granularity — an edit that
+        # `_states_for_binding` caches team workflow states by `_state_cache_key`
+        # (provider, site, team) — coarser than a binding's natural key, so two
+        # bindings can share one entry — but validates each binding's own
+        # `waiting` state separately (`_validated_waiting_state_bindings`).
+        # Compare both at the state_key granularity below (an edit that
         # changes `linear_states` together with a natural-key component absent
-        # from the state-cache-key (e.g. `github_repo`) must still evict.
+        # from the state-cache-key, e.g. `github_repo`, must still evict) and
+        # per binding_key, so a sibling binding's warm cache can't hide this
+        # binding's own edited/never-checked `waiting` state (SYM-189).
         new_states_by_state_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
         for binding in effective.repos:
             new_states_by_state_key.setdefault(_state_cache_key(binding), {})[
                 _binding_key(binding)
             ] = binding.linear_states
-        for state_key, new_states in new_states_by_state_key.items():
-            if new_states != previous_states_by_state_key.get(state_key):
+        for state_key, new_per_binding in new_states_by_state_key.items():
+            previous_per_binding = previous_states_by_state_key.get(state_key, {})
+            if new_per_binding != previous_per_binding:
                 self._states.pop(state_key, None)
+                # `for_binding` bakes a Jira binding's declared states into its
+                # `JiraTracker` at construction (`_states`, returned as-is by
+                # `team_states()`); a natural-key-preserving edit to those
+                # states never triggers `_hot_add_trackers`'s "context already
+                # registered" skip otherwise, so the tracker would keep
+                # serving the pre-edit workflow forever. `project_key` aliases
+                # `linear_team_key` for Jira, so `state_key` already is the
+                # tracker context (SYM-189).
+                provider, site, team_key = state_key
+                if provider == "jira":
+                    self._stale_tracker_contexts.add(
+                        TrackerContext(provider=provider, site=site, project_key=team_key)
+                    )
+            # `_states_for_binding` only validates `linear_states.waiting` the
+            # first time it loads a *state_key*, so a binding sharing an
+            # already-warm state_key with a sibling binding (e.g. a second
+            # hot-added github_repo on the same team) never gets its own
+            # waiting state checked. Evict this binding's validated mark too,
+            # on top of the state_key cache above, whenever its own
+            # `linear_states` changed (or it's new) so it's re-checked on its
+            # own next lookup regardless of the sibling's cache state
+            # (SYM-189).
+            for binding_key, new_linear_states in new_per_binding.items():
+                if previous_per_binding.get(binding_key) != new_linear_states:
+                    self._validated_waiting_state_bindings.discard(binding_key)
         # A state-cache-key with no surviving binding is stale too — the loop
         # above only ever touches keys still present in the new config, so a
         # removed binding's entry would otherwise linger forever (SYM-189).
@@ -984,6 +1051,10 @@ class _OrchestratorBase:
         for key in list(self._review_fix_binding_sems):
             if key not in current_binding_keys:
                 self._review_fix_binding_sems.pop(key, None)
+        # Same accumulation risk as the semaphores above (SYM-189).
+        for key in list(self._validated_waiting_state_bindings):
+            if key not in current_binding_keys:
+                self._validated_waiting_state_bindings.discard(key)
         self.config = effective
         # The reconciler resolves bindings by iterating its own `config.repos`;
         # keep it pointed at the same effective config the poll loop uses.
@@ -991,12 +1062,14 @@ class _OrchestratorBase:
 
     async def _react_to_binding_set(self) -> None:
         """Reconcile in-memory state that must follow the binding set: register
-        trackers for newly-seen contexts and prune `tracker_queue` scopes for
-        bindings that are gone. A no-op when the set is unchanged."""
+        trackers for newly-seen contexts, rebuild any whose constructor
+        payload changed under an unchanged natural key, and prune
+        `tracker_queue` scopes for bindings that are gone. A no-op when the
+        set is unchanged and no tracker context is pending a rebuild."""
         keys = frozenset(_binding_key(binding) for binding in self.config.repos)
-        if keys == self._binding_keys:
+        if keys == self._binding_keys and not self._stale_tracker_contexts:
             return
-        hot_add_ok = self._hot_add_trackers()
+        hot_add_ok = await self._hot_add_trackers()
         # Only commit the new key set once the hot-add and the prune both
         # succeed, so a transient failure in either is retried on the next
         # tick instead of stranding an unscanned binding or stale scopes
@@ -1005,14 +1078,23 @@ class _OrchestratorBase:
         if hot_add_ok and prune_ok:
             self._binding_keys = keys
 
-    def _hot_add_trackers(self) -> bool:
+    async def _hot_add_trackers(self) -> bool:
         """Register a tracker client for any binding whose provider/site (for
-        Jira, /project) context the registry never saw at boot. Returns
-        whether every binding's context is now registered."""
+        Jira, /project) context the registry never saw at boot, and rebuild +
+        replace one whose constructor payload changed (`_stale_tracker_contexts`)
+        even though its context was already registered. Returns whether every
+        binding's context is now registered."""
         all_registered = True
+        # One representative binding per context, mirroring the last-write-wins
+        # registration order `_configured_tracker_registry` used at boot — a
+        # rebuild must construct from the same binding boot would have.
+        representative: dict[TrackerContext, RepoBinding] = {}
         for binding in self.config.repos:
-            ctx = _tracker_context_for_binding(binding)
-            if self._tracker_context_registered(ctx):
+            representative[_tracker_context_for_binding(binding)] = binding
+        handled_stale: set[TrackerContext] = set()
+        for ctx, binding in representative.items():
+            stale = ctx in self._stale_tracker_contexts
+            if self._tracker_context_registered(ctx) and not stale:
                 continue
             if self._tracker_factory is None:
                 log.warning("cannot hot-add tracker for %s: no tracker factory", ctx)
@@ -1024,8 +1106,29 @@ class _OrchestratorBase:
                 log.exception("failed to build tracker for hot-add: %s", ctx)
                 all_registered = False
                 continue
+            old = self._trackers.get(ctx) if stale else None
             self._trackers.register(ctx.provider, ctx.site, tracker, project_key=ctx.project_key)
-            log.info("hot-added tracker for %s", ctx)
+            self._hot_added_trackers.append(tracker)
+            if stale:
+                handled_stale.add(ctx)
+                log.info("rebuilt tracker for %s: constructor payload changed", ctx)
+            else:
+                log.info("hot-added tracker for %s", ctx)
+            # Single-tracker deployments reuse one client for every context
+            # (see `Orchestrator.__init__`'s fallback factory) — never close
+            # the client we just re-registered.
+            if old is not None and old is not tracker:
+                try:
+                    await old.aclose()
+                except Exception:  # noqa: BLE001 — must not kill the loop
+                    log.exception("failed to close stale tracker for %s", ctx)
+        # Drop a stale mark once rebuilt, or once its context no longer
+        # belongs to any current binding — there's nothing left to rebuild.
+        self._stale_tracker_contexts = {
+            ctx
+            for ctx in self._stale_tracker_contexts
+            if ctx in representative and ctx not in handled_stale
+        }
         return all_registered
 
     def _tracker_context_registered(self, ctx: TrackerContext) -> bool:

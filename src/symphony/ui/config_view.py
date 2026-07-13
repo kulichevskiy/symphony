@@ -9,6 +9,8 @@ built from an allowlist of non-sensitive fields, never a raw `model_dump` of
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -73,15 +75,24 @@ def build_config_view(config: Config) -> ConfigView:
     )
 
 
-def create_config_router(config: Config | None) -> APIRouter:
-    """Router exposing `GET /api/config` — the redacted loaded config."""
+def create_config_router(config: Config | Callable[[], Config | None] | None) -> APIRouter:
+    """Router exposing `GET /api/config` — the redacted loaded config.
+
+    `config` may be a callable so a DB-owned topology's `GET /api/config`
+    reflects the daemon's live, hot-reloaded bindings instead of a snapshot
+    frozen at app-creation time (SYM-189) — the view is rebuilt on every
+    request rather than once here.
+    """
     router = APIRouter(prefix="/api")
-    view = build_config_view(config) if config is not None else None
+
+    def _current() -> Config | None:
+        return config() if callable(config) else config
 
     @router.get("/config", response_model=ConfigView)
     async def get_config() -> ConfigView:
-        if view is None:
+        current = _current()
+        if current is None:
             raise HTTPException(status_code=503, detail="config view is not available")
-        return view
+        return build_config_view(current)
 
     return router

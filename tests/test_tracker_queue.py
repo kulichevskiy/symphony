@@ -297,7 +297,7 @@ async def test_scan_persists_ready_and_waiting_queue_snapshot(tmp_path: Path) ->
             workspace=MagicMock(),
             push_fn=AsyncMock(),
         )
-        orch._states = {"ENG": {"Todo": "state-todo"}}  # noqa: SLF001
+        orch._states = {"ENG": {"Todo": "state-todo", "Waiting": "state-waiting"}}  # noqa: SLF001
 
         tasks = await orch._scan_binding(binding)  # noqa: SLF001
         assert tasks == []

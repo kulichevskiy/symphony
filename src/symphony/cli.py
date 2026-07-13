@@ -341,6 +341,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 await orch.warmup()
                 await orch._tick()  # pylint: disable=protected-access
                 await orch.drain_dispatch_tasks()
+                await orch.aclose_hot_added_trackers()
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
@@ -361,12 +362,23 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     orch,
                     conn,
                     webhook_settings,
-                    github_webhook_settings,
+                    # A DB-owned topology hot-applies binding edits onto
+                    # `orch.config` (SYM-189) — resolve the webhook settings
+                    # from it on every request instead of baking in this
+                    # boot-time snapshot, so an edited/added repo's
+                    # enabled/secret state doesn't need a restart. Whether the
+                    # router mounts at all is still decided once, here, from
+                    # boot state.
+                    (
+                        (lambda: _github_webhook_settings(orch.config))
+                        if github_webhook_settings is not None
+                        else None
+                    ),
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_log_root=cfg.log_root,
                     ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
-                    ui_external_config=cfg,
+                    ui_external_config=lambda: orch.config,
                     ui_external_linear=external_linear,
                     ui_external_github=cast(GitHubExternalClient, orch._gh),
                     ui_pr_no_progress_threshold=(
@@ -400,6 +412,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 if webhook_server is not None and webhook_task is not None:
                     webhook_server.should_exit = True  # type: ignore[attr-defined]
                     await webhook_task
+                await orch.aclose_hot_added_trackers()
     finally:
         await conn.close()
 

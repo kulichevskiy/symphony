@@ -442,18 +442,25 @@ def compute_drift(
 class ExternalSnapshotService:
     def __init__(
         self,
-        config: Config,
+        config: Config | Callable[[], Config | None] | None,
         linear: LinearExternalClient,
         github: GitHubExternalClient,
         *,
         cache: ExternalSnapshotCache | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
-        self._config = config
+        # A callable re-reads the daemon's live, hot-reloaded topology on
+        # every call instead of the `Config` snapshot at app-creation time
+        # (SYM-189).
+        self._config_provider = config
         self._issue_tracker_client = linear
         self._github = github
         self.cache = cache or ExternalSnapshotCache()
         self._clock = clock
+
+    def _config(self) -> Config | None:
+        provider = self._config_provider
+        return provider() if callable(provider) else provider
 
     def _now(self) -> datetime:
         if self._clock is not None:
@@ -478,7 +485,10 @@ class ExternalSnapshotService:
         if sqlite_view is None:
             return None
 
-        binding = _resolve_binding(self._config, sqlite_view)
+        current_config = self._config()
+        binding = (
+            _resolve_binding(current_config, sqlite_view) if current_config is not None else None
+        )
         fetched_at = _iso(now)
         linear = await self._pull_linear(issue_id, fetched_at=fetched_at, now=now)
         github = await self._pull_github(sqlite_view, fetched_at=fetched_at, now=now)
@@ -541,7 +551,10 @@ class ExternalSnapshotService:
         now: datetime,
     ) -> JsonDict:
         issue_id = str(sqlite_view["issue"]["id"])
-        binding = _resolve_binding(self._config, sqlite_view)
+        current_config = self._config()
+        binding = (
+            _resolve_binding(current_config, sqlite_view) if current_config is not None else None
+        )
         target = _github_pr_target(sqlite_view)
         if target is None:
             payload: JsonDict = {"error": "No GitHub PR is recorded for this issue"}

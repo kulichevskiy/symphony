@@ -85,6 +85,8 @@ class IssueTracker(Protocol):
         title: str,
     ) -> str: ...
 
+    async def aclose(self) -> None: ...
+
 
 class TrackerRegistry:
     def __init__(self) -> None:
@@ -98,6 +100,12 @@ class TrackerRegistry:
         project_key: str = "",
     ) -> None:
         self._trackers[(provider, site, project_key)] = tracker
+
+    def get(self, ctx: TrackerContext) -> IssueTracker | None:
+        """Exact-match lookup, unlike `resolve` — no site-wide/project-key
+        fallback, so a caller replacing a specific context's client never
+        risks reading (and later closing) a different context's tracker."""
+        return self._trackers.get((ctx.provider, ctx.site, ctx.project_key))
 
     def resolve(self, ctx: TrackerContext | None = None) -> IssueTracker:
         key = (

@@ -18,9 +18,11 @@ from pathlib import Path
 import pytest
 
 from symphony import db
-from symphony.config import Config
+from symphony.config import Config, LinearStates, RepoBinding
 from symphony.effective_config import assemble_effective_config
 from symphony.linear.client import LinearError
+from symphony.orchestrator.poll import Orchestrator, _binding_key
+from symphony.tracker import TrackerContext, TrackerRegistry
 from tests.harness import Harness
 
 REPO = "org/repo"
@@ -436,3 +438,184 @@ async def test_hot_add_failure_is_retried_on_the_next_tick(tmp_path: Path) -> No
         assert harness.sim.issues[ops_issue.id].state_name != READY
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_hot_added_binding_sharing_warm_state_cache_still_validates_waiting_state(
+    tmp_path: Path,
+) -> None:
+    """`_states_for_binding` caches team workflow states by `_state_cache_key`
+    (provider, site, team) — coarser than a binding's natural key. A second
+    binding on the same team, hot-added after the first already warmed that
+    shared cache entry, must still get its own `waiting` state checked instead
+    of silently reusing the sibling's cache hit (SYM-189 review fix)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG", repo="org/eng-a")
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+
+        # A second binding on the SAME team, hot-added mid-run, declaring a
+        # waiting state absent from the team's workflow. Adding it changes the
+        # per-state_key binding set, so the reload evicts the shared cache
+        # entry (a separate, already-fixed gap) — that's not what's under
+        # test here.
+        await _insert(
+            harness.conn,
+            team="ENG",
+            repo="org/eng-b",
+            priority=1,
+            linear_states={
+                "ready": READY,
+                "in_progress": "In Progress",
+                "code_review": "Needs Approval",
+                "done": DONE,
+                # Not one of `LinearStates`' own default role names (so it
+                # can't accidentally match ENG's auto-derived sim states) and
+                # never explicitly seeded either.
+                "waiting": "On Hold",
+            },
+        )
+        await harness.orch._reload_bindings()  # noqa: SLF001
+
+        first_binding = next(b for b in harness.orch.config.repos if b.github_repo == "org/eng-a")
+        second_binding = next(b for b in harness.orch.config.repos if b.github_repo == "org/eng-b")
+        # Mirrors scan order within one tick: the first binding on this team
+        # is scanned (and re-warms the just-evicted shared cache entry)
+        # before the second.
+        await harness.orch._states_for_binding(first_binding)  # noqa: SLF001
+
+        with pytest.raises(LinearError, match="On Hold"):
+            await harness.orch._states_for_binding(second_binding)  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_hot_added_tracker_clients(tmp_path: Path) -> None:
+    """A hot-added client (`_hot_add_trackers`, a provider/site unseen at
+    boot) has no owner besides the orchestrator's own bookkeeping — unlike
+    boot clients, entered through `_configured_tracker_registry`'s
+    `AsyncExitStack`. `aclose_hot_added_trackers` must close it or its
+    underlying connection leaks for the rest of the process (SYM-189 review
+    fix)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG")
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+
+        class _FakeTracker:
+            def __init__(self) -> None:
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        built: list[_FakeTracker] = []
+
+        def _factory(binding: RepoBinding) -> _FakeTracker:
+            tracker = _FakeTracker()
+            built.append(tracker)
+            return tracker
+
+        harness.orch._tracker_factory = _factory  # noqa: SLF001
+
+        # A binding on a tracker site the process never saw at boot.
+        await _insert(harness.conn, team="OPS", repo="org/ops", site="other-site", priority=1)
+        await harness.orch._reload_bindings()  # noqa: SLF001
+        await harness.orch._react_to_binding_set()  # noqa: SLF001
+
+        assert len(built) == 1
+        assert not built[0].closed
+
+        await harness.orch.aclose_hot_added_trackers()
+        assert built[0].closed
+        # Idempotent: a second call (e.g. both the `once` and the daemon
+        # shutdown path) must not error on an already-closed client.
+        await harness.orch.aclose_hot_added_trackers()
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_jira_binding_states_edit_rebuilds_and_closes_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Jira binding's declared `states` are baked into its `JiraTracker` at
+    construction (`for_binding`); `team_states()` just returns that captured
+    mapping, so an edit to `linear_states` that leaves the binding's natural
+    key (and so its tracker context) unchanged must still rebuild + register
+    a fresh client, and close the stale one — `_react_to_binding_set`'s
+    "binding set unchanged" early return must not skip this (SYM-189 review
+    fix)."""
+    binding = RepoBinding(
+        linear_team_key="PROJ",
+        github_repo="org/repo",
+        provider="jira",
+        tracker_site="acme",
+        linear_states=LinearStates(ready="To Do", waiting="Blocked"),
+    )
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        repos=[binding],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+
+        class _FakeJiraTracker:
+            def __init__(self, *, states: dict[str, str]) -> None:
+                self.states = states
+                self.closed = False
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        built: list[_FakeJiraTracker] = []
+
+        def _factory(b: RepoBinding) -> _FakeJiraTracker:
+            tracker = _FakeJiraTracker(states=dict(b.linear_states.model_dump()))
+            built.append(tracker)
+            return tracker
+
+        registry = TrackerRegistry()
+        first = _factory(binding)
+        registry.register("jira", "acme", first, project_key="PROJ")
+
+        orch = Orchestrator(
+            cfg, registry, conn, reload_bindings_from_db=True, tracker_factory=_factory
+        )
+        # Boot already reacted to this binding set — the bug is the early
+        # return skipping a rebuild when the set (correctly) looks unchanged.
+        orch._binding_keys = frozenset({_binding_key(binding)})  # noqa: SLF001
+
+        edited = binding.model_copy(
+            update={"linear_states": LinearStates(ready="To Do", waiting="On Hold")}
+        )
+        edited_cfg = cfg.model_copy(update={"repos": [edited]})
+
+        async def _fake_assemble(conn, base, *, boot_gates, is_reload):
+            return edited_cfg
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._base.assemble_effective_config", _fake_assemble
+        )
+
+        await orch._reload_bindings()  # noqa: SLF001
+        await orch._react_to_binding_set()  # noqa: SLF001
+
+        assert len(built) == 2
+        assert built[1].states["waiting"] == "On Hold"
+        assert first.closed
+        ctx = TrackerContext(provider="jira", site="acme", project_key="PROJ")
+        assert registry.get(ctx) is built[1]
+    finally:
+        await conn.close()
