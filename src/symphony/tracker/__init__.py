@@ -101,6 +101,13 @@ class TrackerRegistry:
     ) -> None:
         self._trackers[(provider, site, project_key)] = tracker
 
+    def discard(self, provider: str, site: str, project_key: str = "") -> None:
+        """Remove a context's registration, e.g. once its client is closed
+        because the binding introducing it is gone — a binding reintroducing
+        the same context later must hot-add a fresh client, not resolve the
+        closed one."""
+        self._trackers.pop((provider, site, project_key), None)
+
     def get(self, ctx: TrackerContext) -> IssueTracker | None:
         """Exact-match lookup, unlike `resolve` — no site-wide/project-key
         fallback, so a caller replacing a specific context's client never

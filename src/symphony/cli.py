@@ -228,19 +228,28 @@ def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
 
 
-async def _db_owns_topology(conn: aiosqlite.Connection) -> bool:
-    """Whether the DB is the topology source of truth: bindings exist now, or
-    the importer has migrated it before (`config_globals.migrated_at` set).
+async def _db_owns_topology(conn: aiosqlite.Connection, *, yaml_has_repos_topology: bool) -> bool:
+    """Whether the DB is the topology source of truth: bindings exist now, the
+    importer has migrated it before (`config_globals.migrated_at` set), or
+    there is no YAML `repos:` topology to fall back to (a true fresh install).
 
     The marker matters on its own because a migrated DB can have zero
     *current* bindings — e.g. every binding was deleted via the UI — and
     leftover YAML `repos:` must stay ignored (not resolved/validated) in that
-    case too, same as when bindings are still present.
+    case too, same as when bindings are still present. A true fresh install
+    (no bindings, never migrated, and no YAML `repos:` either) must also
+    count as DB-owned — otherwise `_run`'s tick-boundary reload (SYM-189)
+    stays disabled forever and a binding added via the UI/importer after boot
+    is never picked up without a restart. Only a not-yet-migrated legacy YAML
+    deployment (bindings absent, `repos:` still present in the YAML) stays
+    YAML-owned until the importer runs.
     """
     if await db.config_bindings.count(conn) > 0:
         return True
     globals_row = await db.config_globals.get(conn)
-    return bool(globals_row and globals_row.migrated_at)
+    if globals_row and globals_row.migrated_at:
+        return True
+    return not yaml_has_repos_topology
 
 
 @asynccontextmanager
@@ -319,11 +328,14 @@ async def _run(config_path: Path, *, once: bool) -> None:
     try:
         # A migrated deployment's leftover YAML `repos:` is ignored — don't
         # pay for (or risk boot-crashing on) validating/resolving it.
-        db_owns_topology = await _db_owns_topology(conn)
+        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
         base = Config.load(config_path, resolve_repos=not db_owns_topology)
         try:
             cfg = await assemble_effective_config(
-                conn, base, yaml_has_repos_topology=Config.peek_repos_topology(config_path)
+                conn, base, yaml_has_repos_topology=yaml_has_repos_topology
             )
         except ConfigBootError as e:
             click.echo(str(e), err=True)
@@ -358,7 +370,18 @@ async def _run(config_path: Path, *, once: bool) -> None:
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
             github_webhook_settings = _github_webhook_settings(cfg)
-            if cfg.linear_webhook_secret or github_webhook_settings or cfg.ui.enabled:
+            # A DB-owned topology can hot-enable a repo's webhook (or add a
+            # binding needing one) at any later tick — the boot-time booleans
+            # above can't see that yet, so a headless (`ui.enabled=False`)
+            # deployment with nothing webhook-enabled at boot must still
+            # start the HTTP surface, or a hot-enabled repo would need a
+            # restart to get a live endpoint (SYM-189).
+            if (
+                cfg.linear_webhook_secret
+                or github_webhook_settings
+                or cfg.ui.enabled
+                or db_owns_topology
+            ):
                 import uvicorn
 
                 webhook_settings = (
@@ -625,13 +648,16 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
 async def _preflight(config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        db_owns_topology = await _db_owns_topology(conn)
+        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
         base = Config.load(config_path, resolve_repos=not db_owns_topology)
         cfg = await assemble_effective_config(
             conn,
             base,
             boot_gates=False,
-            yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+            yaml_has_repos_topology=yaml_has_repos_topology,
         )
     except ConfigBootError as e:
         click.echo(str(e), err=True)
@@ -1167,7 +1193,10 @@ def dispatch(linear_id: str, config_path: Path) -> None:
 async def _dispatch(linear_id: str, config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        db_owns_topology = await _db_owns_topology(conn)
+        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
         base = Config.load(config_path, resolve_repos=not db_owns_topology)
         if not base.linear_api_key:
             click.echo("LINEAR_API_KEY is empty", err=True)
@@ -1177,7 +1206,7 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
                 conn,
                 base,
                 boot_gates=False,
-                yaml_has_repos_topology=Config.peek_repos_topology(config_path),
+                yaml_has_repos_topology=yaml_has_repos_topology,
             )
         except ConfigBootError as e:
             click.echo(str(e), err=True)

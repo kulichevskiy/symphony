@@ -619,3 +619,145 @@ async def test_jira_binding_states_edit_rebuilds_and_closes_tracker(
         assert registry.get(ctx) is built[1]
     finally:
         await conn.close()
+
+
+def _linear_binding(*, team: str, repo: str, site: str = "default") -> RepoBinding:
+    return RepoBinding(
+        linear_team_key=team,
+        github_repo=repo,
+        tracker_site=site,
+        linear_states=LinearStates(
+            ready="Todo", in_progress="In Progress", code_review="Needs Approval"
+        ),
+    )
+
+
+class _FakeLinearTracker:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_hot_added_linear_tracker_aliased_as_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Boot registration aliases the first Linear tracker it sees to
+    `(linear, default)`, for callers such as `_external_linear_tracker` that
+    resolve the daemon's default Linear client without a full
+    `TrackerContext`. A fresh install boots with zero bindings — no alias is
+    set at all — and hot-adds its first Linear binding, on a non-default
+    site, later; the hot-add path must set that alias too, or those callers
+    stay broken forever with no restart able to fix it (SYM-189 review fix).
+    """
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        repos=[],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        built: list[_FakeLinearTracker] = []
+
+        def _factory(b: RepoBinding) -> _FakeLinearTracker:
+            tracker = _FakeLinearTracker()
+            built.append(tracker)
+            return tracker
+
+        registry = TrackerRegistry()
+        orch = Orchestrator(
+            cfg, registry, conn, reload_bindings_from_db=True, tracker_factory=_factory
+        )
+        orch._binding_keys = frozenset()  # noqa: SLF001 — boot reacted to the empty set
+
+        binding = _linear_binding(team="ENG", repo="org/repo", site="acme")
+        edited_cfg = cfg.model_copy(update={"repos": [binding]})
+
+        async def _fake_assemble(conn, base, *, boot_gates, is_reload):
+            return edited_cfg
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._base.assemble_effective_config", _fake_assemble
+        )
+
+        await orch._reload_bindings()  # noqa: SLF001
+        await orch._react_to_binding_set()  # noqa: SLF001
+
+        assert len(built) == 1
+        assert registry.get(TrackerContext(provider="linear", site="acme")) is built[0]
+        assert registry.get(TrackerContext()) is built[0]
+        assert registry.resolve(TrackerContext()) is built[0]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_removed_binding_closes_and_unregisters_hot_added_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tracker `_hot_add_trackers` builds for a provider/site never seen at
+    boot has no owner besides the orchestrator's own bookkeeping. If the
+    binding that introduced it is later deleted, the client must close (and
+    its registry entry drop) right away rather than only at process
+    shutdown, or the connection leaks for the rest of the run — and a future
+    binding reintroducing the same context would otherwise resolve the
+    already-closed client instead of hot-adding a fresh one (SYM-189 review
+    fix)."""
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        repos=[],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        built: list[_FakeLinearTracker] = []
+
+        def _factory(b: RepoBinding) -> _FakeLinearTracker:
+            tracker = _FakeLinearTracker()
+            built.append(tracker)
+            return tracker
+
+        registry = TrackerRegistry()
+        orch = Orchestrator(
+            cfg, registry, conn, reload_bindings_from_db=True, tracker_factory=_factory
+        )
+        orch._binding_keys = frozenset()  # noqa: SLF001 — boot reacted to the empty set
+
+        binding = _linear_binding(team="OPS", repo="org/ops", site="acme")
+        with_binding_cfg = cfg.model_copy(update={"repos": [binding]})
+
+        async def _fake_assemble_add(conn, base, *, boot_gates, is_reload):
+            return with_binding_cfg
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._base.assemble_effective_config", _fake_assemble_add
+        )
+        await orch._reload_bindings()  # noqa: SLF001
+        await orch._react_to_binding_set()  # noqa: SLF001
+
+        ctx = TrackerContext(provider="linear", site="acme")
+        tracker = registry.get(ctx)
+        assert tracker is built[0]
+        assert not tracker.closed
+        # Hot-adding the only Linear binding also aliases it as the default.
+        assert registry.get(TrackerContext()) is tracker
+
+        async def _fake_assemble_remove(conn, base, *, boot_gates, is_reload):
+            return cfg
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._base.assemble_effective_config", _fake_assemble_remove
+        )
+        await orch._reload_bindings()  # noqa: SLF001
+        await orch._react_to_binding_set()  # noqa: SLF001
+
+        assert tracker.closed
+        assert registry.get(ctx) is None
+        # The default alias must not keep resolving to the now-closed client.
+        assert registry.get(TrackerContext()) is None
+    finally:
+        await conn.close()

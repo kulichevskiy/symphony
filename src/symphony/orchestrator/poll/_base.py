@@ -298,7 +298,7 @@ class _OrchestratorBase:
     _config_write_lock: asyncio.Lock
     _binding_keys: frozenset[BindingKey] | None
     _stale_tracker_contexts: set[TrackerContext]
-    _hot_added_trackers: list[IssueTracker]
+    _hot_added_trackers: dict[TrackerContext, IssueTracker]
     _conn: aiosqlite.Connection
     _shutdown: asyncio.Event
     _wake: asyncio.Event
@@ -417,11 +417,13 @@ class _OrchestratorBase:
         # skip its reaction just because the key set matches (SYM-189).
         self._stale_tracker_contexts: set[TrackerContext] = set()
         # Clients built by `_hot_add_trackers` for a provider/site/project
-        # never seen at boot (or rebuilt for a stale context). Unlike boot
-        # trackers — entered through `_configured_tracker_registry`'s
-        # `AsyncExitStack` — these have no owner until closed here at
-        # shutdown (SYM-189).
-        self._hot_added_trackers: list[IssueTracker] = []
+        # never seen at boot (or rebuilt for a stale context), keyed by that
+        # context. Unlike boot trackers — entered through
+        # `_configured_tracker_registry`'s `AsyncExitStack` — these have no
+        # other owner: `_close_removed_hot_added_trackers` closes one as soon
+        # as its binding disappears, and any still here at process exit close
+        # in `aclose_hot_added_trackers` (SYM-189).
+        self._hot_added_trackers: dict[TrackerContext, IssueTracker] = {}
         # Serializes toggling `_dispatch_paused` against the final
         # check-then-insert in `_dispatch_one`, so a pause request can never
         # land in the middle of that critical section.
@@ -788,7 +790,7 @@ class _OrchestratorBase:
         `AsyncExitStack` and close there; a hot-added one has no other owner,
         so it would otherwise leak its `httpx.AsyncClient` through process
         exit (SYM-189). Call once, after `run()` returns."""
-        for tracker in self._hot_added_trackers:
+        for tracker in self._hot_added_trackers.values():
             try:
                 await tracker.aclose()
             except Exception:  # noqa: BLE001 — must not block shutdown
@@ -1067,14 +1069,19 @@ class _OrchestratorBase:
     async def _react_to_binding_set(self) -> None:
         """Reconcile in-memory state that must follow the binding set: register
         trackers for newly-seen contexts, rebuild any whose constructor
-        payload changed under an unchanged natural key, prune `tracker_queue`
-        scopes for bindings that are gone, and publish only bindings whose
-        tracker actually registered. A no-op when the set is unchanged and no
+        payload changed under an unchanged natural key, close a hot-added
+        tracker whose binding is gone, prune `tracker_queue` scopes for
+        bindings that are gone, and publish only bindings whose tracker
+        actually registered. A no-op when the set is unchanged and no
         tracker context is pending a rebuild."""
         keys = frozenset(_binding_key(binding) for binding in self.config.repos)
         if keys == self._binding_keys and not self._stale_tracker_contexts:
             return
         hot_add_ok = await self._hot_add_trackers()
+        # Runs after the hot-add above so a still-live default-Linear alias
+        # (SYM-189 review fix) is repointed away from a departing tracker
+        # before that tracker closes.
+        await self._close_removed_hot_added_trackers()
         # Only commit the new key set once the hot-add and the prune both
         # succeed, so a transient failure in either is retried on the next
         # tick instead of stranding an unscanned binding or stale scopes
@@ -1132,7 +1139,7 @@ class _OrchestratorBase:
                 continue
             old = self._trackers.get(ctx) if stale else None
             self._trackers.register(ctx.provider, ctx.site, tracker, project_key=ctx.project_key)
-            self._hot_added_trackers.append(tracker)
+            self._hot_added_trackers[ctx] = tracker
             if stale:
                 handled_stale.add(ctx)
                 log.info("rebuilt tracker for %s: constructor payload changed", ctx)
@@ -1153,7 +1160,50 @@ class _OrchestratorBase:
             for ctx in self._stale_tracker_contexts
             if ctx in representative and ctx not in handled_stale
         }
+        # Boot registration aliases the first Linear binding it iterates to
+        # `(DEFAULT_PROVIDER, DEFAULT_SITE)`, for callers like
+        # `_external_linear_tracker` that resolve the "default" Linear client
+        # without a full `TrackerContext` (e.g. a fresh install boots with no
+        # Linear binding, so no alias is set, and hot-adds the first one
+        # later). Keep the alias pointed at whichever Linear context is first
+        # in the current binding order, mirroring boot's own selection
+        # (SYM-189 review fix).
+        first_linear_ctx = next(
+            (ctx for ctx in representative if ctx.provider == DEFAULT_PROVIDER), None
+        )
+        if first_linear_ctx is not None:
+            first_linear_tracker = self._trackers.get(first_linear_ctx)
+            default_ctx = TrackerContext()
+            if first_linear_tracker is not None and first_linear_tracker is not self._trackers.get(
+                default_ctx
+            ):
+                self._trackers.register(DEFAULT_PROVIDER, DEFAULT_SITE, first_linear_tracker)
         return all_registered
+
+    async def _close_removed_hot_added_trackers(self) -> None:
+        """Close a hot-added client whose binding is gone — otherwise it only
+        closes at process shutdown (`aclose_hot_added_trackers`), leaking its
+        connection for the rest of the run if a DB-owned daemon hot-adds a
+        binding for a new provider/site/project and that binding is later
+        deleted (SYM-189 review fix). A client still serving another live
+        context — single-tracker fallback deployments reuse one client for
+        every context — is left open, just dropped from this bookkeeping."""
+        live_contexts = {_tracker_context_for_binding(binding) for binding in self.config.repos}
+        removed = [ctx for ctx in self._hot_added_trackers if ctx not in live_contexts]
+        for ctx in removed:
+            tracker = self._hot_added_trackers.pop(ctx)
+            self._trackers.discard(ctx.provider, ctx.site, ctx.project_key)
+            default_ctx = TrackerContext()
+            if self._trackers.get(default_ctx) is tracker:
+                self._trackers.discard(
+                    default_ctx.provider, default_ctx.site, default_ctx.project_key
+                )
+            if tracker in self._hot_added_trackers.values():
+                continue
+            try:
+                await tracker.aclose()
+            except Exception:  # noqa: BLE001 — must not kill the loop
+                log.exception("failed to close removed-binding tracker for %s", ctx)
 
     def _tracker_context_registered(self, ctx: TrackerContext) -> bool:
         try:
