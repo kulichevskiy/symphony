@@ -203,6 +203,75 @@ async def test_fetch_claude_effort_capabilities_missing_key_returns_none(
     assert await fetch_claude_effort_capabilities("sonnet") is None
 
 
+@pytest.mark.parametrize(
+    ("alias", "expected_model_id"),
+    [
+        ("opus", "claude-opus-4-8"),
+        ("sonnet", "claude-sonnet-5"),
+        ("haiku", "claude-haiku-4-5-20251001"),
+    ],
+)
+async def test_fetch_claude_effort_capabilities_resolves_cli_alias(
+    monkeypatch, alias, expected_model_id
+) -> None:  # type: ignore[no-untyped-def]
+    """The Models API has no `opus`/`sonnet`/`haiku` alias — only the `claude`
+    CLI does — so the short alias must be mapped to a full model ID before the
+    request goes out, or `/v1/models/<alias>` 404s (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities(alias)
+    assert seen_paths == [f"/v1/models/{expected_model_id}"]
+
+
+async def test_fetch_claude_effort_capabilities_full_model_id_passes_through(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("claude-sonnet-4-6")
+    assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
+
+
+async def test_fetch_claude_effort_capabilities_filters_unsupported_levels(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """A level whose value is `null` or carries `supported: false` must be
+    dropped — its mere presence as a key in the tree previously passed the
+    caller's plain membership check even though the model rejects it
+    (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "capabilities": {
+                    "effort": {
+                        "low": {},
+                        "medium": {"supported": True},
+                        "high": {"supported": False},
+                        "xhigh": None,
+                    }
+                }
+            },
+        )
+
+    _install_mock_transport(monkeypatch, _handler)
+    assert await fetch_claude_effort_capabilities("sonnet") == ["low", "medium"]
+
+
 async def test_fetch_claude_effort_capabilities_http_error_raises_valueerror(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]

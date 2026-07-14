@@ -16,15 +16,27 @@ import httpx
 CLAUDE_MODELS_API_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
 
+# The `claude` CLI's own short `--model` aliases are a CLI-only convenience —
+# the Models API has no such alias and only resolves full IDs, so a bare
+# `/v1/models/opus` 404s. Map each alias to the full ID it currently backs so
+# the online capability check queries something the API actually knows.
+_CLAUDE_ALIAS_MODEL_IDS: dict[str, str] = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
 
 async def fetch_claude_effort_capabilities(
     model: str, api_key: str | None = None
 ) -> list[str] | None:
     """Return the effort levels claude `model` supports, in API order.
 
-    Reads the Models API `capabilities.effort.<level>` tree for `model`
-    (`opus`/`sonnet`/`haiku` aliases flow through unchanged). `api_key` is the
-    key to authenticate with; when `None` it falls back to the process env
+    Reads the Models API `capabilities.effort.<level>` tree for `model`,
+    resolving a short `opus`/`sonnet`/`haiku` CLI alias to its current full
+    model ID first — the Models API doesn't recognize the bare alias. A full
+    `claude-*` ID passes through unchanged. `api_key` is the key to
+    authenticate with; when `None` it falls back to the process env
     `ANTHROPIC_API_KEY`. Preflight resolves the key from the process env OR a
     binding's `env:` mapping and passes it in, so a key supplied only through a
     binding still drives validation.
@@ -46,10 +58,11 @@ async def fetch_claude_effort_capabilities(
     key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         return None
+    api_model = _CLAUDE_ALIAS_MODEL_IDS.get(model, model)
     try:
         async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
             resp = await client.get(
-                f"/v1/models/{model}",
+                f"/v1/models/{api_model}",
                 headers={
                     "x-api-key": key,
                     "anthropic-version": _ANTHROPIC_VERSION,
@@ -72,7 +85,16 @@ async def fetch_claude_effort_capabilities(
             f"Models API returned no effort capabilities for claude model "
             f"{model!r}; cannot validate"
         )
-    return list(effort_tree)
+    # Each level's value carries a support flag (e.g. `null`/`{"supported":
+    # false}` for an unsupported level); a bare `{}` (no flag at all, as in
+    # the common case) means supported. Keep only levels the model actually
+    # supports — otherwise an unsupported level's mere presence in the tree
+    # would pass the caller's membership check.
+    return [
+        level
+        for level, meta in effort_tree.items()
+        if meta is not None and (not isinstance(meta, dict) or meta.get("supported", True))
+    ]
 
 
 __all__ = ["CLAUDE_MODELS_API_BASE", "fetch_claude_effort_capabilities"]

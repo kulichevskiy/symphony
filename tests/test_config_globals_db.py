@@ -46,6 +46,22 @@ async def test_update_roles_stale_version_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_roles_stale_version_rolls_back_write_transaction(tmp_path: Path) -> None:
+    """A lost race must not leave the conditional UPDATE's write transaction
+    open — that would hold the connection's write lock until some later,
+    unrelated commit/rollback and could block every other config writer
+    (SYM-191 review)."""
+    conn = await _conn(tmp_path)
+    try:
+        await db.config_globals.update_roles(conn, roles={}, expected_version=0)
+        with pytest.raises(db.config_globals.StaleVersionError):
+            await db.config_globals.update_roles(conn, roles={}, expected_version=0)
+        assert conn.in_transaction is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_update_roles_concurrent_writers_only_one_wins(tmp_path: Path) -> None:
     """Two connections racing `update_roles` with the same `expected_version`
     must not both succeed: the check-and-write is one atomic SQL statement, not

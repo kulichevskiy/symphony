@@ -120,6 +120,11 @@ async def update_roles(
         )
     if cur.rowcount != 1:
         current = await get(conn)
+        # The conditional INSERT/UPDATE above already opened a write
+        # transaction even though it matched zero rows; leaving it open would
+        # hold the connection's write lock until some later, unrelated
+        # commit/rollback (SYM-191 review).
+        await conn.rollback()
         raise StaleVersionError(current.version if current is not None else 0)
     if commit:
         await conn.commit()
