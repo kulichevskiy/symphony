@@ -357,7 +357,7 @@ describe("BindingForm", () => {
     ).toBe("gpt-5.1-codex");
     // A role left unset stays at inherit.
     expect(
-      (screen.getByLabelText("binding fix agent") as HTMLSelectElement).value,
+      (screen.getByLabelText("binding review_find agent") as HTMLSelectElement).value,
     ).toBe("");
   });
 
@@ -654,14 +654,24 @@ describe("RoleMatrixEditor", () => {
     }
   });
 
-  it("hides the agent/model controls for review_verify (never consumed at dispatch)", () => {
+  it("hides review_verify's agent (never resolved at dispatch) but shows its live model cell", () => {
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
     expect(screen.queryByLabelText("binding review_verify agent")).toBeNull();
-    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+    expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
     expect(screen.getByLabelText("binding review_find agent")).toBeTruthy();
     expect(screen.getByLabelText("binding review_find model")).toBeTruthy();
+  });
+
+  it("hides fix/accept agent+model controls (dispatch still uses the legacy binding fields)", () => {
+    render(
+      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
+    );
+    for (const role of ["fix", "accept"]) {
+      expect(screen.queryByLabelText(`binding ${role} agent`)).toBeNull();
+      expect(screen.queryByLabelText(`binding ${role} model`)).toBeNull();
+    }
   });
 });
 

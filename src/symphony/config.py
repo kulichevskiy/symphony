@@ -811,6 +811,17 @@ class Config(BaseModel):
                         f"role {name!r}: unknown {family} model {role.model!r}; "
                         f"supported: {', '.join(supported)}"
                     )
+                if explicit_effort and role.agent == "claude" and role.model is None:
+                    # No model resolves (the ordinary default: claude builders
+                    # pass no `--model`), so there is no known model to check
+                    # the effort against, and the CLI's own default model may
+                    # not support it — fail closed here rather than letting
+                    # the mismatch surface only at dispatch (SYM-191 review).
+                    raise ValueError(
+                        f"role {name!r} sets effort {role.effort!r} for claude with no "
+                        "resolved model; pin an explicit model on this role to set an "
+                        "effort override"
+                    )
                 if explicit_effort and not _role_effort_in_family(role.agent, role.effort):
                     # The effort is family-checked against the *resolved* role,
                     # not the explicit cell: server-side assembly resolves the

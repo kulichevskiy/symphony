@@ -36,23 +36,31 @@ const ROLE_ORDER = [
   "accept",
 ] as const;
 
-// Which cells of a role are actually threaded into a dispatched command
-// (`resolved_role(role, ...)` call sites under `orchestrator/poll/`) — the
+// Which cells of a role are actually threaded into a dispatched command — the
 // rest validate/display but never affect a runtime dispatch, so exposing them
 // as editable would offer a knob that silently does nothing:
 //  * `effort` only ever reaches a subprocess flag for `implement`
 //    (`build_runner_command`); `review_find`/`fix`'s command builders take no
 //    `effort` param, and `review_verify`/`accept` are never resolved on any
 //    dispatch path.
-//  * `review_verify`'s `agent`/`model` are likewise never resolved on a
-//    dispatch path — the verifier pass reuses `review_find`'s resolved agent
-//    plus a separate legacy model field.
+//  * `review_verify.agent` is never resolved on a dispatch path — the
+//    verifier pass reuses the legacy `binding.agent` (`_lifecycle.py` passes
+//    it through as `implementer_agent`). `review_verify.model` IS live:
+//    `effective_config._synthesize_legacy_role_fields` copies it into
+//    `binding.local_review_verifier_claude_model`, which `_lifecycle.py`
+//    threads straight into the verifier's `--model`.
+//  * `fix.agent`/`fix.model` are NOT wired: `_run_fix_agent` builds its command
+//    from the legacy `binding.agent`/`binding.codex_model` fields, never from
+//    `resolved_role("fix", ...)` (`orchestrator/poll/_base.py`).
+//  * `accept.agent`/`accept.model` are NOT wired: `build_acceptance_command`
+//    hardcodes the `claude` CLI and takes no model param at all
+//    (`agent/runners/acceptance.py`).
 const ROLE_FIELDS: Record<string, { agent: boolean; model: boolean; effort: boolean }> = {
   implement: { agent: true, model: true, effort: true },
   review_find: { agent: true, model: true, effort: false },
-  review_verify: { agent: false, model: false, effort: false },
-  fix: { agent: true, model: true, effort: false },
-  accept: { agent: true, model: true, effort: false },
+  review_verify: { agent: false, model: true, effort: false },
+  fix: { agent: false, model: false, effort: false },
+  accept: { agent: false, model: false, effort: false },
 };
 
 /** Muted placeholder for a cell whose field the runtime never reads. */
@@ -917,11 +925,9 @@ export function BindingsPanel({
       {savedWarnings?.length ? (
         <Alert role="status">
           <AlertTitle>Saved with warnings</AlertTitle>
-          <AlertDescription>
-            {savedWarnings.map((w) => (
-              <div key={w}>{w}</div>
-            ))}
-          </AlertDescription>
+          {savedWarnings.map((w) => (
+            <AlertDescription key={w}>{w}</AlertDescription>
+          ))}
         </Alert>
       ) : null}
 
@@ -1051,11 +1057,9 @@ export function GlobalRolesCard({
       {warnings?.length ? (
         <Alert role="status">
           <AlertTitle>Saved with warnings</AlertTitle>
-          <AlertDescription>
-            {warnings.map((w) => (
-              <div key={w}>{w}</div>
-            ))}
-          </AlertDescription>
+          {warnings.map((w) => (
+            <AlertDescription key={w}>{w}</AlertDescription>
+          ))}
         </Alert>
       ) : null}
 

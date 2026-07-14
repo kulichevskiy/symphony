@@ -1315,6 +1315,28 @@ repos:
         Config.load(p)
 
 
+def test_roles_effort_without_model_claude_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A claude effort override with no model anywhere in the chain fails
+    closed even when the effort is in the Claude family: there is no resolved
+    model to check it against, and the CLI's own default model may not
+    support it (SYM-191 review)."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        effort: max
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="no resolved model"):
+        Config.load(p)
+
+
 def test_roles_config_builds_fix_command_with_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """A `roles`-based config drives the built `fix` claude command through
     both builder-fix command builders (poll's `build_fix_runner_command` and
