@@ -654,24 +654,30 @@ describe("RoleMatrixEditor", () => {
     }
   });
 
-  it("hides review_verify's agent (never resolved at dispatch) but shows its live model cell", () => {
+  it("shows review_verify's agent+model (agent gates whether the model reaches the verifier)", () => {
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
-    expect(screen.queryByLabelText("binding review_verify agent")).toBeNull();
+    expect(screen.getByLabelText("binding review_verify agent")).toBeTruthy();
     expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
     expect(screen.getByLabelText("binding review_find agent")).toBeTruthy();
     expect(screen.getByLabelText("binding review_find model")).toBeTruthy();
   });
 
-  it("hides fix/accept agent+model controls (dispatch still uses the legacy binding fields)", () => {
+  it("shows fix's live model cell but hides its agent (dispatch CLI stays the legacy binding.agent)", () => {
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
-    for (const role of ["fix", "accept"]) {
-      expect(screen.queryByLabelText(`binding ${role} agent`)).toBeNull();
-      expect(screen.queryByLabelText(`binding ${role} model`)).toBeNull();
-    }
+    expect(screen.queryByLabelText("binding fix agent")).toBeNull();
+    expect(screen.getByLabelText("binding fix model")).toBeTruthy();
+  });
+
+  it("hides accept's agent+model controls (dispatch never resolves them)", () => {
+    render(
+      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
+    );
+    expect(screen.queryByLabelText("binding accept agent")).toBeNull();
+    expect(screen.queryByLabelText("binding accept model")).toBeNull();
   });
 });
 

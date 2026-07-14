@@ -43,23 +43,30 @@ const ROLE_ORDER = [
 //    (`build_runner_command`); `review_find`/`fix`'s command builders take no
 //    `effort` param, and `review_verify`/`accept` are never resolved on any
 //    dispatch path.
-//  * `review_verify.agent` is never resolved on a dispatch path — the
-//    verifier pass reuses the legacy `binding.agent` (`_lifecycle.py` passes
-//    it through as `implementer_agent`). `review_verify.model` IS live:
-//    `effective_config._synthesize_legacy_role_fields` copies it into
-//    `binding.local_review_verifier_claude_model`, which `_lifecycle.py`
-//    threads straight into the verifier's `--model`.
-//  * `fix.agent`/`fix.model` are NOT wired: `_run_fix_agent` builds its command
-//    from the legacy `binding.agent`/`binding.codex_model` fields, never from
-//    `resolved_role("fix", ...)` (`orchestrator/poll/_base.py`).
+//  * `review_verify.agent` never picks the verifier's own CLI — the verifier
+//    pass always reuses the legacy `binding.agent` (`_lifecycle.py` passes it
+//    through as `implementer_agent`). It must still be editable: `resolved_
+//    role("review_verify", ...).model` only reaches the verifier's `--model`
+//    when the *resolved* agent is `claude`
+//    (`effective_config._synthesize_legacy_role_fields`), and that agent
+//    defaults to the implementer-opposite family
+//    (`resolved_reviewer_agent()`) — so for the common claude implementer, a
+//    `review_verify.model` override silently drops unless `agent` is also
+//    pinned to `claude`.
+//  * `fix.agent` is NOT wired: `_run_fix_agent` picks its CLI from the legacy
+//    `binding.agent`, never from `resolved_role("fix", ...).agent`
+//    (`orchestrator/poll/_base.py`/`_helpers.build_fix_runner_command`).
+//    `fix.model` IS live: `_fix_claude_model` reads
+//    `resolved_role("fix", ...).model` and threads it straight into the
+//    fixer's `--model` whenever the resolved fix agent is claude.
 //  * `accept.agent`/`accept.model` are NOT wired: `build_acceptance_command`
 //    hardcodes the `claude` CLI and takes no model param at all
 //    (`agent/runners/acceptance.py`).
 const ROLE_FIELDS: Record<string, { agent: boolean; model: boolean; effort: boolean }> = {
   implement: { agent: true, model: true, effort: true },
   review_find: { agent: true, model: true, effort: false },
-  review_verify: { agent: false, model: true, effort: false },
-  fix: { agent: false, model: false, effort: false },
+  review_verify: { agent: true, model: true, effort: false },
+  fix: { agent: false, model: true, effort: false },
   accept: { agent: false, model: false, effort: false },
 };
 
