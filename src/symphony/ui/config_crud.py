@@ -516,6 +516,13 @@ async def _reject_unsupported_efforts(
     effort for that pair — a present-but-broken key means something is wrong,
     not "no key configured" (SYM-191 review).
 
+    A claude role with `effort` set but `model=None` (e.g. `implement: {agent:
+    claude, effort: xhigh}` with no model anywhere in the chain — the ordinary
+    default, since claude builders pass no `--model`) fails closed too: there
+    is no known model to check the effort against, and the CLI's own default
+    model may not support it, so the mismatch would only surface at dispatch
+    instead of at save (SYM-191 review).
+
     `bindings` scopes the sweep: `_assemble_and_validate` passes just the
     candidate, so a stale pair on an unrelated binding can't block this save.
     `put_roles` leaves it `None` (all of `trial.repos`); zero bindings there
@@ -546,8 +553,16 @@ async def _reject_unsupported_efforts(
                 ):
                     continue
             role = binding.resolved_role(name, trial.roles)
-            if role.agent == "claude" and role.model is not None and role.effort is not None:
-                pairs.add((binding_key, role.model, role.effort))
+            if role.agent != "claude" or role.effort is None:
+                continue
+            if role.model is None:
+                raise _validation_error(
+                    ["roles"],
+                    f"role {name!r} sets effort {role.effort!r} for claude with no "
+                    "resolved model; pin an explicit model on this role to set an "
+                    "effort override",
+                )
+            pairs.add((binding_key, role.model, role.effort))
     caps: dict[tuple[str, str], list[str] | None] = {}
     for key, model, effort in sorted(pairs):
         cache_key = (key, model)

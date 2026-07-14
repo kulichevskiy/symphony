@@ -36,15 +36,41 @@ const ROLE_ORDER = [
   "accept",
 ] as const;
 
+// Which cells of a role are actually threaded into a dispatched command
+// (`resolved_role(role, ...)` call sites under `orchestrator/poll/`) — the
+// rest validate/display but never affect a runtime dispatch, so exposing them
+// as editable would offer a knob that silently does nothing:
+//  * `effort` only ever reaches a subprocess flag for `implement`
+//    (`build_runner_command`); `review_find`/`fix`'s command builders take no
+//    `effort` param, and `review_verify`/`accept` are never resolved on any
+//    dispatch path.
+//  * `review_verify`'s `agent`/`model` are likewise never resolved on a
+//    dispatch path — the verifier pass reuses `review_find`'s resolved agent
+//    plus a separate legacy model field.
+const ROLE_FIELDS: Record<string, { agent: boolean; model: boolean; effort: boolean }> = {
+  implement: { agent: true, model: true, effort: true },
+  review_find: { agent: true, model: true, effort: false },
+  review_verify: { agent: false, model: false, effort: false },
+  fix: { agent: true, model: true, effort: false },
+  accept: { agent: true, model: true, effort: false },
+};
+
+/** Muted placeholder for a cell whose field the runtime never reads. */
+function UnusedCell() {
+  return <span className="text-xs text-muted-foreground">not used</span>;
+}
+
 // --- Role matrix editing (SYM-191) -------------------------------------------
 
-/** Models offered for an explicitly-picked agent. An inherited (empty) agent
- *  leaves the family unknown client-side, so the model cell only offers
- *  "inherit" — the server resolves the inherited model. */
+/** Models offered for an (agent) pick. An inherited (empty) agent leaves the
+ *  family unknown client-side, so the model cell offers the union of both
+ *  families (mirroring `effortsFor`'s inherited-agent fallback) — an operator
+ *  can still override just the model without first pinning an agent; the
+ *  server family-checks the resolved pair at save. */
 function modelsFor(options: ConfigOptions, agent: string): string[] {
   if (agent === "codex") return options.codex_models;
   if (agent === "claude") return options.claude_aliases;
-  return [];
+  return [...new Set([...options.claude_aliases, ...options.codex_models])].sort();
 }
 
 /** Efforts offered for an (agent, model) pick. Claude efforts are per model
@@ -112,6 +138,7 @@ export function RoleMatrixEditor({
         </thead>
         <tbody>
           {ROLE_ORDER.map((role) => {
+            const fields = ROLE_FIELDS[role];
             const cell = roles[role] ?? {};
             const agent = String(cell.agent ?? "");
             const model = String(cell.model ?? "");
@@ -138,47 +165,58 @@ export function RoleMatrixEditor({
               <tr key={role} className="border-b border-border/70 last:border-0">
                 <td className="px-3 py-2 font-mono text-xs">{role}</td>
                 <td className="px-3 py-2">
-                  <Select
-                    value={agent}
-                    onChange={(e) => cellChange(role, "agent", e.target.value)}
-                    aria-label={`${scope} ${role} agent`}
-                  >
-                    <option value="">inherit</option>
-                    {options.agent_families.map((a) => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
-                  </Select>
+                  {fields.agent ? (
+                    <Select
+                      value={agent}
+                      onChange={(e) => cellChange(role, "agent", e.target.value)}
+                      aria-label={`${scope} ${role} agent`}
+                    >
+                      <option value="">inherit</option>
+                      {options.agent_families.map((a) => (
+                        <option key={a} value={a}>
+                          {a}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <UnusedCell />
+                  )}
                 </td>
                 <td className="px-3 py-2">
-                  <Select
-                    value={model}
-                    onChange={(e) => cellChange(role, "model", e.target.value)}
-                    aria-label={`${scope} ${role} model`}
-                    disabled={agent === "" && !model}
-                  >
-                    <option value="">inherit</option>
-                    {modelChoices.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </Select>
+                  {fields.model ? (
+                    <Select
+                      value={model}
+                      onChange={(e) => cellChange(role, "model", e.target.value)}
+                      aria-label={`${scope} ${role} model`}
+                    >
+                      <option value="">inherit</option>
+                      {modelChoices.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <UnusedCell />
+                  )}
                 </td>
                 <td className="px-3 py-2">
-                  <Select
-                    value={effort}
-                    onChange={(e) => cellChange(role, "effort", e.target.value)}
-                    aria-label={`${scope} ${role} effort`}
-                  >
-                    <option value="">inherit</option>
-                    {effortChoices.map((ef) => (
-                      <option key={ef} value={ef}>
-                        {ef}
-                      </option>
-                    ))}
-                  </Select>
+                  {fields.effort ? (
+                    <Select
+                      value={effort}
+                      onChange={(e) => cellChange(role, "effort", e.target.value)}
+                      aria-label={`${scope} ${role} effort`}
+                    >
+                      <option value="">inherit</option>
+                      {effortChoices.map((ef) => (
+                        <option key={ef} value={ef}>
+                          {ef}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <UnusedCell />
+                  )}
                 </td>
               </tr>
             );

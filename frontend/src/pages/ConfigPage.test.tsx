@@ -615,13 +615,17 @@ describe("RoleMatrixEditor", () => {
     expect(model.disabled).toBe(false);
   });
 
-  it("disables the model cell only when both agent and model are inherited", () => {
+  it("offers the union of both families' models when the agent is inherited", () => {
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
     const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
     expect(model.value).toBe("");
-    expect(model.disabled).toBe(true);
+    expect(model.disabled).toBe(false);
+    expect([...model.options].map((o) => o.value)).toEqual([
+      "",
+      ...[...OPTIONS.claude_aliases, ...OPTIONS.codex_models].sort(),
+    ]);
   });
 
   it("renders a stored model not in the current family list instead of blanking the select", () => {
@@ -638,6 +642,26 @@ describe("RoleMatrixEditor", () => {
     const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
     expect(model.value).toBe("claude-opus-4-20250514");
     expect([...model.options].map((o) => o.value)).toContain("claude-opus-4-20250514");
+  });
+
+  it("hides the effort control for roles whose effort the runtime never reads", () => {
+    render(
+      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
+    );
+    expect(screen.getByLabelText("binding implement effort")).toBeTruthy();
+    for (const role of ["review_find", "review_verify", "fix", "accept"]) {
+      expect(screen.queryByLabelText(`binding ${role} effort`)).toBeNull();
+    }
+  });
+
+  it("hides the agent/model controls for review_verify (never consumed at dispatch)", () => {
+    render(
+      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
+    );
+    expect(screen.queryByLabelText("binding review_verify agent")).toBeNull();
+    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+    expect(screen.getByLabelText("binding review_find agent")).toBeTruthy();
+    expect(screen.getByLabelText("binding review_find model")).toBeTruthy();
   });
 });
 

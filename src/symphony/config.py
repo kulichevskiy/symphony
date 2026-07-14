@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .agent.codex_models import (
@@ -92,7 +92,13 @@ class RoleConfig(BaseModel):
     the back-compat default for the role, which may itself be `None` (no
     `--model`, CLI default). `effort` is a family-specific literal (like
     `model`) validated in `Config.load`; `effort=None` passes no flag.
+
+    `extra="forbid"`: a typo'd key (e.g. `effr`) would otherwise silently drop
+    under pydantic's default `extra="ignore"`, persisting a cell the operator
+    thinks is set but the daemon never sees (SYM-191 review).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     agent: Literal["claude", "codex"] | None = None
     model: str | None = None

@@ -882,6 +882,51 @@ async def test_roles_put_rejects_bad_effort_with_zero_bindings(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_roles_put_rejects_unknown_role_cell_field(tmp_path: Path) -> None:
+    """A typo'd role-cell key (e.g. `effr` for `effort`) is rejected, not
+    silently dropped — `RoleConfig`'s default `extra="ignore"` would otherwise
+    persist a cell the operator thinks is set but the daemon never sees
+    (SYM-191 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {"implement": {"agent": "claude", "effr": "high"}},
+                    "version": 0,
+                },
+            )
+            assert put.status_code == 422, put.text
+
+            # Rejected, not persisted — a reread still shows the empty matrix.
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {"roles": {}, "version": 0}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_binding_rejects_unknown_role_cell_field(tmp_path: Path) -> None:
+    """The same unknown-field guard applies to a per-binding `roles:`
+    override — `RepoBinding.roles` shares the same `RoleConfig` cell type."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(roles={"implement": {"agent": "claude", "effr": "high"}})
+                },
+            )
+            assert resp.status_code == 422, resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_roles_put_version_conflict(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:
@@ -926,7 +971,8 @@ async def test_roles_put_diversity_warning_non_blocking(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_effort_with_inherited_model_saves(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """An effort override with no explicit model saves — it is family-checked
-    against the resolved role, not rejected for lacking a model (SYM-191)."""
+    against the resolved role — as long as that role resolves a codex agent,
+    which needs no per-model capability check (SYM-191)."""
 
     async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
         return None
@@ -938,10 +984,42 @@ async def test_effort_with_inherited_model_saves(tmp_path: Path, monkeypatch) ->
         async with _client(app) as client:
             created = await client.post(
                 "/api/config/bindings",
-                json={"payload": _payload(roles={"implement": {"effort": "high"}})},
+                json={
+                    "payload": _payload(roles={"implement": {"agent": "codex", "effort": "high"}})
+                },
             )
             assert created.status_code == 201, created.text
-            assert created.json()["payload"]["roles"] == {"implement": {"effort": "high"}}
+            assert created.json()["payload"]["roles"] == {
+                "implement": {"agent": "codex", "effort": "high"}
+            }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_effort_with_no_resolved_model_rejected(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A claude role that resolves `effort` but no `model` (e.g. `implement:
+    {agent: claude, effort: xhigh}` — the ordinary default, since claude
+    builders pass no `--model`) fails at save: there is no model to check the
+    effort against, and the CLI's own default model may not support it, so the
+    mismatch would otherwise only surface at dispatch (SYM-191 review)."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(roles={"implement": {"agent": "claude", "effort": "xhigh"}})
+                },
+            )
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"][0]["loc"] == ["roles"]
     finally:
         await conn.close()
 
