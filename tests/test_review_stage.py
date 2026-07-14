@@ -1780,10 +1780,13 @@ async def test_review_fix_run_is_gated_by_review_semaphore(tmp_path: Path) -> No
         tasks: list[asyncio.Task[None]] = []
         try:
             tasks = await orch._poll_review_runs()  # noqa: SLF001
-            # Give the event loop enough turns for the task to get through all
-            # the mock awaits (CI fetch, head SHA, log tail) and reach the
-            # semaphore block.  All mocks resolve instantly so 0.05 s is ample.
-            await asyncio.sleep(0.05)
+            # Wait for the task to get through all the mock awaits (CI fetch,
+            # head SHA, log tail) and reach the semaphore block, instead of a
+            # fixed sleep that can flake under CI load.
+            for _ in range(500):
+                if gh.pr_checks.await_count:
+                    break
+                await asyncio.sleep(0.01)
 
             # Task is alive but runner never started — stuck on _review_fix_sem.
             assert len(tasks) == 1
