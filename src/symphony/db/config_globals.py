@@ -87,17 +87,40 @@ async def update_roles(
     `expected_version` (0 when no row exists yet — a fresh, never-migrated DB);
     otherwise a `StaleVersionError` is raised. `migrated_at` is preserved. On
     success `version` is bumped to `expected_version + 1` and returned.
+
+    The check-and-write is a single conditional `UPDATE`/`INSERT` statement,
+    not a separate `SELECT` followed by a write — SQLite serializes each
+    statement at the file-lock level, so this stays atomic across concurrent
+    connections/processes racing on the same `expected_version` (unlike a
+    read-then-upsert, where two writers could both read the same current
+    version before either writes).
     """
-    current = await get(conn)
-    current_version = current.version if current is not None else 0
-    if current_version != expected_version:
-        raise StaleVersionError(current_version)
-    new_version = current_version + 1
-    await set_globals(
-        conn,
-        roles=roles,
-        migrated_at=current.migrated_at if current is not None else "",
-        version=new_version,
-        commit=commit,
-    )
+    new_version = expected_version + 1
+    payload = json.dumps(roles, separators=(",", ":"))
+    if expected_version == 0:
+        # No row exists yet at any version >= 1 (see schema default), so a
+        # fresh DB's first write is an insert guarded against a racing first
+        # write rather than an update keyed on a stored version.
+        cur = await conn.execute(
+            """
+            INSERT INTO config_globals (id, roles, migrated_at, version)
+            SELECT 1, ?, '', ?
+             WHERE NOT EXISTS (SELECT 1 FROM config_globals WHERE id = 1)
+            """,
+            (payload, new_version),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            UPDATE config_globals
+               SET roles = ?, version = ?
+             WHERE id = 1 AND version = ?
+            """,
+            (payload, new_version, expected_version),
+        )
+    if cur.rowcount != 1:
+        current = await get(conn)
+        raise StaleVersionError(current.version if current is not None else 0)
+    if commit:
+        await conn.commit()
     return new_version

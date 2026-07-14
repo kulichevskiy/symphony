@@ -406,17 +406,39 @@ def _reject_duplicate_selector(candidate: RepoBinding, others: list[RepoBinding]
             )
 
 
+async def _reject_stale_globals(conn: aiosqlite.Connection, validated_version: int) -> None:
+    """Raise a 409 if the global roles matrix's `version` has moved since
+    `_assemble_and_validate` ran. Must be re-run inside `lock` immediately
+    before the insert/update it guards: a global roles PUT landing during the
+    (possibly 30s) pre-lock capability check would otherwise be invisible to
+    this binding's save — that write bumps `config_globals.version`, not this
+    binding's own row version, so the binding's own optimistic lock can't
+    catch it (SYM-191 review)."""
+    current = await config_globals.get(conn)
+    current_version = current.version if current is not None else 0
+    if current_version != validated_version:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "msg": "global roles matrix changed while validating this binding; "
+                "reload and retry",
+            },
+        )
+
+
 async def _assemble_and_validate(
     conn: aiosqlite.Connection,
     base: Config,
     candidate: RepoBinding,
     *,
     exclude_id: int | None,
-) -> list[str]:
+) -> tuple[list[str], int]:
     """Assemble the trial effective config (system knobs + all DB bindings, the
     candidate swapped in for `exclude_id`, + global matrix) and re-run the
     roles-matrix validators. Returns non-blocking warnings (lost review-family
-    diversity). Raises a 422 on a duplicate selector or a validator error."""
+    diversity) and the global-matrix `version` validated against (0 when no
+    globals row exists), so the caller can recheck it hasn't moved before
+    committing. Raises a 422 on a duplicate selector or a validator error."""
     others = await _other_bindings(conn, base, exclude_id=exclude_id)
     _reject_duplicate_selector(candidate, others)
 
@@ -426,6 +448,7 @@ async def _assemble_and_validate(
         from pydantic import TypeAdapter
 
         global_roles = TypeAdapter(dict[RoleName, RoleConfig]).validate_python(globals_row.roles)
+    globals_version = globals_row.version if globals_row is not None else 0
 
     trial = base.model_copy(update={"repos": [*others, candidate], "roles": global_roles})
     caught = _run_matrix_validators(trial)
@@ -437,11 +460,12 @@ async def _assemble_and_validate(
     # `validate_roles_matrix` warns for every binding in the trial set; only the
     # candidate's own warnings are relevant to this save (others are unchanged).
     prefix = f"binding {candidate.project_key}/{candidate.github_repo}:"
-    return [
+    wgs = [
         str(w.message)
         for w in caught
         if issubclass(w.category, UserWarning) and str(w.message).startswith(prefix)
     ]
+    return wgs, globals_version
 
 
 def _run_matrix_validators(trial: Config) -> list[warnings.WarningMessage]:
@@ -484,9 +508,13 @@ async def _reject_unsupported_efforts(
     same way it will actually run, not silently skipped. codex efforts are
     the fixed family enum (already checked structurally by
     `validate_roles_matrix`). A `None` result (no ANTHROPIC_API_KEY anywhere
-    for that binding, or a Models-API error) skips the pair: the daemon may
-    run claude via CLI auth, and the structural family check already ran —
-    exactly preflight's fail-open-on-cannot-validate behavior.
+    for that binding) skips the pair: the daemon may run claude via CLI auth,
+    and the structural family check already ran — exactly preflight's
+    fail-open-on-no-key behavior. A key IS present but the Models-API call
+    itself fails (auth, network, malformed response) raises `ValueError`,
+    which this save fails closed on (422) rather than silently accepting any
+    effort for that pair — a present-but-broken key means something is wrong,
+    not "no key configured" (SYM-191 review).
 
     `bindings` scopes the sweep: `_assemble_and_validate` passes just the
     candidate, so a stale pair on an unrelated binding can't block this save.
@@ -526,8 +554,8 @@ async def _reject_unsupported_efforts(
         if cache_key not in caps:
             try:
                 caps[cache_key] = await fetch_claude_effort_capabilities(model, key)
-            except ValueError:
-                caps[cache_key] = None
+            except ValueError as e:
+                raise _validation_error(["roles"], str(e)) from e
         supported = caps[cache_key]
         if supported is not None and effort not in supported:
             raise _validation_error(
@@ -692,7 +720,24 @@ def create_config_crud_router(
         # role is unaffected by this write and must not block it (SYM-191
         # review) — that binding's own save already validated its pair.
         await _reject_unsupported_efforts(trial, only_inherited=True)
+        binding_snapshot = {row.id: row.version for row in existing}
         async with lock:
+            # Cheap, DB-only recheck: a binding created/updated/deleted during
+            # the (possibly 30s) capability check above isn't reflected in
+            # `trial`, and a binding write bumps its own row's version, not
+            # `config_globals.version` — so the write below can't detect that
+            # staleness on its own. Bindings don't change often enough for
+            # this to cost real retries; fail safe with a 409 rather than
+            # commit against a stale binding set (SYM-191 review).
+            fresh = await config_bindings.list_all(conn)
+            if {row.id: row.version for row in fresh} != binding_snapshot:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "msg": "bindings changed while validating the roles matrix; "
+                        "reload and retry",
+                    },
+                )
             try:
                 new_version = await config_globals.update_roles(
                     conn, roles=stored, expected_version=body.version
@@ -740,7 +785,7 @@ def create_config_crud_router(
         # Assembly + validation (including the external Models-API capability
         # check, up to the full 30s httpx timeout) runs before the lock is
         # acquired — see the matching comment in `put_roles` for why.
-        wgs = await _assemble_and_validate(conn, base, binding, exclude_id=None)
+        wgs, globals_version = await _assemble_and_validate(conn, base, binding, exclude_id=None)
         async with lock:
             # Re-check the cheap, DB-state-dependent duplicate-selector
             # invariant against a fresh listing, now that the lock excludes
@@ -749,6 +794,7 @@ def create_config_crud_router(
             # from a racing create/update could have landed since (SYM-191
             # review).
             _reject_duplicate_selector(binding, await _other_bindings(conn, base, exclude_id=None))
+            await _reject_stale_globals(conn, globals_version)
             try:
                 new_id = await config_bindings.insert(
                     conn,
@@ -817,12 +863,15 @@ def create_config_crud_router(
         # read here too (not inside the lock); the write below still carries
         # its own optimistic-lock `version` check, so a concurrent change
         # lands as a 409, not a lost update.
-        wgs = await _assemble_and_validate(conn, base, binding, exclude_id=binding_id)
+        wgs, globals_version = await _assemble_and_validate(
+            conn, base, binding, exclude_id=binding_id
+        )
         async with lock:
             # Same re-check as `create_binding` — see that comment.
             _reject_duplicate_selector(
                 binding, await _other_bindings(conn, base, exclude_id=binding_id)
             )
+            await _reject_stale_globals(conn, globals_version)
             try:
                 row = await config_bindings.update(
                     conn,

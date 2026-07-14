@@ -1171,3 +1171,115 @@ async def test_global_roles_put_not_blocked_by_unrelated_binding_override(
             assert put.status_code == 200, put.text
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_save_fails_closed_on_capability_lookup_error(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A present `ANTHROPIC_API_KEY` that fails the Models-API capability
+    lookup (auth error, network error, malformed response) must fail the save
+    with a 422, not silently accept the effort as if no key were configured
+    at all (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "broken-key")
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        raise ValueError(f"could not reach the Models API to validate claude model {model!r}")
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}}
+                    )
+                },
+            )
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_rejects_when_bindings_change_during_validation(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A binding created while a roles PUT's (network-bound) capability check
+    is in flight must not be silently missed: the in-lock recheck against a
+    fresh binding listing fails the write with a 409 rather than committing
+    against a stale binding snapshot (SYM-191 review)."""
+    conn, db_path = await _open(tmp_path)
+    original_list_all = config_bindings.list_all
+    calls = {"n": 0}
+
+    async def _list_all(c: Any) -> list[Any]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Simulate a binding create landing between the pre-lock snapshot
+            # and the in-lock recheck.
+            await config_bindings.insert(
+                c, payload=_payload(), key=("ENG", "org/repo", "", "linear", "default")
+            )
+        return await original_list_all(c)
+
+    monkeypatch.setattr("symphony.ui.config_crud.config_bindings.list_all", _list_all)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+            assert put.status_code == 409, put.text
+            assert "bindings changed" in put.json()["detail"]["msg"]
+
+            # Not persisted — a reread still shows the empty matrix.
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {"roles": {}, "version": 0}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_binding_create_rejects_when_globals_change_during_validation(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A global roles PUT landing while a binding save's (network-bound)
+    capability check is in flight must not be silently missed: the in-lock
+    recheck against the current globals version fails the write with a 409
+    rather than committing against a stale global-roles snapshot (SYM-191
+    review)."""
+    conn, db_path = await _open(tmp_path)
+    original_get = db.config_globals.get
+    calls = {"n": 0}
+
+    async def _get(c: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        # Simulate a global roles PUT landing between the pre-lock validation
+        # and the in-lock recheck.
+        await db.config_globals.set_globals(c, roles={"implement": {"agent": "codex"}}, version=1)
+        return await original_get(c)
+
+    monkeypatch.setattr("symphony.ui.config_crud.config_globals.get", _get)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/config/bindings", json={"payload": _payload()})
+            assert resp.status_code == 409, resp.text
+            assert "global roles matrix changed" in resp.json()["detail"]["msg"]
+
+            # Not persisted — no binding was created.
+            listed = await client.get("/api/config/bindings")
+            assert listed.json() == []
+    finally:
+        await conn.close()
