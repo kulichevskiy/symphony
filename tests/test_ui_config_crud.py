@@ -1078,7 +1078,8 @@ async def test_save_rejects_unsupported_claude_effort(tmp_path: Path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_stale_effort_on_unrelated_binding_does_not_block_save(
-    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
 ) -> None:
     """A now-unsupported claude (model, effort) on binding A (e.g. saved
     fail-open before ANTHROPIC_API_KEY was configured) must not fail a save on
@@ -1130,7 +1131,8 @@ async def test_stale_effort_on_unrelated_binding_does_not_block_save(
 
 @pytest.mark.asyncio
 async def test_global_roles_put_not_blocked_by_unrelated_binding_override(
-    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
 ) -> None:
     """A binding pinning its own explicit `(model, effort)` for one role must
     not block a global roles PUT that doesn't touch that role: the pair is

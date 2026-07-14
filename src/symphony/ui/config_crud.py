@@ -502,8 +502,10 @@ async def _reject_unsupported_efforts(
     env_source = _env_key_source()
     process_key = env_source.get("ANTHROPIC_API_KEY", "")
     pairs: set[tuple[str, str, str]] = set()  # (key, model, effort)
-    for binding in bindings if bindings is not None else (
-        trial.repos or [_synthetic_matrix_validation_binding()]
+    for binding in (
+        bindings
+        if bindings is not None
+        else (trial.repos or [_synthetic_matrix_validation_binding()])
     ):
         binding_key = _binding_anthropic_key(binding, env_source, process_key)
         for name in get_args(RoleName):
@@ -746,9 +748,7 @@ def create_config_crud_router(
             # after the slow capability check), so a same-selector binding
             # from a racing create/update could have landed since (SYM-191
             # review).
-            _reject_duplicate_selector(
-                binding, await _other_bindings(conn, base, exclude_id=None)
-            )
+            _reject_duplicate_selector(binding, await _other_bindings(conn, base, exclude_id=None))
             try:
                 new_id = await config_bindings.insert(
                     conn,
