@@ -1595,7 +1595,7 @@ async def test_drain_guard_blocks_delete_on_operator_wait(tmp_path: Path) -> Non
                 f"/api/config/bindings/{rec['id']}?version={rec['version']}"
             )
             assert deleted.status_code == 409, deleted.text
-            assert deleted.json()["detail"]["blockers"]["operator_waits"] == [issue_id]
+            assert deleted.json()["detail"]["blockers"]["operator_waits"] == ["ENG-1"]
     finally:
         await conn.close()
 

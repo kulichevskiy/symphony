@@ -372,6 +372,30 @@ describe("BindingForm", () => {
     await waitFor(() => expect(screen.getByText(/Edit conflict/)).toBeTruthy());
     expect(screen.getByText(/now version 8/)).toBeTruthy();
   });
+
+  it("renders the blocker list, not the conflict banner, on a drain-guard 409 from a rename", async () => {
+    mockFetch(409, {
+      detail: {
+        msg: "cannot rename a binding with active work",
+        blockers: {
+          running_runs: ["ENG-1"],
+          open_prs: [],
+          operator_waits: [],
+          scheduled_slots: 0,
+        },
+      },
+    });
+    render(
+      <BindingForm binding={record()} options={OPTIONS} onSaved={() => {}} onCancel={() => {}} />,
+    );
+    fireEvent.change(screen.getByLabelText("project_key"), { target: { value: "OTHER" } });
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() =>
+      expect(screen.getByText(/active work must drain first/)).toBeTruthy(),
+    );
+    expect(screen.getByText(/running: ENG-1/)).toBeTruthy();
+    expect(screen.queryByText(/Edit conflict/)).toBeNull();
+  });
 });
 
 describe("BindingsPanel", () => {

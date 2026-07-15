@@ -349,18 +349,7 @@ async def _drain_blockers(
     natural_key = _row_natural_key(row)
     running = await runs.live_identifiers_for_binding_key(conn, binding_key)
     open_prs = await issue_prs.open_identifiers_for_binding_key(conn, binding_key)
-    waits = [
-        w.issue_id
-        for w in await operator_waits.list_all(conn)
-        if (
-            w.linear_team_key,
-            w.github_repo,
-            w.issue_label,
-            w.tracker_provider,
-            w.tracker_site,
-        )
-        == natural_key
-    ]
+    waits = await operator_waits.open_identifiers_for_natural_key(conn, natural_key)
     scheduled = scheduled_slots(natural_key) if scheduled_slots is not None else 0
     if running or open_prs or waits or scheduled:
         return {

@@ -163,6 +163,36 @@ async def list_all(conn: aiosqlite.Connection) -> list[OperatorWait]:
     ]
 
 
+async def open_identifiers_for_natural_key(
+    conn: aiosqlite.Connection,
+    natural_key: tuple[str, str, str, str, str],
+) -> list[str]:
+    """Human issue identifiers of waits parked within a binding's natural-key
+    scope `(linear_team_key, github_repo, issue_label, tracker_provider,
+    tracker_site)`.
+
+    A drain-guard blocker: resolves through `issues` like
+    `issue_prs.open_identifiers_for_binding_key`'s COALESCE, so the blocker
+    list renders the same identifier form (`ENG-1`) as `running_runs`/
+    `open_prs` instead of the internal issue id (SYM-193 review)."""
+    linear_team_key, github_repo, issue_label, tracker_provider, tracker_site = natural_key
+    cur = await conn.execute(
+        """
+        SELECT COALESCE(i.identifier, w.issue_id) AS identifier
+          FROM operator_waits w
+          LEFT JOIN issues i ON i.id = w.issue_id
+         WHERE w.linear_team_key = ?
+           AND w.github_repo = ?
+           AND w.issue_label = ?
+           AND w.tracker_provider = ?
+           AND w.tracker_site = ?
+         ORDER BY identifier
+        """,
+        (linear_team_key, github_repo, issue_label, tracker_provider, tracker_site),
+    )
+    return [str(row["identifier"]) for row in await cur.fetchall()]
+
+
 async def get(conn: aiosqlite.Connection, issue_id: str) -> OperatorWait | None:
     cur = await conn.execute(
         """

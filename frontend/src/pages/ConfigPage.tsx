@@ -511,6 +511,7 @@ export function BindingForm({
   const [rawError, setRawError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldError[]>([]);
   const [conflict, setConflict] = useState<number | null | false>(false);
+  const [blockers, setBlockers] = useState<DrainBlockers | null>(null);
   const [saving, setSaving] = useState(false);
 
   function patch(next: Record<string, unknown>) {
@@ -552,6 +553,7 @@ export function BindingForm({
     setSaving(true);
     setFieldErrors([]);
     setConflict(false);
+    setBlockers(null);
     const body: BindingWrite = {
       payload,
       // Preserve the current enabled state on edit (the card's toggle owns
@@ -568,6 +570,7 @@ export function BindingForm({
     } catch (e) {
       if (e instanceof ConfigWriteError) {
         if (e.status === 422) setFieldErrors(e.fieldErrors);
+        else if (e.blockers) setBlockers(e.blockers);
         else if (e.status === 409) setConflict(e.conflictVersion);
         else setFieldErrors([{ loc: ["_"], msg: e.message }]);
       } else {
@@ -624,7 +627,12 @@ export function BindingForm({
         </Button>
       </div>
 
-      {conflict !== false ? (
+      {blockers ? (
+        <Alert className="mb-4 border-destructive/50" role="alert">
+          <AlertTitle>Cannot apply — active work must drain first</AlertTitle>
+          <AlertDescription>{formatBlockers(blockers)}</AlertDescription>
+        </Alert>
+      ) : conflict !== false ? (
         <Alert className="mb-4 border-destructive/50" role="alert">
           <AlertTitle>Edit conflict</AlertTitle>
           <AlertDescription>
