@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -475,11 +476,14 @@ async def test_backfill_skips_running_runs(tmp_path: Path) -> None:
     assert _model_rows(db_path) == {}
 
 
-@pytest.mark.asyncio
-async def test_cli_backfill_model_usage(tmp_path: Path) -> None:
+def test_cli_backfill_model_usage(tmp_path: Path) -> None:
+    """The CLI command spawns its own event loop internally (SYM-192 review:
+    it resolves Codex models from the DB-backed effective config); running
+    it via a plain sync test — not `@pytest.mark.asyncio` — mirrors real CLI
+    invocation, which never runs inside an already-active loop."""
     db_path = tmp_path / "state.sqlite"
     log_root = tmp_path / "logs"
-    await _seed_run(db_path, run_id="implement-run", tokens=(100, 50, 30, 20))
+    asyncio.run(_seed_run(db_path, run_id="implement-run", tokens=(100, 50, 30, 20)))
     _write_log(
         log_root / "implement-run.log",
         {
@@ -513,28 +517,34 @@ async def test_cli_backfill_model_usage(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.asyncio
-async def test_cli_backfill_model_usage_config_resolves_fix_and_accept_models(
+def test_cli_backfill_model_usage_config_resolves_fix_and_accept_models(
     tmp_path: Path,
 ) -> None:
     """`roles.fix`/`roles.accept` pinning a different Codex model than
     `roles.implement` must backfill review-fix/acceptance-fix runs with
-    their own role's model, not the implementer's (SYM-192 review)."""
+    their own role's model, not the implementer's (SYM-192 review).
+
+    Plain sync test (not `@pytest.mark.asyncio`), same reason as
+    `test_cli_backfill_model_usage` above."""
     db_path = tmp_path / "state.sqlite"
     log_root = tmp_path / "logs"
-    await _seed_run(
-        db_path,
-        run_id="review-fix-run",
-        team_key="ENG",
-        stage="review_fix",
-        tokens=(900, 120, 0, 80),
+    asyncio.run(
+        _seed_run(
+            db_path,
+            run_id="review-fix-run",
+            team_key="ENG",
+            stage="review_fix",
+            tokens=(900, 120, 0, 80),
+        )
     )
-    await _seed_run(
-        db_path,
-        run_id="acceptance-fix-run",
-        team_key="ENG",
-        stage="acceptance_fix",
-        tokens=(900, 120, 0, 80),
+    asyncio.run(
+        _seed_run(
+            db_path,
+            run_id="acceptance-fix-run",
+            team_key="ENG",
+            stage="acceptance_fix",
+            tokens=(900, 120, 0, 80),
+        )
     )
     for run_id in ("review-fix-run", "acceptance-fix-run"):
         _write_log(
@@ -587,5 +597,72 @@ repos:
         ("codex", "gpt-5.5"): (900, 120, 0, 80),
     }
     assert _model_rows(db_path)["acceptance-fix-run"] == {
+        ("codex", "gpt-5.5"): (900, 120, 0, 80),
+    }
+
+
+def test_cli_backfill_model_usage_resolves_fix_role_from_config_db_without_yaml(
+    tmp_path: Path,
+) -> None:
+    """A binding whose `fix` role was only ever set through the DB (no
+    `--config` YAML, e.g. a matrix edit made via the UI) must still backfill
+    its review-fix run with that role's model, not fall back to `unknown`
+    (SYM-192 review: `runs backfill-model-usage` used to resolve Codex models
+    from a static `--config` file only, missing DB-only bindings/roles)."""
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    asyncio.run(
+        _seed_run(
+            db_path,
+            run_id="review-fix-run",
+            team_key="ENG",
+            stage="review_fix",
+            tokens=(900, 120, 0, 80),
+        )
+    )
+    _write_log(
+        log_root / "review-fix-run.log",
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 900, "output_tokens": 120, "cached_input_tokens": 80},
+        },
+    )
+
+    async def _seed_db_config() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await db.config_bindings.insert(
+                conn,
+                payload={
+                    "linear_team_key": "ENG",
+                    "github_repo": "org/repo",
+                    "linear_states": {"ready": "Todo", "code_review": "In Review"},
+                },
+                key=("ENG", "org/repo", "", "linear", "default"),
+                priority=0,
+            )
+            await db.config_globals.set_globals(
+                conn,
+                roles={"fix": {"agent": "codex", "model": "gpt-5.5"}},
+                migrated_at="t",
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_seed_db_config())
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "runs",
+            "backfill-model-usage",
+            "--db",
+            str(db_path),
+            "--log-root",
+            str(log_root),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert _model_rows(db_path)["review-fix-run"] == {
         ("codex", "gpt-5.5"): (900, 120, 0, 80),
     }

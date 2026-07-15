@@ -18,7 +18,7 @@ import sys
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any, cast, get_args
+from typing import TYPE_CHECKING, Any, cast, get_args
 
 import aiosqlite
 import click
@@ -46,6 +46,9 @@ from .tracker import (
 )
 from .ui.external import GitHubExternalClient
 from .webhook import WebhookSettings
+
+if TYPE_CHECKING:
+    from .db.token_backfill import CodexModels
 
 _ANSI_RESET = "\x1b[0m"
 _ANSI_DIM = "\x1b[2m"
@@ -993,27 +996,19 @@ def runs_backfill_tokens(db_path: Path, log_root: Path) -> None:
     "config_path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
     required=False,
-    help="Config file used to resolve Codex models per team binding. "
-    "Without it, Codex usage is attributed to `unknown`.",
+    help="YAML system-knobs file, used as the legacy topology fallback for "
+    "any team not yet migrated to the config DB. Per-team roles resolve "
+    "from `--db`'s config tables when present there; without either "
+    "source, Codex usage is attributed to `unknown`.",
 )
 def runs_backfill_model_usage(db_path: Path, log_root: Path, config_path: Path | None) -> None:
     """Backfill per-(provider, model) token attribution from historical logs."""
-    from .db.token_backfill import CodexModels, run_model_usage_backfill
+    from .db.token_backfill import run_model_usage_backfill
 
-    codex_models_by_team: dict[str, CodexModels] = {}
-    if config_path is not None:
-        cfg = Config.load(config_path)
-        for binding in cfg.repos:
-            codex_models_by_team.setdefault(
-                binding.linear_team_key,
-                CodexModels(
-                    implementer=binding.resolved_role("implement", cfg.roles).codex_model_arg(),
-                    fix=binding.resolved_role("fix", cfg.roles).codex_model_arg(),
-                    accept=binding.resolved_role("accept", cfg.roles).codex_model_arg(),
-                    reviewer=binding.resolved_role("review_find", cfg.roles).codex_model_arg(),
-                    verifier=binding.resolved_role("review_verify", cfg.roles).codex_model_arg(),
-                ),
-            )
+    try:
+        codex_models_by_team = asyncio.run(_backfill_model_usage_codex_models(db_path, config_path))
+    except ConfigBootError as e:
+        raise click.ClickException(str(e)) from e
 
     try:
         result = run_model_usage_backfill(
@@ -1025,6 +1020,55 @@ def runs_backfill_model_usage(db_path: Path, log_root: Path, config_path: Path |
         raise click.ClickException(str(exc)) from exc
     click.echo(f"updated: {result.updated}")
     click.echo(f"skipped: {result.skipped}")
+
+
+async def _backfill_model_usage_codex_models(
+    db_path: Path, config_path: Path | None
+) -> dict[str, CodexModels]:
+    """Per-team Codex models for `backfill-model-usage`, from the same DB-backed
+    effective config the daemon dispatches through (SYM-192 review).
+
+    Reading a static `--config` YAML here would miss (or stale-attribute) any
+    team whose roles now live only in the config DB, since a matrix edit made
+    through the UI never touches the YAML file.
+    """
+    from .db.token_backfill import CodexModels
+
+    conn = await db.connect(db_path)
+    try:
+        yaml_has_repos_topology = (
+            Config.peek_repos_topology(config_path) if config_path is not None else False
+        )
+        db_owns_topology = await _db_owns_topology(
+            conn, yaml_has_repos_topology=yaml_has_repos_topology
+        )
+        base = (
+            Config.load(config_path, resolve_repos=not db_owns_topology)
+            if config_path is not None
+            else Config()
+        )
+        cfg = await assemble_effective_config(
+            conn,
+            base,
+            boot_gates=False,
+            yaml_has_repos_topology=yaml_has_repos_topology,
+        )
+    finally:
+        await conn.close()
+
+    codex_models_by_team: dict[str, CodexModels] = {}
+    for binding in cfg.repos:
+        codex_models_by_team.setdefault(
+            binding.linear_team_key,
+            CodexModels(
+                implementer=binding.resolved_role("implement", cfg.roles).codex_model_arg(),
+                fix=binding.resolved_role("fix", cfg.roles).codex_model_arg(),
+                accept=binding.resolved_role("accept", cfg.roles).codex_model_arg(),
+                reviewer=binding.resolved_role("review_find", cfg.roles).codex_model_arg(),
+                verifier=binding.resolved_role("review_verify", cfg.roles).codex_model_arg(),
+            ),
+        )
+    return codex_models_by_team
 
 
 @main.command("local-review-dry-run")

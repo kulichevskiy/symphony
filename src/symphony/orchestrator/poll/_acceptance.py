@@ -59,7 +59,12 @@ from ...pipeline.taste_guide import load_taste_guide
 from ...tracker import (
     Issue as LinearIssue,
 )
-from ._base import _binding_key, _infra_retry_backoff_secs, _OrchestratorBase
+from ._base import (
+    _binding_key,
+    _infra_retry_backoff_secs,
+    _OrchestratorBase,
+    _record_run_model_usage,
+)
 from ._git import (
     _git_fetch_branch,
     _git_status_short,
@@ -898,6 +903,12 @@ class _AcceptanceMixin(_OrchestratorBase):
                             codex_model=role_codex_model(accept_role),
                             claude_model=role_claude_model(accept_role),
                             effort=accept_role.effort,
+                        )
+                        await _record_run_model_usage(
+                            self._conn,
+                            run_id,
+                            self.config.log_root / f"{run_id}.log",
+                            codex_model=accept_role.attribution_codex_model(),
                         )
                         verdict = _replace_acceptance_criteria_labels(
                             verdict=verdict,

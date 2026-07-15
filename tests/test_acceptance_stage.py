@@ -94,6 +94,19 @@ def _codex_acceptance_events(verdict_footer: str = ACCEPTANCE_FOOTER_PASS) -> li
             kind="stdout",
             line=json.dumps(
                 {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 900,
+                        "output_tokens": 120,
+                        "cached_input_tokens": 80,
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
                     "type": "item.completed",
                     "item": {
                         "type": "agent_message",
@@ -527,13 +540,19 @@ async def test_acceptance_verdict_run_uses_resolved_accept_role(
         await orch.drain_dispatch_tasks()
 
         assert [spec.stage for spec in runner.captured_specs] == ["acceptance", "merge"]
-        acceptance_command = runner.captured_specs[0].command
+        acceptance_spec = runner.captured_specs[0]
+        acceptance_command = acceptance_spec.command
         assert acceptance_command[0] == "codex"
         assert acceptance_command[acceptance_command.index("--model") + 1] == "gpt-5.1-codex"
         assert (
             acceptance_command[acceptance_command.index("--config") + 1]
             == 'model_reasoning_effort="high"'
         )
+        # The accept role's resolved Codex model must attribute the run's
+        # per-model usage row, not go unrecorded (SYM-192 review).
+        usage_rows = await db.run_model_usage.list_for_run(conn, acceptance_spec.run_id)
+        assert [(row.provider, row.model) for row in usage_rows] == [("codex", "gpt-5.1-codex")]
+        assert (usage_rows[0].input_tokens, usage_rows[0].output_tokens) == (900, 120)
     finally:
         await conn.close()
 

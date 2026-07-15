@@ -206,6 +206,19 @@ async def run_acceptance(
     # subprocess tees to it in real time (same file the issue-detail API
     # reports `has_log` for).
     log_path = log_root / f"{run_id}.log" if log_root is not None else None
+    if agent == "codex" and mode in _PLAYWRIGHT_MODES:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=0.0,
+            hero_screenshot_url="",
+            details=(
+                f"Acceptance mode {mode!r} requires the Playwright MCP server, which "
+                "the codex CLI has no --mcp-config flag to receive; the accept role "
+                "must resolve to claude for dev/preview acceptance."
+            ),
+            preview_url=preview_url,
+        )
     if mode == _DEV_MODE:
         return await _run_dev_acceptance(
             runner=runner,

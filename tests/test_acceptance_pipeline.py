@@ -854,6 +854,41 @@ async def test_acceptance_runner_parses_codex_pass_verdict(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["dev", "preview"])
+async def test_acceptance_runner_guards_codex_visual_modes(mode: str, tmp_path: Path) -> None:
+    """`roles.accept.agent: codex` with `acceptance.mode: dev`/`preview` must
+    fail closed with `infra_error` instead of running the codex CLI without
+    any browser tool (codex has no `--mcp-config` flag to receive the
+    Playwright MCP server `build_acceptance_command` wires up for Claude —
+    SYM-192 review). The runner must never even start: no subprocess spawn,
+    no per-run Playwright MCP config written to the workspace.
+    """
+    runner = _ScriptedRunner([])
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode=mode,
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=15,
+        preview_url="https://preview.example.com",
+        dev_command="npm run dev",
+        dev_port=4321,
+        agent="codex",
+        codex_model="gpt-5.1-codex",
+        effort="high",
+    )
+
+    assert verdict.kind == "infra_error"
+    assert "Playwright MCP" in verdict.details
+    assert runner.captured_spec is None
+    assert not (tmp_path / ".symphony" / "acceptance").exists()
+
+
+@pytest.mark.asyncio
 async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
