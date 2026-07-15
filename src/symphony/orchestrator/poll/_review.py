@@ -3161,13 +3161,17 @@ class _ReviewMixin(_OrchestratorBase):
             self._active_run_ids.discard(fix_run_id)
 
         # Dispatch merge directly, bypassing the review verdict check.
-        self._schedule_merge(
-            binding=binding,
-            issue=issue,
-            pr_number=state.pr_number,
-            pr_url=state.pr_url,
-            skip_review=True,
-        )
+        # Reserved under `config_write_lock` so the drain guard's
+        # `scheduled_slots` sample can't miss this reservation (SYM-193
+        # review; see `_review_fix_dispatch_slot` in `_dispatch.py`).
+        async with self._config_write_lock:
+            self._schedule_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=state.pr_number,
+                pr_url=state.pr_url,
+                skip_review=True,
+            )
         log.info(
             "skip-review: advancing %s (PR #%d) directly to merge",
             issue.identifier,

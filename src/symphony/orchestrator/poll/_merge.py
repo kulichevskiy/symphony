@@ -388,14 +388,19 @@ class _MergeMixin(_OrchestratorBase):
                 async def clear_reconciled_merge_wait(_new_run_id: str) -> None:
                     await self._clear_operator_wait(wait.issue_id, wait.run_id)
 
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr.pr_number,
-                    pr_url=pr.pr_url,
-                    approved_head_sha=approved_head_sha,
-                    on_started=clear_reconciled_merge_wait,
-                )
+                # Reserved under `config_write_lock` so the drain guard's
+                # `scheduled_slots` sample can't miss this reservation
+                # (SYM-193 review; see `_review_fix_dispatch_slot` in
+                # `_dispatch.py`).
+                async with self._config_write_lock:
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr.pr_number,
+                        pr_url=pr.pr_url,
+                        approved_head_sha=approved_head_sha,
+                        on_started=clear_reconciled_merge_wait,
+                    )
             log.info(
                 "reconciled merge wait for %s via %s (reason=%s)",
                 issue.identifier,
@@ -1625,13 +1630,16 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
-        self._schedule_merge(
-            binding=binding,
-            issue=issue,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            on_started=on_merge_started,
-        )
+        # Reserved under `config_write_lock` — see `_review_fix_dispatch_slot`
+        # in `_dispatch.py` (SYM-193 review).
+        async with self._config_write_lock:
+            self._schedule_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                on_started=on_merge_started,
+            )
 
     async def _parked_closed_unmerged_pr_for_event(
         self, event: GitHubWebhookEvent
@@ -2361,15 +2369,19 @@ class _MergeMixin(_OrchestratorBase):
                     return []
                 if await self._acceptance_infra_retry_backoff_active(candidate.issue_id):
                     return []
-                return [
-                    self._schedule_acceptance(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=candidate.pr_number,
-                        pr_url=candidate.pr_url,
-                        pr_head_sha=head_sha,
-                    )
-                ]
+                # Reserved under `config_write_lock` — see
+                # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193
+                # review).
+                async with self._config_write_lock:
+                    return [
+                        self._schedule_acceptance(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=candidate.pr_number,
+                            pr_url=candidate.pr_url,
+                            pr_head_sha=head_sha,
+                        )
+                    ]
             if not binding.auto_merge:
                 await self._park_pr_for_manual_merge(
                     binding=binding,
@@ -2408,17 +2420,20 @@ class _MergeMixin(_OrchestratorBase):
 
                 on_started = clear_conflict_fix_marker
 
-            return [
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=candidate.pr_number,
-                    pr_url=candidate.pr_url,
-                    approved_head_sha=head_sha,
-                    skip_review=verdict.kind is not VerdictKind.APPROVED,
-                    on_started=on_started,
-                )
-            ]
+            # Reserved under `config_write_lock` — see
+            # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193 review).
+            async with self._config_write_lock:
+                return [
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                        approved_head_sha=head_sha,
+                        skip_review=verdict.kind is not VerdictKind.APPROVED,
+                        on_started=on_started,
+                    )
+                ]
         elif verdict.merge_conflict:
             await db.issue_prs.clear_merge_conflict_fixed(
                 self._conn,

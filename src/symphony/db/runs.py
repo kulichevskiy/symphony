@@ -689,7 +689,13 @@ async def has_active(
     return row is not None
 
 
-async def occupancy_for_binding_key(conn: aiosqlite.Connection, binding_key: str) -> int:
+async def occupancy_for_binding_key(
+    conn: aiosqlite.Connection,
+    binding_key: str,
+    *,
+    legacy_team_key: str,
+    legacy_github_repo: str,
+) -> int:
     """The launch gate's authoritative binding occupancy: distinct issues with
     live *dispatch-occupying* work under `binding_key`. Counted by distinct
     issue so an issue's concurrent `implement`+`local_review` rows collapse to
@@ -698,14 +704,31 @@ async def occupancy_for_binding_key(conn: aiosqlite.Connection, binding_key: str
     semaphore), so counting them would stall a binding whose issues are all in
     review. Written under the launch lock before an agent spawns, so a
     freshly-lowered `max_concurrent` admits nothing new until occupancy falls
-    below it, regardless of which semaphore a queued task waited on (SYM-193)."""
+    below it, regardless of which semaphore a queued task waited on (SYM-193).
+
+    A DB upgraded with runs still live from before the `binding_key` column
+    existed leaves them stamped at the migration's `''` default, so an exact
+    match alone would undercount a binding's occupancy for those. Matched the
+    same way as `live_identifiers_for_binding_key`'s legacy fallback: team +
+    repo (the repo taken from the issue's PR row when one exists, else treated
+    as a match — a still-running first dispatch predates any PR)."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
-        SELECT COUNT(DISTINCT issue_id) FROM runs
-         WHERE binding_key = ? AND status IN ({placeholders}) AND stage != 'review'
+        SELECT COUNT(DISTINCT r.issue_id) FROM runs r
+          JOIN issues i ON i.id = r.issue_id
+          LEFT JOIN issue_prs p ON p.issue_id = r.issue_id
+         WHERE r.status IN ({placeholders}) AND r.stage != 'review'
+           AND (
+             r.binding_key = ?
+             OR (
+               r.binding_key = ''
+               AND i.team_key = ?
+               AND (p.github_repo IS NULL OR p.github_repo = ?)
+             )
+           )
         """,
-        (binding_key, *LIVE_STATUSES),
+        (*LIVE_STATUSES, binding_key, legacy_team_key, legacy_github_repo),
     )
     row = await cur.fetchone()
     return int(row[0]) if row else 0

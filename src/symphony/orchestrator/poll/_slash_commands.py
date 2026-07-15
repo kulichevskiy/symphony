@@ -937,12 +937,17 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     pr_url=state.pr_url,
                 )
             else:
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=state.pr_number,
-                    pr_url=state.pr_url,
-                )
+                # Reserve while holding `config_write_lock` so the drain
+                # guard's `scheduled_slots` sample can't miss this
+                # reservation (SYM-193 review; see `_review_fix_dispatch_slot`
+                # in `_dispatch.py`).
+                async with self._config_write_lock:
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=state.pr_number,
+                        pr_url=state.pr_url,
+                    )
             body = acceptance_skipped(
                 CommentVars(
                     stage="acceptance",
@@ -1148,12 +1153,16 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     pr_url=pr_url,
                 )
             else:
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                )
+                # See the sibling `SKIP_ACCEPTANCE` branch above for why this
+                # reservation is made under `config_write_lock` (SYM-193
+                # review).
+                async with self._config_write_lock:
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                    )
             body = skip_acceptance_forced(
                 CommentVars(
                     stage="acceptance",
@@ -1172,13 +1181,16 @@ class _SlashCommandsMixin(_OrchestratorBase):
 
         await self._clear_operator_wait(issue_id, run_id)
         await db.acceptance_state.reset(self._conn, issue_id)
-        self._schedule_acceptance(
-            binding=binding,
-            issue=issue,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            pr_head_sha=state.pr_head_sha,
-        )
+        # See the `SKIP_ACCEPTANCE` branch above for why this reservation is
+        # made under `config_write_lock` (SYM-193 review).
+        async with self._config_write_lock:
+            self._schedule_acceptance(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                pr_head_sha=state.pr_head_sha,
+            )
         body = retry_acceptance_requested(
             CommentVars(
                 stage="acceptance",

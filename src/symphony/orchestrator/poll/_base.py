@@ -797,7 +797,10 @@ class _OrchestratorBase:
             )
             return False
         occupancy = await db.runs.occupancy_for_binding_key(
-            self._conn, _binding_storage_key(binding)
+            self._conn,
+            _binding_storage_key(binding),
+            legacy_team_key=binding.linear_team_key,
+            legacy_github_repo=binding.github_repo,
         )
         if occupancy >= current.max_concurrent:
             log.info(

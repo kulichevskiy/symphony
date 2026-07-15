@@ -631,6 +631,11 @@ class _AcceptanceMixin(_OrchestratorBase):
         pr_head_sha: str,
         reset_iteration: bool = True,
     ) -> str | None:
+        # Launch gate: acceptance is a follow-up stage (drains in-flight work
+        # even on a disabled binding), but a lowered `max_concurrent` must
+        # still admit nothing new (SYM-193 review).
+        if not await self._launch_gate_admits(binding, first_dispatch=False):
+            return None
         run_id = str(uuid.uuid4())
         inserted = await db.runs.create_if_no_active(
             self._conn,

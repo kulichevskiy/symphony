@@ -349,7 +349,12 @@ class _DispatchMixin(_OrchestratorBase):
             yield
             return
 
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        # Held only across the reservation itself, so it's serialized against
+        # the drain guard's `scheduled_slots` sample (config_crud holds the
+        # same lock across its whole check-then-write) without blocking this
+        # slot's semaphore wait on unrelated config writes (SYM-193 review).
+        async with self._config_write_lock:
+            self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
         try:
             async with self._review_fix_sem, review_binding_sem:
                 async with self._global_dispatch_sem, binding_sem:
@@ -416,7 +421,12 @@ class _DispatchMixin(_OrchestratorBase):
             if binding.linear_states.waiting is not None and is_blocked(issue):
                 await self._park_blocked_by_deps(binding, issue)
                 return None
-            return self._schedule_dispatch(binding, issue)
+            # Reserve while holding `config_write_lock` so the drain guard's
+            # `scheduled_slots` sample (taken under the same lock) can't miss
+            # a reservation that lands mid-check (SYM-193 review; see
+            # `_review_fix_dispatch_slot`).
+            async with self._config_write_lock:
+                return self._schedule_dispatch(binding, issue)
 
     async def _blocking_existing_pr(
         self,
