@@ -33,6 +33,7 @@ from symphony.orchestrator.poll import (
     Orchestrator,
     SlashHandlerFailure,
     build_fix_runner_command,
+    build_merge_runner_command,
     build_runner_command,
     pr_number_from_url,
 )
@@ -2394,6 +2395,185 @@ def test_build_runner_command_allows_git_writes_for_codex_implement(
     assert "workspace-write" not in argv
     assert "--config" not in argv
     assert argv[-1] == "implement this"
+
+
+# --- effort threads through every runner command builder (SYM-192) ---------
+
+
+def test_build_fix_runner_command_threads_effort_claude() -> None:
+    argv = build_fix_runner_command("claude", "fix this", effort="high")
+    assert argv[argv.index("--effort") + 1] == "high"
+    assert "--effort" not in build_fix_runner_command("claude", "fix this")
+
+
+def test_build_fix_runner_command_threads_effort_codex(tmp_path: Path) -> None:
+    argv = build_fix_runner_command(
+        "codex", "fix this", codex_model="gpt-5.1-codex", effort="high", workspace_path=tmp_path
+    )
+    assert 'model_reasoning_effort="high"' in argv
+
+
+def test_build_merge_runner_command_threads_model_and_effort() -> None:
+    argv = build_merge_runner_command("claude", "merge this", claude_model="opus", effort="max")
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--effort") + 1] == "max"
+
+
+@pytest.mark.asyncio
+async def test_merge_command_reflects_matrix_override(tmp_path: Path) -> None:
+    """A matrix `implement` model/effort override reaches the merge-run argv
+    (the merge stage resolves the `implement` role)."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude", codex_model=None).model_copy(
+            update={"roles": {"implement": RoleConfig(model="opus", effort="max")}}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        captured = await _capture_stage_command(orch, "_run_stage_command")
+        await orch._run_merge_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="merge-run",
+            workspace_path=tmp_path / "ws",
+            pr_url="https://github.com/org/repo/pull/42",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[argv.index("--model") + 1] == "opus"
+        assert argv[argv.index("--effort") + 1] == "max"
+    finally:
+        await conn.close()
+
+
+async def _capture_stage_command(orch: Orchestrator, attr: str) -> dict[str, list[str]]:
+    captured: dict[str, list[str]] = {}
+
+    async def fake(**kwargs: object) -> tuple[UsageDelta, str, int]:
+        captured["command"] = kwargs["command"]  # type: ignore[assignment]
+        return UsageDelta(), "exit", 0
+
+    setattr(orch, attr, fake)  # noqa: B010
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_implement_command_reflects_matrix_override(tmp_path: Path) -> None:
+    """A matrix `implement` override of agent/model/effort reaches the actual
+    implement argv (codex path carries model + reasoning effort)."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            branch_prefix="symphony",
+            linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+            roles={
+                "implement": RoleConfig(agent="codex", model="gpt-5.1-codex-max", effort="high")
+            },
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        captured = await _capture_stage_command(orch, "_run_stage_command")
+        await orch._run_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="impl-run",
+            workspace_path=tmp_path / "ws",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[0] == "codex"
+        assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
+        assert 'model_reasoning_effort="high"' in argv
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_fix_command_reflects_matrix_effort(tmp_path: Path) -> None:
+    """A matrix `fix` effort override reaches the fix-run argv."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude", codex_model=None).model_copy(
+            update={"roles": {"fix": RoleConfig(model="sonnet", effort="high")}}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        captured = await _capture_stage_command(orch, "_run_runner")
+        await orch._run_fix_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="fix-run",
+            workspace_path=tmp_path / "ws",
+            prompt="fix the bug",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[argv.index("--model") + 1] == "sonnet"
+        assert argv[argv.index("--effort") + 1] == "high"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_fix_command_reflects_matrix_override(tmp_path: Path) -> None:
+    """A matrix `accept` override of agent/model/effort reaches the acceptance
+    fix argv (codex path)."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            branch_prefix="symphony",
+            linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+            roles={"accept": RoleConfig(agent="codex", model="gpt-5.1-codex-max", effort="low")},
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        captured = await _capture_stage_command(orch, "_run_runner")
+        await orch._run_acceptance_fix_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="acc-run",
+            workspace_path=tmp_path / "ws",
+            prompt="address acceptance feedback",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[0] == "codex"
+        assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
+        assert 'model_reasoning_effort="low"' in argv
+    finally:
+        await conn.close()
 
 
 # --- PR URL parser ---------------------------------------------------------

@@ -110,8 +110,12 @@ repos:
 @pytest.mark.asyncio
 async def test_codex_reviewer_inherits_binding_codex_model(tmp_path: Path) -> None:
     """`reviewer_agent: codex` + `codex_model` (no reviewer model pinned): the
-    reviewer inherits the binding codex model, and that inheritance is baked
-    into the matrix rather than dropped."""
+    finder (`review_find`) inherits the binding codex model, and that
+    inheritance is baked into the matrix rather than dropped. `reviewer_agent`
+    only ever governed the finder, not the verifier — `review_verify` defaults
+    to the implementer's own family (claude, unset here) to stay opposite
+    `review_find`, so it resolves identically before and after the legacy
+    fields are stripped and gets no matrix cell."""
     conn, _result, rows, globals_row = await _import(
         tmp_path,
         f"""
@@ -126,7 +130,7 @@ repos:
     payload = rows[0].payload
     roles = payload["roles"]
     assert roles["review_find"]["model"] == "gpt-5.1-codex-max"
-    assert roles["review_verify"]["model"] == "gpt-5.1-codex-max"
+    assert "review_verify" not in roles
     # And it resolves back identically on reload.
     global_roles = globals_row.roles if globals_row else {}
     from symphony.config import RoleConfig
@@ -254,12 +258,11 @@ repos:
 
 
 @pytest.mark.asyncio
-async def test_imported_codex_binding_assembles_with_legacy_fields(tmp_path: Path) -> None:
-    """End-to-end P1 guard: a migrated legacy codex binding, reloaded through
-    `assemble_effective_config`, must still expose `agent`/`codex_model` to
-    the runtime paths that read the legacy top-level fields directly (final
-    -message parsing, usage-cost attribution, fix-turn spawn) until SYM-192
-    moves them all to `resolved_role`."""
+async def test_imported_codex_binding_resolves_roles_at_runtime(tmp_path: Path) -> None:
+    """End-to-end: a migrated legacy codex binding, reloaded through
+    `assemble_effective_config`, exposes its codex agent/model via
+    `resolved_role` — the single source every per-stage consumer reads
+    (SYM-192). Legacy top-level fields are never back-synthesized."""
     from symphony.config import Config
     from symphony.effective_config import assemble_effective_config
 
@@ -283,9 +286,14 @@ repos:
         ),
     )
     (binding,) = cfg.repos
-    assert binding.agent == "codex"
-    assert binding.codex_model == "gpt-5.1-codex-max"
-    assert binding.reviewer_agent == "claude"
+    # No legacy back-synthesis: the payload stays at model defaults.
+    assert binding.agent == "claude"
+    # The resolved matrix carries the migrated codex builder + opposite-family
+    # (claude) reviewer roles.
+    impl = binding.resolved_role("implement", cfg.roles)
+    assert impl.agent == "codex" and impl.model == "gpt-5.1-codex-max"
+    assert binding.resolved_role("fix", cfg.roles).agent == "codex"
+    assert binding.resolved_role("review_find", cfg.roles).agent == "claude"
     await conn.close()
 
 

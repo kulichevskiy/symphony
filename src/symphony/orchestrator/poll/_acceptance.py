@@ -59,7 +59,12 @@ from ...pipeline.taste_guide import load_taste_guide
 from ...tracker import (
     Issue as LinearIssue,
 )
-from ._base import _binding_key, _infra_retry_backoff_secs, _OrchestratorBase
+from ._base import (
+    _binding_key,
+    _infra_retry_backoff_secs,
+    _OrchestratorBase,
+    _record_run_model_usage,
+)
 from ._git import (
     _git_fetch_branch,
     _git_status_short,
@@ -73,12 +78,14 @@ from ._helpers import (
     _parse_rfc3339,
     _termination_kwargs,
     build_fix_runner_command,
+    role_claude_model,
+    role_codex_model,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from ...agent.codex_models import DEFAULT_CODEX_MODEL
+    from ...config import ResolvedRole
     from ._base import BindingKey
 
 log = logging.getLogger(__name__)
@@ -234,10 +241,9 @@ class _AcceptanceMixin(_OrchestratorBase):
             workspace_path: Path,
             command: list[str],
             stage: str,
-            agent: str,
+            role: ResolvedRole,
             binding: RepoBinding,
             issue: LinearIssue,
-            codex_model: str = DEFAULT_CODEX_MODEL,
             activity_stage: str | None = None,
             prior_total: float = 0.0,
             clear_pid_on_finish: bool = False,
@@ -876,6 +882,11 @@ class _AcceptanceMixin(_OrchestratorBase):
                 else:
                     workspace_path = await self._workspace.acquire(binding, issue)
                     try:
+                        accept_role = binding.resolved_role(
+                            "accept",
+                            self.config.roles,
+                            visual_acceptance=effective_mode in {"dev", "preview"},
+                        )
                         verdict = await run_acceptance(
                             runner=self._runner,
                             run_id=run_id,
@@ -892,6 +903,16 @@ class _AcceptanceMixin(_OrchestratorBase):
                             dev_command=binding.acceptance.dev_command,
                             dev_port=binding.acceptance.dev_port,
                             log_root=self.config.log_root,
+                            agent=accept_role.agent,
+                            codex_model=role_codex_model(accept_role),
+                            claude_model=role_claude_model(accept_role),
+                            effort=accept_role.effort,
+                        )
+                        await _record_run_model_usage(
+                            self._conn,
+                            run_id,
+                            self.config.log_root / f"{run_id}.log",
+                            codex_model=accept_role.attribution_codex_model(),
                         )
                         verdict = _replace_acceptance_criteria_labels(
                             verdict=verdict,
@@ -1258,10 +1279,13 @@ class _AcceptanceMixin(_OrchestratorBase):
         prompt: str,
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
+        role = binding.resolved_role("accept", self.config.roles)
         command = build_fix_runner_command(
-            binding.agent,
+            role.agent,
             prompt,
-            codex_model=binding.codex_model,
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
+            effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
@@ -1270,8 +1294,7 @@ class _AcceptanceMixin(_OrchestratorBase):
             workspace_path=workspace_path,
             command=command,
             stage="acceptance_fix",
-            agent=binding.agent,
-            codex_model=binding.codex_model,
+            role=role,
             binding=binding,
             issue=issue,
             activity_stage="acceptance_fix",

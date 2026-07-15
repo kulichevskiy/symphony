@@ -1,8 +1,9 @@
 """Acceptance verdict classifier.
 
 The Acceptance agent is asked to end its final message with a stable footer.
-The classifier reads the Claude stream-json transcript, extracts the final
-message and terminal cost, then turns that into an `AcceptanceVerdict`.
+The classifier reads the agent's terminal transcript (Claude stream-json or
+Codex `--json`), extracts the final message and terminal cost, then turns
+that into an `AcceptanceVerdict`.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import Literal, TypedDict
 
 from ..tokens import effective_tokens
 from .cost_guard import UsageDelta
+from .local_review import classify_stream_api_error, extract_last_agent_message
 
 AcceptanceVerdictKind = Literal["pass", "reject", "infra_error"]
 AcceptanceScreenshotKind = Literal["hero", "criterion"]
@@ -125,8 +127,13 @@ def acceptance_classifier(
     transcript: str,
     criteria: list[str] | None = None,
     cost: float | None = None,
+    agent: str = "claude",
 ) -> AcceptanceVerdict:
-    parsed = _parse_claude_transcript(transcript)
+    parsed = (
+        _parse_codex_transcript(transcript)
+        if agent == "codex"
+        else _parse_claude_transcript(transcript)
+    )
     verdict_cost = parsed.cost if cost is None else cost
     if parsed.terminal_infra_error_details:
         return AcceptanceVerdict(
@@ -373,6 +380,28 @@ def _parse_claude_transcript(transcript: str) -> _ParsedTranscript:
         cost=cost,
         infra_error_details=infra_error_details,
         terminal_infra_error_details=terminal_infra_error_details,
+    )
+
+
+def _parse_codex_transcript(transcript: str) -> _ParsedTranscript:
+    """Parse `codex exec --json` output (SYM-192 review).
+
+    Codex's final answer lands in `item.completed`/`agent_message` events,
+    not Claude's `result`/`assistant` shape — reuse the same extraction
+    local review already relies on. Codex never prices itself (cost stays
+    0; the caller falls back to token-based pricing), so only the message
+    and any API-error signal are pulled from the transcript.
+    """
+    api_error = classify_stream_api_error(transcript)
+    error_details = (
+        f"Acceptance runner reported a codex error: {api_error.message}" if api_error else ""
+    )
+    message = extract_last_agent_message(agent="codex", stdout=transcript)
+    return _ParsedTranscript(
+        message=message,
+        cost=0.0,
+        infra_error_details=error_details,
+        terminal_infra_error_details=error_details,
     )
 
 

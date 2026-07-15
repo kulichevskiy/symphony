@@ -14,6 +14,7 @@ from symphony.config import (
     Config,
     LinearStates,
     RepoBinding,
+    RoleConfig,
     Secrets,
     TrackerStates,
     UIStatusThresholds,
@@ -1011,8 +1012,10 @@ repos:
 
 
 def test_roles_old_style_claude_config_resolves_identically() -> None:
-    """A binding with no `roles:` block resolves builder→claude/None,
-    review→opposite-family (codex) carrying the legacy codex_model."""
+    """A binding with no `roles:` block resolves builder→claude/None;
+    `review_find`→opposite-family (codex) carrying the legacy codex_model;
+    `review_verify`→the implementer's own family (claude, matching
+    `implement`) so it stays opposite `review_find` for two-pass diversity."""
     binding = _review_binding(agent="claude", codex_model="gpt-5.1-codex-max")
     impl = binding.resolved_role("implement")
     assert impl.agent == "claude"
@@ -1023,12 +1026,15 @@ def test_roles_old_style_claude_config_resolves_identically() -> None:
     rf = binding.resolved_role("review_find")
     rv = binding.resolved_role("review_verify")
     assert rf.agent == "codex" and rf.model == "gpt-5.1-codex-max"
-    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex-max"
+    assert rv.agent == "claude" and rv.model is None
+    assert rf.agent != rv.agent
 
 
 def test_roles_old_style_codex_config_resolves_identically() -> None:
-    """codex builder carries codex_model; review defaults to claude with the
-    legacy local-review claude models (finder vs verifier kept distinct)."""
+    """codex builder carries codex_model; `review_find` defaults to the
+    opposite family (claude) with the legacy finder claude model;
+    `review_verify` defaults to the implementer's own family (codex)
+    carrying the implementer's codex_model, staying opposite `review_find`."""
     binding = _review_binding(
         agent="codex",
         codex_model="gpt-5.1-codex",
@@ -1040,6 +1046,19 @@ def test_roles_old_style_codex_config_resolves_identically() -> None:
     rf = binding.resolved_role("review_find")
     rv = binding.resolved_role("review_verify")
     assert rf.agent == "claude" and rf.model == "sonnet"
+    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex"
+    assert rf.agent != rv.agent
+
+
+def test_roles_review_verify_defaults_opposite_review_find_when_implement_claude() -> None:
+    """Default two-pass diversity: with no `roles:` override, `review_verify`
+    resolves to the implementer's family (claude), opposite `review_find`
+    (codex) — the adversarial verifier never silently collapses onto the
+    finder's agent+model."""
+    binding = _review_binding(agent="claude", local_review_verifier_claude_model="opus")
+    rf = binding.resolved_role("review_find")
+    rv = binding.resolved_role("review_verify")
+    assert (rf.agent, rf.model) != (rv.agent, rv.model)
     assert rv.agent == "claude" and rv.model == "opus"
 
 
@@ -1480,6 +1499,29 @@ repos:
     assert cfg.repos[0].resolved_role("implement", cfg.roles).model == "sonnet"
 
 
+def test_legacy_reviewer_agent_with_matrix_review_verify_does_not_conflict(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy `reviewer_agent` only maps onto `review_find.agent`; `review_verify`
+    defaults to the implementer's family regardless, so setting both `reviewer_agent`
+    and `roles.review_verify.agent` targets different cells and must not conflict."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    reviewer_agent: codex
+    roles:
+      review_verify:
+        agent: claude
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role("review_verify", cfg.roles).agent == "claude"
+
+
 # --- roles matrix: effort knob (SYM-127) ----------------------------------
 
 
@@ -1521,12 +1563,11 @@ repos:
     assert cfg.repos[1].resolved_role("implement", cfg.roles).effort == "medium"
 
 
-@pytest.mark.parametrize("role", ["review_find", "review_verify", "fix", "accept"])
-def test_roles_effort_rejected_for_unwired_role(role: str, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Only `implement`'s command builder threads `effort` through to a
-    dispatch flag; an `effort` cell on any other role is dead configuration
-    that would otherwise look effective in the resolved matrix while every
-    dispatch path silently ignores it (SYM-191 review)."""
+@pytest.mark.parametrize("role", ["implement", "review_find", "review_verify", "fix", "accept"])
+def test_roles_effort_wired_for_every_role(role: str, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Every role's command builder now threads `effort` through to a dispatch
+    flag (SYM-192), so an `effort` cell is effective — and resolves — on any of
+    the five roles, not just `implement`."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1534,10 +1575,82 @@ repos:
     github_repo: org/repo
     roles:
       {role}:
+        agent: codex
         effort: high
 {_BINDING_STATES}
 """
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
-    with pytest.raises(ValidationError, match="does not support an effort override"):
-        Config.load(p)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role(role, cfg.roles).effort == "high"
+
+
+def test_roles_review_defaults_follow_resolved_implement_not_legacy_agent() -> None:
+    """A roles-only DB config can leave the legacy `agent` field at its
+    `claude` default while the global matrix resolves `implement` to codex.
+    `review_find`/`review_verify` defaults must key off that *resolved*
+    `implement` role, not the stale `agent` field, or the two-pass loop's
+    family diversity silently collapses (SYM-192 review)."""
+    binding = _review_binding()  # agent left at its "claude" default
+    global_roles = {"implement": RoleConfig(agent="codex", model="gpt-5.1-codex-max")}
+    impl = binding.resolved_role("implement", global_roles)
+    assert impl.agent == "codex" and impl.model == "gpt-5.1-codex-max"
+    rf = binding.resolved_role("review_find", global_roles)
+    rv = binding.resolved_role("review_verify", global_roles)
+    assert rf.agent == "claude"  # opposite the *resolved* codex implementer
+    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex-max"  # implementer's family + model
+
+
+def test_visual_acceptance_defaults_accept_role_to_claude_for_codex_binding() -> None:
+    """Codex has no `--mcp-config` flag for the Playwright MCP server dev/
+    preview acceptance needs. An unconfigured `accept` role on a codex
+    binding must default to claude for those modes rather than resolving
+    into a guaranteed infra error (SYM-192 review)."""
+    binding = _review_binding(agent="codex")
+    assert binding.resolved_role("accept").agent == "codex"
+    assert binding.resolved_role("accept", visual_acceptance=True).agent == "claude"
+
+
+def test_visual_acceptance_honors_explicit_codex_override() -> None:
+    """An operator who explicitly pins `roles.accept.agent: codex` gets
+    exactly that, even for a visual acceptance run."""
+    binding = _review_binding(agent="codex", roles={"accept": RoleConfig(agent="codex")})
+    assert binding.resolved_role("accept", visual_acceptance=True).agent == "codex"
+
+
+def test_visual_acceptance_clears_codex_model_and_effort_when_forcing_claude() -> None:
+    """A `roles.accept` cell that sets only `model`/`effort` (no `agent`) on a
+    codex-family binding is inherited/validated as codex settings. Forcing the
+    agent to claude for dev/preview acceptance must also drop that stale
+    codex model/effort, or the resulting command runs
+    `claude --model gpt-5.1-codex-max` / `claude --effort minimal`, which
+    fails despite validation passing (SYM-192 review)."""
+    binding = _review_binding(
+        agent="codex",
+        codex_model="gpt-5.1-codex-max",
+        roles={"accept": RoleConfig(model="gpt-5.1-codex-max", effort="minimal")},
+    )
+    forced = binding.resolved_role("accept", visual_acceptance=True)
+    assert forced.agent == "claude"
+    assert forced.model is None
+    assert forced.effort is None
+    # Non-forced (non-visual-acceptance) resolution keeps the codex cells.
+    unforced = binding.resolved_role("accept")
+    assert unforced.agent == "codex"
+    assert unforced.model == "gpt-5.1-codex-max"
+    assert unforced.effort == "minimal"
+
+
+def test_review_verify_codex_override_does_not_inherit_claude_implement_model() -> None:
+    """`implement` resolving to Claude with a pinned model (e.g. global
+    `roles.implement.model: sonnet`) must not leak that model into a binding
+    that overrides only `roles.review_verify.agent: codex` — `codex --model
+    sonnet` is not a supported codex model (SYM-192 review)."""
+    binding = _review_binding(roles={"review_verify": RoleConfig(agent="codex")})
+    global_roles = {"implement": RoleConfig(model="sonnet")}
+    impl = binding.resolved_role("implement", global_roles)
+    assert impl.agent == "claude" and impl.model == "sonnet"
+    rv = binding.resolved_role("review_verify", global_roles)
+    assert rv.agent == "codex"
+    assert rv.model != "sonnet"
+    assert rv.model == binding.resolved_reviewer_codex_model()

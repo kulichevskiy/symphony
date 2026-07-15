@@ -66,65 +66,6 @@ def _resolve_bindings(cfg: Config) -> None:
         binding.resolve_env(env_source)
 
 
-_ROLE_NAMES: tuple[RoleName, ...] = ("implement", "review_find", "review_verify", "fix", "accept")
-
-
-def _synthesize_legacy_role_fields(cfg: Config) -> None:
-    """Bridge until every per-stage consumer reads `resolved_role` (SYM-192).
-
-    Several runtime paths still read the legacy top-level role fields directly
-    (`binding.agent` for codex resume/activity support and usage-cost
-    attribution, `binding.codex_model`, the reviewer/local-review model
-    fields). DB payloads are legacy-free by construction, so a migrated codex
-    binding would otherwise hit those paths with claude defaults — wrong final
-    -message parsing, wrong cost attribution, even claude spawned for fix
-    turns. Derive the legacy fields from the resolved matrix instead.
-
-    Synthesis must not change any `resolved_role` output (legacy fields are
-    the resolution *fallback*, so a per-role mixed matrix — e.g. a codex
-    implement cell over an inherited claude fix — could be altered by a
-    synthesized `agent`). Each binding's five roles are resolved before and
-    after; on any difference the synthesis is reverted for that binding and
-    the direct readers keep seeing defaults, exactly as they would for the
-    same exotic matrix in YAML.
-
-    Runs *after* `validate_roles_matrix()`: synthesized fields land in
-    `model_fields_set` and would otherwise trip the legacy/matrix conflict
-    guard, which exists to stop *operators* setting the same knob twice.
-    """
-    for binding in cfg.repos:
-        before = {name: binding.resolved_role(name, cfg.roles) for name in _ROLE_NAMES}
-        impl, fix, acc = before["implement"], before["fix"], before["accept"]
-        rf, rv = before["review_find"], before["review_verify"]
-        update: dict[str, str] = {}
-        if impl.agent == fix.agent == acc.agent:
-            update["agent"] = impl.agent
-            if impl.agent == "codex" and impl.model and impl.model == fix.model == acc.model:
-                update["codex_model"] = impl.model
-        if rf.agent == rv.agent:
-            update["reviewer_agent"] = rf.agent
-            if rf.agent == "codex" and rf.model and rf.model == rv.model:
-                update["reviewer_codex_model"] = rf.model
-        if rf.agent == "claude" and rf.model:
-            update["local_review_claude_model"] = rf.model
-        if rv.agent == "claude" and rv.model:
-            update["local_review_verifier_claude_model"] = rv.model
-        original = {field: getattr(binding, field) for field in update}
-        for field, value in update.items():
-            setattr(binding, field, value)
-        after = {name: binding.resolved_role(name, cfg.roles) for name in _ROLE_NAMES}
-        if after != before:
-            for field, value in original.items():
-                setattr(binding, field, value)
-            _log.warning(
-                "binding %s/%s: per-role matrix too mixed to synthesize legacy "
-                "role fields; direct legacy-field readers see defaults until "
-                "SYM-192 moves them to resolved_role",
-                binding.project_key,
-                binding.github_repo,
-            )
-
-
 async def assemble_effective_config(
     conn: aiosqlite.Connection,
     base: Config,
@@ -227,5 +168,4 @@ async def assemble_effective_config(
         effective.validate_roles_matrix()
     except (ValidationError, ValueError) as e:
         raise ConfigBootError(f"invalid role configuration in the config DB: {e}") from e
-    _synthesize_legacy_role_fields(effective)
     return effective

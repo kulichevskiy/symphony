@@ -126,16 +126,22 @@ def run_backfill(*, db_path: Path, log_root: Path) -> BackfillResult:
 
 @dataclass(frozen=True)
 class CodexModels:
-    """Codex models a team's binding would have used per role.
+    """Codex models a team's binding would have used per resolved role.
 
-    `implementer` drives implement / review-fix / merge runs and the
-    local-review `fix-*` transcripts; `reviewer` drives the local-review
-    `review-*` transcripts. Either may be `None` when the binding can't be
-    resolved, in which case Codex usage falls back to `unknown`.
+    `implementer` drives `implement`/`implement_fix`/`merge` runs; `fix`
+    drives `review_fix`/`verify_fix` runs and the local-review `fix-*`
+    transcripts; `accept` drives `acceptance`/`acceptance_fix` runs;
+    `reviewer` drives local-review `review-*` (find/single-pass)
+    transcripts; `verifier` drives local-review `review-*-verify`
+    transcripts. Any field may be `None` when the binding can't be resolved,
+    in which case Codex usage falls back to `unknown`.
     """
 
     implementer: str | None = None
+    fix: str | None = None
+    accept: str | None = None
     reviewer: str | None = None
+    verifier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,9 +176,9 @@ def run_model_usage_backfill(
     log is re-parsed with the shared `parse_model_usage` parser and its
     `run_model_usage` rows are rewritten wholesale, so a repeated run is
     idempotent (no double-counting). Claude models come exactly from the
-    log; Codex usage is attributed to the model from the run's team binding
-    (`fix-*` → implementer, `review-*` → reviewer) or `unknown` when the
-    binding can't be resolved.
+    log; Codex usage is attributed to the model from the run's team binding's
+    resolved role for that `stage` (see `_STAGE_ROLE_FIELD`), or `unknown`
+    when the binding can't be resolved.
     """
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
@@ -229,6 +235,22 @@ def run_model_usage_backfill(
     return ModelUsageBackfillResult(updated=updated, skipped=skipped)
 
 
+# Top-level `runs.stage` → `CodexModels` field of the role that stage
+# dispatches through (SYM-192 review); stages not listed here (e.g. `review`,
+# which posts a PR comment rather than running an agent) fall back to
+# `implementer`, matching this backfill's historical behavior.
+_STAGE_ROLE_FIELD: dict[str, str] = {
+    "implement": "implementer",
+    "implement_fix": "implementer",
+    "merge": "implementer",
+    "review_fix": "fix",
+    "verify": "fix",
+    "verify_fix": "fix",
+    "acceptance": "accept",
+    "acceptance_fix": "accept",
+}
+
+
 def _model_usages_for_row(
     *,
     conn: sqlite3.Connection,
@@ -237,34 +259,39 @@ def _model_usages_for_row(
     paths_by_run_id: dict[str, tuple[Path, ...]],
     local_review_paths_by_parent: dict[str, tuple[Path, ...]],
 ) -> list[ModelUsage]:
-    if str(row["stage"]) == "local_review":
+    stage = str(row["stage"])
+    if stage == "local_review":
         parent_run_id = _local_review_parent_run_id(conn=conn, row=row)
         if parent_run_id is None:
             return []
         paths = local_review_paths_by_parent.get(parent_run_id, ())
         return _local_review_model_usages(paths, codex=codex)
 
+    codex_model = getattr(codex, _STAGE_ROLE_FIELD.get(stage, "implementer"))
     usages: list[ModelUsage] = []
     for path in paths_by_run_id.get(str(row["id"]), ()):
         lines = _read_lines(path)
         if lines is None:
             continue
-        usages.extend(parse_model_usage(lines, codex_model=codex.implementer))
+        usages.extend(parse_model_usage(lines, codex_model=codex_model))
     return usages
 
 
 def _local_review_model_usages(paths: tuple[Path, ...], *, codex: CodexModels) -> list[ModelUsage]:
     """Parse local-review role transcripts into per-(provider, model) usage.
 
-    `fix-*.out.log` are implementer turns, `review-*.out.log` reviewer
-    turns; each file is one process, so it is parsed independently with the
-    codex model of its role (Claude ignores it — its `modelUsage` carries
-    the exact model).
+    `fix-*.out.log` are `fix`-role turns, `review-*-verify.out.log` the
+    `review_verify` pass, other `review-*.out.log` the `review_find`
+    finder/single-pass; each file is one process, so it is parsed
+    independently with the codex model of its role (Claude ignores it — its
+    `modelUsage` carries the exact model).
     """
     usages: list[ModelUsage] = []
     for path in sorted(paths):
         if path.name.startswith("fix-"):
-            codex_model = codex.implementer
+            codex_model = codex.fix
+        elif path.name.startswith("review-") and path.name.endswith("-verify.out.log"):
+            codex_model = codex.verifier
         elif path.name.startswith("review-"):
             codex_model = codex.reviewer
         else:

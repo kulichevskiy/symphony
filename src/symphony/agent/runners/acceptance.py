@@ -14,7 +14,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from symphony.agent.process import Usage, parse_event_line
+from symphony.agent.codex_models import DEFAULT_CODEX_MODEL
+from symphony.agent.process import parse_event_line
 from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
 from symphony.pipeline.acceptance_classifier import (
     ACCEPTANCE_FOOTER_PASS,
@@ -23,7 +24,7 @@ from symphony.pipeline.acceptance_classifier import (
     AcceptanceVerdict,
     acceptance_classifier,
 )
-from symphony.pipeline.cost_guard import UsageDelta
+from symphony.pipeline.cost_guard import UsageCostEstimator, UsageDelta
 from symphony.pipeline.local_review_io import (
     CollectedRunnerOutput,
     open_run_log,
@@ -196,11 +197,28 @@ async def run_acceptance(
     dev_port: int | None = None,
     dev_startup_timeout_secs: float = _DEV_SERVER_STARTUP_TIMEOUT_SECS,
     log_root: Path | None = None,
+    agent: str = "claude",
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
+    effort: str | None = None,
 ) -> AcceptanceVerdict:
     # `{log_root}/{run_id}.log` is the run's tailable log — the acceptance
     # subprocess tees to it in real time (same file the issue-detail API
     # reports `has_log` for).
     log_path = log_root / f"{run_id}.log" if log_root is not None else None
+    if agent == "codex" and mode in _PLAYWRIGHT_MODES:
+        return AcceptanceVerdict(
+            kind="infra_error",
+            criteria=list(criteria or []),
+            cost=0.0,
+            hero_screenshot_url="",
+            details=(
+                f"Acceptance mode {mode!r} requires the Playwright MCP server, which "
+                "the codex CLI has no --mcp-config flag to receive; the accept role "
+                "must resolve to claude for dev/preview acceptance."
+            ),
+            preview_url=preview_url,
+        )
     if mode == _DEV_MODE:
         return await _run_dev_acceptance(
             runner=runner,
@@ -216,6 +234,10 @@ async def run_acceptance(
             dev_port=dev_port,
             dev_startup_timeout_secs=dev_startup_timeout_secs,
             log_path=log_path,
+            agent=agent,
+            codex_model=codex_model,
+            claude_model=claude_model,
+            effort=effort,
         )
     if mode == _PREVIEW_MODE:
         return await _run_preview_acceptance(
@@ -229,6 +251,10 @@ async def run_acceptance(
             stall_secs=stall_secs,
             preview_url=preview_url,
             log_path=log_path,
+            agent=agent,
+            codex_model=codex_model,
+            claude_model=claude_model,
+            effort=effort,
         )
     if mode != _CODE_ONLY_MODE:
         return AcceptanceVerdict(
@@ -259,6 +285,10 @@ async def run_acceptance(
         workspace_path=workspace_path,
         command=build_acceptance_command(
             prompt=prompt,
+            agent=agent,
+            codex_model=codex_model,
+            claude_model=claude_model,
+            effort=effort,
         ),
         stall_secs=stall_secs,
         stage="acceptance",
@@ -268,6 +298,8 @@ async def run_acceptance(
         spec,
         wall_clock_secs=stall_secs,
         log_path=log_path,
+        agent=agent,
+        codex_model=codex_model,
     )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
@@ -284,6 +316,7 @@ async def run_acceptance(
         parsed = acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
+            agent=agent,
         )
         usage = _usage_delta_with_cost(
             acceptance_run.usage,
@@ -305,6 +338,7 @@ async def run_acceptance(
         acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
+            agent=agent,
         ),
         acceptance_run.usage,
     )
@@ -325,6 +359,10 @@ async def _run_dev_acceptance(
     dev_port: int | None,
     dev_startup_timeout_secs: float,
     log_path: Path | None = None,
+    agent: str = "claude",
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
+    effort: str | None = None,
 ) -> AcceptanceVerdict:
     if not dev_command or dev_port is None:
         return AcceptanceVerdict(
@@ -373,6 +411,10 @@ async def _run_dev_acceptance(
             stall_secs=stall_secs,
             preview_url=resolved_preview_url,
             log_path=log_path,
+            agent=agent,
+            codex_model=codex_model,
+            claude_model=claude_model,
+            effort=effort,
         )
     finally:
         await _stop_dev_server(dev_server)
@@ -390,6 +432,10 @@ async def _run_preview_acceptance(
     stall_secs: float,
     preview_url: str,
     log_path: Path | None = None,
+    agent: str = "claude",
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
+    effort: str | None = None,
 ) -> AcceptanceVerdict:
     if not preview_url:
         return AcceptanceVerdict(
@@ -411,6 +457,10 @@ async def _run_preview_acceptance(
         stall_secs=stall_secs,
         preview_url=preview_url,
         log_path=log_path,
+        agent=agent,
+        codex_model=codex_model,
+        claude_model=claude_model,
+        effort=effort,
     )
 
 
@@ -427,6 +477,10 @@ async def _run_playwright_acceptance(
     stall_secs: float,
     preview_url: str,
     log_path: Path | None = None,
+    agent: str = "claude",
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
+    effort: str | None = None,
 ) -> AcceptanceVerdict:
     artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -451,6 +505,10 @@ async def _run_playwright_acceptance(
             prompt=prompt,
             mode=mode,
             mcp_config_path=mcp_config_path,
+            agent=agent,
+            codex_model=codex_model,
+            claude_model=claude_model,
+            effort=effort,
         ),
         env={
             "SYMPHONY_ACCEPTANCE_PREVIEW_URL": preview_url,
@@ -464,6 +522,8 @@ async def _run_playwright_acceptance(
         spec,
         wall_clock_secs=stall_secs,
         log_path=log_path,
+        agent=agent,
+        codex_model=codex_model,
     )
     collected = acceptance_run.output
     if acceptance_run.abort_details:
@@ -481,6 +541,7 @@ async def _run_playwright_acceptance(
         parsed = acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
+            agent=agent,
         )
         usage = _usage_delta_with_cost(
             acceptance_run.usage,
@@ -502,6 +563,7 @@ async def _run_playwright_acceptance(
     verdict = acceptance_classifier(
         transcript=collected.stdout,
         criteria=criteria,
+        agent=agent,
     )
     return _with_usage(
         _validate_dev_artifacts(
@@ -518,16 +580,6 @@ class _AcceptanceRunOutput:
     abort_details: str = ""
     cost: float = 0.0
     usage: UsageDelta = field(default_factory=UsageDelta)
-
-
-def _usage_delta_from_usage(usage: Usage) -> UsageDelta:
-    return UsageDelta(
-        cost_usd=usage.cost_usd,
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        cache_write_tokens=usage.cache_write_tokens,
-        cache_read_tokens=usage.cache_read_tokens,
-    )
 
 
 def _sum_usage_delta(left: UsageDelta, right: UsageDelta) -> UsageDelta:
@@ -551,7 +603,16 @@ def _usage_delta_with_cost(usage: UsageDelta, cost: float) -> UsageDelta:
 
 
 def _with_usage(verdict: AcceptanceVerdict, usage: UsageDelta) -> AcceptanceVerdict:
-    return replace(verdict, usage=_usage_delta_with_cost(usage, verdict.cost))
+    """Attach usage to `verdict`, keeping the higher of the two cost figures.
+
+    Claude self-prices, so `verdict.cost` (from the transcript's `result`
+    event) and `usage.cost_usd` (the runner's tracked total) already agree.
+    Codex never prices itself — the classifier always reports 0 — so without
+    `max()` a passing/rejecting Codex run would silently report $0 instead of
+    the runner's per-token cost estimate (SYM-192 review).
+    """
+    cost = max(verdict.cost, usage.cost_usd)
+    return replace(verdict, cost=cost, usage=_usage_delta_with_cost(usage, cost))
 
 
 @dataclass
@@ -569,6 +630,8 @@ async def _collect_acceptance_output(
     *,
     wall_clock_secs: float,
     log_path: Path | None = None,
+    agent: str = "claude",
+    codex_model: str = DEFAULT_CODEX_MODEL,
 ) -> _AcceptanceRunOutput:
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -578,6 +641,10 @@ async def _collect_acceptance_output(
     stall_timeout = False
     tracked_cost = 0.0
     tracked_usage = UsageDelta()
+    # Claude self-prices each turn (`cost_usd` is a running total); Codex
+    # never prices itself, so the estimator prices cumulative token deltas
+    # against `codex_model` (SYM-192) — same idiom as the general runner.
+    cost_estimator = UsageCostEstimator(agent=agent, codex_model=codex_model)
     started_at = time.monotonic()
     iterator: AsyncIterator[RunnerEvent] = runner.run(spec).__aiter__()
     # Tee every line to `{log_root}/{run_id}.log` as it arrives so the
@@ -642,11 +709,8 @@ async def _collect_acceptance_output(
                 tee_run_log(logf, event.line)
                 usage = parse_event_line(event.line)
                 if usage is not None:
-                    tracked_usage = _sum_usage_delta(
-                        tracked_usage,
-                        _usage_delta_from_usage(usage),
-                    )
-                    tracked_cost = max(tracked_cost, usage.cost_usd)
+                    tracked_usage = _sum_usage_delta(tracked_usage, cost_estimator.delta(usage))
+                    tracked_cost = tracked_usage.cost_usd
             elif event.kind == "stderr" and event.line is not None:
                 stderr_parts.append(event.line)
                 tee_run_log(logf, event.line, stderr=True)
@@ -959,7 +1023,29 @@ def build_acceptance_command(
     prompt: str,
     mode: str = _CODE_ONLY_MODE,
     mcp_config_path: Path | None = None,
+    agent: str = "claude",
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
+    """argv for the acceptance-verdict subprocess (the `accept` role, SYM-192).
+
+    `claude_model`/`effort` are the resolved `accept` role's Claude model /
+    reasoning effort: set → `--model`/`--effort` flag, unset → no flag (CLI
+    default). Both are ignored for codex, which takes `codex_model`/`effort`
+    the same way `build_runner_command` does.
+
+    Codex has no `--mcp-config` flag (`mcp_config_path` is Claude-only, used
+    for the Playwright MCP server on dev/preview modes); codex's own MCP
+    wiring lives in its config.toml, unaffected here — same convention as the
+    implement/fix/merge command builders.
+    """
+    if agent == "codex":
+        command = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--json"]
+        if effort is not None:
+            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+        command.extend(["--model", codex_model, prompt])
+        return command
     command = [
         "claude",
         "--print",
@@ -987,6 +1073,10 @@ def build_acceptance_command(
                 "mcp__playwright__*",
             ]
         )
+    if claude_model is not None:
+        command.extend(["--model", claude_model])
+    if effort is not None:
+        command.extend(["--effort", effort])
     command.append(prompt)
     return command
 

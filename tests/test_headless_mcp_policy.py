@@ -30,7 +30,7 @@ from symphony.agent.prompt import (
     review_fix_prompt,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator, build_runner_command
 from symphony.pipeline.local_review import VERDICT_CHANGES_REQUESTED_MARKER
@@ -427,10 +427,9 @@ async def test_local_review_fixer_spawn_injects_binding_env(
         issue_title="Apply schema migration",
         issue_body="Add the breakdown table.",
         labels=["symphony"],
-        implementer_agent="claude",
-        implementer_codex_model="",
-        reviewer_agent="claude",
-        reviewer_codex_model="",
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=1,
         stall_secs=10,
         binding_env={"SUPABASE_ACCESS_TOKEN": "sbp-resolved"},

@@ -22,6 +22,7 @@ from ... import db
 from ...agent.claude_cli import claude_builder_allowed_tools
 from ...agent.codex_cli import build_codex_workspace_write_command
 from ...agent.codex_models import DEFAULT_CODEX_MODEL
+from ...config import ResolvedRole
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review_loop import LoopResult
 from ...pipeline.state_machine import classify_termination
@@ -82,6 +83,21 @@ def build_pr_body(issue: LinearIssue) -> str:
     (which appends `Relates to ...`), so the body itself is empty by
     default. Returning the URL here keeps the format pinned in tests."""
     return f"Relates to {issue.url}"
+
+
+def role_codex_model(role: ResolvedRole) -> str:
+    """Codex `--model` for a resolved role — see `ResolvedRole.codex_model_arg`."""
+    return role.codex_model_arg()
+
+
+def role_claude_model(role: ResolvedRole) -> str | None:
+    """Claude `--model` for a resolved role — see `ResolvedRole.claude_model_arg`."""
+    return role.claude_model_arg()
+
+
+def role_attribution_codex_model(role: ResolvedRole) -> str | None:
+    """Usage-attribution codex model — see `ResolvedRole.attribution_codex_model`."""
+    return role.attribution_codex_model()
 
 
 def build_runner_command(
@@ -148,6 +164,7 @@ def build_fix_runner_command(
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
+    effort: str | None = None,
     workspace_path: Path | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
@@ -155,17 +172,20 @@ def build_fix_runner_command(
 
     Fix-runs go through the binding's CLI (claude or codex), NOT through
     the GitHub `@codex review` bot. The bot is only consulted via PR
-    comments; the binding's `agent` field is what drives code changes
+    comments; the resolved `fix` role's agent is what drives code changes
     in response to its feedback.
 
     `claude_model` is the resolved `fix` role's Claude model: set →
     `--model <alias>`, unset → no flag (CLI default). It is ignored for codex.
+    `effort` is the resolved role's reasoning effort, threaded through the
+    same way `build_runner_command` does (SYM-192).
     """
     return build_runner_command(
         agent,
         prompt,
         codex_model=codex_model,
         claude_model=claude_model,
+        effort=effort,
         workspace_path=workspace_path,
         mcp_servers=mcp_servers,
     )
@@ -176,6 +196,8 @@ def build_merge_runner_command(
     prompt: str,
     *,
     codex_model: str = DEFAULT_CODEX_MODEL,
+    claude_model: str | None = None,
+    effort: str | None = None,
     workspace_path: Path | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
@@ -184,6 +206,8 @@ def build_merge_runner_command(
         agent,
         prompt,
         codex_model=codex_model,
+        claude_model=claude_model,
+        effort=effort,
         workspace_path=workspace_path,
         mcp_servers=mcp_servers,
     )

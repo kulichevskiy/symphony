@@ -56,14 +56,6 @@ SUPPORTED_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 RoleName = Literal["implement", "review_find", "review_verify", "fix", "accept"]
 _BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
 
-# Roles whose command builder actually threads `effort` through to a dispatch
-# flag (`orchestrator.poll._base._run_agent` → `build_runner_command`).
-# `review_find`/`fix` take no `effort` param and `review_verify`/`accept` are
-# never resolved on any dispatch path at all, so an `effort` cell on any of
-# them is pure dead configuration — rejected in `validate_roles_matrix` rather
-# than silently persisted (SYM-191 review).
-_EFFORT_WIRED_ROLES: frozenset[str] = frozenset({"implement"})
-
 # Legacy top-level role fields the `roles:` matrix supersedes. Each is still
 # honored (mapped into the matrix below) but now warns, and collides loudly
 # with its matrix equivalent so an operator never sets both.
@@ -84,8 +76,8 @@ _LEGACY_ROLE_FIELDS: frozenset[str] = frozenset(
 _LEGACY_FIELD_CELLS: dict[str, tuple[tuple[RoleName, str], ...]] = {
     "agent": (("implement", "agent"), ("fix", "agent"), ("accept", "agent")),
     "codex_model": (("implement", "model"), ("fix", "model"), ("accept", "model")),
-    "reviewer_agent": (("review_find", "agent"), ("review_verify", "agent")),
-    "reviewer_codex_model": (("review_find", "model"), ("review_verify", "model")),
+    "reviewer_agent": (("review_find", "agent"),),
+    "reviewer_codex_model": (("review_find", "model"),),
     "local_review_claude_model": (("review_find", "model"),),
     "local_review_verifier_claude_model": (("review_verify", "model"),),
 }
@@ -123,6 +115,21 @@ class ResolvedRole(BaseModel):
     agent: Literal["claude", "codex"]
     model: str | None = None
     effort: str | None = None
+
+    def codex_model_arg(self) -> str:
+        """Codex `--model` for this role: the resolved model for a codex role,
+        else the CLI default (the claude command path ignores it)."""
+        return self.model if self.agent == "codex" and self.model else DEFAULT_CODEX_MODEL
+
+    def claude_model_arg(self) -> str | None:
+        """Claude `--model` for this role: the resolved model for a claude
+        role, `None` (no flag) for a codex role."""
+        return self.model if self.agent == "claude" else None
+
+    def attribution_codex_model(self) -> str | None:
+        """Codex model to attribute this role's usage/cost to, or `None` for a
+        claude role (whose runs emit no codex-priced usage lines)."""
+        return self.model if self.agent == "codex" else None
 
 
 def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) -> bool:
@@ -481,11 +488,20 @@ class RepoBinding(BaseModel):
         """Whether the `@codex` GitHub-bot review runs on the PR."""
         return self.remote_review
 
-    def resolved_reviewer_agent(self) -> Literal["claude", "codex"]:
-        """Reviewer agent after applying the implementer-opposite default."""
+    def resolved_reviewer_agent(
+        self, global_roles: Mapping[RoleName, RoleConfig] | None = None
+    ) -> Literal["claude", "codex"]:
+        """Reviewer agent after applying the implementer-opposite default.
+
+        Opposes the *resolved* `implement` role (which may come from the
+        `roles:` matrix), not the raw legacy `agent` field — a roles-only DB
+        config can leave `agent` at its `claude` default while the matrix
+        resolves `implement` to codex.
+        """
         if self.reviewer_agent is not None:
             return self.reviewer_agent
-        return "codex" if self.agent == "claude" else "claude"
+        implement_agent = self.resolved_role("implement", global_roles).agent
+        return "codex" if implement_agent == "claude" else "claude"
 
     def resolved_reviewer_codex_model(self) -> str:
         """Codex model for the reviewer when it's the codex agent."""
@@ -520,36 +536,76 @@ class RepoBinding(BaseModel):
         """Per-binding override wins; falls back to `command_timeout_secs`."""
         return self.verify_timeout_secs if self.verify_timeout_secs is not None else global_default
 
-    def _default_role_agent(self, name: RoleName) -> Literal["claude", "codex"]:
+    def _default_role_agent(
+        self, name: RoleName, global_roles: Mapping[RoleName, RoleConfig] | None = None
+    ) -> Literal["claude", "codex"]:
         if name in _BUILDER_ROLES:
             return self.agent
-        return self.resolved_reviewer_agent()
+        # Both review roles key off the *resolved* `implement` role, not the
+        # raw legacy `agent` field — a roles-only DB config can leave `agent`
+        # at its `claude` default while the matrix resolves `implement` to
+        # codex, and a review default keyed off the stale field would silently
+        # collapse the family diversity these roles exist to preserve.
+        if name == "review_verify":
+            # Adversarial verifier defaults to the implementer's family, kept
+            # opposite `review_find` (which defaults to the reviewer-opposite
+            # family) so the two-pass loop keeps its model diversity.
+            return self.resolved_role("implement", global_roles).agent
+        return self.resolved_reviewer_agent(global_roles)
 
-    def _default_role_model(self, name: RoleName, agent: Literal["claude", "codex"]) -> str | None:
+    def _default_role_model(
+        self,
+        name: RoleName,
+        agent: Literal["claude", "codex"],
+        global_roles: Mapping[RoleName, RoleConfig] | None = None,
+    ) -> str | None:
         """Back-compat model default for a role given its resolved agent.
 
         Maps the legacy top-level fields into the matrix so a config with no
         `roles:` block resolves to exactly today's values: codex builders
-        carry `codex_model`; claude builders pass no `--model`; review roles
-        carry `reviewer_codex_model` (codex) or the local-review claude
-        finder/verifier models (claude).
+        carry `codex_model`; claude builders pass no `--model`; `review_find`
+        carries `reviewer_codex_model` (codex) or `local_review_claude_model`
+        (claude); `review_verify` carries the resolved `implement` role's model
+        (codex, matching its implementer-family default agent) or
+        `local_review_verifier_claude_model` (claude).
         """
         if name in _BUILDER_ROLES:
             return self.codex_model if agent == "codex" else None
+        if name == "review_verify":
+            if agent == "codex":
+                implement_role = self.resolved_role("implement", global_roles)
+                # Only reuse `implement`'s model when it actually resolved to
+                # codex too — an explicit `roles.review_verify.agent: codex`
+                # override on a Claude-family `implement` must not inherit a
+                # Claude model string into a codex command (SYM-192 review).
+                if implement_role.agent == "codex":
+                    return implement_role.model
+                return self.resolved_reviewer_codex_model()
+            return self.local_review_verifier_claude_model
         if agent == "codex":
             return self.resolved_reviewer_codex_model()
-        if name == "review_verify":
-            return self.local_review_verifier_claude_model
         return self.local_review_claude_model
 
     def resolved_role(
-        self, name: RoleName, global_roles: Mapping[RoleName, RoleConfig] | None = None
+        self,
+        name: RoleName,
+        global_roles: Mapping[RoleName, RoleConfig] | None = None,
+        *,
+        visual_acceptance: bool = False,
     ) -> ResolvedRole:
         """Resolve a role to `{agent, model}`.
 
         Deep-merges per field: a per-binding `roles[name]` field wins over the
         global `roles[name]` field, and an unset field falls back to the
         back-compat default derived from the legacy top-level fields.
+
+        `visual_acceptance=True` (the `accept` role for a `dev`/`preview`
+        acceptance run) forces an unconfigured `accept` default off codex:
+        codex has no `--mcp-config` flag to drive the Playwright MCP server
+        those modes need, so a codex-builder binding with no explicit
+        `roles.accept.agent` must fall back to claude rather than resolving
+        the acceptance stage into a guaranteed infra error. An explicit
+        `roles.accept.agent: codex` override still passes through untouched.
         """
         binding_role = self.roles.get(name)
         global_role = (global_roles or {}).get(name)
@@ -569,9 +625,18 @@ class RepoBinding(BaseModel):
         if effort is None and global_role is not None:
             effort = global_role.effort
         if agent is None:
-            agent = self._default_role_agent(name)
+            agent = self._default_role_agent(name, global_roles)
+            if visual_acceptance and name == "accept" and agent == "codex":
+                # `model`/`effort` above may already carry codex-family
+                # values inherited from an unset-agent `roles.accept` cell
+                # (e.g. a codex model or effort string) — discard them so
+                # they don't ride along into the forced Claude command
+                # (SYM-192 review).
+                agent = "claude"
+                model = None
+                effort = None
         if model is None:
-            model = self._default_role_model(name, agent)
+            model = self._default_role_model(name, agent, global_roles)
         # `effort` has no legacy top-level field, so its only source is the
         # `roles:` blocks; unset stays None (no flag).
         return ResolvedRole(agent=agent, model=model, effort=effort)
@@ -809,17 +874,9 @@ class Config(BaseModel):
                 ) or (global_role is not None and global_role.effort is not None)
                 if not (explicit_model or explicit_effort):
                     continue
-                if explicit_effort and name not in _EFFORT_WIRED_ROLES:
-                    # Only `implement`'s command builder threads `effort`
-                    # through to a dispatch flag — persisting it on any other
-                    # role would look effective in the resolved matrix while
-                    # every dispatch path silently ignores it (SYM-191
-                    # review).
-                    raise ValueError(
-                        f"role {name!r} does not support an effort override; "
-                        f"effort only reaches dispatch for the "
-                        f"{sorted(_EFFORT_WIRED_ROLES)!r} role(s)"
-                    )
+                # Every role's command builder now threads `effort` through to
+                # a dispatch flag (SYM-192), so an effort cell is effective on
+                # any of the five roles — no per-role wiring gate.
                 role = binding.resolved_role(name, self.roles)
                 if explicit_model and not _role_model_in_family(role.agent, role.model):
                     if role.agent == "codex":
@@ -862,7 +919,7 @@ class Config(BaseModel):
                 # posture isn't the operator's to fix here.
                 continue
             implement = binding.resolved_role("implement", self.roles)
-            for review_name in ("review_find", "review_verify"):
+            for review_name in ("review_find",):
                 review = binding.resolved_role(review_name, self.roles)
                 if review.agent == implement.agent:
                     warnings.warn(
@@ -873,6 +930,21 @@ class Config(BaseModel):
                         UserWarning,
                         stacklevel=2,
                     )
+            # The two-pass local-review loop's adversarial value depends on
+            # `review_verify` disagreeing with `review_find` (see
+            # `_default_role_agent`); warn if a `roles:` override collapses
+            # them onto the same agent+model.
+            find = binding.resolved_role("review_find", self.roles)
+            verify = binding.resolved_role("review_verify", self.roles)
+            if find.agent == verify.agent and find.model == verify.model:
+                warnings.warn(
+                    f"binding {binding.project_key}/{binding.github_repo}: "
+                    f"role 'review_verify' uses the same agent+model "
+                    f"({verify.agent!r}, {verify.model!r}) as 'review_find'; "
+                    "the two-pass review loop's adversarial diversity is lost.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     @classmethod
     def peek_db_path(cls, path: Path) -> Path:

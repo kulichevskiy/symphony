@@ -222,18 +222,15 @@ async def test_db_binding_env_is_resolved_not_left_as_key_names(
 
 
 @pytest.mark.asyncio
-async def test_legacy_role_fields_synthesized_for_codex_binding(tmp_path: Path) -> None:
-    """DB payloads are legacy-free, but several runtime paths still read the
-    legacy top-level fields directly (`binding.agent` for codex resume and
-    usage-cost attribution, `binding.codex_model`, ...). Assembly must
-    synthesize them from the resolved matrix so a migrated codex binding
-    doesn't run those paths with claude defaults (SYM-192 retires this)."""
+async def test_no_legacy_synthesis_resolved_role_is_authoritative(tmp_path: Path) -> None:
+    """DB payloads are legacy-free and (SYM-192) every per-stage consumer reads
+    `resolved_role`, so assembly must NOT back-synthesize the legacy top-level
+    fields: the binding keeps its default `agent`/`codex_model`, while the
+    resolved matrix carries the real per-role values."""
     conn = await db.connect(tmp_path / "state.sqlite")
     # What the importer emits for a legacy `agent: codex` +
     # `codex_model: gpt-5.1-codex-max` binding: agent/model cells on every
-    # builder role, plus explicit claude cells on the review roles (the
-    # legacy-free baseline would otherwise flip their opposite-family
-    # default to codex).
+    # builder role, plus explicit claude cells on the review roles.
     await db.config_bindings.insert(
         conn,
         payload={
@@ -245,29 +242,31 @@ async def test_legacy_role_fields_synthesized_for_codex_binding(tmp_path: Path) 
                 "fix": {"agent": "codex", "model": "gpt-5.1-codex-max"},
                 "accept": {"agent": "codex", "model": "gpt-5.1-codex-max"},
                 "review_find": {"agent": "claude", "model": "sonnet"},
-                "review_verify": {"agent": "claude"},
+                "review_verify": {"agent": "claude", "model": "opus"},
             },
         },
         key=("ENG", "org/api", "", "linear", "default"),
     )
     cfg = await assemble_effective_config(conn, _base(tmp_path))
     (binding,) = cfg.repos
-    assert binding.agent == "codex"
-    assert binding.codex_model == "gpt-5.1-codex-max"
-    assert binding.reviewer_agent == "claude"
-    assert binding.local_review_claude_model == "sonnet"
-    # Synthesis must not have changed any resolved role.
+    # Legacy fields are never synthesized — they stay at model defaults.
+    assert binding.agent == "claude"
+    assert binding.reviewer_agent is None
+    assert binding.local_review_claude_model is None
+    # The resolved matrix is the single source of truth for every consumer.
     assert binding.resolved_role("implement", cfg.roles).agent == "codex"
+    assert binding.resolved_role("implement", cfg.roles).model == "gpt-5.1-codex-max"
     assert binding.resolved_role("review_find", cfg.roles).agent == "claude"
+    assert binding.resolved_role("review_find", cfg.roles).model == "sonnet"
+    assert binding.resolved_role("review_verify", cfg.roles).model == "opus"
     await conn.close()
 
 
 @pytest.mark.asyncio
-async def test_mixed_matrix_skips_legacy_synthesis_keeping_resolution(tmp_path: Path) -> None:
+async def test_mixed_matrix_resolves_per_role_without_legacy_fields(tmp_path: Path) -> None:
     """A per-role mixed matrix (codex implement over inherited claude fix)
-    can't be represented by one legacy `agent` value without changing the
-    fallback resolution — synthesis must leave the binding untouched and the
-    resolved roles identical to what the matrix alone dictates."""
+    resolves each role independently; no legacy field is written, so the
+    binding's default `agent` stays `claude` while `implement` is codex."""
     conn = await db.connect(tmp_path / "state.sqlite")
     await db.config_bindings.insert(
         conn,

@@ -14,7 +14,7 @@ import pytest
 
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.config import AcceptanceConfig, Config, LinearStates, RepoBinding
+from symphony.config import AcceptanceConfig, Config, LinearStates, RepoBinding, RoleConfig
 from symphony.github.client import CheckRun, GitHubError, PRChecks
 from symphony.linear.client import LinearError, LinearIssue
 from symphony.orchestrator import poll as poll_module
@@ -79,6 +79,38 @@ def _acceptance_events(
                         "cache_creation_input_tokens": 30,
                         "cache_read_input_tokens": 40,
                         "output_tokens": 20,
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
+def _codex_acceptance_events(verdict_footer: str = ACCEPTANCE_FOOTER_PASS) -> list[RunnerEvent]:
+    return [
+        RunnerEvent(kind="started", pid=2222),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 900,
+                        "output_tokens": 120,
+                        "cached_input_tokens": 80,
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": f"Acceptance verdict.\n\n{verdict_footer}",
                     },
                 }
             ),
@@ -438,6 +470,89 @@ async def test_acceptance_pass_honors_needs_human_approval_label_added_mid_flow(
             call("iss-1", "state-na"),
         ]
         gh.pr_merge.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_acceptance_verdict_run_uses_resolved_accept_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`roles.accept` must drive the acceptance-verdict subprocess itself,
+    not just the post-rejection fix run (SYM-192 review)."""
+
+    async def no_sync(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    monkeypatch.setattr(poll_module, "_sync_workspace_to_remote", no_sync)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        # No legacy top-level `agent=` on the binding: it would conflict with
+        # the global `roles["accept"]` matrix cell set below.
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            branch_prefix="symphony",
+            acceptance=AcceptanceConfig(mode="code_only", time_cap_minutes=15.0),  # type: ignore[arg-type]
+            linear_states=LinearStates(
+                ready="Todo",
+                code_review="Needs Approval",
+                in_progress="In Progress",
+                needs_approval="Needs Approval",
+                in_acceptance="In Acceptance",
+                blocked="Blocked",
+                done="Done",
+            ),
+        )
+        await _seed_review_candidate(conn, binding)
+        runner = _FakeRunner([_codex_acceptance_events(), _merge_events()])
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+        workspace.cleanup = AsyncMock()
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                roles={
+                    "accept": RoleConfig(agent="codex", model="gpt-5.1-codex", effort="high"),
+                },
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            linear,
+            conn,
+            runner=runner,
+            gh=_github(),
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        tasks = await orch._poll_merge_candidates()  # noqa: SLF001
+        if tasks:
+            await asyncio.gather(*tasks)
+        await orch.drain_dispatch_tasks()
+
+        assert [spec.stage for spec in runner.captured_specs] == ["acceptance", "merge"]
+        acceptance_spec = runner.captured_specs[0]
+        acceptance_command = acceptance_spec.command
+        assert acceptance_command[0] == "codex"
+        assert acceptance_command[acceptance_command.index("--model") + 1] == "gpt-5.1-codex"
+        assert (
+            acceptance_command[acceptance_command.index("--config") + 1]
+            == 'model_reasoning_effort="high"'
+        )
+        # The accept role's resolved Codex model must attribute the run's
+        # per-model usage row, not go unrecorded (SYM-192 review).
+        usage_rows = await db.run_model_usage.list_for_run(conn, acceptance_spec.run_id)
+        assert [(row.provider, row.model) for row in usage_rows] == [("codex", "gpt-5.1-codex")]
+        assert (usage_rows[0].input_tokens, usage_rows[0].output_tokens) == (900, 120)
     finally:
         await conn.close()
 

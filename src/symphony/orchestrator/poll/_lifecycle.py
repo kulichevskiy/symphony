@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 from ... import db
-from ...config import RepoBinding
+from ...config import RepoBinding, ResolvedRole
 from ...github.client import GitHubError
 from ...linear.client import LinearError
 from ...linear.templates import (
@@ -155,8 +155,6 @@ class _LifecycleMixin(_OrchestratorBase):
             termination_detail: str | None = None,
         ) -> None: ...
 
-        def _fix_claude_model(self, binding: RepoBinding) -> str | None: ...
-
         async def _maybe_park_for_token_budget(
             self, issue_id: str, run_id: str, binding: RepoBinding
         ) -> bool: ...
@@ -207,7 +205,7 @@ class _LifecycleMixin(_OrchestratorBase):
             run_id: str,
             workspace_path: Path,
             prior_total: float,
-        ) -> tuple[UsageDelta, str, int | None]: ...
+        ) -> tuple[UsageDelta, str, int | None, ResolvedRole]: ...
 
         async def _run_dirty_tree_fix_turn(
             self,
@@ -734,7 +732,7 @@ class _LifecycleMixin(_OrchestratorBase):
         head_before = await _workspace_head_sha(workspace_path)
 
         try:
-            cumulative_usage, final_kind, final_returncode = await self._run_agent(
+            cumulative_usage, final_kind, final_returncode, implement_role = await self._run_agent(
                 binding=binding,
                 issue=issue,
                 storage_issue_id=issue_id,
@@ -792,7 +790,7 @@ class _LifecycleMixin(_OrchestratorBase):
         head_after = await _workspace_head_sha(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
         log_path = self.config.log_root / f"{run_id}.log"
-        final_message = _read_run_final_message(log_path, agent=binding.agent)
+        final_message = _read_run_final_message(log_path, agent=implement_role.agent)
         # A killed-then-redispatched run re-runs the agent conservatively; it
         # re-confirms (SYMPHONY_DONE) without a *new* commit. If the branch
         # already carries deliverable commits (ahead of base) on a clean tree,
@@ -1451,18 +1449,14 @@ class _LifecycleMixin(_OrchestratorBase):
                     )
                     base_branch = "main"
 
-            # Resolve the reviewer from the roles matrix (review_find), falling
-            # back through resolved_role to the legacy reviewer defaults when no
-            # `roles:` block is set. The legacy resolved_reviewer_agent() ignores
-            # the matrix, so a `roles: review_find/verify` block was silently
-            # dead config and the reviewer always defaulted to codex.
-            review_find_role = binding.resolved_role("review_find", self.config.roles)
-            reviewer_agent = review_find_role.agent
-            reviewer_codex_model = (
-                review_find_role.model
-                if reviewer_agent == "codex" and review_find_role.model
-                else binding.resolved_reviewer_codex_model()
-            )
+            # Resolve every local-review pass from the roles matrix (SYM-192):
+            # the finder / single pass is `review_find`, the adversarial pass-2
+            # verifier is `review_verify`, and the in-loop fixer is `fix`. Each
+            # carries its own agent, model, and effort — no legacy field reads.
+            reviewer_role = binding.resolved_role("review_find", self.config.roles)
+            verifier_role = binding.resolved_role("review_verify", self.config.roles)
+            fixer_role = binding.resolved_role("fix", self.config.roles)
+            reviewer_agent = reviewer_role.agent
             last_message_dir = self.config.log_root / "local_review" / parent_run_id
             # Local-review uses its own cap (default 3) which is
             # typically lower than `review_iteration_cap` (default 12)
@@ -1516,13 +1510,9 @@ class _LifecycleMixin(_OrchestratorBase):
                     issue_title=issue.title,
                     issue_body=issue.description,
                     labels=list(issue.labels),
-                    implementer_agent=binding.agent,
-                    implementer_codex_model=binding.codex_model,
-                    reviewer_agent=reviewer_agent,
-                    reviewer_codex_model=reviewer_codex_model,
-                    local_review_claude_model=binding.local_review_claude_model,
-                    local_review_verifier_claude_model=(binding.local_review_verifier_claude_model),
-                    fix_claude_model=self._fix_claude_model(binding),
+                    reviewer_role=reviewer_role,
+                    verifier_role=verifier_role,
+                    fixer_role=fixer_role,
                     cap=cap,
                     stall_secs=self.config.stall_timeout_secs,
                     command_secs=self.config.command_timeout_secs,
@@ -1542,8 +1532,9 @@ class _LifecycleMixin(_OrchestratorBase):
                     run_id=local_review_run_id,
                     result=result,
                     log_dir=last_message_dir,
-                    implementer_codex_model=binding.codex_model,
-                    reviewer_codex_model=reviewer_codex_model,
+                    fixer_codex_model=fixer_role.attribution_codex_model(),
+                    reviewer_codex_model=reviewer_role.attribution_codex_model(),
+                    verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
 
             log.info(
@@ -1571,8 +1562,9 @@ class _LifecycleMixin(_OrchestratorBase):
         run_id: str,
         result: LoopResult | None,
         log_dir: Path | None = None,
-        implementer_codex_model: str | None = None,
+        fixer_codex_model: str | None = None,
         reviewer_codex_model: str | None = None,
+        verifier_codex_model: str | None = None,
     ) -> None:
         """Close the local-review `runs` row started by the phase.
 
@@ -1603,8 +1595,9 @@ class _LifecycleMixin(_OrchestratorBase):
                 await self._record_local_review_model_usage(
                     run_id=run_id,
                     log_dir=log_dir,
-                    implementer_codex_model=implementer_codex_model,
+                    fixer_codex_model=fixer_codex_model,
                     reviewer_codex_model=reviewer_codex_model,
+                    verifier_codex_model=verifier_codex_model,
                 )
         status = _local_review_status_from_result(result)
         try:
@@ -1638,22 +1631,25 @@ class _LifecycleMixin(_OrchestratorBase):
         *,
         run_id: str,
         log_dir: Path,
-        implementer_codex_model: str | None,
+        fixer_codex_model: str | None,
         reviewer_codex_model: str | None,
+        verifier_codex_model: str | None,
     ) -> None:
         """Attribute a local-review run's tokens to (provider, model).
 
-        The phase writes one role transcript per iteration under
-        `log_dir`: `fix-*.out.log` (implementer) and `review-*.out.log`
-        (reviewer). Each file is parsed with the codex model of its role
-        (Claude ignores it — its `modelUsage` carries the exact model).
+        The phase writes one role transcript per iteration under `log_dir`:
+        `fix-*.out.log` (the `fix` fixer), `review-*-verify.out.log` (the
+        `review_verify` pass), and other `review-*.out.log` (the `review_find`
+        finder / single pass). Each is parsed with its resolved role's codex
+        model (Claude ignores it — its `modelUsage` carries the exact model).
         Best-effort; never fails the run.
         """
         usages = await asyncio.to_thread(
             _parse_local_review_model_usage,
             log_dir,
-            implementer_codex_model=implementer_codex_model,
+            fixer_codex_model=fixer_codex_model,
             reviewer_codex_model=reviewer_codex_model,
+            verifier_codex_model=verifier_codex_model,
         )
         if not usages:
             return
@@ -1922,7 +1918,10 @@ class _LifecycleMixin(_OrchestratorBase):
         # `UsageCostEstimator.delta` is threaded into the fix turn's
         # `collect_runner_output` to bill its tokens; the fix-turn stdout
         # is written to `verify_log_path` for per-model attribution.
-        cost_estimator = _UsageCostEstimator(agent=binding.agent, codex_model=binding.codex_model)
+        fixer_role = binding.resolved_role("fix", self.config.roles)
+        cost_estimator = _UsageCostEstimator(
+            agent=fixer_role.agent, codex_model=fixer_role.codex_model_arg()
+        )
         verify_run_id = str(uuid.uuid4())
         verify_log_path = self.config.log_root / f"{verify_run_id}.log"
         await db.runs.create(
@@ -1945,9 +1944,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 issue_title=issue.title,
                 issue_body=issue.description,
                 labels=list(issue.labels),
-                implementer_agent=binding.agent,
-                implementer_codex_model=binding.codex_model,
-                fix_claude_model=self._fix_claude_model(binding),
+                fixer_role=fixer_role,
                 stall_secs=self.config.stall_timeout_secs,
                 command_secs=self.config.command_timeout_secs,
                 wall_clock_secs=self.config.wall_clock_timeout_secs,
@@ -1964,7 +1961,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 ok=result.ok if result is not None else False,
                 cost_estimator=cost_estimator,
                 log_path=verify_log_path,
-                codex_model=binding.codex_model,
+                codex_model=fixer_role.attribution_codex_model(),
             )
         log.info(
             "verify phase for %s: ok=%s fix_attempted=%s",

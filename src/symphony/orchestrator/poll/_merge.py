@@ -118,6 +118,8 @@ from ._helpers import (
     _termination_kwargs,
     build_fix_runner_command,
     build_merge_runner_command,
+    role_claude_model,
+    role_codex_model,
 )
 from ._review import (
     CODEX_NO_ISSUES_MARKER,
@@ -1076,11 +1078,13 @@ class _MergeMixin(_OrchestratorBase):
         prompt: str,
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
+        role = binding.resolved_role("fix", self.config.roles)
         command = build_fix_runner_command(
-            binding.agent,
+            role.agent,
             prompt,
-            codex_model=binding.codex_model,
-            claude_model=self._fix_claude_model(binding),
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
+            effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
@@ -1091,6 +1095,7 @@ class _MergeMixin(_OrchestratorBase):
             run_id=run_id,
             workspace_path=workspace_path,
             stage="review_fix",
+            role=role,
             prior_total=prior_total,
         )
 
@@ -1173,11 +1178,13 @@ class _MergeMixin(_OrchestratorBase):
                 pr_number=pr_number,
                 base_ref=base_ref,
             )
+            role = binding.resolved_role("fix", self.config.roles)
             command = build_fix_runner_command(
-                binding.agent,
+                role.agent,
                 prompt,
-                codex_model=binding.codex_model,
-                claude_model=self._fix_claude_model(binding),
+                codex_model=role_codex_model(role),
+                claude_model=role_claude_model(role),
+                effort=role.effort,
                 workspace_path=workspace_path,
                 mcp_servers=binding.mcp_servers,
             )
@@ -1189,6 +1196,7 @@ class _MergeMixin(_OrchestratorBase):
                     run_id=fix_run_id,
                     workspace_path=workspace_path,
                     stage="review_fix",
+                    role=role,
                     prior_total=prior_total,
                 )
             except Exception as e:  # noqa: BLE001
@@ -3426,10 +3434,13 @@ class _MergeMixin(_OrchestratorBase):
             labels=list(issue.labels),
             pr_url=pr_url,
         )
+        role = binding.resolved_role("implement", self.config.roles)
         command = build_merge_runner_command(
-            binding.agent,
+            role.agent,
             prompt,
-            codex_model=binding.codex_model,
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
+            effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
@@ -3440,5 +3451,6 @@ class _MergeMixin(_OrchestratorBase):
             run_id=run_id,
             workspace_path=workspace_path,
             stage="merge",
+            role=role,
             prior_total=prior_total,
         )
