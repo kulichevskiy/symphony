@@ -541,6 +541,106 @@ describe("RoleMatrixEditor", () => {
     expect(roles.implement).toEqual({ agent: "codex" });
   });
 
+  it("keeps fix/accept's hidden agent cell locked to implement's (builder-agent sync)", () => {
+    // `_synthesize_legacy_role_fields` only bridges the legacy
+    // `binding.agent` field (still read by completion parsing, activity, and
+    // cost attribution) back onto the daemon's other builder readers when
+    // implement/fix/accept all resolve to the same family — so switching
+    // implement's agent here must carry fix/accept along, even though their
+    // own agent cell is hidden.
+    let roles: RolesMatrix = {};
+    const { rerender } = render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement agent"), {
+      target: { value: "codex" },
+    });
+    expect(roles.fix).toEqual({ agent: "codex" });
+    expect(roles.accept).toEqual({ agent: "codex" });
+
+    rerender(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement agent"), {
+      target: { value: "" },
+    });
+    expect(roles.fix).toBeUndefined();
+    expect(roles.accept).toBeUndefined();
+  });
+
+  it("hides fix's model cell once its (propagated) agent resolves to codex", () => {
+    let roles: RolesMatrix = {
+      implement: { agent: "claude" },
+      fix: { agent: "claude", model: "sonnet" },
+    };
+    const { rerender } = render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    expect(screen.getByLabelText("binding fix model")).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText("binding implement agent"), {
+      target: { value: "codex" },
+    });
+    // Switching families also strands fix's stale claude model.
+    expect(roles.fix).toEqual({ agent: "codex" });
+    rerender(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    expect(screen.queryByLabelText("binding fix model")).toBeNull();
+  });
+
+  it("shows review_verify's model cell for a claude (or inherited) agent", () => {
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ review_verify: { agent: "claude", model: "opus" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
+  });
+
+  it("hides review_verify's model cell once its own agent is set to codex", () => {
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ review_verify: { agent: "codex" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+  });
+
   it("drops an effort the new model doesn't support when the model changes", () => {
     // opus supports high; sonnet (per OPTIONS) only offers low/medium.
     let roles: RolesMatrix = {

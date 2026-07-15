@@ -52,13 +52,25 @@ const ROLE_ORDER = [
 //    defaults to the implementer-opposite family
 //    (`resolved_reviewer_agent()`) — so for the common claude implementer, a
 //    `review_verify.model` override silently drops unless `agent` is also
-//    pinned to `claude`.
+//    pinned to `claude`. When the row's own `agent` cell is explicitly
+//    `codex`, the model cell is hidden outright (see `modelWired` below): the
+//    verifier's codex model always comes from the legacy `binding.codex_model`
+//    (`implementer_codex_model`), never from `resolved_role("review_verify",
+//    ...).model`, so a codex-resolved override is *always* a no-op, not just
+//    the claude-default case above.
 //  * `fix.agent` is NOT wired: `_run_fix_agent` picks its CLI from the legacy
 //    `binding.agent`, never from `resolved_role("fix", ...).agent`
-//    (`orchestrator/poll/_base.py`/`_helpers.build_fix_runner_command`).
-//    `fix.model` IS live: `_fix_claude_model` reads
-//    `resolved_role("fix", ...).model` and threads it straight into the
-//    fixer's `--model` whenever the resolved fix agent is claude.
+//    (`orchestrator/poll/_base.py`/`_helpers.build_fix_runner_command`). Its
+//    hidden cell is kept in lockstep with `implement.agent` (see `cellChange`)
+//    so `_synthesize_legacy_role_fields` can still sync `binding.agent` for
+//    the legacy readers (completion parsing, activity, cost) when an operator
+//    picks codex for `implement`.
+//    `fix.model` IS live *only for a claude-resolved fix role*:
+//    `_fix_claude_model` reads `resolved_role("fix", ...).model` and threads
+//    it into the fixer's `--model`. `_run_fix_agent` always passes
+//    `codex_model=binding.codex_model` — never `resolved_role("fix",
+//    ...).model` — so a codex-resolved fix role's model cell (see
+//    `modelWired`) is hidden the same way as `review_verify`'s.
 //  * `accept.agent`/`accept.model` are NOT wired: `build_acceptance_command`
 //    hardcodes the `claude` CLI and takes no model param at all
 //    (`agent/runners/acceptance.py`).
@@ -115,8 +127,11 @@ export function RoleMatrixEditor({
   options: ConfigOptions;
   onChange: (next: RolesMatrix) => void;
 }) {
-  function cellChange(role: string, field: keyof RoleCell, value: string) {
-    const next: RolesMatrix = { ...roles };
+  /** Set a single role's single field within `next`, in place. Factored out
+   *  of `cellChange` so a builder-agent change can apply the same
+   *  clear-on-family-switch logic to `fix`/`accept` as it does to the row the
+   *  operator actually touched. */
+  function setCell(next: RolesMatrix, role: string, field: keyof RoleCell, value: string) {
     const cell: RoleCell = { ...(next[role] ?? {}) };
     if (value === "") delete cell[field];
     else cell[field] = value;
@@ -137,6 +152,23 @@ export function RoleMatrixEditor({
     }
     if (Object.keys(cell).length === 0) delete next[role];
     else next[role] = cell;
+  }
+
+  function cellChange(role: string, field: keyof RoleCell, value: string) {
+    const next: RolesMatrix = { ...roles };
+    setCell(next, role, field, value);
+    // `implement`/`fix`/`accept` share dispatch's builder-agent identity:
+    // `_synthesize_legacy_role_fields` only bridges the legacy `binding.agent`
+    // field (read by completion parsing, activity, and cost attribution) back
+    // to the daemon's other builder-role readers when all three resolve to
+    // the same family. `fix`/`accept`'s agent cell is hidden (never wired to
+    // their own dispatch — see `ROLE_FIELDS`), so keep it locked to
+    // `implement`'s here rather than letting it silently diverge and leave
+    // those legacy readers on a stale family (SYM-191 review).
+    if (role === "implement" && field === "agent") {
+      setCell(next, "fix", "agent", value);
+      setCell(next, "accept", "agent", value);
+    }
     onChange(next);
   }
 
@@ -158,6 +190,13 @@ export function RoleMatrixEditor({
             const agent = String(cell.agent ?? "");
             const model = String(cell.model ?? "");
             const effort = String(cell.effort ?? "");
+            // `review_verify`/`fix` resolve their codex model from the legacy
+            // `binding.codex_model`, never from this cell — once the row's
+            // own (explicit or propagated) agent is codex, editing it here is
+            // always a no-op, so hide it rather than offer a dead knob.
+            const modelWired =
+              fields.model &&
+              !((role === "review_verify" || role === "fix") && agent === "codex");
             // Include a stored effort not in the current option list (e.g.
             // loaded before a model change tightened the set) so the Select
             // never renders a value with no matching <option>.
@@ -198,7 +237,7 @@ export function RoleMatrixEditor({
                   )}
                 </td>
                 <td className="px-3 py-2">
-                  {fields.model ? (
+                  {modelWired ? (
                     <Select
                       value={model}
                       onChange={(e) => cellChange(role, "model", e.target.value)}

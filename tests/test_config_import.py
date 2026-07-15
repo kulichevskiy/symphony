@@ -168,7 +168,6 @@ repos:
     local_review_verifier_claude_model: opus
     roles:
       review_find:
-        effort: high
         model: sonnet
 {_STATES}
 """

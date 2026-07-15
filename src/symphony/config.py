@@ -56,6 +56,14 @@ SUPPORTED_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 RoleName = Literal["implement", "review_find", "review_verify", "fix", "accept"]
 _BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
 
+# Roles whose command builder actually threads `effort` through to a dispatch
+# flag (`orchestrator.poll._base._run_agent` → `build_runner_command`).
+# `review_find`/`fix` take no `effort` param and `review_verify`/`accept` are
+# never resolved on any dispatch path at all, so an `effort` cell on any of
+# them is pure dead configuration — rejected in `validate_roles_matrix` rather
+# than silently persisted (SYM-191 review).
+_EFFORT_WIRED_ROLES: frozenset[str] = frozenset({"implement"})
+
 # Legacy top-level role fields the `roles:` matrix supersedes. Each is still
 # honored (mapped into the matrix below) but now warns, and collides loudly
 # with its matrix equivalent so an operator never sets both.
@@ -801,6 +809,17 @@ class Config(BaseModel):
                 ) or (global_role is not None and global_role.effort is not None)
                 if not (explicit_model or explicit_effort):
                     continue
+                if explicit_effort and name not in _EFFORT_WIRED_ROLES:
+                    # Only `implement`'s command builder threads `effort`
+                    # through to a dispatch flag — persisting it on any other
+                    # role would look effective in the resolved matrix while
+                    # every dispatch path silently ignores it (SYM-191
+                    # review).
+                    raise ValueError(
+                        f"role {name!r} does not support an effort override; "
+                        f"effort only reaches dispatch for the "
+                        f"{sorted(_EFFORT_WIRED_ROLES)!r} role(s)"
+                    )
                 role = binding.resolved_role(name, self.roles)
                 if explicit_model and not _role_model_in_family(role.agent, role.model):
                     if role.agent == "codex":
