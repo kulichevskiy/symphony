@@ -244,6 +244,7 @@ _STAGE_ROLE_FIELD: dict[str, str] = {
     "implement_fix": "implementer",
     "merge": "implementer",
     "review_fix": "fix",
+    "verify": "fix",
     "verify_fix": "fix",
     "acceptance": "accept",
     "acceptance_fix": "accept",

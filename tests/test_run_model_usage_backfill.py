@@ -323,6 +323,44 @@ async def test_backfill_review_fix_stage_uses_fix_model_not_implementer(
 
 
 @pytest.mark.asyncio
+async def test_backfill_verify_stage_uses_fix_model_not_implementer(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.sqlite"
+    log_root = tmp_path / "logs"
+    await _seed_run(
+        db_path,
+        run_id="verify-run",
+        team_key="ENG",
+        stage="verify",
+        tokens=(900, 120, 0, 80),
+    )
+    _write_log(
+        log_root / "verify-run.log",
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 120,
+                "cached_input_tokens": 80,
+            },
+        },
+    )
+
+    result = run_model_usage_backfill(
+        db_path=db_path,
+        log_root=log_root,
+        codex_models_by_team={
+            "ENG": CodexModels(implementer="gpt-5-codex", fix="gpt-5-codex-fix"),
+        },
+    )
+    assert result.updated == 1
+    assert _model_rows(db_path)["verify-run"] == {
+        ("codex", "gpt-5-codex-fix"): (900, 120, 0, 80),
+    }
+
+
+@pytest.mark.asyncio
 async def test_backfill_acceptance_fix_stage_uses_accept_model(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     log_root = tmp_path / "logs"
