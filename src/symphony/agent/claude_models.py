@@ -14,6 +14,8 @@ import re
 
 import httpx
 
+from ..config import SUPPORTED_CLAUDE_EFFORTS
+
 CLAUDE_MODELS_API_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
 
@@ -153,11 +155,16 @@ async def fetch_claude_effort_capabilities(
     # false}` for an unsupported level); a bare `{}` (no flag at all, as in
     # the common case) means supported. Keep only levels the model actually
     # supports — otherwise an unsupported level's mere presence in the tree
-    # would pass the caller's membership check.
+    # would pass the caller's membership check. The tree also carries a
+    # sibling `supported` boolean alongside the per-level entries (SYM-191
+    # review) — restrict to known effort level names so that flag, or any
+    # other non-level metadata key, never leaks out as a fake "effort".
     return [
         level
         for level, meta in effort_tree.items()
-        if meta is not None and (not isinstance(meta, dict) or meta.get("supported", True))
+        if level in SUPPORTED_CLAUDE_EFFORTS
+        and meta is not None
+        and (not isinstance(meta, dict) or meta.get("supported", True))
     ]
 
 

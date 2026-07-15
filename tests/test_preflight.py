@@ -351,6 +351,33 @@ async def test_fetch_claude_effort_capabilities_filters_unsupported_levels(
     assert await fetch_claude_effort_capabilities("sonnet") == ["low", "medium"]
 
 
+async def test_fetch_claude_effort_capabilities_ignores_sibling_metadata_keys(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """The Models API's `effort` tree carries a sibling `supported` boolean
+    alongside the per-level entries, not just per-level flags. That key must
+    not be returned as if it were an effort level (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "capabilities": {
+                    "effort": {
+                        "low": {},
+                        "medium": {},
+                        "high": {},
+                        "supported": True,
+                    }
+                }
+            },
+        )
+
+    _install_mock_transport(monkeypatch, _handler)
+    assert await fetch_claude_effort_capabilities("sonnet") == ["low", "medium", "high"]
+
+
 async def test_fetch_claude_effort_capabilities_http_error_raises_valueerror(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
