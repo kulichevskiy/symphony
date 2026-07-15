@@ -152,9 +152,9 @@ async def assemble_effective_config(
 
     # `list_all` already returns dispatch-evaluation order (priority, then the
     # stable natural-key tiebreak). The row's `enabled` column is stamped onto
-    # each binding, but this slice gives it no semantics — every row loads and
-    # dispatches as enabled, and the importer refuses `enabled: false` input.
-    # The lifecycle (dispatch skip, launch gate, drain guard) ships in SYM-193.
+    # each binding; assembly loads every row (enabled + disabled) so disabled
+    # bindings stay visible to the follow-up pollers, and the orchestrator's
+    # dispatch scan + launch gate enforce the disable semantics (SYM-193).
     try:
         bindings = [
             RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored

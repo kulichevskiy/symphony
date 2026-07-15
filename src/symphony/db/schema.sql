@@ -45,7 +45,11 @@ CREATE TABLE IF NOT EXISTS runs (
     termination_kind   TEXT NOT NULL DEFAULT '',
     termination_detail TEXT NOT NULL DEFAULT '',
     exit_returncode    INTEGER,
-    stage_done_announced_at TEXT NOT NULL DEFAULT ''
+    stage_done_announced_at TEXT NOT NULL DEFAULT '',
+    -- The binding this run was dispatched under, as the JSON-encoded natural
+    -- key (`_binding_storage_key`). Lets the drain guard attribute a
+    -- still-running run to its binding even before a PR row exists (SYM-193).
+    binding_key TEXT NOT NULL DEFAULT ''
 );
 
 -- Active-run lookup: dedupe in poll (status='running') and reconcile

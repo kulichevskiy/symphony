@@ -748,6 +748,70 @@ class _OrchestratorBase:
             return None
         return self._binding_for_issue(issue, tracker_ctx=tracker_ctx)
 
+    def scheduled_slot_count_for_binding_key(self, key: BindingKey) -> int:
+        """In-memory scheduled dispatch/fix-run reservations for `key`.
+
+        The daemon reserves a slot (`_reserve_scheduled_slot`) before the run
+        row exists, so the drain guard must consult this — a delete racing a
+        scan could otherwise remove the binding a scheduled task is about to
+        start under (SYM-193). `key` is the binding natural-key tuple, the same
+        layout `_binding_key` produces."""
+        return self._scheduled_binding_counts.get(key, 0)
+
+    def _current_binding_row(self, binding: RepoBinding) -> RepoBinding | None:
+        """The binding currently loaded (hot-reloaded from the DB) matching
+        `binding`'s natural key, or `None` if it's gone. The launch gate
+        re-resolves the row here so it validates against the *current* config —
+        a scheduled task can sit behind semaphores long enough for the operator
+        to disable the binding or lower its cap (SYM-193)."""
+        key = _binding_key(binding)
+        for current in self.config.repos:
+            if _binding_key(current) == key:
+                return current
+        return None
+
+    async def _launch_gate_admits(
+        self, binding: RepoBinding, *, first_dispatch: bool
+    ) -> bool:
+        """The single authoritative pre-spawn check (SYM-193).
+
+        Re-validates against the current binding row immediately before an
+        agent spawn. A first dispatch of an issue aborts when the binding is
+        disabled or gone; follow-up stages (fix-runs, review iterations,
+        acceptance, merge-conflict rebases) proceed — they are how in-flight
+        work drains. Either way, occupancy (live runs attributed to the
+        binding's stamped key — running plus launched-but-unfinished, since the
+        run row is written under the launch lock before the agent spawns) is
+        re-checked against the *current* cap, so a lowered `max_concurrent`
+        admits nothing new until occupancy falls below it, regardless of which
+        semaphore a queued task waited on. Running work is never killed."""
+        current = self._current_binding_row(binding)
+        if current is None:
+            log.info(
+                "launch gate: binding %s no longer configured, aborting spawn",
+                binding.linear_team_key,
+            )
+            return False
+        if first_dispatch and not current.enabled:
+            log.info(
+                "launch gate: binding %s is disabled, aborting first dispatch",
+                binding.linear_team_key,
+            )
+            return False
+        occupancy = await db.runs.occupancy_for_binding_key(
+            self._conn, _binding_storage_key(binding)
+        )
+        if occupancy >= current.max_concurrent:
+            log.info(
+                "launch gate: binding %s at capacity (occupancy=%d, cap=%d), "
+                "aborting spawn",
+                binding.linear_team_key,
+                occupancy,
+                current.max_concurrent,
+            )
+            return False
+        return True
+
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
         viewer_keys_by_ctx: dict[TrackerContext, list[str]] = {}
@@ -2209,6 +2273,7 @@ class _OrchestratorBase:
             status="running",
             pid=None,
             started_at=started_at,
+            binding_key=_binding_storage_key(binding),
         )
         created_review_run = inserted
         if not inserted:
@@ -2236,6 +2301,7 @@ class _OrchestratorBase:
                 status="running",
                 pid=None,
                 started_at=started_at,
+                binding_key=_binding_storage_key(binding),
             )
             created_review_run = True
         if created_review_run and pr_number is not None and post_codex_review:
@@ -2762,6 +2828,7 @@ class _OrchestratorBase:
                     status="running",
                     pid=None,
                     started_at=self._now().isoformat(),
+                    binding_key=_binding_storage_key(binding),
                     ignored_stages=ignored_stages,
                 )
                 if not inserted:
@@ -2817,6 +2884,7 @@ class _OrchestratorBase:
             status="running",
             pid=None,
             started_at=self._now().isoformat(),
+            binding_key=_binding_storage_key(binding),
         )
         role = binding.resolved_role("implement", self.config.roles)
         command = build_fix_runner_command(

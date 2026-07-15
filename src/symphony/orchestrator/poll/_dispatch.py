@@ -91,6 +91,14 @@ class _DispatchMixin(_OrchestratorBase):
 
     async def _scan_binding(self, binding: RepoBinding) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
+        # Disabled binding: start no new issues and drop its tracker-queue lanes
+        # so the UI board reflects the pause. The binding stays loaded (and so
+        # visible to review monitors, merge polling, and operator-wait
+        # resolution, which all iterate `config.repos`), letting in-flight work
+        # drain to completion (SYM-193).
+        if not binding.enabled:
+            await self._clear_disabled_binding_lanes(binding)
+            return scheduled
         ready_state = binding.linear_states.ready
         waiting_state = binding.linear_states.waiting
         waiting_issues: list[LinearIssue] = []
@@ -158,6 +166,19 @@ class _DispatchMixin(_OrchestratorBase):
             if len(scheduled) >= capacity:
                 break
         return scheduled
+
+    async def _clear_disabled_binding_lanes(self, binding: RepoBinding) -> None:
+        """Drop a disabled binding's `tracker_queue` snapshot so its Ready/
+        Waiting lanes vanish from the UI board while it's paused (SYM-193).
+        `_prune_tracker_queue_scopes` can't do this — the scope is still
+        configured, just disabled — so replace the snapshot with no rows."""
+        await db.tracker_queue.replace_scan(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            rows=[],
+            seen_at=self._now().isoformat(),
+        )
 
     async def _persist_queue_snapshot(
         self,

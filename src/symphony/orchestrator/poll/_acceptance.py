@@ -61,6 +61,7 @@ from ...tracker import (
 )
 from ._base import (
     _binding_key,
+    _binding_storage_key,
     _infra_retry_backoff_secs,
     _OrchestratorBase,
     _record_run_model_usage,
@@ -639,6 +640,7 @@ class _AcceptanceMixin(_OrchestratorBase):
             status="running",
             pid=None,
             started_at=self._now().isoformat(),
+            binding_key=_binding_storage_key(binding),
             ignored_stage="review",
         )
         if not inserted:
@@ -1117,6 +1119,7 @@ class _AcceptanceMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                binding_key=_binding_storage_key(binding),
             )
             self._dispatch_run_ids[issue.id] = fix_run_id
 

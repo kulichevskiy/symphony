@@ -195,7 +195,7 @@ describe("BindingForm", () => {
     expect(sent.payload.max_concurrent).toBe(6);
   });
 
-  it("has no toggle for the unsupported disabled state and always saves enabled", async () => {
+  it("has no enabled toggle in the drawer and preserves the binding's state", async () => {
     const fetchMock = mockFetch(200, record({ enabled: false, version: 5 }));
     const onSaved = vi.fn();
     render(
@@ -206,12 +206,14 @@ describe("BindingForm", () => {
         onCancel={() => {}}
       />,
     );
+    // The card owns the enable/disable toggle (SYM-193); the drawer has none.
     expect(screen.queryByLabelText("enabled")).toBeNull();
     fireEvent.click(screen.getByText("Save"));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
     const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
-    expect(sent.enabled).toBe(true);
+    // The edit preserves the disabled state rather than silently re-enabling.
+    expect(sent.enabled).toBe(false);
   });
 
   it("defaults webhook_enabled off when no global secret is configured", async () => {
@@ -385,6 +387,60 @@ describe("BindingsPanel", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/config/bindings/3?version=7");
     expect(init?.method).toBe("DELETE");
+  });
+
+  it("toggles a binding's enabled state from the card", async () => {
+    const fetchMock = mockFetch(200, record({ id: 3, version: 7, enabled: false }));
+    const onChanged = vi.fn();
+    render(
+      <BindingsPanel
+        bindings={[record({ id: 3, version: 7, enabled: true })]}
+        options={OPTIONS}
+        onChanged={onChanged}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("enabled 3"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/config/bindings/3");
+    expect(init?.method).toBe("PUT");
+    const body = JSON.parse(init?.body as string);
+    expect(body.enabled).toBe(false);
+  });
+
+  it("shows an active-work indicator on the card", () => {
+    render(
+      <BindingsPanel
+        bindings={[record({ active_work: true })]}
+        options={OPTIONS}
+        onChanged={() => {}}
+      />,
+    );
+    expect(screen.getByText("active work")).toBeTruthy();
+  });
+
+  it("renders the drain blocker list when a delete is rejected", async () => {
+    mockFetch(409, {
+      detail: {
+        msg: "cannot delete a binding with active work",
+        blockers: {
+          running_runs: ["ENG-1"],
+          open_prs: ["ENG-2"],
+          operator_waits: [],
+          scheduled_slots: 0,
+        },
+      },
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(
+      <BindingsPanel bindings={[record({ id: 3, version: 7 })]} options={OPTIONS} onChanged={() => {}} />,
+    );
+    fireEvent.click(screen.getByText("Delete"));
+    await waitFor(() =>
+      expect(screen.getByText(/active work must drain first/)).toBeTruthy(),
+    );
+    expect(screen.getByText(/running: ENG-1/)).toBeTruthy();
+    expect(screen.getByText(/open PRs: ENG-2/)).toBeTruthy();
   });
 
   it("does not delete when the confirm is dismissed", () => {

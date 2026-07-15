@@ -437,6 +437,28 @@ async def has_open(conn: aiosqlite.Connection) -> bool:
     return row is not None
 
 
+async def open_identifiers_for_binding_key(
+    conn: aiosqlite.Connection, binding_key: str
+) -> list[str]:
+    """Issue identifiers of unmerged PRs dispatched under `binding_key`.
+
+    A drain-guard blocker: an open PR belongs to the binding it was dispatched
+    under (its stamped `binding_key`), so deleting/renaming that binding would
+    orphan the PR mid-pipeline. Returns the blocking issue identifiers (empty
+    when the binding is drained of open PRs) (SYM-193)."""
+    cur = await conn.execute(
+        """
+        SELECT COALESCE(i.identifier, p.issue_id) AS identifier
+          FROM issue_prs p
+          LEFT JOIN issues i ON i.id = p.issue_id
+         WHERE p.binding_key = ? AND p.merged_at IS NULL
+         ORDER BY identifier
+        """,
+        (binding_key,),
+    )
+    return [str(row["identifier"]) for row in await cur.fetchall()]
+
+
 async def has_orphaned_review_pr(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
     """True when review resurrection can pick up an issue's PR."""
     live_placeholders = ",".join("?" * len(LIVE_STATUSES))

@@ -15,6 +15,7 @@ import {
   type ConfigView,
   createBinding,
   deleteBinding,
+  type DrainBlockers,
   fetchBindings,
   fetchConfigOptions,
   fetchConfigView,
@@ -553,9 +554,9 @@ export function BindingForm({
     setConflict(false);
     const body: BindingWrite = {
       payload,
-      // Disabling has no runtime effect until SYM-193 — the write path
-      // rejects `enabled: false` outright, so there's no toggle for it here.
-      enabled: true,
+      // Preserve the current enabled state on edit (the card's toggle owns
+      // enable/disable, SYM-193); a new binding starts enabled.
+      enabled: binding ? binding.enabled : true,
       priority,
       version: binding ? binding.version : undefined,
     };
@@ -860,12 +861,24 @@ export function BindingForm({
   );
 }
 
+/** Render a drain-guard blocker map as a compact human-readable summary. */
+function formatBlockers(b: DrainBlockers): string {
+  const parts: string[] = [];
+  if (b.running_runs.length) parts.push(`running: ${b.running_runs.join(", ")}`);
+  if (b.open_prs.length) parts.push(`open PRs: ${b.open_prs.join(", ")}`);
+  if (b.operator_waits.length)
+    parts.push(`parked: ${b.operator_waits.join(", ")}`);
+  if (b.scheduled_slots) parts.push(`scheduled: ${b.scheduled_slots}`);
+  return parts.join("; ");
+}
+
 /** One editable binding row with enable/edit/delete/reorder controls. */
 function EditableBindingCard({
   binding,
   onEdit,
   onDelete,
   onReorder,
+  onToggleEnabled,
   isFirst,
   isLast,
 }: {
@@ -873,6 +886,7 @@ function EditableBindingCard({
   onEdit: () => void;
   onDelete: () => void;
   onReorder: (dir: -1 | 1) => void;
+  onToggleEnabled: () => void;
   isFirst: boolean;
   isLast: boolean;
 }) {
@@ -895,8 +909,25 @@ function EditableBindingCard({
         {!binding.enabled ? (
           <span className="text-xs text-muted-foreground">(disabled)</span>
         ) : null}
+        {binding.active_work ? (
+          <span
+            className="rounded bg-amber-500/15 px-1.5 py-0.5 text-xs text-amber-600"
+            title="This binding has active work — delete/rename is blocked until it drains."
+          >
+            active work
+          </span>
+        ) : null}
       </div>
       <div className="flex items-center gap-1">
+        <label className="mr-2 flex items-center gap-1 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={binding.enabled}
+            onChange={onToggleEnabled}
+            aria-label={`enabled ${binding.id}`}
+          />
+          enabled
+        </label>
         <span className="mr-2 font-mono text-xs text-muted-foreground">
           priority {binding.priority}
         </span>
@@ -968,10 +999,33 @@ export function BindingsPanel({
       await deleteBinding(b.id, b.version);
       onChanged();
     } catch (e) {
+      if (e instanceof ConfigWriteError && e.blockers) {
+        setError(`Cannot delete — active work must drain first. ${formatBlockers(e.blockers)}`);
+      } else {
+        setError(
+          e instanceof ConfigWriteError && e.status === 409
+            ? "Binding changed since load — reload and retry the delete."
+            : "Failed to delete binding.",
+        );
+      }
+    }
+  }
+
+  async function toggleEnabled(b: BindingRecord) {
+    setError(null);
+    try {
+      await updateBinding(b.id, {
+        payload: b.payload,
+        enabled: !b.enabled,
+        priority: b.priority,
+        version: b.version,
+      });
+      onChanged();
+    } catch (e) {
       setError(
         e instanceof ConfigWriteError && e.status === 409
-          ? "Binding changed since load — reload and retry the delete."
-          : "Failed to delete binding.",
+          ? "Binding changed since load — reload and retry."
+          : "Failed to toggle the binding.",
       );
     }
   }
@@ -1047,6 +1101,7 @@ export function BindingsPanel({
             onEdit={() => setEditing(b)}
             onDelete={() => remove(b)}
             onReorder={(dir) => reorder(i, dir)}
+            onToggleEnabled={() => toggleEnabled(b)}
           />
         ))
       ) : (

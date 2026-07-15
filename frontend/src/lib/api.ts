@@ -487,6 +487,9 @@ export interface BindingRecord {
   tracker_site: string;
   webhook_secret_set: boolean;
   payload: Record<string, unknown>;
+  /** Whether the binding has active work (running runs, open PRs, parked
+   *  waits, or scheduled slots) — a delete/rename would be drain-blocked. */
+  active_work?: boolean;
   /** Non-blocking warnings from the last write (e.g. lost review diversity). */
   warnings?: string[];
 }
@@ -505,14 +508,24 @@ export interface FieldError {
   msg: string;
 }
 
-/** A 409 (stale version) or 422 (validation) from a binding write. The form
- *  renders `fieldErrors` inline and `conflictVersion` as a conflict banner. */
+/** Active work that blocks a drain-guarded delete/rename (SYM-193). */
+export interface DrainBlockers {
+  running_runs: string[];
+  open_prs: string[];
+  operator_waits: string[];
+  scheduled_slots: number;
+}
+
+/** A 409 (stale version or drain conflict) or 422 (validation) from a binding
+ *  write. The form renders `fieldErrors` inline, `conflictVersion` as a
+ *  conflict banner, and `blockers` as the drain blocker list. */
 export class ConfigWriteError extends ApiError {
   constructor(
     message: string,
     status: number,
     readonly fieldErrors: FieldError[] = [],
     readonly conflictVersion: number | null = null,
+    readonly blockers: DrainBlockers | null = null,
   ) {
     super(message, status);
     this.name = "ConfigWriteError";
@@ -561,6 +574,16 @@ async function writeBinding(
     );
   }
   if (response.status === 409) {
+    const blockers = detail?.detail?.blockers ?? null;
+    if (blockers) {
+      throw new ConfigWriteError(
+        detail?.detail?.msg ?? "Binding has active work",
+        409,
+        [],
+        null,
+        blockers as DrainBlockers,
+      );
+    }
     throw new ConfigWriteError("Binding was modified by another writer", 409, [], detail?.detail?.current_version ?? null);
   }
   throw new ConfigWriteError("Failed to save binding", response.status);
@@ -585,6 +608,16 @@ export async function deleteBinding(id: number, version: number): Promise<void> 
   if (response.ok) return;
   if (response.status === 409) {
     const detail = await response.json().catch(() => null);
+    const blockers = detail?.detail?.blockers ?? null;
+    if (blockers) {
+      throw new ConfigWriteError(
+        detail?.detail?.msg ?? "Binding has active work",
+        409,
+        [],
+        null,
+        blockers as DrainBlockers,
+      );
+    }
     throw new ConfigWriteError("Binding was modified by another writer", 409, [], detail?.detail?.current_version ?? null);
   }
   throw new ConfigWriteError("Failed to delete binding", response.status);

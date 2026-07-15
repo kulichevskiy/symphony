@@ -88,6 +88,7 @@ from ._base import (
     PARKED_CLOSED_UNMERGED_COMMENT,
     SlashHandlerFailure,
     _binding_key,
+    _binding_storage_key,
     _OrchestratorBase,
 )
 from ._git import (
@@ -2673,6 +2674,7 @@ class _MergeMixin(_OrchestratorBase):
                     status="running",
                     pid=None,
                     started_at=self._now().isoformat(),
+                    binding_key=_binding_storage_key(binding),
                     ignored_stage="review",
                 )
                 if not inserted:
@@ -2742,6 +2744,7 @@ class _MergeMixin(_OrchestratorBase):
             status="running",
             pid=None,
             started_at=now,
+            binding_key=_binding_storage_key(binding),
             ignored_stage="review",
             ignored_stages=("review_fix",) if skip_review else (),
         )
@@ -3318,6 +3321,7 @@ class _MergeMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                binding_key=_binding_storage_key(binding),
                 ignored_stage="review",
             )
             if not inserted:

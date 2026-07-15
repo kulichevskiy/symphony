@@ -261,6 +261,15 @@ class _LifecycleMixin(_OrchestratorBase):
                     issue.identifier,
                 )
                 return None
+            # Launch gate: the single authoritative pre-spawn check (SYM-193).
+            # A first dispatch aborts if the binding was disabled/removed since
+            # scan, or if occupancy already meets the current cap. Held under
+            # the same lock as the insert so the occupancy count (live runs
+            # stamped with this binding_key) and the run row it admits move
+            # atomically — two queued dispatches for the same binding can't both
+            # pass a stale count.
+            if not await self._launch_gate_admits(binding, first_dispatch=True):
+                return None
             inserted = await db.runs.create_if_not_dispatched(
                 self._conn,
                 id=run_id,
@@ -269,6 +278,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=now,
+                binding_key=_binding_storage_key(binding),
             )
         if not inserted:
             log.info(
