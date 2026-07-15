@@ -347,8 +347,18 @@ async def _drain_blockers(
     exists. Returns the blocker map, or `None` when the binding is drained."""
     binding_key = _binding_key_str(row)
     natural_key = _row_natural_key(row)
-    running = await runs.live_identifiers_for_binding_key(conn, binding_key)
-    open_prs = await issue_prs.open_identifiers_for_binding_key(conn, binding_key)
+    running = await runs.live_identifiers_for_binding_key(
+        conn,
+        binding_key,
+        legacy_team_key=row.project_key,
+        legacy_github_repo=row.github_repo,
+    )
+    open_prs = await issue_prs.open_identifiers_for_binding_key(
+        conn,
+        binding_key,
+        legacy_team_key=row.project_key,
+        legacy_github_repo=row.github_repo,
+    )
     waits = await operator_waits.open_identifiers_for_natural_key(conn, natural_key)
     scheduled = scheduled_slots(natural_key) if scheduled_slots is not None else 0
     if running or open_prs or waits or scheduled:

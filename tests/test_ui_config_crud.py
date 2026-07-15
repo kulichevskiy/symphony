@@ -1561,6 +1561,65 @@ async def test_drain_guard_blocks_delete_on_open_pr(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_legacy_running_run(tmp_path: Path) -> None:
+    """A run still live from before the `binding_key` column existed is
+    stamped at the migration's `''` default — the drain guard must still
+    attribute it (by team + repo) rather than let the delete through
+    (SYM-193 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.runs.create(
+                conn,
+                id="run-1",
+                issue_id=issue_id,
+                stage="implement",
+                status="running",
+                pid=None,
+                started_at="2026-01-01T00:00:00Z",
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["running_runs"] == ["ENG-1"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_legacy_open_pr(tmp_path: Path) -> None:
+    """An unmerged PR opened before the `binding_key` column existed is
+    stamped at the migration's `''` default — the drain guard must still
+    attribute it (by team + repo) rather than let the delete through
+    (SYM-193 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo="org/repo",
+                pr_number=7,
+                pr_url="https://github.com/org/repo/pull/7",
+                created_at="2026-01-01T00:00:00Z",
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["open_prs"] == ["ENG-1"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_drain_guard_blocks_delete_on_operator_wait(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:

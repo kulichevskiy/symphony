@@ -649,6 +649,12 @@ class _DispatchMixin(_OrchestratorBase):
     ) -> RepoBinding | None:
         issue_labels = set(issue.labels)
         for binding in self.config.repos:
+            # A disabled binding starts no new work — the same pause
+            # `_scan_binding` applies to the poll scan, mirrored here so a
+            # Linear issue webhook can't route a first dispatch around it
+            # (SYM-193 review).
+            if not binding.enabled:
+                continue
             if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if binding.linear_team_key != issue.team_key:

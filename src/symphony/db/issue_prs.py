@@ -438,23 +438,38 @@ async def has_open(conn: aiosqlite.Connection) -> bool:
 
 
 async def open_identifiers_for_binding_key(
-    conn: aiosqlite.Connection, binding_key: str
+    conn: aiosqlite.Connection,
+    binding_key: str,
+    *,
+    legacy_team_key: str,
+    legacy_github_repo: str,
 ) -> list[str]:
     """Issue identifiers of unmerged PRs dispatched under `binding_key`.
 
     A drain-guard blocker: an open PR belongs to the binding it was dispatched
     under (its stamped `binding_key`), so deleting/renaming that binding would
     orphan the PR mid-pipeline. Returns the blocking issue identifiers (empty
-    when the binding is drained of open PRs) (SYM-193)."""
+    when the binding is drained of open PRs) (SYM-193).
+
+    A DB upgraded with PRs opened before the `binding_key` column existed
+    leaves them stamped at the migration's `''` default, so an exact match
+    alone would miss them; those are also matched by team + repo (`github_repo`
+    is on the row itself, unlike the run case). That drops the issue label,
+    which pre-`binding_key` history can't recover, but a false-positive
+    blocker is the safe direction (SYM-193 review)."""
     cur = await conn.execute(
         """
         SELECT COALESCE(i.identifier, p.issue_id) AS identifier
           FROM issue_prs p
           LEFT JOIN issues i ON i.id = p.issue_id
-         WHERE p.binding_key = ? AND p.merged_at IS NULL
+         WHERE p.merged_at IS NULL
+           AND (
+             p.binding_key = ?
+             OR (p.binding_key = '' AND p.github_repo = ? AND i.team_key = ?)
+           )
          ORDER BY identifier
         """,
-        (binding_key,),
+        (binding_key, legacy_github_repo, legacy_team_key),
     )
     return [str(row["identifier"]) for row in await cur.fetchall()]
 

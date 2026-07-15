@@ -169,6 +169,29 @@ async def test_launch_gate_disabled_aborts_first_dispatch_not_followups(
 
 
 @pytest.mark.asyncio
+async def test_ready_binding_for_issue_skips_disabled_binding(tmp_path: Path) -> None:
+    """The webhook path's dispatch resolver must skip a disabled binding
+    itself, matching the poll scan's pause — relying solely on the launch
+    gate would still let a disabled binding reserve a scheduled slot and
+    contend for a dispatch semaphore before the gate aborts the spawn
+    (SYM-193 review)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, enabled=False)
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        issue = harness.sim.seed_issue(
+            identifier="ENG-1", team_key=TEAM, state_name=READY, title="paused"
+        )
+        await harness.warmup()
+        assert harness.orch._ready_binding_for_issue(issue) is None  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_launch_gate_blocks_spawn_over_lowered_cap(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "symphony.sqlite")
     await _insert(conn, enabled=True, max_concurrent=2)

@@ -712,20 +712,42 @@ async def occupancy_for_binding_key(conn: aiosqlite.Connection, binding_key: str
 
 
 async def live_identifiers_for_binding_key(
-    conn: aiosqlite.Connection, binding_key: str
+    conn: aiosqlite.Connection,
+    binding_key: str,
+    *,
+    legacy_team_key: str,
+    legacy_github_repo: str,
 ) -> list[str]:
     """Issue identifiers of live runs dispatched under `binding_key` — the
-    drain guard's human-readable "running runs" blocker list (SYM-193)."""
+    drain guard's human-readable "running runs" blocker list (SYM-193).
+
+    A DB upgraded with runs still live from before the `binding_key` column
+    existed leaves them stamped at the migration's `''` default, so an exact
+    match alone would miss them. Those are also matched by team + repo (the
+    repo taken from the issue's PR row when one exists, else treated as a
+    match — a still-running first dispatch predates any PR) — an
+    approximation, since pre-`binding_key` history can't recover the issue
+    label, but a false-positive blocker is the safe direction (SYM-193
+    review)."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
         SELECT DISTINCT i.identifier
           FROM runs r
           JOIN issues i ON i.id = r.issue_id
-         WHERE r.binding_key = ? AND r.status IN ({placeholders})
+          LEFT JOIN issue_prs p ON p.issue_id = r.issue_id
+         WHERE r.status IN ({placeholders})
+           AND (
+             r.binding_key = ?
+             OR (
+               r.binding_key = ''
+               AND i.team_key = ?
+               AND (p.github_repo IS NULL OR p.github_repo = ?)
+             )
+           )
          ORDER BY i.identifier
         """,
-        (binding_key, *LIVE_STATUSES),
+        (*LIVE_STATUSES, binding_key, legacy_team_key, legacy_github_repo),
     )
     return [str(row["identifier"]) for row in await cur.fetchall()]
 
