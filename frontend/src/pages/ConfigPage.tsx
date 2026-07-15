@@ -100,6 +100,24 @@ function modelsFor(options: ConfigOptions, agent: string): string[] {
   return [...new Set([...options.claude_aliases, ...options.codex_models])].sort();
 }
 
+/** Best-effort resolved agent family for `role`, used only to decide whether
+ *  a dead model cell should be hidden — NOT a full inheritance resolution
+ *  (this component never sees the global matrix, so a global override this
+ *  binding leaves inherited can still slip past). An explicit cell wins;
+ *  otherwise `fix` mirrors `implement` (kept in lockstep by `cellChange`) and
+ *  `review_verify` defaults to the implementer-opposite family
+ *  (`resolved_reviewer_agent`), same as the server's default when nothing
+ *  overrides anything. */
+function effectiveAgent(role: string, roles: RolesMatrix): string {
+  const own = String(roles[role]?.agent ?? "");
+  if (own) return own;
+  if (role === "review_verify") {
+    return effectiveAgent("implement", roles) === "codex" ? "claude" : "codex";
+  }
+  if (role === "fix") return effectiveAgent("implement", roles);
+  return "claude";
+}
+
 /** Efforts offered for an (agent, model) pick. Claude efforts are per model
  *  (the live capability set); an inherited agent offers the union so an effort
  *  override over an inherited model is still selectable — the server
@@ -192,11 +210,18 @@ export function RoleMatrixEditor({
             const effort = String(cell.effort ?? "");
             // `review_verify`/`fix` resolve their codex model from the legacy
             // `binding.codex_model`, never from this cell — once the row's
-            // own (explicit or propagated) agent is codex, editing it here is
-            // always a no-op, so hide it rather than offer a dead knob.
+            // agent (explicit, propagated, or the resolved-default family —
+            // see `effectiveAgent`) is codex, editing it here is always a
+            // no-op, so hide it rather than offer a dead knob. This also
+            // covers the common case of a default Claude implementer, whose
+            // `review_verify` inherits Codex with an empty (not `"codex"`)
+            // agent cell.
             const modelWired =
               fields.model &&
-              !((role === "review_verify" || role === "fix") && agent === "codex");
+              !(
+                (role === "review_verify" || role === "fix") &&
+                effectiveAgent(role, roles) === "codex"
+              );
             // Include a stored effort not in the current option list (e.g.
             // loaded before a model change tightened the set) so the Select
             // never renders a value with no matching <option>.

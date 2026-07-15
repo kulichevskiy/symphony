@@ -229,6 +229,25 @@ async def test_fetch_claude_effort_capabilities_resolves_cli_alias(
     assert seen_paths == [f"/v1/models/{expected_model_id}"]
 
 
+async def test_fetch_claude_effort_capabilities_alias_env_override(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """An org's Claude Code model allowlist can pin `sonnet` to an older ID
+    than the one hard-coded here; `SYMPHONY_CLAUDE_ALIAS_SONNET` lets an
+    operator tell us the real pinned ID instead of the guess (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("SYMPHONY_CLAUDE_ALIAS_SONNET", "claude-sonnet-4-6")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("sonnet")
+    assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
+
+
 async def test_fetch_claude_effort_capabilities_full_model_id_passes_through(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]

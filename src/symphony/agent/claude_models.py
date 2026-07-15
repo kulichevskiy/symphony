@@ -20,11 +20,38 @@ _ANTHROPIC_VERSION = "2023-06-01"
 # the Models API has no such alias and only resolves full IDs, so a bare
 # `/v1/models/opus` 404s. Map each alias to the full ID it currently backs so
 # the online capability check queries something the API actually knows.
+#
+# This is only a guess of what the alias resolves to. An org enforcing a
+# Claude Code model allowlist can pin an alias to an older version than the
+# one hard-coded here (docs: family aliases resolve to the newest version the
+# allowlist permits — https://docs.anthropic.com/en/docs/claude-code/model-config),
+# so this default can validate a different model than the one the CLI
+# actually runs. `_alias_override_env` lets an operator in that situation tell
+# us the real pinned ID instead.
 _CLAUDE_ALIAS_MODEL_IDS: dict[str, str] = {
     "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001",
 }
+
+
+def _alias_override_env(alias: str) -> str:
+    return f"SYMPHONY_CLAUDE_ALIAS_{alias.upper()}"
+
+
+def _resolve_alias_model_id(model: str) -> str:
+    """Resolve a CLI-only alias to the full model ID to check capabilities for.
+
+    Checks `SYMPHONY_CLAUDE_ALIAS_<ALIAS>` (e.g. `SYMPHONY_CLAUDE_ALIAS_SONNET
+    =claude-sonnet-4-6`) first, for an operator whose org allowlist pins the
+    alias away from our hard-coded guess; falls back to
+    `_CLAUDE_ALIAS_MODEL_IDS`, then the model name itself for a full `claude-*`
+    ID.
+    """
+    override = os.environ.get(_alias_override_env(model))
+    if override:
+        return override
+    return _CLAUDE_ALIAS_MODEL_IDS.get(model, model)
 
 
 async def fetch_claude_effort_capabilities(
@@ -34,9 +61,10 @@ async def fetch_claude_effort_capabilities(
 
     Reads the Models API `capabilities.effort.<level>` tree for `model`,
     resolving a short `opus`/`sonnet`/`haiku` CLI alias to its current full
-    model ID first — the Models API doesn't recognize the bare alias. A full
-    `claude-*` ID passes through unchanged. `api_key` is the key to
-    authenticate with; when `None` it falls back to the process env
+    model ID first (see `_resolve_alias_model_id`) — the Models API doesn't
+    recognize the bare alias. A full `claude-*` ID passes through unchanged.
+    `api_key` is the key to authenticate with; when `None` it falls back to
+    the process env
     `ANTHROPIC_API_KEY`. Preflight resolves the key from the process env OR a
     binding's `env:` mapping and passes it in, so a key supplied only through a
     binding still drives validation.
@@ -58,7 +86,7 @@ async def fetch_claude_effort_capabilities(
     key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         return None
-    api_model = _CLAUDE_ALIAS_MODEL_IDS.get(model, model)
+    api_model = _resolve_alias_model_id(model)
     try:
         async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
             resp = await client.get(

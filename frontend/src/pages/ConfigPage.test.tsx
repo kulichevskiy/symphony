@@ -754,14 +754,32 @@ describe("RoleMatrixEditor", () => {
     }
   });
 
-  it("shows review_verify's agent+model (agent gates whether the model reaches the verifier)", () => {
+  it("hides review_verify's model cell when its agent inherits Codex from a default Claude implementer", () => {
+    // With everything inherited, `implement` resolves to the class default
+    // `claude`, so `review_verify` resolves to the implementer-opposite
+    // family (Codex) — a Codex-resolved verifier reads its model from the
+    // legacy `binding.codex_model`, never this cell, so it must stay hidden
+    // even though the cell's own `agent` is `""` rather than `"codex"`
+    // (SYM-191 review).
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
     expect(screen.getByLabelText("binding review_verify agent")).toBeTruthy();
-    expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
+    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
     expect(screen.getByLabelText("binding review_find agent")).toBeTruthy();
     expect(screen.getByLabelText("binding review_find model")).toBeTruthy();
+  });
+
+  it("shows review_verify's model cell once its own agent is pinned to claude", () => {
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ review_verify: { agent: "claude" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
   });
 
   it("shows fix's live model cell but hides its agent (dispatch CLI stays the legacy binding.agent)", () => {
