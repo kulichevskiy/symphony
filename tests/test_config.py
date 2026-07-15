@@ -1498,6 +1498,29 @@ repos:
     assert cfg.repos[0].resolved_role("implement", cfg.roles).model == "sonnet"
 
 
+def test_legacy_reviewer_agent_with_matrix_review_verify_does_not_conflict(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Legacy `reviewer_agent` only maps onto `review_find.agent`; `review_verify`
+    defaults to the implementer's family regardless, so setting both `reviewer_agent`
+    and `roles.review_verify.agent` targets different cells and must not conflict."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    reviewer_agent: codex
+    roles:
+      review_verify:
+        agent: claude
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role("review_verify", cfg.roles).agent == "claude"
+
+
 # --- roles matrix: effort knob (SYM-127) ----------------------------------
 
 

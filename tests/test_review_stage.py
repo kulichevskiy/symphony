@@ -2419,6 +2419,40 @@ def test_build_merge_runner_command_threads_model_and_effort() -> None:
     assert argv[argv.index("--effort") + 1] == "max"
 
 
+@pytest.mark.asyncio
+async def test_merge_command_reflects_matrix_override(tmp_path: Path) -> None:
+    """A matrix `implement` model/effort override reaches the merge-run argv
+    (the merge stage resolves the `implement` role)."""
+    from symphony.config import RoleConfig
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(agent="claude", codex_model=None).model_copy(
+            update={"roles": {"implement": RoleConfig(model="opus", effort="max")}}
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        captured = await _capture_stage_command(orch, "_run_stage_command")
+        await orch._run_merge_agent(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            run_id="merge-run",
+            workspace_path=tmp_path / "ws",
+            pr_url="https://github.com/org/repo/pull/42",
+            prior_total=0.0,
+        )
+        argv = captured["command"]
+        assert argv[argv.index("--model") + 1] == "opus"
+        assert argv[argv.index("--effort") + 1] == "max"
+    finally:
+        await conn.close()
+
+
 async def _capture_stage_command(orch: Orchestrator, attr: str) -> dict[str, list[str]]:
     captured: dict[str, list[str]] = {}
 

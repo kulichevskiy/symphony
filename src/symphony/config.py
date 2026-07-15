@@ -76,7 +76,7 @@ _LEGACY_ROLE_FIELDS: frozenset[str] = frozenset(
 _LEGACY_FIELD_CELLS: dict[str, tuple[tuple[RoleName, str], ...]] = {
     "agent": (("implement", "agent"), ("fix", "agent"), ("accept", "agent")),
     "codex_model": (("implement", "model"), ("fix", "model"), ("accept", "model")),
-    "reviewer_agent": (("review_find", "agent"), ("review_verify", "agent")),
+    "reviewer_agent": (("review_find", "agent"),),
     "reviewer_codex_model": (("review_find", "model"),),
     "local_review_claude_model": (("review_find", "model"),),
     "local_review_verifier_claude_model": (("review_verify", "model"),),
